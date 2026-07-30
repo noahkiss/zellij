@@ -349,8 +349,9 @@ pub fn delete_session(name: &str, force: bool) {
                     .ok();
             }
         });
+        wait_for_session_to_exit(name);
     }
-    if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(name)) {
+    if let Err(e) = remove_session_info_folder(name) {
         if e.kind() == std::io::ErrorKind::NotFound {
             eprintln!("Session: {:?} not found.", name);
             process::exit(2);
@@ -360,6 +361,46 @@ pub fn delete_session(name: &str, force: bool) {
     } else {
         println!("Session: {:?} successfully deleted.", name);
     }
+}
+
+const DELETE_SESSION_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const DELETE_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long to keep sweeping the session_info folder after the server socket has gone away.
+const DELETE_SESSION_SWEEP_DURATION: Duration = Duration::from_millis(500);
+
+/// Block until the server for this session stops answering, or the timeout expires.
+///
+/// `KillSession` is fire-and-forget over IPC, and the dying server writes its final session
+/// snapshot on the way out. Deleting the session_info folder while that is still in flight lets the
+/// snapshot land back on disk afterwards, and the "deleted" session reappears in `zellij ls` with a
+/// stale layout.
+fn wait_for_session_to_exit(name: &str) {
+    let deadline = std::time::Instant::now() + DELETE_SESSION_EXIT_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if !assert_socket(name) {
+            return;
+        }
+        std::thread::sleep(DELETE_SESSION_POLL_INTERVAL);
+    }
+    log::warn!(
+        "Timed out waiting for session {:?} to exit before deleting it",
+        name
+    );
+}
+
+/// Remove the session_info folder, then keep sweeping it briefly in case the exiting server writes
+/// its snapshot back after the socket has already gone.
+fn remove_session_info_folder(name: &str) -> std::io::Result<()> {
+    let folder = session_info_folder_for_session(name);
+    std::fs::remove_dir_all(&folder)?;
+    let deadline = std::time::Instant::now() + DELETE_SESSION_SWEEP_DURATION;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(DELETE_SESSION_POLL_INTERVAL);
+        if folder.exists() {
+            let _ = std::fs::remove_dir_all(&folder);
+        }
+    }
+    Ok(())
 }
 
 pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
