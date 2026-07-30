@@ -109,6 +109,15 @@ Builds the session fresh from the layout instead of from whatever shape it had w
 layout edits apply deterministically. The snapshot is discarded rather than ignored — leaving it
 would keep the name taken by a dead session.
 
+## Assessed and deliberately not built
+
+- **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in
+  v0.44.3 as a CLI/IPC surface — `zellij subscribe --format json` pushes per-pane render updates as
+  they happen (no polling, works on plugin panes, `--ansi` and `--scrollback` supported), and
+  `list-panes --json` / `list-tabs --json` / `zellij action` cover the tree and mutations. See
+  [docs/web-api-assessment.md](docs/web-api-assessment.md) for the seams, per-endpoint costs, and
+  the security constraints if it is ever revisited.
+
 ## Not done
 
 - **`--plugin-watch` as a CLI flag.** `Options` crosses the client/server protobuf contract, and
