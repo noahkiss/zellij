@@ -572,9 +572,13 @@ impl Pane for PluginPane {
         self.set_should_render(true);
     }
     fn dump_screen(&self, full: bool, client_id: Option<ClientId>) -> String {
-        client_id
-            .and_then(|c| self.grids.get(&c))
+        self.grid_to_dump(client_id)
             .map(|g| g.dump_screen(full))
+            .unwrap_or_else(|| "".to_owned())
+    }
+    fn dump_screen_with_ansi(&self, full: bool, client_id: Option<ClientId>) -> String {
+        self.grid_to_dump(client_id)
+            .map(|g| g.dump_screen_with_ansi(full))
             .unwrap_or_else(|| "".to_owned())
     }
     fn scroll_up(&mut self, count: usize, client_id: ClientId) {
@@ -906,6 +910,15 @@ impl Pane for PluginPane {
 }
 
 impl PluginPane {
+    // callers that address a pane by id rather than by focus (eg. `dump-screen --pane-id`) have no
+    // client_id to offer. Every client's grid holds the same rendered plugin output, so any one of
+    // them answers the question.
+    fn grid_to_dump(&self, client_id: Option<ClientId>) -> Option<&Grid> {
+        match client_id {
+            Some(client_id) => self.grids.get(&client_id),
+            None => self.grids.values().next(),
+        }
+    }
     fn resize_grids(&mut self) {
         let content_rows = self.get_content_rows();
         let content_columns = self.get_content_columns();
