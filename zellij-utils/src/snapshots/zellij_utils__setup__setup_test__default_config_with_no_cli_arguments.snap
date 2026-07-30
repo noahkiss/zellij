@@ -5993,6 +5993,7 @@ Config {
         theme_dir: None,
         mouse_mode: None,
         pane_frames: None,
+        plugin_watch: None,
         mirror_session: None,
         on_force_close: None,
         scroll_buffer_size: None,
@@ -6189,5 +6190,8 @@ Config {
         cursor_style: None,
         mac_option_is_meta: true,
         base_url: None,
+    },
+    plugin_permissions: PluginPermissions {
+        granted: {},
     },
 }

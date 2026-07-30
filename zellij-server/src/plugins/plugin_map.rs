@@ -20,7 +20,9 @@ use zellij_utils::{
     input::layout::{PluginUserConfiguration, RunPlugin, RunPluginLocation},
     input::plugins::PluginConfig,
 };
-use zellij_utils::{data::PermissionType, errors::prelude::*};
+use zellij_utils::{
+    data::PermissionType, errors::prelude::*, input::permission::PluginPermissions,
+};
 
 // the idea here is to provide atomicity when adding/removing plugins from the map (eg. when a new
 // client connects) but to also allow updates/renders not to block each other
@@ -313,6 +315,7 @@ pub struct PluginEnv {
     pub stdin_pipe: Arc<Mutex<VecDeque<u8>>>,
     pub stdout_pipe: Arc<Mutex<VecDeque<u8>>>,
     pub keybinds: Keybinds,
+    pub plugin_permissions: Arc<PluginPermissions>,
     pub intercepting_key_presses: bool,
     pub store_limits: StoreLimits,
 }

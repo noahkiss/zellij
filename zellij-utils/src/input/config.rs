@@ -16,6 +16,7 @@ use std::convert::TryFrom;
 use super::keybinds::Keybinds;
 use super::layout::RunPluginOrAlias;
 use super::options::Options;
+use super::permission::PluginPermissions;
 use super::plugins::{PluginAliases, PluginsConfigError};
 use super::theme::{Themes, UiConfig};
 use super::web_client::WebClientConfig;
@@ -38,6 +39,7 @@ pub struct Config {
     pub env: EnvironmentVariables,
     pub background_plugins: HashSet<RunPluginOrAlias>,
     pub web_client: WebClientConfig,
+    pub plugin_permissions: PluginPermissions,
 }
 
 #[derive(Error, Debug, Serialize, Deserialize)]

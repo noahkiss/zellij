@@ -892,8 +892,15 @@ fn show_cursor(env: &PluginEnv, cursor_position: Option<(usize, usize)>) {
 }
 
 fn request_permission(env: &PluginEnv, permissions: Vec<PermissionType>) -> Result<()> {
-    if PermissionCache::from_path_or_default(None)
-        .check_permissions(env.plugin.location.to_string(), &permissions)
+    // config-level grants are consulted first and never written back to the permissions cache: they
+    // are declarative, so they cannot be pruned by a later deny, and they work for background
+    // plugins that have no pane to show a prompt in
+    let pre_granted = env
+        .plugin_permissions
+        .all_granted(&env.plugin.location.to_string(), &permissions);
+    if pre_granted
+        || PermissionCache::from_path_or_default(None)
+            .check_permissions(env.plugin.location.to_string(), &permissions)
     {
         return env
             .senders

@@ -5,6 +5,7 @@ mod plugin_map;
 mod plugin_worker;
 mod wasm_bridge;
 mod watch_filesystem;
+mod watch_plugin_files;
 mod zellij_exports;
 use log::info;
 
@@ -22,8 +23,10 @@ use crate::route::NotificationEnd;
 use crate::screen::ScreenInstruction;
 use crate::session_layout_metadata::SessionLayoutMetadata;
 use crate::{pty::PtyInstruction, thread_bus::Bus, ClientId, ServerInstruction};
+use std::sync::Arc;
 use zellij_utils::data::PaneRenderReport;
 use zellij_utils::input::layout::TabLayoutInfo;
+use zellij_utils::input::permission::PluginPermissions;
 
 pub use wasm_bridge::PluginRenderAsset;
 use wasm_bridge::WasmBridge;
@@ -194,6 +197,8 @@ pub enum PluginInstruction {
         file_path: Option<PathBuf>,
     },
     WatchFilesystem,
+    /// one or more watched plugin .wasm files changed on disk
+    PluginFilesChanged(Vec<PathBuf>),
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ChangePluginHostDir(PathBuf, PluginId, ClientId),
     WebServerStarted(String), // String -> the base url of the web server
@@ -260,6 +265,7 @@ impl From<&PluginInstruction> for PluginContext {
             PluginInstruction::MessageFromPlugin { .. } => PluginContext::MessageFromPlugin,
             PluginInstruction::UnblockCliPipes { .. } => PluginContext::UnblockCliPipes,
             PluginInstruction::WatchFilesystem => PluginContext::WatchFilesystem,
+            PluginInstruction::PluginFilesChanged(..) => PluginContext::PluginFilesChanged,
             PluginInstruction::KeybindPipe { .. } => PluginContext::KeybindPipe,
             PluginInstruction::DumpLayoutToPlugin { .. } => PluginContext::DumpLayoutToPlugin,
             PluginInstruction::Reconfigure { .. } => PluginContext::Reconfigure,
@@ -303,6 +309,8 @@ pub(crate) fn plugin_thread_main(
     plugin_aliases: PluginAliases,
     default_mode: InputMode,
     default_keybinds: Keybinds,
+    plugin_permissions: Arc<PluginPermissions>,
+    plugin_watch: bool,
     background_plugins: HashSet<RunPluginOrAlias>,
     // the client id that started the session,
     // we need it here because the thread's own list of connected clients might not yet be updated
@@ -332,6 +340,8 @@ pub(crate) fn plugin_thread_main(
         available_layout_errors,
         default_mode,
         default_keybinds,
+        plugin_permissions,
+        plugin_watch,
     );
 
     for run_plugin_or_alias in background_plugins {
@@ -1180,6 +1190,9 @@ pub(crate) fn plugin_thread_main(
             },
             PluginInstruction::WatchFilesystem => {
                 wasm_bridge.start_fs_watcher_if_not_started();
+            },
+            PluginInstruction::PluginFilesChanged(changed_paths) => {
+                wasm_bridge.reload_changed_plugin_files(changed_paths);
             },
             PluginInstruction::ChangePluginHostDir(new_host_folder, plugin_id, client_id) => {
                 if let Ok(_) = wasm_bridge.change_plugin_host_dir(

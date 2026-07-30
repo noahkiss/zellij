@@ -528,6 +528,7 @@ pub enum PluginContext {
     MessageFromPlugin,
     UnblockCliPipes,
     WatchFilesystem,
+    PluginFilesChanged,
     KeybindPipe,
     DumpLayoutToPlugin,
     ListClientsMetadata,
