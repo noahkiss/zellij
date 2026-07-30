@@ -579,6 +579,20 @@ pub fn validate_session_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Drop a dead session's resurrection snapshot, so the name is free and the next session by that
+/// name is built from the layout rather than from the shape it happened to have when it died.
+pub fn discard_resurrection_snapshot(name: &str) {
+    if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(name)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::error!(
+                "Failed to discard the resurrection snapshot for session {:?}: {:?}",
+                name,
+                e
+            );
+        }
+    }
+}
+
 pub fn assert_session_ne(name: &str) {
     if let Err(e) = validate_session_name(name) {
         eprintln!("{}", e);

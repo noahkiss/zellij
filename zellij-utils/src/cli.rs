@@ -329,6 +329,10 @@ pub enum Sessions {
         #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
         force_run_commands: bool,
 
+        /// Ignore any resurrection snapshot for this session and build it fresh from the layout
+        #[clap(long, value_parser, takes_value(false), default_value("false"))]
+        no_resurrect: bool,
+
         /// Authentication token for remote sessions
         #[clap(short('t'), long, value_parser)]
         token: Option<String>,

@@ -15,7 +15,8 @@ use zellij_client::{
 
 use zellij_utils::sessions::{
     assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
-    generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
+    discard_resurrection_snapshot, generate_unique_session_name, get_active_session,
+    get_resurrectable_sessions, get_sessions,
     get_sessions_sorted_by_mtime, kill_session as kill_session_impl, match_session_name,
     print_sessions, print_sessions_with_index, resurrection_layout, session_exists,
     validate_session_name, ActiveSession, SessionNameMatch,
@@ -723,6 +724,7 @@ pub(crate) fn start_client(opts: CliArgs) {
                     create: true,
                     create_background: false,
                     force_run_commands: false,
+                    no_resurrect: false,
                     index: None,
                     options: None,
                     token: None,
@@ -757,6 +759,7 @@ pub(crate) fn start_client(opts: CliArgs) {
             create,
             create_background,
             force_run_commands,
+            no_resurrect,
             index,
             options,
             token,
@@ -817,7 +820,20 @@ pub(crate) fn start_client(opts: CliArgs) {
                         .as_ref()
                         .and_then(|s| session_exists(&s).ok())
                         .unwrap_or(false);
-                    let resurrection_layout =
+                    // --no-resurrect makes the snapshot invisible to the rest of this
+                    // decision, so the session is built from the layout instead of from whatever
+                    // shape it happened to have when it died
+                    let resurrection_layout = if no_resurrect {
+                        // the snapshot is discarded rather than merely ignored: leaving it on disk
+                        // would keep the session name taken by a dead session and block the fresh
+                        // start the flag asks for
+                        if !session_exists {
+                            if let Some(session_name) = session_name.as_ref() {
+                                discard_resurrection_snapshot(session_name);
+                            }
+                        }
+                        None
+                    } else {
                         session_name
                             .as_ref()
                             .and_then(|s| match resurrection_layout(&s) {
@@ -826,7 +842,8 @@ pub(crate) fn start_client(opts: CliArgs) {
                                     eprintln!("{}", e);
                                     process::exit(2);
                                 },
-                            });
+                            })
+                    };
                     if (create || should_create_detached)
                         && !session_exists
                         && resurrection_layout.is_none()
