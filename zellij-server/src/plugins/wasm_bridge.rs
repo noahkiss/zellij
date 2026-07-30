@@ -602,18 +602,9 @@ impl WasmBridge {
             return Ok(());
         };
 
-        let (rows, columns) = self.size_of_plugin_id(plugin_id).unwrap_or((0, 0));
-        self.cached_events_for_pending_plugins
-            .insert(plugin_id, vec![]);
-        self.cached_resizes_for_pending_plugins
-            .insert(plugin_id, (rows, columns));
-
-        let mut loading_indication = LoadingIndication::new(run_plugin.location.to_string());
-        self.start_plugin_loading_indication(&[plugin_id], &loading_indication);
-        self.loading_plugins.insert((plugin_id, run_plugin.clone()));
-
-        let plugin_executor = self.plugin_executor.clone();
-
+        // everything that can refuse the reload is checked before any pending state is created:
+        // a bail after the fact orphans the cached-events entry and the loading_plugins entry,
+        // which starves the still-running instance and wedges later reloads for this location
         let Some(first_client_id) = self.get_first_client_id() else {
             log::error!("No connected clients, cannot reload plugin.");
             return Ok(());
@@ -622,18 +613,30 @@ impl WasmBridge {
             log::error!("Could not find running plugin with id: {}", plugin_id);
             return Ok(());
         };
-        let tab_index = self.tab_index_of_plugin_id(plugin_id);
-        let Some(size) = self.size_of_plugin_id(plugin_id) else {
+        let Some((rows, columns)) = self.size_of_plugin_id(plugin_id) else {
             log::error!(
                 "Could not find size of running plugin with id: {}",
                 plugin_id
             );
             return Ok(());
         };
+        let tab_index = self.tab_index_of_plugin_id(plugin_id);
         let size = Size {
-            rows: size.0,
-            cols: size.1,
+            rows,
+            cols: columns,
         };
+
+        self.cached_events_for_pending_plugins
+            .insert(plugin_id, vec![]);
+        self.cached_resizes_for_pending_plugins
+            .insert(plugin_id, (rows, columns));
+
+        let mut loading_indication = LoadingIndication::new(run_plugin.location.to_string());
+        self.start_plugin_loading_indication(&[plugin_id], &loading_indication);
+        self.loading_plugins.insert((plugin_id, run_plugin.clone()));
+        self.watch_plugin_file(&run_plugin);
+
+        let plugin_executor = self.plugin_executor.clone();
 
         let cwd = self.cwd_of_plugin_id(plugin_id);
 
@@ -689,8 +692,19 @@ impl WasmBridge {
             return Ok(());
         }
 
-        let plugin_ids = self
-            .all_plugin_ids_for_plugin_location(&run_plugin.location, &run_plugin.configuration)?;
+        // an exact (location, configuration) match is preferred, but a CLI reload issued without a
+        // matching -c would otherwise find nothing and fall through to spawning a stray pane. Fall
+        // back to matching on location alone so `zellij action start-or-reload-plugin <path>`
+        // reloads what is actually running.
+        let plugin_ids = match self
+            .all_plugin_ids_for_plugin_location(&run_plugin.location, &run_plugin.configuration)
+        {
+            Ok(plugin_ids) => plugin_ids,
+            Err(e) => match self.all_plugin_ids_for_plugin_location_only(&run_plugin.location) {
+                Ok(plugin_ids) => plugin_ids,
+                Err(_) => return Err(e),
+            },
+        };
         for plugin_id in &plugin_ids {
             self.reload_plugin_with_id(*plugin_id)?;
         }
@@ -1633,10 +1647,16 @@ impl WasmBridge {
         Ok(())
     }
     fn plugin_is_currently_being_loaded(&self, plugin_location: &RunPluginLocation) -> bool {
-        self.loading_plugins
-            .iter()
-            .find(|(_plugin_id, run_plugin)| &run_plugin.location == plugin_location)
-            .is_some()
+        self.loading_plugins.iter().any(|(plugin_id, run_plugin)| {
+            // a plugin parked on an unanswered permission prompt is not loading, it is waiting
+            // on a human, and it never leaves loading_plugins until that human answers. Treating
+            // it as "currently loading" parks every later reload for this location for the rest
+            // of the session.
+            &run_plugin.location == plugin_location
+                && !self
+                    .plugin_ids_waiting_for_permission_request
+                    .contains(plugin_id)
+        })
     }
     fn plugin_id_of_loading_plugin(
         &self,
@@ -1664,6 +1684,15 @@ impl WasmBridge {
             .lock()
             .unwrap()
             .all_plugin_ids_for_plugin_location(plugin_location, plugin_configuration)
+    }
+    fn all_plugin_ids_for_plugin_location_only(
+        &self,
+        plugin_location: &RunPluginLocation,
+    ) -> Result<Vec<PluginId>> {
+        self.plugin_map
+            .lock()
+            .unwrap()
+            .all_plugin_ids_for_plugin_location_only(plugin_location)
     }
     pub fn all_plugin_and_client_ids_for_plugin_location(
         &mut self,
