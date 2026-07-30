@@ -229,7 +229,14 @@ pub fn print_sessions(
         .iter()
         .for_each(|(session_name, timestamp, is_dead)| {
             if short {
-                println!("{}", session_name);
+                // the name stays the first whitespace-separated field so `zellij ls -s` remains
+                // cut/awk-parseable, but a resurrectable session is no longer indistinguishable
+                // from a running one
+                if *is_dead {
+                    println!("{} (EXITED)", session_name);
+                } else {
+                    println!("{}", session_name);
+                }
                 return;
             }
             if no_formatting {
