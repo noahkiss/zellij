@@ -1,416 +1,105 @@
 name: Release
+
+# Fork release pipeline. Builds only the targets this fork is installed on
+# (glibc linux x86_64, macOS arm64 and x86_64) and publishes the bare `zellij`
+# binary as a tarball for the homebrew tap to pour.
+
 on:
   push:
     tags:
-      - 'v*.*.*'
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and release'
+        required: true
+
+permissions:
+  contents: write
 
 jobs:
+  # Created up front so the three build jobs only ever upload to it — creating
+  # it from the matrix races and one of the jobs loses.
   create-release:
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
-      - name: create_release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Ensure release exists
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && '' || github.ref }}
-          release_name: Release ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref }}
-          draft: ${{ github.event_name == 'workflow_dispatch' }}
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ]; then
+            tag='${{ inputs.tag }}'
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes ""
 
-  build-release-normal:
+  build:
     needs: create-release
-    name: build-release-normal
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    env:
-      RUST_BACKTRACE: 1
     strategy:
       fail-fast: false
       matrix:
-        build:
-          - linux musl x64
-          - linux musl aarch64
-          #- linux musl riscv64
-          - macos x64
-          - macos aarch64
-          - windows x64
         include:
-          - build: linux musl x64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - build: linux musl aarch64
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-#          - build: linux musl riscv64
-#            os: ubuntu-latest
-#            target: riscv64gc-unknown-linux-musl
-          - build: macos x64
-            os: macos-latest
-            target: x86_64-apple-darwin
-          - build: macos aarch64
-            os: macos-latest
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
             target: aarch64-apple-darwin
-          - build: windows x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - os: macos-13
+            target: x86_64-apple-darwin
     steps:
-      - name: Set release tag (Unix)
-        if: runner.os != 'Windows'
+      - name: Resolve tag
         run: |
-          if [ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]; then
-            echo "RELEASE_TAG=main" >> "$GITHUB_ENV"
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ]; then
+            tag='${{ inputs.tag }}'
           else
-            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}"  >> "$GITHUB_ENV"
+            tag="${GITHUB_REF#refs/tags/}"
           fi
+          echo "RELEASE_TAG=${tag}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${tag#v}" >> "$GITHUB_ENV"
 
-      - name: Set release tag (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
-            echo "RELEASE_TAG=main" >> $env:GITHUB_ENV
-          } else {
-            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
-            echo "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
-          }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Install build dependencies (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v2
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install musl-tools
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          target: "${{ matrix.target }},wasm32-wasip1"
+          target: ${{ matrix.target }}
           cache: false
           rustflags: ""
 
-      - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-
-      - name: Build release binary (cross-compiled)
-        if: matrix.build != 'windows x64'
-        run: cargo xtask ci cross ${{ matrix.target }}
-
-      - name: Build release binary (Windows native)
-        if: matrix.build == 'windows x64'
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo xtask ci build-release
-
-      - name: Create artifact (Unix)
-        if: runner.os != 'Windows'
-        id: make-artifact-unix
-        run: |
-          asset_name="zellij-${{ matrix.target }}.tar.gz"
-          tar cvzf "${asset_name}" -C "target/${{ matrix.target }}/release" zellij
-          echo "asset_name=${asset_name}" >> "$GITHUB_OUTPUT"
-
-      - name: Create artifact (Windows)
-        if: runner.os == 'Windows'
-        id: make-artifact-windows
-        run: |
-          $asset_name = "zellij-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/release/zellij.exe" -DestinationPath $asset_name
-          echo "asset_name=$asset_name" >> $env:GITHUB_OUTPUT
-
-      - name: Create checksum (Unix)
-        if: runner.os != 'Windows'
-        id: make-checksum-unix
-        run: |
-          checksum_name="zellij-${{ matrix.target }}.sha256sum"
-          if [[ "$RUNNER_OS" != "macOS" ]]; then
-            sha256sum "target/${{ matrix.target }}/release/zellij" > "${checksum_name}"
-          else
-            shasum -a 256 "target/${{ matrix.target }}/release/zellij" > "${checksum_name}"
-          fi
-          echo "checksum_name=${checksum_name}" >> "$GITHUB_OUTPUT"
-
-      - name: Create checksum (Windows)
-        if: runner.os == 'Windows'
-        id: make-checksum-windows
-        run: |
-          $checksum_name = "zellij-${{ matrix.target }}.sha256sum"
-          $hash = (Get-FileHash "target/release/zellij.exe" -Algorithm SHA256).Hash.ToLower()
-          "$hash  target/release/zellij.exe" | Out-File -Encoding ascii $checksum_name
-          echo "checksum_name=$checksum_name" >> $env:GITHUB_OUTPUT
-
-      - name: Upload release archive
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.make-artifact-unix.outputs.asset_name || steps.make-artifact-windows.outputs.asset_name }}
-          asset_name: ${{ runner.os == 'Windows' && format('zellij-{0}.zip', matrix.target) || format('zellij-{0}.tar.gz', matrix.target) }}
-          asset_content_type: application/octet-stream
+          key: ${{ matrix.target }}
 
-      - name: Upload checksum
-        uses: actions/upload-release-asset@v1.0.2
+      - name: Build
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENSSL_NO_VENDOR: '1'
+        run: cargo build --release --locked --bin zellij --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          asset="zellij-nkmk-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
+          tar czf "${asset}" -C "target/${{ matrix.target }}/release" zellij
+          shasum -a 256 "${asset}" > "${asset}.sha256"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.make-checksum-unix.outputs.checksum_name || steps.make-checksum-windows.outputs.checksum_name }}
-          asset_name: zellij-${{matrix.target}}.sha256sum
-          asset_content_type: text/plain
-
-      # ===== Windows MSI installer =====
-      - name: Install WiX v6
-        if: runner.os == 'Windows'
-        run: dotnet tool install --global wix --version 6.0.2
-
-      - name: Add WiX UI extension
-        if: runner.os == 'Windows'
-        run: wix extension add WixToolset.UI.wixext/6.0.2
-
-      - name: Build MSI installer
-        if: runner.os == 'Windows'
-        run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          New-Item -ItemType Directory -Force -Path target\wix
-          wix build wix\main.wxs wix\Zellij.wxl `
-            -d Version=$version `
-            -arch x64 `
-            -ext WixToolset.UI.wixext `
-            -o target\wix\zellij-x86_64-pc-windows-msvc-installer.msi
-
-      - name: Create MSI checksum
-        if: runner.os == 'Windows'
-        id: make-checksum-msi
-        run: |
-          $checksum_name = "zellij-${{ matrix.target }}-installer.sha256sum"
-          $hash = (Get-FileHash "target\wix\zellij-${{ matrix.target }}-installer.msi" -Algorithm SHA256).Hash.ToLower()
-          "$hash  zellij-${{ matrix.target }}-installer.msi" | Out-File -Encoding ascii $checksum_name
-          echo "checksum_name=$checksum_name" >> $env:GITHUB_OUTPUT
-
-      - name: Upload MSI installer
-        if: runner.os == 'Windows'
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: target\wix\zellij-${{ matrix.target }}-installer.msi
-          asset_name: zellij-${{ matrix.target }}-installer.msi
-          asset_content_type: application/octet-stream
-
-      - name: Upload MSI checksum
-        if: runner.os == 'Windows'
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.make-checksum-msi.outputs.checksum_name }}
-          asset_name: zellij-${{ matrix.target }}-installer.sha256sum
-          asset_content_type: text/plain
-
-  build-release-noweb:
-    needs: create-release
-    name: build-release-noweb
-    runs-on: ${{ matrix.os }}
-    env:
-      RUST_BACKTRACE: 1
-    strategy:
-      fail-fast: false
-      matrix:
-        build:
-          - linux musl x64
-          - linux musl aarch64
-          #- linux musl riscv64
-          - macos x64
-          - macos aarch64
-          - windows x64
-        include:
-          - build: linux musl x64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - build: linux musl aarch64
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-#          - build: linux musl riscv64
-#            os: ubuntu-latest
-#            target: riscv64gc-unknown-linux-musl
-          - build: macos x64
-            os: macos-latest
-            target: x86_64-apple-darwin
-          - build: macos aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
-          - build: windows x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-    steps:
-      - name: Set release tag (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          if [ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]; then
-            echo "RELEASE_TAG=main" >> "$GITHUB_ENV"
-          else
-            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}"  >> "$GITHUB_ENV"
-          fi
-
-      - name: Set release tag (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
-            echo "RELEASE_TAG=main" >> $env:GITHUB_ENV
-          } else {
-            $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
-            echo "RELEASE_TAG=$tag" >> $env:GITHUB_ENV
-          }
-
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v2
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install musl-tools
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y --no-install-recommends musl-tools
-
-      - name: Install Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: "${{ matrix.target }},wasm32-wasip1"
-          cache: false
-          rustflags: ""
-
-      - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-
-      - name: Build release binary (cross-compiled, no-web)
-        if: matrix.build != 'windows x64'
-        run: cargo xtask ci cross ${{ matrix.target }} --no-web
-
-      - name: Build release binary (Windows native, no-web)
-        if: matrix.build == 'windows x64'
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo xtask ci build-release --no-web
-
-      - name: Create artifact (Unix)
-        if: runner.os != 'Windows'
-        id: make-artifact-unix
-        run: |
-          asset_name="zellij-no-web-${{ matrix.target }}.tar.gz"
-          tar cvzf "${asset_name}" -C "target/${{ matrix.target }}/release" zellij
-          echo "asset_name=${asset_name}" >> "$GITHUB_OUTPUT"
-
-      - name: Create artifact (Windows)
-        if: runner.os == 'Windows'
-        id: make-artifact-windows
-        run: |
-          $asset_name = "zellij-no-web-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/release/zellij.exe" -DestinationPath $asset_name
-          echo "asset_name=$asset_name" >> $env:GITHUB_OUTPUT
-
-      - name: Create checksum (Unix)
-        if: runner.os != 'Windows'
-        id: make-checksum-unix
-        run: |
-          checksum_name="zellij-no-web-${{ matrix.target }}.sha256sum"
-          if [[ "$RUNNER_OS" != "macOS" ]]; then
-            sha256sum "target/${{ matrix.target }}/release/zellij" > "${checksum_name}"
-          else
-            shasum -a 256 "target/${{ matrix.target }}/release/zellij" > "${checksum_name}"
-          fi
-          echo "checksum_name=${checksum_name}" >> "$GITHUB_OUTPUT"
-
-      - name: Create checksum (Windows)
-        if: runner.os == 'Windows'
-        id: make-checksum-windows
-        run: |
-          $checksum_name = "zellij-no-web-${{ matrix.target }}.sha256sum"
-          $hash = (Get-FileHash "target/release/zellij.exe" -Algorithm SHA256).Hash.ToLower()
-          "$hash  target/release/zellij.exe" | Out-File -Encoding ascii $checksum_name
-          echo "checksum_name=$checksum_name" >> $env:GITHUB_OUTPUT
-
-      - name: Upload release archive
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.make-artifact-unix.outputs.asset_name || steps.make-artifact-windows.outputs.asset_name }}
-          asset_name: ${{ runner.os == 'Windows' && format('zellij-no-web-{0}.zip', matrix.target) || format('zellij-no-web-{0}.tar.gz', matrix.target) }}
-          asset_content_type: application/octet-stream
-
-      - name: Upload checksum
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.make-checksum-unix.outputs.checksum_name || steps.make-checksum-windows.outputs.checksum_name }}
-          asset_name: zellij-no-web-${{matrix.target}}.sha256sum
-          asset_content_type: text/plain
-
-      # ===== Windows MSI installer (no-web) =====
-      - name: Install WiX v6
-        if: runner.os == 'Windows'
-        run: dotnet tool install --global wix --version 6.0.2
-
-      - name: Add WiX UI extension
-        if: runner.os == 'Windows'
-        run: wix extension add WixToolset.UI.wixext/6.0.2
-
-      - name: Build MSI installer (no-web)
-        if: runner.os == 'Windows'
-        run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          New-Item -ItemType Directory -Force -Path target\wix
-          wix build wix\main.wxs wix\Zellij.wxl `
-            -d Version=$version `
-            -arch x64 `
-            -ext WixToolset.UI.wixext `
-            -o target\wix\zellij-no-web-${{ matrix.target }}-installer.msi
-
-      - name: Create MSI checksum (no-web)
-        if: runner.os == 'Windows'
-        id: make-checksum-msi
-        run: |
-          $checksum_name = "zellij-no-web-${{ matrix.target }}-installer.sha256sum"
-          $hash = (Get-FileHash "target\wix\zellij-no-web-${{ matrix.target }}-installer.msi" -Algorithm SHA256).Hash.ToLower()
-          "$hash  zellij-no-web-${{ matrix.target }}-installer.msi" | Out-File -Encoding ascii $checksum_name
-          echo "checksum_name=$checksum_name" >> $env:GITHUB_OUTPUT
-
-      - name: Upload MSI installer (no-web)
-        if: runner.os == 'Windows'
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: target\wix\zellij-no-web-${{ matrix.target }}-installer.msi
-          asset_name: zellij-no-web-${{ matrix.target }}-installer.msi
-          asset_content_type: application/octet-stream
-
-      - name: Upload MSI checksum (no-web)
-        if: runner.os == 'Windows'
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ steps.make-checksum-msi.outputs.checksum_name }}
-          asset_name: zellij-no-web-${{ matrix.target }}-installer.sha256sum
-          asset_content_type: text/plain
-
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: |
+            zellij-nkmk-${{ env.RELEASE_VERSION }}-${{ matrix.target }}.tar.gz
+            zellij-nkmk-${{ env.RELEASE_VERSION }}-${{ matrix.target }}.tar.gz.sha256
