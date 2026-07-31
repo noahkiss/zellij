@@ -150,16 +150,18 @@ impl PaneFrame {
             && (corner == boundary_type::TOP_LEFT || corner == boundary_type::TOP_RIGHT)
         {
             boundary_type::HORIZONTAL
+        } else if self.style.top_only_frames
+            && (corner == boundary_type::TOP_LEFT || corner == boundary_type::TOP_RIGHT)
+        {
+            // nkmk top-only frames: no verticals anywhere, so every title line runs edge to
+            // edge (same shape stock uses for the title line when frames are off). Checked
+            // BEFORE the stacked mapping below — a collapsed stacked pane otherwise gets
+            // upward-facing bottom corners on its title line.
+            boundary_type::HORIZONTAL
         } else if self.pane_is_stacked_under && corner == boundary_type::TOP_RIGHT {
             boundary_type::BOTTOM_RIGHT
         } else if self.pane_is_stacked_under && corner == boundary_type::TOP_LEFT {
             boundary_type::BOTTOM_LEFT
-        } else if self.style.top_only_frames
-            && (corner == boundary_type::TOP_LEFT || corner == boundary_type::TOP_RIGHT)
-        {
-            // nkmk top-only frames: no verticals below the corners, so the top line runs
-            // edge to edge (same shape stock uses for the title line when frames are off)
-            boundary_type::HORIZONTAL
         } else {
             corner
         };
