@@ -13,8 +13,8 @@ Upstream's README, documentation and license apply to everything except the patc
 brew install noahkiss/tap/zellij-nkmk
 ```
 
-That pours a prebuilt binary from the fork's GitHub releases (glibc linux x86_64, macOS arm64,
-macOS x86_64). Anywhere else — musl, linux arm64 — use `noahkiss/tap/zellij-nkmk-source`, which is
+That pours a prebuilt binary from the fork's GitHub releases (glibc linux x86_64, macOS arm64).
+Anywhere else — musl, linux arm64, intel macs — use `noahkiss/tap/zellij-nkmk-source`, which is
 the same version built from the tag tarball.
 
 It installs a binary named `zellij`, so it conflicts with the `zellij` formula. Unlink that first:
@@ -164,18 +164,18 @@ prebuilt assets checked into `zellij-utils/assets/plugins/`.
 
 ## Releasing
 
-`.github/workflows/release.yml` replaces upstream's release job. Pushing a `v*` tag builds three
-targets — `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` — and attaches
+`.github/workflows/release.yml` replaces upstream's release job. Pushing a `v*` tag builds two
+targets — `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` — and attaches
 `zellij-nkmk-<version>-<target>.tar.gz` (the bare binary) plus a `.sha256` to that tag's release,
 creating the release if it does not exist. Nothing else is published: no musl, no linux arm64, no
-Windows.
+intel mac, no Windows.
 
 1. Land the patches, bump the workspace version in `Cargo.toml` (and the `zellij-client` /
    `zellij-server` pins), `cargo build --release` once so `Cargo.lock` is current, commit.
 2. `git tag v<version> && git push origin main --tags`. Tags are immutable once a formula pins
    them — never move one.
 3. Watch the run: `gh run watch -R noahkiss/zellij $(gh run list -R noahkiss/zellij --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')`.
-4. Bump `Formula/zellij-nkmk.rb` in the tap: `version`, the three URLs, and the three `sha256`
+4. Bump `Formula/zellij-nkmk.rb` in the tap: `version`, the URLs, and the `sha256`
    values. The shas are on the release as `<asset>.sha256` — `gh release download v<version>
    -R noahkiss/zellij -p '*.sha256' -D - 2>/dev/null` or just read them off the release page.
    `Formula/zellij-nkmk-source.rb` takes the tag tarball's sha instead.
