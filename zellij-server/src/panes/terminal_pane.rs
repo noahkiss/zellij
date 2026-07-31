@@ -951,6 +951,10 @@ impl Pane for TerminalPane {
         self.style.rounded_corners = rounded_corners;
         self.frame.clear();
     }
+    fn update_top_only_frames(&mut self, top_only_frames: bool) {
+        self.style.top_only_frames = top_only_frames;
+        self.frame.clear();
+    }
     fn drain_fake_cursors(&mut self) -> Option<HashSet<(usize, usize)>> {
         if !self.fake_cursor_locations.is_empty() {
             for (y, _x) in &self.fake_cursor_locations {

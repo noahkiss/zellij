@@ -734,6 +734,7 @@ pub enum ScreenInstruction {
         auto_layout: bool,
         rounded_corners: bool,
         hide_session_name: bool,
+        top_only_frames: bool,
         stacked_resize: bool,
         default_editor: Option<PathBuf>,
         advanced_mouse_actions: bool,
@@ -4480,6 +4481,7 @@ impl Screen {
         auto_layout: bool,
         rounded_corners: bool,
         hide_session_name: bool,
+        top_only_frames: bool,
         stacked_resize: bool,
         default_editor: Option<PathBuf>,
         advanced_mouse_actions: bool,
@@ -4495,6 +4497,9 @@ impl Screen {
         self.default_mode_info.update_theme(theme);
         self.default_mode_info
             .update_rounded_corners(rounded_corners);
+        // nkmk: keep the screen-level style current so tabs created after a live config
+        // reload inherit the frame style too
+        self.style.top_only_frames = top_only_frames;
         // `default_mode_info` is the fallback used by `change_mode` for
         // clients that don't yet have a per-client `mode_info` entry, so its
         // keybinds and base mode must be kept in sync with reconfigures.
@@ -4524,6 +4529,7 @@ impl Screen {
         for tab in self.tabs.values_mut() {
             tab.update_theme(theme);
             tab.update_rounded_corners(rounded_corners);
+            tab.update_top_only_frames(top_only_frames);
             tab.update_default_shell(default_shell.clone());
             tab.update_default_editor(self.default_editor.clone());
             tab.update_auto_layout(auto_layout);
@@ -8728,6 +8734,7 @@ pub(crate) fn screen_thread_main(
                 auto_layout,
                 rounded_corners,
                 hide_session_name,
+                top_only_frames,
                 stacked_resize,
                 default_editor,
                 advanced_mouse_actions,
@@ -8752,6 +8759,7 @@ pub(crate) fn screen_thread_main(
                         auto_layout,
                         rounded_corners,
                         hide_session_name,
+                        top_only_frames,
                         stacked_resize,
                         default_editor,
                         advanced_mouse_actions,

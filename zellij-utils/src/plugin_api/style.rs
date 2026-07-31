@@ -21,6 +21,8 @@ impl TryFrom<ProtobufStyle> for Style {
             colors: s,
             rounded_corners: protobuf_style.rounded_corners,
             hide_session_name: protobuf_style.hide_session_name,
+            // nkmk: not part of the plugin wire format — plugins never draw pane frames
+            top_only_frames: false,
         })
     }
 }

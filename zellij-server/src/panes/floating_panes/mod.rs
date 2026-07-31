@@ -1296,6 +1296,12 @@ impl FloatingPanes {
             pane.update_rounded_corners(rounded_corners);
         }
     }
+    pub fn update_pane_top_only_frames(&mut self, top_only_frames: bool) {
+        self.style.top_only_frames = top_only_frames;
+        for pane in self.panes.values_mut() {
+            pane.update_top_only_frames(top_only_frames);
+        }
+    }
     pub fn next_selectable_pane_id_above(&mut self, pane_id: &PaneId) -> Option<PaneId> {
         let display_area = *self.display_area.borrow();
         let viewport = *self.viewport.borrow();

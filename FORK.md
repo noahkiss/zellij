@@ -109,6 +109,23 @@ Builds the session fresh from the layout instead of from whatever shape it had w
 layout edits apply deterministically. The snapshot is discarded rather than ignored — leaving it
 would keep the name taken by a dead session.
 
+### Top-only pane frames (`ui { pane_frames { top_only true } }`)
+
+```kdl
+ui {
+    pane_frames {
+        top_only true
+    }
+}
+```
+
+Draws only the top frame line (which runs edge to edge and carries the title); the side and
+bottom frame cells stay reserved but blank, so panes keep their 1-cell padding ring without the
+box. The resize-hint undertitle is suppressed with it; the held-pane `[ EXIT CODE ]` / re-run
+undertitle and hover tooltips still draw. Rides the same live config-reload path as
+`rounded_corners`, so toggling it is a config.kdl edit — no restart. Off by default (stock
+rendering); plugins never see the flag (it is not part of the protobuf wire format).
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

@@ -5205,9 +5205,12 @@ impl UiConfig {
                     .unwrap_or(false);
             let hide_session_name =
                 kdl_get_child_entry_bool_value!(pane_frames, "hide_session_name").unwrap_or(false);
+            let top_only_frames =
+                kdl_children_property_first_arg_as_bool!(pane_frames, "top_only").unwrap_or(false);
             let frame_config = FrameConfig {
                 rounded_corners,
                 hide_session_name,
+                top_only_frames,
             };
             ui_config.pane_frames = frame_config;
         }
@@ -5224,6 +5227,12 @@ impl UiConfig {
             let mut rounded_corners = KdlNode::new("rounded_corners");
             rounded_corners.push(KdlValue::Bool(true));
             frame_config_children.nodes_mut().push(rounded_corners);
+        }
+        if self.pane_frames.top_only_frames {
+            has_ui_config = true;
+            let mut top_only = KdlNode::new("top_only");
+            top_only.push(KdlValue::Bool(true));
+            frame_config_children.nodes_mut().push(top_only);
         }
         if self.pane_frames.hide_session_name {
             has_ui_config = true;

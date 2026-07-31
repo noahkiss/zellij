@@ -1376,6 +1376,8 @@ pub struct Style {
     pub colors: Styling,
     pub rounded_corners: bool,
     pub hide_session_name: bool,
+    /// nkmk fork: draw only the top frame line; sides and bottom stay as blank padding.
+    pub top_only_frames: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]

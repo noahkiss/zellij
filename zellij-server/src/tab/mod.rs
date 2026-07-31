@@ -635,6 +635,7 @@ pub trait Pane {
     fn update_theme(&mut self, _theme: Styling) {}
     fn update_arrow_fonts(&mut self, _should_support_arrow_fonts: bool) {}
     fn update_rounded_corners(&mut self, _rounded_corners: bool) {}
+    fn update_top_only_frames(&mut self, _top_only_frames: bool) {}
     fn set_should_be_suppressed(&mut self, _should_be_suppressed: bool) {}
     fn query_should_be_suppressed(&self) -> bool {
         false
@@ -5681,6 +5682,16 @@ impl Tab {
             .update_pane_rounded_corners(rounded_corners);
         for (_, pane) in self.suppressed_panes.values_mut() {
             pane.update_rounded_corners(rounded_corners);
+        }
+    }
+    pub fn update_top_only_frames(&mut self, top_only_frames: bool) {
+        self.style.top_only_frames = top_only_frames;
+        self.floating_panes
+            .update_pane_top_only_frames(top_only_frames);
+        self.tiled_panes
+            .update_pane_top_only_frames(top_only_frames);
+        for (_, pane) in self.suppressed_panes.values_mut() {
+            pane.update_top_only_frames(top_only_frames);
         }
     }
     pub fn update_arrow_fonts(&mut self, should_support_arrow_fonts: bool) {

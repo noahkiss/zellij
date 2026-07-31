@@ -26,6 +26,7 @@ impl UiConfig {
 pub struct FrameConfig {
     pub rounded_corners: bool,
     pub hide_session_name: bool,
+    pub top_only_frames: bool,
 }
 
 impl FrameConfig {
@@ -33,6 +34,7 @@ impl FrameConfig {
         let mut merged = self.clone();
         merged.rounded_corners = other.rounded_corners;
         merged.hide_session_name = other.hide_session_name;
+        merged.top_only_frames = other.top_only_frames;
         merged
     }
 }

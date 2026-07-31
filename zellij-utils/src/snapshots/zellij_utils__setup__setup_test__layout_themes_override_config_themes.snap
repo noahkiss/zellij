@@ -1,5 +1,6 @@
 ---
 source: zellij-utils/src/setup.rs
+assertion_line: 790
 expression: "format!(\"{:#?}\", config)"
 ---
 Config {
@@ -7934,6 +7935,7 @@ Config {
         pane_frames: FrameConfig {
             rounded_corners: false,
             hide_session_name: false,
+            top_only_frames: false,
         },
     },
     env: {},

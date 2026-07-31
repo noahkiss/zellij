@@ -154,6 +154,12 @@ impl PaneFrame {
             boundary_type::BOTTOM_RIGHT
         } else if self.pane_is_stacked_under && corner == boundary_type::TOP_LEFT {
             boundary_type::BOTTOM_LEFT
+        } else if self.style.top_only_frames
+            && (corner == boundary_type::TOP_LEFT || corner == boundary_type::TOP_RIGHT)
+        {
+            // nkmk top-only frames: no verticals below the corners, so the top line runs
+            // edge to edge (same shape stock uses for the title line when frames are off)
+            boundary_type::HORIZONTAL
         } else {
             corner
         };
@@ -974,7 +980,10 @@ impl PaneFrame {
                             x,
                             y,
                         ));
-                    } else if self.show_help_text && self.is_main_client {
+                    } else if self.show_help_text
+                        && self.is_main_client
+                        && !self.style.top_only_frames
+                    {
                         let x = self.geom.x;
                         let y = self.geom.y + row;
                         character_chunks.push(CharacterChunk::new(
@@ -1003,7 +1012,11 @@ impl PaneFrame {
                     } else {
                         let mut bottom_row = vec![];
                         for col in 0..self.geom.cols {
-                            let boundary = if col == 0 {
+                            let boundary = if self.style.top_only_frames {
+                                // nkmk top-only frames: the bottom line keeps its cell (the
+                                // padding the frame provides) but draws nothing
+                                " "
+                            } else if col == 0 {
                                 // bottom left corner
                                 self.get_corner(boundary_type::BOTTOM_LEFT)
                             } else if col == self.geom.cols - 1 {
@@ -1021,10 +1034,14 @@ impl PaneFrame {
                         character_chunks.push(CharacterChunk::new(bottom_row, x, y));
                     }
                 } else {
-                    let boundary_character_left =
-                        foreground_color(boundary_type::VERTICAL, self.color);
-                    let boundary_character_right =
-                        foreground_color(boundary_type::VERTICAL, self.color);
+                    // nkmk top-only frames: sides keep their cell but draw blank padding
+                    let vertical = if self.style.top_only_frames {
+                        " "
+                    } else {
+                        boundary_type::VERTICAL
+                    };
+                    let boundary_character_left = foreground_color(vertical, self.color);
+                    let boundary_character_right = foreground_color(vertical, self.color);
 
                     let x = self.geom.x;
                     let y = self.geom.y + row;

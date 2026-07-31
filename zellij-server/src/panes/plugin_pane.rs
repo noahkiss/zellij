@@ -814,6 +814,10 @@ impl Pane for PluginPane {
         self.style.rounded_corners = rounded_corners;
         self.frame.clear();
     }
+    fn update_top_only_frames(&mut self, top_only_frames: bool) {
+        self.style.top_only_frames = top_only_frames;
+        self.frame.clear();
+    }
     fn set_should_be_suppressed(&mut self, should_be_suppressed: bool) {
         self.should_be_suppressed = should_be_suppressed;
     }

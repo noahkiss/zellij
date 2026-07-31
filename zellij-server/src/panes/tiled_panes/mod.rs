@@ -2736,6 +2736,12 @@ impl TiledPanes {
             pane.update_rounded_corners(rounded_corners);
         }
     }
+    pub fn update_pane_top_only_frames(&mut self, top_only_frames: bool) {
+        self.style.top_only_frames = top_only_frames;
+        for pane in self.panes.values_mut() {
+            pane.update_top_only_frames(top_only_frames);
+        }
+    }
     pub fn stack_panes(
         &mut self,
         root_pane_id: PaneId,
