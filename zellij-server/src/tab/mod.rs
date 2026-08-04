@@ -144,6 +144,13 @@ pub const MIN_TERMINAL_WIDTH: usize = 5;
 
 const MAX_PENDING_VTE_EVENTS: usize = 7000;
 
+/// Why a stacked pane was refused, and the invocation that works instead. Reported both by the tab
+/// that refuses the pane and, for non-blocking calls whose notification is signalled before the tab
+/// runs, by the screen.
+pub const CANNOT_STACK_WITHOUT_ANCHOR: &str =
+    "cannot stack a pane: no client is attached and no target pane was given. Pass \
+     --near-current-pane with ZELLIJ_PANE_ID set to the pane to stack under.";
+
 type HoldForCommand = Option<RunCommand>;
 pub type SuppressedPanes = HashMap<PaneId, (bool, Box<dyn Pane>)>; // bool => is scrollback editor
 
@@ -1954,13 +1961,9 @@ impl Tab {
         // The pty was already spawned by the time we get here, so it has to be closed as well or
         // it outlives the pane that was never created.
         if !start_suppressed && pane_id_to_stack_under.is_none() && client_id.is_none() {
-            let message = "cannot stack a pane: no client is attached and no target pane was \
-                           given. Pass --near-current-pane with ZELLIJ_PANE_ID set to the pane \
-                           to stack under."
-                .to_owned();
-            log::error!("{}", message);
+            log::error!("{}", CANNOT_STACK_WITHOUT_ANCHOR);
             if let Some(mut blocking_notification) = blocking_notification {
-                blocking_notification.set_error_message(message);
+                blocking_notification.set_error_message(CANNOT_STACK_WITHOUT_ANCHOR.to_owned());
             }
             self.senders
                 .send_to_pty(PtyInstruction::ClosePane(pid, None))

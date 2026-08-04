@@ -396,10 +396,12 @@ explicitly rather than relying on focus:
 ZELLIJ_PANE_ID=<id> zellij -s <session> action new-pane --stacked --near-current-pane
 ```
 
-The message reaches the CLI as a non-zero exit for `--blocking` invocations. Without `--blocking`,
-zellij reports a new pane as soon as its pty spawns — before the tab has decided whether it can
-place it — so the plain form still exits 0 and the reason appears in the server log only. The pane
-is refused and the pty is closed either way; only the exit code differs.
+The message reaches the CLI on stderr with a non-zero exit, `--blocking` or not. That needs saying
+because zellij normally reports a new pane as soon as its pty spawns — before the tab has decided
+whether it can place it — so a refusal that only the tab knows about would arrive after the CLI had
+already exited 0. The refusal is therefore signalled from the screen, where the completion channel
+still belongs to the caller, while the tab still does the refusing and closes the pty. Panes that
+are placed successfully are unaffected and still return immediately.
 
 Nothing guesses a stack target. Picking some pane to stack under when the caller did not name one
 would put a confidently wrong answer where an error belongs.
