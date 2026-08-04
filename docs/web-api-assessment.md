@@ -98,7 +98,7 @@ Non-negotiable, and recorded here so a future implementation does not have to re
   actually applies. A route added below it is silently unauthenticated.
 - Bound per the existing web-server config, never a separate listener with its own binding rules.
 - Default off, gated on the web server being explicitly enabled.
-- A tailnet-only deployment posture is a reason the exposure is *acceptable*, not a reason to skip
+- A private-network-only deployment posture is a reason the exposure is *acceptable*, not a reason to skip
   auth — the endpoint executes arbitrary actions in a live terminal.
 
 ## Recommendation
