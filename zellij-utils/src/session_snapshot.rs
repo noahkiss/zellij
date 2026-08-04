@@ -579,6 +579,95 @@ pub fn prune_session(
     removed
 }
 
+/// A `session_info` folder in the cache that this binary does not use, holding a saved layout.
+#[derive(Debug, Clone)]
+pub struct ImportableFolder {
+    pub path: PathBuf,
+    pub session_name: String,
+    /// The cache directory it came from, eg. `0.43.1` or `contract_version_1`, recorded in the
+    /// sidecar so an imported snapshot says where it was adopted from.
+    pub from: String,
+}
+
+/// The `session_info` directories of other versions and other client/server contracts.
+///
+/// Before 0.44.0 session state was scoped by version rather than by contract, so an upgrade left
+/// the old directory stranded. The same happens to the current directory the day upstream bumps the
+/// contract version. Both look identical from here.
+pub fn legacy_session_info_dirs() -> Vec<PathBuf> {
+    use crate::consts::{ZELLIJ_CACHE_DIR, ZELLIJ_SESSION_INFO_CACHE_DIR};
+    let Ok(entries) = std::fs::read_dir(&*ZELLIJ_CACHE_DIR) else {
+        return vec![];
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path().join("session_info"))
+        .filter(|dir| dir.is_dir() && dir != &*ZELLIJ_SESSION_INFO_CACHE_DIR)
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// The session folders under one or more `session_info` directories.
+///
+/// A directory that holds a `session-layout.kdl` itself is taken as a single session folder, so
+/// `--from` accepts either shape.
+pub fn importable_folders(dirs: &[PathBuf]) -> Vec<ImportableFolder> {
+    let mut folders = vec![];
+    for dir in dirs {
+        let from = dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| dir.display().to_string());
+        if dir.join(SNAPSHOT_LAYOUT_FILE_NAME).exists() {
+            if let Some(session_name) = dir.file_name() {
+                folders.push(ImportableFolder {
+                    path: dir.clone(),
+                    session_name: session_name.to_string_lossy().to_string(),
+                    from,
+                });
+            }
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || !path.join(SNAPSHOT_LAYOUT_FILE_NAME).exists() {
+                continue;
+            }
+            folders.push(ImportableFolder {
+                session_name: entry.file_name().to_string_lossy().to_string(),
+                path,
+                from: from.clone(),
+            });
+        }
+    }
+    folders
+}
+
+/// Whether the archive already holds this exact shape for this session name.
+pub fn is_already_archived(settings: &SnapshotSettings, folder: &ImportableFolder) -> bool {
+    let Ok(hash) = hash_directory_contents(&folder.path) else {
+        return false;
+    };
+    snapshots_for_session(settings, &folder.session_name)
+        .iter()
+        .any(|snapshot| snapshot.id.ends_with(&hash))
+}
+
+/// How many legacy layouts are sitting outside the archive, for the one-line hint `snapshot list`
+/// prints. Deliberately only a hint: nothing is ever swept automatically, because silently
+/// relocating a user's files is indistinguishable from data loss when it goes wrong.
+pub fn unimported_legacy_layout_count(settings: &SnapshotSettings) -> usize {
+    importable_folders(&legacy_session_info_dirs())
+        .iter()
+        .filter(|folder| !is_already_archived(settings, folder))
+        .count()
+}
+
 /// Prune every session in the archive.
 pub fn prune_all(settings: &SnapshotSettings, keep: usize) -> Vec<Snapshot> {
     archived_session_names(settings)
@@ -791,6 +880,59 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 3);
         assert_eq!(kept, ids[2..].to_vec());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn importable_folders_accept_a_session_info_dir_or_a_single_session_folder() {
+        let (_settings, root) = temp_settings("importable");
+        let session_info = root.join("0.43.1").join("session_info");
+        write_session_info_folder(&session_info.join("one"), "layout {\n    tab\n}\n");
+        write_session_info_folder(&session_info.join("two"), "layout {\n    tab\n}\n");
+        std::fs::create_dir_all(session_info.join("no-layout")).unwrap();
+
+        let mut from_parent: Vec<String> = importable_folders(&[session_info.clone()])
+            .into_iter()
+            .map(|folder| folder.session_name)
+            .collect();
+        from_parent.sort();
+        assert_eq!(from_parent, vec!["one".to_owned(), "two".to_owned()]);
+
+        let single = importable_folders(&[session_info.join("one")]);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].session_name, "one");
+        assert_eq!(single[0].from, "session_info");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn importing_the_same_folder_twice_adds_one_snapshot() {
+        let (settings, root) = temp_settings("import-idempotent");
+        let source = root.join("0.43.1").join("session_info").join("a-session");
+        write_session_info_folder(&source, "layout {\n    tab\n}\n");
+        let folder = importable_folders(&[source.clone()]).pop().unwrap();
+
+        assert!(!is_already_archived(&settings, &folder));
+        assert!(archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Imported,
+            &settings,
+            Some(folder.from.clone())
+        )
+        .unwrap()
+        .is_some());
+        assert!(is_already_archived(&settings, &folder));
+        assert!(archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Imported,
+            &settings,
+            Some(folder.from.clone())
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(snapshots_for_session(&settings, "a-session").len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

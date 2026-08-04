@@ -18,15 +18,16 @@ use zellij_utils::sessions::{
     discard_resurrection_snapshot, generate_unique_session_name, get_active_session,
     get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
     kill_session as kill_session_impl, match_session_name, print_sessions,
-    print_sessions_with_index, resurrection_layout, session_exists, validate_session_name,
-    ActiveSession, SessionNameMatch,
+    print_sessions_with_index, resurrection_layout, session_exists,
+    session_in_other_contract_versions, validate_session_name, ActiveSession, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
-use zellij_utils::consts::VERSION;
+use zellij_utils::consts::{CLIENT_SERVER_CONTRACT_VERSION, VERSION};
 use zellij_utils::session_snapshot::{
-    archive_session_info, list_snapshots, prune_all, remove_snapshot, resolve_snapshot, Snapshot,
-    SnapshotReason, SnapshotSettings,
+    archive_session_info, archive_session_info_folder, importable_folders, is_already_archived,
+    legacy_session_info_dirs, list_snapshots, prune_all, remove_snapshot, resolve_snapshot,
+    unimported_legacy_layout_count, Snapshot, SnapshotReason, SnapshotSettings,
 };
 
 #[cfg(feature = "web_server_capability")]
@@ -88,6 +89,30 @@ pub(crate) fn kill_all_sessions(yes: bool) {
 
 pub(crate) fn snapshot_settings(opts: &CliArgs) -> SnapshotSettings {
     SnapshotSettings::from_options(get_config_options_from_cli_args(opts).ok().as_ref())
+}
+
+/// A session that exists under another client/server contract is invisible to this binary, and the
+/// bare "no session with that name" is misleading about why. Name the mismatch, and the way out.
+fn print_contract_mismatch_help(session_name: &str, config_options: Option<&Options>) {
+    let contracts = session_in_other_contract_versions(session_name);
+    if contracts.is_empty() {
+        return;
+    }
+    let contracts: Vec<String> = contracts.iter().map(|c| c.to_string()).collect();
+    eprintln!(
+        "Session '{}' is running under client/server contract {}; this binary speaks {}.",
+        session_name,
+        contracts.join(", "),
+        CLIENT_SERVER_CONTRACT_VERSION
+    );
+    let settings = SnapshotSettings::from_options(config_options);
+    if resolve_snapshot(&settings, "latest", Some(session_name)).is_ok() {
+        eprintln!("Its layout was captured - rebuild it with:");
+        eprintln!(
+            "    zellij snapshot restore latest --session {}",
+            session_name
+        );
+    }
 }
 
 fn resolve_snapshot_or_exit(
@@ -174,6 +199,13 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
                 },
             }
         },
+        SnapshotCli::Import {
+            from,
+            dry_run,
+            prune_source,
+        } => {
+            import_snapshots_command(&settings, from, dry_run, prune_source);
+        },
         SnapshotCli::Prune { keep } => {
             let keep = keep.unwrap_or(settings.limit);
             let removed = prune_all(&settings, keep);
@@ -185,6 +217,72 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
         },
     }
     process::exit(0);
+}
+
+fn import_snapshots_command(
+    settings: &SnapshotSettings,
+    from: Option<PathBuf>,
+    dry_run: bool,
+    prune_source: bool,
+) {
+    let dirs = match from {
+        Some(from) => vec![from],
+        None => legacy_session_info_dirs(),
+    };
+    let folders = importable_folders(&dirs);
+    if folders.is_empty() {
+        println!("Nothing to import.");
+        return;
+    }
+    let mut imported = 0;
+    let mut skipped = 0;
+    for folder in folders {
+        if dry_run {
+            if is_already_archived(settings, &folder) {
+                println!(
+                    "would skip  {} ({}) - already in the archive",
+                    folder.session_name, folder.from
+                );
+                skipped += 1;
+            } else {
+                println!("would import {} ({})", folder.session_name, folder.from);
+                imported += 1;
+            }
+            continue;
+        }
+        match archive_session_info_folder(
+            &folder.path,
+            &folder.session_name,
+            SnapshotReason::Imported,
+            settings,
+            Some(folder.from.clone()),
+        ) {
+            Ok(Some(snapshot)) => {
+                println!(
+                    "imported {} ({}) as {}",
+                    folder.session_name, folder.from, snapshot.id
+                );
+                imported += 1;
+            },
+            Ok(None) => {
+                println!(
+                    "skipped  {} ({}) - already in the archive",
+                    folder.session_name, folder.from
+                );
+                skipped += 1;
+            },
+            Err(e) => {
+                eprintln!("failed to import {}: {}", folder.path.display(), e);
+                continue;
+            },
+        }
+        if prune_source {
+            if let Err(e) = std::fs::remove_dir_all(&folder.path) {
+                eprintln!("failed to remove {}: {}", folder.path.display(), e);
+            }
+        }
+    }
+    println!("{} imported, {} already present.", imported, skipped);
 }
 
 fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, json: bool) {
@@ -220,6 +318,7 @@ fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, js
     }
     if snapshots.is_empty() {
         eprintln!("No snapshots in {}.", settings.dir.display());
+        print_legacy_layout_hint(settings);
         return;
     }
     println!(
@@ -241,6 +340,19 @@ fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, js
             snapshot.meta.tabs,
             snapshot.meta.panes,
             unparseable
+        );
+    }
+    print_legacy_layout_hint(settings);
+}
+
+/// Say that adoptable layouts exist; never adopt them. Silently relocating a user's files is the
+/// kind of helpfulness that is indistinguishable from data loss when it goes wrong.
+fn print_legacy_layout_hint(settings: &SnapshotSettings) {
+    let count = unimported_legacy_layout_count(settings);
+    if count > 0 {
+        eprintln!(
+            "\n{} saved layout(s) from another version or contract are not in the archive. Adopt them with:\n    zellij snapshot import",
+            count
         );
     }
 }
@@ -839,6 +951,7 @@ fn attach_with_session_name(
             },
             SessionNameMatch::None => {
                 eprintln!("No session with the name '{}' found!", prefix);
+                print_contract_mismatch_help(prefix, Some(&config_options));
                 process::exit(1);
             },
         },

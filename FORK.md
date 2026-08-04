@@ -314,6 +314,39 @@ A restored layout runs its recorded commands, exactly as resurrection does today
 weeks ago is a sharper edge than a session that died minutes ago, so `snapshot show` prints the
 layout before `restore` acts on it. There is deliberately no confirmation prompt.
 
+#### Adopting layouts the archive never saw
+
+```
+zellij snapshot import [--from <dir>] [--dry-run] [--prune-source]
+```
+
+Scans the `session_info` directories in the cache that this binary does not use — `$cache/<version>/`
+from before 0.44.0 moved session state to contract scoping, and `$cache/contract_version_*/` for the
+day upstream bumps the contract — and copies every folder holding a `session-layout.kdl` into the
+archive with reason `imported`, stamped with the directory it came from. `--from` takes either a
+`session_info` directory or a single session folder. Importing is idempotent: a folder whose shape is
+already archived under that session name is skipped, so re-running adds nothing.
+
+Nothing is ever swept automatically. Silently relocating a user's files is the kind of helpfulness
+that is indistinguishable from data loss when it goes wrong, so `snapshot list` prints one line when
+it sees adoptable layouts and leaves the decision to the user.
+
+The same contract bump that strands a `session_info` directory also makes a running session
+unreachable: the socket path is contract-scoped and the wire format genuinely differs, so a
+mismatched client attaching to a live server is a protocol violation rather than a path problem.
+Attaching to a name that only exists under another contract now says so, and names the way out:
+
+```
+No session with the name 'my-session' found!
+Session 'my-session' is running under client/server contract 1; this binary speaks 2.
+Its layout was captured - rebuild it with:
+    zellij snapshot restore latest --session my-session
+```
+
+The last two lines appear only when a snapshot for that name exists. Nothing is probed — another
+contract's server would not understand the question — so this is a socket-file check, not a
+connection.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

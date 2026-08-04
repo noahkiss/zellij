@@ -82,6 +82,38 @@ pub fn get_sessions_in_other_socket_dirs() -> Vec<(std::path::PathBuf, Vec<Strin
         .collect()
 }
 
+/// The client/server contract versions a session by this name has a socket under, other than the
+/// one this binary speaks.
+///
+/// The socket path is contract-scoped and the wire format genuinely differs across a contract bump,
+/// so a mismatched client attaching to a live server is a protocol violation rather than a path
+/// problem. The right response is a better failure, which needs to know the mismatch is there.
+/// Nothing is probed: another contract's server would not understand the question.
+pub fn session_in_other_contract_versions(name: &str) -> Vec<usize> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    let mut contracts: Vec<usize> = socket_dir_candidates()
+        .into_iter()
+        .flat_map(|root| fs::read_dir(&root).into_iter().flatten().flatten())
+        .filter_map(|entry| {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if dir_name == *CLIENT_SERVER_CONTRACT_DIR {
+                return None;
+            }
+            let contract = dir_name.strip_prefix("contract_version_")?.parse().ok()?;
+            let socket = entry.path().join(name);
+            if is_ipc_socket(&fs::metadata(&socket).ok()?.file_type()) {
+                Some(contract)
+            } else {
+                None
+            }
+        })
+        .collect();
+    contracts.sort_unstable();
+    contracts.dedup();
+    contracts
+}
+
 fn print_other_socket_dir_warning() {
     for (dir, sessions) in get_sessions_in_other_socket_dirs() {
         eprintln!(
