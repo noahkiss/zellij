@@ -2738,6 +2738,11 @@ impl Options {
         let scrollback_lines_to_serialize =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "scrollback_lines_to_serialize")
                 .map(|(v, _)| v as usize);
+        let snapshot_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "snapshot_dir")
+            .map(|(string, _entry)| PathBuf::from(string));
+        let session_snapshot_limit =
+            kdl_property_first_arg_as_i64_or_error!(kdl_options, "session_snapshot_limit")
+                .map(|(v, _)| v.max(0) as usize);
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -2855,6 +2860,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3189,6 +3196,20 @@ impl Options {
         } else {
             None
         }
+    }
+    fn snapshot_dir_to_kdl(&self) -> Option<KdlNode> {
+        self.snapshot_dir.as_ref().map(|snapshot_dir| {
+            let mut node = KdlNode::new("snapshot_dir");
+            node.push(KdlValue::String(snapshot_dir.display().to_string()));
+            node
+        })
+    }
+    fn session_snapshot_limit_to_kdl(&self) -> Option<KdlNode> {
+        self.session_snapshot_limit.map(|limit| {
+            let mut node = KdlNode::new("session_snapshot_limit");
+            node.push(KdlValue::Base10(limit as i64));
+            node
+        })
     }
     fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
         self.plugin_watch.map(|plugin_watch| {
@@ -4288,6 +4309,12 @@ impl Options {
         }
         if let Some(theme_dir) = self.theme_dir_to_kdl(add_comments) {
             nodes.push(theme_dir);
+        }
+        if let Some(snapshot_dir) = self.snapshot_dir_to_kdl() {
+            nodes.push(snapshot_dir);
+        }
+        if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
+            nodes.push(session_snapshot_limit);
         }
         if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
             nodes.push(plugin_watch);

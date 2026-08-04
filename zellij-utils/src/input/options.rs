@@ -166,6 +166,21 @@ pub struct Options {
     #[serde(default)]
     pub scrollback_lines_to_serialize: Option<usize>,
 
+    /// Where the session snapshot archive lives. Defaults to the state directory
+    /// ($XDG_STATE_HOME/zellij/snapshots, else the platform convention).
+    /// config.kdl only - it is read wherever a snapshot is written or listed, so there is nothing
+    /// for a CLI flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
+
+    /// How many snapshots to keep per session name, oldest pruned first. Default is 10, 0 turns
+    /// the archive off.
+    /// config.kdl only, like snapshot_dir.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_snapshot_limit: Option<usize>,
+
     /// Whether to use ANSI styled underlines
     #[clap(long, value_parser)]
     #[serde(default)]
@@ -358,6 +373,8 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or(self.scrollback_lines_to_serialize);
+        let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
+        let session_snapshot_limit = other.session_snapshot_limit.or(self.session_snapshot_limit);
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -420,6 +437,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -495,6 +514,10 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or_else(|| self.scrollback_lines_to_serialize.clone());
+        let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
+        let session_snapshot_limit = other
+            .session_snapshot_limit
+            .or_else(|| self.session_snapshot_limit.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -557,6 +580,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,

@@ -433,6 +433,8 @@ fn test_client_messages() {
             configuration_options: Some(Options {
                 // config-file only, not carried over the contract
                 plugin_watch: None,
+                snapshot_dir: None,
+                session_snapshot_limit: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),

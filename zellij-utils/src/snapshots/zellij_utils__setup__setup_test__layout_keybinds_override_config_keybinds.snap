@@ -118,6 +118,8 @@ Config {
         session_serialization: None,
         serialize_pane_viewport: None,
         scrollback_lines_to_serialize: None,
+        snapshot_dir: None,
+        session_snapshot_limit: None,
         styled_underlines: None,
         serialization_interval: None,
         disable_session_metadata: None,

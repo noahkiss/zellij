@@ -819,7 +819,11 @@ pub enum CliAction {
     /// Dump current layout to stdout
     DumpLayout,
     /// Save the current session state to disk immediately
-    SaveSession,
+    SaveSession {
+        /// Also copy the saved state into the snapshot archive, as a manual snapshot
+        #[clap(long, value_parser, default_value("false"), takes_value(false))]
+        archive: bool,
+    },
     /// Open the pane scrollback in your default editor
     EditScrollback {
         /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
@@ -1323,7 +1327,11 @@ pub enum CliAction {
     },
     /// Move the focused tab in the specified direction. [right|left]
     MoveTab {
-        #[clap(value_parser, required_unless_present = "to-index", conflicts_with = "to-index")]
+        #[clap(
+            value_parser,
+            required_unless_present = "to-index",
+            conflicts_with = "to-index"
+        )]
         direction: Option<Direction>,
         /// Move the tab to this absolute position (0-based), clamped to the last position
         #[clap(long, value_parser)]

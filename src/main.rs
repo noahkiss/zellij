@@ -253,13 +253,13 @@ fn main() {
         commands::kill_session(target_session);
     } else if let Some(Command::Sessions(Sessions::DeleteAllSessions { yes, force })) = opts.command
     {
-        commands::delete_all_sessions(yes, force);
+        commands::delete_all_sessions(yes, force, &opts);
     } else if let Some(Command::Sessions(Sessions::DeleteSession {
         ref target_session,
         force,
     })) = opts.command
     {
-        commands::delete_session(target_session, force);
+        commands::delete_session(target_session, force, &opts);
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);
     } else if opts.layout.is_some() || opts.layout_string.is_some() {

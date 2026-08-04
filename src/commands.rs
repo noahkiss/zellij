@@ -16,13 +16,14 @@ use zellij_client::{
 use zellij_utils::sessions::{
     assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
     discard_resurrection_snapshot, generate_unique_session_name, get_active_session,
-    get_resurrectable_sessions, get_sessions,
-    get_sessions_sorted_by_mtime, kill_session as kill_session_impl, match_session_name,
-    print_sessions, print_sessions_with_index, resurrection_layout, session_exists,
-    validate_session_name, ActiveSession, SessionNameMatch,
+    get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
+    kill_session as kill_session_impl, match_session_name, print_sessions,
+    print_sessions_with_index, resurrection_layout, session_exists, validate_session_name,
+    ActiveSession, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
+use zellij_utils::session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings};
 
 #[cfg(feature = "web_server_capability")]
 use zellij_client::web_client::start_web_client as start_web_client_impl;
@@ -81,7 +82,11 @@ pub(crate) fn kill_all_sessions(yes: bool) {
     }
 }
 
-pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
+pub(crate) fn snapshot_settings(opts: &CliArgs) -> SnapshotSettings {
+    SnapshotSettings::from_options(get_config_options_from_cli_args(opts).ok().as_ref())
+}
+
+pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
     use std::collections::BTreeMap;
     use zellij_server::background_jobs::scan_session_list_default_dirs;
 
@@ -121,7 +126,7 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
         }
     }
     for session in &dead_sessions {
-        delete_session_impl(&session.0, force);
+        delete_session_impl(&session.0, force, &snapshot_settings(opts));
     }
     process::exit(0);
 }
@@ -140,7 +145,7 @@ pub(crate) fn kill_session(target_session: &Option<String>) {
     }
 }
 
-pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
+pub(crate) fn delete_session(target_session: &Option<String>, force: bool, opts: &CliArgs) {
     match target_session {
         Some(target_session) => {
             if let Err(e) = validate_session_name(target_session) {
@@ -148,7 +153,7 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
                 process::exit(1);
             }
             assert_dead_session(target_session, force);
-            delete_session_impl(target_session, force);
+            delete_session_impl(target_session, force, &snapshot_settings(opts));
             process::exit(0);
         },
         None => {
@@ -588,9 +593,29 @@ fn attach_with_cli_client(
 ) {
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // `save-session --archive` is a client-side addition to the existing action: the action itself
+    // is unchanged and synchronous, so the archive copy is taken once it has returned. Nothing
+    // about it crosses the client/server contract.
+    let should_archive = matches!(
+        cli_action,
+        zellij_utils::cli::CliAction::SaveSession { archive: true }
+    );
+    let snapshot_settings =
+        SnapshotSettings::from_options(config.as_ref().map(|config| &config.options));
     match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
         Ok(actions) => {
             zellij_client::cli_client::start_cli_client(Box::new(os_input), session_name, actions);
+            if should_archive {
+                match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)
+                {
+                    Ok(Some(snapshot)) => println!("Archived snapshot {}", snapshot.id),
+                    Ok(None) => println!("Nothing new to archive."),
+                    Err(e) => {
+                        eprintln!("Failed to archive the session: {}", e);
+                        std::process::exit(2);
+                    },
+                }
+            }
             std::process::exit(0);
         },
         Err(e) => {

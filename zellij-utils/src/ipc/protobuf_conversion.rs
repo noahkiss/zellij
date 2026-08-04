@@ -751,6 +751,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
         Ok(Self {
             // config-file only, deliberately not carried over the client/server contract
             plugin_watch: None,
+            snapshot_dir: None,
+            session_snapshot_limit: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

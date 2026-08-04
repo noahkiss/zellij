@@ -212,6 +212,73 @@ panes for a bulk action. It never carried stack membership, and its behaviour is
 The fields cross the plugin API, so `event.proto` and its generated Rust are regenerated
 (`cargo xtask build`). The client/server contract has no `PaneInfo` and is untouched.
 
+### The session snapshot archive
+
+Zellij keeps exactly one serialized shape per session name and overwrites it in place, so relaunching
+a session under the same name destroys the layout worth keeping within one serialization interval —
+and `delete-session`, the operation that most often motivates rebuilding a session, removes it
+outright. Snapshots keep a dated history beside the live file.
+
+A snapshot is a directory copy of the session's `session_info` folder plus a `snapshot.kdl` sidecar:
+
+```
+<state dir>/zellij/snapshots/<session name>/<epoch ms>-<short id>/
+    session-layout.kdl
+    session-metadata.kdl
+    initial_contents_1 …
+    snapshot.kdl
+```
+
+The copy is a directory rather than a file because the layout parser resolves the
+`initial_contents_<n>` files it references against the layout file's own parent folder, so a
+self-contained directory replays through the stock parser unchanged. The sidecar records the session
+name, the epoch, the producing zellij and client/server contract versions, why the snapshot was cut,
+and the tab and pane counts, so listing needs no layout parse.
+
+One is cut on each of four events:
+
+| Trigger | Reason |
+|---|---|
+| Graceful server shutdown | `shutdown` |
+| `zellij action save-session --archive` | `manual` |
+| `zellij delete-session` | `delete` |
+| Server start, for any `session_info` folder whose server is gone | `promoted` |
+
+Shutdown serializes once more before archiving, so what it captures is the shape the session had when
+it was killed rather than one up to a whole serialization interval old. The startup sweep is the
+SIGKILL and crash path, where the periodic file survives and is promoted rather than lost to the next
+session of the same name. The periodic serializer itself never touches the archive.
+
+Shutdown and delete both fire on an ordinary teardown, so a copy identical to the newest snapshot for
+that name is skipped: `delete-session --force` leaves one snapshot, not two. Sameness is judged on
+the layout and pane contents, not on `session-metadata.kdl`, which carries client counts and
+timestamps that change on every write.
+
+The archive lives under the **state** directory rather than the cache, because a snapshot is state
+and a cache directory is by definition disposable. It also sits outside both the version and
+`contract_version_<n>` directories, so neither an upgrade nor a contract bump orphans history.
+Resolution order, on every platform:
+
+1. `snapshot_dir "<path>"` in config.kdl
+2. `$XDG_STATE_HOME/zellij/snapshots`, if set to an absolute path
+3. the platform state directory (`~/.local/state/zellij/snapshots` on Linux)
+4. the platform data directory (macOS and Windows, which have no state directory)
+
+`$XDG_STATE_HOME` is checked by hand because the `directories` crate honours the XDG variables on
+Linux but ignores them on macOS. Explicit configuration wins; platform convention is the fallback.
+
+```kdl
+snapshot_dir "/path/to/snapshots"   // optional, defaults as above
+session_snapshot_limit 10           // per session name, oldest pruned first; 0 disables archiving
+```
+
+Both are config-file only. Snapshots inherit `serialize_pane_viewport` rather than adding a flag of
+their own — with it off (the default) a snapshot is two KDL files.
+
+Bare `save-session` keeps its in-place behaviour; `--archive` is handled by the CLI client after the
+existing action returns, so nothing here crosses the client/server contract and plugins see nothing
+new.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

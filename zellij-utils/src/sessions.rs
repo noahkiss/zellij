@@ -6,6 +6,7 @@ use crate::{
     envs,
     input::layout::Layout,
     ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
+    session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
 };
 use anyhow;
 use humantime::format_duration;
@@ -407,7 +408,7 @@ pub fn kill_session(name: &str) {
     };
 }
 
-pub fn delete_session(name: &str, force: bool) {
+pub fn delete_session(name: &str, force: bool, snapshot_settings: &SnapshotSettings) {
     if force {
         use crate::consts::ipc_connect;
         let path = &*ZELLIJ_SOCK_DIR.join(name);
@@ -432,7 +433,7 @@ pub fn delete_session(name: &str, force: bool) {
         });
         wait_for_session_to_exit(name);
     }
-    if let Err(e) = remove_session_info_folder(name) {
+    if let Err(e) = remove_session_info_folder(name, snapshot_settings) {
         if e.kind() == std::io::ErrorKind::NotFound {
             eprintln!("Session: {:?} not found.", name);
             process::exit(2);
@@ -469,9 +470,24 @@ fn wait_for_session_to_exit(name: &str) {
     );
 }
 
-/// Remove the session_info folder, then keep sweeping it briefly in case the exiting server writes
-/// its snapshot back after the socket has already gone.
-fn remove_session_info_folder(name: &str) -> std::io::Result<()> {
+/// Archive the session's shape, remove the session_info folder, then keep sweeping it briefly in
+/// case the exiting server writes its snapshot back after the socket has already gone.
+///
+/// Archiving first is what turns the destructive path into the capturing one: deleting a session is
+/// exactly the operation that later motivates restoring it. The server usually archives the same
+/// shape on its way out, and the archive drops a copy identical to the newest one, so an ordinary
+/// `delete-session --force` still leaves one snapshot rather than two.
+fn remove_session_info_folder(
+    name: &str,
+    snapshot_settings: &SnapshotSettings,
+) -> std::io::Result<()> {
+    if let Err(e) = archive_session_info(name, SnapshotReason::Delete, snapshot_settings) {
+        log::error!(
+            "Failed to archive session {:?} before deleting it: {}",
+            name,
+            e
+        );
+    }
     let folder = session_info_folder_for_session(name);
     std::fs::remove_dir_all(&folder)?;
     let deadline = std::time::Instant::now() + DELETE_SESSION_SWEEP_DURATION;
