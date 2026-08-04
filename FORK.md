@@ -134,6 +134,24 @@ undertitle and hover tooltips still draw. Rides the same live config-reload path
 `rounded_corners`, so toggling it is a config.kdl edit — no restart. Off by default (stock
 rendering); plugins never see the flag (it is not part of the protobuf wire format).
 
+### Absolute tab reorder (`move-tab --to-index`)
+
+```
+zellij action move-tab --to-index 0 --tab-id 3
+zellij action move-tab --to-index 2            # the focused tab
+```
+
+Moves a tab to an absolute 0-based position in one call, instead of a run of relative
+`move-tab left|right` calls that races anything else changing the session. The relative form is
+unchanged and still the positional argument; the two are mutually exclusive. Unlike the relative
+form, which swaps the tab with its neighbour, this shifts the tabs in between — dragging a tab from
+position 0 to 3 gives `1,2,3,0`, not a 0↔3 swap. An index past the last tab is clamped to the last
+position rather than rejected, so a drag past the end lands the tab at the end.
+
+This adds an `Action` and therefore a message to the client/server contract (tag 140), without
+bumping the contract version: a fork client talking to a stock server of the same contract simply
+gets nothing for this one action, and every other action keeps working.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

@@ -7139,7 +7139,8 @@ pub fn send_cli_move_tab_with_tab_id() {
     mock_screen.new_tab(TiledPaneLayout::default());
     std::thread::sleep(std::time::Duration::from_millis(100));
     let cli_action = CliAction::MoveTab {
-        direction: Direction::Right,
+        direction: Some(Direction::Right),
+        to_index: None,
         tab_id: Some(0),
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
@@ -7170,6 +7171,58 @@ pub fn move_tab_by_id_verifies_screen_state() {
     screen.move_tab_by_id(0, Direction::Right).expect("TEST");
     assert_eq!(screen.get_tab_by_id(0).unwrap().position, original_pos_1);
     assert_eq!(screen.get_tab_by_id(1).unwrap().position, original_pos_0);
+}
+
+#[test]
+pub fn move_tab_to_index_shifts_the_tabs_in_between() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    new_tab(&mut screen, 3, 2);
+    new_tab(&mut screen, 4, 3);
+
+    // 0,1,2,3 -> 1,2,3,0
+    screen
+        .move_tab_to_index(Some(0), 3, client_id)
+        .expect("TEST");
+    assert_eq!(screen.get_tab_by_id(0).unwrap().position, 3);
+    assert_eq!(screen.get_tab_by_id(1).unwrap().position, 0);
+    assert_eq!(screen.get_tab_by_id(2).unwrap().position, 1);
+    assert_eq!(screen.get_tab_by_id(3).unwrap().position, 2);
+
+    // and back again, this time moving left
+    screen
+        .move_tab_to_index(Some(0), 0, client_id)
+        .expect("TEST");
+    assert_eq!(screen.get_tab_by_id(0).unwrap().position, 0);
+    assert_eq!(screen.get_tab_by_id(1).unwrap().position, 1);
+    assert_eq!(screen.get_tab_by_id(2).unwrap().position, 2);
+    assert_eq!(screen.get_tab_by_id(3).unwrap().position, 3);
+}
+
+#[test]
+pub fn move_tab_to_index_clamps_an_out_of_range_index() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    new_tab(&mut screen, 3, 2);
+
+    screen
+        .move_tab_to_index(Some(0), 100, client_id)
+        .expect("TEST");
+    assert_eq!(screen.get_tab_by_id(0).unwrap().position, 2);
+    assert_eq!(screen.get_tab_by_id(1).unwrap().position, 0);
+    assert_eq!(screen.get_tab_by_id(2).unwrap().position, 1);
 }
 
 // ==========================================

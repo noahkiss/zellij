@@ -1129,7 +1129,8 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::ToggleFloatingPanesByTabId { .. }
             | Action::PreviousSwapLayoutByTabId { .. }
             | Action::NextSwapLayoutByTabId { .. }
-            | Action::MoveTabByTabId { .. } => {
+            | Action::MoveTabByTabId { .. }
+            | Action::MoveTabToIndex { .. } => {
                 Err("These are CLI-only actions, not available in keybindings")
             },
             Action::SwitchToMode { input_mode } => {

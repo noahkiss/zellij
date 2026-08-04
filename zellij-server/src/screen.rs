@@ -868,6 +868,7 @@ pub enum ScreenInstruction {
     PreviousSwapLayoutWithTabId(usize, Option<NotificationEnd>),
     NextSwapLayoutWithTabId(usize, Option<NotificationEnd>),
     MoveTabWithTabId(usize, Direction, Option<NotificationEnd>),
+    MoveTabToIndex(Option<usize>, usize, ClientId, Option<NotificationEnd>),
 }
 
 impl From<&ScreenInstruction> for ScreenContext {
@@ -1224,6 +1225,7 @@ impl From<&ScreenInstruction> for ScreenContext {
                 ScreenContext::NextSwapLayoutWithTabId
             },
             ScreenInstruction::MoveTabWithTabId(..) => ScreenContext::MoveTabWithTabId,
+            ScreenInstruction::MoveTabToIndex(..) => ScreenContext::MoveTabToIndex,
         }
     }
 }
@@ -3672,6 +3674,61 @@ impl Screen {
         } else {
             log::error!("Tab with id {} not found", tab_id);
         }
+        Ok(())
+    }
+
+    /// Moves a tab to an absolute position, shifting the tabs in between rather than swapping.
+    ///
+    /// `tab_id` of None targets the client's active tab. `new_position` is clamped to the last
+    /// position, so a consumer that drags a tab past the end lands it there rather than erroring.
+    pub fn move_tab_to_index(
+        &mut self,
+        tab_id: Option<usize>,
+        new_position: usize,
+        client_id: ClientId,
+    ) -> Result<()> {
+        if self.tabs.len() < 2 {
+            return Ok(());
+        }
+        let tab_id = match tab_id {
+            Some(tab_id) => tab_id,
+            None => {
+                let Some(client_id) = self.client_id(client_id) else {
+                    return Ok(());
+                };
+                match self.get_active_tab(client_id) {
+                    Ok(active_tab) => active_tab.id,
+                    Err(err) => {
+                        Err::<(), _>(err)
+                            .context("failed to move tab to index")
+                            .non_fatal();
+                        return Ok(());
+                    },
+                }
+            },
+        };
+        let Some(old_position) = self.tabs.get(&tab_id).map(|t| t.position) else {
+            log::error!("Tab with id {} not found", tab_id);
+            return Ok(());
+        };
+        let new_position = new_position.min(self.tabs.len() - 1);
+        if new_position == old_position {
+            return Ok(());
+        }
+
+        for tab in self.tabs.values_mut() {
+            if tab.id == tab_id {
+                tab.position = new_position;
+            } else if old_position < new_position {
+                if tab.position > old_position && tab.position <= new_position {
+                    tab.position -= 1;
+                }
+            } else if tab.position >= new_position && tab.position < old_position {
+                tab.position += 1;
+            }
+        }
+        self.log_and_report_session_state()
+            .context("failed to move tab to index")?;
         Ok(())
     }
 
@@ -9881,6 +9938,19 @@ pub(crate) fn screen_thread_main(
                     pending_events_waiting_for_tab.push(ScreenInstruction::MoveTabWithTabId(
                         tab_id,
                         direction,
+                        _completion_tx,
+                    ));
+                }
+            },
+            ScreenInstruction::MoveTabToIndex(tab_id, index, client_id, _completion_tx) => {
+                if pending_tab_ids.is_empty() {
+                    screen.move_tab_to_index(tab_id, index, client_id)?;
+                    screen.render(None)?;
+                } else {
+                    pending_events_waiting_for_tab.push(ScreenInstruction::MoveTabToIndex(
+                        tab_id,
+                        index,
+                        client_id,
                         _completion_tx,
                     ));
                 }

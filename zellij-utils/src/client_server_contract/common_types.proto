@@ -277,6 +277,7 @@ message Action {
     SetDarkThemeAction set_dark_theme = 137;
     SetLightThemeAction set_light_theme = 138;
     ToggleThemeAction toggle_theme = 139;
+    MoveTabToIndexAction move_tab_to_index = 140;
   }
 }
 
@@ -1233,3 +1234,4 @@ message ToggleFloatingPanesByTabIdAction { uint64 id = 1; }
 message PreviousSwapLayoutByTabIdAction { uint64 id = 1; }
 message NextSwapLayoutByTabIdAction { uint64 id = 1; }
 message MoveTabByTabIdAction { uint64 id = 1; Direction direction = 2; }
+message MoveTabToIndexAction { optional uint64 id = 1; uint64 index = 2; }
