@@ -3683,7 +3683,11 @@ impl Screen {
     ///
     /// The active-tab lookup mirrors the chain `add_client` uses, because a detached session has
     /// no connected clients at all and asking only the client map would resolve to nothing.
-    fn tab_id_for_absolute_move(&self, tab_id: Option<usize>, client_id: ClientId) -> Option<usize> {
+    fn tab_id_for_absolute_move(
+        &self,
+        tab_id: Option<usize>,
+        client_id: ClientId,
+    ) -> Option<usize> {
         if let Some(tab_id) = tab_id {
             return self.tabs.contains_key(&tab_id).then_some(tab_id);
         }

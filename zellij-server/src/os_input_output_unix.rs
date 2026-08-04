@@ -427,7 +427,11 @@ impl UnixPtyBackend {
     /// Signal the whole process group led by `pid`. A pane's shell is a session leader, so its
     /// pgid equals its pid; signalling the group takes the shell's own children with it.
     pub fn kill_group(&self, pid: u32, force: bool) -> Result<()> {
-        let signal = if force { Signal::SIGKILL } else { Signal::SIGHUP };
+        let signal = if force {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGHUP
+        };
         let _ = kill(unistd::Pid::from_raw(-(pid as i32)), Some(signal));
         Ok(())
     }

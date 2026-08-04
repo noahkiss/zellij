@@ -484,7 +484,11 @@ fn send_kill_session(name: &str, budget: Duration) {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            log::error!("Failed to build a runtime to kill session {:?}: {}", name, e);
+            log::error!(
+                "Failed to build a runtime to kill session {:?}: {}",
+                name,
+                e
+            );
             return;
         },
     };
