@@ -102,6 +102,31 @@ The delete waits for the server to stop answering before removing the session_in
 sweeps it briefly. Previously the dying server's final snapshot landed after the delete and the
 session reappeared in `zellij ls` with a stale layout.
 
+### `delete-session` and `kill-session` wait for the server to actually be gone
+
+```
+zellij delete-session my-session --force              # returns when the server is gone
+zellij kill-session my-session --wait-timeout 30      # allow longer than the 10s default
+zellij delete-session my-session --force --no-wait    # old behaviour: send and return
+```
+
+Both commands now block until the server process has exited, and exit **1** with
+`session '<name>': server still running after <n>s` on stderr if it has not. `--no-wait` returns as
+soon as the server acknowledges the kill. `kill-all-sessions` and `delete-all-sessions` take the
+same flags, attempt every session, and exit non-zero if any of them did not go.
+
+The kill itself now awaits the server's acknowledgement instead of being fire-and-forget. The wait
+watches the server process where the kernel names it (the socket reports its peer's PID), and the
+socket file otherwise; "stopped answering" is no longer accepted as an answer.
+
+Server teardown was fixed to match. A killed server used to be able to linger for minutes still
+parenting its pane shells: it dropped its session while holding the write lock every route thread
+needs, joined the screen thread (which can block on a channel nobody drains after shutdown starts)
+before the pty thread that kills the shells, and hung up each shell alone with a single SIGHUP.
+Teardown now drains that channel, releases the lock first, joins pty first, signals each pane's
+process **group**, and escalates to SIGKILL after 200ms. A caller that polls `zellij ls` to decide
+"it is safe to rebuild now" finally gets a true answer to the question it is asking.
+
 ### `zellij ls -s` marks exited sessions
 
 Dead sessions get an `(EXITED)` suffix. The name is still the first whitespace-separated field, so

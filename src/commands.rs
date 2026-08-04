@@ -19,7 +19,8 @@ use zellij_utils::sessions::{
     get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
     kill_session as kill_session_impl, match_session_name, print_sessions,
     print_sessions_with_index, resurrection_layout, session_exists,
-    session_in_other_contract_versions, validate_session_name, ActiveSession, SessionNameMatch,
+    session_in_other_contract_versions, validate_session_name, ActiveSession, KillWait,
+    SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
@@ -57,7 +58,7 @@ use zellij_utils::{
 
 pub(crate) use zellij_utils::sessions::list_sessions;
 
-pub(crate) fn kill_all_sessions(yes: bool) {
+pub(crate) fn kill_all_sessions(yes: bool, wait: KillWait) {
     match get_sessions() {
         Ok(sessions) if sessions.is_empty() => {
             eprintln!("No active zellij sessions found.");
@@ -75,10 +76,13 @@ pub(crate) fn kill_all_sessions(yes: bool) {
                     process::exit(1);
                 }
             }
+            // every session is attempted before the exit code is decided: a wedged server should
+            // not stop the rest of them from being killed
+            let mut all_gone = true;
             for session in &sessions {
-                kill_session_impl(&session.0);
+                all_gone &= kill_session_impl(&session.0, wait);
             }
-            process::exit(0);
+            process::exit(if all_gone { 0 } else { 1 });
         },
         Err(e) => {
             eprintln!("Error occurred: {:?}", e);
@@ -357,7 +361,7 @@ fn print_legacy_layout_hint(settings: &SnapshotSettings) {
     }
 }
 
-pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
+pub(crate) fn delete_all_sessions(yes: bool, force: bool, wait: KillWait, opts: &CliArgs) {
     use std::collections::BTreeMap;
     use zellij_server::background_jobs::scan_session_list_default_dirs;
 
@@ -396,18 +400,19 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
             process::exit(1);
         }
     }
+    let mut all_gone = true;
     for session in &dead_sessions {
-        delete_session_impl(&session.0, force, &snapshot_settings(opts));
+        all_gone &= delete_session_impl(&session.0, force, &snapshot_settings(opts), wait);
     }
-    process::exit(0);
+    process::exit(if all_gone { 0 } else { 1 });
 }
 
-pub(crate) fn kill_session(target_session: &Option<String>) {
+pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait) {
     match target_session {
         Some(target_session) => {
             assert_session(target_session);
-            kill_session_impl(target_session);
-            process::exit(0);
+            let gone = kill_session_impl(target_session, wait);
+            process::exit(if gone { 0 } else { 1 });
         },
         None => {
             println!("Please specify the session name to kill.");
@@ -416,7 +421,12 @@ pub(crate) fn kill_session(target_session: &Option<String>) {
     }
 }
 
-pub(crate) fn delete_session(target_session: &Option<String>, force: bool, opts: &CliArgs) {
+pub(crate) fn delete_session(
+    target_session: &Option<String>,
+    force: bool,
+    wait: KillWait,
+    opts: &CliArgs,
+) {
     match target_session {
         Some(target_session) => {
             if let Err(e) = validate_session_name(target_session) {
@@ -424,8 +434,8 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool, opts:
                 process::exit(1);
             }
             assert_dead_session(target_session, force);
-            delete_session_impl(target_session, force, &snapshot_settings(opts));
-            process::exit(0);
+            let gone = delete_session_impl(target_session, force, &snapshot_settings(opts), wait);
+            process::exit(if gone { 0 } else { 1 });
         },
         None => {
             println!("Please specify the session name to delete.");
