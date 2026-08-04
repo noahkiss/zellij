@@ -167,6 +167,22 @@ reachable from plugins and nowhere else — so consumers no longer have to scan 
 `PaneListEntry` is a CLI-only struct, so this is JSON output only: no protobuf, no contract change,
 and plugins see nothing new.
 
+### The socket directory is visible, and `ls` warns about sessions outside it
+
+Every session operation is scoped to one socket directory, resolved from the environment
+(`$ZELLIJ_SOCKET_DIR`, else `$XDG_RUNTIME_DIR/zellij`, else `$TMPDIR/zellij-<uid>`, else
+`/tmp/zellij-<uid>`). Two clients with different environments therefore build their own servers,
+see none of each other's sessions, and never error — a session can read `EXITED - attach to
+resurrect` while its server is alive under another path. Two additions make that visible:
+
+- `zellij setup --check` prints `[SOCKET DIR]` beside the existing `[CACHE DIR]`.
+- `zellij ls` scans the socket roots this build would have resolved to under a different
+  environment, and warns on stderr, naming the directory and the sessions, when it finds live ones
+  of the current contract version. Silent when there is nothing to report.
+
+The scan is read-only. Unlike the listing of the directory in use, it does not delete a socket that
+refuses a connection — that socket belongs to another environment.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

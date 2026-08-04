@@ -42,6 +42,62 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
     }
 }
 
+/// Live sessions of this contract version sitting in a socket root this environment did *not*
+/// resolve to, keyed by the directory they were found in.
+///
+/// Two clients with different environments each build their own server and neither can see the
+/// other, so `zellij ls` reports "no sessions" while a server is very much alive elsewhere. This
+/// is the scan that makes that split visible.
+///
+/// Read-only, deliberately: unlike [`assert_socket`], a socket that refuses a connection is left
+/// in place rather than removed, because it is not this environment's to clean up.
+pub fn get_sessions_in_other_socket_dirs() -> Vec<(std::path::PathBuf, Vec<String>)> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    socket_dir_candidates()
+        .into_iter()
+        .map(|root| root.join(&*CLIENT_SERVER_CONTRACT_DIR))
+        .filter(|dir| dir != &*ZELLIJ_SOCK_DIR)
+        .filter_map(|dir| {
+            let sessions: Vec<String> = fs::read_dir(&dir)
+                .ok()?
+                .filter_map(|file| {
+                    let file = file.ok()?;
+                    if !is_ipc_socket(&file.file_type().ok()?) {
+                        return None;
+                    }
+                    if !probe_socket(&file.path()) {
+                        return None;
+                    }
+                    file.file_name().into_string().ok()
+                })
+                .collect();
+            if sessions.is_empty() {
+                None
+            } else {
+                Some((dir, sessions))
+            }
+        })
+        .collect()
+}
+
+fn print_other_socket_dir_warning() {
+    for (dir, sessions) in get_sessions_in_other_socket_dirs() {
+        eprintln!(
+            "WARNING: {} live session(s) in another socket directory: {}",
+            sessions.len(),
+            dir.display()
+        );
+        for session in sessions {
+            eprintln!("  {}", session);
+        }
+        eprintln!(
+            "These are invisible to this environment. ZELLIJ_SOCK_DIR here is: {}",
+            ZELLIJ_SOCK_DIR.display()
+        );
+    }
+}
+
 pub fn get_resurrectable_sessions() -> Vec<(String, Duration)> {
     match fs::read_dir(&*ZELLIJ_SESSION_INFO_CACHE_DIR) {
         Ok(files_in_session_info_folder) => {
@@ -147,22 +203,33 @@ fn assert_socket(name: &str) -> bool {
     use crate::consts::ipc_connect;
     let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
-        Ok(stream) => {
-            let mut sender: IpcSenderWithContext<ClientToServerMsg> =
-                IpcSenderWithContext::new(stream);
-            let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
-            let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
-            match receiver.recv_server_msg() {
-                Some((ServerToClientMsg::Connected, _)) => true,
-                None | Some((_, _)) => false,
-            }
-        },
+        Ok(stream) => socket_answers(stream),
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
             drop(fs::remove_file(path));
             false
         },
         Err(_) => false,
     }
+}
+
+/// Ask a connected server whether it is alive.
+#[cfg(unix)]
+fn socket_answers(stream: interprocess::local_socket::Stream) -> bool {
+    let mut sender: IpcSenderWithContext<ClientToServerMsg> = IpcSenderWithContext::new(stream);
+    let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
+    let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
+    match receiver.recv_server_msg() {
+        Some((ServerToClientMsg::Connected, _)) => true,
+        None | Some((_, _)) => false,
+    }
+}
+
+/// [`assert_socket`] for a socket outside `ZELLIJ_SOCK_DIR`, without the stale-socket cleanup.
+#[cfg(unix)]
+fn probe_socket(path: &std::path::Path) -> bool {
+    crate::consts::ipc_connect(path)
+        .map(socket_answers)
+        .unwrap_or(false)
 }
 
 /// On Windows, reads the server PID from the marker file and checks whether
@@ -207,6 +274,13 @@ fn assert_socket(name: &str) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn assert_socket(_name: &str) -> bool {
     true
+}
+
+/// Only unix resolves the socket directory from the environment, so there is never another
+/// directory to scan elsewhere.
+#[cfg(not(unix))]
+fn probe_socket(_path: &std::path::Path) -> bool {
+    false
 }
 
 pub fn print_sessions(
@@ -423,6 +497,7 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
             }
             if all_sessions.is_empty() {
                 eprintln!("No active zellij sessions found.");
+                print_other_socket_dir_warning();
                 1
             } else {
                 print_sessions(
@@ -436,6 +511,7 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
                     short,
                     reverse,
                 );
+                print_other_socket_dir_warning();
                 0
             }
         },

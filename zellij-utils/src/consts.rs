@@ -327,6 +327,30 @@ mod unix_only {
         };
         pub static ref WEBSERVER_SOCKET_PATH: PathBuf = ZELLIJ_SOCK_DIR.join("web_server_bus");
     }
+
+    /// Every socket root this build could resolve to, in the order `ZELLIJ_SOCK_DIR` tries them.
+    ///
+    /// The chosen one is first; the rest are the roots a differently-configured environment (a
+    /// different `ZELLIJ_SOCKET_DIR`, a missing `XDG_RUNTIME_DIR`, a different `TMPDIR`) would
+    /// have landed in. These are roots — the sockets themselves live one level down, under
+    /// `CLIENT_SERVER_CONTRACT_DIR`.
+    pub fn socket_dir_candidates() -> Vec<PathBuf> {
+        let mut candidates = vec![];
+        let mut push = |dir: PathBuf| {
+            if !candidates.contains(&dir) {
+                candidates.push(dir);
+            }
+        };
+        if let Ok(dir) = envs::get_socket_dir() {
+            push(PathBuf::from(dir));
+        }
+        if let Some(runtime_dir) = ZELLIJ_PROJ_DIR.runtime_dir() {
+            push(runtime_dir.to_owned());
+        }
+        push(ZELLIJ_TMP_DIR.clone());
+        push(PathBuf::from("/tmp").join(format!("zellij-{}", *UID)));
+        candidates
+    }
 }
 
 #[cfg(not(unix))]
@@ -374,5 +398,11 @@ mod not_unix {
             ipc_dir
         };
         pub static ref WEBSERVER_SOCKET_PATH: PathBuf = ZELLIJ_SOCK_DIR.join("web_server_bus");
+    }
+
+    /// See the unix counterpart. Named pipes are not filesystem paths here, so the only
+    /// candidate is the one in use.
+    pub fn socket_dir_candidates() -> Vec<PathBuf> {
+        vec![ZELLIJ_SOCK_DIR.clone()]
     }
 }
