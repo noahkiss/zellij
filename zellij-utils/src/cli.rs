@@ -333,6 +333,20 @@ pub enum Sessions {
         #[clap(long, value_parser, takes_value(false), default_value("false"))]
         no_resurrect: bool,
 
+        /// Rebuild the session from an archived snapshot instead of resurrecting it in place.
+        /// Takes a snapshot id (a unique prefix is enough) and defaults to the newest snapshot
+        /// for this session name
+        #[clap(
+            long,
+            value_name = "ID",
+            value_parser,
+            min_values(0),
+            max_values(1),
+            require_equals(false),
+            default_missing_value("latest")
+        )]
+        restore: Option<String>,
+
         /// Authentication token for remote sessions
         #[clap(short('t'), long, value_parser)]
         token: Option<String>,
@@ -380,6 +394,10 @@ pub enum Sessions {
         #[clap(short, long, value_parser, takes_value(false), default_value("false"))]
         force: bool,
     },
+
+    /// Inspect and restore archived session snapshots
+    #[clap(subcommand)]
+    Snapshot(SnapshotCli),
 
     /// Kill all sessions
     #[clap(visible_alias = "ka")]
@@ -716,6 +734,49 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// considered a different plugin for the purposes of determining the pipe destination)
         #[clap(short('c'), long, value_parser, display_order(4))]
         plugin_configuration: Option<PluginUserConfiguration>,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+pub enum SnapshotCli {
+    /// List archived snapshots, newest first
+    #[clap(visible_alias = "ls")]
+    List {
+        /// Only snapshots of this session name
+        #[clap(long, value_parser)]
+        session: Option<String>,
+
+        /// Print the list as JSON
+        #[clap(long, value_parser, takes_value(false), default_value("false"))]
+        json: bool,
+    },
+    /// Print a snapshot's layout
+    Show {
+        /// The snapshot id, or a unique prefix of one
+        #[clap(value_parser)]
+        id: String,
+    },
+    /// Rebuild a session from a snapshot
+    Restore {
+        /// The snapshot id, a unique prefix of one, or `latest`
+        #[clap(value_parser)]
+        id: String,
+
+        /// Restore under this session name instead of the one the snapshot was taken from
+        #[clap(long, value_parser)]
+        session: Option<String>,
+    },
+    /// Delete a snapshot
+    Rm {
+        /// The snapshot id, or a unique prefix of one
+        #[clap(value_parser)]
+        id: String,
+    },
+    /// Delete all but the newest snapshots of each session
+    Prune {
+        /// How many snapshots to keep per session name, defaults to session_snapshot_limit
+        #[clap(long, value_parser)]
+        keep: Option<usize>,
     },
 }
 

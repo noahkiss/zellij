@@ -505,14 +505,18 @@ pub fn list_snapshots(settings: &SnapshotSettings, session_name: Option<&str>) -
 }
 
 /// Resolve `latest`, an exact id, or a unique id prefix.
+///
+/// `latest` is scoped to `session_name` when there is one, since "the newest snapshot of this
+/// session" is what asking for it beside a session name means. An id is looked up across the whole
+/// archive either way: ids are unique, and restoring one session's snapshot under another name is
+/// exactly what makes a snapshot a reusable template.
 pub fn resolve_snapshot(
     settings: &SnapshotSettings,
     id: &str,
     session_name: Option<&str>,
 ) -> Result<Snapshot, String> {
-    let snapshots = list_snapshots(settings, session_name); // newest first
     if id == "latest" {
-        return snapshots
+        return list_snapshots(settings, session_name)
             .into_iter()
             .next()
             .ok_or_else(|| match session_name {
@@ -520,7 +524,7 @@ pub fn resolve_snapshot(
                 None => "No snapshots in the archive.".to_owned(),
             });
     }
-    let matches: Vec<Snapshot> = snapshots
+    let matches: Vec<Snapshot> = list_snapshots(settings, None)
         .into_iter()
         .filter(|snapshot| snapshot.id == id || snapshot.id.starts_with(id))
         .collect();

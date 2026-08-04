@@ -279,6 +279,41 @@ Bare `save-session` keeps its in-place behaviour; `--archive` is handled by the 
 existing action returns, so nothing here crosses the client/server contract and plugins see nothing
 new.
 
+#### Reading and restoring the archive
+
+```
+zellij snapshot list [--session <name>] [--json]
+zellij snapshot show <id>
+zellij snapshot restore <id|latest> [--session <new-name>]
+zellij snapshot rm <id>
+zellij snapshot prune [--keep <n>]
+zellij attach <name> --restore [<id>|latest]
+```
+
+`<id>` is the directory name, and any unique prefix of one is accepted, like a git short SHA.
+`latest` means the newest snapshot of the named session for `attach --restore`, and the newest in
+the archive for `snapshot restore`; to restore the newest of one session under a different name,
+name the session in `attach --restore` or give the id.
+
+Listing reads directories and sidecars only, so it works with no server running and with no session
+of that name left. It trial-parses each layout and marks the ones that no longer parse rather than
+failing, because a layout a newer binary rejects is still a text file a human can repair, and
+finding that out at list time beats finding it out at restore time.
+
+`restore` points the existing resurrection path at the archive directory instead of the cache, so it
+is the ordinary new-session path with a different layout file. `--session` restores under another
+name, which makes a snapshot a reusable template and lets a restore be rehearsed beside a live
+session. Restoring into a name that is currently running is refused; restoring a snapshot written by
+a different upstream base is reported and then done anyway.
+
+`--restore` on `attach` is the counterpart to `--no-resurrect`: three explicit behaviours for a dead
+name — resurrect from the in-place file (default), start clean (`--no-resurrect`), or rebuild from a
+chosen snapshot (`--restore`).
+
+A restored layout runs its recorded commands, exactly as resurrection does today. A snapshot from
+weeks ago is a sharper edge than a session that died minutes ago, so `snapshot show` prints the
+layout before `restore` acts on it. There is deliberately no confirmation prompt.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

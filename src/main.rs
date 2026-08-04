@@ -245,6 +245,8 @@ fn main() {
         commands::list_aliases(opts);
     } else if let Some(Command::Sessions(Sessions::Watch { ref session_name })) = opts.command {
         commands::watch_session(session_name.clone(), opts);
+    } else if let Some(Command::Sessions(Sessions::Snapshot(snapshot_cli))) = opts.command.clone() {
+        commands::snapshot_command(snapshot_cli, opts);
     } else if let Some(Command::Sessions(Sessions::KillAllSessions { yes })) = opts.command {
         commands::kill_all_sessions(yes);
     } else if let Some(Command::Sessions(Sessions::KillSession { ref target_session })) =
