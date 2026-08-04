@@ -372,6 +372,38 @@ The last two lines appear only when a snapshot for that name exists. Nothing is 
 contract's server would not understand the question — so this is a socket-file check, not a
 connection.
 
+### `--stacked` fails instead of quietly creating nothing
+
+A stack needs an anchor: either a pane to stack under, or a client whose focused pane the new pane
+can join. `zellij action new-pane --stacked` against a session **nobody is attached to** supplies
+neither, because there is no focus to read. Upstream logged an internal error, dropped the pane and
+returned success — so the CLI printed a terminal id and exited 0 while creating no pane, and the pty
+that had already been spawned for it stayed alive as a shell with no pane, for the life of the
+session.
+
+Now that case is refused before the pane is built, the orphaned pty is closed, and the reason says
+what to do instead:
+
+```
+cannot stack a pane: no client is attached and no target pane was given.
+Pass --near-current-pane with ZELLIJ_PANE_ID set to the pane to stack under.
+```
+
+That invocation is the working one for a detached consumer — it names the pane to stack under
+explicitly rather than relying on focus:
+
+```
+ZELLIJ_PANE_ID=<id> zellij -s <session> action new-pane --stacked --near-current-pane
+```
+
+The message reaches the CLI as a non-zero exit for `--blocking` invocations. Without `--blocking`,
+zellij reports a new pane as soon as its pty spawns — before the tab has decided whether it can
+place it — so the plain form still exits 0 and the reason appears in the server log only. The pane
+is refused and the pty is closed either way; only the exit code differs.
+
+Nothing guesses a stack target. Picking some pane to stack under when the caller did not name one
+would put a confidently wrong answer where an error belongs.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

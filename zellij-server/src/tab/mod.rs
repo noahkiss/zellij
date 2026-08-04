@@ -1947,6 +1947,27 @@ impl Tab {
         borderless: Option<bool>,
     ) -> Result<()> {
         let err_context = || format!("failed to create new pane with id {pid:?}");
+
+        // A stack needs an anchor: either an explicit pane to stack under, or a client whose
+        // focused pane we can stack onto. With neither - `--stacked` against a session nobody is
+        // attached to - there is nothing to stack against, so refuse before building the pane.
+        // The pty was already spawned by the time we get here, so it has to be closed as well or
+        // it outlives the pane that was never created.
+        if !start_suppressed && pane_id_to_stack_under.is_none() && client_id.is_none() {
+            let message = "cannot stack a pane: no client is attached and no target pane was \
+                           given. Pass --near-current-pane with ZELLIJ_PANE_ID set to the pane \
+                           to stack under."
+                .to_owned();
+            log::error!("{}", message);
+            if let Some(mut blocking_notification) = blocking_notification {
+                blocking_notification.set_error_message(message);
+            }
+            self.senders
+                .send_to_pty(PtyInstruction::ClosePane(pid, None))
+                .with_context(err_context)?;
+            return Ok(());
+        }
+
         if should_focus_pane {
             self.hide_floating_panes();
         }
@@ -2042,6 +2063,8 @@ impl Tab {
             } else if let Some(client_id) = client_id {
                 self.add_stacked_pane_to_active_pane(new_pane, pid, client_id)
             } else {
+                // unreachable: the guard at the top of this function already refused this case
+                // and closed the pty
                 log::error!("Must have client id or pane id to stack pane");
                 return Ok(());
             }
