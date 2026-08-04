@@ -152,6 +152,21 @@ This adds an `Action` and therefore a message to the client/server contract (tag
 bumping the contract version: a fork client talking to a stock server of the same contract simply
 gets nothing for this one action, and every other action keeps working.
 
+### `pane_pid` in `list-panes --json`
+
+```
+zellij action list-panes --all --json
+```
+
+Terminal panes carry `pane_pid`, the pid of the process zellij spawned for the pane. The field is
+omitted for plugin panes and for any pane the pty does not answer for, exactly like the neighbouring
+`pane_command` and `pane_cwd`. This only exposes what the pty thread already knew — the pid was
+reachable from plugins and nowhere else — so consumers no longer have to scan `/proc/*/environ` for
+`ZELLIJ_PANE_ID` to map a pane to a process.
+
+`PaneListEntry` is a CLI-only struct, so this is JSON output only: no protobuf, no contract change,
+and plugins see nothing new.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

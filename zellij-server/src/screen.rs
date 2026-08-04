@@ -3284,6 +3284,7 @@ impl Screen {
                 tab_name: tab.name.clone(),
                 pane_command: None,
                 pane_cwd: None,
+                pane_pid: None,
             }
         }
 

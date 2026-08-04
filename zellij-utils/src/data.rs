@@ -2359,6 +2359,8 @@ pub struct PaneListEntry {
     pub pane_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_pid: Option<i32>,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;
