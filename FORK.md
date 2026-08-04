@@ -27,6 +27,10 @@ brew install noahkiss/tap/zellij-nkmk
 Switching binaries does not migrate running sessions — the old server keeps running under the old
 binary until it exits. Restart your sessions to pick up the fork.
 
+Sessions themselves are portable across the swap: sockets are scoped by client/server *contract*
+(`$XDG_RUNTIME_DIR/zellij/contract_version_1/`), not by version string, so the fork CLI attaches to
+and manages sessions started by a stock build of the same contract, and the reverse.
+
 ## Versioning
 
 `<upstream version>-nkmk.<fork counter>`, e.g. `0.44.3-nkmk.1`. `zellij --version` reports the fork
@@ -179,6 +183,13 @@ intel mac, no Windows.
    values. The shas are on the release as `<asset>.sha256` — `gh release download v<version>
    -R noahkiss/zellij -p '*.sha256' -D - 2>/dev/null` or just read them off the release page.
    `Formula/zellij-nkmk-source.rb` takes the tag tarball's sha instead.
+
+A pour of the prebuilt formula reinstalls in about 2 seconds. If a test install takes minutes
+instead, it fell through to a source build because `brew` read a **stale local tap clone** — run
+`brew update` (or pull the tap checkout) before testing a formula change made in the same session.
+
+The release job builds only the two targets above. Intel macOS was dropped deliberately; if it is
+ever restored, the runner label is `macos-15-intel` — GitHub retired `macos-13` in December 2025.
 
 To rebuild an existing tag (workflow changes, a lost asset):
 
