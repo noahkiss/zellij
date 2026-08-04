@@ -24,7 +24,7 @@ use zellij_utils::{
         command::RunCommand,
         layout::{Run, RunPluginOrAlias, SplitDirection},
     },
-    pane_size::{Offset, PaneGeom, Size, SizeInPixels, Viewport},
+    pane_size::{Dimension, Offset, PaneGeom, Size, SizeInPixels, Viewport},
 };
 
 use std::{
@@ -2702,6 +2702,7 @@ impl TiledPanes {
             .map(|(id, _)| *id)
     }
     pub fn pane_info(&self, current_pane_group: &HashMap<ClientId, Vec<PaneId>>) -> Vec<PaneInfo> {
+        let index_in_stack = self.index_in_stack_per_pane();
         let mut pane_infos = vec![];
         for (pane_id, pane) in self.panes.iter() {
             let mut pane_info_for_pane = pane_info_for_pane(pane_id, pane, &current_pane_group);
@@ -2710,9 +2711,39 @@ impl TiledPanes {
             pane_info_for_pane.is_suppressed = false;
             pane_info_for_pane.is_focused = is_focused;
             pane_info_for_pane.is_fullscreen = is_focused && self.fullscreen_is_active();
+            pane_info_for_pane.index_in_stack = index_in_stack.get(pane_id).copied();
             pane_infos.push(pane_info_for_pane);
         }
         pane_infos
+    }
+
+    pub fn index_in_stack(&self, pane_id: &PaneId) -> Option<usize> {
+        self.index_in_stack_per_pane().get(pane_id).copied()
+    }
+
+    /// The position of each stacked pane inside its own stack, counted from the top.
+    ///
+    /// A stack is the set of panes sharing a `stacked` id as well as the same horizontal placement
+    /// (mirroring how `StackedPanes::positions_in_stack` finds the members of a stack).
+    fn index_in_stack_per_pane(&self) -> HashMap<PaneId, usize> {
+        let mut stacks: HashMap<(usize, usize, Dimension), Vec<(PaneId, usize)>> = HashMap::new();
+        for (pane_id, pane) in self.panes.iter() {
+            let geom = pane.position_and_size();
+            if let Some(stack_id) = geom.stacked {
+                stacks
+                    .entry((stack_id, geom.x, geom.cols))
+                    .or_default()
+                    .push((*pane_id, geom.y));
+            }
+        }
+        let mut index_in_stack = HashMap::new();
+        for mut stack in stacks.into_values() {
+            stack.sort_by_key(|(_pane_id, y)| *y);
+            for (index, (pane_id, _y)) in stack.into_iter().enumerate() {
+                index_in_stack.insert(pane_id, index);
+            }
+        }
+        index_in_stack
     }
 
     pub fn pane_id_is_focused(&self, pane_id: &PaneId) -> bool {

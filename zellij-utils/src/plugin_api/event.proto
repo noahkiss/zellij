@@ -435,6 +435,10 @@ message PaneInfo {
     repeated IndexInPaneGroup index_in_pane_group = 23;
     optional string default_fg = 24;
     optional string default_bg = 25;
+    optional string program_title = 26;
+    optional uint32 stack_id = 27;
+    optional uint32 index_in_stack = 28;
+    bool is_expanded_in_stack = 29;
 }
 
 message IndexInPaneGroup {

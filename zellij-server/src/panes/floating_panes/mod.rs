@@ -1261,6 +1261,9 @@ impl FloatingPanes {
             pane_info_for_pane.is_suppressed = false;
             pane_info_for_pane.is_focused = is_focused;
             pane_info_for_pane.is_fullscreen = false;
+            // stacks are a tiled-layer concept, a floating pane is never a member of one
+            pane_info_for_pane.stack_id = None;
+            pane_info_for_pane.is_expanded_in_stack = false;
             pane_infos.push(pane_info_for_pane);
         }
         pane_infos

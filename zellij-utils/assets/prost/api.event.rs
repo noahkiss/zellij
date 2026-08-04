@@ -577,6 +577,14 @@ pub struct PaneInfo {
     pub default_fg: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="25")]
     pub default_bg: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="26")]
+    pub program_title: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag="27")]
+    pub stack_id: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag="28")]
+    pub index_in_stack: ::core::option::Option<u32>,
+    #[prost(bool, tag="29")]
+    pub is_expanded_in_stack: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -6215,6 +6215,10 @@ impl PaneInfo {
             index_in_pane_group: Default::default(), // we don't serialize this
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
         };
         Ok((tab_position, pane_info))
     }
@@ -6365,6 +6369,10 @@ fn serialize_and_deserialize_session_info_with_data() {
             index_in_pane_group: Default::default(), // we don't serialize this
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
         },
         PaneInfo {
             id: 1,
@@ -6392,6 +6400,10 @@ fn serialize_and_deserialize_session_info_with_data() {
             index_in_pane_group: Default::default(), // we don't serialize this
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
         },
     ];
     let mut panes = HashMap::new();

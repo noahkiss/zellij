@@ -615,6 +615,11 @@ pub trait Pane {
     fn start_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
     fn progress_animation_offset(&mut self) {} // only relevant for plugins
     fn current_title(&self) -> String;
+    /// The title the program running in this pane set for itself (OSC 0/2), regardless of any
+    /// user-assigned pane name
+    fn program_title(&self) -> Option<String> {
+        None
+    }
     fn custom_title(&self) -> Option<String>;
     fn is_held(&self) -> bool {
         false
@@ -3932,6 +3937,7 @@ impl Tab {
             info.is_fullscreen = self.tiled_panes.fullscreen_is_active();
             info.is_floating = false;
             info.is_suppressed = false;
+            info.index_in_stack = self.tiled_panes.index_in_stack(&pane_id);
             return Some(info);
         }
 
@@ -3942,6 +3948,8 @@ impl Tab {
             info.is_fullscreen = false;
             info.is_floating = true;
             info.is_suppressed = false;
+            info.stack_id = None;
+            info.is_expanded_in_stack = false;
             return Some(info);
         }
 
@@ -3952,6 +3960,10 @@ impl Tab {
             info.is_fullscreen = false;
             info.is_floating = false;
             info.is_suppressed = true;
+            // a suppressed pane keeps the geometry it had before being suppressed, which can still
+            // name a stack it is no longer a visible member of
+            info.stack_id = None;
+            info.is_expanded_in_stack = false;
             return Some(info);
         }
 
@@ -5431,6 +5443,8 @@ impl Tab {
             pane_info_for_suppressed_pane.is_suppressed = true;
             pane_info_for_suppressed_pane.is_focused = false;
             pane_info_for_suppressed_pane.is_fullscreen = false;
+            pane_info_for_suppressed_pane.stack_id = None;
+            pane_info_for_suppressed_pane.is_expanded_in_stack = false;
             pane_info.push(pane_info_for_suppressed_pane);
         }
         pane_info
@@ -6192,6 +6206,10 @@ pub fn pane_info_for_pane(
         .and_then(|(x, y, is_visible)| if is_visible { Some((x, y)) } else { None });
     pane_info.is_selectable = pane.selectable();
     pane_info.title = pane.current_title();
+    pane_info.program_title = pane.program_title();
+    let geom = pane.position_and_size();
+    pane_info.stack_id = geom.stacked;
+    pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();
     pane_info.exited = pane.exited();
     pane_info.exit_status = pane.exit_status();
     pane_info.is_held = pane.is_held();

@@ -183,6 +183,35 @@ resurrect` while its server is alive under another path. Two additions make that
 The scan is read-only. Unlike the listing of the directory in use, it does not delete a socket that
 refuses a connection — that socket belongs to another environment.
 
+### Pane identity and stack membership in `PaneInfo`
+
+```
+zellij action list-panes --all --json
+```
+
+`PaneInfo` carries four more fields, so a programmatic consumer can tell panes apart and mirror what
+a stack looks like on screen.
+
+- `program_title` — the title the program set for itself with OSC 0/2. zellij records that title
+  unconditionally, but `title` returns the user-assigned pane name instead as soon as one is set, so
+  naming a pane used to make the program's own title unreachable. The two are now reported side by
+  side: `title` for display, `program_title` for identity. `null` for plugin panes and for terminals
+  whose program never set a title.
+- `stack_id` — the id of the stack a tiled pane belongs to, `null` for panes that are not stacked.
+- `index_in_stack` — the pane's position in its stack, counted from the top.
+- `is_expanded_in_stack` — `true` for the one member of a stack that is not collapsed. A stack's
+  expanded member is the one with a flexible height, which is what this tests; the collapsed members
+  are pinned to a single row.
+
+Floating and suppressed panes report `null`/`false` for all three stack fields.
+
+This is not the same thing as the neighbouring `index_in_pane_group`, which tracks the multi-select
+grouping feature (Ctrl+click marking, `TogglePaneInGroup`) and is empty unless the user has staged
+panes for a bulk action. It never carried stack membership, and its behaviour is unchanged here.
+
+The fields cross the plugin API, so `event.proto` and its generated Rust are regenerated
+(`cargo xtask build`). The client/server contract has no `PaneInfo` and is untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

@@ -895,6 +895,9 @@ impl Pane for TerminalPane {
             self.pane_name.to_owned()
         }
     }
+    fn program_title(&self) -> Option<String> {
+        self.grid.title.clone()
+    }
     fn custom_title(&self) -> Option<String> {
         if self.pane_name.is_empty() {
             None
