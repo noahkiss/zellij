@@ -24,6 +24,17 @@ brew unlink zellij
 brew install noahkiss/tap/zellij-nkmk
 ```
 
+Two things can make an install or upgrade fail in ways the output does not explain:
+
+- **`brew upgrade` refuses on a legacy keg.** Early installs landed as keg version `3`, and
+  Homebrew compares `3` against `0.44.3-nkmk.4` token by token — `3 > 0`, so it decides the
+  installed copy is newer and prints `… 3 already installed` instead of upgrading. Check with
+  `brew list --versions zellij-nkmk`: if it reports a bare number, the one-time fix is
+  `brew uninstall zellij-nkmk && brew install noahkiss/tap/zellij-nkmk`. Kegs named
+  `0.44.3-nkmk.<n>` upgrade normally from then on.
+- **Untrusted-tap gate.** Newer Homebrew refuses to load formulae from a third-party tap until
+  it is trusted: `brew trust noahkiss/tap` (or `brew trust --formula noahkiss/tap/zellij-nkmk`).
+
 Switching binaries does not migrate running sessions — the old server keeps running under the old
 binary until it exits. Restart your sessions to pick up the fork.
 
