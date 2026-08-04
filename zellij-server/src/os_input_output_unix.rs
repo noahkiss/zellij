@@ -424,6 +424,20 @@ impl UnixPtyBackend {
         Ok(())
     }
 
+    /// Signal the whole process group led by `pid`. A pane's shell is a session leader, so its
+    /// pgid equals its pid; signalling the group takes the shell's own children with it.
+    pub fn kill_group(&self, pid: u32, force: bool) -> Result<()> {
+        let signal = if force { Signal::SIGKILL } else { Signal::SIGHUP };
+        let _ = kill(unistd::Pid::from_raw(-(pid as i32)), Some(signal));
+        Ok(())
+    }
+
+    /// Signal 0 asks the kernel whether the process exists without touching it. A zombie still
+    /// counts as alive here; the server reaps its children, so that state does not persist.
+    pub fn is_process_alive(&self, pid: u32) -> bool {
+        kill(unistd::Pid::from_raw(pid as i32), None).is_ok()
+    }
+
     pub fn send_sigint(&self, pid: u32) -> Result<()> {
         let _ = kill(unistd::Pid::from_raw(pid as i32), Some(Signal::SIGINT));
         Ok(())

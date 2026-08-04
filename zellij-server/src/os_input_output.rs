@@ -319,6 +319,20 @@ pub trait ServerOsApi: Send + Sync {
     fn kill(&self, pid: u32) -> Result<()>;
     /// Terminate the process with process ID `pid`. (SIGKILL)
     fn force_kill(&self, pid: u32) -> Result<()>;
+    /// Terminate the process group led by `pid`, so a pane's descendants go with its shell.
+    /// Defaults to signalling the process alone where groups are not available.
+    fn kill_group(&self, pid: u32, force: bool) -> Result<()> {
+        if force {
+            self.force_kill(pid)
+        } else {
+            self.kill(pid)
+        }
+    }
+    /// Whether `pid` still exists. Defaults to "no", which only makes kill escalation give up
+    /// early.
+    fn is_process_alive(&self, _pid: u32) -> bool {
+        false
+    }
     /// Send SIGINT to the process with process ID `pid`
     fn send_sigint(&self, pid: u32) -> Result<()>;
     /// Returns a [`Box`] pointer to this [`ServerOsApi`] struct.
@@ -424,6 +438,31 @@ impl ServerOsApi for ServerOsInputOutput {
     }
     fn force_kill(&self, pid: u32) -> Result<()> {
         self.pty_backend.force_kill(pid)
+    }
+    fn kill_group(&self, pid: u32, force: bool) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.pty_backend.kill_group(pid, force)
+        }
+        #[cfg(not(unix))]
+        {
+            if force {
+                self.force_kill(pid)
+            } else {
+                self.kill(pid)
+            }
+        }
+    }
+    fn is_process_alive(&self, pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            self.pty_backend.is_process_alive(pid)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            false
+        }
     }
     fn send_sigint(&self, pid: u32) -> Result<()> {
         self.pty_backend.send_sigint(pid)
