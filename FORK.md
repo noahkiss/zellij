@@ -470,6 +470,34 @@ Two things the generated files deliberately do:
 They deliberately set no `TMPDIR` and no `ZELLIJ_SOCKET_DIR`, and no `ProcessType` — that last one
 is a throttling hint, and panes inherit the server's QoS.
 
+What they *do* set is the short list of things a launcher supplies to nobody and a pane cannot
+re-derive. Every one is a **default**: a key or directive of the same name in the config's
+`session_service` block replaces it, and is never written beside it.
+
+| | systemd | launchd | why |
+|---|---|---|---|
+| `TERM` | `Environment=TERM=` | in `EnvironmentVariables` | a unit has none; every pane would be `dumb` |
+| `PATH` | `Environment=PATH=` | in `EnvironmentVariables` | see below |
+| working directory | — (defaults to `$HOME`) | `WorkingDirectory` | launchd gives none, so panes open in `/` |
+| job output | — (stderr is the journal) | `StandardOutPath`, `StandardErrorPath` | launchd sends it to `/dev/null` |
+
+**`PATH` was asymmetric, and the symptom is not the obvious one.** The plist pinned a
+Homebrew-shaped `PATH` and the unit pinned none at all. The **server** resolves a layout `command`,
+a `zellij run --`, a `zellij edit` and a `copy_command` against its own `PATH` — once, fixed for the
+life of the session — so in a launcher-created session on Linux those failed with "Command not
+found" while an interactive pane in the same session worked: the rc chain had fixed the *shell's*
+`PATH`, not the server's. Both generators now write one, derived rather than hardcoded: the
+directory the unit's own binary was found in, then the platform default. A package-manager prefix
+arrives that way on its own.
+
+**The launchd log paths are what the whole design rests on.** `session up` asserts the session it
+created is really there and prints why when it is not; launchd sends the output of a job naming no
+path to `/dev/null`, so on a Mac a session that never came back after login left no evidence
+anywhere. They default to `$XDG_STATE_HOME/zellij/session-<name>.{out,err}.log` — the same state
+directory as the restart log and the snapshot archive, per-user, and surviving the reboot the log is
+about. `session enable` creates that directory before loading the job, because launchd will not, and
+a job whose stdout cannot be opened does not run.
+
 ### `session up` will not create a session in the wrong macOS session domain
 
 macOS puts every process in a session domain, and only the graphical (`Aqua`) one carries the
@@ -782,12 +810,13 @@ checked per `NAME=` word (quoted words included), `PassEnvironment=` per name, a
 whatever it likes. On the launchd side a key is still refused when its name or its string value
 names one of the two: a plist key cannot be read the way a directive can.
 
-`TERM` is the one exception, and deliberately so: it is a *default* the generator supplies rather
-than a part of the unit it owns, so an entry setting it replaces that default instead of being
-refused. On launchd it is written inside `EnvironmentVariables` rather than as a top-level key.
-
-With nothing configured the generated unit is byte-for-byte what it was, but for the `TERM` a
-launcher cannot supply itself.
+The generator's own **defaults** are the exception, and deliberately so — `TERM`, `PATH`, and on
+launchd `WorkingDirectory`, `StandardOutPath` and `StandardErrorPath`. They are values the
+generator supplies, not parts of the unit it owns, so an entry setting one replaces that default
+instead of being refused, and the key is never written twice. `TERM` and `PATH` are environment
+variables rather than plist keys, so on launchd a configured one is routed inside
+`EnvironmentVariables`, where it means something, rather than left beside it as a top-level key
+launchd ignores in silence.
 
 ## Assessed and deliberately not built
 

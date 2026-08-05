@@ -768,36 +768,72 @@ fn xml_escape(text: &str) -> String {
 /// healthy session is a no-op and a pass over a missing one restores it.
 const CHECK_INTERVAL_SECS: u64 = 60;
 
-/// Whether the config already sets TERM for the service.
+/// Whether the config already sets this variable for the service.
 ///
-/// systemd takes the last assignment of a variable, so a second `Environment=TERM=` line would not
+/// systemd takes the last assignment of a variable, so a second `Environment=NAME=` line would not
 /// break anything - but two of them in one unit is a thing to read twice and get wrong, and the
 /// generator's default is the one to drop.
-fn sets_term(directives: &[String]) -> bool {
+fn sets_env_var(directives: &[String], name: &str) -> bool {
+    let assignment = format!("{}=", name);
     directives.iter().any(|directive| {
         directive
             .strip_prefix("Environment=")
-            .map(|assignment| {
-                assignment
+            .map(|value| {
+                value
                     .trim_start_matches(['"', '\''])
-                    .starts_with("TERM=")
+                    .starts_with(&assignment)
             })
             .unwrap_or(false)
     })
 }
 
-fn systemd_unit(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
-    let extras = extras.cloned().unwrap_or_default();
-    // A default, not a decision: a config that sets its own TERM replaces this line rather than
-    // adding a second one.
-    let term = if sets_term(&extras.systemd.service) {
+/// One `Environment=NAME=value` line, or nothing when the config has already written one.
+fn env_default(directives: &[String], name: &str, value: &str) -> String {
+    if sets_env_var(directives, name) {
         String::new()
     } else {
-        format!(
-            "Environment=TERM={}\n",
-            crate::session_lifecycle::DEFAULT_TERM
-        )
-    };
+        format!("Environment={}={}\n", name, value)
+    }
+}
+
+/// The PATH a generated unit gives the server, and through it every command the server resolves.
+///
+/// This is not the same question as a pane's PATH, and that is the trap. A pane shell sources the
+/// rc chain and fixes its own PATH; the SERVER resolves a layout `command`, a `zellij run --`, a
+/// `zellij edit` and a `copy_command` against the PATH it was started with, once, for the life of
+/// the session. So a launcher-created session had an interactive pane that worked beside a layout
+/// pane reporting "Command not found" - and only on the machine where the launcher won the race.
+///
+/// The directory the unit's own binary lives in leads the list, because that is the one directory
+/// this machine is known to keep terminal software in: it is where the binary the unit execs was
+/// found. A package manager prefix arrives that way instead of being hardcoded. The rest is the
+/// platform's own default, as `sh` would use with no PATH at all.
+const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+fn service_path(exe: &Path) -> String {
+    match exe.parent().map(|dir| dir.display().to_string()) {
+        Some(dir)
+            if !dir.is_empty()
+                && !PLATFORM_PATH
+                    .split(':')
+                    .any(|platform_dir| platform_dir == dir) =>
+        {
+            format!("{}:{}", dir, PLATFORM_PATH)
+        },
+        _ => PLATFORM_PATH.to_owned(),
+    }
+}
+
+fn systemd_unit(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
+    let extras = extras.cloned().unwrap_or_default();
+    // Defaults, not decisions: a config that sets its own TERM or PATH replaces these lines rather
+    // than adding a second assignment of the same variable.
+    let term = env_default(
+        &extras.systemd.service,
+        "TERM",
+        crate::session_lifecycle::DEFAULT_TERM,
+    );
+    let path = env_default(&extras.systemd.service, "PATH", &service_path(exe));
     format!(
         "\
 # zellij session '{session}' - write to ~/.config/systemd/user/{unit}
@@ -830,7 +866,13 @@ KillMode=process
 # The server hands its own environment to every pane shell, and a unit has no TERM: without this
 # every pane in a session this unit created comes up with TERM=dumb. Setting your own terminal type
 # in the config's `session_service` block replaces this line rather than adding a second one.
-{term}ExecStart={exe} session up {session}
+{term}\
+# PATH, for the same reason and a different symptom. The SERVER resolves a layout `command`, a
+# `zellij run --`, a `zellij edit` and a `copy_command` against its own PATH, once, for the life of
+# the session - a pane shell fixing its own PATH from the rc chain does not fix that. A unit is
+# started with none. The first entry is where the binary below was found; setting PATH in the
+# config's `session_service` block replaces this line.
+{path}ExecStart={exe} session up {session}
 {service_extra}
 [Install]
 WantedBy=default.target
@@ -839,6 +881,7 @@ WantedBy=default.target
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
         term = term,
+        path = path,
         unit = systemd_service_name(session),
         timer = systemd_timer_name(session),
         unit_extra = directive_lines(&extras.systemd.unit),
@@ -892,23 +935,72 @@ pub fn systemd_timer_name(session: &str) -> String {
     format!("zellij-session-{}.timer", session)
 }
 
+/// Take a string value the generator has a default for out of the configured keys.
+///
+/// The keys are removed whether or not a string comes back, because every one of these is written
+/// by the generator itself: leaving one in the extras would put the key in the dictionary twice,
+/// and a dict with the same key twice is not a plist.
+fn take_default_key(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<String> {
+    let mut given = None;
+    keys.retain(|key| {
+        if key.name != name {
+            return true;
+        }
+        if let (None, PlistValue::String(value)) = (&given, &key.value) {
+            given = Some(value.clone());
+        }
+        false
+    });
+    given
+}
+
+/// Where a launchd job's output goes, per session.
+///
+/// launchd sends the output of a job that names no path to `/dev/null`, and that is where the whole
+/// design's diagnostics went: `session up` asserts its post-condition and prints why it failed, and
+/// on a Mac nobody could read it. A session that never came back after login left no evidence
+/// anywhere. systemd needed nothing here - a unit's stderr is the journal.
+///
+/// The state directory, not `/tmp`: this is the same state that holds the restart log and the
+/// snapshot archive, it is per-user, and it survives a reboot, which a log about what happened at
+/// login has to.
+pub fn launchd_log_paths(session: &str) -> (PathBuf, PathBuf) {
+    let dir = crate::consts::ZELLIJ_STATE_DIR.clone();
+    (
+        dir.join(format!("session-{}.out.log", session)),
+        dir.join(format!("session-{}.err.log", session)),
+    )
+}
+
+/// The directory a launchd-created session's panes start in.
+///
+/// launchd gives a job no working directory, so it inherits `/` and every pane of a session the
+/// agent created opens there. A systemd user unit is right by accident - it defaults to `$HOME` -
+/// which is why the generated unit says nothing about it and this one has to.
+fn launchd_working_directory() -> String {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().display().to_string())
+        .unwrap_or_else(|| "/".to_owned())
+}
+
 fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
     let extras = extras.cloned().unwrap_or_default();
-    // TERM is an environment default the generator owns a value for, not a plist key - launchd has
-    // no top-level key by that name. A config entry naming it therefore replaces the value inside
-    // EnvironmentVariables, where it means something, instead of becoming a key launchd ignores.
-    // A dict cannot carry the same key twice, so it has to be replaced rather than appended.
-    let (given_term, keys): (Vec<LaunchdKey>, Vec<LaunchdKey>) = extras
-        .launchd
-        .into_iter()
-        .partition(|key| key.name == "TERM");
-    let term = given_term
-        .into_iter()
-        .find_map(|key| match key.value {
-            PlistValue::String(value) => Some(value),
-            _ => None,
-        })
+    // Every one of these is a value the generator owns a DEFAULT for rather than a part of the
+    // plist it owns outright, so a config entry naming one replaces the value instead of being
+    // refused. TERM and PATH are environment variables, not plist keys - launchd has no top-level
+    // key by either name - so a configured one is routed into EnvironmentVariables, where it means
+    // something. The rest are real plist keys and are written where they belong.
+    let mut keys = extras.launchd;
+    let term = take_default_key(&mut keys, "TERM")
         .unwrap_or_else(|| crate::session_lifecycle::DEFAULT_TERM.to_owned());
+    let path = take_default_key(&mut keys, "PATH").unwrap_or_else(|| service_path(exe));
+    let working_directory =
+        take_default_key(&mut keys, "WorkingDirectory").unwrap_or_else(launchd_working_directory);
+    let (default_out, default_err) = launchd_log_paths(session);
+    let out_path = take_default_key(&mut keys, "StandardOutPath")
+        .unwrap_or_else(|| default_out.display().to_string());
+    let err_path = take_default_key(&mut keys, "StandardErrorPath")
+        .unwrap_or_else(|| default_err.display().to_string());
     format!(
         "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -944,9 +1036,22 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
 
   TERM is here because a launch agent has none, and the server hands its own environment to every
   pane shell it spawns: without it every pane of a session this agent created comes up with
-  TERM=dumb. A TERM key in the config's `session_service` launchd block replaces this value; it
-  belongs in this dictionary rather than beside it, because launchd has no top-level key by that
-  name.
+  TERM=dumb. PATH is here for the same reason and a different symptom: the SERVER resolves a layout
+  `command`, a `zellij run --`, a `zellij edit` and a `copy_command` against its own PATH, once, for
+  the life of the session, and a pane shell fixing its own PATH from the rc chain does not fix that.
+  Its first entry is the directory the binary above was found in.
+
+  StandardOutPath and StandardErrorPath are not decoration. `zellij session up` asserts that the
+  session it created is really there and prints why if it is not, and launchd sends the output of a
+  job that names no path to /dev/null - so a session that never came back after login used to leave
+  no evidence anywhere at all.
+
+  WorkingDirectory, because launchd gives a job none: without it every pane of a session this agent
+  created opens in /. A systemd user unit defaults to the home directory and needs no such line.
+
+  Each of these is a DEFAULT. A key of the same name in the config's `session_service` launchd
+  block replaces it; TERM and PATH are replaced inside this dictionary, where they mean something,
+  because launchd has no top-level key by either name.
 -->
 <plist version=\"1.0\">
 <dict>
@@ -964,10 +1069,16 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>{path}</string>
         <key>TERM</key>
         <string>{term}</string>
     </dict>
+    <key>WorkingDirectory</key>
+    <string>{working_directory}</string>
+    <key>StandardOutPath</key>
+    <string>{out_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{err_path}</string>
     <key>RunAtLoad</key>
     <true/>
     <key>StartInterval</key>
@@ -980,6 +1091,10 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
         term = xml_escape(&term),
+        path = xml_escape(&path),
+        working_directory = xml_escape(&working_directory),
+        out_path = xml_escape(&out_path),
+        err_path = xml_escape(&err_path),
         extra_keys = plist_entries(&keys),
     )
 }
@@ -1217,6 +1332,16 @@ pub fn enable(
         std::fs::write(&file.path, &file.contents)
             .map_err(|e| format!("could not write {}: {}", file.path.display(), e))?;
         written.push(file.path.clone());
+    }
+    // launchd opens the paths the plist names and creates neither the directory above them nor the
+    // job when it cannot: a log directory that does not exist yet would stop the session coming up
+    // at all, which is a poor trade for a log.
+    if kind == ServiceKind::Launchd {
+        let (out, _) = launchd_log_paths(session);
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
+        }
     }
     load_job(&files)?;
     Ok(EnableOutcome::Enabled { written, beside })
@@ -2217,6 +2342,111 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
         assert!(plist.contains("<string>up</string>\n        <string>work</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
+    }
+
+    /// launchd sends the output of a job that names no path to /dev/null - including the
+    /// post-condition failure `session up` prints, which is the whole diagnostic this design rests
+    /// on. Without these keys a session that never came back after login left no evidence anywhere.
+    #[test]
+    fn the_launchd_plist_says_where_the_job_s_output_goes() {
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let (out, err) = launchd_log_paths("work");
+        assert!(plist.contains(&format!(
+            "<key>StandardOutPath</key>\n    <string>{}</string>",
+            out.display()
+        )));
+        assert!(plist.contains(&format!(
+            "<key>StandardErrorPath</key>\n    <string>{}</string>",
+            err.display()
+        )));
+        // the state directory, not /tmp: per-user, and it survives the reboot the log is about
+        assert!(out.starts_with(&*crate::consts::ZELLIJ_STATE_DIR));
+        assert!(out.to_string_lossy().contains("work"));
+    }
+
+    /// launchd gives a job no working directory, so without this every pane of a session the agent
+    /// created opens in `/`. A systemd user unit defaults to the home directory, which is why only
+    /// this generator says anything about it.
+    #[test]
+    fn the_launchd_plist_starts_the_session_in_the_home_directory() {
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let home = directories::BaseDirs::new().unwrap();
+        assert!(plist.contains(&format!(
+            "<key>WorkingDirectory</key>\n    <string>{}</string>",
+            home.home_dir().display()
+        )));
+    }
+
+    /// The server resolves a layout `command`, `zellij run --`, `zellij edit` and `copy_command`
+    /// against its OWN PATH, once, for the life of the session - so a launcher-created session had
+    /// an interactive pane that worked beside a layout pane reporting "Command not found". Both
+    /// generators have to answer it, and they used to disagree: the plist pinned a Homebrew-shaped
+    /// PATH and the unit pinned none at all.
+    #[test]
+    fn both_generators_give_the_server_a_path() {
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let expected = service_path(&exe());
+        assert!(unit.contains(&format!("Environment=PATH={}\n", expected)));
+        assert!(plist.contains(&format!(
+            "<key>PATH</key>\n        <string>{}</string>",
+            expected
+        )));
+        // derived, not hardcoded: the directory the unit's own binary was found in leads the list
+        assert!(expected.starts_with("/usr/local/bin:"));
+        assert!(expected.contains(PLATFORM_PATH));
+    }
+
+    #[test]
+    fn a_binary_outside_the_platform_path_puts_its_own_directory_first() {
+        let path = service_path(Path::new("/opt/homebrew/bin/zellij"));
+        assert_eq!(path, format!("/opt/homebrew/bin:{}", PLATFORM_PATH));
+        // and a directory the platform default already names is not repeated
+        assert_eq!(service_path(Path::new("/usr/bin/zellij")), PLATFORM_PATH);
+    }
+
+    /// Each generated default has to be replaceable, and replacing it must not leave the key in the
+    /// file twice: a dict with one key twice is not a plist, and two systemd assignments of one
+    /// variable are a unit nobody can read with confidence.
+    #[test]
+    fn every_generated_default_is_overridable_without_being_written_twice() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_systemd_directive("service", "Environment=PATH=/my/bin")
+            .unwrap();
+        for (key, value) in [
+            ("PATH", "/my/bin"),
+            ("WorkingDirectory", "/my/home"),
+            ("StandardOutPath", "/my/logs/out.log"),
+            ("StandardErrorPath", "/my/logs/err.log"),
+        ] {
+            extras
+                .add_launchd_key(key, PlistValue::String(value.to_owned()))
+                .unwrap();
+        }
+
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras));
+        assert_eq!(unit.matches("Environment=PATH=").count(), 1);
+        assert!(unit.contains("Environment=PATH=/my/bin"));
+
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        for (key, value) in [
+            ("PATH", "/my/bin"),
+            ("WorkingDirectory", "/my/home"),
+            ("StandardOutPath", "/my/logs/out.log"),
+            ("StandardErrorPath", "/my/logs/err.log"),
+        ] {
+            assert_eq!(
+                plist.matches(&format!("<key>{}</key>", key)).count(),
+                1,
+                "{} is written twice",
+                key
+            );
+            assert!(plist.contains(&format!("<string>{}</string>", value)));
+        }
+        // PATH belongs inside EnvironmentVariables: a top-level key by that name is one launchd
+        // ignores in silence
+        assert!(plist.contains("<key>PATH</key>\n        <string>/my/bin</string>"));
     }
 
     /// The session the server is started in is the session every pane inherits, and only the domain
