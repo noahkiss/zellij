@@ -90,6 +90,15 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
   RunAtLoad brings the session up at login; StartInterval re-checks it. `zellij session up` is
   idempotent and asserts its own result, so a pass over a healthy session does nothing.
 
+  LimitLoadToSessionType Aqua is why this agent is worth having, and it goes with loading the job
+  into the gui/ domain above. A job in the graphical login session runs with the context that
+  grants access to TCC-gated resources, the login keychain, the pasteboard and notifications. A
+  process cannot ask for that context: it is conferred by the domain the job was loaded into, and
+  inherited by children. For a multiplexer that is decisive, because the server is long-lived and
+  every pane in it inherits what the server has - a server first started from an SSH shell lacks
+  that access for as long as it lives, and attaching to it later from a graphical terminal does not
+  change it. Started from here it always has it, however you attach afterwards.
+
   EnvironmentVariables carries PATH and NOTHING ELSE - in particular no TMPDIR and no
   ZELLIJ_SOCKET_DIR. launchd hands out a per-user TMPDIR that differs from the one a login shell
   sees, so a pinned socket directory here would build a session invisible to every terminal. The
@@ -106,6 +115,8 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
         <string>up</string>
         <string>{session}</string>
     </array>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -160,6 +171,15 @@ mod tests {
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work");
         assert!(plist.contains("<string>up</string>\n        <string>work</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
+    }
+
+    /// The session the server is started in is the session every pane inherits, and only the domain
+    /// the job is loaded into can confer it. Without this the agent is no better than the first
+    /// interactive attach, which is the thing it exists to beat.
+    #[test]
+    fn the_launchd_plist_loads_into_the_graphical_login_session() {
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work");
+        assert!(plist.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
     }
 
     /// The whole point of generating these: a unit that pins either variable builds a session the
