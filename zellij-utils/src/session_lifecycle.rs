@@ -505,6 +505,182 @@ pub fn env_vars_to_drop<'a>(
         .collect()
 }
 
+/// Which build is serving a session, relative to the binary that is asking.
+///
+/// `Unknown` is not a fault to report. A client that cannot see the server's executable knows
+/// nothing about it, and a wrong "your session is stale" costs more than saying nothing: it sends
+/// someone to restart a session that did not need restarting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMatch {
+    Same,
+    Different,
+    Unknown,
+}
+
+/// A running program's executable, identified by more than its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableIdentity {
+    /// The path, canonicalised where it could be. A package manager installs a stable name that is
+    /// a symlink into a versioned directory, so two spellings routinely name one build.
+    pub path: PathBuf,
+    /// Device and inode, where the file could be stat'ed. One file has one pair whatever it is
+    /// called, and a replacement gets a new one, so this decides wherever it is available.
+    pub file_id: Option<(u64, u64)>,
+    /// The file the process started from is no longer at its path - an upgrade wrote over it in
+    /// place. Linux says so by appending " (deleted)" to the `/proc/<pid>/exe` link.
+    pub replaced: bool,
+}
+
+/// What can be learnt about the file at `path`, without failing if the answer is "not much".
+fn identify_executable(path: PathBuf) -> ExecutableIdentity {
+    let (path, replaced) = match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(real_path) => (PathBuf::from(real_path), true),
+        None => (path, false),
+    };
+    let path = path.canonicalize().unwrap_or(path);
+    // a replaced file's path may now hold its replacement, whose inode is not the running one's
+    #[cfg(unix)]
+    let file_id = if replaced {
+        None
+    } else {
+        std::fs::metadata(&path).ok().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        })
+    };
+    #[cfg(not(unix))]
+    let file_id: Option<(u64, u64)> = None;
+    ExecutableIdentity {
+        path,
+        file_id,
+        replaced,
+    }
+}
+
+/// Whether two executables are the same build, judged only on what was actually established.
+///
+/// Inodes decide it where both sides have them. Where they do not, only agreement is trustworthy:
+/// two paths that differ may still be two names for one build, and calling that a mismatch is the
+/// false alarm this is written to avoid.
+pub fn compare_builds(
+    ours: Option<&ExecutableIdentity>,
+    theirs: Option<&ExecutableIdentity>,
+) -> BuildMatch {
+    let (Some(ours), Some(theirs)) = (ours, theirs) else {
+        return BuildMatch::Unknown;
+    };
+    if ours.replaced {
+        // our own file has been replaced too, so there is nothing left on disk to compare against
+        return BuildMatch::Unknown;
+    }
+    if theirs.replaced {
+        // ours is on disk and theirs is not, so they cannot be the same file
+        return BuildMatch::Different;
+    }
+    match (ours.file_id, theirs.file_id) {
+        (Some(ours), Some(theirs)) if ours == theirs => BuildMatch::Same,
+        (Some(_), Some(_)) => BuildMatch::Different,
+        _ if ours.path == theirs.path => BuildMatch::Same,
+        _ => BuildMatch::Unknown,
+    }
+}
+
+/// The executable a running process started from.
+///
+/// `/proc/<pid>/exe` is the whole answer on Linux: it is the kernel's own reference to the file,
+/// and it says so when the file has since been replaced.
+#[cfg(target_os = "linux")]
+fn executable_of_pid(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{}/exe", pid)).ok()
+}
+
+/// The executable a running process started from.
+///
+/// macOS has no `/proc`, and `ps -o comm=` is not a substitute - it is truncated at the column
+/// width. `proc_pidpath` is the kernel asked directly, and fills a buffer with the full path.
+#[cfg(target_os = "macos")]
+fn executable_of_pid(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // PROC_PIDPATHINFO_MAXSIZE, which is not exposed by the libc crate
+    let mut buffer = vec![0u8; 4096];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// Everywhere else there is no portable way to ask, so nothing is claimed.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn executable_of_pid(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// The build behind the server serving `name` from the socket directory this binary resolved.
+///
+/// Exactly one such server, or nothing: two servers for one name is its own fault, reported by the
+/// post-conditions, and guessing which of them a client will reach would be inventing an answer.
+pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
+    let expected_socket = ZELLIJ_SOCK_DIR.join(name);
+    let mut ours = servers_for_session(name)
+        .into_iter()
+        .filter(|server| server.socket == expected_socket);
+    let server = ours.next()?;
+    if ours.next().is_some() {
+        return None;
+    }
+    executable_of_pid(server.pid).map(identify_executable)
+}
+
+/// The build of the binary running right now.
+pub fn own_executable() -> Option<ExecutableIdentity> {
+    std::env::current_exe().ok().map(identify_executable)
+}
+
+/// What to say about a session served by a build that is not this one, if it is.
+///
+/// A server keeps the binary it started with for the whole life of the session, so upgrading the
+/// package changes nothing until the session is restarted. Nothing else says so, and a machine can
+/// therefore sit on a superseded build for days while everyone believes the upgrade took effect.
+pub fn build_mismatch_warning(name: &str) -> Option<String> {
+    let ours = own_executable();
+    let theirs = server_executable(name);
+    if compare_builds(ours.as_ref(), theirs.as_ref()) != BuildMatch::Different {
+        return None;
+    }
+    let (ours, theirs) = (ours?, theirs?);
+    Some(format!(
+        "warning: session '{}' is running a different build of zellij than this binary.\n  \
+         running: {}\n  this:    {}\n  \
+         A server keeps the binary it started with, so an upgrade does not reach a running \
+         session.\n  Run `zellij session restart {}` to bring it onto this build.",
+        name,
+        theirs.path.display(),
+        ours.path.display(),
+        name
+    ))
+}
+
+/// Say it, at most once for the life of this process.
+///
+/// A client talks to its server many times over; the mismatch is one fact about the session and is
+/// worth one line, not one line per action, per reconnect or per render.
+pub fn warn_if_server_build_differs(name: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if let Some(warning) = build_mismatch_warning(name) {
+            eprintln!("{}", warning);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +954,73 @@ mod tests {
         assert_eq!(
             gui_domain_action(None, false, None, false),
             GuiDomainAction::NoGuiSession
+        );
+    }
+
+    fn executable(path: &str, file_id: Option<(u64, u64)>) -> ExecutableIdentity {
+        ExecutableIdentity {
+            path: PathBuf::from(path),
+            file_id,
+            replaced: false,
+        }
+    }
+
+    #[test]
+    fn one_file_under_two_names_is_one_build() {
+        // the stable name and the versioned path a package manager points it at
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 1234)));
+        let theirs = executable("/opt/zellij/1.2.3/bin/zellij", Some((66, 1234)));
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    fn a_different_file_at_the_same_path_is_a_different_build() {
+        // the ordinary upgrade: one path, a new file behind it, a server still on the old one
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
+        let theirs = executable("/opt/zellij/bin/zellij", Some((66, 1234)));
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    fn a_server_whose_file_is_gone_is_on_another_build() {
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
+        let theirs = ExecutableIdentity {
+            path: PathBuf::from("/opt/zellij/bin/zellij"),
+            file_id: None,
+            replaced: true,
+        };
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    fn an_executable_that_could_not_be_read_says_nothing() {
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
+        assert_eq!(compare_builds(Some(&ours), None), BuildMatch::Unknown);
+        assert_eq!(compare_builds(None, Some(&ours)), BuildMatch::Unknown);
+        assert_eq!(compare_builds(None, None), BuildMatch::Unknown);
+    }
+
+    #[test]
+    fn without_inodes_only_agreement_is_trusted() {
+        // two spellings with nothing to tell them apart by may still be one build
+        let ours = executable("/opt/zellij/bin/zellij", None);
+        let theirs = executable("/opt/zellij/1.2.3/bin/zellij", None);
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Unknown
+        );
+        assert_eq!(
+            compare_builds(
+                Some(&ours),
+                Some(&executable("/opt/zellij/bin/zellij", None))
+            ),
+            BuildMatch::Same
         );
     }
 }

@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
-use zellij_utils::session_lifecycle::{env_vars_to_drop, DownOutcome, SessionFacts};
+use zellij_utils::session_lifecycle::{
+    env_vars_to_drop, warn_if_server_build_differs, DownOutcome, SessionFacts,
+};
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
 use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start_client};
@@ -128,6 +130,9 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
 
     if healthy && restore.is_none() {
         println!("ok    session '{}' already running", name);
+        // "already running" is exactly the answer that hides a superseded build: an `up` after an
+        // upgrade reports success and leaves the old server serving the session.
+        warn_if_server_build_differs(name);
         return Ok(());
     }
     if healthy || facts.listed {

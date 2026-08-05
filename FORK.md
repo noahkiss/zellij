@@ -530,6 +530,41 @@ literal string rather than failing config parsing. `plugin_permissions` expands 
 wildcard and remote-URL rejections, so a variable cannot smuggle a `*` past a check whose whole
 purpose is explicit listing.
 
+### A warning when the running session is a different build
+
+A server keeps the binary it started with for the whole life of the session. Upgrading the package
+does nothing to a session that is already up, and nothing anywhere said so — so a machine sits on a
+superseded build for days while everyone believes the upgrade took effect, and the bug that was
+fixed keeps happening. This has actually happened here.
+
+A client that reaches an existing server now says it once, on stderr:
+
+```
+warning: session 'work' is running a different build of zellij than this binary.
+  running: /opt/zellij/1.2.3/bin/zellij
+  this:    /opt/zellij/1.2.4/bin/zellij
+  A server keeps the binary it started with, so an upgrade does not reach a running session.
+  Run `zellij session restart work` to bring it onto this build.
+```
+
+Said on `zellij action ...`, on an attach to an existing session, and by `session up` when it finds
+the session already running — that last one being the report that otherwise hides the problem, since
+it says "ok" about a server built before the binary saying it. Once per invocation, never fatal,
+and it changes no exit code.
+
+The server's executable comes from `/proc/<pid>/exe` on Linux and from `proc_pidpath` on macOS,
+which has no `/proc` (`ps -o comm=` is truncated at the column width and is not a substitute). The
+server pid comes from the existing process scan, not a second one. Both executables are compared by
+device and inode where they can be stat'ed, because the installed name is a symlink into a versioned
+directory and two spellings routinely mean one build; a path comparison alone would cry wolf every
+time. Where an inode is missing on either side, only agreement is trusted and disagreement is
+reported as nothing at all: a wrong "your session is stale" sends someone to restart a session that
+did not need it, which costs more than silence. An executable that cannot be read, a platform that
+cannot be asked, and two servers for one name all produce no warning.
+
+Nothing about this reaches `SessionInfo` or the status bar. That would put a version on the plugin
+API contract, which is far more than a warning is worth.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

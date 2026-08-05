@@ -872,6 +872,9 @@ fn attach_with_cli_client(
     session_name: &str,
     config: Option<Config>,
 ) {
+    // an action is the usual way a script meets a session, so it is where a stale server is usually
+    // met too - the warning costs one process scan and changes nothing about the action
+    zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // `save-session --archive` is a client-side addition to the existing action: the action itself
@@ -1213,6 +1216,12 @@ pub(crate) fn start_client(opts: CliArgs) {
                     if val == *client.get_session_name() {
                         panic!("You are trying to attach to the current session (\"{}\"). This is not supported.", val);
                     }
+                }
+
+                // an attach joins a server that may predate this binary. Said once per client, and
+                // only for a session that already exists - a new one is this build by definition.
+                if let ClientInfo::Attach(session_name, _) = &client {
+                    zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
                 }
 
                 if let Some(layout_info) = layout_info {
