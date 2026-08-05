@@ -53,13 +53,33 @@ the ignore: run `git status` before you commit and confirm no private note is st
 ## Build and test
 
 ```
-cargo build --release
-cargo test -p zellij-utils -p zellij-server
+cargo check                                  # while editing
+cargo test -p zellij-utils --profile quick   # the loop
+cargo build --release                        # once, before committing
 ```
 
-`rust-toolchain.toml` pins the toolchain; rustup installs it on the first cargo call. **Use
-`--release`.** A debug build expects the WASM plugins to be built from source; the release build
-uses the prebuilt assets in `zellij-utils/assets/plugins/`.
+`rust-toolchain.toml` pins the toolchain; rustup installs it on the first cargo call.
+
+**Never build without optimizations.** A debug build expects the WASM plugins to be built from
+source; an optimized build uses the prebuilt assets in `zellij-utils/assets/plugins/`. So plain
+`cargo test` fails on the assets, and "just drop `--release` to save time" is not the shortcut it
+looks like.
+
+**Use `--profile quick` to iterate, not `--release`.** `quick` inherits `release`, so debug
+assertions stay off and the prebuilt assets are still used, but it drops full LTO and raises
+`codegen-units` — the two settings that make a release rebuild slow and that only earn their keep
+in the artifact that ships. `--release` re-optimizes the whole program at every link and confines
+each crate's codegen to one core; in an edit-test loop that is most of the wall-clock, and it buys
+nothing a test run can observe.
+
+Two things to know before reaching for it. `quick` gets its own `target/` subtree, so the first
+build after switching is cold and slower than the release build it replaces — it pays back from
+the second. And it is not what ships: build `--release` once before you commit, and never measure
+runtime performance against `quick`.
+
+Whole-binary builds are the expensive ones, because they pull in `zellij-server` and its embedded
+`wasmtime`. Prefer `cargo check` and a `-p <crate>` test while iterating, and keep the full
+`cargo build --release` for the end.
 
 CI also runs `cargo xtask build` and `cargo xtask test` on Linux, macOS and Windows, plus a
 `--no-web` test pass. A change behind a feature flag still has to compile without it.
