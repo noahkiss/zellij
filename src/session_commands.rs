@@ -190,7 +190,7 @@ fn disable(name: &str) -> Result<(), ()> {
             // the two commands contradicting each other over the same machine. What this command
             // removes is what `session enable` wrote, and that is not this.
             println!(
-                "ok    nothing zellij installed for '{}'; nothing of ours to remove",
+                "warn  nothing zellij installed for '{}'; nothing of ours to remove",
                 name
             );
             for job in jobs {
@@ -202,7 +202,15 @@ fn disable(name: &str) -> Result<(), ()> {
                     job.path.display()
                 );
             }
-            Ok(())
+            // Non-zero, because the question this command answers is "will the session come back",
+            // and here it still will. A caller reading only the exit code would otherwise take
+            // this for a session that has been switched off - and the next boot would disagree.
+            eprintln!(
+                "session disable: '{}' is still launched by a job zellij did not write; remove \
+                 that job by hand to stop it",
+                name
+            );
+            Err(())
         },
         Ok(DisableOutcome::Disabled { removed, remaining }) => {
             for path in removed {
@@ -212,7 +220,7 @@ fn disable(name: &str) -> Result<(), ()> {
                 "off   service for '{}' unloaded and removed; the session itself is untouched",
                 name
             );
-            for job in remaining {
+            for job in &remaining {
                 println!(
                     "      {} still runs `session up {}` ({}) - not written by zellij, so it is \
                      left alone",
@@ -221,7 +229,19 @@ fn disable(name: &str) -> Result<(), ()> {
                     job.path.display()
                 );
             }
-            Ok(())
+            // Removing our own unit while another launcher still starts the session is a partial
+            // result, not a success: the session keeps coming back, from something this command
+            // has just made harder to find. Same reasoning as the NotOurs arm above.
+            if remaining.is_empty() {
+                Ok(())
+            } else {
+                eprintln!(
+                    "session disable: '{}' is still launched by a job zellij did not write; \
+                     remove that job by hand to stop it",
+                    name
+                );
+                Err(())
+            }
         },
         Err(reason) => {
             eprintln!("session disable: {}", reason);

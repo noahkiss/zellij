@@ -763,6 +763,12 @@ name: com.example.my-terminal" while `disable` said "no service installed; nothi
   remove it**. What it removes stays exactly what `enable` wrote: a job written by hand is somebody
   else's file, and a command that deleted it because a session name matched would be one nobody
   could trust.
+- `disable` **exits non-zero whenever a job it did not write is still there**, whether or not it
+  removed one of its own. The question the command answers is "will this session come back", and
+  while another launcher runs `session up` the answer is yes. Exiting 0 would tell a script the
+  session had been switched off, and the next boot would disagree — worse after a partial removal,
+  because the session then returns from something the command has just made harder to find. The
+  detail is on stdout either way; the exit code is for the caller that reads nothing else.
 
 ### Extra unit directives from the config (`session_service`)
 
