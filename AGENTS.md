@@ -129,3 +129,20 @@ Three surfaces look similar and cost very different amounts.
 
 Sockets are scoped by contract version, not by version string, so a fork build and a stock build of
 the same contract share sessions. Keep it that way.
+
+## Rolling a new config key out before every machine has the binary
+
+**An unknown key in `config.kdl` is ignored, not an error.** Verified by running a config carrying
+three new keys through the previous release's binary: `setup --check` still reported
+`CONFIG FILE: Well defined`.
+
+That decides the rollout order for a config-only feature. The key can be added to a shared config
+first and the binaries upgraded afterwards, in any order — machines still on the old build ignore it
+until they catch up. There is no need to hold the config back, and no need to gate it per machine.
+
+The reverse is not true and is the trap: a shell alias, a service unit, or a script that calls a
+**new subcommand** breaks immediately on any machine that has not upgraded. Config is forgiving;
+the command surface is not. When a change spans both, land the config early and the callers last.
+
+Worth re-verifying rather than assuming if a future release changes config parsing — the check is
+two minutes: fetch the previous release's binary and run `setup --check` against the new config.
