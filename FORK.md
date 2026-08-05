@@ -462,7 +462,10 @@ Two things the generated files deliberately do:
   falling back with a warning, and `--exe` overrides. On macOS this also matters for identity:
   permission grants are recorded against the executable image, so a versioned path re-asks for
   every permission after every upgrade.
-- **The plist sets `LimitLoadToSessionType Aqua`.** See below.
+- **The plist sets `LimitLoadToSessionType Aqua`**, and its install line bootstraps into `gui/`.
+  The bootstrap target is what actually puts the job in the graphical login session — a job
+  bootstrapped into `gui/` reports the Aqua domain with or without the key. The key restricts which
+  session types the job may auto-load into, so at login it cannot come up anywhere else. See below.
 
 They deliberately set no `TMPDIR` and no `ZELLIJ_SOCKET_DIR`, and no `ProcessType` — that last one
 is a throttling hint, and panes inherit the server's QoS.

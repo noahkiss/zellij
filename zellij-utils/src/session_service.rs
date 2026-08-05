@@ -161,14 +161,19 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
   RunAtLoad brings the session up at login; StartInterval re-checks it. `zellij session up` is
   idempotent and asserts its own result, so a pass over a healthy session does nothing.
 
-  LimitLoadToSessionType Aqua is why this agent is worth having, and it goes with loading the job
-  into the gui/ domain above. A job in the graphical login session runs with the context that
-  grants access to TCC-gated resources, the login keychain, the pasteboard and notifications. A
-  process cannot ask for that context: it is conferred by the domain the job was loaded into, and
-  inherited by children. For a multiplexer that is decisive, because the server is long-lived and
-  every pane in it inherits what the server has - a server first started from an SSH shell lacks
-  that access for as long as it lives, and attaching to it later from a graphical terminal does not
-  change it. Started from here it always has it, however you attach afterwards.
+  Loading into the gui/ domain above is what puts this job in the graphical login session, and that
+  is why the agent is worth having. A job there runs with the context that grants access to
+  TCC-gated resources, the login keychain, the pasteboard and notifications. A process cannot ask
+  for that context: it is conferred by the domain the job was loaded into, and inherited by
+  children. For a multiplexer that is decisive, because the server is long-lived and every pane in
+  it inherits what the server has - a server first started from an SSH shell lacks that access for
+  as long as it lives, and attaching to it later from a graphical terminal does not change it.
+  Started from here it always has it, however you attach afterwards.
+
+  LimitLoadToSessionType Aqua does NOT itself confer that context - a job bootstrapped into gui/
+  reports the Aqua domain with or without the key. What it does is restrict which session types
+  the job may auto-load into, so at login it cannot come up anywhere else. Keep it for that, but
+  do not read its presence as the thing granting the context: the bootstrap target is.
 
   EnvironmentVariables carries PATH and NOTHING ELSE - in particular no TMPDIR and no
   ZELLIJ_SOCKET_DIR. launchd hands out a per-user TMPDIR that differs from the one a login shell
