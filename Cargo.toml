@@ -31,6 +31,7 @@ thiserror = { workspace = true }
 isahc = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+daemonize = { workspace = true }
 nix = { workspace = true }
 
 [target.'cfg(windows)'.build-dependencies]

@@ -4792,6 +4792,7 @@ version = "0.44.3-nkmk.4"
 dependencies = [
  "anyhow",
  "clap",
+ "daemonize",
  "dialoguer",
  "embed-resource",
  "humantime",

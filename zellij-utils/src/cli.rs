@@ -411,6 +411,10 @@ pub enum Sessions {
     #[clap(subcommand)]
     Snapshot(SnapshotCli),
 
+    /// Create, tear down and restart a named session, asserting the result
+    #[clap(subcommand)]
+    Session(SessionLifecycleCli),
+
     /// Kill all sessions
     #[clap(visible_alias = "ka")]
     KillAllSessions {
@@ -758,6 +762,68 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// considered a different plugin for the purposes of determining the pipe destination)
         #[clap(short('c'), long, value_parser, display_order(4))]
         plugin_configuration: Option<PluginUserConfiguration>,
+    },
+}
+
+/// The lifecycle of one named session: create it, remove it, replace it.
+///
+/// Each of these states a post-condition and checks it, rather than reporting what it asked for.
+/// The session name defaults to the `session_name` config option where one is set, so a machine
+/// that runs a single named session can say `zellij session up` and mean it.
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+pub enum SessionLifecycleCli {
+    /// Create the session in the background if it is not already up, then assert that it is
+    Up {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Build the session from an archived snapshot instead of from the layout. Takes a
+        /// snapshot id (a unique prefix is enough) and defaults to the newest snapshot for this
+        /// session name. Without it the session comes up FRESH from the layout, which is what
+        /// makes a layout edit apply
+        #[clap(
+            long,
+            value_name = "ID",
+            value_parser,
+            min_values(0),
+            max_values(1),
+            require_equals(false),
+            default_missing_value("latest")
+        )]
+        restore: Option<String>,
+    },
+
+    /// Remove the session, archiving a snapshot of its shape first, then assert that it is gone
+    Down {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+    },
+
+    /// Take the session down and bring it back, from inside it or from anywhere else
+    Restart {
+        /// Name of the session, defaults to the current session, then to the `session_name`
+        /// config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Come back from the default layout instead of from the pre-restart shape. This is how a
+        /// layout edit is applied
+        #[clap(long, value_parser, takes_value(false), conflicts_with("restore"))]
+        fresh: bool,
+
+        /// Come back from a specific snapshot rather than the one the teardown archives
+        #[clap(long, value_name = "ID", value_parser)]
+        restore: Option<String>,
+
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
     },
 }
 

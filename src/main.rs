@@ -1,4 +1,5 @@
 mod commands;
+mod session_commands;
 #[cfg(test)]
 mod tests;
 
@@ -248,6 +249,8 @@ fn main() {
         commands::watch_session(session_name.clone(), opts);
     } else if let Some(Command::Sessions(Sessions::Snapshot(snapshot_cli))) = opts.command.clone() {
         commands::snapshot_command(snapshot_cli, opts);
+    } else if let Some(Command::Sessions(Sessions::Session(session_cli))) = opts.command.clone() {
+        session_commands::session_lifecycle_command(session_cli, opts);
     } else if let Some(Command::Sessions(Sessions::KillAllSessions {
         yes,
         no_wait,
