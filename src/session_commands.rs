@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    env_vars_to_drop, term_for_new_session, warn_if_server_build_differs, DownOutcome, SessionFacts,
+    colorterm_for_new_session, env_vars_to_drop, term_for_new_session,
+    warn_if_server_build_differs, DownOutcome, SessionFacts,
 };
 use zellij_utils::session_service::{
     self, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome, PlistValue, ServiceExe,
@@ -457,15 +458,43 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         },
     }
 
-    // The last thing before the server is created, and only on the path that creates it: the server
-    // takes this process's environment and hands it to every pane shell, so a TERM set here is the
-    // TERM of every pane for the life of the session. A launcher has none - see
-    // `zellij_utils::session_lifecycle::term_for_new_session`. An `up` that found the session
-    // healthy has already returned, so nothing here touches a session that exists, and `restart`
-    // ends in this function and is covered by it.
+    // Everything from here to `start_client` is the environment the new session is built with, and
+    // only on the path that creates it: the server takes this process's environment and hands it to
+    // every pane shell, so what is set here is set in every pane for the life of the session. An
+    // `up` that found the session healthy has already returned, so nothing here touches a session
+    // that exists, and `restart` ends in this function and is covered by it.
+
+    // "Which session am I in" is read from these three. A launcher's environment has none - but
+    // `systemctl --user import-environment` and `dbus-update-activation-environment --systemd`, run
+    // from inside a pane as a desktop session ordinarily does, put a pane's copies into the user
+    // manager's environment, and from there into this unit. zellij would then believe it is running
+    // INSIDE a session, refuse to attach, and the timer would repeat that every minute forever.
+    // `restart` scrubs them for its own reason - it is about to destroy the session it was typed
+    // in - and this is the same scrub for the creator that never had a pane. It is also what makes
+    // an `UnsetEnvironment=` directive in the unit unnecessary rather than merely permitted.
+    for var in [
+        envs::ZELLIJ_ENV_KEY,
+        envs::SESSION_NAME_ENV_KEY,
+        "ZELLIJ_PANE_ID",
+    ] {
+        std::env::remove_var(var);
+    }
+    // The configured drop-list is about the same hazard from the other end: a variable describing
+    // the ONE program that asked for this would otherwise describe every pane of the session. It
+    // reads as restart-specific and is not - `session up other-session` typed in an agent's pane
+    // bakes the agent's variables into a session it has nothing to do with.
+    drop_configured_env(opts);
+
+    // A launcher has no TERM and no COLORTERM - see
+    // `zellij_utils::session_lifecycle::term_for_new_session`. Both describe the CONNECTION rather
+    // than the user, which is what makes them the generator's business at all: the rc chain in each
+    // pane re-derives a locale or a PATH for itself and cannot re-derive these.
     if let Some(term) = term_for_new_session(std::env::var("TERM").ok().as_deref()) {
         println!("      no usable TERM here; the session gets TERM={}", term);
         std::env::set_var("TERM", term);
+    }
+    if let Some(colorterm) = colorterm_for_new_session(std::env::var("COLORTERM").ok().as_deref()) {
+        std::env::set_var("COLORTERM", colorterm);
     }
 
     let mut opts = opts.clone();

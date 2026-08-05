@@ -533,6 +533,29 @@ pub fn term_for_new_session(current: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// What a truecolor-capable terminal puts in COLORTERM, and what zellij's renderer is.
+pub const DEFAULT_COLORTERM: &str = "truecolor";
+
+/// The COLORTERM to give a session being CREATED, or `None` to keep what is already there.
+///
+/// The same argument as [`term_for_new_session`], and the same place in the code, because it is the
+/// same fact: this describes the CONNECTION, not the user. zellij's own renderer emits 24-bit
+/// colour to the pane, so a pane inside it really is looking at a truecolor surface - the value is
+/// true of the thing on the other end of the pty whatever the user would have preferred. That is
+/// what separates it from a locale, which is a preference the rc chain re-derives for itself.
+///
+/// A launcher supplies none, and the server hands its environment to every pane, so without it
+/// nvim colourschemes, delta, bat and eza fall back to 256 colours in a launcher-created session
+/// and look right in a terminal opened beside it - the same session, judged differently by the two
+/// panes. Anything already set is left alone: a terminal that says something about itself is
+/// better informed than this is.
+pub fn colorterm_for_new_session(current: Option<&str>) -> Option<&'static str> {
+    match current {
+        Some(colorterm) if !colorterm.is_empty() => None,
+        _ => Some(DEFAULT_COLORTERM),
+    }
+}
+
 /// Whether one `session_restart_drop_env` pattern names this variable.
 ///
 /// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
@@ -874,6 +897,22 @@ mod tests {
         assert_eq!(term_for_new_session(Some("")), Some(DEFAULT_TERM));
         // `dumb` is what an environment with no terminal type produces, not a choice anyone made
         assert_eq!(term_for_new_session(Some("dumb")), Some(DEFAULT_TERM));
+    }
+
+    #[test]
+    fn a_creator_with_no_colorterm_hands_out_truecolor() {
+        assert_eq!(
+            colorterm_for_new_session(None),
+            Some(DEFAULT_COLORTERM),
+            "zellij's renderer really does present a truecolor surface to the pane"
+        );
+        assert_eq!(colorterm_for_new_session(Some("")), Some(DEFAULT_COLORTERM));
+    }
+
+    #[test]
+    fn a_colorterm_that_is_already_set_is_never_overridden() {
+        assert_eq!(colorterm_for_new_session(Some("truecolor")), None);
+        assert_eq!(colorterm_for_new_session(Some("24bit")), None);
     }
 
     #[test]

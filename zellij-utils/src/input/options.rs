@@ -201,12 +201,14 @@ pub struct Options {
     #[serde(default)]
     pub session_aliases: Option<BTreeMap<String, String>>,
 
-    /// Environment variables `zellij session restart` unsets before it rebuilds the session, as
-    /// exact names or as a name ending in `*`, which matches by prefix. A restart inherits the
-    /// environment of the pane it was typed in, and the rebuilt session hands that environment to
-    /// every pane in it - so a variable that describes the ONE program that asked for the restart
-    /// ends up describing all of them. Unset means drop nothing.
-    /// config.kdl only - it is read by the restart itself, which is the only thing it affects.
+    /// Environment variables unset before this binary CREATES a session, as exact names or as a
+    /// name ending in `*`, which matches by prefix. The name reads restart-specific and the rule is
+    /// not: `session up` applies it too, and `restart` ends in `up`. A session is built from the
+    /// environment of whatever asked for it, and it hands that environment to every pane in it - so
+    /// a variable describing the ONE program that asked (an agent's pane, a wrapper's own
+    /// bookkeeping) ends up describing all of them. Unset means drop nothing.
+    /// config.kdl only - it is read by the command that creates the session, which is all it
+    /// affects.
     #[clap(skip)]
     #[serde(default)]
     pub session_restart_drop_env: Option<Vec<String>>,

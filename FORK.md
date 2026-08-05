@@ -571,6 +571,26 @@ cannot carry one key twice, and two systemd assignments of one variable are a un
 with confidence. On launchd the config's `TERM` goes inside `EnvironmentVariables`, where it means
 something, rather than beside it as a top-level key launchd would ignore.
 
+### `COLORTERM`, and the `ZELLIJ_*` variables, on the same creating path
+
+Three more corrections in the one place `up` builds a session's environment, all of them the same
+rule as `TERM`: what is set there is set in every pane for the life of the session, and only the
+facts a pane's rc chain **cannot re-derive** belong there.
+
+- **`COLORTERM=truecolor`** when nothing set it. This is not a preference like a locale: zellij's
+  own renderer emits 24-bit colour to the pane, so the value is true of the thing on the other end
+  of the pty whoever created the session. Without it nvim colourschemes, `delta`, `bat` and `eza`
+  fall back to 256 colours in a launcher-created session and look right in a terminal opened beside
+  it. A value already set is never overridden.
+- **`ZELLIJ`, `ZELLIJ_SESSION_NAME`, `ZELLIJ_PANE_ID` are unset.** `restart` already scrubbed them,
+  for its own reason. `up` did not, and a launcher can be handed them: `systemctl --user
+  import-environment` and `dbus-update-activation-environment --systemd`, both ordinary desktop
+  idioms, copy a pane's environment into the user manager, and the unit inherits it from there.
+  zellij would then believe it is running inside a session, refuse to attach, and the timer would
+  repeat that every 60s forever. This is what makes an `UnsetEnvironment=` line in the unit
+  unnecessary rather than merely permitted.
+- **The configured drop-list** (`session_restart_drop_env`, above) is applied here too.
+
 ### Configurable terminal title
 
 ```kdl
@@ -587,7 +607,7 @@ did, and an unresolvable hostname does not leave a dangling separator. Unknown p
 literal. The format is fixed once the first client connects and read from there while panes render,
 so the per-frame cost is unchanged.
 
-### Environment variables dropped on restart
+### Environment variables dropped when a session is created
 
 ```kdl
 session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
@@ -596,8 +616,13 @@ session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
 A restart triggered from inside a pane inherits that pane's environment, and the rebuilt session
 then hands it to **every** pane — so a tool that marks its own environment leaks that mark into
 panes it has nothing to do with. Names match exactly, or by prefix with a trailing `*`; a `*`
-anywhere else is a literal character. Dropped after the restart daemonizes and before it rebuilds.
-Empty or absent means nothing is dropped.
+anywhere else is a literal character. Empty or absent means nothing is dropped.
+
+The key name reads restart-specific; the rule is not. It applies to any session **this binary
+creates**, so `session up other-session` typed in an agent's pane drops them too — that command has
+exactly the same problem, and `restart` ends in `up` anyway. Dropped after a restart has
+daemonized, and in `up` immediately before the server is asked for, which is before the server
+captures the environment it will hand out.
 
 ### `~` and `$VAR` in config paths
 
