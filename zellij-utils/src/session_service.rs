@@ -197,8 +197,6 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
     <true/>
     <key>StartInterval</key>
     <integer>{interval}</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
 </dict>
 </plist>
 ",
@@ -324,6 +322,18 @@ mod tests {
 
     /// The whole point of generating these: a unit that pins either variable builds a session the
     /// rest of the machine cannot see.
+    #[test]
+    fn the_launchd_plist_does_not_throttle_the_session() {
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work");
+        // ProcessType Background asks launchd to deprioritize CPU and I/O. Panes inherit the
+        // server's QoS, so it would throttle every build and long-running job in the session.
+        // Omitting the key leaves launchd's Standard default, which is what an interactive
+        // multiplexer wants.
+        assert!(
+            !plist.contains("<key>ProcessType</key>"),
+            "plist sets ProcessType, which panes inherit"
+        );
+    }
     #[test]
     fn no_unit_sets_a_socket_dir_or_a_tmpdir() {
         for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
