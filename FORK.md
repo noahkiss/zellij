@@ -565,6 +565,91 @@ cannot be asked, and two servers for one name all produce no warning.
 Nothing about this reaches `SessionInfo` or the status bar. That would put a version on the plugin
 API contract, which is far more than a warning is worth.
 
+### `zellij session enable|disable|status`
+
+```
+zellij session enable  [NAME] [--exe PATH]
+zellij session disable [NAME]
+zellij session status  [NAME]
+```
+
+Absorbs the install that `setup --generate-service` left to the reader. `enable` writes the unit
+into the user's own directory (`~/.config/systemd/user`, `~/Library/LaunchAgents`) and loads it —
+`systemctl --user daemon-reload` then `enable --now`, or `launchctl bootstrap gui/<uid>`. No root,
+no system domain.
+
+`disable` is the half worth having. Both init systems keep the definition they were handed rather
+than the file it came from, so removing the file first leaves a job that still runs from a
+definition nothing on disk describes — and launchd's `bootout` needs the label, which was in the
+file just deleted. So it unloads first, then removes, then tells systemd to look again.
+
+Both are idempotent, following `session up`/`session down`: `enable` over an unchanged install
+reports it and touches nothing, `disable` with nothing installed is the state that was asked for.
+`enable` over a *changed* one rewrites and reloads, because a rewritten file that was not reloaded
+is a lie on disk.
+
+`status` reports the facts separately, because they come apart and the difference is the diagnosis:
+
+```
+session   my-session
+init      systemd (user)
+service   ~/.config/systemd/user/zellij-session-my-session.service - installed
+timer     ~/.config/systemd/user/zellij-session-my-session.timer - installed
+loaded    yes (service enabled, timer enabled and armed)
+config    [Unit] After=network.target
+running   yes, in /run/user/1000/zellij/contract_version_1
+```
+
+A file with no job was never loaded; a job with no session is a unit that is failing; a session
+with no job will not come back. It exits 0 when the unit is installed and loaded, whatever the
+session is doing — repairing the session is the unit's job and `session up` is what reports on it.
+
+**Linux gets a timer.** The plist has `StartInterval`, so macOS had a watchdog and Linux did not: a
+session that died overnight came back at the next login there and within a minute here. `enable`
+writes and enables a paired `.timer` at the same interval, `disable` removes both. One unit name
+per session (`zellij-session-<name>.service`), for the reason the launchd label is per session.
+
+`setup --generate-service` is unchanged and still prints the service to stdout, from the same
+generator.
+
+### Extra unit directives from the config (`session_service`)
+
+```kdl
+session_service {
+    systemd {
+        unit "After=network.target" "Before=some-other.service"
+        service "Nice=-5"
+    }
+    launchd {
+        keys {
+            ProcessType "Interactive"
+            Nice 5
+        }
+    }
+}
+```
+
+A generated unit cannot know the local facts. systemd's answer is a drop-in directory, which is a
+poor answer for the tool that generated the unit: the drop-in is invisible to it, so `status`
+cannot report it, and someone reading only the config has no idea it exists. Configuration a tool
+generates from belongs where the tool can see it — so it lives here, and `status` lists it.
+
+**Raw passthrough.** A systemd entry is a literal directive line appended to the section that names
+it (`unit` → `[Unit]`, `service` → `[Service]`, `install` → `[Install]`); a launchd entry is a
+plist key with a string, integer or boolean value, XML-escaped. zellij models neither schema: a
+copy of two specifications that already exist would be worse than both, and would reject every key
+added to them after it was written.
+
+What it will not carry is what the generator owns — `ExecStart`, the plist keys zellij writes
+itself (`Label`, `ProgramArguments`, `LimitLoadToSessionType`, `EnvironmentVariables`, `RunAtLoad`,
+`StartInterval`), and anything naming `TMPDIR` or `ZELLIJ_SOCKET_DIR`. Those are config errors
+naming the offending entry, reported at parse time so `setup --check` catches them; a unit that
+pins either variable builds a session no terminal can see, which is the failure this whole design
+exists to prevent. A duplicate key is not an override either: a dict with the same key twice is not
+a plist.
+
+With nothing configured the generated unit is byte-for-byte what it was.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in
