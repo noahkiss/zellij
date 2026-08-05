@@ -662,7 +662,15 @@ impl Setup {
             );
         }
         let mut out = std::io::stdout();
-        let _ = out.write_all(service_unit(kind, exe.path(), &session).as_bytes());
+        // the same generator `zellij session enable` uses, so what is printed here is what would
+        // be installed - including whatever `session_service` in the config adds
+        let unit = service_unit(
+            kind,
+            exe.path(),
+            &session,
+            config_options.session_service.as_ref(),
+        );
+        let _ = out.write_all(unit.as_bytes());
     }
 
     fn parse_layout_and_override_config(

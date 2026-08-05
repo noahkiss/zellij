@@ -17,6 +17,9 @@ use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermiss
 use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
+use crate::session_service::{PlistValue, SessionServiceOptions};
+#[cfg(test)]
+use crate::session_service::LaunchdKey;
 use kdl_layout_parser::KdlLayoutParser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -2673,6 +2676,32 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
     }
 }
 
+/// One launchd key's value, as KDL spells it.
+///
+/// Strings, integers and booleans and nothing else: those cover every key anyone has wanted, and a
+/// value of another shape is far more likely to be a typo than a plist type this does not carry
+/// yet - so it is reported rather than guessed at.
+fn plist_value_from_kdl(kdl_key: &KdlNode) -> Result<PlistValue, ConfigError> {
+    let name = kdl_name!(kdl_key);
+    if let Some(value) = kdl_first_entry_as_string!(kdl_key) {
+        return Ok(PlistValue::String(value.to_owned()));
+    }
+    if let Some(value) = kdl_first_entry_as_bool!(kdl_key) {
+        return Ok(PlistValue::Bool(value));
+    }
+    if let Some(value) = kdl_first_entry_as_i64!(kdl_key) {
+        return Ok(PlistValue::Integer(value));
+    }
+    Err(ConfigError::new_kdl_error(
+        format!(
+            "Failed to parse the launchd key {:?}: expected a string, an integer or a boolean",
+            name
+        ),
+        kdl_key.span().offset(),
+        kdl_key.span().len(),
+    ))
+}
+
 impl Options {
     pub fn from_kdl(kdl_options: &KdlDocument) -> Result<Self, ConfigError> {
         let on_force_close =
@@ -2769,6 +2798,10 @@ impl Options {
                 .map(|(template, _entry)| template.to_string());
         let session_aliases = match kdl_options.get("session_aliases") {
             Some(kdl_session_aliases) => Some(Self::session_aliases_from_kdl(kdl_session_aliases)?),
+            None => None,
+        };
+        let session_service = match kdl_options.get("session_service") {
+            Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
             None => None,
         };
         let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
@@ -2902,6 +2935,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            session_service,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3303,6 +3337,126 @@ impl Options {
             session_aliases.insert(session_name.into(), alias.to_string());
         }
         Ok(session_aliases)
+    }
+    /// The `session_service` block: extra directives for the unit `zellij session enable` writes.
+    ///
+    /// Every entry is passed through verbatim - zellij models neither schema - so the only thing
+    /// checked here is that an entry does not take over a part of the unit the generator owns. It
+    /// is checked HERE, at parse time, rather than when a unit is written, so that a config error
+    /// is reported by `zellij setup --check` and by every other command, not only by the one
+    /// command that would have used it.
+    fn session_service_from_kdl(
+        kdl_session_service: &KdlNode,
+    ) -> Result<SessionServiceOptions, ConfigError> {
+        let mut session_service = SessionServiceOptions::default();
+        for init_system in
+            kdl_children_nodes_or_error!(kdl_session_service, "empty session_service block")
+        {
+            match kdl_name!(init_system) {
+                "systemd" => {
+                    for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
+                    {
+                        let section_name = kdl_name!(section);
+                        for directive in kdl_string_arguments!(section) {
+                            session_service
+                                .add_systemd_directive(section_name, directive)
+                                .map_err(|e| {
+                                    ConfigError::new_kdl_error(
+                                        e,
+                                        section.span().offset(),
+                                        section.span().len(),
+                                    )
+                                })?;
+                        }
+                    }
+                },
+                "launchd" => {
+                    for keys in kdl_children_nodes_or_error!(init_system, "empty launchd block") {
+                        if kdl_name!(keys) != "keys" {
+                            return Err(ConfigError::new_kdl_error(
+                                format!(
+                                    "Unknown launchd option: {:?} (expected a `keys` block)",
+                                    kdl_name!(keys)
+                                ),
+                                keys.span().offset(),
+                                keys.span().len(),
+                            ));
+                        }
+                        for key in kdl_children_nodes_or_error!(keys, "empty keys block") {
+                            let name = kdl_name!(key);
+                            let value = plist_value_from_kdl(key)?;
+                            session_service.add_launchd_key(name, value).map_err(|e| {
+                                ConfigError::new_kdl_error(e, key.span().offset(), key.span().len())
+                            })?;
+                        }
+                    }
+                },
+                other => {
+                    return Err(ConfigError::new_kdl_error(
+                        format!(
+                            "Unknown init system: {:?} (expected systemd or launchd)",
+                            other
+                        ),
+                        init_system.span().offset(),
+                        init_system.span().len(),
+                    ))
+                },
+            }
+        }
+        Ok(session_service)
+    }
+    fn session_service_to_kdl(&self) -> Option<KdlNode> {
+        let session_service = self.session_service.as_ref()?;
+        if session_service.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("session_service");
+        let mut init_systems = KdlDocument::new();
+
+        let sections = [
+            ("unit", &session_service.systemd.unit),
+            ("service", &session_service.systemd.service),
+            ("install", &session_service.systemd.install),
+        ];
+        if sections.iter().any(|(_, lines)| !lines.is_empty()) {
+            let mut systemd = KdlDocument::new();
+            for (section_name, lines) in sections {
+                if lines.is_empty() {
+                    continue;
+                }
+                let mut section = KdlNode::new(section_name);
+                for line in lines {
+                    section.push(KdlValue::String(line.to_owned()));
+                }
+                systemd.nodes_mut().push(section);
+            }
+            let mut systemd_node = KdlNode::new("systemd");
+            systemd_node.set_children(systemd);
+            init_systems.nodes_mut().push(systemd_node);
+        }
+
+        if !session_service.launchd.is_empty() {
+            let mut keys = KdlDocument::new();
+            for key in &session_service.launchd {
+                let mut key_node = KdlNode::new(key.name.to_owned());
+                key_node.push(match &key.value {
+                    PlistValue::String(value) => KdlValue::String(value.to_owned()),
+                    PlistValue::Integer(value) => KdlValue::Base10(*value),
+                    PlistValue::Bool(value) => KdlValue::Bool(*value),
+                });
+                keys.nodes_mut().push(key_node);
+            }
+            let mut keys_node = KdlNode::new("keys");
+            keys_node.set_children(keys);
+            let mut launchd = KdlDocument::new();
+            launchd.nodes_mut().push(keys_node);
+            let mut launchd_node = KdlNode::new("launchd");
+            launchd_node.set_children(launchd);
+            init_systems.nodes_mut().push(launchd_node);
+        }
+
+        node.set_children(init_systems);
+        Some(node)
     }
     fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
         self.plugin_watch.map(|plugin_watch| {
@@ -4414,6 +4568,9 @@ impl Options {
         }
         if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
             nodes.push(session_restart_drop_env);
+        }
+        if let Some(session_service) = self.session_service_to_kdl() {
+            nodes.push(session_service);
         }
         if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
             nodes.push(session_snapshot_limit);
@@ -7632,6 +7789,99 @@ fn session_restart_drop_env_config_parsing() {
 fn session_restart_drop_env_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_restart_drop_env, None);
+}
+
+#[test]
+fn session_service_config_parsing() {
+    let config_with_session_service = r#"
+        session_service {
+            systemd {
+                unit "After=network.target" "Before=some-other.service"
+                service "Nice=-5"
+            }
+            launchd {
+                keys {
+                    ProcessType "Interactive"
+                    Nice 5
+                    AbandonProcessGroup true
+                }
+            }
+        }
+    "#;
+    let config = Config::from_kdl(config_with_session_service, None).unwrap();
+    let session_service = config.options.session_service.clone().unwrap();
+    assert_eq!(
+        session_service.systemd.unit,
+        vec![
+            "After=network.target".to_owned(),
+            "Before=some-other.service".to_owned()
+        ]
+    );
+    assert_eq!(session_service.systemd.service, vec!["Nice=-5".to_owned()]);
+    assert!(session_service.systemd.install.is_empty());
+    assert_eq!(
+        session_service.launchd,
+        vec![
+            LaunchdKey {
+                name: "ProcessType".to_owned(),
+                value: PlistValue::String("Interactive".to_owned())
+            },
+            LaunchdKey {
+                name: "Nice".to_owned(),
+                value: PlistValue::Integer(5)
+            },
+            LaunchdKey {
+                name: "AbandonProcessGroup".to_owned(),
+                value: PlistValue::Bool(true)
+            },
+        ]
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn session_service_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.session_service, None);
+}
+
+/// The entries the generator owns are rejected where a person can see it - at parse time, so that
+/// `zellij setup --check` reports them like any other config error rather than the unit quietly
+/// becoming one that builds an invisible session.
+#[test]
+fn session_service_refuses_the_entries_the_generator_owns() {
+    let offenders = [
+        (
+            r#"session_service { systemd { service "ExecStart=/bin/false" } }"#,
+            "ExecStart",
+        ),
+        (
+            r#"session_service { systemd { service "Environment=TMPDIR=/tmp/mine" } }"#,
+            "TMPDIR",
+        ),
+        (
+            r#"session_service { launchd { keys { Label "mine" } } }"#,
+            "Label",
+        ),
+        (
+            r#"session_service { launchd { keys { EnvironmentVariables "mine" } } }"#,
+            "EnvironmentVariables",
+        ),
+    ];
+    for (config, offender) in offenders {
+        let error = format!("{:?}", Config::from_kdl(config, None).unwrap_err());
+        assert!(
+            error.contains(offender),
+            "{:?} was not reported as naming {}: {}",
+            config,
+            offender,
+            error
+        );
+    }
 }
 
 #[cfg(test)]

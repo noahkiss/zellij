@@ -21,7 +21,8 @@ use zellij_utils::session_lifecycle::{
     env_vars_to_drop, warn_if_server_build_differs, DownOutcome, SessionFacts,
 };
 use zellij_utils::session_service::{
-    self, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome, ServiceExe, ServiceKind,
+    self, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome, PlistValue, ServiceExe,
+    ServiceKind, SessionServiceOptions,
 };
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
@@ -73,7 +74,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
         },
         SessionLifecycleCli::Enable { session_name, exe } => {
             let name = resolve_session_name(session_name, &opts, false);
-            process::exit(match enable(&name, exe) {
+            process::exit(match enable(&name, exe, &opts) {
                 Ok(()) => 0,
                 Err(()) => 1,
             });
@@ -87,7 +88,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
         },
         SessionLifecycleCli::Status { session_name, exe } => {
             let name = resolve_session_name(session_name, &opts, false);
-            process::exit(status(&name, exe));
+            process::exit(status(&name, exe, &opts));
         },
     }
 }
@@ -118,15 +119,28 @@ fn service_exe(explicit: Option<PathBuf>) -> PathBuf {
     exe.path().to_path_buf()
 }
 
+/// What the config adds to the generated unit, if anything.
+///
+/// A generated unit knows the binary, the session and the schedule; everything local - an ordering
+/// against another service, a nice level - comes from here. The config is where it lives so that
+/// the tool can see it: a systemd drop-in would work and `zellij session status` could never
+/// report it.
+fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
+    get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_service)
+}
+
 /// Write the unit and hand it to the init system.
 ///
 /// The whole command is idempotent, because the thing it installs is: `zellij session up` over a
 /// healthy session is a no-op, so re-enabling costs nothing and enabling twice is not an error to
 /// report but a state to confirm.
-fn enable(name: &str, exe: Option<PathBuf>) -> Result<(), ()> {
+fn enable(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> Result<(), ()> {
     let kind = native_service_kind()?;
     let exe = service_exe(exe);
-    match session_service::enable(kind, &exe, name) {
+    let extras = configured_extras(opts);
+    match session_service::enable(kind, &exe, name, extras.as_ref()) {
         Ok(EnableOutcome::AlreadyEnabled) => {
             println!("ok    service for '{}' is already enabled", name);
             Ok(())
@@ -182,13 +196,14 @@ fn disable(name: &str) -> Result<(), ()> {
 ///
 /// Exits 0 when the unit is installed AND loaded, whatever the session is doing - the session is
 /// the thing the unit repairs, and `zellij session up` is the command that reports on it.
-fn status(name: &str, exe: Option<PathBuf>) -> i32 {
+fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
     let Ok(kind) = native_service_kind() else {
         return 1;
     };
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
     let exe = resolve_service_exe(exe, &current_exe, &path_dirs());
-    let status = match session_service::status(kind, exe.path(), name) {
+    let extras = configured_extras(opts);
+    let status = match session_service::status(kind, exe.path(), name, extras.as_ref()) {
         Ok(status) => status,
         Err(reason) => {
             eprintln!("session status: {}", reason);
@@ -216,6 +231,10 @@ fn status(name: &str, exe: Option<PathBuf>) -> i32 {
         status.load_detail
     );
 
+    // what the config adds is reported here because it can be: this is the whole argument for
+    // keeping it in the config rather than in a drop-in directory the tool cannot see
+    print_configured_extras(kind, extras.as_ref());
+
     let facts = SessionFacts::collect(name);
     match facts.assert_up() {
         Ok(()) => println!("running   yes, in {}", facts.socket_dir.display()),
@@ -226,6 +245,38 @@ fn status(name: &str, exe: Option<PathBuf>) -> i32 {
         0
     } else {
         1
+    }
+}
+
+/// List what `session_service` in the config puts into the unit, for the init system in use.
+fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOptions>) {
+    let Some(extras) = extras.filter(|extras| !extras.is_empty()) else {
+        println!("config    no session_service extras");
+        return;
+    };
+    match kind {
+        ServiceKind::Systemd => {
+            let sections = [
+                ("Unit", &extras.systemd.unit),
+                ("Service", &extras.systemd.service),
+                ("Install", &extras.systemd.install),
+            ];
+            for (section, directives) in sections {
+                for directive in directives {
+                    println!("config    [{}] {}", section, directive);
+                }
+            }
+        },
+        ServiceKind::Launchd => {
+            for key in &extras.launchd {
+                let value = match &key.value {
+                    PlistValue::String(value) => value.to_owned(),
+                    PlistValue::Integer(value) => value.to_string(),
+                    PlistValue::Bool(value) => value.to_string(),
+                };
+                println!("config    {} = {}", key.name, value);
+            }
+        },
     }
 }
 

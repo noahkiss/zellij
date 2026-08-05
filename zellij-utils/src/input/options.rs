@@ -1,6 +1,7 @@
 //! Handles cli and configuration options
 use crate::cli::Command;
 use crate::data::{InputMode, WebSharing};
+use crate::session_service::SessionServiceOptions;
 use clap::{ArgEnum, Args};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -210,6 +211,17 @@ pub struct Options {
     #[serde(default)]
     pub session_restart_drop_env: Option<Vec<String>>,
 
+    /// Extra directives to place in the init-system unit `zellij session enable` writes, passed
+    /// through verbatim: systemd directive lines per section, launchd plist keys. A generated unit
+    /// cannot know the local facts - that this session must start after some other service, that
+    /// it wants a particular nice level - and the systemd answer to that, a drop-in directory, is
+    /// invisible to the tool that generated the unit. Configuration zellij generates from belongs
+    /// where zellij can see it.
+    /// config.kdl only - it is read when a unit is written, which no CLI flag affects.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_service: Option<SessionServiceOptions>,
+
     /// Whether to use ANSI styled underlines
     #[clap(long, value_parser)]
     #[serde(default)]
@@ -413,6 +425,9 @@ impl Options {
         let session_restart_drop_env = other
             .session_restart_drop_env
             .or_else(|| self.session_restart_drop_env.clone());
+        let session_service = other
+            .session_service
+            .or_else(|| self.session_service.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -480,6 +495,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            session_service,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -568,6 +584,9 @@ impl Options {
         let session_restart_drop_env = other
             .session_restart_drop_env
             .or_else(|| self.session_restart_drop_env.clone());
+        let session_service = other
+            .session_service
+            .or_else(|| self.session_service.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -635,6 +654,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            session_service,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
