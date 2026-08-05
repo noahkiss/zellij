@@ -741,11 +741,21 @@ added to them after it was written.
 
 What it will not carry is what the generator owns — `ExecStart`, the plist keys zellij writes
 itself (`Label`, `ProgramArguments`, `LimitLoadToSessionType`, `EnvironmentVariables`, `RunAtLoad`,
-`StartInterval`), and anything naming `TMPDIR` or `ZELLIJ_SOCKET_DIR`. Those are config errors
+`StartInterval`), and anything that **sets** `TMPDIR` or `ZELLIJ_SOCKET_DIR`. Those are config errors
 naming the offending entry, reported at parse time so `setup --check` catches them; a unit that
 pins either variable builds a session no terminal can see, which is the failure this whole design
 exists to prevent. A duplicate key is not an override either: a dict with the same key twice is not
 a plist.
+
+**A mention is not an assignment.** The check used to read the whole directive as text, so
+`UnsetEnvironment=ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID ZELLIJ_SOCKET_DIR` — a unit doing
+exactly what the guard wants — was refused, and because the check runs at KDL parse time the whole
+config failed with it: `setup --check` and every other command, not only `session enable`. The
+directives are now read the way systemd reads them. `Environment=`/`DefaultEnvironment=` are
+checked per `NAME=` word (quoted words included), `PassEnvironment=` per name, and
+`EnvironmentFile=` stays strict because the file is opaque from here. `UnsetEnvironment=` may name
+whatever it likes. On the launchd side a key is still refused when its name or its string value
+names one of the two: a plist key cannot be read the way a directive can.
 
 `TERM` is the one exception, and deliberately so: it is a *default* the generator supplies rather
 than a part of the unit it owns, so an entry setting it replaces that default instead of being

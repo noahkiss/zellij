@@ -615,7 +615,7 @@ impl SessionServiceOptions {
                 directive
             ));
         }
-        if let Some(name) = forbidden_env_name(directive) {
+        if let Some(name) = forbidden_systemd_assignment(directive) {
             return Err(format!(
                 "'{}' sets {}, which would build a session no terminal can see - the binary \
                  resolves that itself",
@@ -653,6 +653,51 @@ impl SessionServiceOptions {
         });
         Ok(())
     }
+}
+
+/// Which forbidden variable a systemd directive SETS, if it sets one.
+///
+/// A mention is not an assignment, and the difference is not academic: `UnsetEnvironment=ZELLIJ
+/// ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID ZELLIJ_SOCKET_DIR` is a unit doing exactly what this guard
+/// wants, and reading it as a violation refused it - at KDL parse time, which fails the WHOLE
+/// config, so `setup --check` and every other command fail with it, not only `session enable`.
+///
+/// So the directives are read the way systemd reads them:
+///
+/// - `Environment=` / `DefaultEnvironment=` carry `NAME=value` words, and it is the NAME that has
+///   to be looked at. Words are separated by whitespace and may be quoted.
+/// - `PassEnvironment=` names variables to import from the manager's environment, which puts the
+///   value into the unit as surely as an assignment does.
+/// - `EnvironmentFile=` is opaque - the file could set anything and cannot be read from here - so
+///   it stays as strict as it was: naming a forbidden variable at all is refused.
+/// - Everything else, `UnsetEnvironment=` included, may name what it likes.
+fn forbidden_systemd_assignment(directive: &str) -> Option<&'static str> {
+    let (key, value) = directive.split_once('=')?;
+    let key = key.trim();
+    if key.eq_ignore_ascii_case("EnvironmentFile") {
+        return forbidden_env_name(value);
+    }
+    let names_variables = key.eq_ignore_ascii_case("PassEnvironment");
+    if !names_variables
+        && !key.eq_ignore_ascii_case("Environment")
+        && !key.eq_ignore_ascii_case("DefaultEnvironment")
+    {
+        return None;
+    }
+    value
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'']))
+        .find_map(|word| {
+            let assigned = if names_variables {
+                word
+            } else {
+                word.split('=').next()?
+            };
+            FORBIDDEN_ENV_NAMES
+                .iter()
+                .find(|name| **name == assigned)
+                .copied()
+        })
 }
 
 fn forbidden_env_name(text: &str) -> Option<&'static str> {
@@ -2094,6 +2139,59 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
                 PlistValue::String("/tmp/ZELLIJ_SOCKET_DIR".to_owned())
             )
             .is_err());
+    }
+
+    /// A directive that UNSETS the variables is the guard's own argument written into the unit, and
+    /// refusing it was a mention being read as an assignment. It refused at KDL parse time, so the
+    /// whole config failed with it - `setup --check` and every other command, not just `session
+    /// enable`.
+    #[test]
+    fn a_directive_that_unsets_the_variables_is_the_opposite_of_pinning_them() {
+        let mut extras = SessionServiceOptions::default();
+        for directive in [
+            "UnsetEnvironment=ZELLIJ ZELLIJ_SESSION_NAME ZELLIJ_PANE_ID ZELLIJ_SOCKET_DIR",
+            "UnsetEnvironment=TMPDIR",
+            // a value that merely mentions one is not an assignment of it either
+            "Description=keeps TMPDIR out of the session",
+        ] {
+            assert!(
+                extras.add_systemd_directive("service", directive).is_ok(),
+                "refused {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn setting_them_is_still_refused_however_it_is_written() {
+        let mut extras = SessionServiceOptions::default();
+        for directive in [
+            "Environment=TMPDIR=/tmp/mine",
+            "Environment=FOO=bar TMPDIR=/tmp/mine",
+            "Environment=\"ZELLIJ_SOCKET_DIR=/tmp/mine\"",
+            "DefaultEnvironment=TMPDIR=/tmp/mine",
+            // importing it from the manager's environment puts it in the unit just the same
+            "PassEnvironment=ZELLIJ_SOCKET_DIR",
+            // an env file could set anything and cannot be read from here, so it stays strict
+            "EnvironmentFile=/etc/zellij/TMPDIR",
+        ] {
+            assert!(
+                extras.add_systemd_directive("service", directive).is_err(),
+                "accepted {}",
+                directive
+            );
+        }
+    }
+
+    #[test]
+    fn a_variable_whose_name_only_starts_the_same_is_not_a_forbidden_one() {
+        let mut extras = SessionServiceOptions::default();
+        assert!(extras
+            .add_systemd_directive("service", "Environment=TMPDIR_BACKUP=/tmp/mine")
+            .is_ok());
+        assert!(extras
+            .add_systemd_directive("service", "Environment=MY_TMPDIR=/tmp/mine")
+            .is_ok());
     }
 
     #[test]
