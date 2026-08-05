@@ -276,6 +276,38 @@ fn assert_up_from(
     Ok(())
 }
 
+/// Whether one `session_restart_drop_env` pattern names this variable.
+///
+/// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
+/// anywhere else is an ordinary character and matches itself - environment variable names are
+/// matched, not globbed, and half a glob implementation is worse than none, because the pattern
+/// that silently means something else is the one that drops the wrong variable.
+fn drop_pattern_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    }
+}
+
+/// The variable names among `names` that `patterns` names, in the order they were given.
+///
+/// A pattern that matches nothing is not an error: config is written once and travels between
+/// machines, where the program it describes may not be installed.
+pub fn env_vars_to_drop<'a>(
+    patterns: &[String],
+    names: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    names
+        .into_iter()
+        .filter(|name| {
+            patterns
+                .iter()
+                .any(|pattern| drop_pattern_matches(pattern, name))
+        })
+        .map(|name| name.to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +432,66 @@ mod tests {
         let expected = PathBuf::from("/run/zellij/c1/work");
         assert!(assert_up_from(&[], &expected, true, true, false).is_ok());
         assert!(assert_up_from(&[], &expected, false, true, false).is_err());
+    }
+
+    fn patterns(patterns: &[&str]) -> Vec<String> {
+        patterns.iter().map(|p| p.to_string()).collect()
+    }
+
+    const ENVIRONMENT: &[&str] = &[
+        "MY_VAR",
+        "MY_VAR_TOO",
+        "MY_PREFIX_ONE",
+        "MY_PREFIX_TWO",
+        "PATH",
+    ];
+
+    #[test]
+    fn an_exact_pattern_drops_only_that_variable() {
+        assert_eq!(
+            env_vars_to_drop(&patterns(&["MY_VAR"]), ENVIRONMENT.iter().copied()),
+            vec!["MY_VAR".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_trailing_star_drops_the_whole_prefix() {
+        assert_eq!(
+            env_vars_to_drop(&patterns(&["MY_PREFIX_*"]), ENVIRONMENT.iter().copied()),
+            vec!["MY_PREFIX_ONE".to_owned(), "MY_PREFIX_TWO".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_star_that_is_not_at_the_end_is_a_literal_character() {
+        // the pattern names a variable called exactly `MY_*_VAR`, which is not in the environment
+        assert!(env_vars_to_drop(&patterns(&["MY_*_VAR"]), ENVIRONMENT.iter().copied()).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_drops_nothing() {
+        assert!(env_vars_to_drop(
+            &patterns(&["NOT_HERE", "NOT_HERE_*"]),
+            ENVIRONMENT.iter().copied()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn no_patterns_drop_nothing() {
+        assert!(env_vars_to_drop(&[], ENVIRONMENT.iter().copied()).is_empty());
+    }
+
+    #[test]
+    fn a_variable_named_by_two_patterns_is_dropped_once() {
+        assert_eq!(
+            env_vars_to_drop(&patterns(&["MY_VAR", "MY_*"]), ENVIRONMENT.iter().copied()),
+            vec![
+                "MY_VAR".to_owned(),
+                "MY_VAR_TOO".to_owned(),
+                "MY_PREFIX_ONE".to_owned(),
+                "MY_PREFIX_TWO".to_owned()
+            ]
+        );
     }
 }

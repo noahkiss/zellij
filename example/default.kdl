@@ -541,6 +541,16 @@ load_plugins {
 //     my-session "MS"
 // }
 
+// Environment variables `zellij session restart` unsets before it rebuilds the session
+// A restart inherits the environment of the pane it was typed in, and the rebuilt session hands
+// that environment to every pane in it - so a variable that describes the one program that asked
+// for the restart would end up describing all of them
+// Each entry is either an exact variable name or a name ending in `*`, which matches by prefix
+// A `*` anywhere else is an ordinary character and matches itself
+// Default: drop nothing
+//
+// session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
+
 // A command to run (will be wrapped with sh -c and provided the RESURRECT_COMMAND env variable)
 // after Zellij attempts to discover a command inside a pane when resurrecting sessions, the STDOUT
 // of this command will be used instead of the discovered RESURRECT_COMMAND

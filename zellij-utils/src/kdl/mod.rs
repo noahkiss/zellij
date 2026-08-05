@@ -2750,6 +2750,15 @@ impl Options {
             Some(kdl_session_aliases) => Some(Self::session_aliases_from_kdl(kdl_session_aliases)?),
             None => None,
         };
+        let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
+            Some(kdl_drop_env) => Some(
+                kdl_string_arguments!(kdl_drop_env)
+                    .iter()
+                    .map(|pattern| pattern.to_string())
+                    .collect(),
+            ),
+            None => None,
+        };
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -2871,6 +2880,7 @@ impl Options {
             session_snapshot_limit,
             terminal_title_template,
             session_aliases,
+            session_restart_drop_env,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3242,6 +3252,17 @@ impl Options {
             aliases.nodes_mut().push(alias_node);
         }
         node.set_children(aliases);
+        Some(node)
+    }
+    fn session_restart_drop_env_to_kdl(&self) -> Option<KdlNode> {
+        let patterns = self.session_restart_drop_env.as_ref()?;
+        if patterns.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("session_restart_drop_env");
+        for pattern in patterns {
+            node.push(KdlValue::String(pattern.to_owned()));
+        }
         Some(node)
     }
     fn session_aliases_from_kdl(
@@ -4369,6 +4390,9 @@ impl Options {
         }
         if let Some(session_aliases) = self.session_aliases_to_kdl() {
             nodes.push(session_aliases);
+        }
+        if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
+            nodes.push(session_restart_drop_env);
         }
         if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
             nodes.push(session_snapshot_limit);
@@ -7560,4 +7584,27 @@ fn terminal_title_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.terminal_title_template, None);
     assert_eq!(config.options.session_aliases, None);
+}
+
+#[test]
+fn session_restart_drop_env_config_parsing() {
+    let config_with_drop_env = r#"
+        session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
+    "#;
+    let config = Config::from_kdl(config_with_drop_env, None).unwrap();
+    assert_eq!(
+        config.options.session_restart_drop_env,
+        Some(vec!["MY_VAR".to_owned(), "MY_PREFIX_*".to_owned()])
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn session_restart_drop_env_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.session_restart_drop_env, None);
 }

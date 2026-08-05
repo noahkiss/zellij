@@ -200,6 +200,16 @@ pub struct Options {
     #[serde(default)]
     pub session_aliases: Option<BTreeMap<String, String>>,
 
+    /// Environment variables `zellij session restart` unsets before it rebuilds the session, as
+    /// exact names or as a name ending in `*`, which matches by prefix. A restart inherits the
+    /// environment of the pane it was typed in, and the rebuilt session hands that environment to
+    /// every pane in it - so a variable that describes the ONE program that asked for the restart
+    /// ends up describing all of them. Unset means drop nothing.
+    /// config.kdl only - it is read by the restart itself, which is the only thing it affects.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_restart_drop_env: Option<Vec<String>>,
+
     /// Whether to use ANSI styled underlines
     #[clap(long, value_parser)]
     #[serde(default)]
@@ -400,6 +410,9 @@ impl Options {
         let session_aliases = other
             .session_aliases
             .or_else(|| self.session_aliases.clone());
+        let session_restart_drop_env = other
+            .session_restart_drop_env
+            .or_else(|| self.session_restart_drop_env.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -466,6 +479,7 @@ impl Options {
             session_snapshot_limit,
             terminal_title_template,
             session_aliases,
+            session_restart_drop_env,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -551,6 +565,9 @@ impl Options {
         let session_aliases = other
             .session_aliases
             .or_else(|| self.session_aliases.clone());
+        let session_restart_drop_env = other
+            .session_restart_drop_env
+            .or_else(|| self.session_restart_drop_env.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -617,6 +634,7 @@ impl Options {
             session_snapshot_limit,
             terminal_title_template,
             session_aliases,
+            session_restart_drop_env,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
-use zellij_utils::session_lifecycle::SessionFacts;
+use zellij_utils::session_lifecycle::{env_vars_to_drop, SessionFacts};
 use zellij_utils::sessions::{
     delete_session as delete_session_impl, validate_session_name, KillWait,
 };
@@ -236,6 +236,27 @@ fn down(name: &str, wait_timeout: u64, opts: &CliArgs) -> Result<(), ()> {
     Ok(())
 }
 
+/// Unset what `session_restart_drop_env` names, so the rebuilt session does not hand it out.
+///
+/// The environment a restart inherits is the environment of the pane it was typed in, and the
+/// session built from it gives that environment to every pane in it. A variable that describes the
+/// one program that asked for the restart would then describe all of them, and programs that read
+/// it would believe something about their pane that is not true. Called once the restart is a
+/// session of its own and before anything is rebuilt, so nothing carries the old values across.
+fn drop_configured_env(opts: &CliArgs) {
+    let Some(patterns) = get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_restart_drop_env)
+    else {
+        return;
+    };
+    let names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
+    for name in env_vars_to_drop(&patterns, names.iter().map(|name| name.as_str())) {
+        println!("      dropping {} from the rebuilt session", name);
+        std::env::remove_var(name);
+    }
+}
+
 /// Take the session down and bring it back, from inside it or from anywhere else.
 ///
 /// The work has to outlive the session it is destroying: the teardown kills every pane shell,
@@ -291,6 +312,7 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
     ] {
         std::env::remove_var(var);
     }
+    drop_configured_env(opts);
 
     if down(name, wait_timeout, opts).is_err() {
         eprintln!("teardown failed; NOT recreating the session.");
@@ -306,6 +328,7 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
 /// the server is about to kill.
 #[cfg(not(unix))]
 fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArgs) -> ! {
+    drop_configured_env(opts);
     if down(name, wait_timeout, opts).is_err() {
         eprintln!("teardown failed; NOT recreating the session.");
         process::exit(1);
