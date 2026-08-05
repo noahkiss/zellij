@@ -213,17 +213,40 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
 
     println!("session   {}", name);
     println!("init      {}", status.kind.name());
-    let mut installed = true;
-    for file in &status.files {
-        let state = match (file.present, file.stale) {
-            (false, _) => "missing".to_owned(),
-            (true, true) => {
+    // A job that runs `session up` for this session under another name is doing the work, so the
+    // file this build would have written being absent is not the fault it looks like. It is
+    // reported against the first file, which is the one that runs the command - the timer beside it
+    // on systemd is this build's own arrangement and says nothing about someone else's.
+    let elsewhere = status.installed_as.first();
+    for (index, file) in status.files.iter().enumerate() {
+        let state = match (file.present, file.stale, index == 0, elsewhere) {
+            (false, _, true, Some(job)) => format!(
+                "installed under a different name: {} ({})",
+                job.name,
+                job.path.display()
+            ),
+            (false, ..) => "missing".to_owned(),
+            (true, true, ..) => {
                 "installed (differs from what `session enable` would write now)".to_owned()
             },
-            (true, false) => "installed".to_owned(),
+            (true, false, ..) => "installed".to_owned(),
         };
-        installed &= file.present;
         println!("{:9} {} - {}", file.role, file.path.display(), state);
+    }
+    let installed = match elsewhere {
+        // this build did not write that install and cannot say which files belong to it, so
+        // whether the init system holds the job is the whole of what can be judged
+        Some(_) => true,
+        None => status.files.iter().all(|file| file.present),
+    };
+    for other in status.installed_as.iter().skip(1) {
+        println!(
+            "{:9} {} also runs `session up {}` ({})",
+            "ambiguous",
+            other.name,
+            name,
+            other.path.display()
+        );
     }
     println!(
         "loaded    {} ({})",

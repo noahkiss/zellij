@@ -114,6 +114,319 @@ pub fn launchd_label(session: &str) -> String {
     format!("dev.zellij.session.{}", session)
 }
 
+/// An installed job, reduced to the two things that identify it: the name the init system knows it
+/// by, and the command it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledJob {
+    /// The launchd label, or the systemd unit name.
+    pub name: String,
+    /// The file it was read from.
+    pub path: PathBuf,
+    /// The arguments it execs.
+    pub exec: Vec<String>,
+}
+
+/// Which installed job keeps a session up, judged by what it RUNS and not by what it is called.
+///
+/// [`launchd_label`] and [`systemd_service_name`] are this build's naming convention and nobody
+/// else's. A job installed by hand, by an earlier build, or by a dotfiles repository older than
+/// these commands does the same work under whatever name its author chose, and a lookup by the
+/// derived name calls it absent. That is worse than a cosmetic miss: the macOS domain guard exists
+/// to stop a permanently crippled session being created, and a guard that cannot see the job falls
+/// through to creating one - for everybody whose agent it did not install itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionJob<'a> {
+    /// Nothing installed runs `session up` for this session.
+    NotInstalled,
+    /// A job runs it, under the name this build would have installed.
+    Installed(&'a InstalledJob),
+    /// A job runs it under another name. It is still the job; the caller is to say which.
+    InstalledAs(&'a InstalledJob),
+    /// Several run it and none carries this build's name. All of them are carried, so that the one
+    /// chosen from them is not chosen silently.
+    Ambiguous(Vec<&'a InstalledJob>),
+}
+
+impl<'a> SessionJob<'a> {
+    /// The job to act on, where there is one.
+    ///
+    /// With several it is the first by name: arbitrary, but stable between runs. Every one of them
+    /// runs the same command, so any of them does the work - what matters is that the caller names
+    /// the others rather than pretending there was nothing to choose.
+    pub fn job(&self) -> Option<&'a InstalledJob> {
+        match self {
+            SessionJob::NotInstalled => None,
+            SessionJob::Installed(job) | SessionJob::InstalledAs(job) => Some(job),
+            SessionJob::Ambiguous(jobs) => jobs.first().copied(),
+        }
+    }
+
+    /// The job found under a name this build would not have written, where that is what happened.
+    pub fn renamed(&self) -> Option<&'a InstalledJob> {
+        match self {
+            SessionJob::NotInstalled | SessionJob::Installed(_) => None,
+            _ => self.job(),
+        }
+    }
+
+    /// Every job that runs the command, under a name this build would not have written.
+    pub fn renamed_jobs(&self) -> Vec<&'a InstalledJob> {
+        match self {
+            SessionJob::NotInstalled | SessionJob::Installed(_) => Vec::new(),
+            SessionJob::InstalledAs(job) => vec![job],
+            SessionJob::Ambiguous(jobs) => jobs.clone(),
+        }
+    }
+}
+
+/// Find the job that keeps `session` up among `jobs`, preferring the one named `derived_name`.
+///
+/// The exact name wins when it is there, so an install this build wrote is never reported as an
+/// oddity, and the ambiguity that remains is real ambiguity.
+pub fn find_session_job<'a>(
+    jobs: &'a [InstalledJob],
+    session: &str,
+    derived_name: &str,
+) -> SessionJob<'a> {
+    let mut matched: Vec<&InstalledJob> = jobs
+        .iter()
+        .filter(|job| session_up_target(&job.exec) == Some(session))
+        .collect();
+    if let Some(exact) = matched.iter().copied().find(|job| job.name == derived_name) {
+        return SessionJob::Installed(exact);
+    }
+    matched.sort_by(|one, other| one.name.cmp(&other.name));
+    match matched.len() {
+        0 => SessionJob::NotInstalled,
+        1 => SessionJob::InstalledAs(matched[0]),
+        _ => SessionJob::Ambiguous(matched),
+    }
+}
+
+/// Options of `session up` that take a value, so that the value is not read as the session name.
+const SESSION_UP_VALUE_FLAGS: &[&str] = &["--restore"];
+
+/// The session a command line brings up, if that is what it does.
+///
+/// argv[0] is not looked at. A unit may exec zellij directly or hand it to a wrapper - a launcher,
+/// an environment shim, a scheduling helper - with the zellij path several arguments in, and the
+/// binary itself need not be called "zellij": a renamed or symlinked build is the same program.
+/// What identifies the job is the subcommand it runs, so that is what is matched.
+pub fn session_up_target(exec: &[String]) -> Option<&str> {
+    let up = exec
+        .windows(2)
+        .position(|pair| pair[0] == "session" && pair[1] == "up")?;
+    let mut rest = exec[up + 2..].iter();
+    while let Some(argument) = rest.next() {
+        if argument.starts_with('-') {
+            // `--restore <id>` carries a value that is not the session name
+            if SESSION_UP_VALUE_FLAGS.contains(&argument.as_str()) {
+                rest.next();
+            }
+            continue;
+        }
+        return Some(argument);
+    }
+    // `session up` with no name takes it from the config, which this cannot read on the unit's
+    // behalf - so it names no session here rather than guessing at one
+    None
+}
+
+/// `Label` and `ProgramArguments` out of a launch agent plist.
+///
+/// Two keys of a known shape, out of a file format that is XML. A whole plist parser, and the
+/// dependency it arrives with, buys nothing for that. What this does not read is a plist saved in
+/// the binary format - [`read_installed_job`] converts one first.
+pub fn parse_launch_agent(xml: &str) -> Option<(String, Vec<String>)> {
+    let label = first_string(value_after_key(xml, "Label")?)?;
+    let arguments = string_array(value_after_key(xml, "ProgramArguments")?)?;
+    Some((label, arguments))
+}
+
+/// What follows `<key>NAME</key>`, which is that key's value.
+fn value_after_key<'a>(xml: &'a str, key: &str) -> Option<&'a str> {
+    let tag = format!("<key>{}</key>", key);
+    let start = xml.find(&tag)? + tag.len();
+    Some(&xml[start..])
+}
+
+/// The `<string>` a value begins with. It has to BEGIN with one: a value of another type followed
+/// by an unrelated string later in the dictionary is not this key's value.
+fn first_string(value: &str) -> Option<String> {
+    let value = value.trim_start().strip_prefix("<string>")?;
+    let end = value.find("</string>")?;
+    Some(xml_unescape(&value[..end]))
+}
+
+fn string_array(value: &str) -> Option<Vec<String>> {
+    let value = value.trim_start().strip_prefix("<array>")?;
+    let end = value.find("</array>")?;
+    let mut strings = Vec::new();
+    let mut rest = &value[..end];
+    while let Some(start) = rest.find("<string>") {
+        rest = &rest[start + "<string>".len()..];
+        let end = rest.find("</string>")?;
+        strings.push(xml_unescape(&rest[..end]));
+        rest = &rest[end..];
+    }
+    Some(strings)
+}
+
+/// The inverse of [`xml_escape`]. An unrecognised entity is left alone rather than dropped: a
+/// literal that this does not know is still closer to the truth than nothing.
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        // last, so that an escaped entity such as `&amp;lt;` does not become a tag
+        .replace("&amp;", "&")
+}
+
+/// The `ExecStart` of a systemd unit, split into arguments.
+///
+/// `ExecStartPre` and `ExecStartPost` are other keys and are not it, and a commented-out line is
+/// not a directive - both are the ordinary ways a naive substring search reads a unit wrongly.
+pub fn parse_unit_exec_start(unit: &str) -> Option<Vec<String>> {
+    for line in unit.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, command)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "ExecStart" {
+            continue;
+        }
+        // systemd's prefixes on a command: ignore failure, run as root, and so on. None of them
+        // change which command it is.
+        let command = command.trim_start_matches(['-', '+', '!', '@', ':']);
+        return Some(split_command_line(command));
+    }
+    None
+}
+
+/// Split a command line the way both unit formats quote one: whitespace separates arguments, and
+/// quotes hold one together.
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote = None;
+    for character in line.chars() {
+        match (quote, character) {
+            (Some(open), character) if character == open => quote = None,
+            (Some(_), character) => current.push(character),
+            (None, '"') | (None, '\'') => {
+                quote = Some(character);
+                started = true;
+            },
+            (None, character) if character.is_whitespace() => {
+                if started {
+                    arguments.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            },
+            (None, character) => {
+                current.push(character);
+                started = true;
+            },
+        }
+    }
+    if started {
+        arguments.push(current);
+    }
+    arguments
+}
+
+/// Every job installed for this user that this build can read, whatever it is called.
+///
+/// The files are read rather than the init system asked, and for launchd that is the deliberate
+/// choice: `launchctl list` gives labels with no command line, so the command would have to be
+/// fetched with one `launchctl print` per label - hundreds of subprocesses, over output whose
+/// format is undocumented and differs between releases. A plist holds both keys in a documented
+/// format that has not changed. Whether the init system currently HOLDS a job is a separate
+/// question, asked by name afterwards, so nothing here depends on the file being the whole truth.
+///
+/// Compiled under `cfg(test)` on every unix so the macOS path cannot rot on a machine that never
+/// builds it.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub fn installed_launch_agents() -> Vec<InstalledJob> {
+    installed_jobs(ServiceKind::Launchd, "plist")
+}
+
+/// The systemd user units installed for this user.
+#[cfg(target_os = "linux")]
+pub fn installed_user_units() -> Vec<InstalledJob> {
+    installed_jobs(ServiceKind::Systemd, "service")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn installed_jobs(kind: ServiceKind, extension: &str) -> Vec<InstalledJob> {
+    let Ok(dir) = service_dir(kind) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        // no directory is not a fault: a machine with nothing installed has nothing to enumerate
+        return Vec::new();
+    };
+    let mut jobs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(extension) {
+            continue;
+        }
+        if let Some(job) = read_installed_job(kind, &path) {
+            jobs.push(job);
+        }
+    }
+    jobs
+}
+
+/// One job read off disk, or nothing if the file is not one this can make sense of.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn read_installed_job(kind: ServiceKind, path: &Path) -> Option<InstalledJob> {
+    match kind {
+        ServiceKind::Systemd => {
+            let unit = std::fs::read_to_string(path).ok()?;
+            Some(InstalledJob {
+                name: path.file_name()?.to_str()?.to_owned(),
+                path: path.to_path_buf(),
+                exec: parse_unit_exec_start(&unit)?,
+            })
+        },
+        ServiceKind::Launchd => {
+            let xml = launch_agent_xml(path)?;
+            let (label, exec) = parse_launch_agent(&xml)?;
+            Some(InstalledJob {
+                name: label,
+                path: path.to_path_buf(),
+                exec,
+            })
+        },
+    }
+}
+
+/// A launch agent as XML, converting it first if it was saved in the binary plist format.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn launch_agent_xml(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if !bytes.starts_with(b"bplist") {
+        return String::from_utf8(bytes).ok();
+    }
+    let converted = std::process::Command::new("plutil")
+        .args(["-convert", "xml1", "-o", "-"])
+        .arg(path)
+        .output()
+        .ok()?;
+    converted
+        .status
+        .success()
+        .then(|| String::from_utf8(converted.stdout).ok())
+        .flatten()
+}
+
 /// Local facts a generated unit cannot know: that this session must start after some other
 /// service, that it wants a particular nice level, that launchd should treat it as interactive.
 ///
@@ -615,6 +928,10 @@ pub struct ServiceStatus {
     /// Whether the init system currently holds the job, and how it phrased that.
     pub loaded: bool,
     pub load_detail: String,
+    /// Jobs that keep this session up under a name this build would not have written. Ordinarily
+    /// empty. When it is not, the derived file is absent and the work is being done all the same -
+    /// which is the opposite of what "missing" would say.
+    pub installed_as: Vec<InstalledJob>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -700,9 +1017,11 @@ pub fn status(
     extras: Option<&SessionServiceOptions>,
 ) -> Result<ServiceStatus, String> {
     let files = service_files(kind, exe, session, extras)?;
-    let (loaded, load_detail) = job_load_state(&files);
+    let installed_as = jobs_under_another_name(kind, session);
+    let (loaded, load_detail) = job_load_state(&files, &installed_as);
     Ok(ServiceStatus {
         kind,
+        installed_as,
         files: files
             .iter()
             .map(|file| ServiceFileStatus {
@@ -718,11 +1037,47 @@ pub fn status(
 }
 
 fn job_is_loaded(_kind: ServiceKind, files: &[ServiceFile]) -> bool {
-    job_load_state(files).0
+    // `enable` and `disable` act on the install this build writes, so only its own names decide
+    // whether that install is loaded
+    job_load_state(files, &[]).0
+}
+
+/// The jobs that keep `session` up under a name this build would not have written.
+///
+/// Empty on a machine whose install came from this command, which is the ordinary case.
+#[cfg(target_os = "linux")]
+fn jobs_under_another_name(_kind: ServiceKind, session: &str) -> Vec<InstalledJob> {
+    let units = installed_user_units();
+    find_session_job(&units, session, &systemd_service_name(session))
+        .renamed_jobs()
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn jobs_under_another_name(_kind: ServiceKind, session: &str) -> Vec<InstalledJob> {
+    let agents = installed_launch_agents();
+    find_session_job(&agents, session, &launchd_label(session))
+        .renamed_jobs()
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn jobs_under_another_name(_kind: ServiceKind, _session: &str) -> Vec<InstalledJob> {
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
-fn job_load_state(files: &[ServiceFile]) -> (bool, String) {
+fn job_load_state(files: &[ServiceFile], installed_as: &[InstalledJob]) -> (bool, String) {
+    // The install this build would write is not the one doing the work, so its unit names say
+    // nothing about whether the session is looked after. Report the unit that does it.
+    if let Some(job) = installed_as.first() {
+        let state = systemctl::is_enabled(&job.name).unwrap_or_else(|| "unknown".to_owned());
+        return (state == "enabled", format!("{} {}", job.name, state));
+    }
     let states: Vec<String> = files
         .iter()
         .map(|file| {
@@ -745,10 +1100,12 @@ fn job_load_state(files: &[ServiceFile]) -> (bool, String) {
 }
 
 #[cfg(target_os = "macos")]
-fn job_load_state(files: &[ServiceFile]) -> (bool, String) {
-    let label = files
+fn job_load_state(files: &[ServiceFile], installed_as: &[InstalledJob]) -> (bool, String) {
+    // whichever label carries the job, that is the one to ask launchd about
+    let label = installed_as
         .first()
-        .map(|file| file.unit.clone())
+        .map(|job| job.name.clone())
+        .or_else(|| files.first().map(|file| file.unit.clone()))
         .unwrap_or_default();
     let loaded = launchctl::job_is_loaded(&label);
     let detail = if loaded {
@@ -760,7 +1117,7 @@ fn job_load_state(files: &[ServiceFile]) -> (bool, String) {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn job_load_state(_files: &[ServiceFile]) -> (bool, String) {
+fn job_load_state(_files: &[ServiceFile], _installed_as: &[InstalledJob]) -> (bool, String) {
     (false, "unsupported init system".to_owned())
 }
 
@@ -1047,6 +1404,244 @@ mod tests {
         assert_eq!(
             files[0].path.file_name().unwrap().to_string_lossy(),
             format!("{}.plist", launchd_label("work"))
+        );
+    }
+
+    fn job(name: &str, exec: &[&str]) -> InstalledJob {
+        InstalledJob {
+            name: name.to_owned(),
+            path: PathBuf::from(format!("/agents/{}", name)),
+            exec: exec.iter().map(|argument| (*argument).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_job_this_build_installed_is_found_by_its_own_name() {
+        let jobs = [job(
+            &launchd_label("work"),
+            &["/usr/local/bin/zellij", "session", "up", "work"],
+        )];
+        assert_eq!(
+            find_session_job(&jobs, "work", &launchd_label("work")),
+            SessionJob::Installed(&jobs[0])
+        );
+    }
+
+    /// The case the derived name misses entirely: an agent installed by hand, or by anything older
+    /// than this command, doing the job under a name of its author's choosing.
+    #[test]
+    fn a_job_under_another_name_is_still_the_job() {
+        let jobs = [job(
+            "com.example.my-terminal",
+            &["/usr/local/bin/zellij", "session", "up", "work"],
+        )];
+        let found = find_session_job(&jobs, "work", &launchd_label("work"));
+        assert_eq!(found, SessionJob::InstalledAs(&jobs[0]));
+        assert_eq!(found.renamed(), Some(&jobs[0]));
+    }
+
+    #[test]
+    fn a_job_for_another_session_is_not_this_session_s() {
+        let jobs = [
+            job(
+                "com.example.one",
+                &["/usr/bin/zellij", "session", "up", "notes"],
+            ),
+            job(
+                "com.example.two",
+                &["/usr/bin/zellij", "session", "up", "work-notes"],
+            ),
+        ];
+        assert_eq!(
+            find_session_job(&jobs, "work", &launchd_label("work")),
+            SessionJob::NotInstalled
+        );
+    }
+
+    #[test]
+    fn a_job_running_another_subcommand_is_not_a_match() {
+        let jobs = [
+            job(
+                "com.example.down",
+                &["/usr/bin/zellij", "session", "down", "work"],
+            ),
+            job("com.example.attach", &["/usr/bin/zellij", "attach", "work"]),
+            job(
+                "com.example.action",
+                &["/usr/bin/zellij", "-s", "work", "action", "dump-screen"],
+            ),
+        ];
+        assert_eq!(
+            find_session_job(&jobs, "work", &launchd_label("work")),
+            SessionJob::NotInstalled
+        );
+    }
+
+    /// argv[0] is whatever the author put in front: a wrapper, an environment shim, a scheduler.
+    /// The subcommand is what identifies the job, and the binary need not even be called zellij.
+    #[test]
+    fn a_wrapper_in_front_of_the_binary_does_not_hide_the_job() {
+        let jobs = [
+            job(
+                "com.example.wrapped",
+                &[
+                    "/usr/bin/env",
+                    "-i",
+                    "/opt/builds/zj-nightly",
+                    "session",
+                    "up",
+                    "work",
+                ],
+            ),
+            job(
+                "com.example.restoring",
+                &[
+                    "/usr/bin/zellij",
+                    "session",
+                    "up",
+                    "--restore",
+                    "3",
+                    "other",
+                ],
+            ),
+        ];
+        assert_eq!(
+            find_session_job(&jobs, "work", &launchd_label("work")),
+            SessionJob::InstalledAs(&jobs[0])
+        );
+        // and the value of an option is not read as the session name
+        assert_eq!(
+            find_session_job(&jobs, "3", &launchd_label("3")),
+            SessionJob::NotInstalled
+        );
+        assert_eq!(
+            find_session_job(&jobs, "other", &launchd_label("other")),
+            SessionJob::InstalledAs(&jobs[1])
+        );
+    }
+
+    #[test]
+    fn several_jobs_for_one_session_are_all_reported() {
+        let jobs = [
+            job(
+                "com.example.second",
+                &["/usr/bin/zellij", "session", "up", "work"],
+            ),
+            job(
+                "com.example.first",
+                &["/usr/bin/zellij", "session", "up", "work"],
+            ),
+        ];
+        let found = find_session_job(&jobs, "work", &launchd_label("work"));
+        assert_eq!(found, SessionJob::Ambiguous(vec![&jobs[1], &jobs[0]]));
+        // one of them is acted on, and both are named so that the choice is not made in silence
+        assert_eq!(found.job(), Some(&jobs[1]));
+        assert_eq!(found.renamed_jobs().len(), 2);
+    }
+
+    /// This build's own name settles it: an install it wrote is never reported as an oddity just
+    /// because something else on the machine runs the same command.
+    #[test]
+    fn the_derived_name_wins_over_the_others() {
+        let jobs = [
+            job(
+                "com.example.other",
+                &["/usr/bin/zellij", "session", "up", "work"],
+            ),
+            job(
+                &launchd_label("work"),
+                &["/usr/bin/zellij", "session", "up", "work"],
+            ),
+        ];
+        let found = find_session_job(&jobs, "work", &launchd_label("work"));
+        assert_eq!(found, SessionJob::Installed(&jobs[1]));
+        assert!(found.renamed().is_none());
+    }
+
+    #[test]
+    fn with_nothing_installed_nothing_is_found() {
+        assert_eq!(
+            find_session_job(&[], "work", &launchd_label("work")),
+            SessionJob::NotInstalled
+        );
+        // a job that names no session takes it from the config, which cannot be read from here
+        let jobs = [job(
+            "com.example.bare",
+            &["/usr/bin/zellij", "session", "up"],
+        )];
+        assert_eq!(
+            find_session_job(&jobs, "work", &launchd_label("work")),
+            SessionJob::NotInstalled
+        );
+    }
+
+    /// What this build writes has to be readable by what this build reads, or the whole lookup is
+    /// theoretical.
+    #[test]
+    fn the_generated_units_are_read_back_as_the_jobs_they_are() {
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras()));
+        let (label, arguments) = parse_launch_agent(&plist).unwrap();
+        assert_eq!(label, launchd_label("work"));
+        assert_eq!(session_up_target(&arguments), Some("work"));
+
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras()));
+        let arguments = parse_unit_exec_start(&unit).unwrap();
+        assert_eq!(arguments[0], exe().display().to_string());
+        assert_eq!(session_up_target(&arguments), Some("work"));
+    }
+
+    /// A hand-written agent: keys in another order, other keys around them, and XML entities in the
+    /// values. All three are ordinary in a file this build did not write.
+    #[test]
+    fn a_hand_written_agent_is_read_the_way_launchd_reads_it() {
+        let plist = "\
+<plist version=\"1.0\">
+<dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/zellij</string>
+        <string>session</string>
+        <string>up</string>
+        <string>one &amp; two</string>
+    </array>
+    <key>Label</key>
+    <string>com.example.my-terminal</string>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+";
+        let (label, arguments) = parse_launch_agent(plist).unwrap();
+        assert_eq!(label, "com.example.my-terminal");
+        assert_eq!(arguments.len(), 4);
+        assert_eq!(session_up_target(&arguments), Some("one & two"));
+    }
+
+    #[test]
+    fn a_hand_written_unit_is_read_the_way_systemd_reads_it() {
+        let unit = "\
+[Unit]
+Description=a terminal
+# ExecStart=/usr/bin/zellij session up commented-out
+
+[Service]
+ExecStartPre=/usr/bin/zellij session down work
+ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
+";
+        let arguments = parse_unit_exec_start(unit).unwrap();
+        // the `-` prefix is systemd's, not part of the path, and a quoted argument is one argument
+        assert_eq!(arguments[0], "/opt/my");
+        assert_eq!(session_up_target(&arguments), Some("my session"));
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_job_is_not_read_as_one() {
+        assert_eq!(parse_launch_agent("<plist><dict></dict></plist>"), None);
+        assert_eq!(
+            parse_unit_exec_start("[Unit]\nDescription=nothing to run\n"),
+            None
         );
     }
 

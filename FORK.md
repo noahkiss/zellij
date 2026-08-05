@@ -488,6 +488,43 @@ waits for the socket and asserts as usual. With no job installed it creates the 
 that GUI-gated access will be unavailable for the life of the server. With no graphical session at
 all it says so instead of quietly creating a crippled one. Linux has no analogue and is unaffected.
 
+### The installed job is found by what it runs, not by what it is called
+
+The guard above, and `session status`, first asked the init system for the name **this build**
+would have installed — `dev.zellij.session.<name>`, `zellij-session-<name>.service`. On a machine
+whose agent was written by hand, or by anything older than these commands, the name is whatever its
+author chose. The lookup missed it and reported "no agent installed" while the agent was installed,
+loaded, and doing the job. That is not cosmetic: the guard exists to stop a permanently crippled
+session being created, and a guard that cannot see the job falls through to creating one — for
+everybody whose agent it did not install itself. Found on a real machine, where `session restart`
+over SSH created a `Background`-domain session past a loaded agent.
+
+So the job is now identified by what it **does**. Both platforms enumerate the user's own
+directory — `~/Library/LaunchAgents/*.plist`, `~/.config/systemd/user/*.service` — read `Label` and
+`ProgramArguments`, or `ExecStart`, and match a job whose arguments run `session up <name>` for this
+session. argv[0] is not looked at: a unit may exec zellij through a wrapper, and a renamed or
+symlinked build is the same program. The subcommand sequence is the identity. A job for another
+session, or one running another subcommand, does not match.
+
+The files are read rather than the init system asked, and for launchd that is deliberate:
+`launchctl list` gives labels with no command line, so the command would need one `launchctl print`
+per label — hundreds of subprocesses, over output whose format is undocumented and differs between
+releases. A plist holds both keys in a documented format. Whether launchd currently *holds* the job
+is a separate question, asked by label afterwards, so nothing rests on the file being the whole
+truth; and the derived label is still tried when the scan finds nothing.
+
+An exact name match wins, so an install this build wrote is never reported as an oddity. One match
+under another name is used, and named in the output. Several matches are all named before one is
+acted on, rather than one being picked in silence. `status` reports the job it found instead of
+calling the file missing:
+
+```
+session   my-session
+init      launchd (user)
+agent     ~/Library/LaunchAgents/dev.zellij.session.my-session.plist - installed under a different name: com.example.my-terminal (~/Library/LaunchAgents/com.example.my-terminal.plist)
+loaded    yes (gui/501/com.example.my-terminal)
+```
+
 ### Configurable terminal title
 
 ```kdl

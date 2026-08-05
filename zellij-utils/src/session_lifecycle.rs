@@ -435,17 +435,49 @@ pub mod launchctl {
 /// Compiled under `cfg(test)` on every unix for the same reason [`launchctl`] is.
 #[cfg(any(target_os = "macos", all(unix, test)))]
 pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<bool, String> {
-    let label = crate::session_service::launchd_label(session);
-    let installed = launchctl::job_is_installed(&label);
+    use crate::session_service::{find_session_job, installed_launch_agents, SessionJob};
+
+    let derived = crate::session_service::launchd_label(session);
+    let agents = installed_launch_agents();
+    let found = find_session_job(&agents, session, &derived);
+    if let SessionJob::Ambiguous(all) = &found {
+        eprintln!(
+            "warning: {} launch agents run `session up {}`: {}",
+            all.len(),
+            session,
+            all.iter()
+                .map(|job| job.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // A plist on disk that launchd was never given is not a job that can be started, and a job may
+    // equally have been loaded from a file this scan cannot see - so the disk says WHICH job it is
+    // and launchd says whether it is there. Falling back to the derived label keeps the case this
+    // build installed itself working even if its file has been moved.
+    let label = found
+        .job()
+        .map(|job| job.name.clone())
+        .filter(|label| launchctl::job_is_installed(label))
+        .or_else(|| launchctl::job_is_installed(&derived).then(|| derived.clone()));
     let action = gui_domain_action(
         launchctl::manager_name().as_deref(),
         launchctl::gui_domain_exists(),
-        installed.then_some(label.as_str()),
+        label.as_deref(),
         session_exists,
     );
     match action {
         GuiDomainAction::Proceed => Ok(false),
         GuiDomainAction::Kickstart(label) => {
+            // say why this label, when it is not the one this build would have installed: from the
+            // outside the choice would otherwise look like it came from nowhere
+            if label != derived {
+                println!(
+                    "      '{}' is kept up by the launch agent '{}', installed under a name this \
+                     build did not choose",
+                    session, label
+                );
+            }
             println!(
                 "      asking launchd for '{}' in the graphical session",
                 label
@@ -459,8 +491,9 @@ pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<
                  that, for as long as the server lives, and attaching from a graphical terminal \n         \
                  later does not change it: access to TCC-gated resources, the login keychain, the \n         \
                  pasteboard and notifications will be unavailable.\n         \
-                 Install a launch agent to avoid this: zellij --session {} setup --generate-service launchd",
-                session, session
+                 No loaded launch agent runs `session up {}`, whatever its label.\n         \
+                 Install one to avoid this: zellij session enable {}",
+                session, session, session
             );
             Ok(false)
         },
