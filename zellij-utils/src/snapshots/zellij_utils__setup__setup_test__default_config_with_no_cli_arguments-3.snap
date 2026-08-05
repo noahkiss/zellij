@@ -32,6 +32,8 @@ Options {
     scrollback_lines_to_serialize: None,
     snapshot_dir: None,
     session_snapshot_limit: None,
+    terminal_title_template: None,
+    session_aliases: None,
     styled_underlines: None,
     serialization_interval: None,
     disable_session_metadata: None,

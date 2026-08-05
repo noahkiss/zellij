@@ -435,6 +435,8 @@ fn test_client_messages() {
                 plugin_watch: None,
                 snapshot_dir: None,
                 session_snapshot_limit: None,
+                terminal_title_template: None,
+                session_aliases: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),

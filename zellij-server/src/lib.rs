@@ -72,7 +72,9 @@ use zellij_utils::{
     },
     ipc::{ClientAttributes, ExitReason, ServerToClientMsg},
     session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
-    shared::{default_palette, web_server_base_url},
+    shared::{
+        default_palette, set_terminal_title_format, web_server_base_url, TerminalTitleFormat,
+    },
 };
 
 pub type ClientId = u16;
@@ -1039,6 +1041,9 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
                 let _ = SNAPSHOT_SETTINGS.set(SnapshotSettings::from_options(Some(
                     &runtime_config_options,
                 )));
+                set_terminal_title_format(TerminalTitleFormat::from_options(
+                    &runtime_config_options,
+                ));
                 promote_orphaned_session_info_folders(&session_name, &snapshot_settings());
 
                 info!("FirstClientConnected: initializing session");
