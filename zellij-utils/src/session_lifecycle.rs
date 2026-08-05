@@ -18,6 +18,7 @@
 use crate::consts::ZELLIJ_SOCK_DIR;
 use crate::sessions::{
     get_sessions_in_other_socket_dirs, session_exists, session_in_other_contract_versions,
+    DeletedSession,
 };
 use std::path::{Path, PathBuf};
 
@@ -276,6 +277,46 @@ fn assert_up_from(
     Ok(())
 }
 
+/// What a `session down` did, judged from what the removal found and whether the post-condition
+/// then held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownOutcome {
+    /// The session was there, and is gone.
+    Removed,
+    /// There was nothing to remove, and the name is down all the same.
+    ///
+    /// This is a success. The caller asked for a state the machine was already in, and got it; a
+    /// `restart` that gave up here - `restart` being a `down` followed by an `up` - would leave the
+    /// user with no session at all over a session that was already absent.
+    NothingToRemove,
+    /// Something is still serving the name, or the removal itself failed.
+    Failed(String),
+}
+
+impl DownOutcome {
+    /// The post-condition is checked first and decides on its own: what is still serving the name
+    /// is worth reporting whatever the removal thought it did.
+    pub fn judge(deleted: DeletedSession, post_condition: Result<(), String>) -> Self {
+        if let Err(reason) = post_condition {
+            return DownOutcome::Failed(reason);
+        }
+        if !deleted.killed {
+            return DownOutcome::Failed(
+                "the server was still running when the wait ran out".to_owned(),
+            );
+        }
+        if deleted.found {
+            DownOutcome::Removed
+        } else {
+            DownOutcome::NothingToRemove
+        }
+    }
+
+    pub fn is_failure(&self) -> bool {
+        matches!(self, DownOutcome::Failed(_))
+    }
+}
+
 /// Whether one `session_restart_drop_env` pattern names this variable.
 ///
 /// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
@@ -493,5 +534,47 @@ mod tests {
                 "MY_PREFIX_TWO".to_owned()
             ]
         );
+    }
+
+    fn deleted(killed: bool, found: bool) -> DeletedSession {
+        DeletedSession { killed, found }
+    }
+
+    #[test]
+    fn a_session_that_was_there_and_is_gone_was_removed() {
+        assert_eq!(
+            DownOutcome::judge(deleted(true, true), Ok(())),
+            DownOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn a_session_that_was_already_absent_is_not_a_failure() {
+        // what a restart depends on: it tears down and rebuilds, and a session that was already
+        // down must not stop it from getting to the rebuild
+        let outcome = DownOutcome::judge(deleted(true, false), Ok(()));
+        assert_eq!(outcome, DownOutcome::NothingToRemove);
+        assert!(!outcome.is_failure());
+    }
+
+    #[test]
+    fn a_name_still_being_served_is_a_failure() {
+        let outcome = DownOutcome::judge(
+            deleted(true, true),
+            Err("1 server process(es) still serving session 'my-session'".to_owned()),
+        );
+        assert!(outcome.is_failure());
+        // the post-condition speaks for itself, whatever the removal believed it did
+        assert_eq!(
+            outcome,
+            DownOutcome::Failed(
+                "1 server process(es) still serving session 'my-session'".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_server_that_outlived_the_wait_is_a_failure() {
+        assert!(DownOutcome::judge(deleted(false, true), Ok(())).is_failure());
     }
 }

@@ -16,10 +16,8 @@ use std::time::{Duration, Instant};
 
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
-use zellij_utils::session_lifecycle::{env_vars_to_drop, SessionFacts};
-use zellij_utils::sessions::{
-    delete_session as delete_session_impl, validate_session_name, KillWait,
-};
+use zellij_utils::session_lifecycle::{env_vars_to_drop, DownOutcome, SessionFacts};
+use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
 use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start_client};
 
@@ -204,15 +202,22 @@ fn wait_for_server(name: &str) -> SessionFacts {
 /// delete is a fault to report, not a thing to paper over: a blind reap is what once left a server
 /// running for twelve minutes, still parenting four pane shells, while every caller believed the
 /// session was down.
+///
+/// Finding nothing to remove is not one of those faults, which is where this parts company with
+/// `delete-session`: the name asked about is down, which is the state that was asked for. Only a
+/// name something is still serving fails.
 fn down(name: &str, wait_timeout: u64, opts: &CliArgs) -> Result<(), ()> {
     let facts = SessionFacts::collect(name);
     if facts.assert_down().is_ok() && !facts.listed {
-        println!("ok    session '{}' is already down", name);
+        println!(
+            "ok    session '{}' is already down; nothing to remove",
+            name
+        );
         return Ok(());
     }
 
     let no_wait = false;
-    let gone = delete_session_impl(
+    let deleted = delete_session_reporting(
         name,
         true,
         &snapshot_settings(opts),
@@ -220,20 +225,25 @@ fn down(name: &str, wait_timeout: u64, opts: &CliArgs) -> Result<(), ()> {
     );
 
     let facts = SessionFacts::collect(name);
-    if let Err(reason) = facts.assert_down() {
-        eprintln!("session down: post-condition FAILED - {}", reason);
-        facts.print_diagnostics();
-        eprintln!("  nothing was force-killed; inspect the above before retrying.");
-        return Err(());
+    match DownOutcome::judge(deleted, facts.assert_down()) {
+        DownOutcome::Failed(reason) => {
+            eprintln!("session down: post-condition FAILED - {}", reason);
+            facts.print_diagnostics();
+            eprintln!("  nothing was force-killed; inspect the above before retrying.");
+            Err(())
+        },
+        DownOutcome::NothingToRemove => {
+            println!("ok    session '{}' is down; nothing to remove", name);
+            Ok(())
+        },
+        DownOutcome::Removed => {
+            println!(
+                "down  session '{}' removed; snapshot archived (zellij snapshot list --session {})",
+                name, name
+            );
+            Ok(())
+        },
     }
-    if !gone {
-        return Err(());
-    }
-    println!(
-        "down  session '{}' removed; snapshot archived (zellij snapshot list --session {})",
-        name, name
-    );
-    Ok(())
 }
 
 /// Unset what `session_restart_drop_env` names, so the rebuilt session does not hand it out.
