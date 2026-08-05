@@ -9,6 +9,12 @@
 //!
 //! The division is: supervision (when to run, what to do about failure) belongs to the init
 //! system, session correctness belongs to `zellij session up`.
+//!
+//! Installing a unit is part of the same job, so it lives here too: `zellij session
+//! enable|disable|status` writes the file this module renders, hands it to the init system, and
+//! takes it back again. The removal half is the half worth having - a launchd job outlives the
+//! plist that created it, so deleting the file by hand leaves a job still running from a
+//! definition that is gone.
 
 use std::path::{Path, PathBuf};
 
@@ -25,6 +31,13 @@ impl ServiceKind {
             "systemd" => Some(ServiceKind::Systemd),
             "launchd" => Some(ServiceKind::Launchd),
             _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            ServiceKind::Systemd => "systemd (user)",
+            ServiceKind::Launchd => "launchd (user)",
         }
     }
 }
@@ -115,15 +128,15 @@ const CHECK_INTERVAL_SECS: u64 = 60;
 fn systemd_unit(exe: &Path, session: &str) -> String {
     format!(
         "\
-# zellij session '{session}' - write to ~/.config/systemd/user/zellij-session.service
+# zellij session '{session}' - write to ~/.config/systemd/user/{unit}
 #
-# Install:
+# `zellij session enable {session}` writes this file and its watchdog timer, and loads both. By
+# hand it is:
 #     systemctl --user daemon-reload
-#     systemctl --user enable --now zellij-session.service
+#     systemctl --user enable --now {unit}
 #
-# `zellij session up` is idempotent and asserts its own result, so a repeating timer is a watchdog
-# rather than a duplicate risk. To add one, drop a zellij-session.timer beside this file with
-# OnUnitActiveSec={interval} and enable that instead of the service.
+# `zellij session up` is idempotent and asserts its own result, so the paired {timer} is a watchdog
+# rather than a duplicate risk: it re-runs the same command every {interval}s.
 #
 # Deliberately absent: TMPDIR and ZELLIJ_SOCKET_DIR. The binary resolves its own socket directory,
 # and a unit that pins a different one creates a session no login shell can see.
@@ -143,7 +156,54 @@ WantedBy=default.target
         session = session,
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
+        unit = systemd_service_name(session),
+        timer = systemd_timer_name(session),
     )
+}
+
+/// The watchdog half of the systemd install.
+///
+/// launchd gets this for free - `StartInterval` is a key on the job itself - so without a timer the
+/// two platforms would not behave the same: a session that died at 3am would come back at the next
+/// login on Linux and within a minute on macOS. The service is enabled as well as the timer, so the
+/// session is created at login and re-checked on the interval, which is what the plist does.
+fn systemd_timer(session: &str) -> String {
+    format!(
+        "\
+# Watchdog for {unit} - write to ~/.config/systemd/user/{timer}
+#
+# `zellij session enable {session}` writes and loads this alongside the service. It re-runs
+# `zellij session up`, which is idempotent: a pass over a healthy session is a no-op.
+
+[Unit]
+Description=zellij session {session} watchdog
+
+[Timer]
+OnBootSec={interval}
+OnUnitActiveSec={interval}
+Unit={unit}
+
+[Install]
+WantedBy=timers.target
+",
+        session = session,
+        interval = CHECK_INTERVAL_SECS,
+        unit = systemd_service_name(session),
+        timer = systemd_timer_name(session),
+    )
+}
+
+/// The systemd unit name of the service that keeps `session` up.
+///
+/// One unit per session name, for the reason [`launchd_label`] gives: a fixed name would let the
+/// second session's install overwrite the first one's.
+pub fn systemd_service_name(session: &str) -> String {
+    format!("zellij-session-{}.service", session)
+}
+
+/// The systemd unit name of the timer that re-runs the service.
+pub fn systemd_timer_name(session: &str) -> String {
+    format!("zellij-session-{}.timer", session)
 }
 
 fn launchd_plist(exe: &Path, session: &str) -> String {
@@ -154,7 +214,7 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
 <!--
   zellij session '{session}' - write to ~/Library/LaunchAgents/{label}.plist
 
-  Install:
+  `zellij session enable {session}` writes this file and loads it. By hand it is:
       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{label}.plist
       launchctl kickstart -k gui/$(id -u)/{label}
 
@@ -210,6 +270,428 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
     )
+}
+
+/// The init system of the machine this is running on, where there is one this module can drive.
+pub fn native_service_kind() -> Option<ServiceKind> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(ServiceKind::Systemd)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(ServiceKind::Launchd)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Where a user's own units live. Both are per-user directories: nothing here needs root, and a
+/// session belongs to the user whose login session it runs in.
+pub fn service_dir(kind: ServiceKind) -> Result<PathBuf, String> {
+    let dirs = directories::BaseDirs::new()
+        .ok_or_else(|| "cannot find the home directory to install into".to_owned())?;
+    Ok(match kind {
+        // config_dir() honours XDG_CONFIG_HOME, which is also where the user's systemd manager
+        // looks - so an unusual config home stays consistent between the two
+        ServiceKind::Systemd => dirs.config_dir().join("systemd").join("user"),
+        ServiceKind::Launchd => dirs.home_dir().join("Library").join("LaunchAgents"),
+    })
+}
+
+/// One file of an install, and the name the init system knows it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFile {
+    /// What this file is, for a person reading the output: "service", "timer", "agent".
+    pub role: &'static str,
+    /// The unit name `systemctl` takes. launchd is addressed by label, not by file name, so this
+    /// is the label there and the file is named after it.
+    pub unit: String,
+    pub path: PathBuf,
+    pub contents: String,
+}
+
+impl ServiceFile {
+    /// Whether the file on disk is already exactly this one. An install that would change nothing
+    /// is an install that should say so rather than reload the init system for no reason.
+    pub fn is_current(&self) -> bool {
+        std::fs::read_to_string(&self.path).map_or(false, |on_disk| on_disk == self.contents)
+    }
+
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+}
+
+/// Every file an install of `session` writes, in the order they should be written.
+///
+/// systemd needs two - see [`systemd_timer`] for why - and launchd one.
+pub fn service_files(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+) -> Result<Vec<ServiceFile>, String> {
+    let dir = service_dir(kind)?;
+    Ok(match kind {
+        ServiceKind::Systemd => {
+            let unit = systemd_service_name(session);
+            let timer = systemd_timer_name(session);
+            vec![
+                ServiceFile {
+                    role: "service",
+                    path: dir.join(&unit),
+                    contents: service_unit(kind, exe, session),
+                    unit,
+                },
+                ServiceFile {
+                    role: "timer",
+                    path: dir.join(&timer),
+                    contents: systemd_timer(session),
+                    unit: timer,
+                },
+            ]
+        },
+        ServiceKind::Launchd => {
+            let label = launchd_label(session);
+            let file = format!("{}.plist", label);
+            vec![ServiceFile {
+                role: "agent",
+                path: dir.join(&file),
+                contents: service_unit(kind, exe, session),
+                unit: label,
+            }]
+        },
+    })
+}
+
+/// What an `enable` did, so the caller can report the difference between doing the work and
+/// finding it already done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnableOutcome {
+    /// Every file was already what this build writes, and the init system already had the job.
+    AlreadyEnabled,
+    Enabled {
+        written: Vec<PathBuf>,
+    },
+}
+
+/// What a `disable` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DisableOutcome {
+    /// Nothing was installed and nothing was loaded: the state asked for is the state found.
+    NotInstalled,
+    Disabled {
+        removed: Vec<PathBuf>,
+    },
+}
+
+/// The facts that come apart, which is why `status` reports them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStatus {
+    pub kind: ServiceKind,
+    pub files: Vec<ServiceFileStatus>,
+    /// Whether the init system currently holds the job, and how it phrased that.
+    pub loaded: bool,
+    pub load_detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceFileStatus {
+    pub role: &'static str,
+    pub path: PathBuf,
+    pub present: bool,
+    /// Present, but not what this build would write now - an upgrade or a config edit that has not
+    /// been re-enabled.
+    pub stale: bool,
+}
+
+/// Write the files and hand them to the init system.
+///
+/// Idempotent in both directions: a second `enable` over an unchanged install reports
+/// [`EnableOutcome::AlreadyEnabled`] and touches nothing, and an `enable` over a changed one
+/// rewrites and reloads. The reload matters - both init systems keep the definition they were
+/// given rather than the file it came from, so a rewritten file that is not reloaded is a lie on
+/// disk.
+pub fn enable(kind: ServiceKind, exe: &Path, session: &str) -> Result<EnableOutcome, String> {
+    let files = service_files(kind, exe, session)?;
+    let up_to_date = files.iter().all(|file| file.is_current());
+    if up_to_date && job_is_loaded(kind, &files) {
+        return Ok(EnableOutcome::AlreadyEnabled);
+    }
+
+    let mut written = Vec::new();
+    for file in &files {
+        if file.is_current() {
+            continue;
+        }
+        if let Some(parent) = file.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
+        }
+        std::fs::write(&file.path, &file.contents)
+            .map_err(|e| format!("could not write {}: {}", file.path.display(), e))?;
+        written.push(file.path.clone());
+    }
+    load_job(&files)?;
+    Ok(EnableOutcome::Enabled { written })
+}
+
+/// Unload the job, then remove the files - in that order.
+///
+/// The order is the reason this command exists. Both init systems hold a definition of their own
+/// once they have been given one, so removing the file first leaves a job that still runs, from a
+/// definition nothing on disk describes. launchd is the worse of the two: `bootout` needs the
+/// label, and the label lives in the file that has just been deleted.
+pub fn disable(kind: ServiceKind, session: &str) -> Result<DisableOutcome, String> {
+    // only the paths and the unit names matter here, not the contents, so any exe will do
+    let files = service_files(kind, Path::new("zellij"), session)?;
+    let anything_present = files.iter().any(|file| file.exists());
+    let loaded = job_is_loaded(kind, &files);
+    if !anything_present && !loaded {
+        return Ok(DisableOutcome::NotInstalled);
+    }
+
+    unload_job(&files)?;
+    let mut removed = Vec::new();
+    for file in &files {
+        match std::fs::remove_file(&file.path) {
+            Ok(()) => removed.push(file.path.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(format!("could not remove {}: {}", file.path.display(), e)),
+        }
+    }
+    // systemd keeps a removed unit in its state until it is told to look again
+    reload_after_removal()?;
+    Ok(DisableOutcome::Disabled { removed })
+}
+
+/// Report the install without changing it.
+pub fn status(kind: ServiceKind, exe: &Path, session: &str) -> Result<ServiceStatus, String> {
+    let files = service_files(kind, exe, session)?;
+    let (loaded, load_detail) = job_load_state(&files);
+    Ok(ServiceStatus {
+        kind,
+        files: files
+            .iter()
+            .map(|file| ServiceFileStatus {
+                role: file.role,
+                path: file.path.clone(),
+                present: file.exists(),
+                stale: file.exists() && !file.is_current(),
+            })
+            .collect(),
+        loaded,
+        load_detail,
+    })
+}
+
+fn job_is_loaded(_kind: ServiceKind, files: &[ServiceFile]) -> bool {
+    job_load_state(files).0
+}
+
+#[cfg(target_os = "linux")]
+fn job_load_state(files: &[ServiceFile]) -> (bool, String) {
+    let states: Vec<String> = files
+        .iter()
+        .map(|file| {
+            let state = systemctl::is_enabled(&file.unit).unwrap_or_else(|| "unknown".to_owned());
+            // whether the watchdog is armed is a separate fact from whether it is enabled, and it
+            // is the one that decides whether a session that dies at night is back by morning
+            if file.role == "timer" && systemctl::is_active(&file.unit) {
+                format!("{} {} and armed", file.role, state)
+            } else {
+                format!("{} {}", file.role, state)
+            }
+        })
+        .collect();
+    // every unit of the install has to be enabled for the install to be: a service without its
+    // timer comes up at login and is never checked again
+    let loaded = files
+        .iter()
+        .all(|file| systemctl::is_enabled(&file.unit).as_deref() == Some("enabled"));
+    (loaded, states.join(", "))
+}
+
+#[cfg(target_os = "macos")]
+fn job_load_state(files: &[ServiceFile]) -> (bool, String) {
+    let label = files
+        .first()
+        .map(|file| file.unit.clone())
+        .unwrap_or_default();
+    let loaded = launchctl::job_is_loaded(&label);
+    let detail = if loaded {
+        format!("{}/{}", launchctl::gui_domain(), label)
+    } else {
+        format!("not in {}", launchctl::gui_domain())
+    };
+    (loaded, detail)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn job_load_state(_files: &[ServiceFile]) -> (bool, String) {
+    (false, "unsupported init system".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn load_job(files: &[ServiceFile]) -> Result<(), String> {
+    systemctl::daemon_reload()?;
+    for file in files {
+        systemctl::enable_now(&file.unit)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn load_job(files: &[ServiceFile]) -> Result<(), String> {
+    for file in files {
+        // launchd refuses to bootstrap a label it already holds, and it would keep the definition
+        // it was given rather than the file just written - so a reload is boot out, then in
+        if launchctl::job_is_loaded(&file.unit) {
+            launchctl::bootout(&file.unit)?;
+        }
+        launchctl::bootstrap(&file.path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn load_job(_files: &[ServiceFile]) -> Result<(), String> {
+    Err("no init system this build knows how to load a unit into".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn unload_job(files: &[ServiceFile]) -> Result<(), String> {
+    // the timer first: stopping the service while its timer still runs invites the timer to start
+    // it again between the two commands
+    for file in files.iter().rev() {
+        systemctl::disable_now(&file.unit)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn unload_job(files: &[ServiceFile]) -> Result<(), String> {
+    for file in files {
+        if launchctl::job_is_loaded(&file.unit) {
+            launchctl::bootout(&file.unit)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unload_job(_files: &[ServiceFile]) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reload_after_removal() -> Result<(), String> {
+    systemctl::daemon_reload()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reload_after_removal() -> Result<(), String> {
+    Ok(())
+}
+
+/// The systemd user manager, addressed as the user - never as root, never system-wide.
+#[cfg(target_os = "linux")]
+pub mod systemctl {
+    use std::process::Command;
+
+    fn run(args: &[&str]) -> Result<String, String> {
+        let output = Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run systemctl: {}", e))?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(format!(
+                "systemctl --user {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    pub fn daemon_reload() -> Result<(), String> {
+        run(&["daemon-reload"]).map(|_| ())
+    }
+
+    pub fn enable_now(unit: &str) -> Result<(), String> {
+        run(&["enable", "--now", unit]).map(|_| ())
+    }
+
+    pub fn disable_now(unit: &str) -> Result<(), String> {
+        run(&["disable", "--now", unit]).map(|_| ())
+    }
+
+    /// What systemd calls the unit's install state - "enabled", "disabled", "not-found". It exits
+    /// non-zero for every answer but "enabled", so the exit status says nothing the word does not.
+    pub fn is_enabled(unit: &str) -> Option<String> {
+        let output = Command::new("systemctl")
+            .args(["--user", "is-enabled", unit])
+            .output()
+            .ok()?;
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!state.is_empty()).then_some(state)
+    }
+
+    /// Whether the timer is armed, which is the fact a person wants next after "is it enabled".
+    pub fn is_active(unit: &str) -> bool {
+        Command::new("systemctl")
+            .args(["--user", "is-active", unit])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// launchd, in the graphical login session domain - see the plist's own comment for why that
+/// domain and no other.
+#[cfg(target_os = "macos")]
+pub mod launchctl {
+    use std::path::Path;
+    use std::process::Command;
+
+    pub fn gui_domain() -> String {
+        format!("gui/{}", unsafe { libc::getuid() })
+    }
+
+    pub fn job_is_loaded(label: &str) -> bool {
+        Command::new("launchctl")
+            .args(["print", &format!("{}/{}", gui_domain(), label)])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    pub fn bootstrap(plist: &Path) -> Result<(), String> {
+        run(&["bootstrap", &gui_domain(), &plist.display().to_string()])
+    }
+
+    pub fn bootout(label: &str) -> Result<(), String> {
+        run(&["bootout", &format!("{}/{}", gui_domain(), label)])
+    }
+
+    fn run(args: &[&str]) -> Result<(), String> {
+        let output = Command::new("launchctl")
+            .args(args)
+            .output()
+            .map_err(|e| format!("could not run launchctl: {}", e))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "launchctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -290,6 +772,55 @@ mod tests {
     }
 
     #[test]
+    fn each_session_has_its_own_systemd_units() {
+        assert_eq!(systemd_service_name("work"), "zellij-session-work.service");
+        assert_eq!(systemd_timer_name("work"), "zellij-session-work.timer");
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work");
+        // the install line has to name the file the installer writes, or a hand install lands
+        // somewhere `zellij session status` never looks
+        assert!(unit.contains("systemctl --user enable --now zellij-session-work.service"));
+    }
+
+    /// The plist gets its watchdog from a key on the job itself. Without a matching timer the same
+    /// command on Linux would only try at login, and the two platforms would behave differently in
+    /// exactly the case the unit exists for.
+    #[test]
+    fn the_linux_timer_re_checks_as_often_as_the_plist_does() {
+        let timer = systemd_timer("work");
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work");
+        assert!(timer.contains(&format!("OnUnitActiveSec={}", CHECK_INTERVAL_SECS)));
+        assert!(timer.contains("Unit=zellij-session-work.service"));
+        assert!(plist.contains(&format!(
+            "<key>StartInterval</key>\n    <integer>{}</integer>",
+            CHECK_INTERVAL_SECS
+        )));
+    }
+
+    #[test]
+    fn a_systemd_install_is_the_service_and_its_timer() {
+        let files = service_files(ServiceKind::Systemd, &exe(), "work").unwrap();
+        let names: Vec<&str> = files.iter().map(|file| file.unit.as_str()).collect();
+        assert_eq!(
+            names,
+            ["zellij-session-work.service", "zellij-session-work.timer"]
+        );
+        // the service is written first: a timer loaded before the unit it triggers is a timer
+        // systemd cannot start
+        assert_eq!(files[0].role, "service");
+    }
+
+    #[test]
+    fn a_launchd_install_is_one_plist_named_by_its_label() {
+        let files = service_files(ServiceKind::Launchd, &exe(), "work").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].unit, launchd_label("work"));
+        assert_eq!(
+            files[0].path.file_name().unwrap().to_string_lossy(),
+            format!("{}.plist", launchd_label("work"))
+        );
+    }
+
+    #[test]
     fn kinds_are_named_by_their_init_system() {
         assert_eq!(
             ServiceKind::from_name("SystemD"),
@@ -341,8 +872,18 @@ mod tests {
     }
     #[test]
     fn no_unit_sets_a_socket_dir_or_a_tmpdir() {
-        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
-            let unit = service_unit(kind, &exe(), "work");
+        let units = [
+            (
+                "systemd",
+                service_unit(ServiceKind::Systemd, &exe(), "work"),
+            ),
+            (
+                "launchd",
+                service_unit(ServiceKind::Launchd, &exe(), "work"),
+            ),
+            ("timer", systemd_timer("work")),
+        ];
+        for (kind, unit) in units {
             for line in unit.lines().filter(|l| !l.trim_start().starts_with('#')) {
                 assert!(
                     !line.contains("<key>TMPDIR</key>") && !line.contains("Environment=TMPDIR"),

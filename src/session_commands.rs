@@ -11,6 +11,7 @@
 //! What survives from the scripts is the discipline: every one of these commands states a
 //! post-condition and checks it. See [`zellij_utils::session_lifecycle`].
 
+use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,9 @@ use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
     env_vars_to_drop, warn_if_server_build_differs, DownOutcome, SessionFacts,
+};
+use zellij_utils::session_service::{
+    self, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome, ServiceExe, ServiceKind,
 };
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
@@ -67,6 +71,161 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             };
             restart(&name, restore, wait_timeout, &opts);
         },
+        SessionLifecycleCli::Enable { session_name, exe } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(match enable(&name, exe) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Disable { session_name } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(match disable(&name) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Status { session_name, exe } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(status(&name, exe));
+        },
+    }
+}
+
+/// The init system of this machine, or a refusal naming what it would have driven.
+fn native_service_kind() -> Result<ServiceKind, ()> {
+    session_service::native_service_kind().ok_or_else(|| {
+        eprintln!(
+            "session enable: no init system this build can install into. \
+             `zellij setup --generate-service` still prints a unit to adapt by hand."
+        );
+    })
+}
+
+/// Which binary the unit should run, warning when the answer is one an upgrade can break.
+fn service_exe(explicit: Option<PathBuf>) -> PathBuf {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let exe = resolve_service_exe(explicit, &current_exe, &path_dirs());
+    if let ServiceExe::Resolved(path) = &exe {
+        eprintln!(
+            "warning: no `zellij` on PATH resolves to this binary, so the unit will run\n  \
+             {}\nwhich is where this binary actually is. If that is inside a version-specific\n\
+             directory, the unit will break the next time zellij is upgraded. Name a stable\n\
+             path with `--exe <PATH>` if it is.",
+            path.display()
+        );
+    }
+    exe.path().to_path_buf()
+}
+
+/// Write the unit and hand it to the init system.
+///
+/// The whole command is idempotent, because the thing it installs is: `zellij session up` over a
+/// healthy session is a no-op, so re-enabling costs nothing and enabling twice is not an error to
+/// report but a state to confirm.
+fn enable(name: &str, exe: Option<PathBuf>) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    let exe = service_exe(exe);
+    match session_service::enable(kind, &exe, name) {
+        Ok(EnableOutcome::AlreadyEnabled) => {
+            println!("ok    service for '{}' is already enabled", name);
+            Ok(())
+        },
+        Ok(EnableOutcome::Enabled { written }) => {
+            for path in written {
+                println!("      wrote {}", path.display());
+            }
+            println!("on    service for '{}' enabled and started", name);
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Unload the unit, then remove it.
+fn disable(name: &str) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    match session_service::disable(kind, name) {
+        Ok(DisableOutcome::NotInstalled) => {
+            println!(
+                "ok    no service installed for '{}'; nothing to remove",
+                name
+            );
+            Ok(())
+        },
+        Ok(DisableOutcome::Disabled { removed }) => {
+            for path in removed {
+                println!("      removed {}", path.display());
+            }
+            println!(
+                "off   service for '{}' unloaded and removed; the session itself is untouched",
+                name
+            );
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session disable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Report the install, one fact per line.
+///
+/// Installed, loaded and running are three different states and they come apart in ways that each
+/// mean something different: a file with no job is an install that was never loaded, a job with no
+/// session is a unit that is failing, and a session with no job is one that will not come back.
+/// Reporting them together as "ok" would hide exactly the case worth reporting.
+///
+/// Exits 0 when the unit is installed AND loaded, whatever the session is doing - the session is
+/// the thing the unit repairs, and `zellij session up` is the command that reports on it.
+fn status(name: &str, exe: Option<PathBuf>) -> i32 {
+    let Ok(kind) = native_service_kind() else {
+        return 1;
+    };
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let exe = resolve_service_exe(exe, &current_exe, &path_dirs());
+    let status = match session_service::status(kind, exe.path(), name) {
+        Ok(status) => status,
+        Err(reason) => {
+            eprintln!("session status: {}", reason);
+            return 1;
+        },
+    };
+
+    println!("session   {}", name);
+    println!("init      {}", status.kind.name());
+    let mut installed = true;
+    for file in &status.files {
+        let state = match (file.present, file.stale) {
+            (false, _) => "missing".to_owned(),
+            (true, true) => {
+                "installed (differs from what `session enable` would write now)".to_owned()
+            },
+            (true, false) => "installed".to_owned(),
+        };
+        installed &= file.present;
+        println!("{:9} {} - {}", file.role, file.path.display(), state);
+    }
+    println!(
+        "loaded    {} ({})",
+        if status.loaded { "yes" } else { "no" },
+        status.load_detail
+    );
+
+    let facts = SessionFacts::collect(name);
+    match facts.assert_up() {
+        Ok(()) => println!("running   yes, in {}", facts.socket_dir.display()),
+        Err(reason) => println!("running   no - {}", reason),
+    }
+
+    if installed && status.loaded {
+        0
+    } else {
+        1
     }
 }
 
