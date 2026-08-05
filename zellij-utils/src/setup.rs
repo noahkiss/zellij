@@ -289,6 +289,12 @@ pub struct Setup {
     /// option
     #[clap(long, value_name = "INIT", value_parser)]
     pub generate_service: Option<String>,
+
+    /// The binary path the generated unit should run. Defaults to the stable name on PATH that
+    /// leads to this binary, which is what survives an upgrade; name a path here if the
+    /// installation is unusual enough that it cannot be found
+    #[clap(long, value_name = "PATH", value_parser)]
+    pub exe: Option<PathBuf>,
 }
 
 impl Setup {
@@ -411,7 +417,7 @@ impl Setup {
         // this one lives here rather than beside the other generators because it needs the merged
         // options: the session it schedules can come from the config file
         if let Some(init) = &self.generate_service {
-            Setup::generate_service(init, opts, config_options);
+            Setup::generate_service(init, self.exe.clone(), opts, config_options);
             std::process::exit(0);
         }
 
@@ -613,8 +619,15 @@ impl Setup {
     ///
     /// The unit is a scheduler and nothing else - see [`crate::session_service`] for why it carries
     /// no environment of its own.
-    fn generate_service(init: &str, opts: &CliArgs, config_options: &Options) {
-        use crate::session_service::{service_unit, ServiceKind};
+    fn generate_service(
+        init: &str,
+        exe: Option<PathBuf>,
+        opts: &CliArgs,
+        config_options: &Options,
+    ) {
+        use crate::session_service::{
+            path_dirs, resolve_service_exe, service_unit, ServiceExe, ServiceKind,
+        };
 
         let Some(kind) = ServiceKind::from_name(init) else {
             eprintln!("Unsupported init system: {} (try systemd or launchd)", init);
@@ -635,9 +648,21 @@ impl Setup {
             );
             std::process::exit(1);
         };
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let exe = resolve_service_exe(exe, &current_exe, &path_dirs());
+        if let ServiceExe::Resolved(path) = &exe {
+            // the failure this warns about is silent otherwise: the unit keeps working until the
+            // day the package is upgraded and the path it names stops existing
+            eprintln!(
+                "warning: no `zellij` on PATH resolves to this binary, so the unit will run\n  \
+                 {}\nwhich is where this binary actually is. If that is inside a version-specific\n\
+                 directory, the unit will break the next time zellij is upgraded. Name a stable\n\
+                 path with `--exe <PATH>` if it is.",
+                path.display()
+            );
+        }
         let mut out = std::io::stdout();
-        let _ = out.write_all(service_unit(kind, &exe, &session).as_bytes());
+        let _ = out.write_all(service_unit(kind, exe.path(), &session).as_bytes());
     }
 
     fn parse_layout_and_override_config(

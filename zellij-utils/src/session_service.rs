@@ -10,7 +10,7 @@
 //! The division is: supervision (when to run, what to do about failure) belongs to the init
 //! system, session correctness belongs to `zellij session up`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The init systems `zellij setup --generate-service` can write for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,68 @@ impl ServiceKind {
             _ => None,
         }
     }
+}
+
+/// Which binary path a unit should exec, and how it was arrived at.
+///
+/// Neither init system looks anything up on PATH, so the unit needs an absolute path - and WHICH
+/// absolute path matters more than it looks. `current_exe` resolves symlinks, and a package manager
+/// that installs into a versioned prefix keeps the stable name on PATH as a symlink into the
+/// version currently installed. Writing the resolved path into a unit therefore writes down a
+/// directory that the next upgrade deletes, and the agent stops working with nothing to show for
+/// it. On macOS it is worse than a broken path: permission grants are recorded against the binary
+/// launchd started, so a version in the path means the identity changes at every upgrade and the
+/// grants stop applying to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceExe {
+    /// A path the user named. Only they know when their installation is unusual.
+    Given(PathBuf),
+    /// A name on PATH that resolves to this binary - the stable half of a versioned install.
+    Stable(PathBuf),
+    /// The resolved path of the running binary, nothing steadier having been found.
+    Resolved(PathBuf),
+}
+
+impl ServiceExe {
+    pub fn path(&self) -> &Path {
+        match self {
+            ServiceExe::Given(path) | ServiceExe::Stable(path) | ServiceExe::Resolved(path) => path,
+        }
+    }
+}
+
+/// Pick the path to write into a unit: what the user said, else the stable name that leads here,
+/// else where this binary actually is.
+///
+/// A PATH entry counts only if it resolves to the SAME file as the running binary - another
+/// zellij, further along the same PATH, is a different program and a unit that execs it is a unit
+/// that keeps the wrong version alive.
+pub fn resolve_service_exe(
+    explicit: Option<PathBuf>,
+    current_exe: &Path,
+    path_dirs: &[PathBuf],
+) -> ServiceExe {
+    if let Some(explicit) = explicit {
+        return ServiceExe::Given(explicit);
+    }
+    let resolved = current_exe
+        .canonicalize()
+        .unwrap_or_else(|_| current_exe.to_path_buf());
+    let name = resolved.file_name().unwrap_or_else(|| "zellij".as_ref());
+    for dir in path_dirs {
+        let candidate = dir.join(name);
+        if candidate.canonicalize().ok().as_deref() == Some(resolved.as_path()) {
+            return ServiceExe::Stable(candidate);
+        }
+    }
+    ServiceExe::Resolved(resolved)
+}
+
+/// The directories of the PATH variable, in the order they are searched.
+pub fn path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default()
 }
 
 /// Render the unit for `kind`, running `exe` against `session`.
@@ -144,6 +206,62 @@ mod tests {
 
     fn exe() -> PathBuf {
         PathBuf::from("/usr/local/bin/zellij")
+    }
+
+    /// A versioned install: the stable name on PATH is a symlink into the version installed now.
+    fn versioned_install() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let versioned = root.path().join("versions/1.2.3/bin");
+        let stable_dir = root.path().join("bin");
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::create_dir_all(&stable_dir).unwrap();
+        let real = versioned.join("zellij");
+        std::fs::write(&real, b"binary").unwrap();
+        let stable = stable_dir.join("zellij");
+        std::os::unix::fs::symlink(&real, &stable).unwrap();
+        (root, real, stable)
+    }
+
+    #[test]
+    fn the_stable_name_on_path_is_preferred_to_the_version_it_points_at() {
+        let (_root, real, stable) = versioned_install();
+        let stable_dir = stable.parent().unwrap().to_path_buf();
+        assert_eq!(
+            resolve_service_exe(None, &real, &[stable_dir]),
+            ServiceExe::Stable(stable)
+        );
+    }
+
+    #[test]
+    fn a_path_entry_that_is_a_different_binary_is_not_this_one() {
+        let (_root, real, stable) = versioned_install();
+        // another zellij, earlier on PATH: same name, its own file
+        let other_dir = stable.parent().unwrap().parent().unwrap().join("other");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(other_dir.join("zellij"), b"another binary").unwrap();
+        assert_eq!(
+            resolve_service_exe(None, &real, &[other_dir]),
+            ServiceExe::Resolved(real.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_path_the_user_named_wins() {
+        let (_root, real, stable) = versioned_install();
+        let stable_dir = stable.parent().unwrap().to_path_buf();
+        let given = PathBuf::from("/opt/zellij/bin/zellij");
+        assert_eq!(
+            resolve_service_exe(Some(given.clone()), &real, &[stable_dir]),
+            ServiceExe::Given(given)
+        );
+    }
+
+    #[test]
+    fn with_nothing_on_path_the_unit_still_gets_an_absolute_path() {
+        let (_root, real, _stable) = versioned_install();
+        let exe = resolve_service_exe(None, &real, &[]);
+        assert_eq!(exe, ServiceExe::Resolved(real.canonicalize().unwrap()));
+        assert!(exe.path().is_absolute());
     }
 
     #[test]
