@@ -628,7 +628,7 @@ API contract, which is far more than a warning is worth.
 ### `zellij session enable|disable|status`
 
 ```
-zellij session enable  [NAME] [--exe PATH]
+zellij session enable  [NAME] [--exe PATH] [--force]
 zellij session disable [NAME]
 zellij session status  [NAME]
 ```
@@ -671,6 +671,22 @@ per session (`zellij-session-<name>.service`), for the reason the launchd label 
 
 `setup --generate-service` is unchanged and still prints the service to stdout, from the same
 generator.
+
+**`enable` and `disable` see a job installed under another name.** Both used to work from the file
+names this build derives, so both were blind to the job [`status` already reported](#the-installed-job-is-found-by-what-it-runs-not-by-what-it-is-called) — and the two
+commands contradicted each other over the same machine: `status` said "installed under a different
+name: com.example.my-terminal" while `disable` said "no service installed; nothing to remove".
+
+- `enable` now **refuses** when something else already runs `session up <name>`, naming the file and
+  exiting non-zero. Two launchers for one session is not redundancy: both start at login
+  (`RunAtLoad`, `After=default.target`) and race — one creates the server, the other reaches
+  `session up`, finds a server serving that name and refuses to create a second, and on systemd is
+  left in `failed`. That failed unit is what someone eventually investigates, and it is not where
+  the fault is. `--force` installs beside it anyway and warns.
+- `disable` **names** the surviving job instead of claiming nothing is installed, and **does not
+  remove it**. What it removes stays exactly what `enable` wrote: a job written by hand is somebody
+  else's file, and a command that deleted it because a session name matched would be one nobody
+  could trust.
 
 ### Extra unit directives from the config (`session_service`)
 

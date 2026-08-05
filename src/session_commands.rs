@@ -72,9 +72,13 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             };
             restart(&name, restore, wait_timeout, &opts);
         },
-        SessionLifecycleCli::Enable { session_name, exe } => {
+        SessionLifecycleCli::Enable {
+            session_name,
+            exe,
+            force,
+        } => {
             let name = resolve_session_name(session_name, &opts, false);
-            process::exit(match enable(&name, exe, &opts) {
+            process::exit(match enable(&name, exe, force, &opts) {
                 Ok(()) => 0,
                 Err(()) => 1,
             });
@@ -136,18 +140,28 @@ fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
 /// The whole command is idempotent, because the thing it installs is: `zellij session up` over a
 /// healthy session is a no-op, so re-enabling costs nothing and enabling twice is not an error to
 /// report but a state to confirm.
-fn enable(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> Result<(), ()> {
+fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
     let kind = native_service_kind()?;
     let exe = service_exe(exe);
     let extras = configured_extras(opts);
-    match session_service::enable(kind, &exe, name, extras.as_ref()) {
+    match session_service::enable(kind, &exe, name, extras.as_ref(), force) {
         Ok(EnableOutcome::AlreadyEnabled) => {
             println!("ok    service for '{}' is already enabled", name);
             Ok(())
         },
-        Ok(EnableOutcome::Enabled { written }) => {
+        Ok(EnableOutcome::Enabled { written, beside }) => {
             for path in written {
                 println!("      wrote {}", path.display());
+            }
+            // only reachable with --force: two launchers for one session race at login, and the
+            // one that loses is left failed. Say so where the person who typed --force sees it.
+            for job in beside {
+                eprintln!(
+                    "warning: {} also runs `session up {}` ({}); both will start at login",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
             }
             println!("on    service for '{}' enabled and started", name);
             Ok(())
@@ -170,7 +184,26 @@ fn disable(name: &str) -> Result<(), ()> {
             );
             Ok(())
         },
-        Ok(DisableOutcome::Disabled { removed }) => {
+        Ok(DisableOutcome::NotOurs { jobs }) => {
+            // `status` reports this job by name, so reporting "nothing installed" here would have
+            // the two commands contradicting each other over the same machine. What this command
+            // removes is what `session enable` wrote, and that is not this.
+            println!(
+                "ok    nothing zellij installed for '{}'; nothing of ours to remove",
+                name
+            );
+            for job in jobs {
+                println!(
+                    "      but {} runs `session up {}` ({}) - not written by zellij, so it is left \
+                     alone",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            Ok(())
+        },
+        Ok(DisableOutcome::Disabled { removed, remaining }) => {
             for path in removed {
                 println!("      removed {}", path.display());
             }
@@ -178,6 +211,15 @@ fn disable(name: &str) -> Result<(), ()> {
                 "off   service for '{}' unloaded and removed; the session itself is untouched",
                 name
             );
+            for job in remaining {
+                println!(
+                    "      {} still runs `session up {}` ({}) - not written by zellij, so it is \
+                     left alone",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
             Ok(())
         },
         Err(reason) => {

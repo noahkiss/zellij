@@ -838,6 +838,11 @@ pub enum SessionLifecycleCli {
         /// this binary, which is what survives an upgrade
         #[clap(long, value_name = "PATH", value_parser)]
         exe: Option<PathBuf>,
+
+        /// Install even when another job already runs `session up` for this session. Two
+        /// launchers race at login and one of them ends up failed, so this is refused by default
+        #[clap(long, value_parser, takes_value(false))]
+        force: bool,
     },
 
     /// Unload the init-system unit and remove it. Removing the file without unloading the job

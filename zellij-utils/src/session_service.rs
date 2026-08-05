@@ -963,6 +963,9 @@ pub enum EnableOutcome {
     AlreadyEnabled,
     Enabled {
         written: Vec<PathBuf>,
+        /// Jobs under another name that already keep this session up, installed beside all the
+        /// same because `--force` said so. Never non-empty without it.
+        beside: Vec<InstalledJob>,
     },
 }
 
@@ -971,9 +974,58 @@ pub enum EnableOutcome {
 pub enum DisableOutcome {
     /// Nothing was installed and nothing was loaded: the state asked for is the state found.
     NotInstalled,
+    /// Nothing this build wrote is installed, but something else keeps the session up. Saying
+    /// "nothing to remove" here would contradict `status`, which reports that job by name.
+    NotOurs { jobs: Vec<InstalledJob> },
     Disabled {
         removed: Vec<PathBuf>,
+        /// Jobs under another name that this command did NOT touch. Removal is scoped to exactly
+        /// what `enable` wrote; a job written by hand is somebody else's file.
+        remaining: Vec<InstalledJob>,
     },
+}
+
+/// Why an install must not join a job that already keeps this session up, when there is one.
+///
+/// Two launchers for one session is not redundancy. Both fire at login - `RunAtLoad`, `After=` -
+/// and they race: one creates the server, the other reaches `session up`, finds a server already
+/// serving the name, and refuses to create a second one. On systemd that second job is then left
+/// in `failed`, which is what a person eventually goes looking at, and it is not where the fault
+/// is. So the second install is refused before it happens rather than diagnosed afterwards.
+///
+/// The message says which job is which, because the two are removed by different means: `session
+/// disable` takes back exactly what `session enable` wrote and nothing else, so a job zellij did
+/// not write has to be removed by whoever wrote it.
+pub fn refusal_to_install_beside(jobs: &[InstalledJob], session: &str) -> Option<String> {
+    if jobs.is_empty() {
+        return None;
+    }
+    let listed = jobs
+        .iter()
+        .map(|job| format!("\n        {} ({})", job.name, job.path.display()))
+        .collect::<String>();
+    Some(format!(
+        "something already runs `session up {session}` under a name this build did not \
+         choose:{listed}\n  \
+         Installing beside it gives '{session}' two launchers, and at login both start: one \
+         creates\n  the server and the other refuses to create a second, and is left failed. \
+         Remove the job\n  above first - it is not zellij's file, so `zellij session disable \
+         {session}` will not touch\n  it - or re-run with --force to install beside it anyway.",
+        session = session,
+        listed = listed,
+    ))
+}
+
+/// What a `disable` amounts to when this build's own install is not there to remove.
+///
+/// Not the same answer as "nothing is installed": a job under another name is still keeping the
+/// session up, and this command will not remove somebody else's file.
+pub fn nothing_of_ours_to_remove(foreign: Vec<InstalledJob>) -> DisableOutcome {
+    if foreign.is_empty() {
+        DisableOutcome::NotInstalled
+    } else {
+        DisableOutcome::NotOurs { jobs: foreign }
+    }
 }
 
 /// The facts that come apart, which is why `status` reports them apart.
@@ -1012,7 +1064,17 @@ pub fn enable(
     exe: &Path,
     session: &str,
     extras: Option<&SessionServiceOptions>,
+    force: bool,
 ) -> Result<EnableOutcome, String> {
+    // Asked BEFORE anything is written, because the fault this prevents is a second launcher
+    // existing at all - see [`refusal_to_install_beside`]. `status` has always reported such a job;
+    // this is the command that acts on the same fact instead of installing on top of it.
+    let beside = jobs_under_another_name(kind, session);
+    if !force {
+        if let Some(refusal) = refusal_to_install_beside(&beside, session) {
+            return Err(refusal);
+        }
+    }
     let files = service_files(kind, exe, session, extras)?;
     let up_to_date = files.iter().all(|file| file.is_current());
     if up_to_date && job_is_loaded(kind, &files) {
@@ -1033,7 +1095,7 @@ pub fn enable(
         written.push(file.path.clone());
     }
     load_job(&files)?;
-    Ok(EnableOutcome::Enabled { written })
+    Ok(EnableOutcome::Enabled { written, beside })
 }
 
 /// Unload the job, then remove the files - in that order.
@@ -1042,13 +1104,20 @@ pub fn enable(
 /// once they have been given one, so removing the file first leaves a job that still runs, from a
 /// definition nothing on disk describes. launchd is the worse of the two: `bootout` needs the
 /// label, and the label lives in the file that has just been deleted.
+///
+/// What is removed is exactly what `enable` wrote, and that scope is deliberate: a job somebody
+/// wrote by hand is their file, and a command that deletes it because the name matched a session
+/// would be a command nobody could trust with a `--force`. Such a job is REPORTED instead - saying
+/// "nothing to remove" while `status` names the job that is doing the work is the contradiction
+/// this fixes.
 pub fn disable(kind: ServiceKind, session: &str) -> Result<DisableOutcome, String> {
     // only the paths and the unit names matter here, not the contents, so any exe will do
     let files = service_files(kind, Path::new("zellij"), session, None)?;
     let anything_present = files.iter().any(|file| file.exists());
     let loaded = job_is_loaded(kind, &files);
+    let foreign = jobs_under_another_name(kind, session);
     if !anything_present && !loaded {
-        return Ok(DisableOutcome::NotInstalled);
+        return Ok(nothing_of_ours_to_remove(foreign));
     }
 
     unload_job(&files)?;
@@ -1062,7 +1131,10 @@ pub fn disable(kind: ServiceKind, session: &str) -> Result<DisableOutcome, Strin
     }
     // systemd keeps a removed unit in its state until it is told to look again
     reload_after_removal()?;
-    Ok(DisableOutcome::Disabled { removed })
+    Ok(DisableOutcome::Disabled {
+        removed,
+        remaining: foreign,
+    })
 }
 
 /// Report the install without changing it.
@@ -1469,6 +1541,66 @@ mod tests {
             path: PathBuf::from(format!("/agents/{}", name)),
             exec: exec.iter().map(|argument| (*argument).to_owned()).collect(),
         }
+    }
+
+    /// `status` has always reported a job installed under another name. Installing a second job
+    /// beside it is what produces the login race: both start, one creates the server and the other
+    /// refuses to create a second and is left failed.
+    #[test]
+    fn an_install_is_refused_beside_a_job_that_already_does_the_work() {
+        let jobs = [job(
+            "com.example.my-terminal",
+            &["/usr/local/bin/zellij", "session", "up", "work"],
+        )];
+        let refusal = refusal_to_install_beside(&jobs, "work").expect("must refuse");
+        assert!(refusal.contains("com.example.my-terminal"));
+        assert!(refusal.contains("/agents/com.example.my-terminal"));
+        // and it says which job is which: `session disable` takes back what `enable` wrote, so it
+        // is not the way to remove somebody else's file
+        assert!(refusal.contains("--force"));
+        assert!(refusal.contains("will not touch"));
+    }
+
+    #[test]
+    fn every_job_that_does_the_work_is_named_in_the_refusal() {
+        let jobs = [
+            job(
+                "com.example.one",
+                &["/usr/bin/zellij", "session", "up", "work"],
+            ),
+            job(
+                "com.example.two",
+                &["/usr/bin/zellij", "session", "up", "work"],
+            ),
+        ];
+        let refusal = refusal_to_install_beside(&jobs, "work").expect("must refuse");
+        assert!(refusal.contains("com.example.one"));
+        assert!(refusal.contains("com.example.two"));
+    }
+
+    #[test]
+    fn nothing_is_refused_on_the_ordinary_machine() {
+        assert_eq!(refusal_to_install_beside(&[], "work"), None);
+    }
+
+    /// The contradiction this fixes: `status` naming the job that keeps the session up while
+    /// `disable` calls the same machine "nothing installed".
+    #[test]
+    fn disable_names_the_foreign_job_rather_than_calling_it_nothing() {
+        let foreign = vec![job(
+            "com.example.my-terminal",
+            &["/usr/local/bin/zellij", "session", "up", "work"],
+        )];
+        assert_eq!(
+            nothing_of_ours_to_remove(foreign.clone()),
+            DisableOutcome::NotOurs { jobs: foreign }
+        );
+        // and removal is still scoped to what `enable` wrote: the outcome carries the job to
+        // report, not a file to delete
+        assert_eq!(
+            nothing_of_ours_to_remove(Vec::new()),
+            DisableOutcome::NotInstalled
+        );
     }
 
     #[test]
