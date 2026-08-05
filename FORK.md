@@ -525,6 +525,29 @@ agent     ~/Library/LaunchAgents/dev.zellij.session.my-session.plist - installed
 loaded    yes (gui/501/com.example.my-terminal)
 ```
 
+### A session created by a launcher gets a usable `TERM`
+
+A launcher — a launch agent, a systemd user unit — is not a login shell and has **no `TERM`**. The
+server hands its own environment to every pane shell it spawns, so a session created by one came up
+with `TERM=dumb` in every pane: keystrokes repeating, and programs reporting `TERM environment
+variable not set.` Measured on two machines, not inferred. It stayed hidden for as long as a login
+shell always won the race to create the session, because a shell always has `TERM` — and appeared
+the moment the launcher became the creator, which is exactly what `session enable` arranges.
+
+So `session up` sets `TERM=xterm-256color` when what it has is unset, empty, or `dumb`, on the path
+that CREATES the session and nowhere else: an `up` that finds the session healthy has already
+returned, and `restart` ends in the same function and is covered by it. `dumb` counts as absent
+because it is what an environment with no terminal type produces, and it is never what a pane wants.
+Any other value is left alone — a real terminal knows what it is better than this does.
+
+The generated units set it too (`Environment=TERM=`, a `TERM` key in `EnvironmentVariables`). Belt
+and braces: it makes the unit correct on its own terms, and it is visible to whoever reads the unit,
+which the in-binary default is not. Unlike `ExecStart` and the label, this one is a **default**: a
+`session_service` entry setting `TERM` replaces it rather than joining it — a plist dictionary
+cannot carry one key twice, and two systemd assignments of one variable are a unit nobody can read
+with confidence. On launchd the config's `TERM` goes inside `EnvironmentVariables`, where it means
+something, rather than beside it as a top-level key launchd would ignore.
+
 ### Configurable terminal title
 
 ```kdl
@@ -685,7 +708,12 @@ pins either variable builds a session no terminal can see, which is the failure 
 exists to prevent. A duplicate key is not an override either: a dict with the same key twice is not
 a plist.
 
-With nothing configured the generated unit is byte-for-byte what it was.
+`TERM` is the one exception, and deliberately so: it is a *default* the generator supplies rather
+than a part of the unit it owns, so an entry setting it replaces that default instead of being
+refused. On launchd it is written inside `EnvironmentVariables` rather than as a top-level key.
+
+With nothing configured the generated unit is byte-for-byte what it was, but for the `TERM` a
+launcher cannot supply itself.
 
 ## Assessed and deliberately not built
 

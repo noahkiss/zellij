@@ -506,6 +506,32 @@ pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<
     }
 }
 
+/// The TERM a session is given when whatever created it had none worth passing on.
+///
+/// A terminal type every terminal emulator of the last two decades understands, and the one the
+/// generated units name - see [`crate::session_service`], which spells it out where a reader of the
+/// unit can see it.
+pub const DEFAULT_TERM: &str = "xterm-256color";
+
+/// The TERM to give a session being CREATED, or `None` to keep what is already there.
+///
+/// The server hands its own environment to every pane shell it spawns, so whatever TERM the creator
+/// had is the TERM of every pane, for the life of the session. A launcher - a launch agent, a
+/// systemd user unit - is not a login shell and has no TERM at all, and the shells in those panes
+/// then come up with `TERM=dumb`: keys repeat, and programs report that TERM is not set. It stayed
+/// hidden for as long as a login shell always won the race to create the session, because a shell
+/// always has one.
+///
+/// `dumb` is treated as absent rather than as a choice. It is what an environment with no terminal
+/// type produces, and it is never what a pane wants. Anything else is left alone: a real terminal
+/// knows what it is better than this does.
+pub fn term_for_new_session(current: Option<&str>) -> Option<&'static str> {
+    match current {
+        Some(term) if !term.is_empty() && term != "dumb" => None,
+        _ => Some(DEFAULT_TERM),
+    }
+}
+
 /// Whether one `session_restart_drop_env` pattern names this variable.
 ///
 /// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
@@ -838,6 +864,22 @@ mod tests {
         let expected = PathBuf::from("/run/zellij/c1/work");
         assert!(assert_up_from(&[], &expected, true, true, false).is_ok());
         assert!(assert_up_from(&[], &expected, false, true, false).is_err());
+    }
+
+    #[test]
+    fn a_creator_with_no_term_hands_out_a_usable_one() {
+        // the launcher case: a launch agent or a systemd unit has no TERM at all
+        assert_eq!(term_for_new_session(None), Some(DEFAULT_TERM));
+        assert_eq!(term_for_new_session(Some("")), Some(DEFAULT_TERM));
+        // `dumb` is what an environment with no terminal type produces, not a choice anyone made
+        assert_eq!(term_for_new_session(Some("dumb")), Some(DEFAULT_TERM));
+    }
+
+    #[test]
+    fn a_real_terminal_keeps_the_term_it_came_with() {
+        assert_eq!(term_for_new_session(Some("xterm-256color")), None);
+        assert_eq!(term_for_new_session(Some("screen-256color")), None);
+        assert_eq!(term_for_new_session(Some("dumb-but-not-dumb")), None);
     }
 
     fn patterns(patterns: &[&str]) -> Vec<String> {

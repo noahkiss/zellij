@@ -644,8 +644,36 @@ fn xml_escape(text: &str) -> String {
 /// healthy session is a no-op and a pass over a missing one restores it.
 const CHECK_INTERVAL_SECS: u64 = 60;
 
+/// Whether the config already sets TERM for the service.
+///
+/// systemd takes the last assignment of a variable, so a second `Environment=TERM=` line would not
+/// break anything - but two of them in one unit is a thing to read twice and get wrong, and the
+/// generator's default is the one to drop.
+fn sets_term(directives: &[String]) -> bool {
+    directives.iter().any(|directive| {
+        directive
+            .strip_prefix("Environment=")
+            .map(|assignment| {
+                assignment
+                    .trim_start_matches(['"', '\''])
+                    .starts_with("TERM=")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn systemd_unit(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
     let extras = extras.cloned().unwrap_or_default();
+    // A default, not a decision: a config that sets its own TERM replaces this line rather than
+    // adding a second one.
+    let term = if sets_term(&extras.systemd.service) {
+        String::new()
+    } else {
+        format!(
+            "Environment=TERM={}\n",
+            crate::session_lifecycle::DEFAULT_TERM
+        )
+    };
     format!(
         "\
 # zellij session '{session}' - write to ~/.config/systemd/user/{unit}
@@ -675,7 +703,10 @@ RemainAfterExit=no
 # bites when this unit CREATES the session, so it stays hidden for as long as something else
 # gets there first.
 KillMode=process
-ExecStart={exe} session up {session}
+# The server hands its own environment to every pane shell, and a unit has no TERM: without this
+# every pane in a session this unit created comes up with TERM=dumb. Setting your own terminal type
+# in the config's `session_service` block replaces this line rather than adding a second one.
+{term}ExecStart={exe} session up {session}
 {service_extra}
 [Install]
 WantedBy=default.target
@@ -683,6 +714,7 @@ WantedBy=default.target
         session = session,
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
+        term = term,
         unit = systemd_service_name(session),
         timer = systemd_timer_name(session),
         unit_extra = directive_lines(&extras.systemd.unit),
@@ -738,6 +770,21 @@ pub fn systemd_timer_name(session: &str) -> String {
 
 fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
     let extras = extras.cloned().unwrap_or_default();
+    // TERM is an environment default the generator owns a value for, not a plist key - launchd has
+    // no top-level key by that name. A config entry naming it therefore replaces the value inside
+    // EnvironmentVariables, where it means something, instead of becoming a key launchd ignores.
+    // A dict cannot carry the same key twice, so it has to be replaced rather than appended.
+    let (given_term, keys): (Vec<LaunchdKey>, Vec<LaunchdKey>) = extras
+        .launchd
+        .into_iter()
+        .partition(|key| key.name == "TERM");
+    let term = given_term
+        .into_iter()
+        .find_map(|key| match key.value {
+            PlistValue::String(value) => Some(value),
+            _ => None,
+        })
+        .unwrap_or_else(|| crate::session_lifecycle::DEFAULT_TERM.to_owned());
     format!(
         "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -766,10 +813,16 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
   the job may auto-load into, so at login it cannot come up anywhere else. Keep it for that, but
   do not read its presence as the thing granting the context: the bootstrap target is.
 
-  EnvironmentVariables carries PATH and NOTHING ELSE - in particular no TMPDIR and no
+  EnvironmentVariables carries PATH and TERM and NOTHING ELSE - in particular no TMPDIR and no
   ZELLIJ_SOCKET_DIR. launchd hands out a per-user TMPDIR that differs from the one a login shell
   sees, so a pinned socket directory here would build a session invisible to every terminal. The
   binary resolves that directory itself.
+
+  TERM is here because a launch agent has none, and the server hands its own environment to every
+  pane shell it spawns: without it every pane of a session this agent created comes up with
+  TERM=dumb. A TERM key in the config's `session_service` launchd block replaces this value; it
+  belongs in this dictionary rather than beside it, because launchd has no top-level key by that
+  name.
 -->
 <plist version=\"1.0\">
 <dict>
@@ -788,6 +841,8 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TERM</key>
+        <string>{term}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -800,7 +855,8 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         label = launchd_label(session),
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
-        extra_keys = plist_entries(&extras.launchd),
+        term = xml_escape(&term),
+        extra_keys = plist_entries(&keys),
     )
 }
 
@@ -1836,6 +1892,49 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
             "plist sets ProcessType, which panes inherit"
         );
     }
+    /// A launcher has no TERM, and the server hands its own environment to every pane shell it
+    /// spawns - so without this every pane of a session the unit created comes up with TERM=dumb.
+    #[test]
+    fn every_generated_unit_sets_a_term() {
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        assert!(unit.contains(&format!(
+            "Environment=TERM={}\n",
+            crate::session_lifecycle::DEFAULT_TERM
+        )));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        assert!(plist.contains(&format!(
+            "<key>TERM</key>\n        <string>{}</string>",
+            crate::session_lifecycle::DEFAULT_TERM
+        )));
+    }
+
+    /// TERM is a default, unlike ExecStart or the label: a machine whose terminal is something else
+    /// has to be able to say so. What it must not do is end up set twice - a plist dict cannot
+    /// carry one key twice at all, and two systemd assignments of one variable are a unit nobody
+    /// can read with confidence.
+    #[test]
+    fn a_configured_term_replaces_the_default_rather_than_joining_it() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_systemd_directive("service", "Environment=TERM=screen-256color")
+            .unwrap();
+        extras
+            .add_launchd_key("TERM", PlistValue::String("screen-256color".to_owned()))
+            .unwrap();
+
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras));
+        assert_eq!(unit.matches("Environment=TERM=").count(), 1);
+        assert!(unit.contains("Environment=TERM=screen-256color"));
+
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        assert_eq!(plist.matches("<key>TERM</key>").count(), 1);
+        assert!(plist.contains("<key>TERM</key>\n        <string>screen-256color</string>"));
+        // and inside EnvironmentVariables, where it means something - launchd has no top-level
+        // key by that name
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(!plist.contains("    <key>TERM</key>\n    <string>"));
+    }
+
     #[test]
     fn no_unit_sets_a_socket_dir_or_a_tmpdir() {
         let units = [

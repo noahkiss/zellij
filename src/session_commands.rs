@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    env_vars_to_drop, warn_if_server_build_differs, DownOutcome, SessionFacts,
+    env_vars_to_drop, term_for_new_session, warn_if_server_build_differs, DownOutcome, SessionFacts,
 };
 use zellij_utils::session_service::{
     self, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome, PlistValue, ServiceExe,
@@ -413,6 +413,17 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
             eprintln!("session up: {}", reason);
             return Err(());
         },
+    }
+
+    // The last thing before the server is created, and only on the path that creates it: the server
+    // takes this process's environment and hands it to every pane shell, so a TERM set here is the
+    // TERM of every pane for the life of the session. A launcher has none - see
+    // `zellij_utils::session_lifecycle::term_for_new_session`. An `up` that found the session
+    // healthy has already returned, so nothing here touches a session that exists, and `restart`
+    // ends in this function and is covered by it.
+    if let Some(term) = term_for_new_session(std::env::var("TERM").ok().as_deref()) {
+        println!("      no usable TERM here; the session gets TERM={}", term);
+        std::env::set_var("TERM", term);
     }
 
     let mut opts = opts.clone();
