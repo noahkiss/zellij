@@ -151,6 +151,32 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         return Err(());
     }
 
+    // Which macOS session domain a server is created in is decided once and inherited by every
+    // pane, so `up` from a shell that is not in the graphical session hands that decision to
+    // launchd rather than making it here. See `zellij_utils::session_lifecycle`.
+    #[cfg(target_os = "macos")]
+    match zellij_utils::session_lifecycle::ensure_gui_session_domain(name, facts.listed) {
+        Ok(true) => {
+            let facts = wait_for_server(name);
+            if let Err(reason) = facts.assert_up() {
+                eprintln!("session up: post-condition FAILED - {}", reason);
+                facts.print_diagnostics();
+                return Err(());
+            }
+            println!(
+                "up    session '{}' in {} (started in the graphical session)",
+                name,
+                facts.socket_dir.display()
+            );
+            return Ok(());
+        },
+        Ok(false) => {},
+        Err(reason) => {
+            eprintln!("session up: {}", reason);
+            return Err(());
+        },
+    }
+
     let mut opts = opts.clone();
     opts.session = None;
     opts.command = Some(Command::Sessions(Sessions::Attach {

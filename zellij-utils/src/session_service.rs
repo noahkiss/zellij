@@ -91,6 +91,15 @@ pub fn path_dirs() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// The launchd label of the agent that keeps `session` up.
+///
+/// One label per session name, because one label is one job: a fixed label would mean the second
+/// session's plist replaced the first one's, and `zellij session up` would have no way to ask
+/// launchd for the job that belongs to the name it was given.
+pub fn launchd_label(session: &str) -> String {
+    format!("dev.zellij.session.{}", session)
+}
+
 /// Render the unit for `kind`, running `exe` against `session`.
 pub fn service_unit(kind: ServiceKind, exe: &Path, session: &str) -> String {
     match kind {
@@ -143,11 +152,11 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <!--
-  zellij session '{session}' - write to ~/Library/LaunchAgents/dev.zellij.session.plist
+  zellij session '{session}' - write to ~/Library/LaunchAgents/{label}.plist
 
   Install:
-      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.zellij.session.plist
-      launchctl kickstart -k gui/$(id -u)/dev.zellij.session
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{label}.plist
+      launchctl kickstart -k gui/$(id -u)/{label}
 
   RunAtLoad brings the session up at login; StartInterval re-checks it. `zellij session up` is
   idempotent and asserts its own result, so a pass over a healthy session does nothing.
@@ -169,7 +178,7 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
 <plist version=\"1.0\">
 <dict>
     <key>Label</key>
-    <string>dev.zellij.session</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
@@ -194,6 +203,7 @@ fn launchd_plist(exe: &Path, session: &str) -> String {
 </plist>
 ",
         session = session,
+        label = launchd_label(session),
         exe = exe.display(),
         interval = CHECK_INTERVAL_SECS,
     )
@@ -262,6 +272,18 @@ mod tests {
         let exe = resolve_service_exe(None, &real, &[]);
         assert_eq!(exe, ServiceExe::Resolved(real.canonicalize().unwrap()));
         assert!(exe.path().is_absolute());
+    }
+
+    #[test]
+    fn each_session_has_its_own_launchd_job() {
+        assert_eq!(launchd_label("work"), "dev.zellij.session.work");
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work");
+        assert!(plist.contains(&format!(
+            "<key>Label</key>\n    <string>{}</string>",
+            launchd_label("work")
+        )));
+        // what `zellij session up` will ask launchd for is what the install line loads
+        assert!(plist.contains(&format!("gui/$(id -u)/{}", launchd_label("work"))));
     }
 
     #[test]

@@ -317,6 +317,162 @@ impl DownOutcome {
     }
 }
 
+/// What `session up` should do about the macOS session domain before it creates anything.
+///
+/// macOS puts every process in a session domain, and only the graphical one - launchd calls it
+/// `Aqua` - can reach TCC-gated resources, the login keychain, the pasteboard or notifications. The
+/// domain is fixed when the server is created and inherited by every pane in it; attaching later
+/// never changes it. So whoever creates the session first decides this for its whole life, and a
+/// shell over SSH is not in the graphical session: create it from there and the session is
+/// permanently without that access, with nothing anywhere saying so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuiDomainAction {
+    /// Nothing to arrange - already graphical, or the session exists and the question is settled.
+    Proceed,
+    /// Ask launchd to start this job, so the session is created in the graphical session rather
+    /// than in this one.
+    Kickstart(String),
+    /// Create it here, and say what it will not be able to do. There is no job to defer to, and
+    /// refusing would leave the user with no session over a capability they may not want.
+    ProceedWithoutGui,
+    /// Nobody is logged in graphically, so there is no session domain to create it in. Reported
+    /// rather than quietly answered with the wrong domain.
+    NoGuiSession,
+}
+
+/// Decide from what the machine says: the domain this process is in, whether a graphical session
+/// exists at all, the label of an installed job for this session if there is one, and whether the
+/// session is already there.
+pub fn gui_domain_action(
+    manager_name: Option<&str>,
+    gui_domain_available: bool,
+    installed_job: Option<&str>,
+    session_exists: bool,
+) -> GuiDomainAction {
+    // an existing session already has a domain, and `up` is not going to replace it over this
+    if session_exists {
+        return GuiDomainAction::Proceed;
+    }
+    if manager_name == Some(GUI_MANAGER_NAME) {
+        return GuiDomainAction::Proceed;
+    }
+    if !gui_domain_available {
+        return GuiDomainAction::NoGuiSession;
+    }
+    match installed_job {
+        Some(label) => GuiDomainAction::Kickstart(label.to_owned()),
+        None => GuiDomainAction::ProceedWithoutGui,
+    }
+}
+
+/// What `launchctl managername` calls the graphical login session.
+pub const GUI_MANAGER_NAME: &str = "Aqua";
+
+/// Asking launchd what this process is in and what it has been given to run.
+///
+/// Compiled under `cfg(test)` on every unix so that the macOS-only path cannot rot unnoticed on a
+/// machine that never builds it; nothing outside macOS calls it.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub mod launchctl {
+    use std::process::Command;
+
+    /// The session domain this process is in. `None` when launchctl will not say - an answer we do
+    /// not have is not one to act on.
+    pub fn manager_name() -> Option<String> {
+        let output = Command::new("launchctl").arg("managername").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// The graphical domain of the user running this process.
+    pub fn gui_domain() -> String {
+        format!("gui/{}", unsafe { libc::getuid() })
+    }
+
+    /// Whether there is a graphical login session for this user at all.
+    pub fn gui_domain_exists() -> bool {
+        print_succeeds(&gui_domain())
+    }
+
+    /// Whether a job by this label is loaded in the graphical domain.
+    pub fn job_is_installed(label: &str) -> bool {
+        print_succeeds(&format!("{}/{}", gui_domain(), label))
+    }
+
+    /// Start the job. It returns 0 from a non-graphical shell too: what the domain of the CALLER
+    /// is has no bearing on the domain the job runs in, which is the point.
+    pub fn kickstart(label: &str) -> Result<(), String> {
+        let target = format!("{}/{}", gui_domain(), label);
+        match Command::new("launchctl")
+            .args(["kickstart", &target])
+            .output()
+        {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(format!(
+                "launchctl kickstart {} failed: {}",
+                target,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => Err(format!("could not run launchctl: {}", e)),
+        }
+    }
+
+    fn print_succeeds(target: &str) -> bool {
+        Command::new("launchctl")
+            .args(["print", target])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// Arrange for the session to be created in the graphical session, or say why it will not be.
+///
+/// `Ok(true)` means launchd has been asked for it and the caller is to wait for the session rather
+/// than create it itself.
+/// Compiled under `cfg(test)` on every unix for the same reason [`launchctl`] is.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<bool, String> {
+    let label = crate::session_service::launchd_label(session);
+    let installed = launchctl::job_is_installed(&label);
+    let action = gui_domain_action(
+        launchctl::manager_name().as_deref(),
+        launchctl::gui_domain_exists(),
+        installed.then_some(label.as_str()),
+        session_exists,
+    );
+    match action {
+        GuiDomainAction::Proceed => Ok(false),
+        GuiDomainAction::Kickstart(label) => {
+            println!(
+                "      asking launchd for '{}' in the graphical session",
+                label
+            );
+            launchctl::kickstart(&label)?;
+            Ok(true)
+        },
+        GuiDomainAction::ProceedWithoutGui => {
+            eprintln!(
+                "warning: creating '{}' outside the graphical session. Every pane in it inherits \n         \
+                 that, for as long as the server lives, and attaching from a graphical terminal \n         \
+                 later does not change it: access to TCC-gated resources, the login keychain, the \n         \
+                 pasteboard and notifications will be unavailable.\n         \
+                 Install a launch agent to avoid this: zellij --session {} setup --generate-service launchd",
+                session, session
+            );
+            Ok(false)
+        },
+        GuiDomainAction::NoGuiSession => Err(format!(
+            "there is no graphical login session to create '{}' in, and creating it here would \
+             give it a session domain it could never leave. Log in graphically first, or create \
+             the session deliberately from a shell in that session.",
+            session
+        )),
+    }
+}
+
 /// Whether one `session_restart_drop_env` pattern names this variable.
 ///
 /// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
@@ -576,5 +732,52 @@ mod tests {
     #[test]
     fn a_server_that_outlived_the_wait_is_a_failure() {
         assert!(DownOutcome::judge(deleted(false, true), Ok(())).is_failure());
+    }
+
+    #[test]
+    fn a_graphical_shell_creates_the_session_itself() {
+        assert_eq!(
+            gui_domain_action(Some(GUI_MANAGER_NAME), true, Some("a.label"), false),
+            GuiDomainAction::Proceed
+        );
+    }
+
+    #[test]
+    fn a_session_that_already_exists_settles_the_question() {
+        // its domain was decided when it was created and `up` is not going to replace it
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, Some("a.label"), true),
+            GuiDomainAction::Proceed
+        );
+    }
+
+    #[test]
+    fn a_non_graphical_shell_defers_to_the_installed_job() {
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, Some("a.label"), false),
+            GuiDomainAction::Kickstart("a.label".to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_job_the_session_is_created_anyway_and_said_so() {
+        // no job to defer to, and no session at all is worse than a session without GUI access
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, None, false),
+            GuiDomainAction::ProceedWithoutGui
+        );
+    }
+
+    #[test]
+    fn with_nobody_logged_in_graphically_there_is_nothing_to_create_it_in() {
+        assert_eq!(
+            gui_domain_action(Some("Background"), false, Some("a.label"), false),
+            GuiDomainAction::NoGuiSession
+        );
+        // and an unknown domain is not treated as the graphical one
+        assert_eq!(
+            gui_domain_action(None, false, None, false),
+            GuiDomainAction::NoGuiSession
+        );
     }
 }
