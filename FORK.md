@@ -417,6 +417,116 @@ are placed successfully are unaffected and still return immediately.
 Nothing guesses a stack target. Picking some pane to stack under when the caller did not name one
 would put a confidently wrong answer where an error belongs.
 
+### Session lifecycle: `zellij session up|down|restart`
+
+```
+zellij session up      [NAME] [--restore [ID]]
+zellij session down    [NAME] [--wait-timeout SECS]
+zellij session restart [NAME] [--fresh | --restore ID]
+```
+
+`up` is idempotent, creates the session detached, and then **asserts its own post-condition**:
+exactly one server for the name, on the socket this binary resolved, present and listed. It refuses
+to create a second server when one already serves the name but fails that check.
+
+The assertion is the point. Launchers used to declare an intended environment and trust it; nothing
+verified the result, so a launcher whose environment differed from a login shell's did not create a
+misplaced session but an **invisible** one, and the next client silently built a second server. The
+diagnostics name every server on the machine, other contract versions, and other socket
+directories, because the thing that explains a failure is usually a session you cannot see.
+
+`restart` exists because a teardown kills every pane shell in the session, including the one running
+the command — so `down && up` typed inside a session never reaches the `up`. It daemonizes first
+(the same double-fork the server itself uses), so it outlives the process group that the teardown
+signals, then runs both halves. Default restores the shape the teardown archived; `--fresh` comes
+back from the layout, which is how a layout edit is applied.
+
+`down` reports success when the session is already gone — you asked for it to be down and it is.
+Only a session that exists and cannot be removed is a failure. The top-level `delete-session` and
+`kill-session` keep their previous exit codes.
+
+None of these read `ZELLIJ_SOCKET_DIR`. The binary resolves its own socket directory, so there is no
+environment variable for a launcher to get wrong, and none for a long-lived shell to hold a stale
+copy of.
+
+### `zellij setup --generate-service <systemd|launchd>`
+
+Writes a user-level systemd unit or launchd plist whose only job is to call `zellij session up`.
+Supervision belongs to the init system; session correctness belongs to the binary.
+
+Two things the generated files deliberately do:
+
+- **They name a stable binary path.** `current_exe()` resolves symlinks, so on a package manager
+  with a versioned install prefix it yields a path that disappears on the next upgrade. The
+  generator prefers a `PATH` entry whose canonical target is this binary — the stable symlink —
+  falling back with a warning, and `--exe` overrides. On macOS this also matters for identity:
+  permission grants are recorded against the executable image, so a versioned path re-asks for
+  every permission after every upgrade.
+- **The plist sets `LimitLoadToSessionType Aqua`.** See below.
+
+They deliberately set no `TMPDIR` and no `ZELLIJ_SOCKET_DIR`, and no `ProcessType` — that last one
+is a throttling hint, and panes inherit the server's QoS.
+
+### `session up` will not create a session in the wrong macOS session domain
+
+macOS puts every process in a session domain, and only the graphical (`Aqua`) one carries the
+context for TCC-gated resources, the login keychain, the pasteboard and notifications. A process
+cannot ask for that context: it is conferred by the domain a job is loaded into, inherited by
+children, fixed when the server is created, and **never changed by attaching later**.
+
+That turns an idempotent `up` into a race. Whoever creates the session first wins the domain
+permanently, and a connection over SSH runs in the `Background` domain — so connecting over SSH
+before the launchd agent has run leaves a session that can never reach those resources, with
+nothing reporting it.
+
+So on macOS, when the current domain is not `Aqua` and the session does not exist, `up` asks
+launchd to start the job in the graphical domain rather than creating the session itself, then
+waits for the socket and asserts as usual. With no job installed it creates the session and warns
+that GUI-gated access will be unavailable for the life of the server. With no graphical session at
+all it says so instead of quietly creating a crippled one. Linux has no analogue and is unaffected.
+
+### Configurable terminal title
+
+```kdl
+terminal_title_template "{host} - {session} | {pane}"
+session_aliases {
+    my-session "MS"
+}
+```
+
+The OSC 0 title was hardcoded to `<session> | <pane>`. Placeholders are `{host}`, `{session}` and
+`{pane}`; `{session}` resolves through the alias map. A placeholder that comes out empty takes the
+literal text around it, so the default template still renders exactly what the hardcoded format
+did, and an unresolvable hostname does not leave a dangling separator. Unknown placeholders stay
+literal. The format is fixed once the first client connects and read from there while panes render,
+so the per-frame cost is unchanged.
+
+### Environment variables dropped on restart
+
+```kdl
+session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
+```
+
+A restart triggered from inside a pane inherits that pane's environment, and the rebuilt session
+then hands it to **every** pane — so a tool that marks its own environment leaks that mark into
+panes it has nothing to do with. Names match exactly, or by prefix with a trailing `*`; a `*`
+anywhere else is a literal character. Dropped after the restart daemonizes and before it rebuilds.
+Empty or absent means nothing is dropped.
+
+### `~` and `$VAR` in config paths
+
+Layouts have always expanded `~` in a plugin location, because layout parsing runs it through
+`shellexpand`. Config did not, so the same path written in `config.kdl` was taken literally — and a
+`plugin_permissions` key copied out of a layout silently never matched, leaving the plugin to prompt
+for a permission it had already been granted.
+
+The path-valued options (`default_shell`, `default_cwd`, `default_layout`, `layout_dir`,
+`theme_dir`, `scrollback_editor`, `snapshot_dir`, `web_server_cert`, `web_server_key`) and
+`plugin_permissions` keys now expand the same way layouts do. Expansion failure falls back to the
+literal string rather than failing config parsing. `plugin_permissions` expands *before* its
+wildcard and remote-URL rejections, so a variable cannot smuggle a `*` past a check whose whole
+purpose is explicit listing.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in
