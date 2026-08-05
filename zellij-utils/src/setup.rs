@@ -283,6 +283,12 @@ pub struct Setup {
     /// Generates auto-start script for the specified shell
     #[clap(long, value_name = "SHELL", value_parser)]
     pub generate_auto_start: Option<String>,
+
+    /// Generates an init-system unit that keeps a session up, for `systemd` or `launchd`. The
+    /// session is named by `zellij --session <name> setup ...`, or by the `session_name` config
+    /// option
+    #[clap(long, value_name = "INIT", value_parser)]
+    pub generate_service: Option<String>,
 }
 
 impl Setup {
@@ -399,6 +405,13 @@ impl Setup {
     pub fn from_cli_with_options(&self, opts: &CliArgs, config_options: &Options) -> Result<()> {
         if self.check {
             Setup::check_defaults_config(opts, config_options)?;
+            std::process::exit(0);
+        }
+
+        // this one lives here rather than beside the other generators because it needs the merged
+        // options: the session it schedules can come from the config file
+        if let Some(init) = &self.generate_service {
+            Setup::generate_service(init, opts, config_options);
             std::process::exit(0);
         }
 
@@ -596,6 +609,37 @@ impl Setup {
             _ => {},
         }
     }
+    /// Write an init-system unit for `zellij session up <session>` to stdout.
+    ///
+    /// The unit is a scheduler and nothing else - see [`crate::session_service`] for why it carries
+    /// no environment of its own.
+    fn generate_service(init: &str, opts: &CliArgs, config_options: &Options) {
+        use crate::session_service::{service_unit, ServiceKind};
+
+        let Some(kind) = ServiceKind::from_name(init) else {
+            eprintln!("Unsupported init system: {} (try systemd or launchd)", init);
+            std::process::exit(1);
+        };
+        let session = opts
+            .session
+            .clone()
+            .or_else(|| config_options.session_name.clone());
+        let Some(session) = session else {
+            // --session belongs to zellij itself rather than to `setup`, so it goes before the
+            // subcommand; say so, because the other order is the one people try first
+            eprintln!(
+                "No session to schedule. Name one with:\n    \
+                 zellij --session <name> setup --generate-service {}\n\
+                 or set `session_name` in the config.",
+                init
+            );
+            std::process::exit(1);
+        };
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let mut out = std::io::stdout();
+        let _ = out.write_all(service_unit(kind, &exe, &session).as_bytes());
+    }
+
     fn parse_layout_and_override_config(
         cli_config_options: Option<&Options>,
         config: Config,

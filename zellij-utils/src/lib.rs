@@ -33,6 +33,7 @@ pub mod logging; // Requires log4rs
 pub mod remote_session_tokens;
 #[cfg(not(target_family = "wasm"))]
 pub mod session_lifecycle;
+pub mod session_service;
 #[cfg(not(target_family = "wasm"))]
 pub mod session_snapshot;
 #[cfg(not(target_family = "wasm"))]
