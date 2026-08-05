@@ -2416,10 +2416,67 @@ fn send_command_not_found_to_screen(
 
 #[cfg(not(windows))]
 pub fn get_default_shell() -> PathBuf {
-    PathBuf::from(std::env::var("SHELL").unwrap_or_else(|_| {
-        log::warn!("Cannot read SHELL env, falling back to use /bin/sh");
-        "/bin/sh".to_string()
-    }))
+    default_shell_from(
+        std::env::var("SHELL").ok().as_deref(),
+        shell_from_passwd_entry,
+    )
+}
+
+/// Which shell a pane gets: what the environment says, else what the passwd database says, else
+/// `/bin/sh`.
+///
+/// The middle step is the one that matters here. A launcher - a launch agent, a systemd user unit -
+/// is not a login shell and hands the server no SHELL, and the server hands its own environment to
+/// every pane it spawns. Falling straight to `/bin/sh` there gives EVERY pane of a
+/// launcher-created session a bare `sh`: no prompt, no aliases, none of the rc chain, while the
+/// session itself looks perfectly up. The passwd entry is where the user's shell is written down,
+/// and it is right whether or not anything exported it. Only reached when the config sets no
+/// `default_shell`, which already answers this for anyone who has set one.
+#[cfg(not(windows))]
+fn default_shell_from(
+    env_shell: Option<&str>,
+    from_passwd: impl Fn() -> Option<PathBuf>,
+) -> PathBuf {
+    if let Some(shell) = env_shell.filter(|shell| !shell.is_empty()) {
+        return PathBuf::from(shell);
+    }
+    if let Some(shell) = from_passwd() {
+        log::info!("Cannot read SHELL env, using the shell from this user's passwd entry");
+        return shell;
+    }
+    log::warn!("Cannot read SHELL env, falling back to use /bin/sh");
+    PathBuf::from("/bin/sh")
+}
+
+/// The login shell recorded for this uid, if the passwd database has one.
+///
+/// `libc::getpwuid_r` rather than `nix`: this crate builds nix without the feature flags that would
+/// expose the passwd functions, the same reason `zellij_utils::shared::short_hostname` calls
+/// `libc::gethostname` directly. Deliberately quiet - every failure here is answered by the
+/// /bin/sh the caller already had.
+#[cfg(not(windows))]
+fn shell_from_passwd_entry() -> Option<PathBuf> {
+    use std::ffi::CStr;
+
+    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 1024];
+    let found = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut passwd,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        )
+    };
+    // a zero return with a null result is "no such user", which is not an error and not a shell
+    if found != 0 || result.is_null() || passwd.pw_shell.is_null() {
+        return None;
+    }
+    let shell = unsafe { CStr::from_ptr(passwd.pw_shell) }.to_str().ok()?;
+    // an empty pw_shell means "the system default", which is the /bin/sh the caller falls back to
+    (!shell.is_empty()).then(|| PathBuf::from(shell))
 }
 
 #[cfg(windows)]

@@ -212,7 +212,23 @@ const SESSION_UP_VALUE_FLAGS: &[&str] = &["--restore"];
 /// an environment shim, a scheduling helper - with the zellij path several arguments in, and the
 /// binary itself need not be called "zellij": a renamed or symlinked build is the same program.
 /// What identifies the job is the subcommand it runs, so that is what is matched.
+///
+/// Two passes, because the subcommand is not always two arguments of the job's own argv. The
+/// commonest hand-written agent runs a shell - `["/bin/sh", "-c", "exec zellij session up
+/// my-session"]` - and there the whole command line is ONE argument, which is exactly the
+/// population this scan exists for: an agent written before these subcommands existed could not
+/// have called them, so it calls something that calls them. The second pass reads inside each
+/// argument.
 pub fn session_up_target(exec: &[String]) -> Option<&str> {
+    if let Some(session) = session_up_in_argv(exec) {
+        return Some(session);
+    }
+    exec.iter().find_map(|argument| session_up_inside(argument))
+}
+
+/// `session up <name>` spread across separate argv elements, which is what a unit that execs zellij
+/// directly produces - and what this build writes.
+fn session_up_in_argv(exec: &[String]) -> Option<&str> {
     let up = exec
         .windows(2)
         .position(|pair| pair[0] == "session" && pair[1] == "up")?;
@@ -230,6 +246,69 @@ pub fn session_up_target(exec: &[String]) -> Option<&str> {
     // `session up` with no name takes it from the config, which this cannot read on the unit's
     // behalf - so it names no session here rather than guessing at one
     None
+}
+
+/// `session up <name>` written inside ONE argument, as a `sh -c` job writes it.
+///
+/// The words are read the way a shell reads them, quotes included, so a session name with a space
+/// in it survives. What is not attempted is shell semantics: a name built from a variable, or a
+/// command that reaches `session up` only through a script this cannot see, is not found here and
+/// is not meant to be - see the caller's warning, which says a job may run something unreadable
+/// rather than claiming none exists.
+fn session_up_inside(argument: &str) -> Option<&str> {
+    let words = word_spans(argument);
+    let word = |span: &(usize, usize)| &argument[span.0..span.1];
+    let up = words
+        .windows(2)
+        .position(|pair| word(&pair[0]) == "session" && word(&pair[1]) == "up")?;
+    let mut rest = words[up + 2..].iter();
+    while let Some(span) = rest.next() {
+        let candidate = word(span);
+        if candidate.starts_with('-') {
+            if SESSION_UP_VALUE_FLAGS.contains(&candidate) {
+                rest.next();
+            }
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Where each word of a command line begins and ends, with the quotes around a word left out of the
+/// span. A byte offset is only ever taken at ASCII whitespace or an ASCII quote, so every span it
+/// produces is a character boundary.
+fn word_spans(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'"' || bytes[index] == b'\'' {
+            let quote = bytes[index];
+            let start = index + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != quote {
+                end += 1;
+            }
+            spans.push((start, end));
+            index = (end + 1).min(bytes.len());
+            continue;
+        }
+        let start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'"'
+            && bytes[index] != b'\''
+        {
+            index += 1;
+        }
+        spans.push((start, index));
+    }
+    spans
 }
 
 /// `Label` and `ProgramArguments` out of a launch agent plist.
@@ -1822,6 +1901,57 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         // the `-` prefix is systemd's, not part of the path, and a quoted argument is one argument
         assert_eq!(arguments[0], "/opt/my");
         assert_eq!(session_up_target(&arguments), Some("my session"));
+    }
+
+    /// The commonest hand-written agent of all: the whole command line in one argument, handed to
+    /// a shell. An agent old enough to predate these subcommands could not have called them
+    /// directly, so this is the shape the scan most needs to read.
+    #[test]
+    fn a_command_line_inside_one_argument_is_still_the_job() {
+        let arguments: Vec<String> = ["/bin/sh", "-c", "exec zellij session up my-session"]
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect();
+        assert_eq!(session_up_target(&arguments), Some("my-session"));
+
+        let jobs = [job(
+            "com.example.my-terminal",
+            &["/bin/sh", "-c", "exec zellij session up work"],
+        )];
+        assert_eq!(
+            find_session_job(&jobs, "work", &launchd_label("work")),
+            SessionJob::InstalledAs(&jobs[0])
+        );
+    }
+
+    #[test]
+    fn a_quoted_name_inside_one_argument_survives_the_quotes() {
+        let arguments = vec![
+            "/bin/bash".to_string(),
+            "-lc".to_string(),
+            "zellij session up 'my session' >/dev/null".to_string(),
+        ];
+        assert_eq!(session_up_target(&arguments), Some("my session"));
+    }
+
+    #[test]
+    fn a_flag_with_a_value_inside_one_argument_is_not_the_session_name() {
+        let arguments = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "zellij session up --restore latest work".to_string(),
+        ];
+        assert_eq!(session_up_target(&arguments), Some("work"));
+    }
+
+    #[test]
+    fn a_shell_running_another_subcommand_is_still_not_a_match() {
+        let arguments = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "zellij session down work && zellij attach work".to_string(),
+        ];
+        assert_eq!(session_up_target(&arguments), None);
     }
 
     #[test]

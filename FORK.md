@@ -525,6 +525,29 @@ agent     ~/Library/LaunchAgents/dev.zellij.session.my-session.plist - installed
 loaded    yes (gui/501/com.example.my-terminal)
 ```
 
+**A command line inside one argument counts too.** The match started as two adjacent argv elements,
+which reads a unit that execs zellij directly and misses the commonest hand-written form of all:
+`ProgramArguments = ["/bin/sh", "-c", "exec zellij session up my-session"]`, where the whole command
+is ONE element. That is exactly the population this scan was written for — an agent predating these
+subcommands could not have called them, so it calls something that does. A second pass therefore
+reads inside each argument, quotes included, when the windowed match finds nothing.
+
+What it still cannot see is a job whose plist names a wrapper script that reaches `session up`
+somewhere inside itself. So the warning says what the scan can support — *no loaded launch agent was
+found naming `session up <name>`; one that reaches it through a wrapper may not be recognisable from
+its plist* — rather than the stronger claim that no agent runs it whatever its label.
+
+### A pane's shell comes from the passwd entry when nothing exported `SHELL`
+
+Same shape again. A launcher hands the server no `SHELL`, the server hands its own environment to
+every pane, and the fallback was `/bin/sh` with a `log::warn!` nobody reads: every pane of a
+launcher-created session would be a bare `sh` — no prompt, no aliases, none of the rc chain — while
+the session itself looks perfectly up. The user's login shell is written down in the passwd
+database, and it is right whether or not anything exported it, so that is consulted (`getpwuid_r`,
+via `libc` — this crate builds `nix` without the features that would expose it) before `/bin/sh`.
+Only reached when the config sets no `default_shell`, which already answers the question for anyone
+who has set one.
+
 ### A session created by a launcher gets a usable `TERM`
 
 A launcher — a launch agent, a systemd user unit — is not a login shell and has **no `TERM`**. The

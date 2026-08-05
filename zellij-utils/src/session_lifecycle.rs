@@ -491,7 +491,8 @@ pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<
                  that, for as long as the server lives, and attaching from a graphical terminal \n         \
                  later does not change it: access to TCC-gated resources, the login keychain, the \n         \
                  pasteboard and notifications will be unavailable.\n         \
-                 No loaded launch agent runs `session up {}`, whatever its label.\n         \
+                 No loaded launch agent was found naming `session up {}` - one that reaches it\n         \
+                 through a wrapper script may not be recognisable from its plist.\n         \
                  Install one to avoid this: zellij session enable {}",
                 session, session, session
             );
