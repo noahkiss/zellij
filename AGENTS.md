@@ -130,6 +130,39 @@ Three surfaces look similar and cost very different amounts.
 Sockets are scoped by contract version, not by version string, so a fork build and a stock build of
 the same contract share sessions. Keep it that way.
 
+## When a launcher becomes the thing that creates the session
+
+Moving session creation out of a shell wrapper and into `zellij session up` surfaced three
+separate bugs in one day, and all three had the same shape: **something a login shell had always
+supplied, which an init-system launcher does not.** Each stayed invisible for as long as a shell
+happened to create the session first, and appeared the moment the launcher won the race.
+
+- **`TERM`.** launchd and systemd give a unit none. The server hands its own environment to every
+  pane shell, so a launcher-created session had `TERM=dumb` in every pane — keystrokes repeating,
+  `TERM environment variable not set`.
+- **systemd `KillMode`.** `session up` daemonizes and returns, so the default `control-group` mode
+  tore down the cgroup when the oneshot deactivated, killing the server it had just started.
+  `KillMode=process` fixes it. launchd has no equivalent reaping.
+- **A launch agent under a different name.** The macOS domain guard looked up the label it would
+  itself have installed, so it could not see a hand-written agent doing the same job, and fell
+  through to creating a Background-domain session — the exact outcome it exists to prevent.
+
+The rule that predicts the first one, and is worth applying to anything similar:
+
+> A pane shell sources the rc chain, so it re-derives almost everything by itself — `LANG`,
+> `XDG_*`, `PATH`. Verified: absent from the launcher's environment, present in an interactive
+> pane. What it **cannot** re-derive is anything describing the *connection* rather than the
+> user's preferences. `TERM` is the clear case. The socket directory was the other, which is why
+> it is now resolved inside the binary instead of exported.
+
+So a generated unit should hold **no opinion about the environment except the values that cannot
+be re-derived**. `TERM` earns its place; a hardcoded locale does not.
+
+The general lesson for the next change of this kind: when moving work from a shell into the
+binary, do not only test the path where a shell is still involved. Test the path where the
+launcher is the sole creator — reboot-like conditions — because that is where the assumptions
+that were silently carried by the shell all fail at once.
+
 ## Rolling a new config key out before every machine has the binary
 
 **An unknown key in `config.kdl` is ignored, not an error.** Verified by running a config carrying
