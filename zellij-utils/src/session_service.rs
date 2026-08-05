@@ -355,6 +355,13 @@ After=default.target
 [Service]
 Type=oneshot
 RemainAfterExit=no
+# KillMode=process, and it is load-bearing. `session up` daemonizes the server and returns, so
+# with the default control-group mode systemd tears the cgroup down the moment this oneshot
+# deactivates - taking the server it has just started with it. The session appears for a second
+# and vanishes, which looks like the session dying rather than the launcher killing it. It only
+# bites when this unit CREATES the session, so it stays hidden for as long as something else
+# gets there first.
+KillMode=process
 ExecStart={exe} session up {session}
 {service_extra}
 [Install]
@@ -1212,6 +1219,16 @@ mod tests {
 
     /// The whole point of generating these: a unit that pins either variable builds a session the
     /// rest of the machine cannot see.
+    #[test]
+    fn the_systemd_unit_does_not_kill_the_session_it_started() {
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        // The default control-group kill mode reaps the daemonized server when this oneshot
+        // deactivates, so the session it just created dies seconds after appearing.
+        assert!(
+            unit.contains("KillMode=process"),
+            "systemd unit would kill the server it started"
+        );
+    }
     #[test]
     fn the_launchd_plist_does_not_throttle_the_session() {
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
