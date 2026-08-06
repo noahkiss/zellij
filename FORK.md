@@ -864,6 +864,35 @@ variables rather than plist keys, so on launchd a configured one is routed insid
 `EnvironmentVariables`, where it means something, rather than left beside it as a top-level key
 launchd ignores in silence.
 
+### A missing `TMPDIR` is an error, not a panic
+
+```
+$ TMPDIR=/nonexistent/path zellij list-sessions
+thread 'main' panicked at zellij-utils/src/logging.rs:26:41:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+```
+
+Hit on a real machine. `configure_logger` is the first thing `main` runs, and it created the log
+directory with an `.unwrap()`. The directory it creates sits under the temporary directory, which
+`TMPDIR` chooses — and on macOS that same variable decides the **socket** directory, because
+`runtime_dir()` is `None` there. So it is the variable most likely to be wrong, and the failure it
+produced was a backtrace naming a line of zellij rather than the directory it could not use.
+
+It now names the path, the temporary directory in force, the variable that chose it, and what to do:
+
+```
+zellij: could not create the temporary directory for logging
+  path           : /nonexistent/path/zellij-501
+  temp directory : /nonexistent/path
+  TMPDIR         : /nonexistent/path
+  reason         : No such file or directory (os error 2)
+  The log directory sits under the temporary directory, which TMPDIR chooses. Create that
+  directory, or unset TMPDIR to fall back to the system default.
+```
+
+Exit code 1, no backtrace. `logging.rs` is upstream code, so the patch is one function and three
+`if let Err`: its own commit, droppable whole at a rebase.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in
