@@ -893,6 +893,28 @@ zellij: could not create the temporary directory for logging
 Exit code 1, no backtrace. `logging.rs` is upstream code, so the patch is one function and three
 `if let Err`: its own commit, droppable whole at a rebase.
 
+### `Ctrl+k` kills a session where `Delete` cannot be typed
+
+The session manager's kill/delete was bound to `Delete` alone, which a Mac keyboard without a
+numeric pad does not have. The key labelled "delete" above Backspace sends Backspace, and
+`fn+Backspace` — which macOS documents as forward-delete — does not arrive as `BareKey::Delete`. So
+on two of this fork's three machines the only destructive action in the plugin was unreachable.
+
+`Ctrl+k` for "kill" now works everywhere `Delete` did — the session list, the resurrect list, and
+the single-screen view. `Delete` is unchanged.
+
+No config option: it adds a key where one was missing rather than changing an existing binding, and
+per-plugin keybinding config does not exist to extend.
+
+`Ctrl+k` is the only unclaimed mnemonic — `Ctrl+w/f/c/r/d/x/a`, Tab, Esc, Enter, the arrows and
+Backspace are all bound in that plugin, and every *unmodified* character is filter input. That last
+point is why this is a guard function and not an or-pattern: `BareKey::Delete | BareKey::Char('k')`
+under one shared guard would accept a bare `k`, so the first search for a session with a k in its
+name would delete one instead. Each key tests its own modifiers.
+
+The widest tier of each help line advertises `<Del/Ctrl k>`; narrower tiers keep `<Del>` rather than
+drop a whole entry to fit it.
+
 ### Focus wraps around the ends of a stack
 
 Moving focus up from the top pane of a stack lands on the bottom pane, and down from the bottom
