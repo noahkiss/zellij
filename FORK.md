@@ -893,6 +893,27 @@ zellij: could not create the temporary directory for logging
 Exit code 1, no backtrace. `logging.rs` is upstream code, so the patch is one function and three
 `if let Err`: its own commit, droppable whole at a rebase.
 
+### Focus wraps around the ends of a stack
+
+Moving focus up from the top pane of a stack lands on the bottom pane, and down from the bottom
+lands on the top. Previously focus simply stopped: `progress_stack_up_if_in_stack` looks for a
+stacked pane *directly above* the current one, finds none at the top, and `move_focus_up` returns
+`false` having done nothing. With `alt+j`/`alt+k` as the way through a stack, that stop is felt on
+every pass — you arrive at one end and the key goes dead.
+
+No config option. This fires only where nothing happened before, so there is no previous behaviour
+to preserve and nothing to opt out of.
+
+The wrap is a **third** fallback, after the ordinary directional move and the in-stack progression.
+Order matters: a stack sitting below another pane still lets you leave it upwards rather than
+wrapping, because `next_selectable_pane_id_above` is consulted first. Only a genuine dead end wraps.
+
+A one-pane stack does not wrap onto itself — that would report a focus change that never happened
+and make `move_focus_up` return `true` having moved nothing.
+
+`expand_pane` does the move rather than `move_up`/`move_down`: those step between neighbours, and
+this jump crosses the whole stack at once. Three tests in `stacked_panes_tests.rs`.
+
 ### macOS decides about file access at server start, not weeks later (macOS only)
 
 Found on a real machine. In a pane of a launcher-created session:

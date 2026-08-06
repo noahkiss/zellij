@@ -1009,6 +1009,22 @@ impl<'a> TiledPaneGrid<'a> {
             None => None,
         }
     }
+    /// Wrap focus to the far end of the stack, once a move has run out of stack to travel.
+    ///
+    /// Reached only after BOTH the ordinary directional move and the in-stack progression came up
+    /// empty, which together mean the focus sits at the end of a stack with nothing beyond it. In
+    /// that position focus previously just stopped dead, so this adds a move where there was none
+    /// rather than replacing one - and because it is last, a stack with a pane above it still lets
+    /// you leave upwards instead of wrapping.
+    ///
+    /// `expand_pane` rather than `move_up`/`move_down`: those step between neighbours, and this
+    /// jump crosses the whole stack at once.
+    pub fn wrap_stack_focus(&mut self, source_pane_id: &PaneId, going_up: bool) -> Option<PaneId> {
+        let mut stacked_panes = StackedPanes::new(self.panes.clone());
+        let destination_pane_id = stacked_panes.far_end_of_stack(source_pane_id, going_up)?;
+        stacked_panes.expand_pane(&destination_pane_id).ok()?;
+        Some(destination_pane_id)
+    }
     pub fn next_selectable_pane_id_below(
         &self,
         current_pane_id: &PaneId,

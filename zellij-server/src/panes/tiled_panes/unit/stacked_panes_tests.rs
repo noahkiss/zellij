@@ -1035,6 +1035,116 @@ fn break_next_to_last_pane_out_of_stack() {
     assert_snapshot!(format!("{:#?}", pane_geoms_after));
 }
 
+#[test]
+fn going_up_from_the_top_of_a_stack_wraps_to_the_bottom() {
+    let mut mock_panes: HashMap<PaneId, &mut Box<dyn Pane>> = HashMap::new();
+    mock_stacked_pane!(
+        PaneId::Terminal(1),
+        Dimension::percent(100.0),
+        32,
+        0,
+        0,
+        Some(1),
+        mock_panes
+    );
+    mock_stacked_pane!(
+        PaneId::Terminal(2),
+        Dimension::fixed(1),
+        1,
+        0,
+        32,
+        Some(2),
+        mock_panes
+    );
+    mock_stacked_pane!(
+        PaneId::Terminal(3),
+        Dimension::fixed(1),
+        1,
+        0,
+        33,
+        Some(3),
+        mock_panes
+    );
+    let mock_panes = Rc::new(RefCell::new(mock_panes));
+
+    // up from the top pane has nowhere higher to go, so it comes round to the lowest one
+    assert_eq!(
+        StackedPanes::new(mock_panes.clone()).far_end_of_stack(&PaneId::Terminal(1), true),
+        Some(PaneId::Terminal(3))
+    );
+    // and down from the bottom comes round to the highest
+    assert_eq!(
+        StackedPanes::new(mock_panes.clone()).far_end_of_stack(&PaneId::Terminal(3), false),
+        Some(PaneId::Terminal(1))
+    );
+}
+
+#[test]
+fn wrapping_from_mid_stack_still_names_the_far_end() {
+    // far_end_of_stack answers "which end", not "may I wrap" - the callers only reach it once the
+    // ordinary step has failed, so it never has to decide whether the pane is at an end.
+    let mut mock_panes: HashMap<PaneId, &mut Box<dyn Pane>> = HashMap::new();
+    mock_stacked_pane!(
+        PaneId::Terminal(1),
+        Dimension::percent(100.0),
+        32,
+        0,
+        0,
+        Some(1),
+        mock_panes
+    );
+    mock_stacked_pane!(
+        PaneId::Terminal(2),
+        Dimension::fixed(1),
+        1,
+        0,
+        32,
+        Some(2),
+        mock_panes
+    );
+    mock_stacked_pane!(
+        PaneId::Terminal(3),
+        Dimension::fixed(1),
+        1,
+        0,
+        33,
+        Some(3),
+        mock_panes
+    );
+    let mock_panes = Rc::new(RefCell::new(mock_panes));
+
+    assert_eq!(
+        StackedPanes::new(mock_panes.clone()).far_end_of_stack(&PaneId::Terminal(2), true),
+        Some(PaneId::Terminal(3))
+    );
+}
+
+#[test]
+fn a_stack_of_one_has_no_far_end_to_wrap_to() {
+    // wrapping onto yourself would report a focus change that did not happen, and move_focus_up
+    // would return true having moved nothing
+    let mut mock_panes: HashMap<PaneId, &mut Box<dyn Pane>> = HashMap::new();
+    mock_stacked_pane!(
+        PaneId::Terminal(1),
+        Dimension::percent(100.0),
+        32,
+        0,
+        0,
+        Some(1),
+        mock_panes
+    );
+    let mock_panes = Rc::new(RefCell::new(mock_panes));
+
+    assert_eq!(
+        StackedPanes::new(mock_panes.clone()).far_end_of_stack(&PaneId::Terminal(1), true),
+        None
+    );
+    assert_eq!(
+        StackedPanes::new(mock_panes.clone()).far_end_of_stack(&PaneId::Terminal(1), false),
+        None
+    );
+}
+
 struct MockPane {
     pane_geom: PaneGeom,
 }
