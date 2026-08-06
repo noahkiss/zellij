@@ -84,6 +84,32 @@ Whole-binary builds are the expensive ones, because they pull in `zellij-server`
 CI also runs `cargo xtask build` and `cargo xtask test` on Linux, macOS and Windows, plus a
 `--no-web` test pass. A change behind a feature flag still has to compile without it.
 
+**A change to `zellij-utils` must also build for wasm, and nothing here checks that for you.**
+
+```
+cargo check -p session-manager --target wasm32-wasip1   # or any default plugin
+```
+
+The default plugins are wasm crates that depend on `zellij-utils`, and their `.wasm` artifacts are
+**checked in prebuilt** under `zellij-utils/assets/plugins/`. Every ordinary build — `cargo check`,
+`--profile quick`, `--release`, CI — uses those prebuilt files and never compiles the plugin crates.
+So `zellij-utils` can stop building for wasm entirely and every signal you have stays green.
+
+That is not hypothetical: it happened at nkmk.7 and survived two releases undetected. `5198a3ebd`
+made `session_service` read `DEFAULT_TERM` from `session_lifecycle`, which is
+`#[cfg(not(target_family = "wasm"))]`. `session_service` is **not** gated, because `kdl/mod.rs`
+parses its config block and is built for wasm — so the reference crossed the gate, and no plugin
+could be rebuilt from then until `fa6bb9bc6`.
+
+The trap is the asymmetric gating in `zellij-utils/src/lib.rs`. Before referencing another module
+from an ungated one, check which side of `#[cfg(not(target_family = "wasm"))]` it sits on. If a
+shared value is wanted on both sides, it belongs in an ungated module such as `shared` — see
+`DEFAULT_TERM`, which lives there for exactly this reason. Gating the *consumer* instead is usually
+wrong; it was tried first for `session_service` and broke `kdl`.
+
+Run the wasm check before any release that touches `zellij-utils`, and always before shipping a
+change to a default plugin — otherwise the plugin change silently is not in the artifact.
+
 ## Testing against a running zellij
 
 **Never run a session-mutating command against a developer's real session.** `kill-session`,
