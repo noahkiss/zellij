@@ -507,12 +507,10 @@ pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<
     }
 }
 
-/// The TERM a session is given when whatever created it had none worth passing on.
-///
-/// A terminal type every terminal emulator of the last two decades understands, and the one the
-/// generated units name - see [`crate::session_service`], which spells it out where a reader of the
-/// unit can see it.
-pub const DEFAULT_TERM: &str = "xterm-256color";
+/// Re-exported so the term logic and its callers still read `session_lifecycle::DEFAULT_TERM`.
+/// The const itself lives in `shared` because `session_service` needs it and is built for wasm,
+/// while this module is not - see the note beside its definition.
+pub use crate::shared::DEFAULT_TERM;
 
 /// The TERM to give a session being CREATED, or `None` to keep what is already there.
 ///

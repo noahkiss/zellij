@@ -924,11 +924,7 @@ fn systemd_unit(exe: &Path, session: &str, extras: Option<&SessionServiceOptions
     let extras = extras.cloned().unwrap_or_default();
     // Defaults, not decisions: a config that sets its own TERM or PATH replaces these lines rather
     // than adding a second assignment of the same variable.
-    let term = env_default(
-        &extras.systemd.service,
-        "TERM",
-        crate::session_lifecycle::DEFAULT_TERM,
-    );
+    let term = env_default(&extras.systemd.service, "TERM", crate::shared::DEFAULT_TERM);
     let path = env_default(&extras.systemd.service, "PATH", &service_path(exe));
     format!(
         "\
@@ -1088,7 +1084,7 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
     // something. The rest are real plist keys and are written where they belong.
     let mut keys = extras.launchd;
     let term = take_default_key(&mut keys, "TERM")
-        .unwrap_or_else(|| crate::session_lifecycle::DEFAULT_TERM.to_owned());
+        .unwrap_or_else(|| crate::shared::DEFAULT_TERM.to_owned());
     let path = take_default_key(&mut keys, "PATH").unwrap_or_else(|| service_path(exe));
     let working_directory =
         take_default_key(&mut keys, "WorkingDirectory").unwrap_or_else(launchd_working_directory);
@@ -2746,12 +2742,12 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
         assert!(unit.contains(&format!(
             "Environment=TERM={}\n",
-            crate::session_lifecycle::DEFAULT_TERM
+            crate::shared::DEFAULT_TERM
         )));
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
         assert!(plist.contains(&format!(
             "<key>TERM</key>\n        <string>{}</string>",
-            crate::session_lifecycle::DEFAULT_TERM
+            crate::shared::DEFAULT_TERM
         )));
     }
 
