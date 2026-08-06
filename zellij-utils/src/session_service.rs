@@ -1841,6 +1841,11 @@ mod tests {
     }
 
     /// A versioned install: the stable name on PATH is a symlink into the version installed now.
+    ///
+    /// Unix only, and so are the four tests below it: the helper builds a symlink, and the thing
+    /// under test resolves the executable named in a systemd unit or a launchd plist. Neither
+    /// exists on Windows, so there is nothing there for these to assert about.
+    #[cfg(unix)]
     fn versioned_install() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let root = tempfile::TempDir::new().unwrap();
         let versioned = root.path().join("versions/1.2.3/bin");
@@ -1855,6 +1860,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_stable_name_on_path_is_preferred_to_the_version_it_points_at() {
         let (_root, real, stable) = versioned_install();
         let stable_dir = stable.parent().unwrap().to_path_buf();
@@ -1865,6 +1871,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_path_entry_that_is_a_different_binary_is_not_this_one() {
         let (_root, real, stable) = versioned_install();
         // another zellij, earlier on PATH: same name, its own file
@@ -1878,6 +1885,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_path_the_user_named_wins() {
         let (_root, real, stable) = versioned_install();
         let stable_dir = stable.parent().unwrap().to_path_buf();
@@ -1889,6 +1897,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn with_nothing_on_path_the_unit_still_gets_an_absolute_path() {
         let (_root, real, _stable) = versioned_install();
         let exe = resolve_service_exe(None, &real, &[]);

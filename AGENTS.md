@@ -91,15 +91,29 @@ cargo check -p session-manager --target wasm32-wasip1   # or any default plugin
 ```
 
 The default plugins are wasm crates that depend on `zellij-utils`, and their `.wasm` artifacts are
-**checked in prebuilt** under `zellij-utils/assets/plugins/`. Every ordinary build — `cargo check`,
-`--profile quick`, `--release`, CI — uses those prebuilt files and never compiles the plugin crates.
-So `zellij-utils` can stop building for wasm entirely and every signal you have stays green.
+**checked in prebuilt** under `zellij-utils/assets/plugins/`. Every *local* build — `cargo check`,
+`--profile quick`, `--release` — uses those prebuilt files and never compiles the plugin crates. So
+`zellij-utils` can stop building for wasm entirely while everything you run locally stays green.
 
-That is not hypothetical: it happened at nkmk.7 and survived two releases undetected. `5198a3ebd`
-made `session_service` read `DEFAULT_TERM` from `session_lifecycle`, which is
+That is not hypothetical: it happened at nkmk.7 and survived two releases. `5198a3ebd` made
+`session_service` read `DEFAULT_TERM` from `session_lifecycle`, which is
 `#[cfg(not(target_family = "wasm"))]`. `session_service` is **not** gated, because `kdl/mod.rs`
 parses its config block and is built for wasm — so the reference crossed the gate, and no plugin
 could be rebuilt from then until `fa6bb9bc6`.
+
+**CI caught it immediately. Nobody looked.** The `Rust` workflow builds plugins from source via
+`cargo xtask build`, so every run from nkmk.7 on failed with this exact error on ubuntu, macOS,
+Windows and the `--no-web` pass — seven jobs red for two releases while the `Release` workflow, which
+ships prebuilt assets, stayed green and made it look fine. So:
+
+```
+gh run list -R <fork> --limit 10 --json workflowName,conclusion,headBranch
+gh run view <id> -R <fork> --log-failed | grep -iE "error\[|error:"
+```
+
+**Check the runs after pushing, and before cutting a release.** A green `Release` says the artifact
+built, not that the tree is healthy — those two workflows fail independently and only one of them
+compiles the plugins.
 
 The trap is the asymmetric gating in `zellij-utils/src/lib.rs`. Before referencing another module
 from an ungated one, check which side of `#[cfg(not(target_family = "wasm"))]` it sits on. If a
