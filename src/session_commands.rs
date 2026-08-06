@@ -280,13 +280,25 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
     // file this build would have written being absent is not the fault it looks like. It is
     // reported against the first file, which is the one that runs the command - the timer beside it
     // on systemd is this build's own arrangement and says nothing about someone else's.
+    //
+    // The timer beside it is found the same way, through the service it starts rather than through
+    // a name derived here - a watchdog somebody wrote by hand arms whatever service does the work,
+    // and calling it missing tells a reader to install a second one.
     let elsewhere = status.installed_as.first();
+    let timer_elsewhere = status.timer_installed_as.as_ref();
     for (index, file) in status.files.iter().enumerate() {
-        let state = match (file.present, file.stale, index == 0, elsewhere) {
-            (false, _, true, Some(job)) => format!(
+        let found_elsewhere = if file.role == "timer" {
+            timer_elsewhere.map(|timer| (&timer.name, &timer.path))
+        } else if index == 0 {
+            elsewhere.map(|job| (&job.name, &job.path))
+        } else {
+            None
+        };
+        let state = match (file.present, file.stale, found_elsewhere) {
+            (false, _, Some((name, path))) => format!(
                 "installed under a different name: {} ({})",
-                job.name,
-                job.path.display()
+                name,
+                path.display()
             ),
             (false, ..) => "missing".to_owned(),
             (true, true, ..) => {
@@ -300,7 +312,12 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
         // this build did not write that install and cannot say which files belong to it, so
         // whether the init system holds the job is the whole of what can be judged
         Some(_) => true,
-        None => status.files.iter().all(|file| file.present),
+        // a timer under another name arms the same service, so it stands in for the file this
+        // build would have written
+        None => status
+            .files
+            .iter()
+            .all(|file| file.present || (file.role == "timer" && timer_elsewhere.is_some())),
     };
     for other in status.installed_as.iter().skip(1) {
         println!(

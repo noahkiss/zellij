@@ -565,6 +565,46 @@ somewhere inside itself. So the warning says what the scan can support — *no l
 found naming `session up <name>`; one that reaches it through a wrapper may not be recognisable from
 its plist* — rather than the stronger claim that no agent runs it whatever its label.
 
+### The timer is found through the service it starts
+
+The patch above found the **service** by behaviour. The timer line one row below it still derived a
+name, so one output block was governed by two rules — and on a machine with a hand-written pair
+`session status` printed this, while `systemctl --user list-timers` showed the timer firing every
+minute:
+
+```
+service  ~/.config/systemd/user/zellij-session-my-session.service - installed under a different name: my-session.service (~/.config/systemd/user/my-session.service)
+timer    ~/.config/systemd/user/zellij-session-my-session.timer - missing
+```
+
+Not cosmetic either: a reader concludes the watchdog is not armed, installs one, and lands in the
+two-schedulers-racing state `enable` now refuses.
+
+A timer cannot be matched the way a service is — it runs nothing, so there is no `session up` in it.
+What it has is a pointer: `Unit=`. So once the service has been found by behaviour, the timer is the
+one whose `Unit=` names **that** service. The derived timer name is fallen back on only when the
+service was itself found under the derived name; otherwise the search would pair somebody else's
+service with this build's own timer, which is the mismatch it exists to end.
+
+`Unit=` is **optional**, and a hand-written timer very often omits it because the pair was named to
+make systemd's default do the work — an absent `Unit=` means the same basename with `.service`. That
+default is applied when the file is read, so both forms are found. A commented-out directive is not
+one, and an empty assignment resets it, the same two readings [`ExecStart`](#the-installed-job-is-found-by-what-it-runs-not-by-what-it-is-called)
+already gets right.
+
+It is a second filter over the directory `installed_jobs` already enumerates — the same
+`~/.config/systemd/user`, the other extension — not a second place to look. systemd only: launchd
+has no timer concept, the agent carries `StartInterval` itself.
+
+The timer found is named the way the service is, and its state joins the `loaded` line, because
+whether the watchdog is *armed* is the fact the whole block is read for:
+
+```
+service  ~/.config/systemd/user/zellij-session-my-session.service - installed under a different name: my-session.service (~/.config/systemd/user/my-session.service)
+timer    ~/.config/systemd/user/zellij-session-my-session.timer - installed under a different name: my-session.timer (~/.config/systemd/user/my-session.timer)
+loaded   yes (my-session.service enabled, my-session.timer enabled and armed)
+```
+
 ### A pane's shell comes from the passwd entry when nothing exported `SHELL`
 
 Same shape again. A launcher hands the server no `SHELL`, the server hands its own environment to

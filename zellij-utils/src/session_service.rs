@@ -126,6 +126,78 @@ pub struct InstalledJob {
     pub exec: Vec<String>,
 }
 
+/// An installed systemd timer, reduced to its name, its file, and the service it starts.
+///
+/// A timer cannot be identified the way a service is: it runs nothing, so there is no `session up`
+/// in it to match. What it has is a pointer - `Unit=` - at the service that does the work, so a
+/// timer is found through the service already found by behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledTimer {
+    /// The systemd unit name, e.g. `my-session.timer`.
+    pub name: String,
+    /// The file it was read from.
+    pub path: PathBuf,
+    /// The unit it starts, with systemd's implicit default already applied.
+    pub starts: String,
+}
+
+/// The unit a timer starts: its `Unit=`, else the systemd default of the same basename with
+/// `.service`.
+///
+/// The default is not an edge case. `Unit=` is optional and a hand-written timer very often omits
+/// it, precisely because the pair was named to make the default do the work.
+pub fn timer_target(unit_file: &str, timer_name: &str) -> String {
+    if let Some(unit) = unit_directive(unit_file) {
+        return unit;
+    }
+    let basename = timer_name.strip_suffix(".timer").unwrap_or(timer_name);
+    format!("{}.service", basename)
+}
+
+/// The `Unit=` directive of a timer file.
+///
+/// Read the way [`parse_unit_exec_start`] reads `ExecStart`: a commented-out line is not a
+/// directive, and a key is the whole of what is left of the `=`. `Unit=` is a `[Timer]` key and no
+/// other section of a timer file defines one, so the section headers need not be tracked to tell
+/// this key from another of the same name.
+fn unit_directive(unit_file: &str) -> Option<String> {
+    for line in unit_file.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "Unit" {
+            continue;
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            // an empty assignment resets the directive, which leaves the default in force
+            return None;
+        }
+        return Some(value.to_owned());
+    }
+    None
+}
+
+/// The timer that starts `service`, whatever the timer is called.
+///
+/// The first by name where several point at the same service: arbitrary, but stable between runs,
+/// and every one of them arms the same watchdog.
+pub fn find_service_timer<'a>(
+    timers: &'a [InstalledTimer],
+    service: &str,
+) -> Option<&'a InstalledTimer> {
+    let mut matched: Vec<&InstalledTimer> = timers
+        .iter()
+        .filter(|timer| timer.starts == service)
+        .collect();
+    matched.sort_by(|one, other| one.name.cmp(&other.name));
+    matched.first().copied()
+}
+
 /// Which installed job keeps a session up, judged by what it RUNS and not by what it is called.
 ///
 /// [`launchd_label`] and [`systemd_service_name`] are this build's naming convention and nobody
@@ -441,8 +513,38 @@ pub fn installed_user_units() -> Vec<InstalledJob> {
     installed_jobs(ServiceKind::Systemd, "service")
 }
 
+/// The timers installed for this user, each paired with the unit it starts.
+///
+/// The same directory `installed_user_units` reads, filtered to the other extension - a timer and
+/// the service it starts live side by side, so this is a second filter over one directory and not a
+/// second place to look.
+#[cfg(target_os = "linux")]
+pub fn installed_user_timers() -> Vec<InstalledTimer> {
+    unit_files(ServiceKind::Systemd, "timer")
+        .into_iter()
+        .filter_map(|path| {
+            let unit_file = std::fs::read_to_string(&path).ok()?;
+            let name = path.file_name()?.to_str()?.to_owned();
+            Some(InstalledTimer {
+                starts: timer_target(&unit_file, &name),
+                name,
+                path,
+            })
+        })
+        .collect()
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
 fn installed_jobs(kind: ServiceKind, extension: &str) -> Vec<InstalledJob> {
+    unit_files(kind, extension)
+        .iter()
+        .filter_map(|path| read_installed_job(kind, path))
+        .collect()
+}
+
+/// Every file of this extension in the user's own unit directory.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn unit_files(kind: ServiceKind, extension: &str) -> Vec<PathBuf> {
     let Ok(dir) = service_dir(kind) else {
         return Vec::new();
     };
@@ -450,17 +552,11 @@ fn installed_jobs(kind: ServiceKind, extension: &str) -> Vec<InstalledJob> {
         // no directory is not a fault: a machine with nothing installed has nothing to enumerate
         return Vec::new();
     };
-    let mut jobs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(extension) {
-            continue;
-        }
-        if let Some(job) = read_installed_job(kind, &path) {
-            jobs.push(job);
-        }
-    }
-    jobs
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some(extension))
+        .collect()
 }
 
 /// One job read off disk, or nothing if the file is not one this can make sense of.
@@ -1279,6 +1375,13 @@ pub struct ServiceStatus {
     /// empty. When it is not, the derived file is absent and the work is being done all the same -
     /// which is the opposite of what "missing" would say.
     pub installed_as: Vec<InstalledJob>,
+    /// The timer that starts the service doing the work, when it is not the timer this build would
+    /// have written. Systemd only - launchd has no timer, the job carries its own interval.
+    ///
+    /// Without this the same output block reported the service by behaviour and the timer by name,
+    /// so an armed watchdog under another name read as "missing" - and a reader who believes that
+    /// installs a second one, which is the two-schedulers race `enable` refuses.
+    pub timer_installed_as: Option<InstalledTimer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1395,10 +1498,12 @@ pub fn status(
 ) -> Result<ServiceStatus, String> {
     let files = service_files(kind, exe, session, extras)?;
     let installed_as = jobs_under_another_name(kind, session);
-    let (loaded, load_detail) = job_load_state(&files, &installed_as);
+    let timer_installed_as = timer_under_another_name(kind, session, installed_as.first());
+    let (loaded, load_detail) = job_load_state(&files, &installed_as, timer_installed_as.as_ref());
     Ok(ServiceStatus {
         kind,
         installed_as,
+        timer_installed_as,
         files: files
             .iter()
             .map(|file| ServiceFileStatus {
@@ -1416,7 +1521,42 @@ pub fn status(
 fn job_is_loaded(_kind: ServiceKind, files: &[ServiceFile]) -> bool {
     // `enable` and `disable` act on the install this build writes, so only its own names decide
     // whether that install is loaded
-    job_load_state(files, &[]).0
+    job_load_state(files, &[], None).0
+}
+
+/// The timer that arms the service keeping `session` up, when it is not the timer this build
+/// writes.
+///
+/// The service is found by behaviour first, and the timer is then found through it. The derived
+/// timer name is only fallen back on when the service was itself found under the derived name -
+/// otherwise the search would pair a foreign service with this build's own timer, which is the
+/// mismatch this exists to end.
+fn timer_under_another_name(
+    kind: ServiceKind,
+    session: &str,
+    service: Option<&InstalledJob>,
+) -> Option<InstalledTimer> {
+    if kind != ServiceKind::Systemd {
+        // launchd has no timer: `StartInterval` is a key on the job itself
+        return None;
+    }
+    let service_name = service
+        .map(|job| job.name.clone())
+        .unwrap_or_else(|| systemd_service_name(session));
+    let timers = installed_timers();
+    let timer = find_service_timer(&timers, &service_name)?;
+    (timer.name != systemd_timer_name(session)).then(|| timer.clone())
+}
+
+/// Every timer this build can read.
+#[cfg(target_os = "linux")]
+fn installed_timers() -> Vec<InstalledTimer> {
+    installed_user_timers()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn installed_timers() -> Vec<InstalledTimer> {
+    Vec::new()
 }
 
 /// The jobs that keep `session` up under a name this build would not have written.
@@ -1448,12 +1588,32 @@ fn jobs_under_another_name(_kind: ServiceKind, _session: &str) -> Vec<InstalledJ
 }
 
 #[cfg(target_os = "linux")]
-fn job_load_state(files: &[ServiceFile], installed_as: &[InstalledJob]) -> (bool, String) {
+fn job_load_state(
+    files: &[ServiceFile],
+    installed_as: &[InstalledJob],
+    timer: Option<&InstalledTimer>,
+) -> (bool, String) {
+    // whether the watchdog is armed is a separate fact from whether it is enabled, and it is the
+    // one that decides whether a session that dies at night is back by morning - so a timer found
+    // under another name is reported here as well, rather than left out of the sentence that
+    // answers the question it answers
+    let found_timer = timer.map(|timer| {
+        let state = systemctl::is_enabled(&timer.name).unwrap_or_else(|| "unknown".to_owned());
+        if systemctl::is_active(&timer.name) {
+            format!("{} {} and armed", timer.name, state)
+        } else {
+            format!("{} {}", timer.name, state)
+        }
+    });
     // The install this build would write is not the one doing the work, so its unit names say
     // nothing about whether the session is looked after. Report the unit that does it.
     if let Some(job) = installed_as.first() {
         let state = systemctl::is_enabled(&job.name).unwrap_or_else(|| "unknown".to_owned());
-        return (state == "enabled", format!("{} {}", job.name, state));
+        let mut detail = format!("{} {}", job.name, state);
+        if let Some(found_timer) = found_timer {
+            detail = format!("{}, {}", detail, found_timer);
+        }
+        return (state == "enabled", detail);
     }
     let states: Vec<String> = files
         .iter()
@@ -1468,16 +1628,29 @@ fn job_load_state(files: &[ServiceFile], installed_as: &[InstalledJob]) -> (bool
             }
         })
         .collect();
+    let mut states = states;
+    if let Some(found_timer) = found_timer {
+        states.push(found_timer);
+    }
     // every unit of the install has to be enabled for the install to be: a service without its
-    // timer comes up at login and is never checked again
-    let loaded = files
-        .iter()
-        .all(|file| systemctl::is_enabled(&file.unit).as_deref() == Some("enabled"));
+    // timer comes up at login and is never checked again. A timer under another name arms the same
+    // service, so it satisfies that half.
+    let loaded = files.iter().all(|file| {
+        systemctl::is_enabled(&file.unit).as_deref() == Some("enabled")
+            || (file.role == "timer"
+                && timer.map_or(false, |timer| {
+                    systemctl::is_enabled(&timer.name).as_deref() == Some("enabled")
+                }))
+    });
     (loaded, states.join(", "))
 }
 
 #[cfg(target_os = "macos")]
-fn job_load_state(files: &[ServiceFile], installed_as: &[InstalledJob]) -> (bool, String) {
+fn job_load_state(
+    files: &[ServiceFile],
+    installed_as: &[InstalledJob],
+    _timer: Option<&InstalledTimer>,
+) -> (bool, String) {
     // whichever label carries the job, that is the one to ask launchd about
     let label = installed_as
         .first()
@@ -1494,7 +1667,11 @@ fn job_load_state(files: &[ServiceFile], installed_as: &[InstalledJob]) -> (bool
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn job_load_state(_files: &[ServiceFile], _installed_as: &[InstalledJob]) -> (bool, String) {
+fn job_load_state(
+    _files: &[ServiceFile],
+    _installed_as: &[InstalledJob],
+    _timer: Option<&InstalledTimer>,
+) -> (bool, String) {
     (false, "unsupported init system".to_owned())
 }
 
@@ -1790,6 +1967,86 @@ mod tests {
             path: PathBuf::from(format!("/agents/{}", name)),
             exec: exec.iter().map(|argument| (*argument).to_owned()).collect(),
         }
+    }
+
+    fn timer(name: &str, unit_file: &str) -> InstalledTimer {
+        InstalledTimer {
+            name: name.to_owned(),
+            path: PathBuf::from(format!("/units/{}", name)),
+            starts: timer_target(unit_file, name),
+        }
+    }
+
+    /// The ordinary hand-written pair: the timer says which service it starts.
+    #[test]
+    fn a_timer_is_found_through_the_service_its_unit_key_names() {
+        let timers = [timer(
+            "my-session.timer",
+            "[Timer]\nOnUnitActiveSec=60\nUnit=my-session.service\n",
+        )];
+        let found = find_service_timer(&timers, "my-session.service").expect("must find the timer");
+        assert_eq!(found.name, "my-session.timer");
+    }
+
+    /// `Unit=` is optional. A timer that omits it starts the service of the same basename, and a
+    /// hand-written pair very often relies on exactly that.
+    #[test]
+    fn a_timer_without_a_unit_key_starts_the_service_of_its_own_name() {
+        let timers = [timer("my-session.timer", "[Timer]\nOnUnitActiveSec=60\n")];
+        assert_eq!(timers[0].starts, "my-session.service");
+        assert!(find_service_timer(&timers, "my-session.service").is_some());
+    }
+
+    /// The case that produced the wrong output: the service is found by behaviour under a name this
+    /// build did not choose, and the timer that arms it is named after IT, not after this build's
+    /// unit. Deriving the timer name called it missing while it was firing every minute.
+    #[test]
+    fn a_renamed_timer_is_found_through_a_renamed_service() {
+        let jobs = [job(
+            "my-session.service",
+            &["/usr/bin/zellij", "session", "up", "work"],
+        )];
+        let service = find_session_job(&jobs, "work", &systemd_service_name("work"))
+            .job()
+            .expect("the service is found by what it runs");
+        assert_eq!(service.name, "my-session.service");
+        let timers = [timer(
+            "my-session.timer",
+            "[Timer]\nUnit=my-session.service\n",
+        )];
+        let found = find_service_timer(&timers, &service.name).expect("must find the timer");
+        assert_eq!(found.name, "my-session.timer");
+        // and it is not the name this build would have written, which is what `status` says
+        assert_ne!(found.name, systemd_timer_name("work"));
+    }
+
+    #[test]
+    fn a_service_with_no_timer_finds_none() {
+        assert_eq!(find_service_timer(&[], "my-session.service"), None);
+    }
+
+    /// A timer pointing at another service is another watchdog. Matching it would report a session
+    /// as looked after by a job that never touches it.
+    #[test]
+    fn a_timer_that_starts_a_different_service_is_not_the_timer() {
+        let timers = [
+            timer("backup.timer", "[Timer]\nUnit=backup.service\n"),
+            timer("other.timer", "[Timer]\nOnUnitActiveSec=60\n"),
+        ];
+        assert_eq!(find_service_timer(&timers, "my-session.service"), None);
+    }
+
+    /// A commented-out directive is not a directive, and neither is a key of another name that ends
+    /// in one - the same two ways a naive search reads `ExecStart` wrongly.
+    #[test]
+    fn a_commented_unit_key_leaves_the_default_in_force() {
+        assert_eq!(
+            timer_target(
+                "[Timer]\n# Unit=commented-out.service\nOnUnitActiveSec=60\n",
+                "my-session.timer"
+            ),
+            "my-session.service"
+        );
     }
 
     /// `status` has always reported a job installed under another name. Installing a second job
