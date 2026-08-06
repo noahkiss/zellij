@@ -893,6 +893,57 @@ zellij: could not create the temporary directory for logging
 Exit code 1, no backtrace. `logging.rs` is upstream code, so the patch is one function and three
 `if let Err`: its own commit, droppable whole at a rebase.
 
+### macOS decides about file access at server start, not weeks later (macOS only)
+
+Found on a real machine. In a pane of a launcher-created session:
+
+```
+$ codex --yolo resume --last
+Error: Operation not permitted (os error 1)
+$ ls ~/Downloads/some-project
+ls: cannot open directory '/Users/<user>/Downloads/some-project': Operation not permitted
+```
+
+Nothing to do with either program. macOS attributes a pane's file access to the **responsible
+process**, and for a session created by a launcher that is the zellij executable — not the shell,
+not what the user ran. The recorded denial named zellij's path, not `ls`'s:
+
+```
+kTCCServiceSystemPolicyDownloadsFolder | …/zellij-nkmk/0.44.3-nkmk.6/bin/zellij | 2  (allowed)
+kTCCServiceSystemPolicyDownloadsFolder | …/zellij-nkmk/0.44.3-nkmk.8/bin/zellij | 0  (denied)
+```
+
+That attribution is the whole problem, because TCC keys a path-based client on its **absolute
+path**, and a package manager puts each release in its own versioned directory. Every upgrade is a
+client macOS has never seen, holding none of the grants the last one earned. So it asks again — from
+a background process, at some unpredictable moment — and a prompt dismissed in passing is recorded
+as a refusal. Files & Folders then denies **permanently and silently**: TCC never asks twice. The
+user connects none of it; they upgraded zellij, and a week later an unrelated tool stopped working
+in a directory that was fine yesterday.
+
+This is a cost the fork itself introduced. Before session creation moved into a launcher, the
+responsible process was the terminal emulator, which had held its grants for years.
+
+`start_server` now opens each protected location once, so macOS decides while the user is still
+looking at the upgrade:
+
+- **Downloads, Desktop, Documents** — promptable. With no decision on record the probe raises the
+  ordinary consent dialog. One click restores what the previous version had.
+- **Full Disk Access** — *not* promptable; Apple offers no API to request it. But attempting it
+  registers the client, which is the only way a program comes to be listed in that settings pane at
+  all, greyed off and waiting for a toggle. Without the attempt there is nothing to toggle, and the
+  versioned path has to be typed in by hand.
+
+Best-effort throughout, and silent about success: a refusal is logged, never raised. Nothing here
+can intercept the failure that actually bites, because that happens in a pane's process later; the
+probe's job is to make the decision happen at a moment that explains itself.
+
+Recovery differs by pane, which the log line says: Full Disk Access is toggled on, while a Files &
+Folders refusal is permanent until its **entry is removed**, after which the prompt returns.
+
+`zellij-server/src/lib.rs` gets one call; the probe and its classifier live in
+`session_lifecycle.rs`, which is fork-owned. No-op off macOS.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in

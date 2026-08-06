@@ -764,6 +764,113 @@ pub fn warn_if_server_build_differs(name: &str) {
     });
 }
 
+/// What one probe of a TCC-protected location found.
+///
+/// The interesting distinction is not allowed-vs-refused, it is whether a DECISION EXISTS. macOS
+/// asks the user once per client and remembers the answer forever; a refusal therefore means the
+/// question has already been put and answered, and putting it again is not possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TccProbe {
+    /// Opened. Either a grant exists, or none was needed, or the user has just been asked and said
+    /// yes - from here the three are indistinguishable, and none of them is a problem.
+    Reachable,
+    /// macOS refused. A decision is already recorded as denied, so nothing prompted and nothing
+    /// will.
+    Refused,
+    /// Not there to probe. Says nothing about permissions.
+    Absent,
+    /// Some other I/O failure. NOT a permission answer - do not report it as one.
+    Inconclusive,
+}
+
+/// Classify a probe from the error it did or did not produce.
+///
+/// Split from the probing so the mapping can be tested on any platform: the part worth getting
+/// right is that only `PermissionDenied` means refused, and every other failure is inconclusive
+/// rather than quietly folded in with it.
+pub fn classify_tcc_probe(error: Option<std::io::ErrorKind>) -> TccProbe {
+    match error {
+        None => TccProbe::Reachable,
+        Some(std::io::ErrorKind::PermissionDenied) => TccProbe::Refused,
+        Some(std::io::ErrorKind::NotFound) => TccProbe::Absent,
+        Some(_) => TccProbe::Inconclusive,
+    }
+}
+
+/// Touch every TCC-protected location a session needs, so macOS decides about THIS binary now.
+///
+/// A session created by a launcher has no terminal emulator above it, and macOS attributes a pane's
+/// file access to the responsible process - which is this binary, not the shell and not whatever the
+/// user ran. Proof from a real machine: a denial recorded while running `ls` and `codex` was written
+/// against the zellij executable's path, not against theirs.
+///
+/// That attribution is the whole problem, because TCC keys a path-based client on its ABSOLUTE PATH.
+/// A package manager puts each release in its own versioned directory, so every upgrade is a client
+/// macOS has never seen, holding none of the grants the last one earned. The user does not connect
+/// the two: they upgrade zellij, and a week later an unrelated tool fails with "Operation not
+/// permitted" in a directory that worked yesterday.
+///
+/// Probing at server start puts the decision back where it belongs - next to the upgrade that caused
+/// it, while the user is still looking. Two kinds of location, which behave differently and are both
+/// worth touching:
+///
+/// - **Files & Folders** (Downloads, Desktop, Documents). Promptable. With no decision on record the
+///   probe raises the ordinary consent dialog, and one click restores what the previous version had.
+/// - **Full Disk Access**. NOT promptable - Apple offers no API to request it. But attempting it
+///   registers the client, which is how a program comes to be listed in that settings pane at all,
+///   greyed off and waiting for a toggle. Without the attempt there is nothing to toggle and the
+///   user must find the versioned path by hand.
+///
+/// Deliberately silent about success and best-effort throughout: this reports a fault, it does not
+/// gate a session on one. A refusal is logged rather than raised because the process that will
+/// actually hit the wall is a pane's, minutes or days later, and nothing here can intercept it.
+#[cfg(target_os = "macos")]
+pub fn probe_protected_locations() {
+    let Some(dirs) = directories::BaseDirs::new() else {
+        return;
+    };
+    let home = dirs.home_dir();
+
+    // The FDA-gated path goes last: it always refuses without a grant, and going first would put a
+    // refusal at the top of the log every single start, ahead of the ones that mean something.
+    let locations = [
+        home.join("Downloads"),
+        home.join("Desktop"),
+        home.join("Documents"),
+        home.join("Library/Application Support/com.apple.TCC/TCC.db"),
+    ];
+
+    for path in locations {
+        // read_dir opens the directory, which is where TCC intercepts; File::open does the same for
+        // the db. Neither reads an entry - the open IS the probe.
+        let error = if path.is_dir() {
+            std::fs::read_dir(&path).err()
+        } else {
+            std::fs::File::open(&path).err()
+        }
+        .map(|e| e.kind());
+
+        if classify_tcc_probe(error) == TccProbe::Refused {
+            log::warn!(
+                "macOS refuses this server access to {}. Every pane will see \"Operation not \
+                 permitted\" there, whatever it runs. The grant is keyed to this exact executable \
+                 path, so an upgrade loses it: {}. Files & Folders records a refusal permanently \
+                 and stops asking - REMOVE the zellij entry under System Settings > Privacy & \
+                 Security > Files and Folders to be asked again. Full Disk Access is never asked \
+                 for, only toggled, and this probe is what lists zellij there.",
+                path.display(),
+                std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| String::from("<unknown>"))
+            );
+        }
+    }
+}
+
+/// Everywhere else has no TCC, so there is nothing to decide.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_protected_locations() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,5 +1244,39 @@ mod tests {
             ),
             BuildMatch::Same
         );
+    }
+
+    #[test]
+    fn only_permission_denied_is_a_refusal() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            classify_tcc_probe(Some(ErrorKind::PermissionDenied)),
+            TccProbe::Refused
+        );
+        assert_eq!(classify_tcc_probe(None), TccProbe::Reachable);
+        assert_eq!(
+            classify_tcc_probe(Some(ErrorKind::NotFound)),
+            TccProbe::Absent
+        );
+    }
+
+    #[test]
+    fn other_failures_do_not_masquerade_as_a_refusal() {
+        // A busy disk or a broken symlink says nothing about consent. Reporting either as a
+        // refusal would send the user to a settings pane that cannot help them.
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(classify_tcc_probe(Some(kind)), TccProbe::Inconclusive);
+        }
+    }
+
+    #[test]
+    fn probing_is_safe_to_call_anywhere() {
+        // Off macOS this is empty, and on macOS it must survive a missing home, an absent
+        // directory and a refusal without propagating any of them. A session is never gated on it.
+        probe_protected_locations();
     }
 }
