@@ -680,6 +680,32 @@ pub fn ssh_auth_sock_is_dangling(value: Option<&str>) -> bool {
     }
 }
 
+/// The variables an X or Wayland client needs to find the display it copies into.
+pub const DISPLAY_ENV_NAMES: &[&str] = &["DISPLAY", "WAYLAND_DISPLAY"];
+
+/// Whether a configured `copy_command` is about to be given no display to talk to.
+///
+/// `copy_command` runs IN THE SERVER, not in the pane that copied, so it inherits the environment
+/// the session was CREATED with and keeps it for the session's whole life. A launcher has no
+/// `DISPLAY` and no `WAYLAND_DISPLAY`, so `wl-copy` or `xclip` in a launcher-created session finds
+/// no display and exits non-zero - and the only place that goes is `log::error!`. From inside, copy
+/// does nothing at all and says nothing at all, in a session where everything else works.
+///
+/// This says the environment is missing, not that the command needs it: a `copy_command` that
+/// writes a file or speaks OSC 52 wants neither variable and is not broken. Which is why the
+/// caller's wording is conditional - what is being reported is a fact about the environment, and
+/// the reader knows what their own command does.
+pub fn copy_command_has_no_display<'a>(
+    copy_command: Option<&str>,
+    env_names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    if copy_command.map_or(true, |command| command.trim().is_empty()) {
+        return false;
+    }
+    let mut names = env_names.into_iter();
+    !names.any(|name| DISPLAY_ENV_NAMES.contains(&name))
+}
+
 /// Whether one `session_restart_drop_env` pattern names this variable.
 ///
 /// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
@@ -1540,6 +1566,29 @@ mod tests {
         // already absent
         assert!(!ssh_auth_sock_is_dangling(None));
         assert!(!ssh_auth_sock_is_dangling(Some("")));
+    }
+
+    #[test]
+    fn a_copy_command_with_no_display_variable_is_reported() {
+        assert!(copy_command_has_no_display(
+            Some("wl-copy"),
+            ["HOME", "PATH", "TERM"]
+        ));
+    }
+
+    #[test]
+    fn either_display_variable_answers_it() {
+        assert!(!copy_command_has_no_display(Some("xclip -i"), ["DISPLAY"]));
+        assert!(!copy_command_has_no_display(
+            Some("wl-copy"),
+            ["WAYLAND_DISPLAY"]
+        ));
+    }
+
+    #[test]
+    fn no_copy_command_is_nothing_to_report() {
+        assert!(!copy_command_has_no_display(None, ["HOME"]));
+        assert!(!copy_command_has_no_display(Some("  "), ["HOME"]));
     }
 
     #[test]

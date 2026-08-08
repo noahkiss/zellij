@@ -703,6 +703,8 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         std::env::remove_var("SSH_AUTH_SOCK");
     }
 
+    warn_if_copy_command_has_no_display(opts);
+
     // The configured drop-list is about the same hazard from the other end: a variable describing
     // the ONE program that asked for this would otherwise describe every pane of the session. It
     // reads as restart-specific and is not - `session up other-session` typed in an agent's pane
@@ -830,6 +832,46 @@ fn down(name: &str, wait_timeout: u64, opts: &CliArgs) -> Result<(), ()> {
         },
     }
 }
+
+/// Say so when the session about to be created has a `copy_command` and no display.
+///
+/// `copy_command` runs in the SERVER, with the environment the session was created with, for the
+/// session's whole life - see `session_lifecycle::copy_command_has_no_display`. A launcher has
+/// neither display variable, so `wl-copy` or `xclip` exits non-zero on every copy and the only
+/// place that goes is `log::error!`: from inside, copy silently does nothing in a session where
+/// everything else works.
+///
+/// Not on macOS, where the ordinary `copy_command` is `pbcopy` and neither variable exists on any
+/// machine - the warning would be wrong on every Mac. Not on Windows either, which has no display
+/// variables to be missing.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn warn_if_copy_command_has_no_display(opts: &CliArgs) {
+    use zellij_utils::session_lifecycle::{copy_command_has_no_display, DISPLAY_ENV_NAMES};
+
+    let Some(copy_command) = get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.copy_command)
+    else {
+        return;
+    };
+    let names: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
+    if !copy_command_has_no_display(Some(&copy_command), names.iter().map(|name| name.as_str())) {
+        return;
+    }
+    eprintln!(
+        "warning: `copy_command` is set to `{}`, and none of {} is in the environment this\n         \
+         session is being created with. copy_command runs in the SERVER with that environment\n         \
+         for the life of the session, so if the command talks to X or Wayland every copy will\n         \
+         fail and the only record will be a line in the server log.\n         \
+         Give the launcher the variable it needs - a `session_service` extra sets one - or\n         \
+         create the session from the graphical login.",
+        copy_command,
+        DISPLAY_ENV_NAMES.join(" or ")
+    );
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn warn_if_copy_command_has_no_display(_opts: &CliArgs) {}
 
 /// Unset what `session_restart_drop_env` names, so the rebuilt session does not hand it out.
 ///

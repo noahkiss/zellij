@@ -741,6 +741,20 @@ socket. There is no launchd equivalent yet: `EnvironmentVariables` is a key the 
 a bare `SSH_AUTH_SOCK` under `launchd { keys { ... } }` would be a top-level plist key, which
 launchd ignores in silence.
 
+### A warning when `copy_command` has no display to talk to
+
+`copy_command` runs **in the server**, not in the pane that copied, so it inherits the environment
+the session was *created* with and keeps it for the session's whole life. A launcher has no
+`DISPLAY` and no `WAYLAND_DISPLAY`, so `wl-copy` or `xclip` in a launcher-created session finds no
+display and exits non-zero — and the only place that goes is `log::error!`. From inside, copy does
+nothing and says nothing, in a session where everything else works.
+
+`session up` now says so on the path that creates the session, naming the command and the missing
+variables. The wording is conditional because the fact being reported is about the environment, not
+about the command: a `copy_command` that writes a file or speaks OSC 52 wants neither variable and
+is not broken. Not on macOS, where the ordinary `copy_command` is `pbcopy` and neither variable
+exists on any machine — a warning that is wrong on every Mac is a warning nobody reads.
+
 ### `~` and `$VAR` in config paths
 
 Layouts have always expanded `~` in a plugin location, because layout parsing runs it through
