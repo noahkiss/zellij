@@ -1855,13 +1855,41 @@ fn job_load_state(
     (false, "unsupported init system".to_owned())
 }
 
+/// Arm the watchdog FIRST, and let every unit be tried before anything is reported.
+///
+/// `enable --now` starts the unit as well as enabling it, and the service is a `oneshot` that runs
+/// `session up` - so on a machine where `up` is failing, enabling the service fails too. Doing that
+/// first and returning on it left the TIMER never enabled, on exactly the machine whose session most
+/// needs re-checking: the one thing that would have retried was the casualty of the first attempt.
+///
+/// So the timer goes first, and the failures are collected rather than returned on. Both units are
+/// enabled whatever the other one did, and the caller is told about all of it at once instead of
+/// about whichever failed earliest.
 #[cfg(target_os = "linux")]
 fn load_job(files: &[ServiceFile]) -> Result<(), String> {
     systemctl::daemon_reload()?;
-    for file in files {
-        systemctl::enable_now(&file.unit)?;
+    // `service_files` writes the service first and the timer second, so the reverse is the timer
+    // first - the same order `unload_job` uses, and for the same reason
+    collect_failures(
+        files
+            .iter()
+            .rev()
+            .map(|file| systemctl::enable_now(&file.unit)),
+    )
+}
+
+/// Run every step, then report all of the failures together.
+///
+/// A partial install is the fault worth avoiding here; stopping at the first failure is what
+/// produces one.
+#[cfg(target_os = "linux")]
+fn collect_failures(results: impl Iterator<Item = Result<(), String>>) -> Result<(), String> {
+    let failures: Vec<String> = results.filter_map(Result::err).collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n                 "))
     }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1884,12 +1912,16 @@ fn load_job(_files: &[ServiceFile]) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn unload_job(files: &[ServiceFile]) -> Result<(), String> {
-    // the timer first: stopping the service while its timer still runs invites the timer to start
-    // it again between the two commands
-    for file in files.iter().rev() {
-        systemctl::disable_now(&file.unit)?;
-    }
-    Ok(())
+    // The timer first: stopping the service while its timer still runs invites the timer to start
+    // it again between the two commands. Collected rather than returned on, for the mirror of the
+    // reason `load_job` collects - a half-install is a real state, and giving up on the first unit
+    // that will not disable would leave the other one enabled and remove neither file.
+    collect_failures(
+        files
+            .iter()
+            .rev()
+            .map(|file| systemctl::disable_now(&file.unit)),
+    )
 }
 
 #[cfg(target_os = "macos")]

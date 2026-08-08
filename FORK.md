@@ -820,6 +820,14 @@ session that died overnight came back at the next login there and within a minut
 writes and enables a paired `.timer` at the same interval, `disable` removes both. One unit name
 per session (`zellij-session-<name>.service`), for the reason the launchd label is per session.
 
+**The timer is enabled before the service, and neither failure hides the other.** `enable --now`
+starts a unit as well as enabling it, and the service is a `oneshot` running `session up` — so on a
+machine where `up` is failing, enabling the service fails too. Doing that first and returning on it
+left the timer never enabled, on exactly the machine whose session most needed re-checking: the one
+thing that would have retried was the casualty of the first attempt. `disable` collects its failures
+the same way, so a unit that will not disable no longer leaves the other one enabled and removes
+neither file.
+
 `setup --generate-service` is unchanged and still prints the service to stdout, from the same
 generator.
 
