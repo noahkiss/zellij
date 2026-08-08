@@ -881,6 +881,17 @@ session that died overnight came back at the next login there and within a minut
 writes and enables a paired `.timer` at the same interval, `disable` removes both. One unit name
 per session (`zellij-session-<name>.service`), for the reason the launchd label is per session.
 
+**The unit directory is asked for, not derived** (systemd). `~/.config/systemd/user` is
+`$XDG_CONFIG_HOME/systemd/user`, and the `XDG_CONFIG_HOME` that matters is the *manager's*, not the
+calling shell's. The manager keeps the environment it was started with; a shell that exports its own
+afterwards is a different answer, and a unit written into that directory is a file the manager never
+looks at — `enable` reports success, `daemon-reload` finds nothing, and every symptom points at the
+unit rather than at where it was put. `enable` and `status` now read `XDG_CONFIG_HOME` out of
+`systemctl --user show-environment`, install against that, and **name both directories** when they
+differ, because a file that is not where its owner expects is the beginning of a second install
+beside the first. A value systemd chose to quote is left unread rather than half-unquoted, and a
+machine with no user manager to ask falls back to the derived path exactly as before.
+
 **The timer is enabled before the service, and neither failure hides the other.** `enable --now`
 starts a unit as well as enabling it, and the service is a `oneshot` running `session up` — so on a
 machine where `up` is failing, enabling the service fails too. Doing that first and returning on it

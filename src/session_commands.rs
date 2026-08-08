@@ -241,6 +241,7 @@ fn assert_pinned_exe(_name: &str, _extras: Option<&SessionServiceOptions>) {}
 /// report but a state to confirm.
 fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
     let kind = native_service_kind()?;
+    print_unit_dir_disagreement();
     let extras = configured_extras(opts);
     // The copy goes in BEFORE the unit that names it. A unit whose binary does not exist is a unit
     // the init system cannot run, and the command that would have created the copy is the one that
@@ -278,6 +279,27 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
             Err(())
         },
     }
+}
+
+/// Name the two answers to "where do this user's units live", when they differ.
+///
+/// The unit goes where the MANAGER reads, which is the one that matters - but a person who then
+/// looks under their own `XDG_CONFIG_HOME` will not find it, and a file that is not where its owner
+/// expects is the beginning of a second install beside the first. So the difference is said out
+/// loud at the moment it is acted on rather than left to be discovered.
+fn print_unit_dir_disagreement() {
+    let Some((manager, shell)) = session_service::unit_dir_disagreement() else {
+        return;
+    };
+    eprintln!(
+        "note: this shell's XDG_CONFIG_HOME and the systemd user manager's disagree.\n      \
+         manager: {}\n      \
+         shell:   {}\n      \
+         The unit goes in the manager's directory, because that is the one it reads. A unit\n      \
+         written to the other would load for nothing and `daemon-reload` would never see it.",
+        manager.display(),
+        shell.display()
+    );
 }
 
 /// Unload the unit, then remove it.
@@ -383,6 +405,7 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
 
     println!("session   {}", name);
     println!("init      {}", status.kind.name());
+    print_unit_dir_disagreement();
     // A job that runs `session up` for this session under another name is doing the work, so the
     // file this build would have written being absent is not the fault it looks like. It is
     // reported against the first file, which is the one that runs the command - the timer beside it

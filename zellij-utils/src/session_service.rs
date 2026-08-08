@@ -1397,11 +1397,92 @@ pub fn service_dir(kind: ServiceKind) -> Result<PathBuf, String> {
     let dirs = directories::BaseDirs::new()
         .ok_or_else(|| "cannot find the home directory to install into".to_owned())?;
     Ok(match kind {
-        // config_dir() honours XDG_CONFIG_HOME, which is also where the user's systemd manager
-        // looks - so an unusual config home stays consistent between the two
-        ServiceKind::Systemd => dirs.config_dir().join("systemd").join("user"),
+        ServiceKind::Systemd => systemd_unit_dir(dirs.config_dir()),
         ServiceKind::Launchd => dirs.home_dir().join("Library").join("LaunchAgents"),
     })
+}
+
+/// The `systemd/user` directory under a config home.
+fn user_units_under(config_home: &Path) -> PathBuf {
+    config_home.join("systemd").join("user")
+}
+
+/// Where the user's systemd manager READS units from - asked, not derived.
+///
+/// `config_dir()` honours the `XDG_CONFIG_HOME` of the process that calls it, and the manager's is
+/// not necessarily the calling shell's. The manager keeps the environment it was started with,
+/// which on most machines is the login session's; a shell that exports its own afterwards is a
+/// different answer, and writing the unit into THAT directory installs a file the manager never
+/// looks at. `enable` then reports success, `daemon-reload` finds nothing, and every symptom points
+/// at the unit rather than at where it was put.
+///
+/// The manager can simply be asked, so it is. Falling back to the derived path keeps a machine with
+/// no running user manager working exactly as before.
+#[cfg(target_os = "linux")]
+fn systemd_unit_dir(derived_config_home: &Path) -> PathBuf {
+    match manager_config_home() {
+        Some(config_home) => user_units_under(&config_home),
+        None => user_units_under(derived_config_home),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_unit_dir(derived_config_home: &Path) -> PathBuf {
+    user_units_under(derived_config_home)
+}
+
+/// The `XDG_CONFIG_HOME` the user's systemd manager holds, asked once per process.
+///
+/// Once, because every command here calls `service_dir` several times over - to write, to scan, to
+/// report - and each ask is a subprocess.
+#[cfg(target_os = "linux")]
+pub fn manager_config_home() -> Option<PathBuf> {
+    static ASKED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ASKED
+        .get_or_init(|| {
+            let environment = systemctl::show_environment()?;
+            let value = environment_value(&environment, "XDG_CONFIG_HOME")?;
+            let path = PathBuf::from(value);
+            // a relative one is not something to install against, and not something systemd would
+            // have honoured either
+            path.is_absolute().then_some(path)
+        })
+        .clone()
+}
+
+/// One `NAME=value` out of `systemctl --user show-environment`.
+///
+/// A value systemd chose to quote - it writes `NAME=$'...'` for anything with a special character
+/// in it - is left unread rather than unquoted by halves. A config home whose path needs escaping
+/// is not a case to guess at, and guessing wrongly would install into a directory that does not
+/// exist while reporting success.
+#[cfg(target_os = "linux")]
+fn environment_value<'a>(environment: &'a str, name: &str) -> Option<&'a str> {
+    environment.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key != name || value.starts_with('$') || value.starts_with('\'') {
+            return None;
+        }
+        Some(value)
+    })
+}
+
+/// The manager's unit directory and the one this shell would have derived, when they differ.
+///
+/// Reported rather than silently reconciled: the file goes where the manager reads, but a person
+/// who then looks for it under their own `XDG_CONFIG_HOME` will not find it, and the difference is
+/// worth one line at the moment it is acted on.
+#[cfg(target_os = "linux")]
+pub fn unit_dir_disagreement() -> Option<(PathBuf, PathBuf)> {
+    let manager = user_units_under(&manager_config_home()?);
+    let dirs = directories::BaseDirs::new()?;
+    let shell = user_units_under(dirs.config_dir());
+    (manager != shell).then_some((manager, shell))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unit_dir_disagreement() -> Option<(PathBuf, PathBuf)> {
+    None
 }
 
 /// One file of an install, and the name the init system knows it by.
@@ -1975,6 +2056,14 @@ pub mod systemctl {
         run(&["daemon-reload"]).map(|_| ())
     }
 
+    /// The environment the user's manager holds, as `NAME=value` lines.
+    ///
+    /// `None` when there is no user manager to ask - which is an ordinary state in a container or
+    /// over a bare SSH login, not a fault to report.
+    pub fn show_environment() -> Option<String> {
+        run(&["show-environment"]).ok()
+    }
+
     pub fn enable_now(unit: &str) -> Result<(), String> {
         run(&["enable", "--now", unit]).map(|_| ())
     }
@@ -2073,6 +2162,31 @@ mod tests {
         let stable = stable_dir.join("zellij");
         std::os::unix::fs::symlink(&real, &stable).unwrap();
         (root, real, stable)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_managers_config_home_is_read_out_of_show_environment() {
+        let environment = "LANG=en_GB.UTF-8\nXDG_CONFIG_HOME=/home/u/.dotconfig\nPATH=/usr/bin\n";
+        assert_eq!(
+            environment_value(environment, "XDG_CONFIG_HOME"),
+            Some("/home/u/.dotconfig")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_quoted_value_is_left_unread_rather_than_half_unquoted() {
+        // systemd writes `NAME=$'...'` for anything needing an escape; guessing at the unquoted
+        // form would install into a directory that does not exist and report success
+        let environment = "XDG_CONFIG_HOME=$'/home/u/my config'\n";
+        assert_eq!(environment_value(environment, "XDG_CONFIG_HOME"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_absent_variable_is_not_an_empty_path() {
+        assert_eq!(environment_value("LANG=C\n", "XDG_CONFIG_HOME"), None);
     }
 
     #[test]
