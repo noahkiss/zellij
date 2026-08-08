@@ -22,8 +22,8 @@ use zellij_utils::session_lifecycle::{
     warn_if_server_build_differs, DownOutcome, SessionFacts,
 };
 use zellij_utils::session_service::{
-    self, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome, PlistValue, ServiceExe,
-    ServiceKind, SessionServiceOptions,
+    self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
+    PinState, PlistValue, ServiceExe, ServiceKind, SessionServiceOptions,
 };
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
@@ -109,9 +109,9 @@ fn native_service_kind() -> Result<ServiceKind, ()> {
 }
 
 /// Which binary the unit should run, warning when the answer is one an upgrade can break.
-fn service_exe(explicit: Option<PathBuf>) -> PathBuf {
+fn service_exe(explicit: Option<PathBuf>, pinned: Option<PathBuf>) -> PathBuf {
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
-    let exe = resolve_service_exe(explicit, &current_exe, &path_dirs());
+    let exe = resolve_service_exe(explicit, pinned, &current_exe, &path_dirs());
     if let ServiceExe::Resolved(path) = &exe {
         eprintln!(
             "warning: no `zellij` on PATH resolves to this binary, so the unit will run\n  \
@@ -136,6 +136,99 @@ fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
         .and_then(|options| options.session_service)
 }
 
+/// Put this build at the pinned path for a command that is about to name that path in a unit.
+///
+/// A failure is fatal only when there is nothing at the path yet: a unit naming a binary that does
+/// not exist cannot be run by anything. When a build IS there it still runs, so the failure is a
+/// stale copy rather than a broken install, and the next `session up` writes it again.
+fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
+    let existed = pinned.exists();
+    match pin_this_build_at(pinned) {
+        Ok(()) => Ok(()),
+        Err(reason) if existed => {
+            eprintln!("warning: {}", reason);
+            eprintln!(
+                "         the build already at {} is what the unit will run",
+                pinned.display()
+            );
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Copy this build to `pinned`, reporting what that came to.
+///
+/// Silent when the copy is already this build, which is every pass but the first after an upgrade:
+/// `session up` runs this each time, and a line saying nothing happened, every minute, from a
+/// watchdog, is a line nobody reads.
+#[cfg(unix)]
+fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
+    use zellij_utils::session_lifecycle::{install_pinned_exe, PinOutcome};
+
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot find this binary to pin it: {}", e))?;
+    match install_pinned_exe(&current_exe, pinned)? {
+        PinOutcome::Installed(path) => println!("      pinned this build at {}", path.display()),
+        PinOutcome::Refreshed(path) => {
+            println!("      refreshed the pinned copy at {}", path.display())
+        },
+        PinOutcome::UpToDate(_) => {},
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn pin_this_build_at(_pinned: &PathBuf) -> Result<(), String> {
+    Ok(())
+}
+
+/// Keep the pinned copy current, on the path the INSTALLED UNIT records.
+///
+/// Not the path this process would derive: the canonical directory honours `XDG_DATA_HOME` on
+/// Linux, and a launcher's environment is not the calling shell's, so a re-derived path can name a
+/// different file from the one the launcher execs - and refreshing that one would leave the running
+/// copy stale while reporting success.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>) {
+    let Some(configured) = configured_pinned_exe(extras) else {
+        return;
+    };
+    let installed = session_service::installed_session_exe(name);
+    match session_service::pin_state(&configured, installed.as_deref()) {
+        PinState::Recorded(path) | PinState::Unrecorded(path) => {
+            if let Err(reason) = pin_this_build_at(&path) {
+                eprintln!("warning: {}", reason);
+            }
+        },
+        PinState::Mismatch {
+            configured,
+            installed,
+        } => eprintln!(
+            "warning: `pin_exe` asks for a copy of zellij at\n           \
+             {}\n         \
+             but the launcher for '{}' runs\n           \
+             {}\n         \
+             Nothing was copied: what `session up` keeps current is the binary the launcher\n         \
+             actually runs. Run `zellij session enable {}` to point it at the pinned path.\n         \
+             On macOS a file-access grant is recorded against the exact path, so the grant has\n         \
+             to name the path the launcher runs.",
+            configured.display(),
+            name,
+            installed,
+            name
+        ),
+    }
+}
+
+/// Nowhere else has a launcher this build installs into, so there is no recorded path and nothing
+/// to keep current.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn assert_pinned_exe(_name: &str, _extras: Option<&SessionServiceOptions>) {}
+
 /// Write the unit and hand it to the init system.
 ///
 /// The whole command is idempotent, because the thing it installs is: `zellij session up` over a
@@ -143,8 +236,16 @@ fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
 /// report but a state to confirm.
 fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
     let kind = native_service_kind()?;
-    let exe = service_exe(exe);
     let extras = configured_extras(opts);
+    // The copy goes in BEFORE the unit that names it. A unit whose binary does not exist is a unit
+    // the init system cannot run, and the command that would have created the copy is the one that
+    // unit runs - so leaving it to the first `session up` would leave nothing able to make the
+    // first `session up` happen.
+    let pinned = configured_pinned_exe(extras.as_ref());
+    if let Some(pinned) = &pinned {
+        pin_before_writing_the_unit(pinned)?;
+    }
+    let exe = service_exe(exe, pinned);
     match session_service::enable(kind, &exe, name, extras.as_ref(), force) {
         Ok(EnableOutcome::AlreadyEnabled) => {
             println!("ok    service for '{}' is already enabled", name);
@@ -264,8 +365,9 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
         return 1;
     };
     let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
-    let exe = resolve_service_exe(exe, &current_exe, &path_dirs());
     let extras = configured_extras(opts);
+    let pinned = configured_pinned_exe(extras.as_ref());
+    let exe = resolve_service_exe(exe, pinned.clone(), &current_exe, &path_dirs());
     let status = match session_service::status(kind, exe.path(), name, extras.as_ref()) {
         Ok(status) => status,
         Err(reason) => {
@@ -337,6 +439,7 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
     // what the config adds is reported here because it can be: this is the whole argument for
     // keeping it in the config rather than in a drop-in directory the tool cannot see
     print_configured_extras(kind, extras.as_ref());
+    let pinned_agrees = print_pin_state(name, pinned.as_deref());
 
     let facts = SessionFacts::collect(name);
     match facts.assert_up() {
@@ -344,16 +447,70 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
         Err(reason) => println!("running   no - {}", reason),
     }
 
-    if installed && status.loaded {
+    if installed && status.loaded && pinned_agrees {
         0
     } else {
         1
     }
 }
 
+/// What the config's `pin_exe` and the installed unit say between them, and whether they agree.
+///
+/// Reported even though nothing is broken, because the disagreement is invisible from every other
+/// angle: the config asks for a pinned copy, the launcher runs something else, and each of them is
+/// internally fine. It is the state a key turned on after `session enable` leaves behind, and the
+/// paths are BOTH named because a macOS grant is keyed to one exact path - a reader who is about to
+/// add it by hand in System Settings needs to know which.
+fn print_pin_state(name: &str, pinned: Option<&std::path::Path>) -> bool {
+    let Some(pinned) = pinned else {
+        println!("pin       off (no `pin_exe` in session_service)");
+        return true;
+    };
+    match pin_state_of(name, pinned) {
+        PinState::Recorded(path) => {
+            println!("pin       {} - the launcher runs it", path.display());
+            true
+        },
+        PinState::Unrecorded(path) => {
+            println!(
+                "pin       {} - nothing installed runs it yet",
+                path.display()
+            );
+            true
+        },
+        PinState::Mismatch {
+            configured,
+            installed,
+        } => {
+            println!(
+                "pin       {} - NOT what the launcher runs",
+                configured.display()
+            );
+            println!(
+                "pin       the launcher runs {} - `zellij session enable {}` re-points it",
+                installed, name
+            );
+            false
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pin_state_of(name: &str, pinned: &std::path::Path) -> PinState {
+    session_service::pin_state(
+        pinned,
+        session_service::installed_session_exe(name).as_deref(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pin_state_of(_name: &str, pinned: &std::path::Path) -> PinState {
+    session_service::pin_state(pinned, None)
+}
+
 /// List what `session_service` in the config puts into the unit, for the init system in use.
 fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOptions>) {
-    let Some(extras) = extras.filter(|extras| !extras.is_empty()) else {
+    let Some(extras) = extras.filter(|extras| extras.has_unit_extras()) else {
         println!("config    no session_service extras");
         return;
     };
@@ -438,6 +595,11 @@ fn refuse_from_inside(name: &str) {
 
 /// Create the session if it is not there, then prove that it is.
 fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
+    // First, and on every `up` including the one that finds the session already healthy: an upgrade
+    // reaches the pinned copy through this pass and no other, and the pass that returns early is
+    // exactly the one an upgraded machine takes every minute.
+    assert_pinned_exe(name, configured_extras(opts).as_ref());
+
     let facts = SessionFacts::collect(name);
     let healthy = facts.assert_up().is_ok();
 

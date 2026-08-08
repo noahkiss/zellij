@@ -626,7 +626,8 @@ impl Setup {
         config_options: &Options,
     ) {
         use crate::session_service::{
-            path_dirs, resolve_service_exe, service_unit, ServiceExe, ServiceKind,
+            configured_pinned_exe, path_dirs, resolve_service_exe, service_unit, ServiceExe,
+            ServiceKind,
         };
 
         let Some(kind) = ServiceKind::from_name(init) else {
@@ -649,7 +650,8 @@ impl Setup {
             std::process::exit(1);
         };
         let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
-        let exe = resolve_service_exe(exe, &current_exe, &path_dirs());
+        let pinned = configured_pinned_exe(config_options.session_service.as_ref());
+        let exe = resolve_service_exe(exe, pinned, &current_exe, &path_dirs());
         if let ServiceExe::Resolved(path) = &exe {
             // the failure this warns about is silent otherwise: the unit keeps working until the
             // day the package is upgraded and the path it names stops existing

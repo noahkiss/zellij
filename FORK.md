@@ -456,12 +456,15 @@ Supervision belongs to the init system; session correctness belongs to the binar
 
 Two things the generated files deliberately do:
 
-- **They name a stable binary path.** `current_exe()` resolves symlinks, so on a package manager
-  with a versioned install prefix it yields a path that disappears on the next upgrade. The
-  generator prefers a `PATH` entry whose canonical target is this binary — the stable symlink —
-  falling back with a warning, and `--exe` overrides. On macOS this also matters for identity:
-  permission grants are recorded against the executable image, so a versioned path re-asks for
-  every permission after every upgrade.
+- **They name a stable binary path.** Neither init system looks anything up on `PATH`, so the unit
+  needs an absolute one — and the generator canonicalises the running binary to get it, which on a
+  package manager with a versioned install prefix yields a path that disappears at the next
+  upgrade. (`current_exe()` itself returns the path zellij was invoked through, symlink and all;
+  the resolution is the generator's.) So it prefers a `PATH` entry whose canonical target is this
+  binary — the stable symlink — falling back to the resolved path with a warning. `--exe`
+  overrides, and [`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe) beats both of the derived
+  answers. On macOS the choice also decides identity: permission grants are recorded against the
+  file, so a versioned path re-asks for every permission after every upgrade.
 - **The plist sets `LimitLoadToSessionType Aqua`**, and its install line bootstraps into `gui/`.
   The bootstrap target is what actually puts the job in the graphical login session — a job
   bootstrapped into `gui/` reports the Aqua domain with or without the key. The key restricts which
@@ -795,6 +798,7 @@ service   ~/.config/systemd/user/zellij-session-my-session.service - installed
 timer     ~/.config/systemd/user/zellij-session-my-session.timer - installed
 loaded    yes (service enabled, timer enabled and armed)
 config    [Unit] After=network.target
+pin       off (no `pin_exe` in session_service)
 running   yes, in /run/user/1000/zellij/contract_version_1
 ```
 
@@ -849,6 +853,9 @@ session_service {
 }
 ```
 
+The block also carries [`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe), which is not a directive:
+it decides which binary the unit names rather than what the unit contains.
+
 A generated unit cannot know the local facts. systemd's answer is a drop-in directory, which is a
 poor answer for the tool that generated the unit: the drop-in is invisible to it, so `status`
 cannot report it, and someone reading only the config has no idea it exists. Configuration a tool
@@ -885,6 +892,97 @@ instead of being refused, and the key is never written twice. `TERM` and `PATH` 
 variables rather than plist keys, so on launchd a configured one is routed inside
 `EnvironmentVariables`, where it means something, rather than left beside it as a top-level key
 launchd ignores in silence.
+
+### A pinned copy of the binary (`pin_exe`)
+
+```kdl
+session_service {
+    pin_exe true                        // the platform's canonical location
+    pin_exe "/opt/zellij/bin/zellij"    // or a path you name
+}
+```
+
+Unset by default, and unset is the whole feature off: nothing is copied and nothing is reported.
+
+**What it does.** `session enable` and every `session up` install a **real copy** of the running
+binary at a fixed path, and the generated unit names that path instead of the package's. `pin_exe
+true` resolves to `~/Library/Application Support/zellij/bin/zellij` on macOS and
+`$XDG_DATA_HOME/zellij/bin/zellij` on Linux — the platform's own per-user data directory, from the
+`directories` crate, deliberately **not** zellij's `XDG_*`-derived paths, which an unusual
+environment can point somewhere no other machine has.
+
+**Why a copy and not a symlink.** A package manager installs each release into its own versioned
+directory, so the path a launcher was told about is a path the next upgrade deletes. On macOS it
+costs more than a broken unit: TCC keys a path-based client on its absolute path, so every upgrade
+is a client the system has never seen, holding none of the grants the last one earned — the
+mechanism behind [the file-access section below](#macos-decides-about-file-access-at-server-start-not-weeks-later-macos-only).
+Measured on one machine, with a session at a fixed path and a grant given to it:
+
+- a **symlink never holds a grant** — macOS resolves it and records the versioned target, both when
+  launchd runs it and when the path is added by hand in System Settings;
+- a **real file keeps its grant when a different build is written over it** — a changed code
+  signature did not revoke it, and the stored requirement is not enforced for an ad-hoc-signed
+  client;
+- it is **not cached state**: it survived `killall tccd`, a fresh server process, and a reboot.
+
+So the refresh writes **over the same file**, and never unlinks and replaces it: a new inode at the
+same path is a new client with none of the grants. Linux gets the same treatment for the plainer
+half of the problem — a versioned path that disappears on upgrade.
+
+**What decides whether to copy.** [Build identity](#a-warning-when-the-running-session-is-a-different-build),
+not a timestamp. The pinned copy is a copy, so it is a different file from the binary it came from
+and only the id the linker stamped in can say whether it is the same build. Same build, nothing is
+written — which is every pass but the first after an upgrade, and the binary is around 40 MB while
+`session up` runs from a watchdog every minute. A refresh says so once:
+
+```
+      refreshed the pinned copy at /home/<user>/.local/share/zellij/bin/zellij
+```
+
+A copy that is **being executed** cannot be written over, which is the ordinary case of a session
+that is already up on the pinned build. That is reported, not swallowed: a server keeps the binary
+it started with anyway, so the restart the message asks for is what the new build was wanted for.
+
+**The unit records the path, and the refresh uses the recorded one.** `up` reads the binary out of
+the installed unit rather than deriving the path again. The canonical directory honours
+`XDG_DATA_HOME`, and a launcher's environment is not the calling shell's — so a re-derived path can
+name a different file from the one the launcher execs, and refreshing that one would leave the
+running copy stale while reporting success. One principle, applied here and in the unit generally:
+**resolve once at enable time, record the absolute path, never re-derive at run time.**
+
+**Turning the key on after `session enable` is a real state, and it is reported.** The config asks
+for a pinned copy, the launcher still runs the package's path, nothing changes, and it looks like
+the feature does not work. `session status` names **both** paths and exits non-zero:
+
+```
+pin       /home/<user>/.local/share/zellij/bin/zellij - NOT what the launcher runs
+pin       the launcher runs /opt/homebrew/bin/zellij - `zellij session enable work` re-points it
+```
+
+and `session up` says it once rather than silently copying nothing:
+
+```
+warning: `pin_exe` asks for a copy of zellij at
+           /home/<user>/.local/share/zellij/bin/zellij
+         but the launcher for 'work' runs
+           /opt/homebrew/bin/zellij
+         Nothing was copied: what `session up` keeps current is the binary the launcher
+         actually runs. Run `zellij session enable work` to point it at the pinned path.
+         On macOS a file-access grant is recorded against the exact path, so the grant has
+         to name the path the launcher runs.
+```
+
+Both name the pinned path deliberately. The grant is keyed to that exact path and
+[auto-registration could not be reproduced](#macos-decides-about-file-access-at-server-start-not-weeks-later-macos-only),
+so the user may have to add it by hand — and a message that does not name it leaves them hunting a
+versioned directory.
+
+`session enable` installs the copy **before** it writes the unit that names it, because a unit whose
+binary does not exist is one the init system cannot run — and the command that would have created
+the copy is the command that unit runs.
+
+The explicit-path form is for a launcher written by hand: the launcher names a path, and the pin has
+to be that same one or the two disagree. `--exe` still beats it, being typed for the one command.
 
 ### A missing `TMPDIR` is an error, not a panic
 

@@ -19,7 +19,7 @@ use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
-use crate::session_service::{PlistValue, SessionServiceOptions};
+use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
 use kdl_layout_parser::KdlLayoutParser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -2676,6 +2676,27 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
     }
 }
 
+/// `pin_exe`, which is a switch that may also be a path.
+///
+/// `pin_exe true` asks for the platform's canonical location and is what almost everyone wants -
+/// the path is zellij's business, and naming it in every config would be a path to keep in step
+/// with every machine. `pin_exe "<path>"` is for an install this cannot guess at, a hand-written
+/// launcher above all: the launcher names a path, and the pin has to be that one or the two
+/// disagree. `pin_exe false` is the default written out, and reads as off.
+fn pin_exe_from_kdl(kdl_pin_exe: &KdlNode) -> Result<Option<PinnedExe>, ConfigError> {
+    if let Some(path) = kdl_first_entry_as_string!(kdl_pin_exe) {
+        return Ok(Some(PinnedExe::At(expand_path(path))));
+    }
+    if let Some(on) = kdl_first_entry_as_bool!(kdl_pin_exe) {
+        return Ok(on.then_some(PinnedExe::Canonical));
+    }
+    Err(ConfigError::new_kdl_error(
+        "pin_exe takes true, false, or the path to pin the binary at".to_owned(),
+        kdl_pin_exe.span().offset(),
+        kdl_pin_exe.span().len(),
+    ))
+}
+
 /// One launchd key's value, as KDL spells it.
 ///
 /// Strings, integers and booleans and nothing else: those cover every key anyone has wanted, and a
@@ -3353,6 +3374,11 @@ impl Options {
             kdl_children_nodes_or_error!(kdl_session_service, "empty session_service block")
         {
             match kdl_name!(init_system) {
+                // not an init system but a property of the install: which binary the unit is to
+                // name. It sits in this block because that is the block the unit is generated from
+                "pin_exe" => {
+                    session_service.pin_exe = pin_exe_from_kdl(init_system)?;
+                },
                 "systemd" => {
                     for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
                     {
@@ -3394,7 +3420,8 @@ impl Options {
                 other => {
                     return Err(ConfigError::new_kdl_error(
                         format!(
-                            "Unknown init system: {:?} (expected systemd or launchd)",
+                            "Unknown session_service entry: {:?} (expected systemd, launchd or \
+                             pin_exe)",
                             other
                         ),
                         init_system.span().offset(),
@@ -3412,6 +3439,20 @@ impl Options {
         }
         let mut node = KdlNode::new("session_service");
         let mut init_systems = KdlDocument::new();
+
+        match &session_service.pin_exe {
+            Some(PinnedExe::Canonical) => {
+                let mut pin = KdlNode::new("pin_exe");
+                pin.push(KdlValue::Bool(true));
+                init_systems.nodes_mut().push(pin);
+            },
+            Some(PinnedExe::At(path)) => {
+                let mut pin = KdlNode::new("pin_exe");
+                pin.push(KdlValue::String(path.display().to_string()));
+                init_systems.nodes_mut().push(pin);
+            },
+            None => {},
+        }
 
         let sections = [
             ("unit", &session_service.systemd.unit),
@@ -7841,6 +7882,85 @@ fn session_service_config_parsing() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(deserialized.options, config.options);
+}
+
+/// `pin_exe` is a switch that may also be a path, and both spellings have to survive the round trip
+/// through KDL - a config written back out with the pin silently dropped would turn the feature off
+/// on the next `zellij setup --dump-config`.
+#[test]
+fn pin_exe_is_a_switch_or_a_path() {
+    let on = Config::from_kdl(
+        "session_service {
+    pin_exe true
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        on.options.session_service.clone().unwrap().pin_exe,
+        Some(PinnedExe::Canonical)
+    );
+    assert_eq!(
+        Config::from_kdl(&on.to_string(false), None)
+            .unwrap()
+            .options,
+        on.options
+    );
+
+    let at = Config::from_kdl(
+        "session_service {\n    pin_exe \"/opt/zellij/bin/zellij\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        at.options.session_service.clone().unwrap().pin_exe,
+        Some(PinnedExe::At(PathBuf::from("/opt/zellij/bin/zellij")))
+    );
+    assert_eq!(
+        Config::from_kdl(&at.to_string(false), None)
+            .unwrap()
+            .options,
+        at.options
+    );
+
+    // written out as false, and read back as the off it says
+    let off = Config::from_kdl(
+        "session_service {
+    pin_exe false
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(off.options.session_service.unwrap().pin_exe, None);
+}
+
+/// A path is expanded like every other path in the config, so one config can be read on machines
+/// whose home directories differ.
+#[test]
+fn a_pinned_path_expands_like_any_other_config_path() {
+    std::env::set_var("ZELLIJ_TEST_PIN_ROOT", "/opt/zellij");
+    let config = Config::from_kdl(
+        "session_service {\n    pin_exe \"$ZELLIJ_TEST_PIN_ROOT/bin/zellij\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config.options.session_service.unwrap().pin_exe,
+        Some(PinnedExe::At(PathBuf::from("/opt/zellij/bin/zellij")))
+    );
+    std::env::remove_var("ZELLIJ_TEST_PIN_ROOT");
+}
+
+#[test]
+fn pin_exe_refuses_a_value_that_is_neither() {
+    let error = Config::from_kdl(
+        "session_service {
+    pin_exe 5
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(format!("{:?}", error).contains("pin_exe"));
 }
 
 #[test]

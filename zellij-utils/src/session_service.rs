@@ -57,6 +57,8 @@ impl ServiceKind {
 pub enum ServiceExe {
     /// A path the user named. Only they know when their installation is unusual.
     Given(PathBuf),
+    /// The pinned copy asked for by `pin_exe` - a path zellij owns and keeps a build at.
+    Pinned(PathBuf),
     /// A name on PATH that resolves to this binary - the stable half of a versioned install.
     Stable(PathBuf),
     /// The resolved path of the running binary, nothing steadier having been found.
@@ -66,24 +68,38 @@ pub enum ServiceExe {
 impl ServiceExe {
     pub fn path(&self) -> &Path {
         match self {
-            ServiceExe::Given(path) | ServiceExe::Stable(path) | ServiceExe::Resolved(path) => path,
+            ServiceExe::Given(path)
+            | ServiceExe::Pinned(path)
+            | ServiceExe::Stable(path)
+            | ServiceExe::Resolved(path) => path,
         }
     }
 }
 
-/// Pick the path to write into a unit: what the user said, else the stable name that leads here,
-/// else where this binary actually is.
+/// Pick the path to write into a unit: what the user said, else the pinned copy, else the stable
+/// name that leads here, else where this binary actually is.
+///
+/// `--exe` comes first because it was typed for this one command, over a config that describes
+/// every command. The pinned path comes next and beats the stable name deliberately: a package
+/// manager's stable name is a symlink, and a symlink holds no macOS permission grant of its own -
+/// the grant is recorded against the file it resolves to, which is the versioned path the next
+/// upgrade deletes. The pinned copy is a real file at a path zellij owns, so the grant outlives
+/// the upgrade.
 ///
 /// A PATH entry counts only if it resolves to the SAME file as the running binary - another
 /// zellij, further along the same PATH, is a different program and a unit that execs it is a unit
 /// that keeps the wrong version alive.
 pub fn resolve_service_exe(
     explicit: Option<PathBuf>,
+    pinned: Option<PathBuf>,
     current_exe: &Path,
     path_dirs: &[PathBuf],
 ) -> ServiceExe {
     if let Some(explicit) = explicit {
         return ServiceExe::Given(explicit);
+    }
+    if let Some(pinned) = pinned {
+        return ServiceExe::Pinned(pinned);
     }
     let resolved = current_exe
         .canonicalize()
@@ -103,6 +119,61 @@ pub fn path_dirs() -> Vec<PathBuf> {
     std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default()
+}
+
+/// What `pin_exe` in the config asks for: a build of zellij kept at a path zellij owns, which the
+/// generated unit then names.
+///
+/// The point is a path that does not change when the package does. A package manager installs each
+/// release into its own versioned directory, so every upgrade moves the binary - and on macOS the
+/// permission grants a user gave the last one were recorded against the path it sat at, so they do
+/// not follow it. Measured on one machine: a real file at a fixed path keeps its grant when a
+/// different build is written over it, and a SYMLINK never holds a grant at all, because macOS
+/// resolves it and records the target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinnedExe {
+    /// `pin_exe true` - the platform's canonical per-user data directory.
+    Canonical,
+    /// `pin_exe "<path>"` - a path the user named, for an install this cannot guess at.
+    At(PathBuf),
+}
+
+impl PinnedExe {
+    /// Where the copy goes, or why this machine cannot say.
+    pub fn path(&self) -> Result<PathBuf, String> {
+        match self {
+            PinnedExe::At(path) => Ok(path.clone()),
+            PinnedExe::Canonical => canonical_pinned_exe(),
+        }
+    }
+}
+
+/// The platform-canonical place for a program's own copy of a file: `~/Library/Application
+/// Support/zellij/bin/zellij` on macOS, `$XDG_DATA_HOME/zellij/bin/zellij` on Linux.
+///
+/// DELIBERATELY not zellij's own `consts.rs` paths. Those are derived from `XDG_*` as zellij
+/// configures itself, and a machine with unusual values would pin the binary somewhere no other
+/// machine has. What is wanted here is the ordinary per-user data directory of the platform, which
+/// is what `directories` reports.
+pub fn canonical_pinned_exe() -> Result<PathBuf, String> {
+    let dirs = directories::BaseDirs::new()
+        .ok_or_else(|| "cannot find the home directory to pin the binary in".to_owned())?;
+    Ok(dirs.data_dir().join("zellij").join("bin").join("zellij"))
+}
+
+/// The path the config's `pin_exe` names, for the callers that only want the answer.
+///
+/// A machine that cannot say where its own data directory is gets a warning and no pin, rather than
+/// a refused command: the pin makes an upgrade keep its permission grants, and failing the whole of
+/// `session enable` over it would be a poor trade.
+pub fn configured_pinned_exe(extras: Option<&SessionServiceOptions>) -> Option<PathBuf> {
+    match extras?.pinned_exe()? {
+        Ok(path) => Some(path),
+        Err(reason) => {
+            eprintln!("warning: `pin_exe` is set, but {}", reason);
+            None
+        },
+    }
 }
 
 /// The launchd label of the agent that keeps `session` up.
@@ -345,6 +416,96 @@ fn session_up_inside(argument: &str) -> Option<&str> {
         return Some(candidate);
     }
     None
+}
+
+/// The binary a job runs `session up` with, as the job records it.
+///
+/// Read the same two ways [`session_up_target`] is read, and for the same reason: the subcommand is
+/// what identifies the job, so the binary is whatever the job puts in front of it. It is returned
+/// exactly as written - a bare `zellij` from an `sh -c` job is not an absolute path and is not
+/// turned into one, because a relative name is precisely the thing a caller comparing against a
+/// pinned path needs to see.
+pub fn session_up_exe(exec: &[String]) -> Option<&str> {
+    if let Some(index) = exec
+        .windows(2)
+        .position(|pair| pair[0] == "session" && pair[1] == "up")
+    {
+        return index.checked_sub(1).map(|before| exec[before].as_str());
+    }
+    exec.iter().find_map(|argument| {
+        let words = word_spans(argument);
+        let word = |span: &(usize, usize)| &argument[span.0..span.1];
+        let index = words
+            .windows(2)
+            .position(|pair| word(&pair[0]) == "session" && word(&pair[1]) == "up")?;
+        index.checked_sub(1).map(|before| word(&words[before]))
+    })
+}
+
+/// What the config's `pin_exe` and the installed unit say between them.
+///
+/// They can disagree, and the disagreement is the state worth reporting: turning the key on AFTER
+/// `session enable` leaves a config that asks for a pinned copy and a launcher that still runs
+/// something else. Nothing breaks, nothing changes, and it looks like the feature does not work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinState {
+    /// Nothing installed runs this session, so no path has been recorded. The configured one is
+    /// what `session enable` would write.
+    Unrecorded(PathBuf),
+    /// The installed unit runs the pinned copy. THIS is the path to install and refresh - see
+    /// [`pin_state`] for why it is not re-derived.
+    Recorded(PathBuf),
+    /// The installed unit runs a different binary.
+    Mismatch {
+        configured: PathBuf,
+        installed: String,
+    },
+}
+
+/// Compare the path the config asks for against the path the installed unit records.
+///
+/// The RECORDED path is the one that matters, and re-deriving it would be a bug rather than a
+/// simplification: the canonical directory honours `XDG_DATA_HOME` on Linux, and a launcher's
+/// environment is not the calling shell's - so a re-derived path can name a different file from
+/// the one the launcher actually execs, and `up` would then refresh a copy nothing runs.
+pub fn pin_state(configured: &Path, installed_exe: Option<&str>) -> PinState {
+    let Some(installed) = installed_exe else {
+        return PinState::Unrecorded(configured.to_path_buf());
+    };
+    if same_exe_path(configured, Path::new(installed)) {
+        return PinState::Recorded(PathBuf::from(installed));
+    }
+    PinState::Mismatch {
+        configured: configured.to_path_buf(),
+        installed: installed.to_owned(),
+    }
+}
+
+/// Whether two spellings name the same executable: the same text, or the same file once both have
+/// been resolved. A pinned path that does not exist yet cannot be canonicalised, and comparing the
+/// text is the whole of what is available then.
+fn same_exe_path(one: &Path, other: &Path) -> bool {
+    if one == other {
+        return true;
+    }
+    match (one.canonicalize(), other.canonicalize()) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => false,
+    }
+}
+
+/// The binary the installed unit for `session` runs, where a unit was found at all.
+///
+/// Found by behaviour, like everything else that looks for this session's job - a job installed
+/// under a name this build did not choose is still the job that runs the session.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+pub fn installed_session_exe(session: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let (jobs, derived) = (installed_user_units(), systemd_service_name(session));
+    #[cfg(not(target_os = "linux"))]
+    let (jobs, derived) = (installed_launch_agents(), launchd_label(session));
+    let job = find_session_job(&jobs, session, &derived).job()?;
+    session_up_exe(&job.exec).map(|exe| exe.to_owned())
 }
 
 /// Where each word of a command line begins and ends, with the quotes around a word left out of the
@@ -621,6 +782,11 @@ pub struct SessionServiceOptions {
     pub systemd: SystemdDirectives,
     #[serde(default)]
     pub launchd: Vec<LaunchdKey>,
+    /// Keep a copy of the binary at a fixed path and point the unit at it. Unset is off, and off is
+    /// the whole feature: nothing is copied, nothing is reported, and the unit names whatever it
+    /// named before.
+    #[serde(default)]
+    pub pin_exe: Option<PinnedExe>,
 }
 
 /// Literal directive lines, per section of the generated `.service` file.
@@ -676,6 +842,24 @@ impl SessionServiceOptions {
             && self.systemd.service.is_empty()
             && self.systemd.install.is_empty()
             && self.launchd.is_empty()
+            && self.pin_exe.is_none()
+    }
+
+    /// Whether anything here is written INTO a unit. `pin_exe` is in this block but is not one of
+    /// those: it decides which binary the unit names, not what the unit contains.
+    pub fn has_unit_extras(&self) -> bool {
+        !(self.systemd.unit.is_empty()
+            && self.systemd.service.is_empty()
+            && self.systemd.install.is_empty()
+            && self.launchd.is_empty())
+    }
+
+    /// Where this config says the binary is to be pinned, or nothing when it does not say.
+    ///
+    /// An unresolvable canonical directory is not silently treated as "off": the config asked for a
+    /// pin, so the caller is to report that it could not be honoured.
+    pub fn pinned_exe(&self) -> Option<Result<PathBuf, String>> {
+        self.pin_exe.as_ref().map(|pin| pin.path())
     }
 
     /// Add a literal directive line to one section of the generated service file.
@@ -1865,7 +2049,7 @@ mod tests {
         let (_root, real, stable) = versioned_install();
         let stable_dir = stable.parent().unwrap().to_path_buf();
         assert_eq!(
-            resolve_service_exe(None, &real, &[stable_dir]),
+            resolve_service_exe(None, None, &real, &[stable_dir]),
             ServiceExe::Stable(stable)
         );
     }
@@ -1879,8 +2063,145 @@ mod tests {
         std::fs::create_dir_all(&other_dir).unwrap();
         std::fs::write(other_dir.join("zellij"), b"another binary").unwrap();
         assert_eq!(
-            resolve_service_exe(None, &real, &[other_dir]),
+            resolve_service_exe(None, None, &real, &[other_dir]),
             ServiceExe::Resolved(real.canonicalize().unwrap())
+        );
+    }
+
+    /// The pin beats the stable name deliberately: that name is a symlink, and a symlink holds no
+    /// macOS permission grant of its own - the grant follows it to the versioned file the next
+    /// upgrade deletes.
+    #[test]
+    #[cfg(unix)]
+    fn the_pinned_copy_is_preferred_to_the_stable_name_on_path() {
+        let (_root, real, stable) = versioned_install();
+        let stable_dir = stable.parent().unwrap().to_path_buf();
+        let pinned = PathBuf::from("/data/zellij/bin/zellij");
+        assert_eq!(
+            resolve_service_exe(None, Some(pinned.clone()), &real, &[stable_dir]),
+            ServiceExe::Pinned(pinned)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_path_typed_for_this_command_still_beats_the_pin_in_the_config() {
+        let (_root, real, _stable) = versioned_install();
+        let given = PathBuf::from("/opt/zellij/bin/zellij");
+        assert_eq!(
+            resolve_service_exe(
+                Some(given.clone()),
+                Some(PathBuf::from("/data/zellij/bin/zellij")),
+                &real,
+                &[]
+            ),
+            ServiceExe::Given(given)
+        );
+    }
+
+    #[test]
+    fn the_canonical_pin_is_the_platforms_own_data_directory() {
+        let path = canonical_pinned_exe().expect("a home directory in the test environment");
+        assert!(path.is_absolute());
+        assert!(path.ends_with("zellij/bin/zellij"), "{}", path.display());
+        // and the data directory, not zellij's own XDG-derived config or cache locations
+        let data = directories::BaseDirs::new()
+            .unwrap()
+            .data_dir()
+            .to_path_buf();
+        assert!(path.starts_with(data), "{}", path.display());
+    }
+
+    #[test]
+    fn a_named_pin_path_is_taken_as_written() {
+        let named = PathBuf::from("/opt/zellij/bin/zellij");
+        assert_eq!(PinnedExe::At(named.clone()).path().unwrap(), named);
+    }
+
+    #[test]
+    fn a_pin_only_config_still_writes_nothing_into_the_unit() {
+        let mut options = SessionServiceOptions::default();
+        options.pin_exe = Some(PinnedExe::Canonical);
+        // it decides which binary the unit names, which is not a directive the unit carries
+        assert!(!options.has_unit_extras());
+        // but it is not "nothing configured" either, or it would never be written back out
+        assert!(!options.is_empty());
+    }
+
+    #[test]
+    fn the_binary_a_job_runs_is_read_from_argv_and_from_a_shell_line() {
+        let argv: Vec<String> = ["/data/zellij/bin/zellij", "session", "up", "work"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(session_up_exe(&argv), Some("/data/zellij/bin/zellij"));
+
+        // the commonest hand-written agent, where the whole command line is one argument
+        let shell: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "exec /opt/homebrew/bin/zellij session up work",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(session_up_exe(&shell), Some("/opt/homebrew/bin/zellij"));
+
+        // a job that names no binary before the subcommand names none, rather than one made up
+        let bare: Vec<String> = ["session", "up", "work"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(session_up_exe(&bare), None);
+    }
+
+    /// Turning `pin_exe` on AFTER `session enable` is the state that looks like the feature does not
+    /// work: the config asks for a pinned copy and the launcher still runs the package's own path.
+    #[test]
+    fn a_launcher_running_another_binary_is_a_mismatch_naming_both_paths() {
+        let pinned = Path::new("/data/zellij/bin/zellij");
+        assert_eq!(
+            pin_state(pinned, Some("/opt/homebrew/bin/zellij")),
+            PinState::Mismatch {
+                configured: pinned.to_path_buf(),
+                installed: "/opt/homebrew/bin/zellij".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_recorded_path_is_what_is_refreshed_even_before_the_copy_exists() {
+        let pinned = Path::new("/data/zellij/bin/zellij");
+        // the unit records it, and it is returned as the unit spells it
+        assert_eq!(
+            pin_state(pinned, Some("/data/zellij/bin/zellij")),
+            PinState::Recorded(pinned.to_path_buf())
+        );
+        // nothing installed records anything, so the configured path is what `enable` would write
+        assert_eq!(
+            pin_state(pinned, None),
+            PinState::Unrecorded(pinned.to_path_buf())
+        );
+    }
+
+    /// Two spellings of one file agree. A launcher written by hand may name the copy through a
+    /// symlinked home directory, and calling that a mismatch would send the reader after a fault
+    /// that is not there.
+    #[test]
+    #[cfg(unix)]
+    fn two_spellings_of_the_pinned_copy_are_not_a_mismatch() {
+        let root = tempfile::TempDir::new().unwrap();
+        let real_dir = root.path().join("data/zellij/bin");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let pinned = real_dir.join("zellij");
+        std::fs::write(&pinned, b"binary").unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(root.path().join("data"), &link).unwrap();
+        let through_link = link.join("zellij/bin/zellij");
+
+        assert_eq!(
+            pin_state(&pinned, through_link.to_str()),
+            PinState::Recorded(through_link)
         );
     }
 
@@ -1891,7 +2212,7 @@ mod tests {
         let stable_dir = stable.parent().unwrap().to_path_buf();
         let given = PathBuf::from("/opt/zellij/bin/zellij");
         assert_eq!(
-            resolve_service_exe(Some(given.clone()), &real, &[stable_dir]),
+            resolve_service_exe(Some(given.clone()), None, &real, &[stable_dir]),
             ServiceExe::Given(given)
         );
     }
@@ -1900,7 +2221,7 @@ mod tests {
     #[cfg(unix)]
     fn with_nothing_on_path_the_unit_still_gets_an_absolute_path() {
         let (_root, real, _stable) = versioned_install();
-        let exe = resolve_service_exe(None, &real, &[]);
+        let exe = resolve_service_exe(None, None, &real, &[]);
         assert_eq!(exe, ServiceExe::Resolved(real.canonicalize().unwrap()));
         assert!(exe.path().is_absolute());
     }

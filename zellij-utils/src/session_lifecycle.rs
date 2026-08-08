@@ -621,7 +621,7 @@ pub struct ExecutableIdentity {
 }
 
 /// What can be learnt about the file at `path`, without failing if the answer is "not much".
-fn identify_executable(path: PathBuf) -> ExecutableIdentity {
+pub fn identify_executable(path: PathBuf) -> ExecutableIdentity {
     let (path, replaced) = match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
         Some(real_path) => (PathBuf::from(real_path), true),
         None => (path, false),
@@ -1012,6 +1012,97 @@ pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
 /// The build of the binary running right now.
 pub fn own_executable() -> Option<ExecutableIdentity> {
     std::env::current_exe().ok().map(identify_executable)
+}
+
+/// What a pass over the pinned copy did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// There was no file at the pinned path, and now there is.
+    Installed(PathBuf),
+    /// The pinned path held a different build, and now holds this one.
+    Refreshed(PathBuf),
+    /// The pinned path already holds this build. The common case, and the reason the build is
+    /// identified at all: copying 40 MB on every `session up` for nothing.
+    UpToDate(PathBuf),
+}
+
+impl PinOutcome {
+    pub fn path(&self) -> &Path {
+        match self {
+            PinOutcome::Installed(path)
+            | PinOutcome::Refreshed(path)
+            | PinOutcome::UpToDate(path) => path,
+        }
+    }
+}
+
+/// Put this build at `target`, if it is not there already.
+///
+/// WRITTEN OVER IN PLACE, never unlinked and replaced. Measured on one machine: macOS keeps a
+/// permission grant when a different build is written over the file the grant names, and the grant
+/// is keyed to that file rather than to its contents - the code signature it recorded is not
+/// enforced for an ad-hoc-signed client. A new inode at the same path is a new client with none of
+/// the grants, so `truncate` is load-bearing and a rename into place would undo the whole point.
+///
+/// Whether to write at all is decided by [`compare_builds`], not by a timestamp or a path: the
+/// pinned copy is a COPY, so it is a different file from the binary it came from and only the id
+/// the linker stamped in can say whether it is the same build.
+///
+/// A write that fails part-way leaves a short file at the pinned path. That is not silent and it is
+/// not permanent: a truncated copy is a different size, so the next `session up` finds it different
+/// and writes it again.
+#[cfg(unix)]
+pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if target.exists() {
+        let ours = identify_executable(source.to_path_buf());
+        let theirs = identify_executable(target.to_path_buf());
+        if compare_builds(Some(&ours), Some(&theirs)) == BuildMatch::Same {
+            return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+        }
+    }
+    let refreshing = target.exists();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
+    }
+    let mut input = std::fs::File::open(source)
+        .map_err(|e| format!("could not read {}: {}", source.display(), e))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(target)
+        .map_err(|e| pin_write_error(target, &e))?;
+    std::io::copy(&mut input, &mut output)
+        .map_err(|e| format!("could not write {}: {}", target.display(), e))?;
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("could not make {} executable: {}", target.display(), e))?;
+    Ok(if refreshing {
+        PinOutcome::Refreshed(target.to_path_buf())
+    } else {
+        PinOutcome::Installed(target.to_path_buf())
+    })
+}
+
+/// Why the pinned path could not be opened for writing, saying what to do about the one cause that
+/// is ordinary: the copy is running.
+///
+/// A server keeps the binary it started with, so the pinned copy of a session that is up is being
+/// executed, and no unix will let it be written to. Restarting the session releases it, and the
+/// restart is what the new build was wanted for anyway.
+#[cfg(unix)]
+fn pin_write_error(target: &Path, error: &std::io::Error) -> String {
+    if error.raw_os_error() == Some(libc::ETXTBSY) {
+        return format!(
+            "the pinned copy at {} is being executed right now, so it cannot be written over. \
+             A server keeps the binary it started with, so restart the session to release it - \
+             `zellij session restart` - and the copy is refreshed on the way back up.",
+            target.display()
+        );
+    }
+    format!("could not write {}: {}", target.display(), error)
 }
 
 /// What to say about a session served by a build that is not this one, if it is.
@@ -1739,6 +1830,79 @@ mod tests {
         let theirs = identify_executable(link);
         assert_eq!(ours.file_id, theirs.file_id, "a symlink is one file");
         assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_pinned_copy_is_created_where_there_was_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("pin-new");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        // a directory that does not exist yet: the pin is zellij's own, so nothing else made it
+        let target = scratch.0.join("bin/zellij");
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Installed(target.clone()))
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "a launcher has to be able to exec it");
+    }
+
+    /// The reason the build is identified at all. `session up` runs this on every pass, including
+    /// the one a watchdog takes every minute, and the binary is around 40 MB.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_same_build_is_not_copied_over_itself() {
+        let scratch = ScratchDir::new("pin-same");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        std::fs::copy(&source, &target).unwrap();
+        let before = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            before,
+            "a copy of the same build was written all the same"
+        );
+    }
+
+    /// The measured constraint the whole feature rests on: macOS keeps a permission grant when the
+    /// file the grant names is written over, and loses it when a new file takes the path. So the
+    /// refresh has to keep the inode.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_refresh_writes_over_the_same_file_rather_than_replacing_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = ScratchDir::new("pin-refresh");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 8192));
+        let target = scratch.write("pinned", &elf_with_build_id(&[0xcd; 20], 4096));
+        let before = std::fs::metadata(&target).unwrap().ino();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone()))
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            before,
+            "the pinned path holds a new file, so a macOS grant would not follow it"
+        );
+        assert_eq!(
+            identify_executable(target).build_id,
+            Some(vec![0xab; 20]),
+            "and it is the new build"
+        );
     }
 
     #[test]
