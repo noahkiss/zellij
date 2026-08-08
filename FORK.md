@@ -1043,9 +1043,9 @@ launchd {
 The guard below reads **every** string inside a value, at any depth: a nesting that could hide
 `ZELLIJ_SOCKET_DIR` from it would be a guard worth nothing.
 
-What it will not carry is what the generator owns — `ExecStart`, the plist keys zellij writes
-itself (`Label`, `ProgramArguments`, `LimitLoadToSessionType`, `EnvironmentVariables`, `RunAtLoad`,
-`StartInterval`), and anything that **sets** `TMPDIR` or `ZELLIJ_SOCKET_DIR`. Those are config errors
+What it will not carry is what the generator owns — `ExecStart`, the three plist keys that are what
+the unit *is* (`Label`, `ProgramArguments`, `EnvironmentVariables`), and anything that **sets**
+`TMPDIR` or `ZELLIJ_SOCKET_DIR`. Those are config errors
 naming the offending entry, reported at parse time so `setup --check` catches them; a unit that
 pins either variable builds a session no terminal can see, which is the failure this whole design
 exists to prevent. A duplicate key is not an override either: a dict with the same key twice is not
@@ -1061,13 +1061,22 @@ checked per `NAME=` word (quoted words included), `PassEnvironment=` per name, a
 whatever it likes. On the launchd side a key is still refused when its name or its string value
 names one of the two: a plist key cannot be read the way a directive can.
 
-The generator's own **defaults** are the exception, and deliberately so — `TERM`, `PATH`, and on
-launchd `WorkingDirectory`, `StandardOutPath` and `StandardErrorPath`. They are values the
-generator supplies, not parts of the unit it owns, so an entry setting one replaces that default
-instead of being refused, and the key is never written twice. `TERM` and `PATH` are environment
+The generator's own **defaults** are the exception, and deliberately so — `TERM`, `PATH`,
+`XDG_STATE_HOME`, and on launchd `WorkingDirectory`, `StandardOutPath`, `StandardErrorPath`,
+`LimitLoadToSessionType`, `RunAtLoad` and `StartInterval`. They are values the generator supplies,
+not parts of the unit it owns, so an entry setting one replaces that default instead of being
+refused, and the key is never written twice. `TERM`, `PATH` and `XDG_STATE_HOME` are environment
 variables rather than plist keys, so on launchd a configured one is routed inside
 `EnvironmentVariables`, where it means something, rather than left beside it as a top-level key
 launchd ignores in silence.
+
+The three **scheduling** keys joined that list when the hand-written plists were audited against
+the generator. They had been the generator's outright, so a machine whose agent ticked on any
+interval but 60 s, or loaded into any session type but `Aqua`, could not have been reproduced from
+a config — which was survivable while you wrote the plist yourself and a blocker the moment it is
+generated for you. A watchdog interval is a local fact, and this block is now the only route a
+local fact has into the file. A test asserts that every key the hand-written agents carried is
+expressible, and that each lands in the plist exactly once.
 
 ### A pinned copy of the binary (`pin_exe`)
 

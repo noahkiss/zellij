@@ -929,20 +929,20 @@ impl PlistValue {
     }
 }
 
-/// The plist keys the generator writes itself.
+/// The plist keys the generator OWNS, as opposed to the ones it supplies a default for.
 ///
-/// A dictionary with the same key twice is not a plist, so an extra key that is one of these is
-/// not an override but a broken file - and every one of them is load-bearing: the label is the
-/// job's identity, `ProgramArguments` is the command, `EnvironmentVariables` is where a TMPDIR
-/// would go, and the two scheduling keys are what makes the job a watchdog.
-const GENERATED_LAUNCHD_KEYS: &[&str] = &[
-    "Label",
-    "ProgramArguments",
-    "LimitLoadToSessionType",
-    "EnvironmentVariables",
-    "RunAtLoad",
-    "StartInterval",
-];
+/// A dictionary with the same key twice is not a plist, so an extra key that is one of these is not
+/// an override but a broken file - and each of the three is what the whole unit is FOR: the label
+/// is the job's identity, `ProgramArguments` is the command, and `EnvironmentVariables` is where a
+/// pinned `TMPDIR` would go, which is the failure this module exists to prevent.
+///
+/// The scheduling keys are deliberately NOT here. `RunAtLoad`, `StartInterval` and
+/// `LimitLoadToSessionType` are decisions the generator makes a sensible default for, not parts of
+/// the file it owns - a watchdog that should tick every five minutes rather than every minute is a
+/// local fact, and once the plists are generated this config is the only route such a fact has into
+/// one. They are taken out of the extras and written in their proper places, so the key still
+/// appears exactly once.
+const GENERATED_LAUNCHD_KEYS: &[&str] = &["Label", "ProgramArguments", "EnvironmentVariables"];
 
 /// Variables a unit must never pin. The whole design rests on the binary resolving its own socket
 /// directory: a unit that sets either of these builds a session no login shell can see, and the
@@ -1198,6 +1198,13 @@ fn xml_escape(text: &str) -> String {
 /// healthy session is a no-op and a pass over a missing one restores it.
 const CHECK_INTERVAL_SECS: u64 = 60;
 
+/// The launchd session type an agent for a graphical login belongs to.
+///
+/// Spelled here rather than taken from `session_lifecycle`, which is not built for wasm while this
+/// module is. It is the same word launchd uses in both places, and duplicating one constant costs
+/// less than the module split it would otherwise force.
+const GUI_SESSION_TYPE: &str = "Aqua";
+
 /// Whether the config already sets this variable for the service.
 ///
 /// systemd takes the last assignment of a variable, so a second `Environment=NAME=` line would not
@@ -1417,17 +1424,43 @@ pub fn systemd_timer_name(session: &str) -> String {
 /// by the generator itself: leaving one in the extras would put the key in the dictionary twice,
 /// and a dict with the same key twice is not a plist.
 fn take_default_key(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<String> {
+    match take_default_value(keys, name)? {
+        PlistValue::String(value) => Some(value),
+        // another type where a string belongs is not a value to guess at, and the key has been
+        // removed either way so it cannot end up in the dictionary twice
+        _ => None,
+    }
+}
+
+/// The same, for a key whose default is not a string.
+fn take_default_value(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<PlistValue> {
     let mut given = None;
     keys.retain(|key| {
         if key.name != name {
             return true;
         }
-        if let (None, PlistValue::String(value)) = (&given, &key.value) {
-            given = Some(value.clone());
+        if given.is_none() {
+            given = Some(key.value.clone());
         }
         false
     });
     given
+}
+
+/// A configured integer where the generator has an integer default.
+fn take_default_integer(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<i64> {
+    match take_default_value(keys, name)? {
+        PlistValue::Integer(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// A configured boolean where the generator has a boolean default.
+fn take_default_bool(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<bool> {
+    match take_default_value(keys, name)? {
+        PlistValue::Bool(value) => Some(value),
+        _ => None,
+    }
 }
 
 /// Where a launchd job's output goes, per session.
@@ -1477,6 +1510,14 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         .unwrap_or_else(|| default_out.display().to_string());
     let err_path = take_default_key(&mut keys, "StandardErrorPath")
         .unwrap_or_else(|| default_err.display().to_string());
+    // The scheduling keys, which are defaults and not parts of the plist the generator owns: a
+    // watchdog that should tick every five minutes rather than every minute is a local fact, and
+    // once the plists are generated the config is the only route such a fact has into one.
+    let session_type = take_default_key(&mut keys, "LimitLoadToSessionType")
+        .unwrap_or_else(|| GUI_SESSION_TYPE.to_owned());
+    let run_at_load = take_default_bool(&mut keys, "RunAtLoad").unwrap_or(true);
+    let interval =
+        take_default_integer(&mut keys, "StartInterval").unwrap_or(CHECK_INTERVAL_SECS as i64);
     // Not a plist key either: it goes inside EnvironmentVariables like TERM and PATH, and unlike
     // them it is absent altogether when this machine has no absolute one to record.
     let state_home = take_default_key(&mut keys, "XDG_STATE_HOME")
@@ -1544,9 +1585,12 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
   WorkingDirectory, because launchd gives a job none: without it every pane of a session this agent
   created opens in /. A systemd user unit defaults to the home directory and needs no such line.
 
-  Each of these is a DEFAULT. A key of the same name in the config's `session_service` launchd
-  block replaces it; TERM and PATH are replaced inside this dictionary, where they mean something,
-  because launchd has no top-level key by either name.
+  Each of these is a DEFAULT, and so are the scheduling keys - LimitLoadToSessionType, RunAtLoad
+  and StartInterval. A key of the same name in the config's `session_service` launchd block
+  replaces it and is not written twice. Only Label, ProgramArguments and EnvironmentVariables are
+  the generator's outright, because those three are what the unit IS. TERM, PATH and XDG_STATE_HOME
+  are replaced inside this dictionary, where they mean something, because launchd has no top-level
+  key by any of those names.
 -->
 <plist version=\"1.0\">
 <dict>
@@ -1560,7 +1604,7 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         <string>{session}</string>
     </array>
     <key>LimitLoadToSessionType</key>
-    <string>Aqua</string>
+    <string>{session_type}</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
@@ -1575,7 +1619,7 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
     <key>StandardErrorPath</key>
     <string>{err_path}</string>
     <key>RunAtLoad</key>
-    <true/>
+    {run_at_load}
     <key>StartInterval</key>
     <integer>{interval}</integer>
 {extra_keys}</dict>
@@ -1584,7 +1628,9 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         session = session,
         label = launchd_label(session),
         exe = exe.display(),
-        interval = CHECK_INTERVAL_SECS,
+        interval = interval,
+        session_type = xml_escape(&session_type),
+        run_at_load = if run_at_load { "<true/>" } else { "<false/>" },
         term = xml_escape(&term),
         path = xml_escape(&path),
         state_home = state_home,
@@ -2525,6 +2571,79 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let files = installed_unit(&dir, None, "[Service]\n");
         assert_eq!(drift_of(&files), UnitDrift::NotInstalled);
+    }
+
+    /// The keys the hand-written launch agents this generator is replacing actually carry.
+    ///
+    /// The audit that had to pass before those files could be retired: every one of them has to be
+    /// expressible here, or generating the plist would silently drop something the machine relied
+    /// on. `StartInterval`, `RunAtLoad` and `LimitLoadToSessionType` were NOT expressible before -
+    /// the generator wrote its own value and refused an extra of the same name - so a hand-written
+    /// agent that ticked on any interval but this one could not have been reproduced.
+    #[test]
+    fn every_key_the_hand_written_agents_used_can_be_configured() {
+        let mut extras = SessionServiceOptions::default();
+        for (name, value) in [
+            (
+                "LimitLoadToSessionType",
+                PlistValue::String("Background".to_owned()),
+            ),
+            ("RunAtLoad", PlistValue::Bool(false)),
+            ("StartInterval", PlistValue::Integer(300)),
+            (
+                "WorkingDirectory",
+                PlistValue::String("/srv/work".to_owned()),
+            ),
+            (
+                "StandardOutPath",
+                PlistValue::String("/tmp/out.log".to_owned()),
+            ),
+            (
+                "StandardErrorPath",
+                PlistValue::String("/tmp/err.log".to_owned()),
+            ),
+        ] {
+            extras
+                .add_launchd_key(name, value)
+                .unwrap_or_else(|e| panic!("{} should be configurable: {}", name, e));
+        }
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        for expected in [
+            "<key>LimitLoadToSessionType</key>\n    <string>Background</string>",
+            "<key>RunAtLoad</key>\n    <false/>",
+            "<key>StartInterval</key>\n    <integer>300</integer>",
+            "<key>WorkingDirectory</key>\n    <string>/srv/work</string>",
+            "<key>StandardOutPath</key>\n    <string>/tmp/out.log</string>",
+            "<key>StandardErrorPath</key>\n    <string>/tmp/err.log</string>",
+        ] {
+            assert!(
+                plist.contains(expected),
+                "missing {}\nin {}",
+                expected,
+                plist
+            );
+        }
+        // and each exactly once: a dict with the same key twice is not a plist
+        for name in [
+            "LimitLoadToSessionType",
+            "RunAtLoad",
+            "StartInterval",
+            "WorkingDirectory",
+        ] {
+            let tag = format!("<key>{}</key>", name);
+            assert_eq!(plist.matches(&tag).count(), 1, "{} appears twice", name);
+        }
+    }
+
+    #[test]
+    fn the_scheduling_keys_keep_their_defaults_when_nothing_configures_them() {
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        assert!(plist.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(plist.contains(&format!(
+            "<key>StartInterval</key>\n    <integer>{}</integer>",
+            CHECK_INTERVAL_SECS
+        )));
     }
 
     #[test]
