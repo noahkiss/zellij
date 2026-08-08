@@ -219,6 +219,16 @@ resurrect` while its server is alive under another path. Two additions make that
 The scan is read-only. Unlike the listing of the directory in use, it does not delete a socket that
 refuses a connection — that socket belongs to another environment.
 
+**An empty listing names the directories it looked in.** "No active zellij sessions found" is true
+of a directory, not of a machine, and the two come apart routinely — a session created under an
+exported `ZELLIJ_SOCKET_DIR` this shell does not have is running, reachable, and completely absent
+from the list. The bare sentence sent a reader looking for a dead session that was not dead. It now
+prints the resolved directory, then the derived alternatives, and says plainly that a directory
+nothing here was told about cannot be on that list: `zellij session up <name>` scans the process
+table and does see such a server, which is the command to reach for. Fixing the candidate set
+itself is not possible — an arbitrary value exported in another shell is not derivable from this
+one — so naming what *was* searched is the whole of the honest answer.
+
 ### Pane identity and stack membership in `PaneInfo`
 
 ```

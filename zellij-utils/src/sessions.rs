@@ -114,6 +114,48 @@ pub fn session_in_other_contract_versions(name: &str) -> Vec<usize> {
     contracts
 }
 
+/// Every socket directory a listing consulted: the one this binary resolved, then the ones a
+/// differently-configured environment would have landed in.
+///
+/// These are the DERIVED candidates and nothing else. A server created under a `ZELLIJ_SOCKET_DIR`
+/// that this process was not given cannot be derived from here by anything, which is exactly why
+/// naming the list is worth doing: a reader who exported one somewhere else can see at a glance
+/// that their directory is not on it.
+pub fn searched_socket_dirs() -> Vec<std::path::PathBuf> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    let mut dirs = vec![ZELLIJ_SOCK_DIR.clone()];
+    for root in socket_dir_candidates() {
+        let dir = root.join(&*CLIENT_SERVER_CONTRACT_DIR);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Say where the listing looked, for the answer that otherwise explains nothing.
+///
+/// "No active zellij sessions found" is true of a directory, not of a machine, and the two come
+/// apart routinely: a session created under an exported `ZELLIJ_SOCKET_DIR` that this shell does
+/// not have is running, reachable and completely absent from this list. Naming the directories
+/// turns the bare sentence into one a reader can check.
+fn print_searched_socket_dirs() {
+    let dirs = searched_socket_dirs();
+    let mut dirs = dirs.iter();
+    if let Some(first) = dirs.next() {
+        eprintln!("  looked in {}", first.display());
+    }
+    for other in dirs {
+        eprintln!("  and in    {}", other.display());
+    }
+    eprintln!(
+        "  A server started with a ZELLIJ_SOCKET_DIR this shell does not have is not in that\n  \
+         list and cannot be. `zellij session up <name>` scans the process table instead, so it\n  \
+         sees one when this does not."
+    );
+}
+
 fn print_other_socket_dir_warning() {
     for (dir, sessions) in get_sessions_in_other_socket_dirs() {
         eprintln!(
@@ -702,6 +744,7 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
             }
             if all_sessions.is_empty() {
                 eprintln!("No active zellij sessions found.");
+                print_searched_socket_dirs();
                 print_other_socket_dir_warning();
                 1
             } else {
