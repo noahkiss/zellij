@@ -1579,6 +1579,10 @@ prebuilt assets checked into `zellij-utils/assets/plugins/`.
 
 ## Releasing
 
+Each release gets a changelog at `changelogs/v<version>.md` — the commit range plus authored notes
+saying what changed and why. Write it before tagging; it is the single source of truth the `zellij`
+skill's references point at.
+
 `.github/workflows/release.yml` replaces upstream's release job. Pushing a `v*` tag builds two
 targets — `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` — and attaches
 `zellij-nkmk-<version>-<target>.tar.gz` (the bare binary) plus a `.sha256` to that tag's release,
