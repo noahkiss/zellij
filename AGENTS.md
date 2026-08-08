@@ -49,6 +49,9 @@ the ignore: run `git status` before you commit and confirm no private note is st
 - **Run `cargo fmt` before you commit.** CI runs `cargo xtask format --check` and fails on drift.
 - Do not bump the version as part of a feature commit. The version bump is its own `chore:` commit,
   made when a release is cut.
+- **A release is not done until the notes match the tag.** Cutting a version means writing
+  `changelogs/v<version>.md` in the same breath, and updating any out-of-repo notes that record the
+  current version — the operator's tooling docs go stale silently and nothing in CI catches it.
 
 ## Build and test
 
