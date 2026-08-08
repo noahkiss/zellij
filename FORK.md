@@ -1265,6 +1265,16 @@ ls`, which reads the sockets alone, keeps listing the session throughout. A user
 The welcome screen is exempt: it hides the current session deliberately, so an empty list there is
 normal.
 
+A third silence has the same cure. The list gets whatever rows remain after the prompt and the help
+lines, and in a short pane that is none — the list vanished with no hint that height was the reason:
+
+```
+2 sessions hidden: the pane is too short to show the list.
+```
+
+Both list views say it, and neither says it when the list is genuinely empty or a filter matched
+nothing.
+
 ### Focus wraps around the ends of a stack
 
 Moving focus up from the top pane of a stack lands on the bottom pane, and down from the bottom

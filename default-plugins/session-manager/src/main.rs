@@ -80,6 +80,22 @@ register_plugin!(State);
 /// Written as a guard rather than an or-pattern because each key needs its OWN modifier test. A
 /// single shared guard would accept `Ctrl+Delete` and, far worse, a bare `k` - which is filter
 /// typing, so the first search for a session with a k in its name would delete one instead.
+/// What to say instead of a session list that has no room left to draw in.
+///
+/// The list is given whatever rows remain after the prompt and the help lines. In a short pane that
+/// is none, and the list simply vanished - the same silence as a failed poll, from a cause the user
+/// can fix in a second by making the pane taller.
+fn pane_too_short_notice(hidden_sessions: usize) -> String {
+    if hidden_sessions == 1 {
+        String::from("1 session hidden: the pane is too short to show the list.")
+    } else {
+        format!(
+            "{} sessions hidden: the pane is too short to show the list.",
+            hidden_sessions
+        )
+    }
+}
+
 fn is_kill_key(key: &KeyWithModifier) -> bool {
     match key.bare_key {
         BareKey::Delete => key.has_no_modifiers(),
@@ -271,6 +287,14 @@ impl ZellijPlugin for State {
                     }
                     if let Some(notice) = self.session_list_notice() {
                         render_session_list_notice(&notice, width.saturating_sub(7), x, y + 5);
+                    } else if room_for_list == 0 && !self.sessions.session_ui_infos.is_empty() {
+                        let hidden = self.sessions.session_ui_infos.len();
+                        render_session_list_notice(
+                            &pane_too_short_notice(hidden),
+                            width.saturating_sub(7),
+                            x,
+                            y + 3,
+                        );
                     }
                 }
             },
@@ -342,6 +366,17 @@ impl ZellijPlugin for State {
                                     content_width,
                                     x_centered,
                                     y_offset + 3,
+                                );
+                            } else if max_table_rows.saturating_sub(1) == 0
+                                && !self.single_screen_state.render_cache.rows.is_empty()
+                            {
+                                // one row of the table is its header, so a single row shows nothing
+                                let hidden = self.single_screen_state.render_cache.rows.len();
+                                render_session_list_notice(
+                                    &pane_too_short_notice(hidden),
+                                    content_width,
+                                    x_centered,
+                                    y_offset + 2,
                                 );
                             }
                         }
