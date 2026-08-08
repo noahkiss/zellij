@@ -536,6 +536,35 @@ fn pin_state_of(_name: &str, pinned: &std::path::Path) -> PinState {
     session_service::pin_state(pinned, None)
 }
 
+/// One configured plist value on one line of `status`.
+///
+/// A container is written out in full rather than summarised as "a dictionary": the whole reason
+/// `status` lists the extras is that a person can check what the unit will contain against what
+/// they typed, and a count of entries answers neither question.
+fn plist_value_summary(value: &PlistValue) -> String {
+    match value {
+        PlistValue::String(value) => value.to_owned(),
+        PlistValue::Integer(value) => value.to_string(),
+        PlistValue::Bool(value) => value.to_string(),
+        PlistValue::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(plist_value_summary)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PlistValue::Dict(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(name, value)| format!("{} = {}", name, plist_value_summary(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// List what `session_service` in the config puts into the unit, for the init system in use.
 fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOptions>) {
     let Some(extras) = extras.filter(|extras| extras.has_unit_extras()) else {
@@ -557,12 +586,11 @@ fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOpti
         },
         ServiceKind::Launchd => {
             for key in &extras.launchd {
-                let value = match &key.value {
-                    PlistValue::String(value) => value.to_owned(),
-                    PlistValue::Integer(value) => value.to_string(),
-                    PlistValue::Bool(value) => value.to_string(),
-                };
-                println!("config    {} = {}", key.name, value);
+                println!(
+                    "config    {} = {}",
+                    key.name,
+                    plist_value_summary(&key.value)
+                );
             }
         },
     }

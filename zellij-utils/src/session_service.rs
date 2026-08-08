@@ -881,20 +881,52 @@ pub struct SystemdDirectives {
     pub install: Vec<String>,
 }
 
-/// One key of the generated plist. Strings, integers and booleans cover every key anyone has
-/// wanted here; a plist can hold arrays and dictionaries too, and when someone needs one they can
-/// be added without changing anything else.
+/// One key of the generated plist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchdKey {
     pub name: String,
     pub value: PlistValue,
 }
 
+/// Every shape a plist value takes, because a generated plist has to carry every shape a
+/// hand-written one did.
+///
+/// Scalars were enough for as long as the plists were WRITTEN BY HAND: anything the config could
+/// not express, you wrote yourself. Once the plist is generated, this block is the ONLY route any
+/// local knowledge has into the file, so the ceiling became the real limit - and the keys beyond it
+/// are the ones people actually reach for. `KeepAlive` in its useful form is a dictionary,
+/// `WatchPaths` is an array, `StartCalendarInterval` is either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlistValue {
     String(String),
     Integer(i64),
     Bool(bool),
+    Array(Vec<PlistValue>),
+    /// Ordered, not a map: a plist dictionary is written in a fixed order and a config that
+    /// round-trips through this should come back looking like what was typed.
+    Dict(Vec<(String, PlistValue)>),
+}
+
+impl PlistValue {
+    /// Every string anywhere inside this value, however deeply nested.
+    ///
+    /// The guard against a config pinning `TMPDIR` or `ZELLIJ_SOCKET_DIR` reads values, and a
+    /// value that can contain other values can hide one inside itself.
+    pub fn strings(&self) -> Vec<&str> {
+        match self {
+            PlistValue::String(value) => vec![value.as_str()],
+            PlistValue::Integer(_) | PlistValue::Bool(_) => Vec::new(),
+            PlistValue::Array(values) => values.iter().flat_map(PlistValue::strings).collect(),
+            PlistValue::Dict(entries) => entries
+                .iter()
+                .flat_map(|(name, value)| {
+                    let mut strings = vec![name.as_str()];
+                    strings.extend(value.strings());
+                    strings
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The plist keys the generator writes itself.
@@ -998,10 +1030,11 @@ impl SessionServiceOptions {
                 generated
             ));
         }
-        if let Some(forbidden) = forbidden_env_name(name).or_else(|| match &value {
-            PlistValue::String(value) => forbidden_env_name(value),
-            _ => None,
-        }) {
+        // every string in the value, not only a top-level one: an array or a dictionary can hide a
+        // forbidden name inside itself, and the guard is worth nothing if a nesting evades it
+        if let Some(forbidden) = forbidden_env_name(name)
+            .or_else(|| value.strings().into_iter().find_map(forbidden_env_name))
+        {
             return Err(format!(
                 "'{}' names {}, which would build a session no terminal can see - the binary \
                  resolves that itself",
@@ -1092,19 +1125,55 @@ fn directive_lines(lines: &[String]) -> String {
         .collect::<String>()
 }
 
-/// A plist value, XML-escaped, at the indentation the generated dict uses.
+/// The configured keys, XML-escaped, at the indentation the generated dict uses.
 fn plist_entries(keys: &[LaunchdKey]) -> String {
     keys.iter()
-        .map(|key| {
-            let value = match &key.value {
-                PlistValue::String(value) => format!("<string>{}</string>", xml_escape(value)),
-                PlistValue::Integer(value) => format!("<integer>{}</integer>", value),
-                PlistValue::Bool(true) => "<true/>".to_owned(),
-                PlistValue::Bool(false) => "<false/>".to_owned(),
-            };
-            format!("    <key>{}</key>\n    {}\n", xml_escape(&key.name), value)
-        })
+        .map(|key| plist_entry(&key.name, &key.value, 1))
         .collect::<String>()
+}
+
+/// One `<key>` and its value, indented for the depth it sits at.
+///
+/// A container's contents go one level deeper, so a nested dictionary reads the way a hand-written
+/// plist does - which matters because the person reading it is comparing it against one.
+fn plist_entry(name: &str, value: &PlistValue, depth: usize) -> String {
+    let indent = "    ".repeat(depth);
+    format!(
+        "{indent}<key>{name}</key>\n{value}",
+        indent = indent,
+        name = xml_escape(name),
+        value = plist_element(value, depth),
+    )
+}
+
+/// One plist value as its own line or block, indented for the depth it sits at.
+fn plist_element(value: &PlistValue, depth: usize) -> String {
+    let indent = "    ".repeat(depth);
+    match value {
+        PlistValue::String(value) => {
+            format!("{}<string>{}</string>\n", indent, xml_escape(value))
+        },
+        PlistValue::Integer(value) => format!("{}<integer>{}</integer>\n", indent, value),
+        PlistValue::Bool(true) => format!("{}<true/>\n", indent),
+        PlistValue::Bool(false) => format!("{}<false/>\n", indent),
+        PlistValue::Array(values) => {
+            let inner: String = values
+                .iter()
+                .map(|value| plist_element(value, depth + 1))
+                .collect();
+            format!(
+                "{indent}<array>\n{inner}{indent}</array>\n",
+                indent = indent
+            )
+        },
+        PlistValue::Dict(entries) => {
+            let inner: String = entries
+                .iter()
+                .map(|(name, value)| plist_entry(name, value, depth + 1))
+                .collect();
+            format!("{indent}<dict>\n{inner}{indent}</dict>\n", indent = indent)
+        },
+    }
 }
 
 /// Escape for XML character data. A plist is XML, and a value carrying an ampersand or an angle
@@ -2366,6 +2435,80 @@ mod tests {
         assert!(could_run_session_up(
             b"bplist00\x00zellij\x00session\x00up\x00work"
         ));
+    }
+
+    #[test]
+    fn an_array_value_is_emitted_as_a_plist_array() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_launchd_key(
+                "WatchPaths",
+                PlistValue::Array(vec![
+                    PlistValue::String("/one".to_owned()),
+                    PlistValue::String("/two".to_owned()),
+                ]),
+            )
+            .unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        assert!(
+            plist.contains(
+                "    <key>WatchPaths</key>\n    <array>\n        <string>/one</string>\n        \
+                 <string>/two</string>\n    </array>\n"
+            ),
+            "{}",
+            plist
+        );
+    }
+
+    #[test]
+    fn a_dictionary_value_is_emitted_as_a_plist_dict() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_launchd_key(
+                "KeepAlive",
+                PlistValue::Dict(vec![("SuccessfulExit".to_owned(), PlistValue::Bool(false))]),
+            )
+            .unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        assert!(
+            plist.contains(
+                "    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        \
+                 <false/>\n    </dict>\n"
+            ),
+            "{}",
+            plist
+        );
+    }
+
+    #[test]
+    fn a_nested_value_is_still_xml_escaped() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_launchd_key(
+                "WatchPaths",
+                PlistValue::Array(vec![PlistValue::String("<one & two>".to_owned())]),
+            )
+            .unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        assert!(
+            plist.contains("<string>&lt;one &amp; two&gt;</string>"),
+            "{}",
+            plist
+        );
+    }
+
+    #[test]
+    fn a_forbidden_name_nested_in_a_value_is_refused() {
+        // the guard is worth nothing if a nesting evades it
+        let mut extras = SessionServiceOptions::default();
+        let refused = extras.add_launchd_key(
+            "Overrides",
+            PlistValue::Dict(vec![(
+                "ZELLIJ_SOCKET_DIR".to_owned(),
+                PlistValue::String("/tmp/elsewhere".to_owned()),
+            )]),
+        );
+        assert!(refused.is_err(), "{:?}", refused);
     }
 
     #[test]

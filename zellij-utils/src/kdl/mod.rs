@@ -2697,11 +2697,31 @@ fn pin_exe_from_kdl(kdl_pin_exe: &KdlNode) -> Result<Option<PinnedExe>, ConfigEr
     ))
 }
 
+/// The node name that marks one element of a plist array.
+///
+/// A KDL node must be named and an array element has no name, so one is reserved. `-` is the
+/// spelling every list in every configuration language the reader has seen already uses, and it is
+/// not a plausible plist key.
+const PLIST_ARRAY_ELEMENT: &str = "-";
+
 /// One launchd key's value, as KDL spells it.
 ///
-/// Strings, integers and booleans and nothing else: those cover every key anyone has wanted, and a
-/// value of another shape is far more likely to be a typo than a plist type this does not carry
-/// yet - so it is reported rather than guessed at.
+/// A scalar is the node's first argument. A container is the node's CHILDREN, and which container
+/// it is follows from what those children are called: every child named `-` is an array, anything
+/// else is a dictionary. Nothing else has to be declared, and the two cannot be confused - a
+/// dictionary key called `-` is not a thing anyone writes.
+///
+/// ```kdl
+/// keys {
+///     ProcessType "Interactive"
+///     WatchPaths {
+///         - "~/.config/zellij/config.kdl"
+///     }
+///     KeepAlive {
+///         SuccessfulExit false
+///     }
+/// }
+/// ```
 fn plist_value_from_kdl(kdl_key: &KdlNode) -> Result<PlistValue, ConfigError> {
     let name = kdl_name!(kdl_key);
     if let Some(value) = kdl_first_entry_as_string!(kdl_key) {
@@ -2713,14 +2733,95 @@ fn plist_value_from_kdl(kdl_key: &KdlNode) -> Result<PlistValue, ConfigError> {
     if let Some(value) = kdl_first_entry_as_i64!(kdl_key) {
         return Ok(PlistValue::Integer(value));
     }
+    if let Some(children) = kdl_key.children() {
+        return plist_container_from_kdl(kdl_key, children.nodes());
+    }
     Err(ConfigError::new_kdl_error(
         format!(
-            "Failed to parse the launchd key {:?}: expected a string, an integer or a boolean",
+            "Failed to parse the launchd key {:?}: expected a string, an integer, a boolean, or a \
+             block of values",
             name
         ),
         kdl_key.span().offset(),
         kdl_key.span().len(),
     ))
+}
+
+/// An array or a dictionary, decided by what its children are called.
+///
+/// A block mixing the two is refused rather than resolved one way: a plist is one or the other, and
+/// picking for the reader would produce a file that is not what they wrote.
+fn plist_container_from_kdl(
+    kdl_key: &KdlNode,
+    children: &[KdlNode],
+) -> Result<PlistValue, ConfigError> {
+    if children.is_empty() {
+        return Err(ConfigError::new_kdl_error(
+            format!(
+                "The launchd key {:?} has an empty block: write an array element as `- <value>`, \
+                 or a dictionary entry as `<Key> <value>`",
+                kdl_name!(kdl_key)
+            ),
+            kdl_key.span().offset(),
+            kdl_key.span().len(),
+        ));
+    }
+    let elements = children
+        .iter()
+        .filter(|child| kdl_name!(child) == PLIST_ARRAY_ELEMENT)
+        .count();
+    if elements == children.len() {
+        return children
+            .iter()
+            .map(plist_value_from_kdl)
+            .collect::<Result<Vec<_>, _>>()
+            .map(PlistValue::Array);
+    }
+    if elements > 0 {
+        return Err(ConfigError::new_kdl_error(
+            format!(
+                "The launchd key {:?} mixes array elements (`-`) with named entries: a plist value \
+                 is an array or a dictionary, not both",
+                kdl_name!(kdl_key)
+            ),
+            kdl_key.span().offset(),
+            kdl_key.span().len(),
+        ));
+    }
+    children
+        .iter()
+        .map(|child| Ok((kdl_name!(child).to_owned(), plist_value_from_kdl(child)?)))
+        .collect::<Result<Vec<_>, ConfigError>>()
+        .map(PlistValue::Dict)
+}
+
+/// One plist value back into the KDL that would have produced it.
+fn plist_value_to_kdl(name: &str, value: &PlistValue) -> KdlNode {
+    let mut node = KdlNode::new(name.to_owned());
+    match value {
+        PlistValue::String(value) => node.push(KdlValue::String(value.to_owned())),
+        PlistValue::Integer(value) => node.push(KdlValue::Base10(*value)),
+        PlistValue::Bool(value) => node.push(KdlValue::Bool(*value)),
+        PlistValue::Array(values) => {
+            let mut children = KdlDocument::new();
+            for value in values {
+                children
+                    .nodes_mut()
+                    .push(plist_value_to_kdl(PLIST_ARRAY_ELEMENT, value));
+            }
+            node.set_children(children);
+        },
+        PlistValue::Dict(entries) => {
+            let mut children = KdlDocument::new();
+            for (entry_name, value) in entries {
+                children
+                    .nodes_mut()
+                    .push(plist_value_to_kdl(entry_name, value));
+            }
+            node.set_children(children);
+        },
+    }
+    node
 }
 
 impl Options {
@@ -3479,13 +3580,8 @@ impl Options {
         if !session_service.launchd.is_empty() {
             let mut keys = KdlDocument::new();
             for key in &session_service.launchd {
-                let mut key_node = KdlNode::new(key.name.to_owned());
-                key_node.push(match &key.value {
-                    PlistValue::String(value) => KdlValue::String(value.to_owned()),
-                    PlistValue::Integer(value) => KdlValue::Base10(*value),
-                    PlistValue::Bool(value) => KdlValue::Bool(*value),
-                });
-                keys.nodes_mut().push(key_node);
+                keys.nodes_mut()
+                    .push(plist_value_to_kdl(&key.name, &key.value));
             }
             let mut keys_node = KdlNode::new("keys");
             keys_node.set_children(keys);
@@ -7882,6 +7978,112 @@ fn session_service_config_parsing() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(deserialized.options, config.options);
+}
+
+/// A plist array and a plist dictionary, spelled in KDL and surviving the round trip.
+///
+/// The keys that need them are the ones people actually reach for once the plist is generated:
+/// `WatchPaths` is an array, `KeepAlive` in its useful form is a dictionary, and neither could be
+/// written at all while a value had to be a scalar.
+#[test]
+fn launchd_keys_carry_arrays_and_dictionaries() {
+    let config = Config::from_kdl(
+        r#"
+        session_service {
+            launchd {
+                keys {
+                    WatchPaths {
+                        - "/one/path"
+                        - "/another/path"
+                    }
+                    KeepAlive {
+                        SuccessfulExit false
+                        Crashed true
+                    }
+                    StartCalendarInterval {
+                        - {
+                            Hour 3
+                            Minute 30
+                        }
+                    }
+                }
+            }
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let launchd = config.options.session_service.clone().unwrap().launchd;
+    assert_eq!(
+        launchd[0].value,
+        PlistValue::Array(vec![
+            PlistValue::String("/one/path".to_owned()),
+            PlistValue::String("/another/path".to_owned()),
+        ])
+    );
+    assert_eq!(
+        launchd[1].value,
+        PlistValue::Dict(vec![
+            ("SuccessfulExit".to_owned(), PlistValue::Bool(false)),
+            ("Crashed".to_owned(), PlistValue::Bool(true)),
+        ])
+    );
+    // an array OF dictionaries, which is the shape StartCalendarInterval takes for several times
+    assert_eq!(
+        launchd[2].value,
+        PlistValue::Array(vec![PlistValue::Dict(vec![
+            ("Hour".to_owned(), PlistValue::Integer(3)),
+            ("Minute".to_owned(), PlistValue::Integer(30)),
+        ])])
+    );
+
+    let written_out = config.to_string(false);
+    let read_back = Config::from_kdl(&written_out, None).unwrap();
+    assert_eq!(read_back.options, config.options);
+}
+
+/// A block that is neither an array nor a dictionary is refused rather than resolved one way.
+#[test]
+fn a_launchd_value_is_an_array_or_a_dictionary_not_both() {
+    let mixed = Config::from_kdl(
+        r#"
+        session_service {
+            launchd {
+                keys {
+                    KeepAlive {
+                        - "one"
+                        SuccessfulExit false
+                    }
+                }
+            }
+        }
+    "#,
+        None,
+    );
+    assert!(mixed.is_err(), "a mixed block should not parse");
+}
+
+/// The guard against pinning the socket directory has to see into a nested value too.
+#[test]
+fn a_forbidden_name_nested_inside_a_value_is_still_refused() {
+    let nested = Config::from_kdl(
+        r#"
+        session_service {
+            launchd {
+                keys {
+                    EnvironmentOverrides {
+                        ZELLIJ_SOCKET_DIR "/tmp/somewhere"
+                    }
+                }
+            }
+        }
+    "#,
+        None,
+    );
+    assert!(
+        nested.is_err(),
+        "a forbidden name inside a dictionary should be refused"
+    );
 }
 
 /// `pin_exe` is a switch that may also be a path, and both spellings have to survive the round trip

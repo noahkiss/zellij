@@ -978,9 +978,42 @@ generates from belongs where the tool can see it — so it lives here, and `stat
 
 **Raw passthrough.** A systemd entry is a literal directive line appended to the section that names
 it (`unit` → `[Unit]`, `service` → `[Service]`, `install` → `[Install]`); a launchd entry is a
-plist key with a string, integer or boolean value, XML-escaped. zellij models neither schema: a
-copy of two specifications that already exist would be worse than both, and would reject every key
-added to them after it was written.
+plist key with any plist value, XML-escaped. zellij models neither schema: a copy of two
+specifications that already exist would be worse than both, and would reject every key added to
+them after it was written.
+
+**Arrays and dictionaries, not only scalars.** A scalar was enough for as long as the plists were
+written by hand — anything the config could not express, you wrote yourself. Once the plist is
+*generated*, this block is the only route any local knowledge has into the file, so the ceiling
+became the real limit, and the keys beyond it are the ones people actually reach for: `WatchPaths`
+is an array, `KeepAlive` in its useful form is a dictionary, `StartCalendarInterval` is either.
+
+A scalar is the node's argument; a container is the node's **children**, and which container it is
+follows from what those children are called. Every child named `-` makes an array, anything else
+makes a dictionary. Nothing has to be declared, the two cannot be confused, and a block mixing them
+is refused rather than resolved one way.
+
+```kdl
+launchd {
+    keys {
+        WatchPaths {
+            - "~/.config/zellij/config.kdl"
+        }
+        KeepAlive {
+            SuccessfulExit false
+        }
+        StartCalendarInterval {
+            - {
+                Hour 3
+                Minute 30
+            }
+        }
+    }
+}
+```
+
+The guard below reads **every** string inside a value, at any depth: a nesting that could hide
+`ZELLIJ_SOCKET_DIR` from it would be a guard worth nothing.
 
 What it will not carry is what the generator owns — `ExecStart`, the plist keys zellij writes
 itself (`Label`, `ProgramArguments`, `LimitLoadToSessionType`, `EnvironmentVariables`, `RunAtLoad`,
