@@ -814,10 +814,11 @@ pub fn classify_tcc_probe(error: Option<std::io::ErrorKind>) -> TccProbe {
 ///
 /// - **Files & Folders** (Downloads, Desktop, Documents). Promptable. With no decision on record the
 ///   probe raises the ordinary consent dialog, and one click restores what the previous version had.
-/// - **Full Disk Access**. NOT promptable - Apple offers no API to request it. But attempting it
-///   registers the client, which is how a program comes to be listed in that settings pane at all,
-///   greyed off and waiting for a toggle. Without the attempt there is nothing to toggle and the
-///   user must find the versioned path by hand.
+/// - **Full Disk Access**. NOT promptable - Apple offers no API to request it, and the attempt was
+///   NOT observed to list the client in that settings pane either: four controlled tests on a clean
+///   slate produced no row, from the server process and from a pane descendant alike. So the FDA
+///   half of this probe has no demonstrated effect, and the path still has to be added by hand. It
+///   is kept because the attempt is free and the log line tells the user which path to add.
 ///
 /// Deliberately silent about success and best-effort throughout: this reports a fault, it does not
 /// gate a session on one. A refusal is logged rather than raised because the process that will
@@ -826,6 +827,20 @@ pub fn classify_tcc_probe(error: Option<std::io::ErrorKind>) -> TccProbe {
 /// Blocking. Call [`probe_protected_locations`] instead unless the wait is wanted.
 #[cfg(target_os = "macos")]
 pub fn probe_protected_locations_now() {
+    // TCC keys a grant to the RESOLVED executable, so the warning has to name that path and not the
+    // one this process was started through. A package manager installs the binary in a versioned
+    // directory and puts a symlink on PATH; `current_exe()` hands back the symlink, which is a path
+    // TCC never records. Naming it sends the reader to a settings entry that will never appear.
+    fn responsible_executable_path() -> String {
+        let Ok(path) = std::env::current_exe() else {
+            return String::from("<unknown>");
+        };
+        std::fs::canonicalize(&path)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
     let Some(dirs) = directories::BaseDirs::new() else {
         return;
     };
@@ -857,11 +872,9 @@ pub fn probe_protected_locations_now() {
                  path, so an upgrade loses it: {}. Files & Folders records a refusal permanently \
                  and stops asking - REMOVE the zellij entry under System Settings > Privacy & \
                  Security > Files and Folders to be asked again. Full Disk Access is never asked \
-                 for, only toggled, and this probe is what lists zellij there.",
+                 for, only toggled, and has to be added by hand at that path.",
                 path.display(),
-                std::env::current_exe()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| String::from("<unknown>"))
+                responsible_executable_path()
             );
         }
     }

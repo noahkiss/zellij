@@ -972,10 +972,24 @@ looking at the upgrade:
 
 - **Downloads, Desktop, Documents** — promptable. With no decision on record the probe raises the
   ordinary consent dialog. One click restores what the previous version had.
-- **Full Disk Access** — *not* promptable; Apple offers no API to request it. But attempting it
-  registers the client, which is the only way a program comes to be listed in that settings pane at
-  all, greyed off and waiting for a toggle. Without the attempt there is nothing to toggle, and the
-  versioned path has to be typed in by hand.
+- **Full Disk Access** — *not* promptable; Apple offers no API to request it. Attempting it was
+  **not observed to register the client** either. An earlier version of this section said the
+  attempt is what lists a program in that settings pane; four controlled tests do not support that.
+  On a clean slate — every entry removed, machine rebooted — the probe ran, was refused, and no
+  `AllFiles` row appeared, from the server process and from a pane descendant alike. There is no
+  hidden table: in the system database only `access` has rows.
+
+  One observation keeps this open rather than simply false. A machine running nkmk.8 carries an
+  `AllFiles` row at `auth_value 0`. Nobody writes a *denied* row by hand, so registration happened
+  at least once. It has not been reproduced and no mechanism is claimed for it.
+
+  So the FDA half of the probe has no demonstrated effect, and the versioned path still has to be
+  typed into that pane by hand. It is kept because the attempt costs nothing and the log line names
+  the path to type.
+
+The warning names the **resolved** executable. A package manager installs the binary in a versioned
+directory and puts a symlink on `PATH`; `current_exe()` returns the symlink, while TCC records the
+target. Printing the symlink sends the reader looking for a settings entry that will never exist.
 
 Best-effort throughout, and silent about success: a refusal is logged, never raised. Nothing here
 can intercept the failure that actually bites, because that happens in a pane's process later; the
