@@ -107,3 +107,49 @@ Consume the existing surfaces: one `zellij subscribe --format json` child proces
 `list-panes --json` / `list-tabs --json` plus `zellij action` for tree and mutations. Revisit a web
 API only if a consumer appears that genuinely cannot spawn a process on the host — and even then,
 prefer a thin external adapter over a fork patch in `web_client`.
+
+## Revisited: a centralised consumer, and file reads
+
+The trigger above came close to firing. The case: a consumer that stops deploying a component to
+every machine and instead runs in one place, reaching each host remotely. Every host then has no
+process belonging to that consumer — which is nearly the "cannot spawn a process on the host"
+condition, except that SSH still can.
+
+**Re-verified against the current tree, not the earlier notes.** The existing control websocket
+cannot carry this today: `WebClientToWebServerControlMessagePayload` accepts only `TerminalResize`
+and `TerminalMetrics`. There is no action dispatch, so nothing is reachable over the web surface as
+it stands. The auth arrangement is unchanged and still as described — routes registered *above* the
+`.route_layer(middleware::from_fn(auth_middleware))` call inherit it; the handful registered below
+are deliberately public.
+
+**One new requirement this case adds: reading files.** The consumer renders program logs written to
+disk beside the session. Nothing in the tree reads arbitrary files on a client's behalf, so this is
+wholly new work — path scoping, follow/tail semantics, streaming — call it 150-250 LOC on top of the
+400-600 already costed, so **600-850 total**, in the directory with the highest rebase cost.
+
+**A tempting argument that does not survive contact: "the terminal process already holds the file
+access grants, so let it do the reading."** Measured, on a machine where the binary holds no Full
+Disk Access at all: a dotfile directory under `$HOME` holding per-project logs was fully readable,
+including opening a log file. Those paths are not in a protected category — the protected set is
+Desktop, Documents, Downloads, iCloud, removable volumes and `~/Library`. **No grant is required by
+anybody**, so grants cannot favour either design. The argument only becomes real for content inside
+the protected set, where a separate consumer process would need its own grants — and would inherit
+the same versioned-path fragility described in the file-access section of FORK.md.
+
+**Connection loss is not a differentiator either.** A remote-command transport and a websocket both
+drop and both need supervision plus a resubscribe. Recovery happens to be clean in both: `subscribe`
+delivers an initial snapshot on connect (`is_initial`), so a reconnect yields current state with no
+diff replay, no missed-event reconciliation and no sequence tracking. The failure mode is *briefly
+stale*, never *silently diverged*. Note this logic gets written either way — the only question is
+whether it lands in the consumer or in this fork, and "reconnect, session death, orphaned
+subscriptions" was already identified above as the principal cost of building it here.
+
+**The security step is the first one, not the last.** Exposing `Action` over HTTP grants arbitrary
+code execution as the user, since pane creation takes a command. A file-read endpoint after that is
+a marginal increment rather than a new category. So the decision is binary — authenticated remote
+control, or none — and the constraints recorded above apply from the first route.
+
+**Recommendation unchanged.** A remote-shell transport reuses an auth model the operator already
+runs, costs nothing in this tree, and keeps the fork out of its most volatile directory. Revisit
+only if that transport proves painful in practice — specifically connection-reuse latency, or the
+log streaming — both of which are cheap to measure and are the same experiments either way.
