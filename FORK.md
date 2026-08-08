@@ -846,6 +846,18 @@ that same reason.
 without being asked. A binary built by a toolchain that does neither still falls through to the size
 comparison.
 
+**Verified on a release artifact, not only reasoned about**, because the release profile sets
+`strip = true` and two things could have gone wrong. Checked on a `--release` build of this tree:
+the `.note.gnu.build-id` **section** is indeed gone, the `PT_NOTE` **segment** carrying it is not,
+and the fork's own reader returns the same id `readelf` does. So a future simplification that looked
+the note up by section name would find nothing on every shipping binary while working perfectly in a
+debug build — the segment walk is load-bearing, not fastidiousness.
+
+The release workflow keeps the flag. It passes `rustflags: ""` to the toolchain action, and an empty
+string there means *do not export `RUSTFLAGS` at all* rather than *export an empty one* — which
+matters, because Cargo drops config-file `rustflags` entirely whenever that variable is set, even to
+nothing. Do not "tidy" that empty string away.
+
 Nothing about this reaches `SessionInfo` or the status bar. That would put a version on the plugin
 API contract, which is far more than a warning is worth.
 
