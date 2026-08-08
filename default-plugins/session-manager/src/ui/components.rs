@@ -1479,6 +1479,50 @@ pub fn render_client_list_controls(max_cols: usize, colors: Colors, x: usize, y:
     }
 }
 
+/// The help line for the snapshot picker, which binds its own keys while it is up.
+///
+/// The name prompt gets a line of its own: while it is open every key it does not consume is
+/// filter input, and offering `<Ctrl r>` there would name a key that does nothing.
+pub fn render_snapshot_picker_controls(
+    is_naming: bool,
+    max_cols: usize,
+    colors: Colors,
+    x: usize,
+    y: usize,
+) {
+    let back = colors.shortcuts("<ESC>");
+    if is_naming {
+        let confirm = colors.shortcuts("<ENTER>");
+        let confirm_text = colors.bold("Restore under this name");
+        let back_text = colors.bold("Cancel");
+        // "Help: <ENTER> - Restore under this name, <ESC> - Cancel" = 55 chars
+        if max_cols > 55 {
+            print!("\u{1b}[m\u{1b}[{y};{x}HHelp: {confirm} - {confirm_text}, {back} - {back_text}");
+        } else if max_cols >= 14 {
+            print!("\u{1b}[m\u{1b}[{y};{x}H{confirm}/{back}");
+        }
+        return;
+    }
+    let arrows = colors.shortcuts("<↓↑>");
+    let navigate = colors.bold("Select");
+    let open = colors.shortcuts("<ENTER>");
+    let open_text = colors.bold("Open");
+    let rename = colors.shortcuts("<Ctrl r>");
+    let rename_text = colors.bold("Restore as");
+    let back_text = colors.bold("Back");
+
+    // "Help: <↓↑> - Select, <ENTER> - Open, <Ctrl r> - Restore as, <ESC> - Back" = 72 chars
+    if max_cols > 72 {
+        print!(
+            "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {open} - {open_text}, {rename} - {rename_text}, {back} - {back_text}"
+        );
+    } else if max_cols >= 26 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{open}/{rename}/{back}");
+    } else if max_cols >= 14 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{open}/{back}");
+    }
+}
+
 pub fn render_controls_line(
     active_screen: ActiveScreen,
     max_cols: usize,

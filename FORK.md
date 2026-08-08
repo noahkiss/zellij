@@ -1390,6 +1390,64 @@ was missing was a way to detach a *named* client: the plugin API had `Detach` (y
 fills that gap and reaches the same `ServerInstruction::DetachSession` that `Action::Detach` uses,
 under the `ChangeApplicationState` permission alongside the other two.
 
+### The session manager picks a session out of the archive
+
+`Ctrl+e` in the session manager opens a chooser over every session shape worth reopening — the ones
+running now and the ones only the snapshot archive still has — with the tabs and panes of the
+selected one beside it:
+
+```
+Reopen a session (4): _
+
+Live sessions                    my-session
+  my-session                     2 tabs, 6 panes · this session
+Snapshots
+> a-session                      a-session
+  another-one                    3h 12m ago · 3 tabs, 7 panes · shutdown
+                                 1754251200000-a1b2c3d4
+
+                                 editing
+                                   nvim FORK.md
+                                   shell
+                                 logs
+                                   tail -f /var/log/syslog
+```
+
+Type to filter by name, `↓↑` selects, `ENTER` opens the selected row — attaching to a live session,
+or rebuilding an archived one — `Ctrl+r` restores a snapshot under a different name, and `ESC` goes
+back. Every key is bound only while the picker is up, so the help line replaces the usual one.
+
+**The preview is the point.** Until now the archive was a list of ids and timestamps in a terminal
+somewhere else; `zellij snapshot show` prints a whole layout file, which answers "what is in this"
+by making you read KDL. A snapshot's value is entirely in what it would give back, and that is a
+list of tabs and the panes in them.
+
+**Restoring over a running session is refused, and the row says so before the key is pressed.** The
+picker knows which names are live, so such a row is drawn dimmed and `ENTER` on it explains and
+points at `Ctrl+r`. The server refuses it a second time, because the picker's list is a poll old and
+the failure it prevents is silent: the switch would attach to the running session and discard the
+layout, handing back the wrong thing rather than nothing. A snapshot whose layout does not parse is
+refused the same way and for the same reason — it would land in an empty session.
+
+`Ctrl+r` is the way out, and it is `snapshot restore --session` under another name. It also makes a
+snapshot a template: restore the same shape beside a session that is still running.
+
+**The sources are a list, not two fields.** Adding another place to reopen a session from — the
+parked remote-session work is the obvious candidate — costs one variant and one builder, not a
+rewrite of every branch in the file. Selection runs over the rows of every source flattened
+together, so a new source changes what is in the list and nothing about moving through it.
+
+The archive is re-read once a second while the picker is open, because a snapshot is cut by a server
+this one knows nothing about: another session shutting down, a `delete-session`, a `save-session
+--archive` elsewhere. The selection is carried by name and id across those reads, so a snapshot
+arriving at the top of the list does not move the row under the cursor. Below 60 columns the preview
+column is dropped rather than squeezed — two unreadable columns are worse than one readable one.
+
+`Ctrl+e` is not a mnemonic and there was no mnemonic left to take. `s` for snapshot, `h` for history
+and `a` for archive all switch modes in the default keybindings before a key reaches the plugin, and
+`r`, `d`, `x`, `w`, `k` and `l` are already bound inside it. The label in the help line does the work
+the letter cannot.
+
 ### Focus wraps around the ends of a stack
 
 Moving focus up from the top pane of a stack lands on the bottom pane, and down from the bottom

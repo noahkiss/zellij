@@ -3,6 +3,7 @@ mod new_session_info;
 mod resurrectable_sessions;
 mod session_list;
 mod single_screen;
+mod snapshot_picker;
 mod ui;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -15,8 +16,8 @@ use ui::{
     components::{
         render_client_list_controls, render_controls_line, render_error, render_new_session_block,
         render_prompt, render_renaming_session_screen, render_screen_toggle,
-        render_session_list_notice, render_single_screen_prompt, render_unified_results,
-        render_unsaved_changes_line, Colors,
+        render_session_list_notice, render_single_screen_prompt, render_snapshot_picker_controls,
+        render_unified_results, render_unsaved_changes_line, Colors,
     },
     welcome_screen::{render_banner, render_welcome_boundaries},
     SessionUiInfo,
@@ -24,6 +25,7 @@ use ui::{
 
 use resurrectable_sessions::ResurrectableSessions;
 use session_list::SessionList;
+use snapshot_picker::{PickerSourceKind, SnapshotPicker};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 enum ActiveScreen {
@@ -69,6 +71,15 @@ struct State {
     /// The clients attached to the current session, shown over the session list on `Ctrl+l`.
     client_list: ClientList,
     show_client_list: bool,
+    /// Every session shape worth reopening - live or archived - shown over the session list on
+    /// `Ctrl+e`, with the tabs and panes of the selected one beside it.
+    snapshot_picker: SnapshotPicker,
+    show_snapshot_picker: bool,
+    /// The archive as the server last reported it.
+    ///
+    /// Kept beside the picker rather than inside it because the picker is rebuilt from both this
+    /// and the live session list, and those two arrive in separate events.
+    snapshots: Vec<SessionSnapshotInfo>,
 }
 
 register_plugin!(State);
@@ -137,6 +148,8 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::Visible,
             EventType::ListClients,
+            EventType::ListSnapshots,
+            EventType::SnapshotRestoreFailed,
         ]);
         rename_plugin_pane(get_plugin_ids().plugin_id, "Session Manager");
         self.refresh_session_list();
@@ -192,6 +205,13 @@ impl ZellijPlugin for State {
                     // is only as current as its last poll
                     list_clients();
                 }
+                if self.show_snapshot_picker {
+                    // a snapshot is cut by another server entirely - a shutdown, a delete, a
+                    // `save-session --archive` elsewhere - so nothing here would ever hear about it
+                    list_snapshots();
+                    self.snapshot_picker
+                        .update(&self.sessions.session_ui_infos, &self.snapshots);
+                }
                 self.arm_refresh_timer();
             },
             Event::Visible(is_visible) => {
@@ -215,6 +235,20 @@ impl ZellijPlugin for State {
             Event::ListClients(clients) => {
                 self.client_list.update(clients);
                 should_render = self.show_client_list;
+            },
+            Event::SnapshotRestoreFailed(error) => {
+                // the picker has already closed itself and hidden the plugin by the time a refusal
+                // races back, so re-open it: an error drawn over a hidden pane is no error at all
+                self.show_snapshot_picker = true;
+                self.show_error(&error);
+                should_render = true;
+            },
+            Event::ListSnapshots(snapshots) => {
+                self.snapshots = snapshots;
+                self.snapshot_picker.mark_answered();
+                self.snapshot_picker
+                    .update(&self.sessions.session_ui_infos, &self.snapshots);
+                should_render = self.show_snapshot_picker;
             },
             Event::PermissionRequestResult(_result) => {
                 should_render = true;
@@ -286,7 +320,10 @@ impl ZellijPlugin for State {
                 );
             },
             ActiveScreen::AttachToSession => {
-                if self.show_client_list {
+                if self.show_snapshot_picker {
+                    self.snapshot_picker
+                        .render(height, width.saturating_sub(7), x, y + 2);
+                } else if self.show_client_list {
                     self.client_list
                         .render(height, width.saturating_sub(7), x, y + 2);
                 } else if let Some(new_session_name) = self.renaming_session_name.as_ref() {
@@ -323,7 +360,9 @@ impl ZellijPlugin for State {
             ActiveScreen::SingleScreen => {
                 match self.single_screen_state.mode {
                     SingleScreenMode::SearchAndSelect => {
-                        if self.show_client_list {
+                        if self.show_snapshot_picker {
+                            self.snapshot_picker.render(height, width, x, y);
+                        } else if self.show_client_list {
                             let content_width = std::cmp::min(width, 90);
                             let x_centered = x + (width.saturating_sub(content_width)) / 2;
                             self.client_list
@@ -494,6 +533,14 @@ impl ZellijPlugin for State {
         }
         if let Some(error) = self.error.as_ref() {
             render_error(&error, height, width, x, y);
+        } else if self.show_snapshot_picker {
+            render_snapshot_picker_controls(
+                self.snapshot_picker.restore_as.is_some(),
+                width,
+                self.colors,
+                x + 1,
+                rows.saturating_sub(1),
+            );
         } else if self.show_client_list {
             render_client_list_controls(width, self.colors, x + 1, rows.saturating_sub(1));
         } else if (self.active_screen == ActiveScreen::AttachToSession
@@ -532,6 +579,172 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Show the snapshot picker and ask the server for the archive.
+    ///
+    /// The answer arrives as `Event::ListSnapshots`, so the archive half of the list is empty for
+    /// one frame; the live half is already known. It clears first rather than showing the previous
+    /// answer, because a snapshot listed here may have been pruned since it was last read.
+    fn open_snapshot_picker(&mut self) {
+        self.show_snapshot_picker = true;
+        self.snapshots.clear();
+        self.snapshot_picker.clear();
+        self.snapshot_picker
+            .update(&self.sessions.session_ui_infos, &self.snapshots);
+        list_snapshots();
+    }
+    /// Keys for the snapshot picker. Returns whether anything changed on screen.
+    ///
+    /// Bare characters are filter input here, as on every screen in this plugin except the client
+    /// list, so every action needs a modifier or a named key.
+    fn handle_snapshot_picker_key(&mut self, key: KeyWithModifier) -> bool {
+        if self.snapshot_picker.restore_as.is_some() {
+            return self.handle_restore_as_key(key);
+        }
+        match key.bare_key {
+            BareKey::Down if key.has_no_modifiers() => {
+                self.snapshot_picker.move_selection_down();
+                true
+            },
+            BareKey::Up if key.has_no_modifiers() => {
+                self.snapshot_picker.move_selection_up();
+                true
+            },
+            BareKey::Enter if key.has_no_modifiers() => self.open_selected_picker_entry(),
+            BareKey::Char('r') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.open_restore_as_prompt()
+            },
+            BareKey::Backspace if key.has_no_modifiers() => {
+                let mut search_term = self.snapshot_picker.search_term.clone();
+                search_term.pop();
+                self.snapshot_picker.update_search_term(search_term);
+                true
+            },
+            BareKey::Esc if key.has_no_modifiers() => {
+                self.close_snapshot_picker();
+                true
+            },
+            BareKey::Char('e') | BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.close_snapshot_picker();
+                true
+            },
+            BareKey::Char(character) if key.has_no_modifiers() => {
+                let mut search_term = self.snapshot_picker.search_term.clone();
+                search_term.push(character);
+                self.snapshot_picker.update_search_term(search_term);
+                true
+            },
+            _ => false,
+        }
+    }
+    fn close_snapshot_picker(&mut self) {
+        self.show_snapshot_picker = false;
+        self.snapshot_picker.restore_as = None;
+    }
+    /// Attach to the selected live session, or restore the selected snapshot under its own name.
+    ///
+    /// A row the picker has already marked as blocked reports why rather than trying: restoring
+    /// over a running session would silently attach to it instead, and a layout that does not parse
+    /// would land the user in an empty session.
+    fn open_selected_picker_entry(&mut self) -> bool {
+        let Some((source, entry)) = self.snapshot_picker.selected_row() else {
+            self.show_error("Nothing selected.");
+            return true;
+        };
+        if let Some(blocked) = entry.blocked.clone() {
+            let is_snapshot = source.kind == PickerSourceKind::Snapshots;
+            self.show_error(&if is_snapshot {
+                format!("{} Use <Ctrl r> to restore it under another name.", blocked)
+            } else {
+                blocked
+            });
+            return true;
+        }
+        let name = entry.name.clone();
+        let id = entry.id.clone();
+        match source.kind {
+            PickerSourceKind::LiveSessions => switch_session_with_focus(&name, None, None),
+            PickerSourceKind::Snapshots => restore_snapshot(&id, None),
+        }
+        self.close_snapshot_picker();
+        if self.is_welcome_screen {
+            // the welcome screen has done its job and now we need to quit this temporary session so
+            // as not to leave garbage sessions behind
+            quit_zellij();
+        } else {
+            hide_self();
+        }
+        true
+    }
+    /// Ask for a name to restore the selected snapshot under.
+    ///
+    /// The way out of a name collision, and the way to rehearse a restore beside a session that is
+    /// still running - the same thing `snapshot restore --session` is for. It starts empty rather
+    /// than prefilled with the taken name, since that name is exactly the one that will not work.
+    fn open_restore_as_prompt(&mut self) -> bool {
+        match self.snapshot_picker.selected_row() {
+            Some((source, _entry)) if source.kind == PickerSourceKind::Snapshots => {
+                self.snapshot_picker.restore_as = Some(String::new());
+            },
+            Some(_) => {
+                self.show_error("Only a snapshot can be restored under another name.");
+            },
+            None => {
+                self.show_error("Must select a snapshot before restoring it.");
+            },
+        }
+        true
+    }
+    fn handle_restore_as_key(&mut self, key: KeyWithModifier) -> bool {
+        let Some(restore_as) = self.snapshot_picker.restore_as.as_mut() else {
+            return false;
+        };
+        match key.bare_key {
+            BareKey::Enter if key.has_no_modifiers() => {
+                let new_name = restore_as.clone();
+                if new_name.is_empty() {
+                    self.show_error("New name must not be empty.");
+                    return true;
+                }
+                if new_name.contains('/') {
+                    self.show_error("Session names cannot contain '/'");
+                    return true;
+                }
+                if self.sessions.has_session(&new_name) {
+                    self.show_error("A session by this name already exists.");
+                    return true;
+                }
+                let Some(id) = self
+                    .snapshot_picker
+                    .selected()
+                    .map(|entry| entry.id.clone())
+                else {
+                    self.show_error("Nothing selected.");
+                    return true;
+                };
+                restore_snapshot(&id, Some(&new_name));
+                self.close_snapshot_picker();
+                if self.is_welcome_screen {
+                    quit_zellij();
+                } else {
+                    hide_self();
+                }
+                true
+            },
+            BareKey::Esc if key.has_no_modifiers() => {
+                self.snapshot_picker.restore_as = None;
+                true
+            },
+            BareKey::Backspace if key.has_no_modifiers() => {
+                restore_as.pop();
+                true
+            },
+            BareKey::Char(character) if key.has_no_modifiers() => {
+                restore_as.push(character);
+                true
+            },
+            _ => false,
+        }
+    }
     /// Show the client list and ask the server to fill it.
     ///
     /// The answer arrives as `Event::ListClients`, so the list is empty for one frame. It clears
@@ -679,6 +892,9 @@ impl State {
     }
     fn handle_attach_to_session(&mut self, key: KeyWithModifier) -> bool {
         let mut should_render = false;
+        if self.show_snapshot_picker {
+            return self.handle_snapshot_picker_key(key);
+        }
         if self.show_client_list {
             return self.handle_client_list_key(key);
         }
@@ -818,6 +1034,10 @@ impl State {
                     self.open_client_list();
                     should_render = true;
                 },
+                BareKey::Char('e') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                    self.open_snapshot_picker();
+                    should_render = true;
+                },
                 BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                     if !self.search_term.is_empty() {
                         self.search_term.clear();
@@ -916,6 +1136,10 @@ impl State {
     }
     fn handle_single_screen_search_key(&mut self, key: KeyWithModifier) -> bool {
         let mut should_render = false;
+
+        if self.show_snapshot_picker {
+            return self.handle_snapshot_picker_key(key);
+        }
 
         if self.show_client_list {
             return self.handle_client_list_key(key);
@@ -1084,6 +1308,10 @@ impl State {
             },
             BareKey::Char('l') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                 self.open_client_list();
+                should_render = true;
+            },
+            BareKey::Char('e') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.open_snapshot_picker();
                 should_render = true;
             },
             BareKey::Char('a') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
