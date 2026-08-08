@@ -1275,6 +1275,18 @@ lines, and in a short pane that is none — the list vanished with no hint that 
 Both list views say it, and neither says it when the list is genuinely empty or a filter matched
 nothing.
 
+The server names the sessions it drops, too, since the plugin can only report that something was
+missing and not which session or why:
+
+```
+WARN  session my-session is running but cannot be listed: its metadata file does not parse: ...
+```
+
+One line per session as it enters that state, and another only if the reason changes — the scan runs
+on every poll of every session manager, roughly once a second each, so an unfiltered warning would
+be thousands of identical lines an hour. A session listed successfully again is forgotten, so a
+recurrence is reported rather than swallowed.
+
 ### The session manager lists the attached clients, and detaches one of them
 
 `Ctrl+l` in the session manager shows every client attached to the current session:

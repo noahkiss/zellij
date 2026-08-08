@@ -763,20 +763,73 @@ fn read_other_live_session_states(
         });
     }
 
+    let mut dropped_this_pass: HashMap<String, String> = HashMap::new();
     for (session_name, creation_time) in other_session_names {
         let session_cache_file_name = session_info_cache_dir
             .join(&session_name)
             .join("session-metadata.kdl");
-        if let Ok(raw_session_info) = fs::read_to_string(&session_cache_file_name) {
-            if let Ok(mut session_info) =
-                SessionInfo::from_string(&raw_session_info, &current_session_name)
-            {
-                session_info.creation_time = creation_time;
-                session_infos_on_machine.insert(session_name, session_info);
-            }
+        match fs::read_to_string(&session_cache_file_name) {
+            Ok(raw_session_info) => {
+                match SessionInfo::from_string(&raw_session_info, &current_session_name) {
+                    Ok(mut session_info) => {
+                        session_info.creation_time = creation_time;
+                        session_infos_on_machine.insert(session_name, session_info);
+                    },
+                    Err(e) => {
+                        dropped_this_pass.insert(
+                            session_name,
+                            format!("its metadata file does not parse: {}", e),
+                        );
+                    },
+                }
+            },
+            Err(e) => {
+                dropped_this_pass.insert(
+                    session_name,
+                    format!(
+                        "{} could not be read: {}",
+                        session_cache_file_name.display(),
+                        e
+                    ),
+                );
+            },
         }
     }
+    report_dropped_sessions(dropped_this_pass);
     session_infos_on_machine
+}
+
+/// Why each session is currently missing from the scan, so the same fault is logged once.
+static DROPPED_SESSIONS: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+/// Name the live sessions this scan could not list, once each.
+///
+/// A session with a socket but no readable, parseable `session-metadata.kdl` is dropped and the
+/// scan still reports success, so the session manager shows an empty list while `zellij ls` - which
+/// reads the sockets alone - keeps listing the session. That divergence went unexplained for
+/// months. It is a fault, not chatter, so it warns.
+///
+/// The scan runs on every poll of every session-manager plugin, which is about once a second each,
+/// so a persistent fault would otherwise fill the log with one identical line per second. Log only
+/// when a session enters the dropped state or its reason changes, and forget the sessions this pass
+/// listed fine, so a recurrence is reported rather than swallowed.
+fn report_dropped_sessions(dropped_this_pass: HashMap<String, String>) {
+    let previously_dropped = DROPPED_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut previously_dropped = match previously_dropped.lock() {
+        Ok(previously_dropped) => previously_dropped,
+        Err(poisoned) => poisoned.into_inner(), // a poisoned log-gating map is no reason to panic
+    };
+    for (session_name, reason) in &dropped_this_pass {
+        if previously_dropped.get(session_name) != Some(reason) {
+            log::warn!(
+                "session {} is running but cannot be listed: {}",
+                session_name,
+                reason
+            );
+        }
+    }
+    *previously_dropped = dropped_this_pass;
 }
 
 fn find_resurrectable_sessions(
