@@ -755,9 +755,10 @@ did not need it, which costs more than a mismatch nobody was told about. An exec
 be read, a platform that cannot be asked, and two servers for one name all produce no warning for
 that same reason.
 
-**A caveat for this fork's own Linux builds.** `rustc` does not pass `--build-id` to the linker by
-default, so a binary built straight from this tree carries no GNU note and falls through to the size
-comparison. A packaged build whose linker adds the flag carries one and gets the exact answer.
+`rustc` does not ask the linker for a build-id by default, so this tree asks for one itself —
+`.cargo/config.toml` adds `-Wl,--build-id=sha1` for Linux targets, and macOS gets an `LC_UUID`
+without being asked. A binary built by a toolchain that does neither still falls through to the size
+comparison.
 
 Nothing about this reaches `SessionInfo` or the status bar. That would put a version on the plugin
 API contract, which is far more than a warning is worth.

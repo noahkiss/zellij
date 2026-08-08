@@ -8,3 +8,16 @@ make = "xtask deprecated"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
+
+# Stamp a GNU build-id into Linux binaries. `rustc` does not ask for one by default, and the fork
+# uses it to tell whether a running server is this build: a COPY of a binary is a different file
+# with a different inode, so the id in the file is the only thing that identifies the BUILD rather
+# than the file. Without it the comparison falls back to file size, which is weaker.
+#
+# `sha1` makes the id a hash of the contents, so one source tree built twice yields one id and any
+# real change yields another. It survives the release profile's `strip = true`, because the note is
+# in an allocated section inside a PT_NOTE segment and `strip` only discards non-allocated ones.
+#
+# `cfg(target_os = "linux")` does not match `wasm32-wasip1`, so the bundled plugins are untouched.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]
