@@ -208,6 +208,7 @@ enum CommandName {
   DeleteDeadSessionAndReply = 213;
   DeleteAllDeadSessionsAndReply = 214;
   DetachClients = 215;
+  ListSnapshots = 216;
 }
 
 message PluginCommand {

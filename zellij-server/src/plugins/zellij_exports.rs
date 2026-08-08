@@ -584,6 +584,7 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                         write_config_to_disk,
                     } => rebind_keys(env, keys_to_rebind, keys_to_unbind, write_config_to_disk)?,
                     PluginCommand::ListClients => list_clients(env),
+                    PluginCommand::ListSnapshots => list_snapshots(env),
                     PluginCommand::ChangeHostFolder(new_host_folder) => {
                         change_host_folder(env, new_host_folder)
                     },
@@ -3787,6 +3788,21 @@ fn list_clients(env: &PluginEnv) {
     });
 }
 
+/// Ask the plugin thread for the session snapshot archive.
+///
+/// Sent on rather than answered here because reading the archive means walking a directory tree
+/// and parsing every saved layout in it, and this runs inside the plugin's own host call - work
+/// that belongs on the thread that already serialises plugin answers. Unlike the client list there
+/// is no screen state involved, so it never reaches the screen thread at all.
+fn list_snapshots(env: &PluginEnv) {
+    let _ = env.senders.to_plugin.as_ref().map(|sender| {
+        sender.send(PluginInstruction::ListSnapshotsToPlugin(
+            env.plugin_id,
+            env.client_id,
+        ))
+    });
+}
+
 fn change_host_folder(env: &PluginEnv, new_host_folder: PathBuf) {
     let _ = env.senders.to_plugin.as_ref().map(|sender| {
         sender.send(PluginInstruction::ChangePluginHostDir(
@@ -5453,6 +5469,7 @@ fn check_command_permission(
         | PluginCommand::CliPipeOutput(..) => PermissionType::ReadCliPipes,
         PluginCommand::MessageToPlugin(..) => PermissionType::MessageAndLaunchOtherPlugins,
         PluginCommand::ListClients
+        | PluginCommand::ListSnapshots
         | PluginCommand::DumpSessionLayout { .. }
         | PluginCommand::GetPanePid { .. }
         | PluginCommand::GetPaneRunningCommand { .. }

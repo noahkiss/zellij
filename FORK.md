@@ -360,6 +360,42 @@ A restored layout runs its recorded commands, exactly as resurrection does today
 weeks ago is a sharper edge than a session that died minutes ago, so `snapshot show` prints the
 layout before `restore` acts on it. There is deliberately no confirmation prompt.
 
+#### A plugin can read the archive
+
+```rust
+subscribe(&[EventType::ListSnapshots]);
+list_snapshots();                            // answered by Event::ListSnapshots
+```
+
+`PluginCommand::ListSnapshots` asks the server for the archive and the answer arrives as
+`Event::ListSnapshots(Vec<SessionSnapshotInfo>)`, newest first. Each entry carries its sidecar — id,
+session name, when and why it was cut, the version that wrote it, and its tab and pane counts — plus
+the tabs and panes of the saved layout, each pane with its name and command.
+
+A **request** rather than a field on `SessionUpdate`, which is what the plan first proposed. Reading
+the archive walks a directory tree and parses every layout in it; `SessionUpdate` is broadcast to
+every subscribed plugin about once a second, and that work does not belong there. `ListClients` had
+already set the shape for an answer only the plugin that asked for it receives.
+
+The counts come from the sidecar and the tabs from the layout, which is why both are carried. A
+snapshot whose layout no longer parses still reports its size and arrives with `layout_error` set,
+rather than reading as an empty session: the same reasoning as `snapshot list` marking those entries
+instead of failing.
+
+Only a directory holding no `session-layout.kdl` at all is left out, and it says so:
+
+```
+WARN  snapshot <path> cannot be listed: it has no session-layout.kdl
+```
+
+One line as a directory enters that state and another only if the reason changes, using the same
+gating map as the dropped-session warning below — a picker left open would otherwise log an
+identical line per poll.
+
+New plugin-API tags only, nothing renumbered: `EventType::ListSnapshots = 47` with payload `41`, and
+`CommandName::ListSnapshots = 216`. The command carries `ReadApplicationState`, alongside
+`ListClients` and `GetSessionList`.
+
 #### Adopting layouts the archive never saw
 
 ```

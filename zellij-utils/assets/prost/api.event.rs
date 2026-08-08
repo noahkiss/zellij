@@ -9,7 +9,7 @@ pub struct EventNameList {
 pub struct Event {
     #[prost(enumeration="EventType", tag="1")]
     pub name: i32,
-    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40")]
+    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41")]
     pub payload: ::core::option::Option<event::Payload>,
 }
 /// Nested message and enum types in `Event`.
@@ -95,7 +95,55 @@ pub mod event {
         CommandChangedPayload(super::CommandChangedPayload),
         #[prost(message, tag="40")]
         HostTerminalThemeChangedPayload(super::HostTerminalThemeChangedPayload),
+        #[prost(message, tag="41")]
+        ListSnapshotsPayload(super::ListSnapshotsPayload),
     }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListSnapshotsPayload {
+    #[prost(message, repeated, tag="1")]
+    pub snapshot_info: ::prost::alloc::vec::Vec<SessionSnapshotInfo>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionSnapshotInfo {
+    #[prost(string, tag="1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub session_name: ::prost::alloc::string::String,
+    #[prost(uint64, tag="3")]
+    pub saved_at: u64,
+    #[prost(string, tag="4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(string, tag="5")]
+    pub zellij_version: ::prost::alloc::string::String,
+    #[prost(uint32, tag="6")]
+    pub tab_count: u32,
+    #[prost(uint32, tag="7")]
+    pub pane_count: u32,
+    #[prost(message, repeated, tag="8")]
+    pub tabs: ::prost::alloc::vec::Vec<SnapshotTabInfo>,
+    #[prost(string, optional, tag="9")]
+    pub layout_error: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SnapshotTabInfo {
+    #[prost(string, optional, tag="1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag="2")]
+    pub panes: ::prost::alloc::vec::Vec<SnapshotPaneInfo>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SnapshotPaneInfo {
+    #[prost(string, optional, tag="1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="2")]
+    pub command: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="3")]
+    pub is_floating: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -847,6 +895,7 @@ pub enum EventType {
     InitialKeybinds = 44,
     CommandChanged = 45,
     HostTerminalThemeChanged = 46,
+    ListSnapshots = 47,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -901,6 +950,7 @@ impl EventType {
             EventType::InitialKeybinds => "InitialKeybinds",
             EventType::CommandChanged => "CommandChanged",
             EventType::HostTerminalThemeChanged => "HostTerminalThemeChanged",
+            EventType::ListSnapshots => "ListSnapshots",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -952,6 +1002,7 @@ impl EventType {
             "InitialKeybinds" => Some(Self::InitialKeybinds),
             "CommandChanged" => Some(Self::CommandChanged),
             "HostTerminalThemeChanged" => Some(Self::HostTerminalThemeChanged),
+            "ListSnapshots" => Some(Self::ListSnapshots),
             _ => None,
         }
     }

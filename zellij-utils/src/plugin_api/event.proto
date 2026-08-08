@@ -69,6 +69,7 @@ enum EventType {
     InitialKeybinds = 44;
     CommandChanged = 45;
     HostTerminalThemeChanged = 46;
+    ListSnapshots = 47;
 }
 
 message EventNameList {
@@ -117,7 +118,35 @@ message Event {
     InitialKeybindsPayload initial_keybinds_payload = 38;
     CommandChangedPayload command_changed_payload = 39;
     HostTerminalThemeChangedPayload host_terminal_theme_changed_payload = 40;
+    ListSnapshotsPayload list_snapshots_payload = 41;
   }
+}
+
+message ListSnapshotsPayload {
+  repeated SessionSnapshotInfo snapshot_info = 1;
+}
+
+message SessionSnapshotInfo {
+  string id = 1;
+  string session_name = 2;
+  uint64 saved_at = 3;
+  string reason = 4;
+  string zellij_version = 5;
+  uint32 tab_count = 6;
+  uint32 pane_count = 7;
+  repeated SnapshotTabInfo tabs = 8;
+  optional string layout_error = 9;
+}
+
+message SnapshotTabInfo {
+  optional string name = 1;
+  repeated SnapshotPaneInfo panes = 2;
+}
+
+message SnapshotPaneInfo {
+  optional string name = 1;
+  optional string command = 2;
+  bool is_floating = 3;
 }
 
 message HostTerminalThemeChangedPayload {

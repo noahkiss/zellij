@@ -1745,6 +1745,20 @@ pub fn list_clients() {
     unsafe { host_run_plugin_command() };
 }
 
+/// Get the session snapshot archive back as an `Event::ListSnapshots` (note: this event must be
+/// subscribed to).
+///
+/// Each entry carries its sidecar - id, session name, when and why it was cut, and its tab and
+/// pane counts - plus the tabs and panes of the saved layout, or the reason that layout no longer
+/// parses. Reading the archive walks a directory tree and parses every layout in it, so ask for it
+/// while a picker is open rather than on a schedule.
+pub fn list_snapshots() {
+    let plugin_command = PluginCommand::ListSnapshots;
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Change configuration for the current user
 pub fn reconfigure(new_config: String, save_configuration_file: bool) {
     let plugin_command = PluginCommand::Reconfigure(new_config, save_configuration_file);

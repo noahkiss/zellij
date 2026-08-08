@@ -2161,6 +2161,7 @@ pub enum CommandName {
     DeleteDeadSessionAndReply = 213,
     DeleteAllDeadSessionsAndReply = 214,
     DetachClients = 215,
+    ListSnapshots = 216,
 }
 impl CommandName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2364,6 +2365,7 @@ impl CommandName {
             CommandName::DeleteDeadSessionAndReply => "DeleteDeadSessionAndReply",
             CommandName::DeleteAllDeadSessionsAndReply => "DeleteAllDeadSessionsAndReply",
             CommandName::DetachClients => "DetachClients",
+            CommandName::ListSnapshots => "ListSnapshots",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2564,6 +2566,7 @@ impl CommandName {
             "DeleteDeadSessionAndReply" => Some(Self::DeleteDeadSessionAndReply),
             "DeleteAllDeadSessionsAndReply" => Some(Self::DeleteAllDeadSessionsAndReply),
             "DetachClients" => Some(Self::DetachClients),
+            "ListSnapshots" => Some(Self::ListSnapshots),
             _ => None,
         }
     }

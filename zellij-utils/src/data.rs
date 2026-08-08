@@ -999,6 +999,8 @@ pub enum Event {
     CommandPaneReRun(u32, Context),            // u32 - terminal_pane_id, Option<i32> -
     FailedToWriteConfigToDisk(Option<String>), // String -> the file path we failed to write
     ListClients(Vec<ClientInfo>),
+    /// The session snapshot archive, newest first. Answers `PluginCommand::ListSnapshots`.
+    ListSnapshots(Vec<SessionSnapshotInfo>),
     HostFolderChanged(PathBuf),               // PathBuf -> new host folder
     FailedToChangeHostFolder(Option<String>), // String -> the error we got when changing
     PastedText(String),
@@ -2389,6 +2391,54 @@ pub struct ClientInfo {
     pub is_current_client: bool,
 }
 
+/// One pane of an archived snapshot, as the saved layout describes it.
+///
+/// Both fields are optional because a saved layout may name a pane, give it a command, both or
+/// neither - an unnamed pane running the default shell carries no text at all, and the reader has
+/// to be able to say so rather than invent a label.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SnapshotPaneInfo {
+    pub name: Option<String>,
+    pub command: Option<String>,
+    pub is_floating: bool,
+}
+
+/// One tab of an archived snapshot, and the panes it holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SnapshotTabInfo {
+    pub name: Option<String>,
+    pub panes: Vec<SnapshotPaneInfo>,
+}
+
+/// An archived session snapshot, as a plugin sees it.
+///
+/// `tab_count` and `pane_count` come from the sidecar and are therefore always present;
+/// `tabs` comes from parsing the saved layout and is empty when that parse failed. Keeping both
+/// means a snapshot whose layout no longer parses still lists its size rather than reading as
+/// empty, which is the difference between "nothing in it" and "cannot be read".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionSnapshotInfo {
+    /// The archive directory name, `<epoch_ms>-<short_hash>`.
+    pub id: String,
+    pub session_name: String,
+    /// Epoch milliseconds.
+    pub saved_at: u64,
+    /// Why the snapshot was cut: `shutdown`, `manual`, `delete`, `promoted`, `imported`, or
+    /// whatever a newer binary wrote. Carried as text on purpose - the sidecar is additive-only,
+    /// and an unknown reason should reach the reader rather than be flattened to "other".
+    pub reason: String,
+    /// The zellij version that wrote the snapshot.
+    pub zellij_version: String,
+    pub tab_count: usize,
+    pub pane_count: usize,
+    pub tabs: Vec<SnapshotTabInfo>,
+    /// Why the saved layout does not parse with this binary, when it does not.
+    ///
+    /// Reported rather than hidden: a layout a newer binary rejects is still a text file a human
+    /// can repair, and finding that out in the picker beats finding it out at restore time.
+    pub layout_error: Option<String>,
+}
+
 impl ClientInfo {
     pub fn new(
         client_id: ClientId,
@@ -3532,6 +3582,12 @@ pub enum PluginCommand {
         write_config_to_disk: bool,
     },
     ListClients,
+    /// Ask for the session snapshot archive. The answer arrives as `Event::ListSnapshots`.
+    ///
+    /// A request rather than a field on `SessionUpdate`, because reading the archive means walking
+    /// a directory tree and parsing every saved layout in it - work worth doing for the one plugin
+    /// that has a picker open, and not on every session poll of every plugin.
+    ListSnapshots,
     ChangeHostFolder(PathBuf),
     SetFloatingPanePinned(PaneId, bool), // bool -> should be pinned
     StackPanes(Vec<PaneId>),

@@ -1948,6 +1948,10 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
                 Some(_) => Err("ListClients should have no payload, found a payload"),
                 None => Ok(PluginCommand::ListClients),
             },
+            Some(CommandName::ListSnapshots) => match protobuf_plugin_command.payload {
+                Some(_) => Err("ListSnapshots should have no payload, found a payload"),
+                None => Ok(PluginCommand::ListSnapshots),
+            },
             Some(CommandName::ChangeHostFolder) => match protobuf_plugin_command.payload {
                 Some(Payload::ChangeHostFolderPayload(change_host_folder_payload)) => {
                     Ok(PluginCommand::ChangeHostFolder(PathBuf::from(
@@ -3754,6 +3758,10 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
             }),
             PluginCommand::ListClients => Ok(ProtobufPluginCommand {
                 name: CommandName::ListClients as i32,
+                payload: None,
+            }),
+            PluginCommand::ListSnapshots => Ok(ProtobufPluginCommand {
+                name: CommandName::ListSnapshots as i32,
                 payload: None,
             }),
             PluginCommand::ChangeHostFolder(new_host_folder) => Ok(ProtobufPluginCommand {

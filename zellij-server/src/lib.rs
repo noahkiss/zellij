@@ -836,7 +836,7 @@ mod session_state_tests {
 /// data has been dropped.
 static SNAPSHOT_SETTINGS: std::sync::OnceLock<SnapshotSettings> = std::sync::OnceLock::new();
 
-fn snapshot_settings() -> SnapshotSettings {
+pub(crate) fn snapshot_settings() -> SnapshotSettings {
     SNAPSHOT_SETTINGS
         .get()
         .cloned()

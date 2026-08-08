@@ -200,6 +200,8 @@ pub enum PluginInstruction {
     /// one or more watched plugin .wasm files changed on disk
     PluginFilesChanged(Vec<PathBuf>),
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
+    /// Answer a plugin's `ListSnapshots` with the session snapshot archive.
+    ListSnapshotsToPlugin(PluginId, ClientId),
     ChangePluginHostDir(PathBuf, PluginId, ClientId),
     WebServerStarted(String), // String -> the base url of the web server
     FailedToStartWebServer(String),
@@ -273,6 +275,7 @@ impl From<&PluginInstruction> for PluginContext {
                 PluginContext::FailedToWriteConfigToDisk
             },
             PluginInstruction::ListClientsToPlugin(..) => PluginContext::ListClientsToPlugin,
+            PluginInstruction::ListSnapshotsToPlugin(..) => PluginContext::ListSnapshotsToPlugin,
             PluginInstruction::ChangePluginHostDir(..) => PluginContext::ChangePluginHostDir,
             PluginInstruction::WebServerStarted(..) => PluginContext::WebServerStarted,
             PluginInstruction::FailedToStartWebServer(..) => PluginContext::FailedToStartWebServer,
@@ -916,6 +919,18 @@ pub(crate) fn plugin_thread_main(
                     Some(plugin_id),
                     Some(client_id),
                     Event::ListClients(client_list_for_plugin),
+                )];
+                wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
+            },
+            PluginInstruction::ListSnapshotsToPlugin(plugin_id, client_id) => {
+                // the archive is on disk and needs no screen or pty state, so it is read here
+                // rather than routed through another thread first
+                let snapshots =
+                    zellij_utils::session_snapshot::snapshot_infos(&crate::snapshot_settings());
+                let updates = vec![(
+                    Some(plugin_id),
+                    Some(client_id),
+                    Event::ListSnapshots(snapshots),
                 )];
                 wasm_bridge.update_plugins(updates, shutdown_send.clone())?;
             },
