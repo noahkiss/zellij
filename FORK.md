@@ -730,13 +730,34 @@ and it changes no exit code.
 
 The server's executable comes from `/proc/<pid>/exe` on Linux and from `proc_pidpath` on macOS,
 which has no `/proc` (`ps -o comm=` is truncated at the column width and is not a substitute). The
-server pid comes from the existing process scan, not a second one. Both executables are compared by
-device and inode where they can be stat'ed, because the installed name is a symlink into a versioned
-directory and two spellings routinely mean one build; a path comparison alone would cry wolf every
-time. Where an inode is missing on either side, only agreement is trusted and disagreement is
-reported as nothing at all: a wrong "your session is stale" sends someone to restart a session that
-did not need it, which costs more than silence. An executable that cannot be read, a platform that
-cannot be asked, and two servers for one name all produce no warning.
+server pid comes from the existing process scan, not a second one.
+
+The two are then compared on the strongest evidence either of them carries, and only a step that
+PROVES a mismatch is allowed to report one.
+
+Device and inode come first: the stat is already paid for, and one inode is one file. That settles
+the case the installed name creates — a symlink into a versioned directory, two spellings for one
+build, which a path comparison alone would cry wolf over every time. But unequal inodes prove
+nothing, because a **copy** of a build is a different file holding the same program — which is
+exactly what a binary pinned at a stable path is.
+
+So where the inodes differ, the identity the linker stamped into the file decides it, both ways:
+the Mach-O `LC_UUID` on macOS, the GNU build-id note on Linux. Both sit in the first few kilobytes,
+reached by reading the header and then the load commands or the `PT_NOTE` segments — never the
+whole file, which is around 40 MB and would be read on every CLI invocation. The note is found
+through the program headers rather than by section name, since sections are what `strip` is
+entitled to discard and segments are not.
+
+Not every toolchain emits one. Where the stamp is missing on either side, a file **size** that
+differs is still proof of two builds. Where the sizes agree as well, nothing has been established
+and the answer is silence: a wrong "your session is stale" sends someone to restart a session that
+did not need it, which costs more than a mismatch nobody was told about. An executable that cannot
+be read, a platform that cannot be asked, and two servers for one name all produce no warning for
+that same reason.
+
+**A caveat for this fork's own Linux builds.** `rustc` does not pass `--build-id` to the linker by
+default, so a binary built straight from this tree carries no GNU note and falls through to the size
+comparison. A packaged build whose linker adds the flag carries one and gets the exact answer.
 
 Nothing about this reaches `SessionInfo` or the status bar. That would put a version on the plugin
 API contract, which is far more than a warning is worth.

@@ -605,8 +605,16 @@ pub struct ExecutableIdentity {
     /// a symlink into a versioned directory, so two spellings routinely name one build.
     pub path: PathBuf,
     /// Device and inode, where the file could be stat'ed. One file has one pair whatever it is
-    /// called, and a replacement gets a new one, so this decides wherever it is available.
+    /// called, and a replacement gets a new one, so equal inodes settle it - but UNEQUAL ones do
+    /// not, because a COPY of a build is a different file holding the same program.
     pub file_id: Option<(u64, u64)>,
+    /// What the linker stamped into the file: the Mach-O `LC_UUID` on macOS, the GNU build-id on
+    /// Linux. This is the only field that identifies a BUILD rather than a file, so two copies of
+    /// one binary agree here and nowhere else.
+    pub build_id: Option<Vec<u8>>,
+    /// The file's length. Not an identity - two builds can share one - but a DIFFERENCE is proof
+    /// of two builds, which is what it is kept for where nothing stamped an id.
+    pub size: Option<u64>,
     /// The file the process started from is no longer at its path - an upgrade wrote over it in
     /// place. Linux says so by appending " (deleted)" to the `/proc/<pid>/exe` link.
     pub replaced: bool,
@@ -619,30 +627,293 @@ fn identify_executable(path: PathBuf) -> ExecutableIdentity {
         None => (path, false),
     };
     let path = path.canonicalize().unwrap_or(path);
-    // a replaced file's path may now hold its replacement, whose inode is not the running one's
+    // a replaced file's path now holds its replacement, and nothing read from it describes the
+    // build that is actually running
     #[cfg(unix)]
-    let file_id = if replaced {
-        None
+    let (file_id, size, build_id) = if replaced {
+        (None, None, None)
     } else {
-        std::fs::metadata(&path).ok().map(|metadata| {
+        let stat = std::fs::metadata(&path).ok();
+        let file_id = stat.as_ref().map(|metadata| {
             use std::os::unix::fs::MetadataExt;
             (metadata.dev(), metadata.ino())
-        })
+        });
+        (
+            file_id,
+            stat.as_ref().map(|metadata| metadata.len()),
+            build_id_of(&path),
+        )
     };
     #[cfg(not(unix))]
-    let file_id: Option<(u64, u64)> = None;
+    let (file_id, size, build_id): (Option<(u64, u64)>, Option<u64>, Option<Vec<u8>>) =
+        (None, None, None);
     ExecutableIdentity {
         path,
         file_id,
+        build_id,
+        size,
         replaced,
     }
 }
 
+/// A read of exactly `len` bytes at `offset`, and nothing else.
+///
+/// The binary is around 40 MB and this runs on every CLI invocation, so no path through here is
+/// allowed to read the whole file. Every caller caps `len` from a header field before asking.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buffer = vec![0u8; len];
+    file.read_exact_at(&mut buffer, offset).ok()?;
+    Some(buffer)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn u16_at(bytes: &[u8], offset: usize, little: bool) -> Option<u16> {
+    let raw: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
+    Some(if little {
+        u16::from_le_bytes(raw)
+    } else {
+        u16::from_be_bytes(raw)
+    })
+}
+
+#[cfg(unix)]
+fn u32_at(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
+    Some(if little {
+        u32::from_le_bytes(raw)
+    } else {
+        u32::from_be_bytes(raw)
+    })
+}
+
+#[cfg(unix)]
+fn u64_at(bytes: &[u8], offset: usize, little: bool) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
+    Some(if little {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
+}
+
+/// The build the file at `path` IS, as its own contents record it.
+///
+/// A copy of a binary is a different file holding the same program, so nothing the filesystem knows
+/// can tell the two apart. Both formats stamp an identity near the front of the file - the Mach-O
+/// `LC_UUID`, the GNU build-id note - and reading it costs a few kilobytes, not 40 MB.
+///
+/// `None` is an ordinary answer: not every linker emits one. It means "no evidence", never
+/// "different".
+#[cfg(unix)]
+fn build_id_of(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let header = read_at(&file, 0, 64)?;
+    #[cfg(target_os = "macos")]
+    {
+        macho_build_id(&file, &header)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if header.get(..4)? == b"\x7fELF" {
+            elf_build_id(&file, &header)
+        } else {
+            None
+        }
+    }
+}
+
+/// The GNU build-id, found through the PROGRAM headers.
+///
+/// The note is reachable two ways, and only one of them survives: sections are what `strip` is
+/// entitled to discard, segments are not. So the `PT_NOTE` segments are walked, not
+/// `.note.gnu.build-id` by name.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn elf_build_id(file: &std::fs::File, header: &[u8]) -> Option<Vec<u8>> {
+    const PT_NOTE: u32 = 4;
+    // a program header table longer than this is not something a linker produced
+    const MAX_SEGMENTS: u16 = 128;
+    // notes are a handful of small records; a segment larger than this is not one of ours
+    const MAX_NOTE_SEGMENT: u64 = 64 * 1024;
+
+    let sixty_four = match header.get(4)? {
+        2 => true,
+        1 => false,
+        _ => return None,
+    };
+    let little = match header.get(5)? {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let (table_at, entry_size, count) = if sixty_four {
+        (
+            u64_at(header, 0x20, little)?,
+            u16_at(header, 0x36, little)? as usize,
+            u16_at(header, 0x38, little)?,
+        )
+    } else {
+        (
+            u32_at(header, 0x1c, little)? as u64,
+            u16_at(header, 0x2a, little)? as usize,
+            u16_at(header, 0x2c, little)?,
+        )
+    };
+    let smallest_entry = if sixty_four { 56 } else { 32 };
+    if count == 0 || count > MAX_SEGMENTS || entry_size < smallest_entry {
+        return None;
+    }
+    let table = read_at(file, table_at, entry_size * count as usize)?;
+    for entry in table.chunks_exact(entry_size) {
+        if u32_at(entry, 0, little)? != PT_NOTE {
+            continue;
+        }
+        let (notes_at, notes_size) = if sixty_four {
+            (u64_at(entry, 8, little)?, u64_at(entry, 32, little)?)
+        } else {
+            (
+                u32_at(entry, 4, little)? as u64,
+                u32_at(entry, 16, little)? as u64,
+            )
+        };
+        if notes_size == 0 || notes_size > MAX_NOTE_SEGMENT {
+            continue;
+        }
+        let Some(notes) = read_at(file, notes_at, notes_size as usize) else {
+            continue;
+        };
+        if let Some(build_id) = gnu_build_id_in_notes(&notes, little) {
+            return Some(build_id);
+        }
+    }
+    None
+}
+
+/// The `NT_GNU_BUILD_ID` record in one note segment, if it holds one.
+///
+/// Each record is a 12-byte header, then a name and a payload, each padded up to four bytes. Both
+/// lengths are checked against the buffer before either is used, so a malformed file yields `None`
+/// rather than a panic.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn gnu_build_id_in_notes(notes: &[u8], little: bool) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let padded = |length: usize| length.checked_add(3).map(|length| length & !3);
+
+    let mut at = 0usize;
+    while at + 12 <= notes.len() {
+        let name_size = u32_at(notes, at, little)? as usize;
+        let payload_size = u32_at(notes, at + 4, little)? as usize;
+        let kind = u32_at(notes, at + 8, little)?;
+        let name_at = at + 12;
+        let payload_at = name_at.checked_add(padded(name_size)?)?;
+        let end = payload_at.checked_add(padded(payload_size)?)?;
+        if end > notes.len() {
+            return None;
+        }
+        if kind == NT_GNU_BUILD_ID && notes.get(name_at..name_at + name_size) == Some(&b"GNU\0"[..])
+        {
+            return notes
+                .get(payload_at..payload_at + payload_size)
+                .map(|build_id| build_id.to_vec());
+        }
+        at = end;
+    }
+    None
+}
+
+/// The `LC_UUID` of one Mach-O image, which may be a slice inside a universal file.
+///
+/// Only the load commands are read - they follow the header directly, and their total size is in
+/// the header, so the read is bounded before the file is touched a second time.
+#[cfg(target_os = "macos")]
+fn macho_uuid(file: &std::fs::File, image_at: u64) -> Option<Vec<u8>> {
+    const LC_UUID: u32 = 0x1b;
+    // both caps are far above anything a real image carries
+    const MAX_LOAD_COMMANDS: u32 = 4096;
+    const MAX_LOAD_COMMANDS_SIZE: u32 = 256 * 1024;
+
+    let header = read_at(file, image_at, 32)?;
+    let (sixty_four, little) = match u32_at(&header, 0, true)? {
+        0xfeed_facf => (true, true),
+        0xcffa_edfe => (true, false),
+        0xfeed_face => (false, true),
+        0xcefa_edfe => (false, false),
+        _ => return None,
+    };
+    let count = u32_at(&header, 16, little)?;
+    let commands_size = u32_at(&header, 20, little)?;
+    if count == 0 || count > MAX_LOAD_COMMANDS || commands_size > MAX_LOAD_COMMANDS_SIZE {
+        return None;
+    }
+    let commands_at = image_at + if sixty_four { 32 } else { 28 };
+    let commands = read_at(file, commands_at, commands_size as usize)?;
+    let mut at = 0usize;
+    for _ in 0..count {
+        let kind = u32_at(&commands, at, little)?;
+        let size = u32_at(&commands, at + 4, little)? as usize;
+        if size < 8 {
+            return None;
+        }
+        if kind == LC_UUID {
+            return commands.get(at + 8..at + 24).map(|uuid| uuid.to_vec());
+        }
+        at = at.checked_add(size)?;
+    }
+    None
+}
+
+/// The identity of a Mach-O file, universal or not.
+///
+/// A universal file is one build only if every slice in it is, so all of their UUIDs are joined in
+/// file order and compared as one value. A thin file is the same walk with one image at offset 0.
+#[cfg(target_os = "macos")]
+fn macho_build_id(file: &std::fs::File, header: &[u8]) -> Option<Vec<u8>> {
+    const FAT_MAGIC: u32 = 0xcafe_babe;
+    const FAT_MAGIC_64: u32 = 0xcafe_babf;
+    // a universal binary of more than this many architectures is not one we produced
+    const MAX_ARCHITECTURES: u32 = 16;
+
+    // a fat header is big-endian whatever the images inside it are
+    let magic = u32_at(header, 0, false)?;
+    if magic != FAT_MAGIC && magic != FAT_MAGIC_64 {
+        return macho_uuid(file, 0);
+    }
+    let wide = magic == FAT_MAGIC_64;
+    let count = u32_at(header, 4, false)?;
+    if count == 0 || count > MAX_ARCHITECTURES {
+        return None;
+    }
+    let entry_size = if wide { 32 } else { 20 };
+    let table = read_at(file, 8, entry_size * count as usize)?;
+    let mut joined = Vec::new();
+    for entry in table.chunks_exact(entry_size) {
+        let image_at = if wide {
+            u64_at(entry, 8, false)?
+        } else {
+            u32_at(entry, 8, false)? as u64
+        };
+        joined.extend(macho_uuid(file, image_at)?);
+    }
+    if joined.is_empty() {
+        return None;
+    }
+    Some(joined)
+}
+
 /// Whether two executables are the same build, judged only on what was actually established.
 ///
-/// Inodes decide it where both sides have them. Where they do not, only agreement is trustworthy:
-/// two paths that differ may still be two names for one build, and calling that a mismatch is the
-/// false alarm this is written to avoid.
+/// The evidence is tried strongest first, and each step only reports `Different` on something that
+/// PROVES it:
+///
+/// 1. one inode is one file, so equal inodes are `Same` and cost nothing beyond the stat already
+///    taken. Unequal inodes prove nothing - a copy of a build is a different file;
+/// 2. the id the linker stamped in decides both ways. It identifies the BUILD, so a copy at a
+///    pinned path and the binary it was copied from agree here;
+/// 3. with no stamp on one side, a size that DIFFERS is still proof of two builds;
+/// 4. same size and nothing to identify either: `Unknown`. Two names for one build is at least as
+///    likely as two builds, and only one of those two answers costs the user anything - a wrong
+///    "your session is stale" sends someone to restart a session that did not need it.
 pub fn compare_builds(
     ours: Option<&ExecutableIdentity>,
     theirs: Option<&ExecutableIdentity>,
@@ -658,9 +929,27 @@ pub fn compare_builds(
         // ours is on disk and theirs is not, so they cannot be the same file
         return BuildMatch::Different;
     }
+    if let (Some(our_file), Some(their_file)) = (ours.file_id, theirs.file_id) {
+        if our_file == their_file {
+            return BuildMatch::Same;
+        }
+    }
+    if let (Some(our_id), Some(their_id)) = (&ours.build_id, &theirs.build_id) {
+        return if our_id == their_id {
+            BuildMatch::Same
+        } else {
+            BuildMatch::Different
+        };
+    }
+    if let (Some(our_size), Some(their_size)) = (ours.size, theirs.size) {
+        if our_size != their_size {
+            return BuildMatch::Different;
+        }
+    }
     match (ours.file_id, theirs.file_id) {
-        (Some(ours), Some(theirs)) if ours == theirs => BuildMatch::Same,
-        (Some(_), Some(_)) => BuildMatch::Different,
+        // two distinct files that nothing above could tell apart
+        (Some(_), Some(_)) => BuildMatch::Unknown,
+        // neither could be stat'ed, so only agreement counts: two spellings may be one build
         _ if ours.path == theirs.path => BuildMatch::Same,
         _ => BuildMatch::Unknown,
     }
@@ -1220,7 +1509,17 @@ mod tests {
         ExecutableIdentity {
             path: PathBuf::from(path),
             file_id,
+            build_id: None,
+            size: None,
             replaced: false,
+        }
+    }
+
+    fn stamped(path: &str, file_id: (u64, u64), build_id: &[u8]) -> ExecutableIdentity {
+        ExecutableIdentity {
+            build_id: Some(build_id.to_vec()),
+            size: Some(41_000_000),
+            ..executable(path, Some(file_id))
         }
     }
 
@@ -1235,8 +1534,8 @@ mod tests {
     #[test]
     fn a_different_file_at_the_same_path_is_a_different_build() {
         // the ordinary upgrade: one path, a new file behind it, a server still on the old one
-        let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
-        let theirs = executable("/opt/zellij/bin/zellij", Some((66, 1234)));
+        let ours = stamped("/opt/zellij/bin/zellij", (66, 4321), b"newer");
+        let theirs = stamped("/opt/zellij/bin/zellij", (66, 1234), b"older");
         assert_eq!(
             compare_builds(Some(&ours), Some(&theirs)),
             BuildMatch::Different
@@ -1244,12 +1543,55 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_of_one_binary_is_one_build() {
+        // what a pinned copy at a stable path looks like: same program, two files, two inodes.
+        // The whole point of the stamped id - by inode alone this is the false alarm.
+        let ours = stamped("/opt/zellij/bin/zellij", (66, 4321), b"one build");
+        let theirs = stamped("/var/zellij/bin/zellij", (66, 9876), b"one build");
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    fn without_a_stamp_a_size_that_differs_is_still_proof() {
+        // no linker id on either side, so the only evidence left is the one that cannot lie
+        let ours = ExecutableIdentity {
+            size: Some(41_000_000),
+            ..executable("/opt/zellij/bin/zellij", Some((66, 4321)))
+        };
+        let theirs = ExecutableIdentity {
+            size: Some(40_000_000),
+            ..executable("/opt/zellij/bin/zellij", Some((66, 1234)))
+        };
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    fn two_unstamped_files_of_one_size_say_nothing() {
+        // a copy on a toolchain that emitted no build id. Silence is the answer that cannot send
+        // someone to restart a session that did not need it
+        let ours = ExecutableIdentity {
+            size: Some(41_000_000),
+            ..executable("/opt/zellij/bin/zellij", Some((66, 4321)))
+        };
+        let theirs = ExecutableIdentity {
+            size: Some(41_000_000),
+            ..executable("/var/zellij/bin/zellij", Some((66, 9876)))
+        };
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Unknown
+        );
+    }
+
+    #[test]
     fn a_server_whose_file_is_gone_is_on_another_build() {
         let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
         let theirs = ExecutableIdentity {
-            path: PathBuf::from("/opt/zellij/bin/zellij"),
-            file_id: None,
             replaced: true,
+            ..executable("/opt/zellij/bin/zellij", None)
         };
         assert_eq!(
             compare_builds(Some(&ours), Some(&theirs)),
@@ -1281,6 +1623,131 @@ mod tests {
             ),
             BuildMatch::Same
         );
+    }
+
+    /// The smallest ELF file that carries a build id: a header, one `PT_NOTE` program header, and
+    /// the note itself. Written by hand so the parser is tested against the format rather than
+    /// against whatever the local toolchain happens to emit - which, as it turns out, may emit no
+    /// build id at all.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn elf_with_build_id(build_id: &[u8], padding: usize) -> Vec<u8> {
+        let mut note = Vec::new();
+        note.extend((4u32).to_le_bytes()); // n_namesz, for "GNU\0"
+        note.extend((build_id.len() as u32).to_le_bytes());
+        note.extend((3u32).to_le_bytes()); // NT_GNU_BUILD_ID
+        note.extend(b"GNU\0");
+        note.extend(build_id);
+        while note.len() % 4 != 0 {
+            note.push(0);
+        }
+
+        let mut file = vec![0u8; 120];
+        file[..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2; // 64-bit
+        file[5] = 1; // little-endian
+        file[6] = 1; // version
+        file[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
+        file[0x12..0x14].copy_from_slice(&0x3eu16.to_le_bytes()); // e_machine
+        file[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        file[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        file[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        file[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        file[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        file[64..68].copy_from_slice(&4u32.to_le_bytes()); // p_type: PT_NOTE
+        file[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        file[96..104].copy_from_slice(&(note.len() as u64).to_le_bytes()); // p_filesz
+
+        file.extend(note);
+        file.extend(std::iter::repeat(0).take(padding));
+        file
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zellij-build-identity-{}-{}",
+                std::process::id(),
+                name
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a writable temp dir");
+            ScratchDir(path)
+        }
+
+        fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).expect("a writable temp dir");
+            path
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_copied_binary_reads_as_the_same_build() {
+        // the case that made this necessary: byte-identical files, two inodes, no false warning
+        let scratch = ScratchDir::new("copy");
+        let original = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let copy = scratch.0.join("zellij-pinned");
+        std::fs::copy(&original, &copy).expect("a writable temp dir");
+
+        let ours = identify_executable(original);
+        let theirs = identify_executable(copy);
+        assert_ne!(ours.file_id, theirs.file_id, "a copy is a different file");
+        assert_eq!(ours.build_id, Some(vec![0xab; 20]));
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn two_builds_read_as_different_builds() {
+        let scratch = ScratchDir::new("different");
+        let ours = scratch.write("new", &elf_with_build_id(&[0xab; 20], 4096));
+        // a differing size alone would settle this, so keep them equal and make the id do the work
+        let theirs = scratch.write("old", &elf_with_build_id(&[0xcd; 20], 4096));
+
+        let ours = identify_executable(ours);
+        let theirs = identify_executable(theirs);
+        assert_eq!(ours.size, theirs.size);
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_symlink_still_reads_as_the_same_build() {
+        // the original case: the installed name pointing into a versioned directory
+        let scratch = ScratchDir::new("symlink");
+        let original = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let link = scratch.0.join("zellij-current");
+        std::os::unix::fs::symlink(&original, &link).expect("a writable temp dir");
+
+        let ours = identify_executable(original);
+        let theirs = identify_executable(link);
+        assert_eq!(ours.file_id, theirs.file_id, "a symlink is one file");
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_file_that_is_not_an_executable_yields_no_id() {
+        // "no evidence" has to stay distinct from "different", or every unreadable file warns
+        let scratch = ScratchDir::new("not-elf");
+        let path = scratch.write("zellij", b"#!/bin/sh\nexec zellij \"$@\"\n");
+        assert_eq!(identify_executable(path).build_id, None);
     }
 
     #[test]
