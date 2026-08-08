@@ -209,6 +209,7 @@ enum CommandName {
   DeleteAllDeadSessionsAndReply = 214;
   DetachClients = 215;
   ListSnapshots = 216;
+  RestoreSnapshot = 217;
 }
 
 message PluginCommand {
@@ -364,6 +365,7 @@ message PluginCommand {
     KillSessionsPayload kill_sessions_and_reply_payload = 162;
     string delete_dead_session_and_reply_payload = 163;
     DetachClientsPayload detach_clients_payload = 164;
+    RestoreSnapshotPayload restore_snapshot_payload = 165;
   }
 }
 
@@ -637,6 +639,11 @@ message ShowPaneWithIdPayload {
 
 message NewTabsWithLayoutInfoPayload {
   event.LayoutInfo layout_info = 1;
+}
+
+message RestoreSnapshotPayload {
+  string snapshot_id = 1;
+  optional string session_name = 2;
 }
 
 message DetachClientsPayload {

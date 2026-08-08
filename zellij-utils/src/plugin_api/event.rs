@@ -370,6 +370,12 @@ impl TryFrom<ProtobufEvent> for Event {
                 },
                 _ => Err("Malformed payload for the ListSnapshots Event"),
             },
+            Some(ProtobufEventType::SnapshotRestoreFailed) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::SnapshotRestoreFailedPayload(payload)) => {
+                    Ok(Event::SnapshotRestoreFailed(payload.error))
+                },
+                _ => Err("Malformed payload for the SnapshotRestoreFailed Event"),
+            },
             Some(ProtobufEventType::HostFolderChanged) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::HostFolderChangedPayload(
                     host_folder_changed_payload,
@@ -1052,6 +1058,12 @@ impl TryFrom<Event> for ProtobufEvent {
                         .filter_map(|s| s.try_into().ok())
                         .collect(),
                 })),
+            }),
+            Event::SnapshotRestoreFailed(error) => Ok(ProtobufEvent {
+                name: ProtobufEventType::SnapshotRestoreFailed as i32,
+                payload: Some(event::Payload::SnapshotRestoreFailedPayload(
+                    SnapshotRestoreFailedPayload { error },
+                )),
             }),
             Event::HostFolderChanged(new_host_folder_path) => Ok(ProtobufEvent {
                 name: ProtobufEventType::HostFolderChanged as i32,
@@ -2183,6 +2195,7 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::FailedToWriteConfigToDisk => EventType::FailedToWriteConfigToDisk,
             ProtobufEventType::ListClients => EventType::ListClients,
             ProtobufEventType::ListSnapshots => EventType::ListSnapshots,
+            ProtobufEventType::SnapshotRestoreFailed => EventType::SnapshotRestoreFailed,
             ProtobufEventType::HostFolderChanged => EventType::HostFolderChanged,
             ProtobufEventType::FailedToChangeHostFolder => EventType::FailedToChangeHostFolder,
             ProtobufEventType::PastedText => EventType::PastedText,
@@ -2238,6 +2251,7 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::FailedToWriteConfigToDisk => ProtobufEventType::FailedToWriteConfigToDisk,
             EventType::ListClients => ProtobufEventType::ListClients,
             EventType::ListSnapshots => ProtobufEventType::ListSnapshots,
+            EventType::SnapshotRestoreFailed => ProtobufEventType::SnapshotRestoreFailed,
             EventType::HostFolderChanged => ProtobufEventType::HostFolderChanged,
             EventType::FailedToChangeHostFolder => ProtobufEventType::FailedToChangeHostFolder,
             EventType::PastedText => ProtobufEventType::PastedText,

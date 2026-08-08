@@ -112,9 +112,10 @@ pub use super::generated_api::api::{
         RenameLayoutResponse as ProtobufRenameLayoutResponse, RenameTabWithIdPayload,
         RenameWebLoginTokenPayload, RenameWebTokenResponse, ReplacePaneWithExistingPanePayload,
         RequestPluginPermissionPayload, RerunCommandPanePayload, ResizePaneIdWithDirectionPayload,
-        ResizePayload, RevokeAllWebTokensResponse, RevokeTokenResponse, RevokeWebLoginTokenPayload,
-        RunActionPayload, RunCommandPayload, RunningCommand as ProtobufRunningCommand,
-        SaveLayoutPayload, SaveLayoutResponse as ProtobufSaveLayoutResponse, SaveSessionPayload,
+        ResizePayload, RestoreSnapshotPayload, RevokeAllWebTokensResponse, RevokeTokenResponse,
+        RevokeWebLoginTokenPayload, RunActionPayload, RunCommandPayload,
+        RunningCommand as ProtobufRunningCommand, SaveLayoutPayload,
+        SaveLayoutResponse as ProtobufSaveLayoutResponse, SaveSessionPayload,
         SaveSessionResponse as ProtobufSaveSessionResponse, ScrollDownInPaneIdPayload,
         ScrollToBottomInPaneIdPayload, ScrollToTopInPaneIdPayload, ScrollUpInPaneIdPayload,
         SessionListSnapshot as ProtobufSessionListSnapshot, SetFloatingPanePinnedPayload,
@@ -1952,6 +1953,16 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
                 Some(_) => Err("ListSnapshots should have no payload, found a payload"),
                 None => Ok(PluginCommand::ListSnapshots),
             },
+            Some(CommandName::RestoreSnapshot) => match protobuf_plugin_command.payload {
+                Some(Payload::RestoreSnapshotPayload(RestoreSnapshotPayload {
+                    snapshot_id,
+                    session_name,
+                })) => Ok(PluginCommand::RestoreSnapshot {
+                    snapshot_id,
+                    session_name,
+                }),
+                _ => Err("Mismatched payload for RestoreSnapshot"),
+            },
             Some(CommandName::ChangeHostFolder) => match protobuf_plugin_command.payload {
                 Some(Payload::ChangeHostFolderPayload(change_host_folder_payload)) => {
                     Ok(PluginCommand::ChangeHostFolder(PathBuf::from(
@@ -3763,6 +3774,16 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
             PluginCommand::ListSnapshots => Ok(ProtobufPluginCommand {
                 name: CommandName::ListSnapshots as i32,
                 payload: None,
+            }),
+            PluginCommand::RestoreSnapshot {
+                snapshot_id,
+                session_name,
+            } => Ok(ProtobufPluginCommand {
+                name: CommandName::RestoreSnapshot as i32,
+                payload: Some(Payload::RestoreSnapshotPayload(RestoreSnapshotPayload {
+                    snapshot_id,
+                    session_name,
+                })),
             }),
             PluginCommand::ChangeHostFolder(new_host_folder) => Ok(ProtobufPluginCommand {
                 name: CommandName::ChangeHostFolder as i32,

@@ -396,6 +396,34 @@ New plugin-API tags only, nothing renumbered: `EventType::ListSnapshots = 47` wi
 `CommandName::ListSnapshots = 216`. The command carries `ReadApplicationState`, alongside
 `ListClients` and `GetSessionList`.
 
+#### A plugin can restore one
+
+```rust
+restore_snapshot("1754251200000-a1b2c3d4", Some("a-new-name"));
+```
+
+`PluginCommand::RestoreSnapshot` is `zellij snapshot restore` reached from inside a session. The id
+is resolved against the archive, `session_name` restores under a different name exactly as
+`--session` does, and the layout file is handed to the same `SwitchSession` the resurrection path
+already uses — a restore has always been an attach that takes its layout from the archive rather
+than from the cache.
+
+**Restoring into a name that is already running is refused.** Left alone it would not fail, it would
+succeed as the wrong thing: the session exists, so the switch attaches to it and the layout is
+ignored, and the user gets the running session in place of the shape they picked. `attach --restore`
+refuses the same case for the same reason. The picker refuses it a second time, before the keypress,
+by marking the row.
+
+The server also trial-parses the layout before switching. Once the client has been told to switch
+there is no screen left to report a broken layout to, and the session it lands in would be empty.
+
+Refusals come back as `Event::SnapshotRestoreFailed` and are logged. A restore that works is not
+reported at all, because the client is already leaving.
+
+New tags only: `CommandName::RestoreSnapshot = 217` with payload `165`, and
+`EventType::SnapshotRestoreFailed = 48` with payload `42`. The command carries
+`ChangeApplicationState`, alongside `SwitchSession`.
+
 #### Adopting layouts the archive never saw
 
 ```

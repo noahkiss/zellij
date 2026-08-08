@@ -1001,6 +1001,11 @@ pub enum Event {
     ListClients(Vec<ClientInfo>),
     /// The session snapshot archive, newest first. Answers `PluginCommand::ListSnapshots`.
     ListSnapshots(Vec<SessionSnapshotInfo>),
+    /// Why a `PluginCommand::RestoreSnapshot` did not restore anything.
+    ///
+    /// A restore that succeeds is not reported: the client is already switching to the restored
+    /// session, so there is nobody left to tell. Only the refusals need a channel back.
+    SnapshotRestoreFailed(String),
     HostFolderChanged(PathBuf),               // PathBuf -> new host folder
     FailedToChangeHostFolder(Option<String>), // String -> the error we got when changing
     PastedText(String),
@@ -3588,6 +3593,16 @@ pub enum PluginCommand {
     /// a directory tree and parsing every saved layout in it - work worth doing for the one plugin
     /// that has a picker open, and not on every session poll of every plugin.
     ListSnapshots,
+    /// Rebuild a session from an archived snapshot, by id.
+    ///
+    /// `session_name` restores under a different name, exactly as `snapshot restore --session`
+    /// does; without it the snapshot's own name is used. Restoring into a name that is already
+    /// running is refused rather than done, and the refusal comes back as
+    /// `Event::SnapshotRestoreFailed`.
+    RestoreSnapshot {
+        snapshot_id: String,
+        session_name: Option<String>,
+    },
     ChangeHostFolder(PathBuf),
     SetFloatingPanePinned(PaneId, bool), // bool -> should be pinned
     StackPanes(Vec<PaneId>),

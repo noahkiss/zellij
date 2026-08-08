@@ -1759,6 +1759,23 @@ pub fn list_snapshots() {
     unsafe { host_run_plugin_command() };
 }
 
+/// Rebuild a session from an archived snapshot, by id.
+///
+/// `session_name` restores under a different name, exactly as `zellij snapshot restore --session`
+/// does; `None` uses the name the snapshot was archived under. On success the calling client
+/// switches to the restored session, so nothing comes back. A refusal - an id that matches nothing,
+/// a layout that will not parse, or a name that is already running - arrives as
+/// `Event::SnapshotRestoreFailed` (note: that event must be subscribed to).
+pub fn restore_snapshot(snapshot_id: &str, session_name: Option<&str>) {
+    let plugin_command = PluginCommand::RestoreSnapshot {
+        snapshot_id: snapshot_id.to_owned(),
+        session_name: session_name.map(|name| name.to_owned()),
+    };
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Change configuration for the current user
 pub fn reconfigure(new_config: String, save_configuration_file: bool) {
     let plugin_command = PluginCommand::Reconfigure(new_config, save_configuration_file);

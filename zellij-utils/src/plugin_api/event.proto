@@ -70,6 +70,7 @@ enum EventType {
     CommandChanged = 45;
     HostTerminalThemeChanged = 46;
     ListSnapshots = 47;
+    SnapshotRestoreFailed = 48;
 }
 
 message EventNameList {
@@ -119,7 +120,12 @@ message Event {
     CommandChangedPayload command_changed_payload = 39;
     HostTerminalThemeChangedPayload host_terminal_theme_changed_payload = 40;
     ListSnapshotsPayload list_snapshots_payload = 41;
+    SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 42;
   }
+}
+
+message SnapshotRestoreFailedPayload {
+  string error = 1;
 }
 
 message ListSnapshotsPayload {
