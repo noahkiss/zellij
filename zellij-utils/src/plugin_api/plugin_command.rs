@@ -31,11 +31,11 @@ pub use super::generated_api::api::{
         CustomRgbHighlight as ProtobufCustomRgbHighlight,
         DeleteAllDeadSessionsResponse as ProtobufDeleteAllDeadSessionsResponse,
         DeleteDeadSessionResponse as ProtobufDeleteDeadSessionResponse, DeleteLayoutPayload,
-        DeleteLayoutResponse as ProtobufDeleteLayoutResponse, DumpLayoutPayload,
-        DumpLayoutResponse as ProtobufDumpLayoutResponse, DumpSessionLayoutPayload,
-        DumpSessionLayoutResponse as ProtobufDumpSessionLayoutResponse, EditLayoutPayload,
-        EditLayoutResponse as ProtobufEditLayoutResponse, EditScrollbackForPaneWithIdPayload,
-        EmbedMultiplePanesPayload, EnvVariable, ExecCmdPayload,
+        DeleteLayoutResponse as ProtobufDeleteLayoutResponse, DetachClientsPayload,
+        DumpLayoutPayload, DumpLayoutResponse as ProtobufDumpLayoutResponse,
+        DumpSessionLayoutPayload, DumpSessionLayoutResponse as ProtobufDumpSessionLayoutResponse,
+        EditLayoutPayload, EditLayoutResponse as ProtobufEditLayoutResponse,
+        EditScrollbackForPaneWithIdPayload, EmbedMultiplePanesPayload, EnvVariable, ExecCmdPayload,
         FixedOrPercent as ProtobufFixedOrPercent,
         FixedOrPercentValue as ProtobufFixedOrPercentValue, FloatMultiplePanesPayload,
         FloatingPaneCoordinates as ProtobufFloatingPaneCoordinates,
@@ -1407,6 +1407,14 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
             Some(CommandName::DisconnectOtherClients) => match protobuf_plugin_command.payload {
                 None => Ok(PluginCommand::DisconnectOtherClients),
                 _ => Err("Mismatched payload for DisconnectOtherClients"),
+            },
+            Some(CommandName::DetachClients) => match protobuf_plugin_command.payload {
+                Some(Payload::DetachClientsPayload(DetachClientsPayload { client_ids })) => {
+                    Ok(PluginCommand::DetachClients(
+                        client_ids.into_iter().map(|c| c as u16).collect(),
+                    ))
+                },
+                _ => Err("Mismatched payload for DetachClients"),
             },
             Some(CommandName::KillSessions) => match protobuf_plugin_command.payload {
                 Some(Payload::KillSessionsPayload(KillSessionsPayload { session_names })) => {
@@ -3272,6 +3280,12 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
             PluginCommand::DisconnectOtherClients => Ok(ProtobufPluginCommand {
                 name: CommandName::DisconnectOtherClients as i32,
                 payload: None,
+            }),
+            PluginCommand::DetachClients(client_ids) => Ok(ProtobufPluginCommand {
+                name: CommandName::DetachClients as i32,
+                payload: Some(Payload::DetachClientsPayload(DetachClientsPayload {
+                    client_ids: client_ids.into_iter().map(|c| c as u32).collect(),
+                })),
             }),
             PluginCommand::KillSessions(session_names) => Ok(ProtobufPluginCommand {
                 name: CommandName::KillSessions as i32,

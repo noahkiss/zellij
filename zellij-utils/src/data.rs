@@ -3456,6 +3456,12 @@ pub enum PluginCommand {
     CliPipeOutput(String, String), // String => pipe name, String => output
     MessageToPlugin(MessageToPlugin),
     DisconnectOtherClients,
+    /// Detach the given clients from this session, leaving it running.
+    ///
+    /// `DisconnectOtherClients` is the all-or-nothing form of this; here the caller names the
+    /// clients, which is what makes a client list actionable rather than informational. The ids
+    /// are the ones reported by `Event::ListClients`.
+    DetachClients(Vec<ClientId>),
     KillSessions(Vec<String>), // one or more session names
     ScanHostFolder(PathBuf),   // TODO: rename to ScanHostFolder
     WatchFilesystem,

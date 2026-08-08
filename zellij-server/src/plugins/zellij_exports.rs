@@ -431,6 +431,7 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     },
                     PluginCommand::MessageToPlugin(message) => message_to_plugin(env, message)?,
                     PluginCommand::DisconnectOtherClients => disconnect_other_clients(env),
+                    PluginCommand::DetachClients(client_ids) => detach_clients(env, client_ids),
                     PluginCommand::KillSessions(session_list) => kill_sessions(session_list),
                     PluginCommand::KillSessionsAndReply(session_list) => {
                         kill_sessions_and_reply(env, session_list)
@@ -3273,6 +3274,16 @@ fn rename_session(env: &PluginEnv, new_session_name: String) {
     }
 }
 
+fn detach_clients(env: &PluginEnv, client_ids: Vec<crate::ClientId>) {
+    if client_ids.is_empty() {
+        return;
+    }
+    let _ = env
+        .senders
+        .send_to_server(ServerInstruction::DetachSession(client_ids, None))
+        .context("failed to send detach clients instruction");
+}
+
 fn disconnect_other_clients(env: &PluginEnv) {
     let _ = env
         .senders
@@ -5421,6 +5432,7 @@ fn check_command_permission(
         | PluginCommand::FloatMultiplePanes(..)
         | PluginCommand::EmbedMultiplePanes(..)
         | PluginCommand::ReplacePaneWithExistingPane(..)
+        | PluginCommand::DetachClients(..)
         | PluginCommand::KillSessions(..)
         | PluginCommand::KillSessionsAndReply(..)
         | PluginCommand::DeleteDeadSessionAndReply(..)

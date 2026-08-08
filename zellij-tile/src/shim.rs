@@ -1594,6 +1594,18 @@ pub fn pipe_message_to_plugin(message_to_plugin: MessageToPlugin) {
     unsafe { host_run_plugin_command() };
 }
 
+/// Detach the given clients from the current session, leaving the session running.
+///
+/// The ids are the ones reported by `Event::ListClients`. This is the selective form of
+/// [`disconnect_other_clients`]: it detaches exactly the clients named, and a caller may include
+/// its own client id to detach itself.
+pub fn detach_clients(client_ids: &[ClientId]) {
+    let plugin_command = PluginCommand::DetachClients(client_ids.to_vec());
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Disconnect all other clients from the current session
 pub fn disconnect_other_clients() {
     let plugin_command = PluginCommand::DisconnectOtherClients;
