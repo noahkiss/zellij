@@ -881,6 +881,19 @@ session that died overnight came back at the next login there and within a minut
 writes and enables a paired `.timer` at the same interval, `disable` removes both. One unit name
 per session (`zellij-session-<name>.service`), for the reason the launchd label is per session.
 
+**The state root is written down at `enable` time.** The snapshot archive and `restart.log` both
+hang off `$XDG_STATE_HOME`, and a launcher has none while a login shell that exports one does — so
+the two resolved *different* state roots. A `down` typed in a pane archived the session's shape to
+one; the launcher's `up --restore latest` looked in the other, found nothing, and came back from the
+layout instead of the shape that was saved. Nothing failed and nothing warned; the session simply
+came back wrong. The generated unit now carries the absolute path the enabling shell resolved
+(`Environment=XDG_STATE_HOME=…`, or an `XDG_STATE_HOME` entry inside launchd's
+`EnvironmentVariables`), which is the same principle as the binary path: resolve once, record the
+result, never re-derive at run time. It is a **default** — a config that sets its own replaces it —
+and it is absent entirely when the enabling environment has no absolute one, because then both
+sides fall through to the same `HOME`-derived directory and there is nothing to disagree about.
+A unit enabled before this change carries no such line, so re-run `session enable` to record one.
+
 **The unit directory is asked for, not derived** (systemd). `~/.config/systemd/user` is
 `$XDG_CONFIG_HOME/systemd/user`, and the `XDG_CONFIG_HOME` that matters is the *manager's*, not the
 calling shell's. The manager keeps the environment it was started with; a shell that exports its own

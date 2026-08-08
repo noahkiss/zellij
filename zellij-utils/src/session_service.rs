@@ -1104,12 +1104,61 @@ fn service_path(exe: &Path) -> String {
     }
 }
 
+/// The `XDG_STATE_HOME` to WRITE DOWN in a unit, resolved once here at generate time.
+///
+/// Everything the fork keeps between sessions hangs off this one variable - the snapshot archive
+/// `down` writes and `up --restore latest` reads, and `restart.log`. A launcher's environment has
+/// no `XDG_STATE_HOME` and a login shell that exports one does, so the two resolve DIFFERENT state
+/// roots: `down` typed in a pane archives the session's shape to one, the launcher's
+/// `up --restore latest` looks in the other, finds nothing, and comes back from the layout instead
+/// of the shape that was saved. Nothing fails; the session simply comes back wrong.
+///
+/// So the value is resolved once, by the command that installs the unit, and RECORDED in it - the
+/// same principle that puts an absolute binary path in the unit rather than a name to re-resolve.
+/// Nothing is recorded when this environment has no absolute one, because then there is nothing to
+/// disagree about: both sides fall through to the platform's own per-user directory, which is
+/// derived from `HOME` and identical either way.
+pub fn recorded_state_home() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("XDG_STATE_HOME")?);
+    path.is_absolute().then_some(path)
+}
+
+/// The `Environment=XDG_STATE_HOME=` line of a generated unit, with the comment that explains it,
+/// or nothing at all.
+///
+/// Nothing at all when there is no absolute one to record, so that a machine without one produces
+/// the same bytes as a build that had never heard of this.
+fn state_home_directive(service_directives: &[String], state_home: Option<&Path>) -> String {
+    let Some(state_home) = state_home else {
+        return String::new();
+    };
+    let line = env_default(
+        service_directives,
+        "XDG_STATE_HOME",
+        &state_home.display().to_string(),
+    );
+    if line.is_empty() {
+        // the config wrote its own, which is the answer this would have supplied a default for
+        return line;
+    }
+    format!(
+        "# XDG_STATE_HOME, written down when this unit was enabled rather than resolved here. The\n\
+         # snapshot archive and restart.log both hang off it and a launcher has none, so a `down`\n\
+         # typed in a pane archived the session's shape to one root while this unit's `up --restore\n\
+         # latest` looked in another and came back from the layout instead.\n\
+         {}",
+        line
+    )
+}
+
 fn systemd_unit(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
     let extras = extras.cloned().unwrap_or_default();
     // Defaults, not decisions: a config that sets its own TERM or PATH replaces these lines rather
     // than adding a second assignment of the same variable.
     let term = env_default(&extras.systemd.service, "TERM", crate::shared::DEFAULT_TERM);
     let path = env_default(&extras.systemd.service, "PATH", &service_path(exe));
+    let state_home =
+        state_home_directive(&extras.systemd.service, recorded_state_home().as_deref());
     format!(
         "\
 # zellij session '{session}' - write to ~/.config/systemd/user/{unit}
@@ -1148,7 +1197,7 @@ KillMode=process
 # the session - a pane shell fixing its own PATH from the rc chain does not fix that. A unit is
 # started with none. The first entry is where the binary below was found; setting PATH in the
 # config's `session_service` block replaces this line.
-{path}ExecStart={exe} session up {session}
+{path}{state_home}ExecStart={exe} session up {session}
 {service_extra}
 [Install]
 WantedBy=default.target
@@ -1158,6 +1207,7 @@ WantedBy=default.target
         interval = CHECK_INTERVAL_SECS,
         term = term,
         path = path,
+        state_home = state_home,
         unit = systemd_service_name(session),
         timer = systemd_timer_name(session),
         unit_extra = directive_lines(&extras.systemd.unit),
@@ -1277,6 +1327,17 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         .unwrap_or_else(|| default_out.display().to_string());
     let err_path = take_default_key(&mut keys, "StandardErrorPath")
         .unwrap_or_else(|| default_err.display().to_string());
+    // Not a plist key either: it goes inside EnvironmentVariables like TERM and PATH, and unlike
+    // them it is absent altogether when this machine has no absolute one to record.
+    let state_home = take_default_key(&mut keys, "XDG_STATE_HOME")
+        .or_else(|| recorded_state_home().map(|home| home.display().to_string()))
+        .map(|value| {
+            format!(
+                "        <key>XDG_STATE_HOME</key>\n        <string>{}</string>\n",
+                xml_escape(&value)
+            )
+        })
+        .unwrap_or_default();
     format!(
         "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -1305,10 +1366,18 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
   the job may auto-load into, so at login it cannot come up anywhere else. Keep it for that, but
   do not read its presence as the thing granting the context: the bootstrap target is.
 
-  EnvironmentVariables carries PATH and TERM and NOTHING ELSE - in particular no TMPDIR and no
-  ZELLIJ_SOCKET_DIR. launchd hands out a per-user TMPDIR that differs from the one a login shell
-  sees, so a pinned socket directory here would build a session invisible to every terminal. The
-  binary resolves that directory itself.
+  EnvironmentVariables carries PATH, TERM, and XDG_STATE_HOME where there was one to record - in
+  particular no TMPDIR and no ZELLIJ_SOCKET_DIR. launchd hands out a per-user TMPDIR that differs
+  from the one a login shell sees, so a pinned socket directory here would build a session invisible
+  to every terminal. The binary resolves that directory itself.
+
+  XDG_STATE_HOME is the opposite case, and is written down for exactly that reason. The snapshot
+  archive and restart.log hang off it, a launch agent has none, and a login shell that exports one
+  does - so `session down` typed in a pane archived the session's shape to one root while this
+  agent's `up --restore latest` looked in another and came back from the layout instead. It is the
+  value the shell that ran `session enable` resolved, recorded here rather than re-derived at run
+  time, and it is absent altogether when that shell had no absolute one - both sides then fall
+  through to the same home-derived directory.
 
   TERM is here because a launch agent has none, and the server hands its own environment to every
   pane shell it spawns: without it every pane of a session this agent created comes up with
@@ -1348,7 +1417,7 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         <string>{path}</string>
         <key>TERM</key>
         <string>{term}</string>
-    </dict>
+{state_home}    </dict>
     <key>WorkingDirectory</key>
     <string>{working_directory}</string>
     <key>StandardOutPath</key>
@@ -1368,6 +1437,7 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
         interval = CHECK_INTERVAL_SECS,
         term = xml_escape(&term),
         path = xml_escape(&path),
+        state_home = state_home,
         working_directory = xml_escape(&working_directory),
         out_path = xml_escape(&out_path),
         err_path = xml_escape(&err_path),
@@ -2187,6 +2257,32 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn an_absent_variable_is_not_an_empty_path() {
         assert_eq!(environment_value("LANG=C\n", "XDG_CONFIG_HOME"), None);
+    }
+
+    #[test]
+    fn an_absolute_state_home_is_written_into_the_unit() {
+        let directive = state_home_directive(&[], Some(Path::new("/home/u/.state")));
+        assert!(
+            directive.ends_with("Environment=XDG_STATE_HOME=/home/u/.state\n"),
+            "{}",
+            directive
+        );
+    }
+
+    #[test]
+    fn no_state_home_leaves_the_unit_exactly_as_it_was() {
+        // both sides then fall through to the same HOME-derived directory, so there is nothing to
+        // record and nothing to disagree about
+        assert_eq!(state_home_directive(&[], None), "");
+    }
+
+    #[test]
+    fn a_configured_state_home_replaces_the_recorded_one() {
+        let configured = vec!["Environment=XDG_STATE_HOME=/elsewhere".to_owned()];
+        assert_eq!(
+            state_home_directive(&configured, Some(Path::new("/home/u/.state"))),
+            ""
+        );
     }
 
     #[test]
