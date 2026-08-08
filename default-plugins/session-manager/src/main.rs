@@ -1,3 +1,4 @@
+mod client_list;
 mod new_session_info;
 mod resurrectable_sessions;
 mod session_list;
@@ -7,13 +8,15 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 use zellij_tile::prelude::*;
 
+use client_list::ClientList;
 use new_session_info::NewSessionInfo;
 use single_screen::{DeleteTarget, SingleScreenMode, SingleScreenState, UnifiedSearchResult};
 use ui::{
     components::{
-        render_controls_line, render_error, render_new_session_block, render_prompt,
-        render_renaming_session_screen, render_screen_toggle, render_session_list_notice,
-        render_single_screen_prompt, render_unified_results, render_unsaved_changes_line, Colors,
+        render_client_list_controls, render_controls_line, render_error, render_new_session_block,
+        render_prompt, render_renaming_session_screen, render_screen_toggle,
+        render_session_list_notice, render_single_screen_prompt, render_unified_results,
+        render_unsaved_changes_line, Colors,
     },
     welcome_screen::{render_banner, render_welcome_boundaries},
     SessionUiInfo,
@@ -63,6 +66,9 @@ struct State {
     /// modal that swallows the next keypress - a failure that re-arms every second would make the
     /// plugin untypeable.
     session_list_error: Option<String>,
+    /// The clients attached to the current session, shown over the session list on `Ctrl+l`.
+    client_list: ClientList,
+    show_client_list: bool,
 }
 
 register_plugin!(State);
@@ -80,6 +86,14 @@ register_plugin!(State);
 /// Written as a guard rather than an or-pattern because each key needs its OWN modifier test. A
 /// single shared guard would accept `Ctrl+Delete` and, far worse, a bare `k` - which is filter
 /// typing, so the first search for a session with a k in its name would delete one instead.
+fn is_kill_key(key: &KeyWithModifier) -> bool {
+    match key.bare_key {
+        BareKey::Delete => key.has_no_modifiers(),
+        BareKey::Char('k') => key.has_modifiers(&[KeyModifier::Ctrl]),
+        _ => false,
+    }
+}
+
 /// What to say instead of a session list that has no room left to draw in.
 ///
 /// The list is given whatever rows remain after the prompt and the help lines. In a short pane that
@@ -93,14 +107,6 @@ fn pane_too_short_notice(hidden_sessions: usize) -> String {
             "{} sessions hidden: the pane is too short to show the list.",
             hidden_sessions
         )
-    }
-}
-
-fn is_kill_key(key: &KeyWithModifier) -> bool {
-    match key.bare_key {
-        BareKey::Delete => key.has_no_modifiers(),
-        BareKey::Char('k') => key.has_modifiers(&[KeyModifier::Ctrl]),
-        _ => false,
     }
 }
 
@@ -130,6 +136,7 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
             EventType::Timer,
             EventType::Visible,
+            EventType::ListClients,
         ]);
         rename_plugin_pane(get_plugin_ids().plugin_id, "Session Manager");
         self.refresh_session_list();
@@ -180,6 +187,11 @@ impl ZellijPlugin for State {
                 if self.refresh_session_list() {
                     should_render = true;
                 }
+                if self.show_client_list {
+                    // clients attach and detach without any event of their own, so the open list
+                    // is only as current as its last poll
+                    list_clients();
+                }
                 self.arm_refresh_timer();
             },
             Event::Visible(is_visible) => {
@@ -199,6 +211,10 @@ impl ZellijPlugin for State {
             },
             Event::Key(key) => {
                 should_render = self.handle_key(key);
+            },
+            Event::ListClients(clients) => {
+                self.client_list.update(clients);
+                should_render = self.show_client_list;
             },
             Event::PermissionRequestResult(_result) => {
                 should_render = true;
@@ -270,7 +286,10 @@ impl ZellijPlugin for State {
                 );
             },
             ActiveScreen::AttachToSession => {
-                if let Some(new_session_name) = self.renaming_session_name.as_ref() {
+                if self.show_client_list {
+                    self.client_list
+                        .render(height, width.saturating_sub(7), x, y + 2);
+                } else if let Some(new_session_name) = self.renaming_session_name.as_ref() {
                     render_renaming_session_screen(&new_session_name, height, width, x, y + 2);
                 } else if self.show_kill_all_sessions_warning {
                     self.render_kill_all_sessions_warning(height, width, x, y);
@@ -304,7 +323,12 @@ impl ZellijPlugin for State {
             ActiveScreen::SingleScreen => {
                 match self.single_screen_state.mode {
                     SingleScreenMode::SearchAndSelect => {
-                        if let Some(new_session_name) = self.renaming_session_name.as_ref() {
+                        if self.show_client_list {
+                            let content_width = std::cmp::min(width, 90);
+                            let x_centered = x + (width.saturating_sub(content_width)) / 2;
+                            self.client_list
+                                .render(height, content_width, x_centered, y);
+                        } else if let Some(new_session_name) = self.renaming_session_name.as_ref() {
                             render_renaming_session_screen(new_session_name, height, width, x, y);
                         } else if self.show_kill_all_sessions_warning {
                             self.render_kill_all_sessions_warning(height, width, x, y);
@@ -470,6 +494,8 @@ impl ZellijPlugin for State {
         }
         if let Some(error) = self.error.as_ref() {
             render_error(&error, height, width, x, y);
+        } else if self.show_client_list {
+            render_client_list_controls(width, self.colors, x + 1, rows.saturating_sub(1));
         } else if (self.active_screen == ActiveScreen::AttachToSession
             || self.active_screen == ActiveScreen::SingleScreen)
             && !self.is_welcome_screen
@@ -506,6 +532,66 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Show the client list and ask the server to fill it.
+    ///
+    /// The answer arrives as `Event::ListClients`, so the list is empty for one frame. It clears
+    /// first rather than showing the previous answer, because a stale client list is exactly the
+    /// kind of thing someone would act on.
+    fn open_client_list(&mut self) {
+        self.show_client_list = true;
+        self.client_list.clear();
+        list_clients();
+    }
+    /// Keys for the client list. Returns whether anything changed on screen.
+    ///
+    /// Nothing here is filter input - this screen has no search term - so a bare character is free
+    /// to carry an action, which is true nowhere else in this plugin.
+    fn handle_client_list_key(&mut self, key: KeyWithModifier) -> bool {
+        match key.bare_key {
+            BareKey::Down if key.has_no_modifiers() => {
+                self.client_list.move_selection_down();
+                true
+            },
+            BareKey::Up if key.has_no_modifiers() => {
+                self.client_list.move_selection_up();
+                true
+            },
+            BareKey::Char('d') if key.has_no_modifiers() => self.detach_selected_client(),
+            BareKey::Esc if key.has_no_modifiers() => {
+                self.show_client_list = false;
+                true
+            },
+            BareKey::Char('l') | BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                // both need the same modifier test, so one guard is right here - unlike the
+                // kill key, where a shared guard would have swallowed a bare character
+                self.show_client_list = false;
+                true
+            },
+            _ => false,
+        }
+    }
+    /// Detach the selected client, except when it is the one driving this plugin.
+    ///
+    /// Detaching yourself from here is refused rather than confirmed: the session's own detach
+    /// binding already does it, and it is the one row where the screen reporting the outcome
+    /// disappears along with the client.
+    fn detach_selected_client(&mut self) -> bool {
+        match self.client_list.selected() {
+            Some(client) if client.is_current_client => {
+                self.show_error("This is the client you are typing in. Use the session's detach key to detach it.");
+            },
+            Some(client) => {
+                let client_id = client.client_id;
+                detach_clients(&[client_id]);
+                self.client_list.remove(client_id);
+                list_clients();
+            },
+            None => {
+                self.show_error("Must select a client before detaching it.");
+            },
+        }
+        true
+    }
     fn reset_selected_index(&mut self) {
         self.sessions.reset_selected_index();
     }
@@ -593,6 +679,9 @@ impl State {
     }
     fn handle_attach_to_session(&mut self, key: KeyWithModifier) -> bool {
         let mut should_render = false;
+        if self.show_client_list {
+            return self.handle_client_list_key(key);
+        }
         if self.show_kill_all_sessions_warning {
             match key.bare_key {
                 BareKey::Char('y') if key.has_no_modifiers() => {
@@ -725,6 +814,10 @@ impl State {
                 BareKey::Char('x') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                     disconnect_other_clients()
                 },
+                BareKey::Char('l') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                    self.open_client_list();
+                    should_render = true;
+                },
                 BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                     if !self.search_term.is_empty() {
                         self.search_term.clear();
@@ -823,6 +916,10 @@ impl State {
     }
     fn handle_single_screen_search_key(&mut self, key: KeyWithModifier) -> bool {
         let mut should_render = false;
+
+        if self.show_client_list {
+            return self.handle_client_list_key(key);
+        }
 
         // Handle kill-all warning overlay first
         if self.show_kill_all_sessions_warning {
@@ -984,6 +1081,10 @@ impl State {
             },
             BareKey::Char('x') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                 disconnect_other_clients();
+            },
+            BareKey::Char('l') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.open_client_list();
+                should_render = true;
             },
             BareKey::Char('a') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                 if !self.is_welcome_screen {

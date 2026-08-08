@@ -1275,6 +1275,45 @@ lines, and in a short pane that is none — the list vanished with no hint that 
 Both list views say it, and neither says it when the list is genuinely empty or a filter matched
 nothing.
 
+### The session manager lists the attached clients, and detaches one of them
+
+`Ctrl+l` in the session manager shows every client attached to the current session:
+
+```
+Clients attached to this session: 2
+
+     Client              Focused pane   Running
+<↓↑> 1 (this client)     terminal 14    zsh
+     2                   terminal 7     nvim FORK.md
+```
+
+`↓↑` selects, `d` detaches the selected client, `ESC` goes back. A detached client keeps its
+session; it is the same outcome as that client pressing its own detach key.
+
+Before this the only thing the plugin could do about a second client was `Ctrl+x`, which
+disconnects *all* of them. Which client to keep was not a question it could ask, because nothing
+told the two apart.
+
+**The current client is listed but cannot be detached from here.** Pressing `d` on it says so
+instead. The session's own detach binding already does that job, and this is the one row where the
+screen reporting the outcome would vanish along with the client that was reading it.
+
+**The row identifies a client by what it is looking at, not by where it came from.** `pane_id` plus
+the command running in that pane is enough to tell two clients apart, and it is what a user
+recognises: the laptop is the one in `nvim FORK.md`. A tty name or `SSH_CONNECTION` was considered
+and rejected — a zellij client is always local to its server, so an ssh or mosh attach would report
+the server's own host, and the plumbing to carry either is much wider than what it would add.
+
+The list is polled once a second while it is open, because clients attach and detach with no event
+of their own. It clears on open rather than showing the previous answer: a stale client list is
+exactly the sort of thing someone would act on.
+
+Server side, `ClientInfo` and `Event::ListClients` already existed and nothing consumed them. What
+was missing was a way to detach a *named* client: the plugin API had `Detach` (yourself) and
+`DisconnectOtherClients` (everyone else) and nothing in between. `PluginCommand::DetachClients`
+fills that gap and reaches the same `ServerInstruction::DetachSession` that `Action::Detach` uses,
+under the `ChangeApplicationState` permission alongside the other two.
+
 ### Focus wraps around the ends of a stack
 
 Moving focus up from the top pane of a stack lands on the bottom pane, and down from the bottom

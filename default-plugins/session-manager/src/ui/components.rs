@@ -1457,6 +1457,28 @@ pub fn render_renaming_session_screen(
     }
 }
 
+/// The help line for the client list, which has its own keys and none of the list's.
+///
+/// It replaces the normal controls line rather than adding to it: every key it names is only bound
+/// while the client list is up, and naming keys that do nothing is worse than naming none.
+pub fn render_client_list_controls(max_cols: usize, colors: Colors, x: usize, y: usize) {
+    let arrows = colors.shortcuts("<↓↑>");
+    let navigate = colors.bold("Select");
+    let detach = colors.shortcuts("<d>");
+    let detach_text = colors.bold("Detach client");
+    let back = colors.shortcuts("<ESC>");
+    let back_text = colors.bold("Back");
+
+    // "Help: <↓↑> - Select, <d> - Detach client, <ESC> - Back" = 54 chars
+    if max_cols > 54 {
+        print!(
+            "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {detach} - {detach_text}, {back} - {back_text}"
+        );
+    } else if max_cols >= 14 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{detach}/{back}");
+    }
+}
+
 pub fn render_controls_line(
     active_screen: ActiveScreen,
     max_cols: usize,
@@ -1490,8 +1512,17 @@ pub fn render_controls_line(
             let kill_text = colors.bold("Kill");
             let kill_all = colors.shortcuts("<Ctrl d>");
             let kill_all_text = colors.bold("Kill all");
+            let clients = colors.shortcuts("<Ctrl l>");
+            let clients_text = colors.bold("Clients");
 
-            if max_cols > 97 {
+            // the client list is the only entry that fits nowhere but the widest tier: it is new,
+            // and displacing an existing key to advertise it would be a bad trade
+            if max_cols > 117 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}, {clients} - {clients_text}"
+                );
+                true
+            } else if max_cols > 97 {
                 print!(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}"
                 );
@@ -1537,9 +1568,17 @@ pub fn render_controls_line(
             // the alias. The narrower tiers keep "<Del>" rather than lose a whole entry to it.
             let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill/Delete");
+            let clients = colors.shortcuts("<Ctrl l>");
+            let clients_text = colors.bold("Clients");
 
+            // Widest: the full line plus ", <Ctrl l> - Clients" = 103 chars
+            if max_cols > 103 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}, {clients} - {clients_text}"
+                );
+                true
             // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del/Ctrl k> - Kill/Delete" = 83 chars
-            if max_cols > 83 {
+            } else if max_cols > 83 {
                 print!(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}"
                 );
