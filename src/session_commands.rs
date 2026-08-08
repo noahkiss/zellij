@@ -32,7 +32,12 @@ use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start
 /// How long to wait for a freshly requested server to appear before calling the creation a failure.
 /// `attach --create-background` returns as soon as the spawn is requested, not once it has happened.
 const SERVER_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(10);
-const SERVER_APPEARANCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// The first gap between polls. Short, because a server that is going to appear usually has.
+const SERVER_APPEARANCE_FIRST_POLL: Duration = Duration::from_millis(50);
+/// The longest gap. Each poll forks `ps` to walk the whole process table, and a fixed short
+/// interval spent the same hundred forks on the session that came up in 200ms and on the one that
+/// was never going to - and the second is the case the watchdog repeats every minute, forever.
+const SERVER_APPEARANCE_MAX_POLL: Duration = Duration::from_millis(1500);
 
 pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs) {
     match cli {
@@ -734,14 +739,29 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
 }
 
 /// Poll until the session looks up, or until the timeout says it never will.
+///
+/// The gap doubles, because every poll costs a `ps` over the whole process table and the two cases
+/// want opposite things from it. A session that comes up does so in the first few hundred
+/// milliseconds and wants to be noticed at once; a session that is never coming up spends the rest
+/// of the ten seconds proving it, and that is the case a launcher REPEATS every minute for as long
+/// as the fault lasts. Backing off cuts the forks on the failing machine by about eight to one and
+/// costs the healthy one nothing.
+///
+/// Nothing here gives up early or escalates, deliberately. This function's whole answer is "the
+/// post-condition does not hold yet", and its caller already reports that loudly and with
+/// diagnostics - to the journal on systemd, to the log the plist names on launchd. What would
+/// escalate is the watchdog deciding to stop retrying, and a watchdog that switches itself off is
+/// the one behaviour a person cannot recover from without a shell on the machine.
 fn wait_for_server(name: &str) -> SessionFacts {
     let deadline = Instant::now() + SERVER_APPEARANCE_TIMEOUT;
+    let mut gap = SERVER_APPEARANCE_FIRST_POLL;
     loop {
         let facts = SessionFacts::collect(name);
         if facts.assert_up().is_ok() || Instant::now() >= deadline {
             return facts;
         }
-        std::thread::sleep(SERVER_APPEARANCE_POLL_INTERVAL);
+        std::thread::sleep(gap);
+        gap = (gap * 2).min(SERVER_APPEARANCE_MAX_POLL);
     }
 }
 

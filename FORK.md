@@ -449,6 +449,15 @@ None of these read `ZELLIJ_SOCKET_DIR`. The binary resolves its own socket direc
 environment variable for a launcher to get wrong, and none for a long-lived shell to hold a stale
 copy of.
 
+The wait for the created server **backs off**. Each poll forks `ps` to walk the whole process
+table, and a fixed 100 ms interval spent the same hundred forks on the session that came up in
+200 ms and on the one that never would — and the second is the case a launcher repeats every minute
+for as long as the fault lasts. The gap doubles from 50 ms to 1.5 s over the same ten seconds, which
+is about eight times fewer forks on the failing machine and no difference on the healthy one.
+Nothing gives up early: what would escalate is the watchdog switching itself off, and that is the
+one state a person cannot recover from without a shell on the machine. The failure is already loud —
+the post-condition and its diagnostics go to the journal, or to the log the plist names.
+
 `up` takes an advisory `flock` on `<socket-dir>/.<name>.up.lock` and holds it across both the check
 and the creation. Without it the two are separate steps, so a `restart` typed by hand overlapping
 the watchdog's minute tick had both sides find no server and both create one — two servers for a
