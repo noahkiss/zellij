@@ -703,21 +703,81 @@ fn installed_jobs(kind: ServiceKind, extension: &str) -> Vec<InstalledJob> {
         .collect()
 }
 
-/// Every file of this extension in the user's own unit directory.
+/// The read-only directories launchd also loads agents from into a user's graphical domain.
+///
+/// An agent here is as loaded, and as much in the way, as one in the user's own directory - which
+/// is the whole point of looking: a job installed by a package or by an MDM profile keeps a session
+/// up exactly as a hand-written one does, and a scan that could not see it reported "nothing
+/// installed" for a machine with a launcher on it.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+const LAUNCHD_SYSTEM_DIRS: &[&str] = &["/Library/LaunchAgents", "/System/Library/LaunchAgents"];
+
+/// The read-only directories the systemd USER manager also reads units from, in its own order of
+/// preference. `/etc` is the administrator's, `/run` is generated, the two `lib` paths are what
+/// packages install into.
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const SYSTEMD_SYSTEM_DIRS: &[&str] = &[
+    "/etc/systemd/user",
+    "/run/systemd/user",
+    "/usr/local/lib/systemd/user",
+    "/usr/lib/systemd/user",
+];
+
+/// Every directory the init system loads units from, the user's own first.
+///
+/// The order is the init system's own precedence, and it is what makes the de-duplication below
+/// correct: a unit in the user's directory SHADOWS one of the same file name further down, so the
+/// first of a name is the one that runs.
+///
+/// Only the user's directory is ever written to. `enable` and `disable` go through `service_dir`,
+/// not through this - installing into `/usr/lib` would need root and would be somebody else's file.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn unit_search_dirs(kind: ServiceKind) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(dir) = service_dir(kind) {
+        dirs.push(dir);
+    }
+    let system: &[&str] = match kind {
+        #[cfg(any(target_os = "macos", all(unix, test)))]
+        ServiceKind::Launchd => LAUNCHD_SYSTEM_DIRS,
+        #[cfg(not(any(target_os = "macos", all(unix, test))))]
+        ServiceKind::Launchd => &[],
+        #[cfg(any(target_os = "linux", all(unix, test)))]
+        ServiceKind::Systemd => SYSTEMD_SYSTEM_DIRS,
+        #[cfg(not(any(target_os = "linux", all(unix, test))))]
+        ServiceKind::Systemd => &[],
+    };
+    dirs.extend(system.iter().map(PathBuf::from));
+    dirs
+}
+
+/// Every file of this extension the init system would load, nearest definition of each name first.
 #[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
 fn unit_files(kind: ServiceKind, extension: &str) -> Vec<PathBuf> {
-    let Ok(dir) = service_dir(kind) else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        // no directory is not a fault: a machine with nothing installed has nothing to enumerate
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some(extension))
-        .collect()
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<std::ffi::OsString> = Vec::new();
+    for dir in unit_search_dirs(kind) {
+        // no directory is not a fault: a machine with nothing installed has nothing to enumerate,
+        // and several of these exist only on some distributions
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().and_then(|e| e.to_str()) != Some(extension) {
+                continue;
+            }
+            let Some(name) = path.file_name().map(|name| name.to_owned()) else {
+                continue;
+            };
+            // a nearer directory has already defined this name, and its file is the one that runs
+            if seen.contains(&name) {
+                continue;
+            }
+            seen.push(name);
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// One job read off disk, or nothing if the file is not one this can make sense of.
@@ -744,10 +804,31 @@ fn read_installed_job(kind: ServiceKind, path: &Path) -> Option<InstalledJob> {
     }
 }
 
+/// Whether a plist could possibly be a job that runs `session up`, judged on its raw bytes.
+///
+/// `/System/Library/LaunchAgents` holds several hundred of Apple's own agents and most are saved in
+/// the binary format, so converting each one would fork `plutil` several hundred times on every
+/// `session up` - which a watchdog runs every minute. This is the cheap half of that question,
+/// asked before any conversion.
+///
+/// It is exactly as precise as the parser it stands in front of. What identifies the job is the
+/// words `session` and `up` in the command line, so a plist whose bytes do not contain "session"
+/// cannot produce a match however it is parsed - and both plist formats store their strings
+/// literally, so the bytes are there to be found in either.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn could_run_session_up(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"session".len())
+        .any(|window| window == b"session")
+}
+
 /// A launch agent as XML, converting it first if it was saved in the binary plist format.
 #[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
 fn launch_agent_xml(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
+    if !could_run_session_up(&bytes) {
+        return None;
+    }
     if !bytes.starts_with(b"bplist") {
         return String::from_utf8(bytes).ok();
     }
@@ -2257,6 +2338,34 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn an_absent_variable_is_not_an_empty_path() {
         assert_eq!(environment_value("LANG=C\n", "XDG_CONFIG_HOME"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_users_own_directory_is_searched_before_the_system_ones() {
+        let dirs = unit_search_dirs(ServiceKind::Systemd);
+        assert_eq!(
+            dirs.first(),
+            service_dir(ServiceKind::Systemd).ok().as_ref()
+        );
+        assert!(dirs.iter().any(|dir| dir == Path::new("/etc/systemd/user")));
+        let agents = unit_search_dirs(ServiceKind::Launchd);
+        assert!(agents
+            .iter()
+            .any(|dir| dir == Path::new("/Library/LaunchAgents")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_plist_that_never_says_session_is_not_converted() {
+        // the cheap half of the question, asked before plutil is forked over several hundred of
+        // Apple's own agents on every pass
+        assert!(!could_run_session_up(
+            b"bplist00\x00com.apple.somethingelse"
+        ));
+        assert!(could_run_session_up(
+            b"bplist00\x00zellij\x00session\x00up\x00work"
+        ));
     }
 
     #[test]

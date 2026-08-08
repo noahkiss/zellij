@@ -558,10 +558,23 @@ session being created, and a guard that cannot see the job falls through to crea
 everybody whose agent it did not install itself. Found on a real machine, where `session restart`
 over SSH created a `Background`-domain session past a loaded agent.
 
-So the job is now identified by what it **does**. Both platforms enumerate the user's own
-directory — `~/Library/LaunchAgents/*.plist`, `~/.config/systemd/user/*.service` — read `Label` and
-`ProgramArguments`, or `ExecStart`, and match a job whose arguments run `session up <name>` for this
-session. argv[0] is not looked at: a unit may exec zellij through a wrapper, and a renamed or
+So the job is now identified by what it **does**. Both platforms enumerate every directory the init
+system loads from — the user's own first, then the read-only system ones: `/Library/LaunchAgents`
+and `/System/Library/LaunchAgents` on macOS, `/etc/systemd/user`, `/run/systemd/user` and the two
+`lib/systemd/user` paths on Linux. A job a package or an MDM profile installed keeps a session up
+exactly as a hand-written one does, and scanning only the user's directory called it absent. A
+nearer directory shadows a file of the same name, which is the init systems' own precedence.
+**Only the user's directory is ever written to** — installing anywhere else would need root and
+would be somebody else's file.
+
+`/System/Library/LaunchAgents` holds several hundred of Apple's agents, most in the binary plist
+format, so converting each one would fork `plutil` hundreds of times per pass — on a command a
+watchdog runs every minute. A plist whose raw bytes never contain `session` cannot match however it
+is parsed, because the subcommand *is* the identity and both plist formats store strings literally.
+That check costs a read and runs before any conversion.
+
+Each file is then read for `Label` and `ProgramArguments`, or for `ExecStart`, and matches when its
+arguments run `session up <name>` for this session. argv[0] is not looked at: a unit may exec zellij through a wrapper, and a renamed or
 symlinked build is the same program. The subcommand sequence is the identity. A job for another
 session, or one running another subcommand, does not match.
 
