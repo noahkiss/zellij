@@ -713,6 +713,34 @@ exactly the same problem, and `restart` ends in `up` anyway. Dropped after a res
 daemonized, and in `up` immediately before the server is asked for, which is before the server
 captures the environment it will hand out.
 
+### A dangling `SSH_AUTH_SOCK` is dropped when a session is created
+
+A stale agent socket is worse than none. With no `SSH_AUTH_SOCK` at all, `ssh` and `git push` fall
+through to the keys on disk and ask for a passphrase — awkward, but it works and the reason is
+legible. With one that names a socket that has gone, every agent-backed command in **every** pane
+fails with `Permission denied (publickey)` for the life of the session, while a terminal opened
+beside it works. A graphical login exports `/tmp/ssh-XXXX/agent.<pid>`, a new path at every login,
+so a session created from an old shell hands out the previous login's path — and the server gives
+its environment to every pane, so the wrong value outlives whatever set it.
+
+`session up` drops the variable when the path it names is not there. It does **not** invent one:
+this binary cannot know where an agent would be on your machine, and a wrong path is the fault
+being removed. A machine that runs an agent at a fixed path can say so itself, as a
+[`session_service`](#extra-unit-directives-from-the-config-session_service) extra:
+
+```kdl
+session_service {
+    systemd {
+        service "Environment=SSH_AUTH_SOCK=%t/ssh-agent.socket"
+    }
+}
+```
+
+`%t` is systemd's `$XDG_RUNTIME_DIR`, which is where a user-level agent unit conventionally puts its
+socket. There is no launchd equivalent yet: `EnvironmentVariables` is a key the generator owns, and
+a bare `SSH_AUTH_SOCK` under `launchd { keys { ... } }` would be a top-level plist key, which
+launchd ignores in silence.
+
 ### `~` and `$VAR` in config paths
 
 Layouts have always expanded `~` in a plugin location, because layout parsing runs it through

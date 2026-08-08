@@ -688,6 +688,21 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
     ] {
         std::env::remove_var(var);
     }
+    // A stale agent socket is worse than none, and the server hands its environment to every pane
+    // for the life of the session - so one dead path here is `git push` failing with "Permission
+    // denied (publickey)" in every pane, beside a terminal where it works. See
+    // `session_lifecycle::ssh_auth_sock_is_dangling`. Nothing is invented in its place: this
+    // machine cannot know where an agent would be, and a wrong path is the fault being removed.
+    let ssh_auth_sock = std::env::var("SSH_AUTH_SOCK").ok();
+    if zellij_utils::session_lifecycle::ssh_auth_sock_is_dangling(ssh_auth_sock.as_deref()) {
+        println!(
+            "      SSH_AUTH_SOCK names a socket that is not there ({}); dropping it rather than \
+             handing it to every pane",
+            ssh_auth_sock.unwrap_or_default()
+        );
+        std::env::remove_var("SSH_AUTH_SOCK");
+    }
+
     // The configured drop-list is about the same hazard from the other end: a variable describing
     // the ONE program that asked for this would otherwise describe every pane of the session. It
     // reads as restart-specific and is not - `session up other-session` typed in an agent's pane

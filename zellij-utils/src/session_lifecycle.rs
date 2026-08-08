@@ -658,6 +658,28 @@ pub fn colorterm_for_new_session(current: Option<&str>) -> Option<&'static str> 
     }
 }
 
+/// Whether an inherited `SSH_AUTH_SOCK` points at a socket that is not there any more.
+///
+/// A STALE value is worse than none, and that is the whole reason this is checked. With no
+/// `SSH_AUTH_SOCK` at all, `ssh` and `git push` fall through to the keys on disk and ask for a
+/// passphrase - awkward, but it works and the reason is legible. With one that names a socket that
+/// has gone, every agent-backed operation in every pane fails with "Permission denied (publickey)"
+/// for the life of the session, while a terminal opened beside it works.
+///
+/// A graphical login exports `/tmp/ssh-XXXX/agent.<pid>`, which is a new path at every login, so a
+/// session created from an old shell hands out the previous login's path. The server gives its
+/// environment to every pane, so the wrong value is inherited by all of them and outlives whatever
+/// set it.
+///
+/// Only the DANGLING case is answered here. Inventing a value is a different question with no
+/// portable answer - see the `session_service` docs for the one a config can state for itself.
+pub fn ssh_auth_sock_is_dangling(value: Option<&str>) -> bool {
+    match value {
+        Some(path) if !path.is_empty() => !Path::new(path).exists(),
+        _ => false,
+    }
+}
+
 /// Whether one `session_restart_drop_env` pattern names this variable.
 ///
 /// Two cases and no more: an exact name, or a name ending in `*`, which matches by prefix. A `*`
@@ -1495,6 +1517,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("invisible"), "{}", err);
+    }
+
+    #[test]
+    fn an_ssh_auth_sock_nothing_is_listening_on_is_dangling() {
+        assert!(ssh_auth_sock_is_dangling(Some(
+            "/tmp/ssh-NOTHING/agent.99999"
+        )));
+    }
+
+    #[test]
+    fn an_ssh_auth_sock_that_is_there_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("agent.1");
+        std::fs::write(&socket, b"").unwrap();
+        assert!(!ssh_auth_sock_is_dangling(socket.to_str()));
+    }
+
+    #[test]
+    fn an_unset_or_empty_ssh_auth_sock_is_not_dangling() {
+        // nothing to drop, and reporting one would send the reader after a variable that is
+        // already absent
+        assert!(!ssh_auth_sock_is_dangling(None));
+        assert!(!ssh_auth_sock_is_dangling(Some("")));
     }
 
     #[test]
