@@ -905,9 +905,10 @@ pub fn start_server(mut os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
 
     envs::set_zellij("0".to_string());
 
-    // Settle macOS's file-access decisions about THIS executable before any pane exists to be
-    // refused by them. A launcher-created session has no terminal emulator to inherit grants from,
-    // and they are keyed to the executable's versioned path, so each upgrade starts with none.
+    // Settle macOS's file-access decisions about THIS executable, so the upgrade that lost the
+    // grants is what asks for them back. A launcher-created session has no terminal emulator to
+    // inherit grants from, and they are keyed to the executable's versioned path, so each upgrade
+    // starts with none. Returns at once - it must never block startup on a consent dialog.
     // No-op off macOS.
     zellij_utils::session_lifecycle::probe_protected_locations();
 

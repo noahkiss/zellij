@@ -822,8 +822,10 @@ pub fn classify_tcc_probe(error: Option<std::io::ErrorKind>) -> TccProbe {
 /// Deliberately silent about success and best-effort throughout: this reports a fault, it does not
 /// gate a session on one. A refusal is logged rather than raised because the process that will
 /// actually hit the wall is a pane's, minutes or days later, and nothing here can intercept it.
+///
+/// Blocking. Call [`probe_protected_locations`] instead unless the wait is wanted.
 #[cfg(target_os = "macos")]
-pub fn probe_protected_locations() {
+pub fn probe_protected_locations_now() {
     let Some(dirs) = directories::BaseDirs::new() else {
         return;
     };
@@ -865,9 +867,33 @@ pub fn probe_protected_locations() {
     }
 }
 
+/// Start the probe on its own thread and return at once.
+///
+/// The probe MUST NOT run on the caller's thread. A promptable location with no decision on record
+/// blocks inside the open until someone answers the consent dialog - measured at about 100 seconds
+/// on one machine, and once until the machine was rebooted. The caller is the server's main thread,
+/// so a waiting dialog means the session never appears at all, and every retry is refused as a
+/// second server. The failure names nothing near its cause.
+///
+/// This gives up an ordering guarantee: panes now spawn while a decision may still be pending. It
+/// costs nothing, because TCC coalesces. Measured on a machine with no decision on record: two
+/// processes touching the same protected directory, one pending dialog, and BOTH waited - neither
+/// was refused. So a pane that touches a protected directory in those first seconds waits alongside
+/// the probe and proceeds once the user answers.
+#[cfg(target_os = "macos")]
+pub fn probe_protected_locations() {
+    let _ = std::thread::Builder::new()
+        .name("tcc_probe".to_string())
+        .spawn(probe_protected_locations_now);
+}
+
 /// Everywhere else has no TCC, so there is nothing to decide.
 #[cfg(not(target_os = "macos"))]
 pub fn probe_protected_locations() {}
+
+/// Everywhere else has no TCC, so there is nothing to decide.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_protected_locations_now() {}
 
 #[cfg(test)]
 mod tests {
@@ -1275,6 +1301,7 @@ mod tests {
     fn probing_is_safe_to_call_anywhere() {
         // Off macOS this is empty, and on macOS it must survive a missing home, an absent
         // directory and a refusal without propagating any of them. A session is never gated on it.
+        probe_protected_locations_now();
         probe_protected_locations();
     }
 }

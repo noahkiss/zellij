@@ -984,6 +984,17 @@ probe's job is to make the decision happen at a moment that explains itself.
 Recovery differs by pane, which the log line says: Full Disk Access is toggled on, while a Files &
 Folders refusal is permanent until its **entry is removed**, after which the prompt returns.
 
+**The probe runs on its own thread, and must.** A promptable location with no decision on record
+blocks inside the open until someone answers the dialog. On the server's main thread that means the
+session never appears — about 100 seconds on one machine, and once until it was rebooted — while
+every retry is refused as a second server, and the log stops at a line nowhere near the cause.
+
+That gives up an ordering guarantee: panes now spawn while a decision may still be pending. It costs
+nothing, because TCC coalesces. Measured on a machine with no decision on record: two processes
+touching the same protected directory, one pending dialog, and **both waited** — neither was refused.
+A pane that touches a protected directory in those first seconds waits alongside the probe and
+proceeds once the user answers.
+
 `zellij-server/src/lib.rs` gets one call; the probe and its classifier live in
 `session_lifecycle.rs`, which is fork-owned. No-op off macOS.
 
