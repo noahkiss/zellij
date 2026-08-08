@@ -1595,8 +1595,16 @@ intel mac, no Windows.
    them — never move one.
 3. Watch the run: `gh run watch -R noahkiss/zellij $(gh run list -R noahkiss/zellij --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')`.
 4. Bump `Formula/zellij-nkmk.rb` in the tap: `version`, the URLs, and the `sha256`
-   values. The shas are on the release as `<asset>.sha256` — `gh release download v<version>
-   -R noahkiss/zellij -p '*.sha256' -D - 2>/dev/null` or just read them off the release page.
+   values. The shas are on the release as `<asset>.sha256`. `-D -` does **not** stream to stdout —
+   it creates a directory literally named `-` — so download to a temp dir and read them:
+
+   ```
+   d=$(mktemp -d) && gh release download v<version> -R noahkiss/zellij -p '*.sha256' -D "$d" \
+     && cat "$d"/*.sha256
+   ```
+
+   Better still, verify rather than transcribe: download the tarballs alongside them and run
+   `sha256sum -c *.sha256` in that directory, so a wrong value cannot reach the formula.
    `Formula/zellij-nkmk-source.rb` takes the tag tarball's sha instead.
 
 A pour of the prebuilt formula reinstalls in about 2 seconds. If a test install takes minutes
