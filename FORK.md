@@ -1232,6 +1232,39 @@ name would delete one instead. Each key tests its own modifiers.
 The widest tier of each help line advertises `<Del/Ctrl k>`; narrower tiers keep `<Del>` rather than
 drop a whole entry to fit it.
 
+### The session manager says why its list is empty
+
+An empty session list used to be indistinguishable from a broken one. The plugin polls the server
+once a second for the list, and the poll's failure went into `Err(_) => return false` — the message
+naming what went wrong was thrown away, and the list stayed empty forever with nothing on screen to
+suggest a failure had happened at all. This fork's own machines have shown that empty list for
+months without ever producing a clue.
+
+The list area now carries the reason, since it is empty anyway:
+
+```
+Session list unavailable: Session-scan state not initialized
+```
+
+The message is the server's own, whatever it is, and it is logged as well. It is drawn as a plain
+line rather than through the plugin's error modal on purpose: that modal swallows the next keypress,
+and a failure that re-arms every second would make the plugin untypeable.
+
+A successful poll that simply returns nothing gets a line too:
+
+```
+No sessions found: the server's scan of its socket and session-info dirs returned none.
+```
+
+That case is the more likely one, and it is not an error anywhere in the server. The scan pairs each
+socket with a `session-metadata.kdl` under the session-info cache directory, and drops any session
+whose file is missing or does not parse — silently, reporting success with an empty list. `zellij
+ls`, which reads the sockets alone, keeps listing the session throughout. A user seeing a full
+`zellij ls` and an empty picker is looking at exactly that mismatch.
+
+The welcome screen is exempt: it hides the current session deliberately, so an empty list there is
+normal.
+
 ### Focus wraps around the ends of a stack
 
 Moving focus up from the top pane of a stack lands on the bottom pane, and down from the bottom

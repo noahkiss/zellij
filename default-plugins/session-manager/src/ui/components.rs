@@ -1408,6 +1408,23 @@ pub fn render_error(error_text: &str, rows: usize, columns: usize, x: usize, y: 
     );
 }
 
+/// Draw a one-line notice where the session list would be.
+///
+/// The list area is empty whenever there is something to say here, so the notice costs nothing and
+/// is the only place a user ever sees why the list is empty.
+pub fn render_session_list_notice(notice: &str, columns: usize, x: usize, y: usize) {
+    if columns == 0 {
+        return;
+    }
+    print_text_with_coordinates(
+        Text::new(notice.to_owned()).color_range(3, ..),
+        x,
+        y,
+        Some(columns),
+        None,
+    );
+}
+
 pub fn render_renaming_session_screen(
     new_session_name: &str,
     rows: usize,

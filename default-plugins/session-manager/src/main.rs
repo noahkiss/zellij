@@ -12,8 +12,8 @@ use single_screen::{DeleteTarget, SingleScreenMode, SingleScreenState, UnifiedSe
 use ui::{
     components::{
         render_controls_line, render_error, render_new_session_block, render_prompt,
-        render_renaming_session_screen, render_screen_toggle, render_single_screen_prompt,
-        render_unified_results, render_unsaved_changes_line, Colors,
+        render_renaming_session_screen, render_screen_toggle, render_session_list_notice,
+        render_single_screen_prompt, render_unified_results, render_unsaved_changes_line, Colors,
     },
     welcome_screen::{render_banner, render_welcome_boundaries},
     SessionUiInfo,
@@ -56,6 +56,13 @@ struct State {
     current_session_last_saved_time: Option<u64>,
     is_visible: bool,
     refresh_timer_armed: bool,
+    /// Why the last session-list poll came back with nothing, if it failed.
+    ///
+    /// The poll runs once a second and its failure is otherwise invisible: the list stays empty
+    /// forever with no indication that anything went wrong. Keep it out of `error`, which is a
+    /// modal that swallows the next keypress - a failure that re-arms every second would make the
+    /// plugin untypeable.
+    session_list_error: Option<String>,
 }
 
 register_plugin!(State);
@@ -262,6 +269,9 @@ impl ZellijPlugin for State {
                     for (i, line) in list.iter().enumerate() {
                         print!("\u{1b}[{};{}H{}", y + i + 5, x, line.render());
                     }
+                    if let Some(notice) = self.session_list_notice() {
+                        render_session_list_notice(&notice, width.saturating_sub(7), x, y + 5);
+                    }
                 }
             },
             ActiveScreen::ResurrectSession => {
@@ -326,6 +336,14 @@ impl ZellijPlugin for State {
                                 x_centered,
                                 y_offset + 2,
                             );
+                            if let Some(notice) = self.session_list_notice() {
+                                render_session_list_notice(
+                                    &notice,
+                                    content_width,
+                                    x_centered,
+                                    y_offset + 3,
+                                );
+                            }
                         }
                     },
                     SingleScreenMode::SelectingLayout => {
@@ -1269,6 +1287,32 @@ impl State {
             ActiveScreen::SingleScreen => ActiveScreen::SingleScreen, // no-op
         };
     }
+    /// What to draw where the session list would be, when the list has nothing to show.
+    ///
+    /// A failed poll is not the only way the list ends up empty: the server's scan drops a session
+    /// silently when its socket has no matching `session-metadata.kdl`, or when that file does not
+    /// parse, and reports success with an empty list. Say so either way - an empty list with no
+    /// explanation is the bug this exists to end.
+    fn session_list_notice(&self) -> Option<String> {
+        if let Some(error) = self.session_list_error.as_ref() {
+            return Some(format!("Session list unavailable: {}", error));
+        }
+        if self.is_welcome_screen {
+            // the welcome screen hides the current session on purpose, so empty is normal here
+            return None;
+        }
+        if self.sessions.session_ui_infos.is_empty()
+            && self
+                .resurrectable_sessions
+                .all_resurrectable_sessions
+                .is_empty()
+        {
+            return Some(String::from(
+                "No sessions found: the server's scan of its socket and session-info dirs returned none.",
+            ));
+        }
+        None
+    }
     fn show_error(&mut self, error_text: &str) {
         self.error = Some(error_text.to_owned());
     }
@@ -1288,8 +1332,18 @@ impl State {
 
     fn refresh_session_list(&mut self) -> bool {
         let snapshot = match get_session_list() {
-            Ok(snapshot) => snapshot,
-            Err(_) => return false,
+            Ok(snapshot) => {
+                self.session_list_error = None;
+                snapshot
+            },
+            Err(e) => {
+                let is_new = self.session_list_error.as_deref() != Some(e.as_str());
+                if is_new {
+                    eprintln!("session-manager: failed to get the session list: {}", e);
+                    self.session_list_error = Some(e);
+                }
+                return is_new;
+            },
         };
         for session_info in &snapshot.live_sessions {
             if session_info.is_current_session {
