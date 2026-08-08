@@ -231,6 +231,110 @@ impl SessionFacts {
     }
 }
 
+/// How long to wait for another `session up` to finish before going ahead without the lock.
+///
+/// Comfortably longer than an `up` takes: the creating path waits at most
+/// `SERVER_APPEARANCE_TIMEOUT` for the server to appear and does nothing slow after that. A wait
+/// that runs out therefore means the holder is wedged rather than busy, and refusing to bring the
+/// session up over a wedged neighbour would be a worse outcome than the race the lock prevents.
+#[cfg(unix)]
+const UP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(unix)]
+const UP_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The lock file one session name's `up` takes, in the socket directory this binary resolved.
+///
+/// That directory and no other: the two processes racing here are two zellij binaries, and the
+/// socket directory is the one path they are guaranteed to have resolved the same way - it is the
+/// directory whose contents they are racing to create. A lock somewhere derived from the
+/// environment would be two different files on the two sides, which is no lock at all.
+#[cfg(unix)]
+pub fn up_lock_path(name: &str) -> PathBuf {
+    ZELLIJ_SOCK_DIR.join(format!(".{}.up.lock", name))
+}
+
+/// An advisory lock held across the whole of one `session up` - the check AND the creation.
+///
+/// `up` is only idempotent if those two are one step. Two of them at once - a `restart` typed by
+/// hand overlapping the watchdog's minute tick - both find no server, both create one, and the name
+/// ends up with two servers where it allows one. `assert_up` then reports the duplicate on both
+/// sides and neither cleans it up, so every later `up` refuses until somebody kills a server by
+/// hand.
+///
+/// With the lock the second one waits, then finds the session healthy and says "already running",
+/// which is what it should have said in the first place.
+#[cfg(unix)]
+pub struct UpLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for UpLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // closing the descriptor would release it anyway; releasing it deliberately is cheaper
+        // than leaving the next reader to know that
+        // SAFETY: the descriptor is owned by this struct and is open for as long as it is
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+/// Take the lock for `name`, waiting for a holder to finish.
+///
+/// `None` means the caller proceeds unlocked, and both ways of getting it are deliberate. A lock
+/// file that cannot be created (an unwritable socket directory) and a holder that never lets go are
+/// both worse reasons to leave a machine with no session than the race is to run.
+#[cfg(unix)]
+pub fn lock_up(name: &str) -> Option<UpLock> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = up_lock_path(name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // never truncated: the file is a name to lock, not a file with contents, and truncating it
+    // would rewrite a file another process is holding
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            log::debug!("could not open {} to lock it: {}", path.display(), e);
+            return None;
+        },
+    };
+    let deadline = std::time::Instant::now() + UP_LOCK_TIMEOUT;
+    loop {
+        // SAFETY: the descriptor is owned by `file`, which outlives this call
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(UpLock { file });
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "warning: another `zellij session up {}` has held {} for {}s. Going ahead \
+                 without the lock, so two servers for this name are possible.",
+                name,
+                path.display(),
+                UP_LOCK_TIMEOUT.as_secs()
+            );
+            return None;
+        }
+        std::thread::sleep(UP_LOCK_POLL);
+    }
+}
+
+/// Nothing to lock where there is no `flock`: the socket checks carry what they carried before.
+#[cfg(not(unix))]
+pub struct UpLock;
+
+#[cfg(not(unix))]
+pub fn lock_up(_name: &str) -> Option<UpLock> {
+    None
+}
+
 /// The up post-condition, separated from the machine so it can be exercised without one.
 ///
 /// `have_process_table` is false where no portable process scan exists; the socket then carries the

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    colorterm_for_new_session, env_vars_to_drop, term_for_new_session,
+    colorterm_for_new_session, env_vars_to_drop, lock_up, term_for_new_session,
     warn_if_server_build_differs, DownOutcome, SessionFacts,
 };
 use zellij_utils::session_service::{
@@ -599,6 +599,11 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
     // reaches the pinned copy through this pass and no other, and the pass that returns early is
     // exactly the one an upgraded machine takes every minute.
     assert_pinned_exe(name, configured_extras(opts).as_ref());
+
+    // Held for the rest of this function, which is what makes `up` idempotent under concurrency:
+    // the check and the creation are one step, so a `restart` overlapping the watchdog's minute
+    // tick waits here and then finds the session already up. See `session_lifecycle::lock_up`.
+    let _up_lock = lock_up(name);
 
     let facts = SessionFacts::collect(name);
     let healthy = facts.assert_up().is_ok();

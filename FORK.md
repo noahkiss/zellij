@@ -449,6 +449,15 @@ None of these read `ZELLIJ_SOCKET_DIR`. The binary resolves its own socket direc
 environment variable for a launcher to get wrong, and none for a long-lived shell to hold a stale
 copy of.
 
+`up` takes an advisory `flock` on `<socket-dir>/.<name>.up.lock` and holds it across both the check
+and the creation. Without it the two are separate steps, so a `restart` typed by hand overlapping
+the watchdog's minute tick had both sides find no server and both create one — two servers for a
+name that allows one, reported by `assert_up` on both sides and cleaned up by neither, after which
+every later `up` refused until somebody killed a server by hand. With the lock the second one waits
+and then reports the session already running. A lock that cannot be taken in 30 seconds is a wedged
+holder rather than a busy one, so it is named and the `up` goes ahead: no session at all is a worse
+outcome than the race.
+
 ### `zellij setup --generate-service <systemd|launchd>`
 
 Writes a user-level systemd unit or launchd plist whose only job is to call `zellij session up`.
