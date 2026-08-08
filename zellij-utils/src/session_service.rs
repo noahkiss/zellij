@@ -1875,6 +1875,53 @@ pub struct ServiceFileStatus {
     pub stale: bool,
 }
 
+/// What the unit ON DISK holds, against what this config and this environment would write now.
+///
+/// The state worth naming is the middle one. Change the config and the loaded job does not change
+/// with it: the file is stale, the init system is still running the definition it was handed, and
+/// nothing anywhere says so. It is the same class of fault as a pinned path the launcher does not
+/// run - internally consistent from every angle, wrong only when the two are compared - which is
+/// why it is reported the same way, by [`PinState`]'s example.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitDrift {
+    /// Nothing this build wrote is on disk, so there is nothing that could have drifted. A job
+    /// under another name is somebody else's file and is not compared against a generated one.
+    NotInstalled,
+    /// Every file present is byte-for-byte what `session enable` would write now.
+    Current,
+    /// A file present is not. Named, because the remedy is to rewrite exactly these.
+    Drifted { paths: Vec<PathBuf> },
+}
+
+/// Compare the installed files against the ones this config would generate.
+pub fn unit_drift(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> Result<UnitDrift, String> {
+    Ok(drift_of(&service_files(kind, exe, session, extras)?))
+}
+
+/// The comparison itself, over files that already carry both halves: what is on disk, and what
+/// `contents` says would be written.
+pub fn drift_of(files: &[ServiceFile]) -> UnitDrift {
+    let present: Vec<&ServiceFile> = files.iter().filter(|file| file.exists()).collect();
+    if present.is_empty() {
+        return UnitDrift::NotInstalled;
+    }
+    let paths: Vec<PathBuf> = present
+        .iter()
+        .filter(|file| !file.is_current())
+        .map(|file| file.path.clone())
+        .collect();
+    if paths.is_empty() {
+        UnitDrift::Current
+    } else {
+        UnitDrift::Drifted { paths }
+    }
+}
+
 /// Write the files and hand them to the init system.
 ///
 /// Idempotent in both directions: a second `enable` over an unchanged install reports
@@ -2435,6 +2482,49 @@ mod tests {
         assert!(could_run_session_up(
             b"bplist00\x00zellij\x00session\x00up\x00work"
         ));
+    }
+
+    /// An install of one unit: what is on disk, against what the generator would write.
+    fn installed_unit(
+        dir: &tempfile::TempDir,
+        on_disk: Option<&str>,
+        would_write: &str,
+    ) -> Vec<ServiceFile> {
+        let path = dir.path().join("zellij-session-work.service");
+        if let Some(on_disk) = on_disk {
+            std::fs::write(&path, on_disk).unwrap();
+        }
+        vec![ServiceFile {
+            role: "service",
+            unit: "zellij-session-work.service".to_owned(),
+            path,
+            contents: would_write.to_owned(),
+        }]
+    }
+
+    #[test]
+    fn an_unchanged_unit_has_not_drifted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = installed_unit(&dir, Some("[Service]\n"), "[Service]\n");
+        assert_eq!(drift_of(&files), UnitDrift::Current);
+    }
+
+    #[test]
+    fn a_changed_config_shows_up_as_drift() {
+        // the fault is invisible from every other angle: the file is internally fine, the loaded
+        // job is internally fine, and only the comparison says anything
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = installed_unit(&dir, Some("[Service]\nNice=-5\n"), "[Service]\n");
+        assert!(matches!(drift_of(&files), UnitDrift::Drifted { .. }));
+    }
+
+    #[test]
+    fn nothing_installed_is_not_drift() {
+        // a machine with no launcher has nothing to have drifted, and reporting drift there would
+        // fire on every `up` forever
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = installed_unit(&dir, None, "[Service]\n");
+        assert_eq!(drift_of(&files), UnitDrift::NotInstalled);
     }
 
     #[test]

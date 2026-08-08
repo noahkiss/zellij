@@ -905,7 +905,8 @@ came back wrong. The generated unit now carries the absolute path the enabling s
 result, never re-derive at run time. It is a **default** — a config that sets its own replaces it —
 and it is absent entirely when the enabling environment has no absolute one, because then both
 sides fall through to the same `HOME`-derived directory and there is nothing to disagree about.
-A unit enabled before this change carries no such line, so re-run `session enable` to record one.
+A unit enabled before this change carries no such line — which is exactly the state
+[the drift check](#the-config-and-the-installed-unit-are-compared) reports.
 
 **The unit directory is asked for, not derived** (systemd). `~/.config/systemd/user` is
 `$XDG_CONFIG_HOME/systemd/user`, and the `XDG_CONFIG_HOME` that matters is the *manager's*, not the
@@ -950,6 +951,33 @@ name: com.example.my-terminal" while `disable` said "no service installed; nothi
   session had been switched off, and the next boot would disagree — worse after a partial removal,
   because the session then returns from something the command has just made harder to find. The
   detail is on stdout either way; the exit code is for the caller that reads nothing else.
+
+### The config and the installed unit are compared
+
+Edit the config and the loaded job does not change with it. The file on disk is stale, the init
+system is still running the definition it was handed, and every angle you can look from is
+internally consistent — it is only wrong when the two are compared. That is the same shape as a
+pinned path the launcher does not run, and it is reported the same way.
+
+`status` gains a `drift` line, and drift counts against its exit code:
+
+```
+drift     ~/.config/systemd/user/zellij-session-my-session.service is NOT what this config would write now
+drift     run `zellij session enable my-session` to rewrite and reload it
+```
+
+`up` says it once per invocation, on the same pass that keeps the pinned copy current — so it
+reaches a machine nobody is looking at, through the journal or the log the plist names. Silent
+unless something zellij wrote is installed *and* differs: a machine with no launcher has nothing to
+report, and reporting it every minute would be worse than saying nothing.
+
+**The remedy has to be `session enable`, not a reload by hand**, and launchd is why: a plist whose
+*content* changed needs `bootout` then `bootstrap`. `launchctl kickstart` restarts the job from the
+definition launchd already holds, so the obvious command runs the old plist and looks like the edit
+did nothing. `session enable` does the right pair, which is the whole reason it exists.
+
+A job installed under another name is not compared. It is somebody else's file and was never
+generated from this config.
 
 ### Extra unit directives from the config (`session_service`)
 

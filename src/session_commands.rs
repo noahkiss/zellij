@@ -23,7 +23,7 @@ use zellij_utils::session_lifecycle::{
 };
 use zellij_utils::session_service::{
     self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
-    PinState, PlistValue, ServiceExe, ServiceKind, SessionServiceOptions,
+    PinState, PlistValue, ServiceExe, ServiceKind, SessionServiceOptions, UnitDrift,
 };
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
@@ -467,6 +467,7 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
     // what the config adds is reported here because it can be: this is the whole argument for
     // keeping it in the config rather than in a drop-in directory the tool cannot see
     print_configured_extras(kind, extras.as_ref());
+    let unit_is_current = print_unit_drift(kind, exe.path(), name, extras.as_ref());
     let pinned_agrees = print_pin_state(name, pinned.as_deref());
 
     let facts = SessionFacts::collect(name);
@@ -475,11 +476,100 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
         Err(reason) => println!("running   no - {}", reason),
     }
 
-    if installed && status.loaded && pinned_agrees {
+    if installed && status.loaded && pinned_agrees && unit_is_current {
         0
     } else {
         1
     }
+}
+
+/// The `drift` line: whether the unit on disk is still what this config would write.
+///
+/// Reported, and counted against the exit code, because nothing else notices. Edit the config and
+/// the loaded job does not change with it - the file is stale, the init system is still running the
+/// definition it was handed, and every angle you can look from is internally consistent. It is only
+/// wrong when the two are compared, which is the same shape as the pin mismatch reported below it.
+///
+/// The remedy has to be `session enable` and not a reload by hand, and launchd is why: a plist
+/// whose CONTENT changed needs `bootout` then `bootstrap`, and `launchctl kickstart` restarts the
+/// job from the definition launchd already holds - so the obvious command runs the old plist and
+/// looks like the edit did nothing.
+fn print_unit_drift(
+    kind: ServiceKind,
+    exe: &std::path::Path,
+    name: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> bool {
+    match session_service::unit_drift(kind, exe, name, extras) {
+        Ok(UnitDrift::NotInstalled) => {
+            println!("drift     nothing zellij wrote is installed to compare against");
+            true
+        },
+        Ok(UnitDrift::Current) => {
+            println!("drift     none - the installed unit is what this config would write");
+            true
+        },
+        Ok(UnitDrift::Drifted { paths }) => {
+            for path in paths {
+                println!(
+                    "drift     {} is NOT what this config would write now",
+                    path.display()
+                );
+            }
+            println!(
+                "drift     run `zellij session enable {}` to rewrite and reload it",
+                name
+            );
+            if kind == ServiceKind::Launchd {
+                println!(
+                    "drift     a changed plist needs bootout then bootstrap, which that command \
+                     does; `launchctl kickstart` restarts the job from the definition launchd \
+                     already holds"
+                );
+            }
+            false
+        },
+        Err(reason) => {
+            eprintln!("session status: {}", reason);
+            false
+        },
+    }
+}
+
+/// Say once that the installed unit no longer matches the config.
+///
+/// On `up`, because `up` is what runs - from a shell after a config edit, and from the launcher
+/// every minute. The launcher's copy of this message is the one that reaches a machine nobody is
+/// looking at, and it goes to the journal or to the log the plist names.
+///
+/// Silent unless something this build wrote is actually installed and actually differs: an `up` on
+/// a machine with no launcher has nothing to say, and saying it every minute would be worse than
+/// saying nothing.
+fn warn_if_unit_drifted(name: &str, opts: &CliArgs) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let Some(kind) = session_service::native_service_kind() else {
+            return;
+        };
+        let extras = configured_extras(opts);
+        let pinned = configured_pinned_exe(extras.as_ref());
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let exe = resolve_service_exe(None, pinned, &current_exe, &path_dirs());
+        let Ok(UnitDrift::Drifted { paths }) =
+            session_service::unit_drift(kind, exe.path(), name, extras.as_ref())
+        else {
+            return;
+        };
+        for path in paths {
+            eprintln!(
+                "warning: {} is not what `zellij session enable` would write now, so the loaded\n         \
+                 job is running an older definition. Run `zellij session enable {}` to bring\n         \
+                 them back together - a config edit does not reach a unit that was not rewritten.",
+                path.display(),
+                name
+            );
+        }
+    });
 }
 
 /// What the config's `pin_exe` and the installed unit say between them, and whether they agree.
@@ -655,6 +745,9 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
     // reaches the pinned copy through this pass and no other, and the pass that returns early is
     // exactly the one an upgraded machine takes every minute.
     assert_pinned_exe(name, configured_extras(opts).as_ref());
+    // Same pass, same reason: a config edit does not reach a unit nobody rewrote, and the `up` that
+    // returns early is exactly the one a machine with a stale unit takes every minute.
+    warn_if_unit_drifted(name, opts);
 
     // Held for the rest of this function, which is what makes `up` idempotent under concurrency:
     // the check and the creation are one step, so a `restart` overlapping the watchdog's minute
