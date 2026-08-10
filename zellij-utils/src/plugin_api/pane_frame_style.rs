@@ -10,6 +10,7 @@ impl TryFrom<ProtobufPaneFrameStyle> for PaneFrameStyle {
             ProtobufPaneFrameStyle::Full => Ok(PaneFrameStyle::Full),
             ProtobufPaneFrameStyle::Titles => Ok(PaneFrameStyle::Titles),
             ProtobufPaneFrameStyle::None => Ok(PaneFrameStyle::None),
+            ProtobufPaneFrameStyle::TopOnly => Ok(PaneFrameStyle::TopOnly),
         }
     }
 }
@@ -21,6 +22,7 @@ impl TryFrom<PaneFrameStyle> for ProtobufPaneFrameStyle {
             PaneFrameStyle::Full => ProtobufPaneFrameStyle::Full,
             PaneFrameStyle::Titles => ProtobufPaneFrameStyle::Titles,
             PaneFrameStyle::None => ProtobufPaneFrameStyle::None,
+            PaneFrameStyle::TopOnly => ProtobufPaneFrameStyle::TopOnly,
         })
     }
 }
@@ -35,6 +37,7 @@ mod tests {
             PaneFrameStyle::Full,
             PaneFrameStyle::Titles,
             PaneFrameStyle::None,
+            PaneFrameStyle::TopOnly,
         ] {
             let protobuf: ProtobufPaneFrameStyle = style.try_into().unwrap();
             let roundtripped: PaneFrameStyle = protobuf.try_into().unwrap();

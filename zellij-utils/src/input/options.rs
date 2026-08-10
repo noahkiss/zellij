@@ -75,6 +75,11 @@ pub enum PaneFrameStyle {
     Full,
     Titles,
     None,
+    // fork addition: `titles` with a horizontal rule behind the title and no
+    // box-drawing separators between panes
+    #[serde(rename = "top_only")]
+    #[value(name = "top_only")]
+    TopOnly,
 }
 
 impl Default for PaneFrameStyle {
@@ -89,7 +94,13 @@ impl PaneFrameStyle {
     }
 
     pub fn draws_titles(&self) -> bool {
-        matches!(self, PaneFrameStyle::Titles)
+        matches!(self, PaneFrameStyle::Titles | PaneFrameStyle::TopOnly)
+    }
+
+    /// Fork addition: `top_only` is `titles` with a rule behind the title and
+    /// no separators between panes.
+    pub fn is_top_only(&self) -> bool {
+        matches!(self, PaneFrameStyle::TopOnly)
     }
 
     pub fn from_options(options: &Options) -> Self {
@@ -98,6 +109,7 @@ impl PaneFrameStyle {
         }
         match options.pane_frame_style {
             Some(PaneFrameStyle::Full) => PaneFrameStyle::Full,
+            Some(PaneFrameStyle::TopOnly) => PaneFrameStyle::TopOnly,
             _ => PaneFrameStyle::Titles,
         }
     }
@@ -110,8 +122,9 @@ impl FromStr for PaneFrameStyle {
             "full" => Ok(PaneFrameStyle::Full),
             "titles" => Ok(PaneFrameStyle::Titles),
             "none" => Ok(PaneFrameStyle::None),
+            "top_only" => Ok(PaneFrameStyle::TopOnly),
             e => Err(format!(
-                "Unknown pane frame style: '{}' (expected 'full', 'titles' or 'none')",
+                "Unknown pane frame style: '{}' (expected 'full', 'titles', 'none' or 'top_only')",
                 e
             )
             .into()),

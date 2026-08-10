@@ -568,6 +568,8 @@ enum PaneFrameStyle {
     Full = 0;
     Titles = 1;
     None = 2;
+    // fork addition, reserved range (see FORK.md)
+    TopOnly = 100;
 }
 
 message InputModeKeybinds {

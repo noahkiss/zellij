@@ -1529,6 +1529,40 @@ proceeds once the user answers.
 `zellij-server/src/lib.rs` gets one call; the probe and its classifier live in
 `session_lifecycle.rs`, which is fork-owned. No-op off macOS.
 
+### `pane_frame_style "top_only"`
+
+A fourth value for upstream's `pane_frame_style`, next to `full`, `titles` and `none`:
+
+```kdl
+pane_frame_style "top_only"
+```
+
+Each pane gets one title line and no box around it. The fork used to ship this as a standalone
+`top_only` option that overrode the frame code; upstream 0.45 added `pane_frame_style` with a
+`titles` mode built on the same frames-off path, so the override is gone and this variant replaces
+it. Anything that reads `pane_frame_style` — the CLI `SetPaneFrameStyle`, the keybinding, the plugin
+API — takes `top_only` as well.
+
+`top_only` **is** `titles`, with two differences:
+
+1. **The title line is a horizontal rule.** `titles` leaves the line blank around the title unless
+   the pane is stacked; `top_only` fills it with `─` always. One condition in
+   `compose_bracketed_title`.
+2. **No separators between panes.** `titles` draws `│` and `├─` from `Boundaries` along every pane
+   edge; `top_only` draws none. `render_pane_boundaries` returns early.
+
+Everywhere else the two behave identically, deliberately: `draws_titles()` answers `true` for both,
+so `top_only` follows the `titles` branch through the layout, offset and stacking code without a
+second path to keep in step.
+
+What that costs: the layout still reserves the column the separators would have used, so a pane with
+a neighbour to its right ends its rule one column short. Closing that gap means re-entering
+upstream's pane-layout arithmetic, which is the code most likely to move under us at the next sync.
+Add it later if the ragged edge grates.
+
+`PaneFrameStyle::TopOnly` carries protobuf tag **100** in both `pane_frame_style.proto` and
+`event.proto` — a fork-reserved number, far from the next one upstream would take.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in
