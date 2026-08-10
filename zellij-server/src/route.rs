@@ -3039,6 +3039,7 @@ fn enrich_panes_with_pty_data(
             let pane_id = PaneId::Terminal(entry.pane_info.id);
             enrich_pane_with_running_command(entry, pane_id, senders)?;
             enrich_pane_with_cwd(entry, pane_id, senders)?;
+            enrich_pane_with_pid(entry, pane_id, senders)?;
         }
     }
     Ok(())
@@ -3085,6 +3086,28 @@ fn enrich_pane_with_cwd(
 
     if let Ok(GetPaneCwdResponse::Ok(cwd)) = cwd_receiver.recv_timeout(Duration::from_millis(100)) {
         entry.pane_cwd = Some(cwd.to_string_lossy().to_string());
+    }
+
+    Ok(())
+}
+
+fn enrich_pane_with_pid(
+    entry: &mut PaneListEntry,
+    pane_id: PaneId,
+    senders: &ThreadSenders,
+) -> Result<()> {
+    use crossbeam::channel::unbounded;
+    use std::time::Duration;
+    use zellij_utils::data::GetPanePidResponse;
+
+    let (pid_sender, pid_receiver) = unbounded();
+    senders.send_to_pty(PtyInstruction::GetPanePid {
+        pane_id,
+        response_channel: pid_sender,
+    })?;
+
+    if let Ok(GetPanePidResponse::Ok(pid)) = pid_receiver.recv_timeout(Duration::from_millis(100)) {
+        entry.pane_pid = Some(pid);
     }
 
     Ok(())
