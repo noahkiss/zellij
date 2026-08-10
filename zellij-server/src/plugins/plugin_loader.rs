@@ -26,7 +26,8 @@ use crate::{
 use zellij_utils::plugin_api::action::ProtobufPluginConfiguration;
 use zellij_utils::{
     consts::ZELLIJ_TMP_DIR, data::InputMode, errors::prelude::*, input::command::TerminalAction,
-    input::keybinds::Keybinds, input::plugins::PluginConfig, pane_size::Size,
+    input::keybinds::Keybinds, input::permission::PluginPermissions, input::plugins::PluginConfig,
+    pane_size::Size,
 };
 
 /// Open a directory as a `File` handle for WASI pre-opening.
@@ -74,6 +75,7 @@ pub struct PluginLoader<'a> {
     layout_dir: Option<PathBuf>,
     default_mode: InputMode,
     keybinds: Keybinds,
+    plugin_permissions: Arc<PluginPermissions>,
     plugin_dir: PathBuf,
     size: Size,
     loading_indication: LoadingIndication,
@@ -115,6 +117,7 @@ impl<'a> PluginLoader<'a> {
             layout_dir: loading_context.layout_dir,
             default_mode: loading_context.default_mode,
             keybinds: loading_context.keybinds,
+            plugin_permissions: loading_context.plugin_permissions,
             plugin_dir: loading_context.plugin_dir,
             size: loading_context.size,
 
@@ -277,6 +280,7 @@ impl<'a> PluginLoader<'a> {
             default_mode: self.default_mode.clone(),
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             keybinds: self.keybinds.clone(),
+            plugin_permissions: self.plugin_permissions.clone(),
             intercepting_key_presses: false,
             stdin_pipe,
             stdout_pipe,
@@ -389,6 +393,7 @@ impl<'a> PluginLoader<'a> {
             default_mode: self.default_mode.clone(),
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             keybinds: self.keybinds.clone(),
+            plugin_permissions: self.plugin_permissions.clone(),
             intercepting_key_presses: false,
             stdin_pipe,
             stdout_pipe,
