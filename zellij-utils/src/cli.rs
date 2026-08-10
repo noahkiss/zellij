@@ -1248,7 +1248,11 @@ pub enum CliAction {
     },
     /// Move the focused tab in the specified direction. [right|left]
     MoveTab {
-        direction: Direction,
+        #[clap(value_parser, required_unless_present = "to_index", conflicts_with = "to_index")]
+        direction: Option<Direction>,
+        /// Move the tab to this absolute position (0-based), clamped to the last position
+        #[clap(long, value_parser)]
+        to_index: Option<usize>,
         /// Target a specific tab by ID
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
