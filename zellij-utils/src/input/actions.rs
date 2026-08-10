@@ -668,6 +668,11 @@ pub enum Action {
         id: u64,
         direction: Direction,
     },
+    /// Move a tab (the focused one if `id` is None) to an absolute position
+    MoveTabToIndex {
+        id: Option<u64>,
+        index: u64,
+    },
 }
 
 impl Default for Action {
@@ -873,12 +878,23 @@ impl Action {
                 },
                 None => Ok(vec![Action::MovePaneBackwards]),
             },
-            CliAction::MoveTab { direction, tab_id } => match tab_id {
-                Some(id) => Ok(vec![Action::MoveTabByTabId {
-                    id: id as u64,
-                    direction,
+            CliAction::MoveTab {
+                direction,
+                to_index,
+                tab_id,
+            } => match (direction, to_index) {
+                (_, Some(index)) => Ok(vec![Action::MoveTabToIndex {
+                    id: tab_id.map(|id| id as u64),
+                    index: index as u64,
                 }]),
-                None => Ok(vec![Action::MoveTab { direction }]),
+                (Some(direction), None) => match tab_id {
+                    Some(id) => Ok(vec![Action::MoveTabByTabId {
+                        id: id as u64,
+                        direction,
+                    }]),
+                    None => Ok(vec![Action::MoveTab { direction }]),
+                },
+                (None, None) => Err("move-tab needs either a direction or --to-index".into()),
             },
             CliAction::Clear { pane_id } => match pane_id {
                 Some(pane_id_str) => {
@@ -3357,7 +3373,8 @@ mod tests {
     #[test]
     fn test_move_tab_with_tab_id() {
         let cli_action = CliAction::MoveTab {
-            direction: Direction::Right,
+            direction: Some(Direction::Right),
+            to_index: None,
             tab_id: Some(10),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
@@ -3376,7 +3393,8 @@ mod tests {
     #[test]
     fn test_move_tab_without_tab_id() {
         let cli_action = CliAction::MoveTab {
-            direction: Direction::Right,
+            direction: Some(Direction::Right),
+            to_index: None,
             tab_id: None,
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
@@ -3389,6 +3407,57 @@ mod tests {
             },
             _ => panic!("Expected MoveTab action"),
         }
+    }
+
+    #[test]
+    fn test_move_tab_to_index_with_tab_id() {
+        let cli_action = CliAction::MoveTab {
+            direction: None,
+            to_index: Some(2),
+            tab_id: Some(10),
+        };
+        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        assert!(result.is_ok());
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::MoveTabToIndex { id, index } => {
+                assert_eq!(*id, Some(10u64));
+                assert_eq!(*index, 2u64);
+            },
+            _ => panic!("Expected MoveTabToIndex action"),
+        }
+    }
+
+    #[test]
+    fn test_move_tab_to_index_without_tab_id() {
+        let cli_action = CliAction::MoveTab {
+            direction: None,
+            to_index: Some(0),
+            tab_id: None,
+        };
+        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        assert!(result.is_ok());
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::MoveTabToIndex { id, index } => {
+                assert_eq!(*id, None);
+                assert_eq!(*index, 0u64);
+            },
+            _ => panic!("Expected MoveTabToIndex action"),
+        }
+    }
+
+    #[test]
+    fn test_move_tab_without_direction_or_index() {
+        let cli_action = CliAction::MoveTab {
+            direction: None,
+            to_index: None,
+            tab_id: None,
+        };
+        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        assert!(result.is_err());
     }
 
     // 28. ANSI flag tests

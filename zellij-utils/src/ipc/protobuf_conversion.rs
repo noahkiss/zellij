@@ -1157,6 +1157,7 @@ impl From<crate::input::actions::Action>
             MovePaneByPaneIdAction,
             MoveTabAction,
             MoveTabByTabIdAction,
+            MoveTabToIndexAction,
             NewBlockingPaneAction,
             NewFloatingPaneAction,
             NewFloatingPluginPaneAction,
@@ -2143,6 +2144,9 @@ impl From<crate::input::actions::Action>
                     direction: direction_to_proto_i32(direction),
                 })
             },
+            crate::input::actions::Action::MoveTabToIndex { id, index } => {
+                ActionType::MoveTabToIndex(MoveTabToIndexAction { id, index })
+            },
         };
 
         Self {
@@ -3109,6 +3113,10 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     direction,
                 })
             },
+            ActionType::MoveTabToIndex(a) => Ok(crate::input::actions::Action::MoveTabToIndex {
+                id: a.id,
+                index: a.index,
+            }),
         }
     }
 }
