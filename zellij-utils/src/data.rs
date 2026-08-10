@@ -2358,11 +2358,26 @@ pub struct PaneInfo {
     pub is_selectable: bool,
     /// Grouped panes (usually through an explicit user action) that are staged for a bulk action
     /// the index is kept track of in order to preserve the pane group order
+    ///
+    /// NOTE: this is the multi-select grouping feature (eg. `TogglePaneInGroup`), it is per-client
+    /// and empty unless the user explicitly marked panes for a bulk action. It has nothing to do
+    /// with stacked panes - for those, see `stack_id` and `index_in_stack`.
     pub index_in_pane_group: BTreeMap<ClientId, usize>,
     /// The default foreground color of this pane, if set (e.g. "#00e000")
     pub default_fg: Option<String>,
     /// The default background color of this pane, if set (e.g. "#001a3a")
     pub default_bg: Option<String>,
+    /// The title the program running inside this pane set for itself with OSC 0/2, if any
+    ///
+    /// Unlike `title`, this is not replaced by a user-assigned pane name, so it can be used to
+    /// identify the program even after the pane has been renamed
+    pub program_title: Option<String>,
+    /// The id of the stack this pane belongs to, if it is part of a stack of tiled panes
+    pub stack_id: Option<usize>,
+    /// The position of this pane inside its stack, counted from the top, if it is part of a stack
+    pub index_in_stack: Option<usize>,
+    /// Whether this pane is the expanded (non-collapsed) member of its stack
+    pub is_expanded_in_stack: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -2376,6 +2391,8 @@ pub struct PaneListEntry {
     pub pane_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_pid: Option<i32>,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;
