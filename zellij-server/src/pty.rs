@@ -2360,13 +2360,44 @@ impl Pty {
     }
 }
 
+/// How long the session teardown waits for hung-up pane shells before it resorts to SIGKILL.
+const PANE_KILL_ESCALATION: std::time::Duration = std::time::Duration::from_millis(200);
+const PANE_KILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
 impl Drop for Pty {
     fn drop(&mut self) {
+        // The session is going away, so every pane goes with it. `close_pane` SIGHUPs the shell
+        // alone; signal the process group first so the shell's own children are hung up too, and
+        // escalate to SIGKILL for whatever ignores it. Without this the server can outlive its
+        // own teardown by minutes, still parenting the shells it was told to kill.
+        let child_pids: Vec<u32> = self.id_to_child_pid.values().copied().collect();
+        if let Some(os_input) = self.bus.os_input.as_ref() {
+            for pid in &child_pids {
+                let _ = os_input.kill_group(*pid, false);
+            }
+        }
+
         let child_ids: Vec<u32> = self.id_to_child_pid.keys().copied().collect();
         for id in child_ids {
             self.close_pane(PaneId::Terminal(id))
                 .with_context(|| format!("failed to close pane for pid {id}"))
                 .fatal();
+        }
+
+        if let Some(os_input) = self.bus.os_input.as_ref() {
+            let deadline = std::time::Instant::now() + PANE_KILL_ESCALATION;
+            while std::time::Instant::now() < deadline {
+                if !child_pids.iter().any(|pid| os_input.is_process_alive(*pid)) {
+                    return;
+                }
+                std::thread::sleep(PANE_KILL_POLL_INTERVAL);
+            }
+            for pid in child_pids {
+                if os_input.is_process_alive(pid) {
+                    let _ = os_input.kill_group(pid, true);
+                    let _ = os_input.force_kill(pid);
+                }
+            }
         }
     }
 }

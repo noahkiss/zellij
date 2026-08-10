@@ -402,6 +402,12 @@ pub enum Sessions {
         /// Name of target session
         #[clap(value_parser)]
         target_session: Option<String>,
+        /// Return as soon as the kill has been acknowledged, without waiting for the server to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
     },
 
     /// Delete a specific session
@@ -413,6 +419,12 @@ pub enum Sessions {
         /// Kill the session if it's running before deleting it
         #[clap(short, long)]
         force: bool,
+        /// Return as soon as the kill has been acknowledged, without waiting for the server to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
     },
 
     /// Inspect and restore archived session snapshots
@@ -425,6 +437,12 @@ pub enum Sessions {
         /// Automatic yes to prompts
         #[clap(short, long, value_parser)]
         yes: bool,
+        /// Return as soon as each kill has been acknowledged, without waiting for servers to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for each server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
     },
 
     /// Delete all sessions
@@ -436,6 +454,12 @@ pub enum Sessions {
         /// Kill the sessions if they're running before deleting them
         #[clap(short, long)]
         force: bool,
+        /// Return as soon as each kill has been acknowledged, without waiting for servers to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for each server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
     },
 
     /// Run a command in a new pane
