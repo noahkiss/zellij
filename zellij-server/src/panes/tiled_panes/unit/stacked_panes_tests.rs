@@ -1262,6 +1262,9 @@ impl Pane for MockPane {
     fn pid(&self) -> PaneId {
         unimplemented!()
     }
+    fn pane_uuid(&self) -> uuid::Uuid {
+        unimplemented!()
+    }
     fn reduce_height(&mut self, _percent: f64) {
         unimplemented!()
     }
