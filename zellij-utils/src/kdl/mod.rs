@@ -2996,6 +2996,9 @@ impl Options {
         let session_snapshot_limit =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "session_snapshot_limit")
                 .map(|(v, _)| v.max(0) as usize);
+        let bell_clear_delay_ms =
+            kdl_property_first_arg_as_i64_or_error!(kdl_options, "bell_clear_delay_ms")
+                .map(|(delay, _entry)| delay.max(0) as u64);
         let terminal_title_template =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "terminal_title_template")
                 .map(|(template, _entry)| template.to_string());
@@ -3166,6 +3169,7 @@ impl Options {
             scrollback_lines_to_serialize,
             snapshot_dir,
             session_snapshot_limit,
+            bell_clear_delay_ms,
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
@@ -3522,6 +3526,13 @@ impl Options {
         self.session_snapshot_limit.map(|limit| {
             let mut node = KdlNode::new("session_snapshot_limit");
             node.push(KdlValue::Base10(limit as i64));
+            node
+        })
+    }
+    fn bell_clear_delay_ms_to_kdl(&self) -> Option<KdlNode> {
+        self.bell_clear_delay_ms.map(|delay| {
+            let mut node = KdlNode::new("bell_clear_delay_ms");
+            node.push(KdlValue::Base10(delay as i64));
             node
         })
     }
@@ -5032,6 +5043,9 @@ impl Options {
         }
         if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
             nodes.push(session_snapshot_limit);
+        }
+        if let Some(bell_clear_delay_ms) = self.bell_clear_delay_ms_to_kdl() {
+            nodes.push(bell_clear_delay_ms);
         }
         if let Some(terminal_title_template) = self.terminal_title_template_to_kdl() {
             nodes.push(terminal_title_template);
@@ -8323,6 +8337,23 @@ fn plugin_permissions_survive_a_config_round_trip() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(config.plugin_permissions, deserialized.plugin_permissions);
+}
+
+#[test]
+fn bell_clear_delay_config_parsing() {
+    let config = Config::from_kdl("bell_clear_delay_ms 1000", None).unwrap();
+    assert_eq!(config.options.bell_clear_delay_ms, Some(1000));
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn bell_clear_delay_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.bell_clear_delay_ms, None);
 }
 
 #[test]

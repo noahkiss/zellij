@@ -1574,6 +1574,30 @@ Add it later if the ragged edge grates.
 `PaneFrameStyle::TopOnly` carries protobuf tag **100** in both `pane_frame_style.proto` and
 `event.proto` — a fork-reserved number, far from the next one upstream would take.
 
+### A dwell before a focused pane's bell clears (`bell_clear_delay_ms`)
+
+```kdl
+bell_clear_delay_ms 1000
+```
+
+A pane that rings the bell shows `[!]` in its title until it is focused, and upstream clears that
+the instant the pane takes focus. Cycling through panes to find the one that rang therefore erases
+every notification on the way. With `bell_clear_delay_ms` set, the `[!]` only clears once the pane
+has been focused, without interruption, for that many milliseconds - counted from the later of the
+focus and the last ring. Flicking past a pane keeps its notification; a pane that rings again while
+you sit on it restarts the dwell, so the ring is never lost.
+
+Default is 0, which is upstream's behaviour to the byte: the focus paths clear the bell
+synchronously as they always have, and no timer is involved.
+
+How it works: `Screen` keeps a `BellDwellTracker` (`zellij-server/src/bell_dwell.rs`) of what each
+client has focused since when, and of the last ring per pane. The focus paths, and a ring on a pane
+that already shows a bell, ask the background-jobs thread for a `ClearPaneBellAfterDwell` job. When
+the job comes due, the tracker decides: it clears only if some client has held that pane focused for
+the whole dwell and it has not rung inside it. A job overtaken by a refocus or a new ring finds the
+answer is no and does nothing. Multiple clients count independently - any one of them dwelling is
+enough.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

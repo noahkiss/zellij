@@ -282,6 +282,14 @@ pub struct Options {
     #[serde(default)]
     pub session_snapshot_limit: Option<usize>,
 
+    /// How long a pane that rang the bell has to stay focused before its notification is
+    /// cleared, in milliseconds. Default is 0 - the notification clears the moment the pane is
+    /// focused.
+    /// config.kdl only - it is read by the server, so there is nothing for a CLI flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub bell_clear_delay_ms: Option<u64>,
+
     /// The template of the terminal title (OSC 0) of the focused pane. Knows the {host},
     /// {session} and {pane} placeholders, anything else is literal text. Placeholders that come
     /// out empty take the literal text around them with them, so that no dangling separator is
@@ -554,6 +562,7 @@ impl Options {
             .or(self.scrollback_lines_to_serialize);
         let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
         let session_snapshot_limit = other.session_snapshot_limit.or(self.session_snapshot_limit);
+        let bell_clear_delay_ms = other.bell_clear_delay_ms.or(self.bell_clear_delay_ms);
         let terminal_title_template = other
             .terminal_title_template
             .or_else(|| self.terminal_title_template.clone());
@@ -645,6 +654,7 @@ impl Options {
             scrollback_lines_to_serialize,
             snapshot_dir,
             session_snapshot_limit,
+            bell_clear_delay_ms,
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
@@ -735,6 +745,7 @@ impl Options {
         let session_snapshot_limit = other
             .session_snapshot_limit
             .or_else(|| self.session_snapshot_limit.clone());
+        let bell_clear_delay_ms = other.bell_clear_delay_ms.or(self.bell_clear_delay_ms);
         let terminal_title_template = other
             .terminal_title_template
             .or_else(|| self.terminal_title_template.clone());
@@ -826,6 +837,7 @@ impl Options {
             scrollback_lines_to_serialize,
             snapshot_dir,
             session_snapshot_limit,
+            bell_clear_delay_ms,
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
