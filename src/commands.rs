@@ -16,7 +16,7 @@ use zellij_utils::sessions::{
     kill_session as kill_session_impl, match_session_name, print_sessions,
     print_sessions_with_index, resurrection_layout, session_exists,
     session_in_other_contract_versions, session_listing_error_message, validate_session_name,
-    ActiveSession, SessionNameMatch,
+    ActiveSession, KillWait, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
@@ -54,7 +54,7 @@ use zellij_utils::{
 
 pub(crate) use zellij_utils::sessions::list_sessions;
 
-pub(crate) fn kill_all_sessions(yes: bool) {
+pub(crate) fn kill_all_sessions(yes: bool, wait: KillWait) {
     match get_sessions() {
         Ok(sessions) if sessions.is_empty() => {
             eprintln!("No active zellij sessions found.");
@@ -72,10 +72,13 @@ pub(crate) fn kill_all_sessions(yes: bool) {
                     process::exit(1);
                 }
             }
+            // every session is attempted before the exit code is decided: a wedged server should
+            // not stop the rest of them from being killed
+            let mut all_gone = true;
             for session in &sessions {
-                kill_session_impl(&session.0);
+                all_gone &= kill_session_impl(&session.0, wait);
             }
-            process::exit(0);
+            process::exit(if all_gone { 0 } else { 1 });
         },
         Err(e) => {
             eprintln!("Error occurred: {:?}", e);
@@ -354,8 +357,8 @@ fn print_legacy_layout_hint(settings: &SnapshotSettings) {
     }
 }
 
-pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
-    use std::collections::BTreeMap;
+pub(crate) fn delete_all_sessions(yes: bool, force: bool, wait: KillWait, opts: &CliArgs) {
+    use std::collections::{BTreeMap, BTreeSet};
     use zellij_server::background_jobs::scan_session_list_default_dirs;
 
     let active_sessions: Vec<String> = get_sessions()
@@ -365,22 +368,19 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
         .collect();
     let (_live_sessions, resurrectable_map) =
         scan_session_list_default_dirs(&String::new(), &[], &BTreeMap::new());
-    let mut resurrectable_sessions: Vec<(String, Duration)> =
-        resurrectable_map.into_iter().collect();
-    if force {
-        for entry in get_resurrectable_sessions() {
-            if !resurrectable_sessions.iter().any(|(n, _)| *n == entry.0) {
-                resurrectable_sessions.push(entry);
-            }
-        }
+    let mut sessions_to_delete: BTreeSet<String> = resurrectable_map.into_keys().collect();
+    for (name, _elapsed) in get_resurrectable_sessions() {
+        sessions_to_delete.insert(name);
     }
-    let dead_sessions: Vec<_> = if force {
-        resurrectable_sessions
+    // a live session only becomes resurrectable once it has serialized itself, so scanning for
+    // resurrectable folders does not find a young one. `--force` is what makes live sessions
+    // targets, so take them from the session list directly rather than hoping they show up there.
+    let live_sessions_kept: Vec<String> = if force {
+        sessions_to_delete.extend(active_sessions.iter().cloned());
+        Vec::new()
     } else {
-        resurrectable_sessions
-            .into_iter()
-            .filter(|(name, _)| !active_sessions.contains(name))
-            .collect()
+        sessions_to_delete.retain(|name| !active_sessions.contains(name));
+        active_sessions.clone()
     };
     if !yes {
         println!("WARNING: this action will delete all resurrectable sessions.");
@@ -393,18 +393,31 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
             process::exit(1);
         }
     }
-    for session in &dead_sessions {
-        delete_session_impl(&session.0, force, &snapshot_settings(opts));
+    // every session is attempted before the exit code is decided: one wedged server should not
+    // stop the rest of them from being deleted
+    let mut all_gone = true;
+    for session in &sessions_to_delete {
+        all_gone &= delete_session_impl(session, force, &snapshot_settings(opts), wait);
     }
-    process::exit(0);
+    for session in &live_sessions_kept {
+        eprintln!(
+            "Session: {:?} is still running and was not deleted. Use --force to kill it first.",
+            session
+        );
+    }
+    process::exit(if all_gone && live_sessions_kept.is_empty() {
+        0
+    } else {
+        1
+    });
 }
 
-pub(crate) fn kill_session(target_session: &Option<String>) {
+pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait) {
     match target_session {
         Some(target_session) => {
             assert_session(target_session);
-            kill_session_impl(target_session);
-            process::exit(0);
+            let gone = kill_session_impl(target_session, wait);
+            process::exit(if gone { 0 } else { 1 });
         },
         None => {
             println!("Please specify the session name to kill.");
@@ -413,7 +426,12 @@ pub(crate) fn kill_session(target_session: &Option<String>) {
     }
 }
 
-pub(crate) fn delete_session(target_session: &Option<String>, force: bool, opts: &CliArgs) {
+pub(crate) fn delete_session(
+    target_session: &Option<String>,
+    force: bool,
+    wait: KillWait,
+    opts: &CliArgs,
+) {
     match target_session {
         Some(target_session) => {
             if let Err(e) = validate_session_name(target_session) {
@@ -421,8 +439,8 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool, opts:
                 process::exit(1);
             }
             assert_dead_session(target_session, force);
-            delete_session_impl(target_session, force, &snapshot_settings(opts));
-            process::exit(0);
+            let gone = delete_session_impl(target_session, force, &snapshot_settings(opts), wait);
+            process::exit(if gone { 0 } else { 1 });
         },
         None => {
             println!("Please specify the session name to delete.");
@@ -791,6 +809,9 @@ fn attach_with_cli_client(
     session_name: &str,
     config: Option<Config>,
 ) {
+    // an action is the usual way a script meets a session, so it is where a stale server is usually
+    // met too - the warning costs one process scan and changes nothing about the action
+    zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // `save-session --archive` is a client-side addition to the existing action: the action itself
@@ -1140,6 +1161,12 @@ pub(crate) fn start_client(opts: CliArgs) {
                     if val == *client.get_session_name() {
                         panic!("You are trying to attach to the current session (\"{}\"). This is not supported.", val);
                     }
+                }
+
+                // an attach joins a server that may predate this binary. Said once per client, and
+                // only for a session that already exists - a new one is this build by definition.
+                if let ClientInfo::Attach(session_name, _) = &client {
+                    zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
                 }
 
                 if let Some(layout_info) = layout_info {
