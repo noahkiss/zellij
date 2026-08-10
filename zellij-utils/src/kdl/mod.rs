@@ -2839,6 +2839,13 @@ impl Options {
         let scrollback_lines_to_serialize =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "scrollback_lines_to_serialize")
                 .map(|(v, _)| v as usize);
+        let terminal_title_template =
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "terminal_title_template")
+                .map(|(template, _entry)| template.to_string());
+        let session_aliases = match kdl_options.get("session_aliases") {
+            Some(kdl_session_aliases) => Some(Self::session_aliases_from_kdl(kdl_session_aliases)?),
+            None => None,
+        };
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -2992,6 +2999,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            terminal_title_template,
+            session_aliases,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3333,6 +3342,48 @@ impl Options {
         } else {
             None
         }
+    }
+    fn terminal_title_template_to_kdl(&self) -> Option<KdlNode> {
+        self.terminal_title_template
+            .as_ref()
+            .map(|terminal_title_template| {
+                let mut node = KdlNode::new("terminal_title_template");
+                node.push(KdlValue::String(terminal_title_template.clone()));
+                node
+            })
+    }
+    fn session_aliases_to_kdl(&self) -> Option<KdlNode> {
+        let session_aliases = self.session_aliases.as_ref()?;
+        if session_aliases.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("session_aliases");
+        let mut aliases = KdlDocument::new();
+        for (session_name, alias) in session_aliases {
+            let mut alias_node = KdlNode::new(session_name.to_owned());
+            alias_node.push(KdlValue::String(alias.to_owned()));
+            aliases.nodes_mut().push(alias_node);
+        }
+        node.set_children(aliases);
+        Some(node)
+    }
+    fn session_aliases_from_kdl(
+        kdl_session_aliases: &KdlNode,
+    ) -> Result<BTreeMap<String, String>, ConfigError> {
+        let mut session_aliases = BTreeMap::new();
+        for session_alias in
+            kdl_children_nodes_or_error!(kdl_session_aliases, "empty session_aliases block")
+        {
+            let session_name = kdl_name!(session_alias);
+            let alias =
+                kdl_first_entry_as_string!(session_alias).ok_or(ConfigError::new_kdl_error(
+                    format!("Failed to parse session alias: {:?}", session_name),
+                    session_alias.span().offset(),
+                    session_alias.span().len(),
+                ))?;
+            session_aliases.insert(session_name.into(), alias.to_string());
+        }
+        Ok(session_aliases)
     }
     fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
         self.plugin_watch.map(|plugin_watch| {
@@ -4674,6 +4725,12 @@ impl Options {
         }
         if let Some(theme_dir) = self.theme_dir_to_kdl(add_comments) {
             nodes.push(theme_dir);
+        }
+        if let Some(terminal_title_template) = self.terminal_title_template_to_kdl() {
+            nodes.push(terminal_title_template);
+        }
+        if let Some(session_aliases) = self.session_aliases_to_kdl() {
+            nodes.push(session_aliases);
         }
         if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
             nodes.push(plugin_watch);
@@ -7946,6 +8003,42 @@ fn plugin_permissions_survive_a_config_round_trip() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(config.plugin_permissions, deserialized.plugin_permissions);
+}
+
+#[test]
+fn terminal_title_config_parsing() {
+    let config_with_terminal_title = r#"
+        terminal_title_template "{host} - {session} | {pane}"
+        session_aliases {
+            my-session "MS"
+        }
+    "#;
+    let config = Config::from_kdl(config_with_terminal_title, None).unwrap();
+    assert_eq!(
+        config.options.terminal_title_template.as_deref(),
+        Some("{host} - {session} | {pane}")
+    );
+    assert_eq!(
+        config
+            .options
+            .session_aliases
+            .as_ref()
+            .and_then(|aliases| aliases.get("my-session"))
+            .map(|alias| alias.as_str()),
+        Some("MS")
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn terminal_title_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.terminal_title_template, None);
+    assert_eq!(config.options.session_aliases, None);
 }
 
 #[cfg(test)]
