@@ -75,6 +75,7 @@ use zellij_utils::{
         plugins::PluginAliases,
     },
     ipc::{ClientAttributes, ExitReason, ServerToClientMsg},
+    session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
     shared::{
         default_palette, set_terminal_title_format, web_server_base_url, TerminalTitleFormat,
     },
@@ -847,6 +848,50 @@ mod session_state_tests {
     }
 }
 
+/// The snapshot archive settings of the session running in this server.
+///
+/// Set once the first client has connected and the config file has been read, because that is the
+/// earliest point at which they are known - and read again on the way out, long after the session
+/// data has been dropped.
+static SNAPSHOT_SETTINGS: std::sync::OnceLock<SnapshotSettings> = std::sync::OnceLock::new();
+
+fn snapshot_settings() -> SnapshotSettings {
+    SNAPSHOT_SETTINGS
+        .get()
+        .cloned()
+        .unwrap_or_else(SnapshotSettings::default)
+}
+
+/// Archive any `session_info` folder left behind by a server that is no longer running.
+///
+/// This is the SIGKILL and crash path: the periodic serializer's file survives, so it is promoted
+/// into the archive rather than lost to the next session of the same name overwriting it. This
+/// session's own folder is always swept, since starting is exactly what is about to reuse it.
+fn promote_orphaned_session_info_folders(own_session_name: &str, settings: &SnapshotSettings) {
+    let Ok(entries) = std::fs::read_dir(&*zellij_utils::consts::ZELLIJ_SESSION_INFO_CACHE_DIR)
+    else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let session_name = entry.file_name().to_string_lossy().to_string();
+        // a socket in place means someone else's server owns that folder. Testing for the file
+        // rather than connecting to it is deliberate: this runs on the server thread, and probing
+        // sockets from here would have us wait on a reply from ourselves.
+        let has_socket = zellij_utils::consts::ZELLIJ_SOCK_DIR
+            .join(&session_name)
+            .exists();
+        if has_socket && session_name != own_session_name {
+            continue;
+        }
+        if let Err(e) = archive_session_info(&session_name, SnapshotReason::Promoted, settings) {
+            log::error!("Failed to promote session {:?}: {}", session_name, e);
+        }
+    }
+}
+
 pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     info!("Starting Zellij server!");
 
@@ -886,6 +931,13 @@ pub fn start_server_impl(
     install_panic_hook: bool,
 ) {
     envs::set_zellij("0".to_string());
+
+    // the socket is named after the session, and this is the only place the server learns its own
+    // name without asking a thread that may already be shutting down
+    let session_name = socket_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
 
     let (to_server, server_receiver): ChannelWithContext<ServerInstruction> = channels::bounded(50);
     let to_server = SenderWithContext::new(to_server);
@@ -1013,6 +1065,11 @@ pub fn start_server_impl(
                         hide_session_name: config.ui.pane_frames.hide_session_name,
                     },
                 };
+
+                let _ = SNAPSHOT_SETTINGS.set(SnapshotSettings::from_options(Some(
+                    &runtime_config_options,
+                )));
+                promote_orphaned_session_info_folders(&session_name, &snapshot_settings());
 
                 set_terminal_title_format(TerminalTitleFormat::from_options(
                     &runtime_config_options,
@@ -1451,6 +1508,10 @@ pub fn start_server_impl(
                 remove_client!(client_id, os_input, session_state, session_data);
             },
             ServerInstruction::KillSession => {
+                // the archive is cut on the way out below; serialize once more first, so what it
+                // captures is the shape the session had when it was killed rather than one up to a
+                // whole serialization interval old
+                serialize_session_before_exit(&session_data);
                 let client_ids = session_state.read().unwrap().client_ids();
                 for client_id in client_ids {
                     let _ = os_input.send_to_client(
@@ -2019,7 +2080,54 @@ pub fn start_server_impl(
     // Drop cached session data before exit.
     *session_data.write().unwrap() = None;
 
+    // Archive after the last serialize and before the socket goes: the socket disappearing is what
+    // `delete-session` waits on, so a snapshot cut here is on disk before anything can delete the
+    // folder it was copied from.
+    if let Err(e) = archive_session_info(
+        &session_name,
+        SnapshotReason::Shutdown,
+        &snapshot_settings(),
+    ) {
+        log::error!(
+            "Failed to archive session {:?} on exit: {}",
+            session_name,
+            e
+        );
+    }
+
     drop(std::fs::remove_file(&socket_path));
+}
+
+/// Ask the session to serialize itself one last time, and wait for that to reach the disk.
+///
+/// Best effort: a session that is already tearing down, or that has serialization turned off, just
+/// leaves whatever the periodic serializer last wrote.
+fn serialize_session_before_exit(session_data: &Arc<RwLock<Option<SessionMetaData>>>) {
+    const FINAL_SERIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    {
+        let session_data = session_data.read().unwrap();
+        let Some(session_data) = session_data.as_ref() else {
+            return;
+        };
+        if session_data
+            .senders
+            .send_to_screen(ScreenInstruction::SaveSession(
+                0,
+                Some(NotificationEnd::new(completion_tx)),
+            ))
+            .is_err()
+        {
+            return;
+        }
+    }
+    let runtime = crate::global_async_runtime::get_tokio_runtime();
+    if runtime
+        .block_on(async { tokio::time::timeout(FINAL_SERIALIZE_TIMEOUT, completion_rx).await })
+        .is_err()
+    {
+        log::warn!("Timed out serializing the session before exit");
+    }
 }
 
 fn init_session(
