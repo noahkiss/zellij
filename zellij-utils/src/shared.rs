@@ -1,6 +1,8 @@
 //! Some general utility functions.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::OnceLock;
 use std::{iter, str::from_utf8};
 
 use crate::data::{Palette, PaletteColor, PaletteSource, ThemeHue};
@@ -67,17 +69,210 @@ pub fn adjust_to_size(s: &str, rows: usize, columns: usize) -> String {
         .join("\n\r")
 }
 
+/// What the terminal title looks like when `terminal_title_template` is not set - the historical
+/// `<session> | <pane>` format.
+pub const DEFAULT_TERMINAL_TITLE_TEMPLATE: &str = "{session} | {pane}";
+
+/// The terminal title format of the session running in this process.
+///
+/// Set once the first client has connected and the config file has been read, because that is the
+/// earliest point at which it is known. Panes read it while rendering, which is far away from any
+/// place that still has the config in hand.
+static TERMINAL_TITLE_FORMAT: OnceLock<TerminalTitleFormat> = OnceLock::new();
+
+/// Fix the terminal title format for the rest of this process. Later calls do nothing.
+pub fn set_terminal_title_format(terminal_title_format: TerminalTitleFormat) {
+    let _ = TERMINAL_TITLE_FORMAT.set(terminal_title_format);
+}
+
+fn terminal_title_format() -> &'static TerminalTitleFormat {
+    static DEFAULT_TERMINAL_TITLE_FORMAT: OnceLock<TerminalTitleFormat> = OnceLock::new();
+    TERMINAL_TITLE_FORMAT
+        .get()
+        .unwrap_or_else(|| DEFAULT_TERMINAL_TITLE_FORMAT.get_or_init(TerminalTitleFormat::default))
+}
+
+/// The placeholders a terminal title template can contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitlePlaceholder {
+    Host,
+    Session,
+    Pane,
+}
+
+impl TitlePlaceholder {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "host" => Some(TitlePlaceholder::Host),
+            "session" => Some(TitlePlaceholder::Session),
+            "pane" => Some(TitlePlaceholder::Pane),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TitleToken {
+    Literal(String),
+    Placeholder(TitlePlaceholder),
+}
+
+/// A parsed `terminal_title_template` plus the session name aliases it renders with.
+///
+/// Parsing happens once (at session start), rendering happens per title change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTitleFormat {
+    tokens: Vec<TitleToken>,
+    session_aliases: BTreeMap<String, String>,
+}
+
+impl Default for TerminalTitleFormat {
+    fn default() -> Self {
+        TerminalTitleFormat::new(None, BTreeMap::new())
+    }
+}
+
+impl TerminalTitleFormat {
+    pub fn new(template: Option<&str>, session_aliases: BTreeMap<String, String>) -> Self {
+        let template = template.unwrap_or(DEFAULT_TERMINAL_TITLE_TEMPLATE);
+        TerminalTitleFormat {
+            tokens: Self::parse_template(template),
+            session_aliases,
+        }
+    }
+    pub fn from_options(config_options: &Options) -> Self {
+        TerminalTitleFormat::new(
+            config_options.terminal_title_template.as_deref(),
+            config_options.session_aliases.clone().unwrap_or_default(),
+        )
+    }
+    /// Split the template into literals and placeholders. An unknown placeholder (eg. `{nope}`) is
+    /// kept as literal text rather than being an error, so that a template can contain braces.
+    fn parse_template(template: &str) -> Vec<TitleToken> {
+        let mut tokens = vec![];
+        let mut literal = String::new();
+        let mut rest = template;
+        while let Some(opening_brace) = rest.find('{') {
+            let (before_brace, from_brace) = rest.split_at(opening_brace);
+            literal.push_str(before_brace);
+            match from_brace.find('}') {
+                Some(closing_brace) => {
+                    let name = &from_brace[1..closing_brace];
+                    match TitlePlaceholder::from_name(name) {
+                        Some(placeholder) => {
+                            if !literal.is_empty() {
+                                tokens.push(TitleToken::Literal(std::mem::take(&mut literal)));
+                            }
+                            tokens.push(TitleToken::Placeholder(placeholder));
+                        },
+                        None => literal.push_str(&from_brace[..=closing_brace]),
+                    }
+                    rest = &from_brace[closing_brace + 1..];
+                },
+                None => {
+                    literal.push_str(from_brace);
+                    rest = "";
+                },
+            }
+        }
+        literal.push_str(rest);
+        if !literal.is_empty() {
+            tokens.push(TitleToken::Literal(literal));
+        }
+        tokens
+    }
+    fn session_alias<'a>(&'a self, session_name: &'a str) -> &'a str {
+        self.session_aliases
+            .get(session_name)
+            .map(|alias| alias.as_str())
+            .unwrap_or(session_name)
+    }
+    /// Render the title, dropping the literals around placeholders that came out empty.
+    ///
+    /// A literal is only kept if every side of it that has placeholders has at least one non-empty
+    /// one - otherwise `{session} | {pane}` would leave a dangling " | " behind whenever a pane has
+    /// no title. Leading and trailing whitespace is trimmed off the result.
+    pub fn render(&self, session_name: Option<&str>, hostname: &str, pane_title: &str) -> String {
+        let values: Vec<Option<&str>> = self
+            .tokens
+            .iter()
+            .map(|token| match token {
+                TitleToken::Literal(_) => None,
+                TitleToken::Placeholder(TitlePlaceholder::Host) => Some(hostname),
+                TitleToken::Placeholder(TitlePlaceholder::Session) => {
+                    Some(session_name.map(|n| self.session_alias(n)).unwrap_or(""))
+                },
+                TitleToken::Placeholder(TitlePlaceholder::Pane) => Some(pane_title),
+            })
+            .collect();
+        let has_value = |values: &[Option<&str>]| values.iter().flatten().any(|v| !v.is_empty());
+        let has_placeholder = |values: &[Option<&str>]| values.iter().any(|v| v.is_some());
+
+        let mut rendered = String::new();
+        for (i, token) in self.tokens.iter().enumerate() {
+            match token {
+                TitleToken::Placeholder(_) => rendered.push_str(values[i].unwrap_or("")),
+                TitleToken::Literal(literal) => {
+                    let (before, after) = (&values[..i], &values[i + 1..]);
+                    let keep = (!has_placeholder(before) || has_value(before))
+                        && (!has_placeholder(after) || has_value(after));
+                    if keep {
+                        rendered.push_str(literal);
+                    }
+                },
+            }
+        }
+        rendered.trim().to_string()
+    }
+}
+
+/// This machine's hostname without any domain suffix, resolved once.
+///
+/// Empty if it cannot be resolved, which the title rendering treats like any other empty part.
+pub fn short_hostname() -> &'static str {
+    static SHORT_HOSTNAME: OnceLock<String> = OnceLock::new();
+    SHORT_HOSTNAME.get_or_init(|| {
+        resolve_hostname()
+            .map(|hostname| hostname.split('.').next().unwrap_or("").to_string())
+            .unwrap_or_default()
+    })
+}
+
+// libc rather than nix::unistd::gethostname, because nix is pulled in here without the feature
+// flags that would expose it
+#[cfg(unix)]
+fn resolve_hostname() -> Option<String> {
+    let mut buffer = vec![0u8; 256];
+    let resolved =
+        unsafe { libc::gethostname(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) } == 0;
+    if !resolved {
+        return None;
+    }
+    let hostname_length = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    buffer.truncate(hostname_length);
+    String::from_utf8(buffer)
+        .ok()
+        .filter(|hostname| !hostname.is_empty())
+}
+
+#[cfg(not(unix))]
+fn resolve_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|hostname| !hostname.is_empty())
+}
+
 pub fn make_terminal_title(pane_title: &str) -> String {
     format!(
-        "\u{1b}]0;{}{}\u{07}",
-        get_session_name()
-            .map(|n| if pane_title.is_empty() {
-                format!("{}", n)
-            } else {
-                format!("{} | ", n)
-            })
-            .unwrap_or_default(),
-        pane_title
+        "\u{1b}]0;{}\u{07}",
+        terminal_title_format().render(
+            get_session_name().ok().as_deref(),
+            short_hostname(),
+            pane_title
+        )
     )
 }
 
@@ -225,4 +420,121 @@ pub fn parse_base_url(url: &str) -> Result<ServerAddress> {
         .ok_or_else(|| anyhow!("No port in URL"))?;
 
     Ok(ServerAddress { ip, port })
+}
+
+#[cfg(test)]
+mod terminal_title_tests {
+    use super::*;
+
+    /// The formatting `make_terminal_title` did before it was templated - the yardstick for the
+    /// default template.
+    fn legacy_title(session_name: Option<&str>, pane_title: &str) -> String {
+        format!(
+            "{}{}",
+            session_name
+                .map(|n| if pane_title.is_empty() {
+                    format!("{}", n)
+                } else {
+                    format!("{} | ", n)
+                })
+                .unwrap_or_default(),
+            pane_title
+        )
+    }
+
+    fn aliases(aliases: &[(&str, &str)]) -> BTreeMap<String, String> {
+        aliases
+            .iter()
+            .map(|(session_name, alias)| (session_name.to_string(), alias.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn default_template_renders_like_the_untemplated_title() {
+        let format = TerminalTitleFormat::default();
+        for session_name in [Some("my-session"), None] {
+            for pane_title in ["", "vim", "some pane"] {
+                assert_eq!(
+                    format.render(session_name, "example-host", pane_title),
+                    legacy_title(session_name, pane_title),
+                    "session: {:?}, pane: {:?}",
+                    session_name,
+                    pane_title
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn template_renders_all_placeholders() {
+        let format = TerminalTitleFormat::new(
+            Some("{host} · {session} | {pane}"),
+            aliases(&[("my-session", "MS")]),
+        );
+        assert_eq!(
+            format.render(Some("my-session"), "example-host", "vim"),
+            "example-host · MS | vim"
+        );
+    }
+
+    #[test]
+    fn session_without_an_alias_renders_its_own_name() {
+        let format = TerminalTitleFormat::new(
+            Some("{host} · {session} | {pane}"),
+            aliases(&[("my-session", "MS")]),
+        );
+        assert_eq!(
+            format.render(Some("other-session"), "example-host", "vim"),
+            "example-host · other-session | vim"
+        );
+    }
+
+    #[test]
+    fn an_empty_pane_title_drops_its_separator() {
+        let format = TerminalTitleFormat::new(
+            Some("{host} · {session} | {pane}"),
+            aliases(&[("my-session", "MS")]),
+        );
+        assert_eq!(
+            format.render(Some("my-session"), "example-host", ""),
+            "example-host · MS"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_hostname_drops_its_separator() {
+        let format = TerminalTitleFormat::new(Some("{host} · {session} | {pane}"), BTreeMap::new());
+        assert_eq!(
+            format.render(Some("my-session"), "", "vim"),
+            "my-session | vim"
+        );
+        assert_eq!(format.render(None, "", ""), "");
+    }
+
+    #[test]
+    fn placeholders_render_in_any_order() {
+        let format = TerminalTitleFormat::new(
+            Some("[{pane}] {session}@{host}"),
+            aliases(&[("my-session", "MS")]),
+        );
+        assert_eq!(
+            format.render(Some("my-session"), "example-host", "vim"),
+            "[vim] MS@example-host"
+        );
+    }
+
+    #[test]
+    fn unknown_placeholders_are_literal_text() {
+        let format = TerminalTitleFormat::new(Some("{nope} {session"), BTreeMap::new());
+        assert_eq!(
+            format.render(Some("my-session"), "example-host", "vim"),
+            "{nope} {session"
+        );
+    }
+
+    #[test]
+    fn a_template_without_placeholders_is_rendered_as_is() {
+        let format = TerminalTitleFormat::new(Some("zellij"), BTreeMap::new());
+        assert_eq!(format.render(None, "", ""), "zellij");
+    }
 }
