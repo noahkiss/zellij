@@ -13,8 +13,12 @@ Three things, on the existing token-authed axum web server:
   (c) action execution over POST
 
 The motivation was a web controller that drives zellij by shelling the CLI on a 1s poll plus a
-doorbell plugin, with a planned improvement where a plugin subscribes to `PaneRenderReportWithAnsi`
-and relays it to the backend over `WebAccess`.
+doorbell plugin, with a planned improvement where a plugin subscribes to per-pane render reports and
+relays them to the backend over `WebAccess`.
+
+That plugin-side route no longer exists: upstream removed the ANSI render-report event in 0.45. The
+finding below is unaffected, because it never depended on it — the CLI `subscribe --ansi` route is
+the one that was verified, and it still works.
 
 ## The finding that decides it
 
