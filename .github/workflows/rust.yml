@@ -1,5 +1,12 @@
 name: Rust
 
+# The Windows Build and Test jobs are deliberately absent. This fork ships two
+# targets - x86_64-unknown-linux-gnu and aarch64-apple-darwin - and upstreaming is
+# not a goal, so nothing here is ever built for or run on Windows. They were also
+# the slowest jobs by a wide margin (~2m50s against ~1m for the rest), so they set
+# the wall-clock floor for the whole workflow while testing a platform that is
+# never shipped. If a rebase brings them back, delete them again.
+
 on:
   push:
     branches: [main]
@@ -37,30 +44,6 @@ jobs:
       - name: Build
         run: cargo xtask build
 
-  build-windows:
-    name: Build (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: wasm32-wasip1
-          rustflags: ""
-
-      - name: Install NASM
-        uses: ilammy/setup-nasm@v1
-
-      - name: Build
-        run: cargo xtask build
-
   test:
     name: Test
 
@@ -86,32 +69,6 @@ jobs:
 
       - name: Test
         run: cargo xtask test
-
-  test-windows:
-    name: Test (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          rustflags: ""
-
-      - name: Test zellij-utils
-        run: cargo test --no-default-features -p zellij-utils --lib
-
-      - name: Test zellij-server
-        run: cargo test --no-default-features -p zellij-server --lib
-
-      - name: Test zellij-client
-        run: cargo test --no-default-features -p zellij-client --lib
 
   integration-test:
     name: Integration Test

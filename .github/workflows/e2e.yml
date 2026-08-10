@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A superseded push cancels its stale run; without this, manual cancellations
+# accumulate and read as failures in `gh run list`.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-e2e:
     name: Build generic binary and run tests on it
