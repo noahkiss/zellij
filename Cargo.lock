@@ -4988,6 +4988,7 @@ version = "0.45.1"
 dependencies = [
  "anyhow",
  "clap",
+ "daemonix",
  "dialoguer",
  "embed-resource",
  "humantime",

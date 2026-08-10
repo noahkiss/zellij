@@ -282,6 +282,18 @@ pub struct Setup {
     /// Generates auto-start script for the specified shell
     #[clap(long, value_name = "SHELL", value_parser)]
     pub generate_auto_start: Option<String>,
+
+    /// Generates an init-system unit that keeps a session up, for `systemd` or `launchd`. The
+    /// session is named by `zellij --session <name> setup ...`, or by the `session_name` config
+    /// option
+    #[clap(long, value_name = "INIT", value_parser)]
+    pub generate_service: Option<String>,
+
+    /// The binary path the generated unit should run. Defaults to the stable name on PATH that
+    /// leads to this binary, which is what survives an upgrade; name a path here if the
+    /// installation is unusual enough that it cannot be found
+    #[clap(long, value_name = "PATH", value_parser)]
+    pub exe: Option<PathBuf>,
 }
 
 impl Setup {
@@ -398,6 +410,13 @@ impl Setup {
     pub fn from_cli_with_options(&self, opts: &CliArgs, config_options: &Options) -> Result<()> {
         if self.check {
             Setup::check_defaults_config(opts, config_options)?;
+            std::process::exit(0);
+        }
+
+        // this one lives here rather than beside the other generators because it needs the merged
+        // options: the session it schedules can come from the config file
+        if let Some(init) = &self.generate_service {
+            Setup::generate_service(init, self.exe.clone(), opts, config_options);
             std::process::exit(0);
         }
 
@@ -616,6 +635,66 @@ impl Setup {
             _ => {},
         }
     }
+    /// Write an init-system unit for `zellij session up <session>` to stdout.
+    ///
+    /// The unit is a scheduler and nothing else - see [`crate::session_service`] for why it carries
+    /// no environment of its own.
+    fn generate_service(
+        init: &str,
+        exe: Option<PathBuf>,
+        opts: &CliArgs,
+        config_options: &Options,
+    ) {
+        use crate::session_service::{
+            configured_pinned_exe, path_dirs, resolve_service_exe, service_unit, ServiceExe,
+            ServiceKind,
+        };
+
+        let Some(kind) = ServiceKind::from_name(init) else {
+            eprintln!("Unsupported init system: {} (try systemd or launchd)", init);
+            std::process::exit(1);
+        };
+        let session = opts
+            .session
+            .clone()
+            .or_else(|| config_options.session_name.clone());
+        let Some(session) = session else {
+            // --session belongs to zellij itself rather than to `setup`, so it goes before the
+            // subcommand; say so, because the other order is the one people try first
+            eprintln!(
+                "No session to schedule. Name one with:\n    \
+                 zellij --session <name> setup --generate-service {}\n\
+                 or set `session_name` in the config.",
+                init
+            );
+            std::process::exit(1);
+        };
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let pinned = configured_pinned_exe(config_options.session_service.as_ref());
+        let exe = resolve_service_exe(exe, pinned, &current_exe, &path_dirs());
+        if let ServiceExe::Resolved(path) = &exe {
+            // the failure this warns about is silent otherwise: the unit keeps working until the
+            // day the package is upgraded and the path it names stops existing
+            eprintln!(
+                "warning: no `zellij` on PATH resolves to this binary, so the unit will run\n  \
+                 {}\nwhich is where this binary actually is. If that is inside a version-specific\n\
+                 directory, the unit will break the next time zellij is upgraded. Name a stable\n\
+                 path with `--exe <PATH>` if it is.",
+                path.display()
+            );
+        }
+        let mut out = std::io::stdout();
+        // the same generator `zellij session enable` uses, so what is printed here is what would
+        // be installed - including whatever `session_service` in the config adds
+        let unit = service_unit(
+            kind,
+            exe.path(),
+            &session,
+            config_options.session_service.as_ref(),
+        );
+        let _ = out.write_all(unit.as_bytes());
+    }
+
     fn parse_layout_and_override_config(
         cli_config_options: Option<&Options>,
         config: Config,

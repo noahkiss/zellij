@@ -22,10 +22,50 @@ use crate::shared::set_permissions;
 
 const LOG_MAX_BYTES: u64 = 1024 * 1024 * 16; // 16 MiB per log
 
+/// Fail with the directory that could not be used and the variable that chose it.
+///
+/// FORK PATCH. This ran `.unwrap()`, and the commonest way it fails is a `TMPDIR` naming a
+/// directory that is not there - on macOS that one variable also decides the socket directory
+/// (`consts.rs`, where `runtime_dir()` is `None`), so it is the variable most likely to be wrong.
+/// A backtrace out of the first line of `main` gives the reader nothing to act on; the path and
+/// the variable that produced it are the whole of what they need.
+fn log_setup_failed(what: &str, path: &Path, error: io::Error) -> ! {
+    // the variable the standard library reads to place the temporary directory on this platform
+    #[cfg(windows)]
+    let variables = ["TMP", "TEMP"];
+    #[cfg(not(windows))]
+    let variables = ["TMPDIR"];
+
+    eprintln!("zellij: could not create the {} for logging", what);
+    eprintln!("  path           : {}", path.display());
+    eprintln!("  temp directory : {}", std::env::temp_dir().display());
+    for variable in variables {
+        eprintln!(
+            "  {:<15}: {}",
+            variable,
+            std::env::var(variable).unwrap_or_else(|_| "(unset)".to_owned())
+        );
+    }
+    eprintln!("  reason         : {}", error);
+    eprintln!(
+        "  The log directory sits under the temporary directory, which {} chooses. Create that \
+         directory, or unset {} to fall back to the system default.",
+        variables.join(" or "),
+        variables.join(" and "),
+    );
+    std::process::exit(1)
+}
+
 pub fn configure_logger() {
-    atomic_create_dir(&*ZELLIJ_TMP_DIR).unwrap();
-    atomic_create_dir(&*ZELLIJ_TMP_LOG_DIR).unwrap();
-    atomic_create_file(&*ZELLIJ_TMP_LOG_FILE).unwrap();
+    if let Err(e) = atomic_create_dir(&ZELLIJ_TMP_DIR) {
+        log_setup_failed("temporary directory", &*ZELLIJ_TMP_DIR, e);
+    }
+    if let Err(e) = atomic_create_dir(&ZELLIJ_TMP_LOG_DIR) {
+        log_setup_failed("log directory", &*ZELLIJ_TMP_LOG_DIR, e);
+    }
+    if let Err(e) = atomic_create_file(&ZELLIJ_TMP_LOG_FILE) {
+        log_setup_failed("log file", &*ZELLIJ_TMP_LOG_FILE, e);
+    }
 
     let trigger = SizeTrigger::new(LOG_MAX_BYTES);
     let roller = FixedWindowRoller::builder()

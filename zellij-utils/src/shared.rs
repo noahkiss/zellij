@@ -69,6 +69,19 @@ pub fn adjust_to_size(s: &str, rows: usize, columns: usize) -> String {
         .join("\n\r")
 }
 
+/// The TERM a session is given when whatever created it had none worth passing on.
+///
+/// A terminal type every terminal emulator of the last two decades understands, and the one the
+/// generated units name - see [`crate::session_service`], which spells it out where a reader of
+/// the unit can see it.
+///
+/// It lives HERE, not beside the term logic in `session_lifecycle`, because `session_service`
+/// reads it and is compiled for wasm while `session_lifecycle` is gated out of wasm. With the
+/// const on the far side of that gate the whole crate - and so every default plugin - failed to
+/// build for wasm, silently, because the plugin .wasm assets are checked in prebuilt and nothing
+/// in the ordinary build recompiles them.
+pub const DEFAULT_TERM: &str = "xterm-256color";
+
 /// What the terminal title looks like when `terminal_title_template` is not set - the historical
 /// `<session> | <pane>` format.
 pub const DEFAULT_TERMINAL_TITLE_TEMPLATE: &str = "{session} | {pane}";
