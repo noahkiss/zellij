@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use clap::{CommandFactory, Parser};
-use zellij_utils::cli::{CliArgs, Command};
+use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 
 #[test]
 fn verify_cli() {
@@ -124,4 +124,65 @@ fn web_cli_status_with_ip_and_port_works() {
     } else {
         panic!("Expected Web command");
     }
+}
+
+fn session_lifecycle_from(args: &[&str]) -> SessionLifecycleCli {
+    match CliArgs::try_parse_from(args) {
+        Ok(CliArgs {
+            command: Some(Command::Sessions(Sessions::Session(cli))),
+            ..
+        }) => cli,
+        other => panic!("Expected a session lifecycle command, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_up_comes_up_fresh_unless_a_restore_is_asked_for() {
+    // the distinction the flag exists for: no --restore means the layout, which is what makes a
+    // layout edit apply
+    match session_lifecycle_from(&["zellij", "session", "up", "work"]) {
+        SessionLifecycleCli::Up {
+            session_name,
+            restore,
+        } => {
+            assert_eq!(session_name.as_deref(), Some("work"));
+            assert_eq!(restore, None);
+        },
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_up_restore_defaults_to_the_newest_snapshot() {
+    match session_lifecycle_from(&["zellij", "session", "up", "work", "--restore"]) {
+        SessionLifecycleCli::Up { restore, .. } => assert_eq!(restore.as_deref(), Some("latest")),
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "up", "work", "--restore", "abc123"]) {
+        SessionLifecycleCli::Up { restore, .. } => assert_eq!(restore.as_deref(), Some("abc123")),
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_session_name_is_optional_everywhere() {
+    // it falls back to the config's session_name at run time
+    match session_lifecycle_from(&["zellij", "session", "down"]) {
+        SessionLifecycleCli::Down { session_name, .. } => assert_eq!(session_name, None),
+        other => panic!("Expected `down`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_restart_cannot_be_both_fresh_and_restored() {
+    assert!(CliArgs::try_parse_from([
+        "zellij",
+        "session",
+        "restart",
+        "work",
+        "--fresh",
+        "--restore",
+        "abc123",
+    ])
+    .is_err());
 }
