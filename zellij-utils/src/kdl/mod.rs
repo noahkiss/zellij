@@ -7047,6 +7047,8 @@ impl PaneInfo {
             stack_id: None,
             index_in_stack: None,
             is_expanded_in_stack: false,
+            // a pane described by a saved layout is not a live pane and has no uuid yet
+            uuid: String::new(),
         };
         Ok((tab_position, pane_info))
     }
@@ -7201,6 +7203,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             stack_id: None,
             index_in_stack: None,
             is_expanded_in_stack: false,
+            uuid: String::new(),
         },
         PaneInfo {
             id: 1,
@@ -7232,6 +7235,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             stack_id: None,
             index_in_stack: None,
             is_expanded_in_stack: false,
+            uuid: String::new(),
         },
     ];
     let mut panes = HashMap::new();

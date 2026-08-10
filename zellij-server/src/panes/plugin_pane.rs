@@ -19,6 +19,7 @@ use crate::ui::{
 use crate::ClientId;
 use std::cell::RefCell;
 use std::rc::Rc;
+use uuid::Uuid;
 use vte;
 use zellij_utils::data::PaneContents;
 use zellij_utils::data::{
@@ -77,6 +78,8 @@ macro_rules! get_or_create_grid {
 
 pub(crate) struct PluginPane {
     pub pid: u32,
+    /// Given at creation, never reused - see `Pane::pane_uuid`
+    uuid: Uuid,
     pub should_render: HashMap<ClientId, bool>,
     pub selectable: bool,
     pub geom: PaneGeom,
@@ -136,6 +139,7 @@ impl PluginPane {
         let initial_loading_message = loading_indication.to_string();
         let mut plugin = PluginPane {
             pid,
+            uuid: Uuid::new_v4(),
             should_render: HashMap::new(),
             selectable: true,
             geom: position_and_size,
@@ -536,6 +540,9 @@ impl Pane for PluginPane {
     }
     fn pid(&self) -> PaneId {
         PaneId::Plugin(self.pid)
+    }
+    fn pane_uuid(&self) -> Uuid {
+        self.uuid
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
