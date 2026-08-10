@@ -421,6 +421,196 @@ impl DownOutcome {
     }
 }
 
+/// What `session up` should do about the macOS session domain before it creates anything.
+///
+/// macOS puts every process in a session domain, and only the graphical one - launchd calls it
+/// `Aqua` - can reach TCC-gated resources, the login keychain, the pasteboard or notifications. The
+/// domain is fixed when the server is created and inherited by every pane in it; attaching later
+/// never changes it. So whoever creates the session first decides this for its whole life, and a
+/// shell over SSH is not in the graphical session: create it from there and the session is
+/// permanently without that access, with nothing anywhere saying so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuiDomainAction {
+    /// Nothing to arrange - already graphical, or the session exists and the question is settled.
+    Proceed,
+    /// Ask launchd to start this job, so the session is created in the graphical session rather
+    /// than in this one.
+    Kickstart(String),
+    /// Create it here, and say what it will not be able to do. There is no job to defer to, and
+    /// refusing would leave the user with no session over a capability they may not want.
+    ProceedWithoutGui,
+    /// Nobody is logged in graphically, so there is no session domain to create it in. Reported
+    /// rather than quietly answered with the wrong domain.
+    NoGuiSession,
+}
+
+/// Decide from what the machine says: the domain this process is in, whether a graphical session
+/// exists at all, the label of an installed job for this session if there is one, and whether the
+/// session is already there.
+pub fn gui_domain_action(
+    manager_name: Option<&str>,
+    gui_domain_available: bool,
+    installed_job: Option<&str>,
+    session_exists: bool,
+) -> GuiDomainAction {
+    // an existing session already has a domain, and `up` is not going to replace it over this
+    if session_exists {
+        return GuiDomainAction::Proceed;
+    }
+    if manager_name == Some(GUI_MANAGER_NAME) {
+        return GuiDomainAction::Proceed;
+    }
+    if !gui_domain_available {
+        return GuiDomainAction::NoGuiSession;
+    }
+    match installed_job {
+        Some(label) => GuiDomainAction::Kickstart(label.to_owned()),
+        None => GuiDomainAction::ProceedWithoutGui,
+    }
+}
+
+/// What `launchctl managername` calls the graphical login session.
+pub const GUI_MANAGER_NAME: &str = "Aqua";
+
+/// Asking launchd what this process is in and what it has been given to run.
+///
+/// Compiled under `cfg(test)` on every unix so that the macOS-only path cannot rot unnoticed on a
+/// machine that never builds it; nothing outside macOS calls it.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub mod launchctl {
+    use std::process::Command;
+
+    /// The session domain this process is in. `None` when launchctl will not say - an answer we do
+    /// not have is not one to act on.
+    pub fn manager_name() -> Option<String> {
+        let output = Command::new("launchctl").arg("managername").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    /// The graphical domain of the user running this process.
+    pub fn gui_domain() -> String {
+        format!("gui/{}", unsafe { libc::getuid() })
+    }
+
+    /// Whether there is a graphical login session for this user at all.
+    pub fn gui_domain_exists() -> bool {
+        print_succeeds(&gui_domain())
+    }
+
+    /// Whether a job by this label is loaded in the graphical domain.
+    pub fn job_is_installed(label: &str) -> bool {
+        print_succeeds(&format!("{}/{}", gui_domain(), label))
+    }
+
+    /// Start the job. It returns 0 from a non-graphical shell too: what the domain of the CALLER
+    /// is has no bearing on the domain the job runs in, which is the point.
+    pub fn kickstart(label: &str) -> Result<(), String> {
+        let target = format!("{}/{}", gui_domain(), label);
+        match Command::new("launchctl")
+            .args(["kickstart", &target])
+            .output()
+        {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(format!(
+                "launchctl kickstart {} failed: {}",
+                target,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => Err(format!("could not run launchctl: {}", e)),
+        }
+    }
+
+    fn print_succeeds(target: &str) -> bool {
+        Command::new("launchctl")
+            .args(["print", target])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+}
+
+/// Arrange for the session to be created in the graphical session, or say why it will not be.
+///
+/// `Ok(true)` means launchd has been asked for it and the caller is to wait for the session rather
+/// than create it itself.
+/// Compiled under `cfg(test)` on every unix for the same reason [`launchctl`] is.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<bool, String> {
+    use crate::session_service::{find_session_job, installed_launch_agents, SessionJob};
+
+    let derived = crate::session_service::launchd_label(session);
+    let agents = installed_launch_agents();
+    let found = find_session_job(&agents, session, &derived);
+    if let SessionJob::Ambiguous(all) = &found {
+        eprintln!(
+            "warning: {} launch agents run `session up {}`: {}",
+            all.len(),
+            session,
+            all.iter()
+                .map(|job| job.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // A plist on disk that launchd was never given is not a job that can be started, and a job may
+    // equally have been loaded from a file this scan cannot see - so the disk says WHICH job it is
+    // and launchd says whether it is there. Falling back to the derived label keeps the case this
+    // build installed itself working even if its file has been moved.
+    let label = found
+        .job()
+        .map(|job| job.name.clone())
+        .filter(|label| launchctl::job_is_installed(label))
+        .or_else(|| launchctl::job_is_installed(&derived).then(|| derived.clone()));
+    let action = gui_domain_action(
+        launchctl::manager_name().as_deref(),
+        launchctl::gui_domain_exists(),
+        label.as_deref(),
+        session_exists,
+    );
+    match action {
+        GuiDomainAction::Proceed => Ok(false),
+        GuiDomainAction::Kickstart(label) => {
+            // say why this label, when it is not the one this build would have installed: from the
+            // outside the choice would otherwise look like it came from nowhere
+            if label != derived {
+                println!(
+                    "      '{}' is kept up by the launch agent '{}', installed under a name this \
+                     build did not choose",
+                    session, label
+                );
+            }
+            println!(
+                "      asking launchd for '{}' in the graphical session",
+                label
+            );
+            launchctl::kickstart(&label)?;
+            Ok(true)
+        },
+        GuiDomainAction::ProceedWithoutGui => {
+            eprintln!(
+                "warning: creating '{}' outside the graphical session. Every pane in it inherits \n         \
+                 that, for as long as the server lives, and attaching from a graphical terminal \n         \
+                 later does not change it: access to TCC-gated resources, the login keychain, the \n         \
+                 pasteboard and notifications will be unavailable.\n         \
+                 No loaded launch agent was found naming `session up {}` - one that reaches it\n         \
+                 through a wrapper script may not be recognisable from its plist.\n         \
+                 Install one to avoid this: zellij session enable {}",
+                session, session, session
+            );
+            Ok(false)
+        },
+        GuiDomainAction::NoGuiSession => Err(format!(
+            "there is no graphical login session to create '{}' in, and creating it here would \
+             give it a session domain it could never leave. Log in graphically first, or create \
+             the session deliberately from a shell in that session.",
+            session
+        )),
+    }
+}
+
 /// Re-exported so the term logic and its callers still read `session_lifecycle::DEFAULT_TERM`.
 /// The const itself lives in `shared` because `session_service` needs it and is built for wasm,
 /// while this module is not - see the note beside its definition.
@@ -546,6 +736,562 @@ pub fn env_vars_to_drop<'a>(
         })
         .map(|name| name.to_owned())
         .collect()
+}
+
+/// Which build is serving a session, relative to the binary that is asking.
+///
+/// `Unknown` is not a fault to report. A client that cannot see the server's executable knows
+/// nothing about it, and a wrong "your session is stale" costs more than saying nothing: it sends
+/// someone to restart a session that did not need restarting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildMatch {
+    Same,
+    Different,
+    Unknown,
+}
+
+/// A running program's executable, identified by more than its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutableIdentity {
+    /// The path, canonicalised where it could be. A package manager installs a stable name that is
+    /// a symlink into a versioned directory, so two spellings routinely name one build.
+    pub path: PathBuf,
+    /// Device and inode, where the file could be stat'ed. One file has one pair whatever it is
+    /// called, and a replacement gets a new one, so equal inodes settle it - but UNEQUAL ones do
+    /// not, because a COPY of a build is a different file holding the same program.
+    pub file_id: Option<(u64, u64)>,
+    /// What the linker stamped into the file: the Mach-O `LC_UUID` on macOS, the GNU build-id on
+    /// Linux. This is the only field that identifies a BUILD rather than a file, so two copies of
+    /// one binary agree here and nowhere else.
+    pub build_id: Option<Vec<u8>>,
+    /// The file's length. Not an identity - two builds can share one - but a DIFFERENCE is proof
+    /// of two builds, which is what it is kept for where nothing stamped an id.
+    pub size: Option<u64>,
+    /// The file the process started from is no longer at its path - an upgrade wrote over it in
+    /// place. Linux says so by appending " (deleted)" to the `/proc/<pid>/exe` link.
+    pub replaced: bool,
+}
+
+/// What can be learnt about the file at `path`, without failing if the answer is "not much".
+pub fn identify_executable(path: PathBuf) -> ExecutableIdentity {
+    let (path, replaced) = match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(real_path) => (PathBuf::from(real_path), true),
+        None => (path, false),
+    };
+    let path = path.canonicalize().unwrap_or(path);
+    // a replaced file's path now holds its replacement, and nothing read from it describes the
+    // build that is actually running
+    #[cfg(unix)]
+    let (file_id, size, build_id) = if replaced {
+        (None, None, None)
+    } else {
+        let stat = std::fs::metadata(&path).ok();
+        let file_id = stat.as_ref().map(|metadata| {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        });
+        (
+            file_id,
+            stat.as_ref().map(|metadata| metadata.len()),
+            build_id_of(&path),
+        )
+    };
+    #[cfg(not(unix))]
+    let (file_id, size, build_id): (Option<(u64, u64)>, Option<u64>, Option<Vec<u8>>) =
+        (None, None, None);
+    ExecutableIdentity {
+        path,
+        file_id,
+        build_id,
+        size,
+        replaced,
+    }
+}
+
+/// A read of exactly `len` bytes at `offset`, and nothing else.
+///
+/// The binary is around 40 MB and this runs on every CLI invocation, so no path through here is
+/// allowed to read the whole file. Every caller caps `len` from a header field before asking.
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buffer = vec![0u8; len];
+    file.read_exact_at(&mut buffer, offset).ok()?;
+    Some(buffer)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn u16_at(bytes: &[u8], offset: usize, little: bool) -> Option<u16> {
+    let raw: [u8; 2] = bytes.get(offset..offset + 2)?.try_into().ok()?;
+    Some(if little {
+        u16::from_le_bytes(raw)
+    } else {
+        u16::from_be_bytes(raw)
+    })
+}
+
+#[cfg(unix)]
+fn u32_at(bytes: &[u8], offset: usize, little: bool) -> Option<u32> {
+    let raw: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
+    Some(if little {
+        u32::from_le_bytes(raw)
+    } else {
+        u32::from_be_bytes(raw)
+    })
+}
+
+#[cfg(unix)]
+fn u64_at(bytes: &[u8], offset: usize, little: bool) -> Option<u64> {
+    let raw: [u8; 8] = bytes.get(offset..offset + 8)?.try_into().ok()?;
+    Some(if little {
+        u64::from_le_bytes(raw)
+    } else {
+        u64::from_be_bytes(raw)
+    })
+}
+
+/// The build the file at `path` IS, as its own contents record it.
+///
+/// A copy of a binary is a different file holding the same program, so nothing the filesystem knows
+/// can tell the two apart. Both formats stamp an identity near the front of the file - the Mach-O
+/// `LC_UUID`, the GNU build-id note - and reading it costs a few kilobytes, not 40 MB.
+///
+/// `None` is an ordinary answer: not every linker emits one. It means "no evidence", never
+/// "different".
+#[cfg(unix)]
+fn build_id_of(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let header = read_at(&file, 0, 64)?;
+    #[cfg(target_os = "macos")]
+    {
+        macho_build_id(&file, &header)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if header.get(..4)? == b"\x7fELF" {
+            elf_build_id(&file, &header)
+        } else {
+            None
+        }
+    }
+}
+
+/// The GNU build-id, found through the PROGRAM headers.
+///
+/// The note is reachable two ways, and only one of them survives: sections are what `strip` is
+/// entitled to discard, segments are not. So the `PT_NOTE` segments are walked, not
+/// `.note.gnu.build-id` by name.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn elf_build_id(file: &std::fs::File, header: &[u8]) -> Option<Vec<u8>> {
+    const PT_NOTE: u32 = 4;
+    // a program header table longer than this is not something a linker produced
+    const MAX_SEGMENTS: u16 = 128;
+    // notes are a handful of small records; a segment larger than this is not one of ours
+    const MAX_NOTE_SEGMENT: u64 = 64 * 1024;
+
+    let sixty_four = match header.get(4)? {
+        2 => true,
+        1 => false,
+        _ => return None,
+    };
+    let little = match header.get(5)? {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let (table_at, entry_size, count) = if sixty_four {
+        (
+            u64_at(header, 0x20, little)?,
+            u16_at(header, 0x36, little)? as usize,
+            u16_at(header, 0x38, little)?,
+        )
+    } else {
+        (
+            u32_at(header, 0x1c, little)? as u64,
+            u16_at(header, 0x2a, little)? as usize,
+            u16_at(header, 0x2c, little)?,
+        )
+    };
+    let smallest_entry = if sixty_four { 56 } else { 32 };
+    if count == 0 || count > MAX_SEGMENTS || entry_size < smallest_entry {
+        return None;
+    }
+    let table = read_at(file, table_at, entry_size * count as usize)?;
+    for entry in table.chunks_exact(entry_size) {
+        if u32_at(entry, 0, little)? != PT_NOTE {
+            continue;
+        }
+        let (notes_at, notes_size) = if sixty_four {
+            (u64_at(entry, 8, little)?, u64_at(entry, 32, little)?)
+        } else {
+            (
+                u32_at(entry, 4, little)? as u64,
+                u32_at(entry, 16, little)? as u64,
+            )
+        };
+        if notes_size == 0 || notes_size > MAX_NOTE_SEGMENT {
+            continue;
+        }
+        let Some(notes) = read_at(file, notes_at, notes_size as usize) else {
+            continue;
+        };
+        if let Some(build_id) = gnu_build_id_in_notes(&notes, little) {
+            return Some(build_id);
+        }
+    }
+    None
+}
+
+/// The `NT_GNU_BUILD_ID` record in one note segment, if it holds one.
+///
+/// Each record is a 12-byte header, then a name and a payload, each padded up to four bytes. Both
+/// lengths are checked against the buffer before either is used, so a malformed file yields `None`
+/// rather than a panic.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn gnu_build_id_in_notes(notes: &[u8], little: bool) -> Option<Vec<u8>> {
+    const NT_GNU_BUILD_ID: u32 = 3;
+    let padded = |length: usize| length.checked_add(3).map(|length| length & !3);
+
+    let mut at = 0usize;
+    while at + 12 <= notes.len() {
+        let name_size = u32_at(notes, at, little)? as usize;
+        let payload_size = u32_at(notes, at + 4, little)? as usize;
+        let kind = u32_at(notes, at + 8, little)?;
+        let name_at = at + 12;
+        let payload_at = name_at.checked_add(padded(name_size)?)?;
+        let end = payload_at.checked_add(padded(payload_size)?)?;
+        if end > notes.len() {
+            return None;
+        }
+        if kind == NT_GNU_BUILD_ID && notes.get(name_at..name_at + name_size) == Some(&b"GNU\0"[..])
+        {
+            return notes
+                .get(payload_at..payload_at + payload_size)
+                .map(|build_id| build_id.to_vec());
+        }
+        at = end;
+    }
+    None
+}
+
+/// The `LC_UUID` of one Mach-O image, which may be a slice inside a universal file.
+///
+/// Only the load commands are read - they follow the header directly, and their total size is in
+/// the header, so the read is bounded before the file is touched a second time.
+#[cfg(target_os = "macos")]
+fn macho_uuid(file: &std::fs::File, image_at: u64) -> Option<Vec<u8>> {
+    const LC_UUID: u32 = 0x1b;
+    // both caps are far above anything a real image carries
+    const MAX_LOAD_COMMANDS: u32 = 4096;
+    const MAX_LOAD_COMMANDS_SIZE: u32 = 256 * 1024;
+
+    let header = read_at(file, image_at, 32)?;
+    let (sixty_four, little) = match u32_at(&header, 0, true)? {
+        0xfeed_facf => (true, true),
+        0xcffa_edfe => (true, false),
+        0xfeed_face => (false, true),
+        0xcefa_edfe => (false, false),
+        _ => return None,
+    };
+    let count = u32_at(&header, 16, little)?;
+    let commands_size = u32_at(&header, 20, little)?;
+    if count == 0 || count > MAX_LOAD_COMMANDS || commands_size > MAX_LOAD_COMMANDS_SIZE {
+        return None;
+    }
+    let commands_at = image_at + if sixty_four { 32 } else { 28 };
+    let commands = read_at(file, commands_at, commands_size as usize)?;
+    let mut at = 0usize;
+    for _ in 0..count {
+        let kind = u32_at(&commands, at, little)?;
+        let size = u32_at(&commands, at + 4, little)? as usize;
+        if size < 8 {
+            return None;
+        }
+        if kind == LC_UUID {
+            return commands.get(at + 8..at + 24).map(|uuid| uuid.to_vec());
+        }
+        at = at.checked_add(size)?;
+    }
+    None
+}
+
+/// The identity of a Mach-O file, universal or not.
+///
+/// A universal file is one build only if every slice in it is, so all of their UUIDs are joined in
+/// file order and compared as one value. A thin file is the same walk with one image at offset 0.
+#[cfg(target_os = "macos")]
+fn macho_build_id(file: &std::fs::File, header: &[u8]) -> Option<Vec<u8>> {
+    const FAT_MAGIC: u32 = 0xcafe_babe;
+    const FAT_MAGIC_64: u32 = 0xcafe_babf;
+    // a universal binary of more than this many architectures is not one we produced
+    const MAX_ARCHITECTURES: u32 = 16;
+
+    // a fat header is big-endian whatever the images inside it are
+    let magic = u32_at(header, 0, false)?;
+    if magic != FAT_MAGIC && magic != FAT_MAGIC_64 {
+        return macho_uuid(file, 0);
+    }
+    let wide = magic == FAT_MAGIC_64;
+    let count = u32_at(header, 4, false)?;
+    if count == 0 || count > MAX_ARCHITECTURES {
+        return None;
+    }
+    let entry_size = if wide { 32 } else { 20 };
+    let table = read_at(file, 8, entry_size * count as usize)?;
+    let mut joined = Vec::new();
+    for entry in table.chunks_exact(entry_size) {
+        let image_at = if wide {
+            u64_at(entry, 8, false)?
+        } else {
+            u32_at(entry, 8, false)? as u64
+        };
+        joined.extend(macho_uuid(file, image_at)?);
+    }
+    if joined.is_empty() {
+        return None;
+    }
+    Some(joined)
+}
+
+/// Whether two executables are the same build, judged only on what was actually established.
+///
+/// The evidence is tried strongest first, and each step only reports `Different` on something that
+/// PROVES it:
+///
+/// 1. one inode is one file, so equal inodes are `Same` and cost nothing beyond the stat already
+///    taken. Unequal inodes prove nothing - a copy of a build is a different file;
+/// 2. the id the linker stamped in decides both ways. It identifies the BUILD, so a copy at a
+///    pinned path and the binary it was copied from agree here;
+/// 3. with no stamp on one side, a size that DIFFERS is still proof of two builds;
+/// 4. same size and nothing to identify either: `Unknown`. Two names for one build is at least as
+///    likely as two builds, and only one of those two answers costs the user anything - a wrong
+///    "your session is stale" sends someone to restart a session that did not need it.
+pub fn compare_builds(
+    ours: Option<&ExecutableIdentity>,
+    theirs: Option<&ExecutableIdentity>,
+) -> BuildMatch {
+    let (Some(ours), Some(theirs)) = (ours, theirs) else {
+        return BuildMatch::Unknown;
+    };
+    if ours.replaced {
+        // our own file has been replaced too, so there is nothing left on disk to compare against
+        return BuildMatch::Unknown;
+    }
+    if theirs.replaced {
+        // ours is on disk and theirs is not, so they cannot be the same file
+        return BuildMatch::Different;
+    }
+    if let (Some(our_file), Some(their_file)) = (ours.file_id, theirs.file_id) {
+        if our_file == their_file {
+            return BuildMatch::Same;
+        }
+    }
+    if let (Some(our_id), Some(their_id)) = (&ours.build_id, &theirs.build_id) {
+        return if our_id == their_id {
+            BuildMatch::Same
+        } else {
+            BuildMatch::Different
+        };
+    }
+    if let (Some(our_size), Some(their_size)) = (ours.size, theirs.size) {
+        if our_size != their_size {
+            return BuildMatch::Different;
+        }
+    }
+    match (ours.file_id, theirs.file_id) {
+        // two distinct files that nothing above could tell apart
+        (Some(_), Some(_)) => BuildMatch::Unknown,
+        // neither could be stat'ed, so only agreement counts: two spellings may be one build
+        _ if ours.path == theirs.path => BuildMatch::Same,
+        _ => BuildMatch::Unknown,
+    }
+}
+
+/// The executable a running process started from.
+///
+/// `/proc/<pid>/exe` is the whole answer on Linux: it is the kernel's own reference to the file,
+/// and it says so when the file has since been replaced.
+#[cfg(target_os = "linux")]
+fn executable_of_pid(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{}/exe", pid)).ok()
+}
+
+/// The executable a running process started from.
+///
+/// macOS has no `/proc`, and `ps -o comm=` is not a substitute - it is truncated at the column
+/// width. `proc_pidpath` is the kernel asked directly, and fills a buffer with the full path.
+#[cfg(target_os = "macos")]
+fn executable_of_pid(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // PROC_PIDPATHINFO_MAXSIZE, which is not exposed by the libc crate
+    let mut buffer = vec![0u8; 4096];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// Everywhere else there is no portable way to ask, so nothing is claimed.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn executable_of_pid(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// The build behind the server serving `name` from the socket directory this binary resolved.
+///
+/// Exactly one such server, or nothing: two servers for one name is its own fault, reported by the
+/// post-conditions, and guessing which of them a client will reach would be inventing an answer.
+pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
+    let expected_socket = ZELLIJ_SOCK_DIR.join(name);
+    let mut ours = servers_for_session(name)
+        .into_iter()
+        .filter(|server| server.socket == expected_socket);
+    let server = ours.next()?;
+    if ours.next().is_some() {
+        return None;
+    }
+    executable_of_pid(server.pid).map(identify_executable)
+}
+
+/// The build of the binary running right now.
+pub fn own_executable() -> Option<ExecutableIdentity> {
+    std::env::current_exe().ok().map(identify_executable)
+}
+
+/// What a pass over the pinned copy did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinOutcome {
+    /// There was no file at the pinned path, and now there is.
+    Installed(PathBuf),
+    /// The pinned path held a different build, and now holds this one.
+    Refreshed(PathBuf),
+    /// The pinned path already holds this build. The common case, and the reason the build is
+    /// identified at all: copying 40 MB on every `session up` for nothing.
+    UpToDate(PathBuf),
+}
+
+impl PinOutcome {
+    pub fn path(&self) -> &Path {
+        match self {
+            PinOutcome::Installed(path)
+            | PinOutcome::Refreshed(path)
+            | PinOutcome::UpToDate(path) => path,
+        }
+    }
+}
+
+/// Put this build at `target`, if it is not there already.
+///
+/// WRITTEN OVER IN PLACE, never unlinked and replaced. Measured on one machine: macOS keeps a
+/// permission grant when a different build is written over the file the grant names, and the grant
+/// is keyed to that file rather than to its contents - the code signature it recorded is not
+/// enforced for an ad-hoc-signed client. A new inode at the same path is a new client with none of
+/// the grants, so `truncate` is load-bearing and a rename into place would undo the whole point.
+///
+/// Whether to write at all is decided by [`compare_builds`], not by a timestamp or a path: the
+/// pinned copy is a COPY, so it is a different file from the binary it came from and only the id
+/// the linker stamped in can say whether it is the same build.
+///
+/// A write that fails part-way leaves a short file at the pinned path. That is not silent and it is
+/// not permanent: a truncated copy is a different size, so the next `session up` finds it different
+/// and writes it again.
+#[cfg(unix)]
+pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if target.exists() {
+        let ours = identify_executable(source.to_path_buf());
+        let theirs = identify_executable(target.to_path_buf());
+        if compare_builds(Some(&ours), Some(&theirs)) == BuildMatch::Same {
+            return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+        }
+    }
+    let refreshing = target.exists();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
+    }
+    let mut input = std::fs::File::open(source)
+        .map_err(|e| format!("could not read {}: {}", source.display(), e))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(target)
+        .map_err(|e| pin_write_error(target, &e))?;
+    std::io::copy(&mut input, &mut output)
+        .map_err(|e| format!("could not write {}: {}", target.display(), e))?;
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("could not make {} executable: {}", target.display(), e))?;
+    Ok(if refreshing {
+        PinOutcome::Refreshed(target.to_path_buf())
+    } else {
+        PinOutcome::Installed(target.to_path_buf())
+    })
+}
+
+/// Why the pinned path could not be opened for writing, saying what to do about the one cause that
+/// is ordinary: the copy is running.
+///
+/// A server keeps the binary it started with, so the pinned copy of a session that is up is being
+/// executed, and no unix will let it be written to. Restarting the session releases it, and the
+/// restart is what the new build was wanted for anyway.
+#[cfg(unix)]
+fn pin_write_error(target: &Path, error: &std::io::Error) -> String {
+    if error.raw_os_error() == Some(libc::ETXTBSY) {
+        return format!(
+            "the pinned copy at {} is being executed right now, so it cannot be written over. \
+             A server keeps the binary it started with, so restart the session to release it - \
+             `zellij session restart` - and the copy is refreshed on the way back up.",
+            target.display()
+        );
+    }
+    format!("could not write {}: {}", target.display(), error)
+}
+
+/// What to say about a session served by a build that is not this one, if it is.
+///
+/// A server keeps the binary it started with for the whole life of the session, so upgrading the
+/// package changes nothing until the session is restarted. Nothing else says so, and a machine can
+/// therefore sit on a superseded build for days while everyone believes the upgrade took effect.
+pub fn build_mismatch_warning(name: &str) -> Option<String> {
+    let ours = own_executable();
+    let theirs = server_executable(name);
+    if compare_builds(ours.as_ref(), theirs.as_ref()) != BuildMatch::Different {
+        return None;
+    }
+    let (ours, theirs) = (ours?, theirs?);
+    Some(format!(
+        "warning: session '{}' is running a different build of zellij than this binary.\n  \
+         running: {}\n  this:    {}\n  \
+         A server keeps the binary it started with, so an upgrade does not reach a running \
+         session.\n  Run `zellij session restart {}` to bring it onto this build.",
+        name,
+        theirs.path.display(),
+        ours.path.display(),
+        name
+    ))
+}
+
+/// Say it, at most once for the life of this process.
+///
+/// A client talks to its server many times over; the mismatch is one fact about the session and is
+/// worth one line, not one line per action, per reconnect or per render.
+pub fn warn_if_server_build_differs(name: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        if let Some(warning) = build_mismatch_warning(name) {
+            eprintln!("{}", warning);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -853,5 +1599,370 @@ mod tests {
     #[test]
     fn a_server_that_outlived_the_wait_is_a_failure() {
         assert!(DownOutcome::judge(deleted(false, true), Ok(())).is_failure());
+    }
+
+    #[test]
+    fn a_graphical_shell_creates_the_session_itself() {
+        assert_eq!(
+            gui_domain_action(Some(GUI_MANAGER_NAME), true, Some("a.label"), false),
+            GuiDomainAction::Proceed
+        );
+    }
+
+    #[test]
+    fn a_session_that_already_exists_settles_the_question() {
+        // its domain was decided when it was created and `up` is not going to replace it
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, Some("a.label"), true),
+            GuiDomainAction::Proceed
+        );
+    }
+
+    #[test]
+    fn a_non_graphical_shell_defers_to_the_installed_job() {
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, Some("a.label"), false),
+            GuiDomainAction::Kickstart("a.label".to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_job_the_session_is_created_anyway_and_said_so() {
+        // no job to defer to, and no session at all is worse than a session without GUI access
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, None, false),
+            GuiDomainAction::ProceedWithoutGui
+        );
+    }
+
+    #[test]
+    fn with_nobody_logged_in_graphically_there_is_nothing_to_create_it_in() {
+        assert_eq!(
+            gui_domain_action(Some("Background"), false, Some("a.label"), false),
+            GuiDomainAction::NoGuiSession
+        );
+        // and an unknown domain is not treated as the graphical one
+        assert_eq!(
+            gui_domain_action(None, false, None, false),
+            GuiDomainAction::NoGuiSession
+        );
+    }
+
+    fn executable(path: &str, file_id: Option<(u64, u64)>) -> ExecutableIdentity {
+        ExecutableIdentity {
+            path: PathBuf::from(path),
+            file_id,
+            build_id: None,
+            size: None,
+            replaced: false,
+        }
+    }
+
+    fn stamped(path: &str, file_id: (u64, u64), build_id: &[u8]) -> ExecutableIdentity {
+        ExecutableIdentity {
+            build_id: Some(build_id.to_vec()),
+            size: Some(41_000_000),
+            ..executable(path, Some(file_id))
+        }
+    }
+
+    #[test]
+    fn one_file_under_two_names_is_one_build() {
+        // the stable name and the versioned path a package manager points it at
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 1234)));
+        let theirs = executable("/opt/zellij/1.2.3/bin/zellij", Some((66, 1234)));
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    fn a_different_file_at_the_same_path_is_a_different_build() {
+        // the ordinary upgrade: one path, a new file behind it, a server still on the old one
+        let ours = stamped("/opt/zellij/bin/zellij", (66, 4321), b"newer");
+        let theirs = stamped("/opt/zellij/bin/zellij", (66, 1234), b"older");
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    fn a_copy_of_one_binary_is_one_build() {
+        // what a pinned copy at a stable path looks like: same program, two files, two inodes.
+        // The whole point of the stamped id - by inode alone this is the false alarm.
+        let ours = stamped("/opt/zellij/bin/zellij", (66, 4321), b"one build");
+        let theirs = stamped("/var/zellij/bin/zellij", (66, 9876), b"one build");
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    fn without_a_stamp_a_size_that_differs_is_still_proof() {
+        // no linker id on either side, so the only evidence left is the one that cannot lie
+        let ours = ExecutableIdentity {
+            size: Some(41_000_000),
+            ..executable("/opt/zellij/bin/zellij", Some((66, 4321)))
+        };
+        let theirs = ExecutableIdentity {
+            size: Some(40_000_000),
+            ..executable("/opt/zellij/bin/zellij", Some((66, 1234)))
+        };
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    fn two_unstamped_files_of_one_size_say_nothing() {
+        // a copy on a toolchain that emitted no build id. Silence is the answer that cannot send
+        // someone to restart a session that did not need it
+        let ours = ExecutableIdentity {
+            size: Some(41_000_000),
+            ..executable("/opt/zellij/bin/zellij", Some((66, 4321)))
+        };
+        let theirs = ExecutableIdentity {
+            size: Some(41_000_000),
+            ..executable("/var/zellij/bin/zellij", Some((66, 9876)))
+        };
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn a_server_whose_file_is_gone_is_on_another_build() {
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
+        let theirs = ExecutableIdentity {
+            replaced: true,
+            ..executable("/opt/zellij/bin/zellij", None)
+        };
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    fn an_executable_that_could_not_be_read_says_nothing() {
+        let ours = executable("/opt/zellij/bin/zellij", Some((66, 4321)));
+        assert_eq!(compare_builds(Some(&ours), None), BuildMatch::Unknown);
+        assert_eq!(compare_builds(None, Some(&ours)), BuildMatch::Unknown);
+        assert_eq!(compare_builds(None, None), BuildMatch::Unknown);
+    }
+
+    #[test]
+    fn without_inodes_only_agreement_is_trusted() {
+        // two spellings with nothing to tell them apart by may still be one build
+        let ours = executable("/opt/zellij/bin/zellij", None);
+        let theirs = executable("/opt/zellij/1.2.3/bin/zellij", None);
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Unknown
+        );
+        assert_eq!(
+            compare_builds(
+                Some(&ours),
+                Some(&executable("/opt/zellij/bin/zellij", None))
+            ),
+            BuildMatch::Same
+        );
+    }
+
+    /// The smallest ELF file that carries a build id: a header, one `PT_NOTE` program header, and
+    /// the note itself. Written by hand so the parser is tested against the format rather than
+    /// against whatever the local toolchain happens to emit - which, as it turns out, may emit no
+    /// build id at all.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn elf_with_build_id(build_id: &[u8], padding: usize) -> Vec<u8> {
+        let mut note = Vec::new();
+        note.extend((4u32).to_le_bytes()); // n_namesz, for "GNU\0"
+        note.extend((build_id.len() as u32).to_le_bytes());
+        note.extend((3u32).to_le_bytes()); // NT_GNU_BUILD_ID
+        note.extend(b"GNU\0");
+        note.extend(build_id);
+        while note.len() % 4 != 0 {
+            note.push(0);
+        }
+
+        let mut file = vec![0u8; 120];
+        file[..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2; // 64-bit
+        file[5] = 1; // little-endian
+        file[6] = 1; // version
+        file[0x10..0x12].copy_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
+        file[0x12..0x14].copy_from_slice(&0x3eu16.to_le_bytes()); // e_machine
+        file[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        file[0x20..0x28].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        file[0x34..0x36].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        file[0x36..0x38].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        file[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        file[64..68].copy_from_slice(&4u32.to_le_bytes()); // p_type: PT_NOTE
+        file[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        file[96..104].copy_from_slice(&(note.len() as u64).to_le_bytes()); // p_filesz
+
+        file.extend(note);
+        file.extend(std::iter::repeat(0).take(padding));
+        file
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    struct ScratchDir(PathBuf);
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zellij-build-identity-{}-{}",
+                std::process::id(),
+                name
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a writable temp dir");
+            ScratchDir(path)
+        }
+
+        fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, contents).expect("a writable temp dir");
+            path
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_copied_binary_reads_as_the_same_build() {
+        // the case that made this necessary: byte-identical files, two inodes, no false warning
+        let scratch = ScratchDir::new("copy");
+        let original = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let copy = scratch.0.join("zellij-pinned");
+        std::fs::copy(&original, &copy).expect("a writable temp dir");
+
+        let ours = identify_executable(original);
+        let theirs = identify_executable(copy);
+        assert_ne!(ours.file_id, theirs.file_id, "a copy is a different file");
+        assert_eq!(ours.build_id, Some(vec![0xab; 20]));
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn two_builds_read_as_different_builds() {
+        let scratch = ScratchDir::new("different");
+        let ours = scratch.write("new", &elf_with_build_id(&[0xab; 20], 4096));
+        // a differing size alone would settle this, so keep them equal and make the id do the work
+        let theirs = scratch.write("old", &elf_with_build_id(&[0xcd; 20], 4096));
+
+        let ours = identify_executable(ours);
+        let theirs = identify_executable(theirs);
+        assert_eq!(ours.size, theirs.size);
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&theirs)),
+            BuildMatch::Different
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_symlink_still_reads_as_the_same_build() {
+        // the original case: the installed name pointing into a versioned directory
+        let scratch = ScratchDir::new("symlink");
+        let original = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let link = scratch.0.join("zellij-current");
+        std::os::unix::fs::symlink(&original, &link).expect("a writable temp dir");
+
+        let ours = identify_executable(original);
+        let theirs = identify_executable(link);
+        assert_eq!(ours.file_id, theirs.file_id, "a symlink is one file");
+        assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_pinned_copy_is_created_where_there_was_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("pin-new");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        // a directory that does not exist yet: the pin is zellij's own, so nothing else made it
+        let target = scratch.0.join("bin/zellij");
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Installed(target.clone()))
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111, "a launcher has to be able to exec it");
+    }
+
+    /// The reason the build is identified at all. `session up` runs this on every pass, including
+    /// the one a watchdog takes every minute, and the binary is around 40 MB.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_same_build_is_not_copied_over_itself() {
+        let scratch = ScratchDir::new("pin-same");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        std::fs::copy(&source, &target).unwrap();
+        let before = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            before,
+            "a copy of the same build was written all the same"
+        );
+    }
+
+    /// The measured constraint the whole feature rests on: macOS keeps a permission grant when the
+    /// file the grant names is written over, and loses it when a new file takes the path. So the
+    /// refresh has to keep the inode.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_refresh_writes_over_the_same_file_rather_than_replacing_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = ScratchDir::new("pin-refresh");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 8192));
+        let target = scratch.write("pinned", &elf_with_build_id(&[0xcd; 20], 4096));
+        let before = std::fs::metadata(&target).unwrap().ino();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone()))
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            before,
+            "the pinned path holds a new file, so a macOS grant would not follow it"
+        );
+        assert_eq!(
+            identify_executable(target).build_id,
+            Some(vec![0xab; 20]),
+            "and it is the new build"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_file_that_is_not_an_executable_yields_no_id() {
+        // "no evidence" has to stay distinct from "different", or every unreadable file warns
+        let scratch = ScratchDir::new("not-elf");
+        let path = scratch.write("zellij", b"#!/bin/sh\nexec zellij \"$@\"\n");
+        assert_eq!(identify_executable(path).build_id, None);
     }
 }

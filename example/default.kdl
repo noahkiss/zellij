@@ -591,6 +591,32 @@ load_plugins {
 //
 // session_restart_drop_env "MY_VAR" "MY_PREFIX_*"
 
+// Extra directives for the init-system unit `zellij session enable` writes
+// A generated unit cannot know the local facts - that this session must start after some other
+// service, that it wants a particular nice level - so they are named here, where `zellij session
+// status` can report them and anyone reading this file can see them
+// Every entry is passed through VERBATIM: zellij models neither systemd's schema nor launchd's
+// - systemd: each string is a literal directive line, appended to the section that names it
+//   (`unit` -> [Unit], `service` -> [Service], `install` -> [Install])
+// - launchd: each entry becomes a plist key, with a string, integer or boolean value
+// An entry that takes over what the generator owns is a config error: ExecStart, the plist keys
+// zellij writes itself, and anything naming TMPDIR or ZELLIJ_SOCKET_DIR - a unit that pins either
+// of those builds a session no terminal can see
+// Default: nothing added
+//
+// session_service {
+//     systemd {
+//         unit "After=network.target" "Before=some-other.service"
+//         service "Nice=-5"
+//     }
+//     launchd {
+//         keys {
+//             ProcessType "Interactive"
+//             Nice 5
+//         }
+//     }
+// }
+
 // A command to run (will be wrapped with sh -c and provided the RESURRECT_COMMAND env variable)
 // after Zellij attempts to discover a command inside a pane when resurrecting sessions, the STDOUT
 // of this command will be used instead of the discovered RESURRECT_COMMAND

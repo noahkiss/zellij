@@ -11,14 +11,19 @@
 //! What survives from the scripts is the discipline: every one of these commands states a
 //! post-condition and checks it. See [`zellij_utils::session_lifecycle`].
 
+use std::path::PathBuf;
 use std::process;
 use std::time::{Duration, Instant};
 
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    colorterm_for_new_session, env_vars_to_drop, lock_up, term_for_new_session, DownOutcome,
-    SessionFacts,
+    colorterm_for_new_session, env_vars_to_drop, lock_up, term_for_new_session,
+    warn_if_server_build_differs, DownOutcome, SessionFacts,
+};
+use zellij_utils::session_service::{
+    self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
+    PinState, PlistValue, ServiceExe, ServiceKind, SessionServiceOptions, UnitDrift,
 };
 use zellij_utils::sessions::{delete_session_reporting, validate_session_name, KillWait};
 
@@ -72,6 +77,611 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
                 Some(restore.unwrap_or_else(|| "latest".to_owned()))
             };
             restart(&name, restore, wait_timeout, &opts);
+        },
+        SessionLifecycleCli::Enable {
+            session_name,
+            exe,
+            force,
+        } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(match enable(&name, exe, force, &opts) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Disable { session_name } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(match disable(&name) {
+                Ok(()) => 0,
+                Err(()) => 1,
+            });
+        },
+        SessionLifecycleCli::Status { session_name, exe } => {
+            let name = resolve_session_name(session_name, &opts, false);
+            process::exit(status(&name, exe, &opts));
+        },
+    }
+}
+
+/// The init system of this machine, or a refusal naming what it would have driven.
+fn native_service_kind() -> Result<ServiceKind, ()> {
+    session_service::native_service_kind().ok_or_else(|| {
+        eprintln!(
+            "session enable: no init system this build can install into. \
+             `zellij setup --generate-service` still prints a unit to adapt by hand."
+        );
+    })
+}
+
+/// Which binary the unit should run, warning when the answer is one an upgrade can break.
+fn service_exe(explicit: Option<PathBuf>, pinned: Option<PathBuf>) -> PathBuf {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let exe = resolve_service_exe(explicit, pinned, &current_exe, &path_dirs());
+    if let ServiceExe::Resolved(path) = &exe {
+        eprintln!(
+            "warning: no `zellij` on PATH resolves to this binary, so the unit will run\n  \
+             {}\nwhich is where this binary actually is. If that is inside a version-specific\n\
+             directory, the unit will break the next time zellij is upgraded. Name a stable\n\
+             path with `--exe <PATH>` if it is.",
+            path.display()
+        );
+    }
+    exe.path().to_path_buf()
+}
+
+/// What the config adds to the generated unit, if anything.
+///
+/// A generated unit knows the binary, the session and the schedule; everything local - an ordering
+/// against another service, a nice level - comes from here. The config is where it lives so that
+/// the tool can see it: a systemd drop-in would work and `zellij session status` could never
+/// report it.
+fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
+    get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_service)
+}
+
+/// Put this build at the pinned path for a command that is about to name that path in a unit.
+///
+/// A failure is fatal only when there is nothing at the path yet: a unit naming a binary that does
+/// not exist cannot be run by anything. When a build IS there it still runs, so the failure is a
+/// stale copy rather than a broken install, and the next `session up` writes it again.
+fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
+    let existed = pinned.exists();
+    match pin_this_build_at(pinned) {
+        Ok(()) => Ok(()),
+        Err(reason) if existed => {
+            eprintln!("warning: {}", reason);
+            eprintln!(
+                "         the build already at {} is what the unit will run",
+                pinned.display()
+            );
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Copy this build to `pinned`, reporting what that came to.
+///
+/// Silent when the copy is already this build, which is every pass but the first after an upgrade:
+/// `session up` runs this each time, and a line saying nothing happened, every minute, from a
+/// watchdog, is a line nobody reads.
+#[cfg(unix)]
+fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
+    use zellij_utils::session_lifecycle::{install_pinned_exe, PinOutcome};
+
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("cannot find this binary to pin it: {}", e))?;
+    match install_pinned_exe(&current_exe, pinned)? {
+        PinOutcome::Installed(path) => println!("      pinned this build at {}", path.display()),
+        PinOutcome::Refreshed(path) => {
+            println!("      refreshed the pinned copy at {}", path.display())
+        },
+        PinOutcome::UpToDate(_) => {},
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn pin_this_build_at(_pinned: &PathBuf) -> Result<(), String> {
+    Ok(())
+}
+
+/// Keep the pinned copy current, on the path the INSTALLED UNIT records.
+///
+/// Not the path this process would derive: the canonical directory honours `XDG_DATA_HOME` on
+/// Linux, and a launcher's environment is not the calling shell's, so a re-derived path can name a
+/// different file from the one the launcher execs - and refreshing that one would leave the running
+/// copy stale while reporting success.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>) {
+    let Some(configured) = configured_pinned_exe(extras) else {
+        return;
+    };
+    let installed = session_service::installed_session_exe(name);
+    match session_service::pin_state(&configured, installed.as_deref()) {
+        PinState::Recorded(path) | PinState::Unrecorded(path) => {
+            if let Err(reason) = pin_this_build_at(&path) {
+                eprintln!("warning: {}", reason);
+            }
+        },
+        PinState::Mismatch {
+            configured,
+            installed,
+        } => eprintln!(
+            "warning: `pin_exe` asks for a copy of zellij at\n           \
+             {}\n         \
+             but the launcher for '{}' runs\n           \
+             {}\n         \
+             Nothing was copied: what `session up` keeps current is the binary the launcher\n         \
+             actually runs. Run `zellij session enable {}` to point it at the pinned path.\n         \
+             On macOS a file-access grant is recorded against the exact path, so the grant has\n         \
+             to name the path the launcher runs.",
+            configured.display(),
+            name,
+            installed,
+            name
+        ),
+    }
+}
+
+/// Nowhere else has a launcher this build installs into, so there is no recorded path and nothing
+/// to keep current.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn assert_pinned_exe(_name: &str, _extras: Option<&SessionServiceOptions>) {}
+
+/// Write the unit and hand it to the init system.
+///
+/// The whole command is idempotent, because the thing it installs is: `zellij session up` over a
+/// healthy session is a no-op, so re-enabling costs nothing and enabling twice is not an error to
+/// report but a state to confirm.
+fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    print_unit_dir_disagreement();
+    let extras = configured_extras(opts);
+    // The copy goes in BEFORE the unit that names it. A unit whose binary does not exist is a unit
+    // the init system cannot run, and the command that would have created the copy is the one that
+    // unit runs - so leaving it to the first `session up` would leave nothing able to make the
+    // first `session up` happen.
+    let pinned = configured_pinned_exe(extras.as_ref());
+    if let Some(pinned) = &pinned {
+        pin_before_writing_the_unit(pinned)?;
+    }
+    let exe = service_exe(exe, pinned);
+    match session_service::enable(kind, &exe, name, extras.as_ref(), force) {
+        Ok(EnableOutcome::AlreadyEnabled) => {
+            println!("ok    service for '{}' is already enabled", name);
+            Ok(())
+        },
+        Ok(EnableOutcome::Enabled { written, beside }) => {
+            for path in written {
+                println!("      wrote {}", path.display());
+            }
+            // only reachable with --force: two launchers for one session race at login, and the
+            // one that loses is left failed. Say so where the person who typed --force sees it.
+            for job in beside {
+                eprintln!(
+                    "warning: {} also runs `session up {}` ({}); both will start at login",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            println!("on    service for '{}' enabled and started", name);
+            Ok(())
+        },
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Name the two answers to "where do this user's units live", when they differ.
+///
+/// The unit goes where the MANAGER reads, which is the one that matters - but a person who then
+/// looks under their own `XDG_CONFIG_HOME` will not find it, and a file that is not where its owner
+/// expects is the beginning of a second install beside the first. So the difference is said out
+/// loud at the moment it is acted on rather than left to be discovered.
+fn print_unit_dir_disagreement() {
+    let Some((manager, shell)) = session_service::unit_dir_disagreement() else {
+        return;
+    };
+    eprintln!(
+        "note: this shell's XDG_CONFIG_HOME and the systemd user manager's disagree.\n      \
+         manager: {}\n      \
+         shell:   {}\n      \
+         The unit goes in the manager's directory, because that is the one it reads. A unit\n      \
+         written to the other would load for nothing and `daemon-reload` would never see it.",
+        manager.display(),
+        shell.display()
+    );
+}
+
+/// Unload the unit, then remove it.
+fn disable(name: &str) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    match session_service::disable(kind, name) {
+        Ok(DisableOutcome::NotInstalled) => {
+            println!(
+                "ok    no service installed for '{}'; nothing to remove",
+                name
+            );
+            Ok(())
+        },
+        Ok(DisableOutcome::NotOurs { jobs }) => {
+            // `status` reports this job by name, so reporting "nothing installed" here would have
+            // the two commands contradicting each other over the same machine. What this command
+            // removes is what `session enable` wrote, and that is not this.
+            println!(
+                "warn  nothing zellij installed for '{}'; nothing of ours to remove",
+                name
+            );
+            for job in jobs {
+                println!(
+                    "      but {} runs `session up {}` ({}) - not written by zellij, so it is left \
+                     alone",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            // Non-zero, because the question this command answers is "will the session come back",
+            // and here it still will. A caller reading only the exit code would otherwise take
+            // this for a session that has been switched off - and the next boot would disagree.
+            eprintln!(
+                "session disable: '{}' is still launched by a job zellij did not write; remove \
+                 that job by hand to stop it",
+                name
+            );
+            Err(())
+        },
+        Ok(DisableOutcome::Disabled { removed, remaining }) => {
+            for path in removed {
+                println!("      removed {}", path.display());
+            }
+            println!(
+                "off   service for '{}' unloaded and removed; the session itself is untouched",
+                name
+            );
+            for job in &remaining {
+                println!(
+                    "      {} still runs `session up {}` ({}) - not written by zellij, so it is \
+                     left alone",
+                    job.name,
+                    name,
+                    job.path.display()
+                );
+            }
+            // Removing our own unit while another launcher still starts the session is a partial
+            // result, not a success: the session keeps coming back, from something this command
+            // has just made harder to find. Same reasoning as the NotOurs arm above.
+            if remaining.is_empty() {
+                Ok(())
+            } else {
+                eprintln!(
+                    "session disable: '{}' is still launched by a job zellij did not write; \
+                     remove that job by hand to stop it",
+                    name
+                );
+                Err(())
+            }
+        },
+        Err(reason) => {
+            eprintln!("session disable: {}", reason);
+            Err(())
+        },
+    }
+}
+
+/// Report the install, one fact per line.
+///
+/// Installed, loaded and running are three different states and they come apart in ways that each
+/// mean something different: a file with no job is an install that was never loaded, a job with no
+/// session is a unit that is failing, and a session with no job is one that will not come back.
+/// Reporting them together as "ok" would hide exactly the case worth reporting.
+///
+/// Exits 0 when the unit is installed AND loaded, whatever the session is doing - the session is
+/// the thing the unit repairs, and `zellij session up` is the command that reports on it.
+fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
+    let Ok(kind) = native_service_kind() else {
+        return 1;
+    };
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let extras = configured_extras(opts);
+    let pinned = configured_pinned_exe(extras.as_ref());
+    let exe = resolve_service_exe(exe, pinned.clone(), &current_exe, &path_dirs());
+    let status = match session_service::status(kind, exe.path(), name, extras.as_ref()) {
+        Ok(status) => status,
+        Err(reason) => {
+            eprintln!("session status: {}", reason);
+            return 1;
+        },
+    };
+
+    println!("session   {}", name);
+    println!("init      {}", status.kind.name());
+    print_unit_dir_disagreement();
+    // A job that runs `session up` for this session under another name is doing the work, so the
+    // file this build would have written being absent is not the fault it looks like. It is
+    // reported against the first file, which is the one that runs the command - the timer beside it
+    // on systemd is this build's own arrangement and says nothing about someone else's.
+    //
+    // The timer beside it is found the same way, through the service it starts rather than through
+    // a name derived here - a watchdog somebody wrote by hand arms whatever service does the work,
+    // and calling it missing tells a reader to install a second one.
+    let elsewhere = status.installed_as.first();
+    let timer_elsewhere = status.timer_installed_as.as_ref();
+    for (index, file) in status.files.iter().enumerate() {
+        let found_elsewhere = if file.role == "timer" {
+            timer_elsewhere.map(|timer| (&timer.name, &timer.path))
+        } else if index == 0 {
+            elsewhere.map(|job| (&job.name, &job.path))
+        } else {
+            None
+        };
+        let state = match (file.present, file.stale, found_elsewhere) {
+            (false, _, Some((name, path))) => format!(
+                "installed under a different name: {} ({})",
+                name,
+                path.display()
+            ),
+            (false, ..) => "missing".to_owned(),
+            (true, true, ..) => {
+                "installed (differs from what `session enable` would write now)".to_owned()
+            },
+            (true, false, ..) => "installed".to_owned(),
+        };
+        println!("{:9} {} - {}", file.role, file.path.display(), state);
+    }
+    let installed = match elsewhere {
+        // this build did not write that install and cannot say which files belong to it, so
+        // whether the init system holds the job is the whole of what can be judged
+        Some(_) => true,
+        // a timer under another name arms the same service, so it stands in for the file this
+        // build would have written
+        None => status
+            .files
+            .iter()
+            .all(|file| file.present || (file.role == "timer" && timer_elsewhere.is_some())),
+    };
+    for other in status.installed_as.iter().skip(1) {
+        println!(
+            "{:9} {} also runs `session up {}` ({})",
+            "ambiguous",
+            other.name,
+            name,
+            other.path.display()
+        );
+    }
+    println!(
+        "loaded    {} ({})",
+        if status.loaded { "yes" } else { "no" },
+        status.load_detail
+    );
+
+    // what the config adds is reported here because it can be: this is the whole argument for
+    // keeping it in the config rather than in a drop-in directory the tool cannot see
+    print_configured_extras(kind, extras.as_ref());
+    let unit_is_current = print_unit_drift(kind, exe.path(), name, extras.as_ref());
+    let pinned_agrees = print_pin_state(name, pinned.as_deref());
+
+    let facts = SessionFacts::collect(name);
+    match facts.assert_up() {
+        Ok(()) => println!("running   yes, in {}", facts.socket_dir.display()),
+        Err(reason) => println!("running   no - {}", reason),
+    }
+
+    if installed && status.loaded && pinned_agrees && unit_is_current {
+        0
+    } else {
+        1
+    }
+}
+
+/// The `drift` line: whether the unit on disk is still what this config would write.
+///
+/// Reported, and counted against the exit code, because nothing else notices. Edit the config and
+/// the loaded job does not change with it - the file is stale, the init system is still running the
+/// definition it was handed, and every angle you can look from is internally consistent. It is only
+/// wrong when the two are compared, which is the same shape as the pin mismatch reported below it.
+///
+/// The remedy has to be `session enable` and not a reload by hand, and launchd is why: a plist
+/// whose CONTENT changed needs `bootout` then `bootstrap`, and `launchctl kickstart` restarts the
+/// job from the definition launchd already holds - so the obvious command runs the old plist and
+/// looks like the edit did nothing.
+fn print_unit_drift(
+    kind: ServiceKind,
+    exe: &std::path::Path,
+    name: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> bool {
+    match session_service::unit_drift(kind, exe, name, extras) {
+        Ok(UnitDrift::NotInstalled) => {
+            println!("drift     nothing zellij wrote is installed to compare against");
+            true
+        },
+        Ok(UnitDrift::Current) => {
+            println!("drift     none - the installed unit is what this config would write");
+            true
+        },
+        Ok(UnitDrift::Drifted { paths }) => {
+            for path in paths {
+                println!(
+                    "drift     {} is NOT what this config would write now",
+                    path.display()
+                );
+            }
+            println!(
+                "drift     run `zellij session enable {}` to rewrite and reload it",
+                name
+            );
+            if kind == ServiceKind::Launchd {
+                println!(
+                    "drift     a changed plist needs bootout then bootstrap, which that command \
+                     does; `launchctl kickstart` restarts the job from the definition launchd \
+                     already holds"
+                );
+            }
+            false
+        },
+        Err(reason) => {
+            eprintln!("session status: {}", reason);
+            false
+        },
+    }
+}
+
+/// Say once that the installed unit no longer matches the config.
+///
+/// On `up`, because `up` is what runs - from a shell after a config edit, and from the launcher
+/// every minute. The launcher's copy of this message is the one that reaches a machine nobody is
+/// looking at, and it goes to the journal or to the log the plist names.
+///
+/// Silent unless something this build wrote is actually installed and actually differs: an `up` on
+/// a machine with no launcher has nothing to say, and saying it every minute would be worse than
+/// saying nothing.
+fn warn_if_unit_drifted(name: &str, opts: &CliArgs) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let Some(kind) = session_service::native_service_kind() else {
+            return;
+        };
+        let extras = configured_extras(opts);
+        let pinned = configured_pinned_exe(extras.as_ref());
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let exe = resolve_service_exe(None, pinned, &current_exe, &path_dirs());
+        let Ok(UnitDrift::Drifted { paths }) =
+            session_service::unit_drift(kind, exe.path(), name, extras.as_ref())
+        else {
+            return;
+        };
+        for path in paths {
+            eprintln!(
+                "warning: {} is not what `zellij session enable` would write now, so the loaded\n         \
+                 job is running an older definition. Run `zellij session enable {}` to bring\n         \
+                 them back together - a config edit does not reach a unit that was not rewritten.",
+                path.display(),
+                name
+            );
+        }
+    });
+}
+
+/// What the config's `pin_exe` and the installed unit say between them, and whether they agree.
+///
+/// Reported even though nothing is broken, because the disagreement is invisible from every other
+/// angle: the config asks for a pinned copy, the launcher runs something else, and each of them is
+/// internally fine. It is the state a key turned on after `session enable` leaves behind, and the
+/// paths are BOTH named because a macOS grant is keyed to one exact path - a reader who is about to
+/// add it by hand in System Settings needs to know which.
+fn print_pin_state(name: &str, pinned: Option<&std::path::Path>) -> bool {
+    let Some(pinned) = pinned else {
+        println!("pin       off (no `pin_exe` in session_service)");
+        return true;
+    };
+    match pin_state_of(name, pinned) {
+        PinState::Recorded(path) => {
+            println!("pin       {} - the launcher runs it", path.display());
+            true
+        },
+        PinState::Unrecorded(path) => {
+            println!(
+                "pin       {} - nothing installed runs it yet",
+                path.display()
+            );
+            true
+        },
+        PinState::Mismatch {
+            configured,
+            installed,
+        } => {
+            println!(
+                "pin       {} - NOT what the launcher runs",
+                configured.display()
+            );
+            println!(
+                "pin       the launcher runs {} - `zellij session enable {}` re-points it",
+                installed, name
+            );
+            false
+        },
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pin_state_of(name: &str, pinned: &std::path::Path) -> PinState {
+    session_service::pin_state(
+        pinned,
+        session_service::installed_session_exe(name).as_deref(),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn pin_state_of(_name: &str, pinned: &std::path::Path) -> PinState {
+    session_service::pin_state(pinned, None)
+}
+
+/// One configured plist value on one line of `status`.
+///
+/// A container is written out in full rather than summarised as "a dictionary": the whole reason
+/// `status` lists the extras is that a person can check what the unit will contain against what
+/// they typed, and a count of entries answers neither question.
+fn plist_value_summary(value: &PlistValue) -> String {
+    match value {
+        PlistValue::String(value) => value.to_owned(),
+        PlistValue::Integer(value) => value.to_string(),
+        PlistValue::Bool(value) => value.to_string(),
+        PlistValue::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(plist_value_summary)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        PlistValue::Dict(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(name, value)| format!("{} = {}", name, plist_value_summary(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// List what `session_service` in the config puts into the unit, for the init system in use.
+fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOptions>) {
+    let Some(extras) = extras.filter(|extras| extras.has_unit_extras()) else {
+        println!("config    no session_service extras");
+        return;
+    };
+    match kind {
+        ServiceKind::Systemd => {
+            let sections = [
+                ("Unit", &extras.systemd.unit),
+                ("Service", &extras.systemd.service),
+                ("Install", &extras.systemd.install),
+            ];
+            for (section, directives) in sections {
+                for directive in directives {
+                    println!("config    [{}] {}", section, directive);
+                }
+            }
+        },
+        ServiceKind::Launchd => {
+            for key in &extras.launchd {
+                println!(
+                    "config    {} = {}",
+                    key.name,
+                    plist_value_summary(&key.value)
+                );
+            }
         },
     }
 }
@@ -131,6 +741,14 @@ fn refuse_from_inside(name: &str) {
 
 /// Create the session if it is not there, then prove that it is.
 fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
+    // First, and on every `up` including the one that finds the session already healthy: an upgrade
+    // reaches the pinned copy through this pass and no other, and the pass that returns early is
+    // exactly the one an upgraded machine takes every minute.
+    assert_pinned_exe(name, configured_extras(opts).as_ref());
+    // Same pass, same reason: a config edit does not reach a unit nobody rewrote, and the `up` that
+    // returns early is exactly the one a machine with a stale unit takes every minute.
+    warn_if_unit_drifted(name, opts);
+
     // Held for the rest of this function, which is what makes `up` idempotent under concurrency:
     // the check and the creation are one step, so a `restart` overlapping the watchdog's minute
     // tick waits here and then finds the session already up. See `session_lifecycle::lock_up`.
@@ -141,6 +759,9 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
 
     if healthy && restore.is_none() {
         println!("ok    session '{}' already running", name);
+        // "already running" is exactly the answer that hides a superseded build: an `up` after an
+        // upgrade reports success and leaves the old server serving the session.
+        warn_if_server_build_differs(name);
         return Ok(());
     }
     if healthy || facts.listed {
@@ -162,6 +783,32 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         );
         facts.print_diagnostics();
         return Err(());
+    }
+
+    // Which macOS session domain a server is created in is decided once and inherited by every
+    // pane, so `up` from a shell that is not in the graphical session hands that decision to
+    // launchd rather than making it here. See `zellij_utils::session_lifecycle`.
+    #[cfg(target_os = "macos")]
+    match zellij_utils::session_lifecycle::ensure_gui_session_domain(name, facts.listed) {
+        Ok(true) => {
+            let facts = wait_for_server(name);
+            if let Err(reason) = facts.assert_up() {
+                eprintln!("session up: post-condition FAILED - {}", reason);
+                facts.print_diagnostics();
+                return Err(());
+            }
+            println!(
+                "up    session '{}' in {} (started in the graphical session)",
+                name,
+                facts.socket_dir.display()
+            );
+            return Ok(());
+        },
+        Ok(false) => {},
+        Err(reason) => {
+            eprintln!("session up: {}", reason);
+            return Err(());
+        },
     }
 
     // Everything from here to `start_client` is the environment the new session is built with, and

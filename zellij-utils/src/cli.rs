@@ -793,6 +793,46 @@ pub enum SessionLifecycleCli {
         #[clap(long, value_parser, default_value("10"))]
         wait_timeout: u64,
     },
+
+    /// Install the init-system unit that keeps the session up, and load it. systemd on Linux,
+    /// launchd on macOS, both in the user's own domain. Running it again over an unchanged
+    /// install changes nothing and says so
+    Enable {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// The binary path the unit should run. Defaults to the stable name on PATH that leads to
+        /// this binary, which is what survives an upgrade
+        #[clap(long, value_name = "PATH", value_parser)]
+        exe: Option<PathBuf>,
+
+        /// Install even when another job already runs `session up` for this session. Two
+        /// launchers race at login and one of them ends up failed, so this is refused by default
+        #[clap(long)]
+        force: bool,
+    },
+
+    /// Unload the init-system unit and remove it. Removing the file without unloading the job
+    /// first is the mistake this exists to prevent
+    Disable {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+    },
+
+    /// Report the unit: whether the file is installed, whether the init system has loaded it, and
+    /// whether the session is actually running. The three come apart, and which one is missing is
+    /// the diagnosis
+    Status {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// The binary path to compare the installed unit against, as `enable` takes it
+        #[clap(long, value_name = "PATH", value_parser)]
+        exe: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]

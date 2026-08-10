@@ -983,6 +983,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             terminal_title_template: None,
             session_aliases: None,
             session_restart_drop_env: None,
+            session_service: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,
