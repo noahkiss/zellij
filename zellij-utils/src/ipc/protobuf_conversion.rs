@@ -946,6 +946,7 @@ impl From<crate::input::options::Options>
                 crate::input::options::PaneFrameStyle::Full => "full".to_owned(),
                 crate::input::options::PaneFrameStyle::Titles => "titles".to_owned(),
                 crate::input::options::PaneFrameStyle::None => "none".to_owned(),
+                crate::input::options::PaneFrameStyle::TopOnly => "top_only".to_owned(),
             }),
             nested_session_handling: options.nested_session_handling.map(|n| {
                 use crate::client_server_contract::client_server_contract::NestedSessionHandling as ProtoNestedSessionHandling;
@@ -1003,6 +1004,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
                 "full" => Some(crate::input::options::PaneFrameStyle::Full),
                 "titles" => Some(crate::input::options::PaneFrameStyle::Titles),
                 "none" => Some(crate::input::options::PaneFrameStyle::None),
+                "top_only" => Some(crate::input::options::PaneFrameStyle::TopOnly),
                 _ => None,
             }),
             mirror_session: options.mirror_session,
@@ -1414,6 +1416,7 @@ impl From<crate::input::actions::Action>
                     crate::input::options::PaneFrameStyle::Full => "full",
                     crate::input::options::PaneFrameStyle::Titles => "titles",
                     crate::input::options::PaneFrameStyle::None => "none",
+                    crate::input::options::PaneFrameStyle::TopOnly => "top_only",
                 };
                 ActionType::SetPaneFrameStyle(SetPaneFrameStyleAction {
                     style: style.to_owned(),

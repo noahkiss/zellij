@@ -760,6 +760,7 @@ impl Action {
                     PaneFrameStyle::Full => "full",
                     PaneFrameStyle::Titles => "titles",
                     PaneFrameStyle::None => "none",
+                    PaneFrameStyle::TopOnly => "top_only",
                 };
                 node.push(style);
                 Some(node)
@@ -3783,12 +3784,13 @@ impl Options {
     }
     fn pane_frame_style_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             " ",
             "// Set the pane frame style when pane_frames is enabled",
             "// Options:",
             "//   - full",
             "//   - titles (default)",
+            "//   - top_only (titles on a horizontal rule, no separators between panes)",
             "// ",
         );
 
@@ -3797,6 +3799,7 @@ impl Options {
                 PaneFrameStyle::Full => "full",
                 PaneFrameStyle::Titles => "titles",
                 PaneFrameStyle::None => "none",
+                PaneFrameStyle::TopOnly => "top_only",
             }
         };
 
