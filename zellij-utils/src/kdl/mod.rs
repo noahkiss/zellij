@@ -2722,6 +2722,27 @@ macro_rules! kdl_get_int_entry {
     };
 }
 
+/// A path as the user wrote it, with `~` and `$VAR`/`${VAR}` resolved.
+///
+/// Layouts have expanded their paths since they had paths, so `~/...` works there and worked
+/// nowhere else - the same path written in the config was taken literally and silently pointed at a
+/// directory named `~`. Everything a user types a path into now goes through the same expansion, so
+/// one config can be written once and read on machines whose home directories differ.
+///
+/// A path with no `~` and no `$` is returned unchanged. Expansion that fails - an unset variable, a
+/// home directory that cannot be resolved - keeps the text as written rather than refusing the
+/// config: an unusable path fails later with a message about the file it names, while a config that
+/// does not parse takes the whole session with it.
+pub(crate) fn expand_path(path: &str) -> PathBuf {
+    match shellexpand::full(path) {
+        Ok(expanded) => PathBuf::from(expanded.as_ref()),
+        Err(e) => {
+            log::error!("Failed to expand the path {:?}: {}", path, e);
+            PathBuf::from(path)
+        },
+    }
+}
+
 impl Options {
     pub fn from_kdl(kdl_options: &KdlDocument) -> Result<Self, ConfigError> {
         let on_force_close =
@@ -2738,9 +2759,9 @@ impl Options {
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "simplified_ui").map(|(v, _)| v);
         let default_shell =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "default_shell")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let default_cwd = kdl_property_first_arg_as_string_or_error!(kdl_options, "default_cwd")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let pane_frames =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frames").map(|(v, _)| v);
         let pane_frame_style =
@@ -2770,11 +2791,11 @@ impl Options {
             };
         let default_layout =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "default_layout")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let layout_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "layout_dir")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let theme_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme_dir")
-            .map(|(string, _entry)| PathBuf::from(string));
+            .map(|(string, _entry)| expand_path(string));
         let mouse_mode =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_mode").map(|(v, _)| v);
         let scroll_buffer_size =
@@ -2799,7 +2820,7 @@ impl Options {
                 .map(|(v, _)| v);
         let scrollback_editor =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "scrollback_editor")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let mirror_session =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mirror_session").map(|(v, _)| v);
         let session_name = kdl_property_first_arg_as_string_or_error!(kdl_options, "session_name")
@@ -2882,10 +2903,10 @@ impl Options {
                 .map(|(web_server_port, _entry)| web_server_port as u16);
         let web_server_cert =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "web_server_cert")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let web_server_key =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "web_server_key")
-                .map(|(string, _entry)| PathBuf::from(string));
+                .map(|(string, _entry)| expand_path(string));
         let enforce_https_for_localhost =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "enforce_https_for_localhost")
                 .map(|(v, _)| v);
@@ -7714,4 +7735,100 @@ fn osc8_hyperlinks_config_parsing() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(deserialized.options.osc8_hyperlinks, Some(true));
+}
+
+#[cfg(test)]
+fn home_dir_for_test() -> String {
+    std::env::var("HOME").expect("HOME is set in the test environment")
+}
+
+#[test]
+fn a_path_with_nothing_to_expand_is_left_alone() {
+    // the conservative half of the promise: no `~` and no `$` means byte-identical
+    for path in [
+        "/opt/zellij/layouts",
+        "relative/layouts",
+        "/opt/weird~name/layouts",
+        "",
+    ] {
+        assert_eq!(expand_path(path), PathBuf::from(path));
+    }
+}
+
+#[test]
+fn a_tilde_and_a_home_variable_name_the_same_directory() {
+    let home = home_dir_for_test();
+    assert_eq!(expand_path("~"), PathBuf::from(&home));
+    assert_eq!(
+        expand_path("~/.config/zellij/layouts"),
+        PathBuf::from(format!("{}/.config/zellij/layouts", home))
+    );
+    assert_eq!(
+        expand_path("$HOME/.config/zellij/layouts"),
+        PathBuf::from(format!("{}/.config/zellij/layouts", home))
+    );
+    assert_eq!(
+        expand_path("${HOME}/.config/zellij/layouts"),
+        PathBuf::from(format!("{}/.config/zellij/layouts", home))
+    );
+}
+
+#[test]
+fn a_variable_that_is_not_set_leaves_the_path_as_written() {
+    // config that cannot be expanded must still be config: zellij starts and the path fails later
+    // where it is used, naming the file it could not find
+    let unexpandable = "$ZELLIJ_A_VARIABLE_NOTHING_SETS/layouts";
+    assert_eq!(expand_path(unexpandable), PathBuf::from(unexpandable));
+}
+
+#[test]
+fn path_options_are_expanded() {
+    let home = home_dir_for_test();
+    let config_str = r#"
+        default_shell "~/bin/my-shell"
+        default_cwd "$HOME/work"
+        default_layout "~/.config/zellij/layouts/my-layout.kdl"
+        layout_dir "~/.config/zellij/layouts"
+        theme_dir "${HOME}/.config/zellij/themes"
+        scrollback_editor "~/bin/my-editor"
+        web_server_cert "~/.config/zellij/cert.pem"
+        web_server_key "/etc/zellij/key.pem"
+    "#;
+    let options = Config::from_kdl(config_str, None).unwrap().options;
+    assert_eq!(
+        options.default_shell,
+        Some(PathBuf::from(format!("{}/bin/my-shell", home)))
+    );
+    assert_eq!(
+        options.default_cwd,
+        Some(PathBuf::from(format!("{}/work", home)))
+    );
+    assert_eq!(
+        options.default_layout,
+        Some(PathBuf::from(format!(
+            "{}/.config/zellij/layouts/my-layout.kdl",
+            home
+        )))
+    );
+    assert_eq!(
+        options.layout_dir,
+        Some(PathBuf::from(format!("{}/.config/zellij/layouts", home)))
+    );
+    assert_eq!(
+        options.theme_dir,
+        Some(PathBuf::from(format!("{}/.config/zellij/themes", home)))
+    );
+    assert_eq!(
+        options.scrollback_editor,
+        Some(PathBuf::from(format!("{}/bin/my-editor", home)))
+    );
+    assert_eq!(
+        options.web_server_cert,
+        Some(PathBuf::from(format!("{}/.config/zellij/cert.pem", home)))
+    );
+    // an absolute path comes through as it was written
+    assert_eq!(
+        options.web_server_key,
+        Some(PathBuf::from("/etc/zellij/key.pem"))
+    );
 }
