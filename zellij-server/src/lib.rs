@@ -935,6 +935,13 @@ pub fn start_server_impl(
 ) {
     envs::set_zellij("0".to_string());
 
+    // Settle macOS's file-access decisions about THIS executable, so the upgrade that lost the
+    // grants is what asks for them back. A launcher-created session has no terminal emulator to
+    // inherit grants from, and they are keyed to the executable's versioned path, so each upgrade
+    // starts with none. Returns at once - it must never block startup on a consent dialog.
+    // No-op off macOS.
+    zellij_utils::session_lifecycle::probe_protected_locations();
+
     // the socket is named after the session, and this is the only place the server learns its own
     // name without asking a thread that may already be shutting down
     let session_name = socket_path
