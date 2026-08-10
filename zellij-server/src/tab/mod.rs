@@ -728,6 +728,8 @@ pub trait Pane {
     fn program_title(&self) -> Option<String> {
         None
     }
+    /// The uuid given to this pane when it was created. Unlike the pane id, it is never reused.
+    fn pane_uuid(&self) -> Uuid;
     fn custom_title(&self) -> Option<String>;
     fn has_explicit_title(&self) -> bool {
         false
@@ -8065,6 +8067,7 @@ pub fn pane_info_for_pane(
     pane_info.is_selectable = pane.selectable();
     pane_info.title = pane.current_title();
     pane_info.program_title = pane.program_title();
+    pane_info.uuid = pane.pane_uuid().to_string();
     let geom = pane.position_and_size();
     pane_info.stack_id = geom.stacked;
     pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();
