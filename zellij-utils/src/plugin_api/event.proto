@@ -504,6 +504,7 @@ message PaneInfo {
     optional uint32 stack_id = 27;
     optional uint32 index_in_stack = 28;
     bool is_expanded_in_stack = 29;
+    string uuid = 30;
 }
 
 message IndexInPaneGroup {

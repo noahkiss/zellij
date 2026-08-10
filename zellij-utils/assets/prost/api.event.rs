@@ -680,6 +680,8 @@ pub struct PaneInfo {
     pub index_in_stack: ::core::option::Option<u32>,
     #[prost(bool, tag="29")]
     pub is_expanded_in_stack: bool,
+    #[prost(string, tag="30")]
+    pub uuid: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -2385,6 +2385,13 @@ pub struct PaneInfo {
     pub index_in_stack: Option<usize>,
     /// Whether this pane is the expanded (non-collapsed) member of its stack
     pub is_expanded_in_stack: bool,
+    /// A uuid given to this pane when it was created and never given to another pane
+    ///
+    /// Pane ids are recycled, so the same `id` can mean a different pane after one closes. The
+    /// uuid does not: it identifies this pane for as long as the server runs, whether the pane is
+    /// tiled, floating or suppressed. It does not survive a server restart or a resurrection -
+    /// what comes back is a new pane, and it says so.
+    pub uuid: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
