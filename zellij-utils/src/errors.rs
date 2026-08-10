@@ -470,6 +470,7 @@ pub enum ScreenContext {
     NextSwapLayoutWithTabId,
     MoveTabWithTabId,
     MoveTabToIndex,
+    ClearBellAfterDwell,
     PluginSubscribedToAnsiPaneContents,
     UpdateBackgroundPluginSubscriptions,
     ClearHintTextCache,
@@ -660,6 +661,7 @@ pub enum BackgroundJobContext {
     StopFlashTabBell,
     StartNestedGuestPing,
     StopNestedGuestPing,
+    ClearPaneBellAfterDwell,
     Exit,
 }
 

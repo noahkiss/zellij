@@ -278,6 +278,9 @@ pub(crate) struct Tab {
     web_server_ip: IpAddr,
     web_server_port: u16,
     pub panes_with_pending_bell: HashSet<PaneId>,
+    /// Panes that rang again while they were focused and already showing a bell. Drained by
+    /// `Screen` to restart the `bell_clear_delay_ms` dwell.
+    panes_that_rang_while_focused: Vec<PaneId>,
     pub tab_has_pending_bell: bool,
     pub tab_bell_flash: bool, // currently in mid-notification-flash
     pub tab_bell_ring: bool,  // need to send ANSI BEL to the controlling terminal
@@ -1033,6 +1036,7 @@ impl Tab {
             web_server_ip,
             web_server_port,
             panes_with_pending_bell: HashSet::new(),
+            panes_that_rang_while_focused: Vec::new(),
             tab_has_pending_bell: false,
             tab_bell_flash: false,
             tab_bell_ring: false,
@@ -3844,6 +3848,8 @@ impl Tab {
                 }
                 self.panes_with_pending_bell.insert(pane_id);
                 newly_notified_panes.push(pane_id);
+            } else if is_focused && self.panes_with_pending_bell.contains(&pane_id) {
+                self.panes_that_rang_while_focused.push(pane_id);
             }
             if !self.tab_bell_ring {
                 self.tab_bell_ring = true;
@@ -3854,6 +3860,12 @@ impl Tab {
             }
         }
         (newly_notified_panes, tab_bell_newly_set)
+    }
+    /// Takes the panes that rang while focused with a bell already pending. Only
+    /// `bell_clear_delay_ms` cares about them, but the list is drained either way so it cannot
+    /// grow.
+    pub fn take_bells_rung_while_focused(&mut self) -> Vec<PaneId> {
+        std::mem::take(&mut self.panes_that_rang_while_focused)
     }
     pub fn clear_bell_notification_for_pane(&mut self, pane_id: PaneId) {
         self.panes_with_pending_bell.remove(&pane_id);

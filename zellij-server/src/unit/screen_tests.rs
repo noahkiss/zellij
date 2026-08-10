@@ -355,6 +355,7 @@ fn create_new_screen_with_kitty_graphics(
         mouse_scroll_resize,
         mouse_hover_effects,
         visual_bell,
+        0,     // bell_clear_delay_ms
         false, // focus_follows_mouse
         false, // mouse_click_through
         web_server_ip,
@@ -5692,6 +5693,7 @@ fn create_new_screen_with_message_capture(
         true,
         true,
         visual_bell,
+        0,     // bell_clear_delay_ms
         false, // focus_follows_mouse
         false, // mouse_click_through
         web_server_ip,
@@ -8876,6 +8878,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         true,
         true,
         visual_bell,
+        0,     // bell_clear_delay_ms
         false, // focus_follows_mouse
         false, // mouse_click_through
         web_server_ip,
@@ -9554,6 +9557,7 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
         true,
         true,
         true,
+        0, // bell_clear_delay_ms
         false,
         false,
         web_server_ip,
@@ -10086,6 +10090,7 @@ fn create_non_mirrored_screen(size: Size) -> Screen {
         true,  // mouse_scroll_resize
         true,  // mouse_hover_effects
         true,  // visual_bell
+        0,     // bell_clear_delay_ms
         false, // focus_follows_mouse
         false, // mouse_click_through
         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
