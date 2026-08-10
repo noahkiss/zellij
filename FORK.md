@@ -1598,6 +1598,40 @@ the whole dwell and it has not rung inside it. A job overtaken by a refocus or a
 answer is no and does nothing. Multiple clients count independently - any one of them dwelling is
 enough.
 
+### A pane uuid that outlives id reuse
+
+```
+zellij action list-panes --all --json
+```
+
+Every pane - terminal and plugin - is given a uuid when it is created, and reports it as `uuid` in
+`list-panes --json` and in `PaneInfo`. A pane id does not identify a pane on its own. It counts up
+from 0 per server, so the id a script wrote down names a different pane in the next session, and
+after a restart or a resurrection of the same session; terminal and plugin ids are separate
+sequences, so pane 0 is two panes at once. A uuid is handed out once, ever, which buys two things:
+re-targeting a pane you created without matching on its title, and an existence check - if the uuid
+is no longer in the listing, the pane is gone.
+
+(Within one running server the terminal id counter is monotonic, so a closed pane's id is not
+reissued while that server lives. The uuid is what makes that guarantee legible, and it is the only
+thing that still holds across the restart.)
+
+What the uuid promises, exactly:
+
+- It is stable for the pane's whole life inside one running server: renaming, moving between tiled
+  and floating, stacking, suppressing and hiding all keep it.
+- It does **not** survive a server restart, a session resurrection, or a snapshot restore. What
+  comes back is a new pane with new state, and it says so with a new uuid. A pane read out of a
+  saved layout (the snapshot listing) reports an empty uuid, because it is a description of a pane
+  rather than a pane.
+
+The uuid is generated in `TerminalPane::new` and `PluginPane::new`, so there is no creation path
+that can forget it, and it is read through the `Pane::pane_uuid` trait method.
+
+`PaneInfo` crosses the plugin API, so `event.proto` gains `string uuid = 30` and its generated Rust
+is regenerated (`cargo xtask build`). `list-panes --json` gets the field for free - `PaneListEntry`
+flattens `PaneInfo`. The client/server contract has no `PaneInfo` and is untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

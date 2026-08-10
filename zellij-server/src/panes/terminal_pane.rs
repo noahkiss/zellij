@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::rc::Rc;
 use std::time::{self, Instant};
+use uuid::Uuid;
 use vte;
 use zellij_utils::data::PaneContents;
 use zellij_utils::input::command::RunCommand;
@@ -132,6 +133,8 @@ type IsFirstRun = bool;
 pub struct TerminalPane {
     pub grid: Grid,
     pub pid: u32,
+    /// Given at creation, never reused - see `Pane::pane_uuid`
+    uuid: Uuid,
     pub selectable: bool,
     pub geom: PaneGeom,
     pub geom_override: Option<PaneGeom>,
@@ -673,6 +676,9 @@ impl Pane for TerminalPane {
     }
     fn pid(&self) -> PaneId {
         PaneId::Terminal(self.pid)
+    }
+    fn pane_uuid(&self) -> Uuid {
+        self.uuid
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
@@ -1377,6 +1383,7 @@ impl TerminalPane {
             notification_end.set_affected_pane_id(PaneId::Terminal(pid));
         }
         TerminalPane {
+            uuid: Uuid::new_v4(),
             frame: HashMap::new(),
             content_offset: Offset::default(),
             pid,

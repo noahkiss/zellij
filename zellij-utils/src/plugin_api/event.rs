@@ -1953,6 +1953,7 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             stack_id: protobuf_pane_info.stack_id.map(|s| s as usize),
             index_in_stack: protobuf_pane_info.index_in_stack.map(|i| i as usize),
             is_expanded_in_stack: protobuf_pane_info.is_expanded_in_stack,
+            uuid: protobuf_pane_info.uuid,
         })
     }
 }
@@ -2002,6 +2003,7 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             stack_id: pane_info.stack_id.map(|s| s as u32),
             index_in_stack: pane_info.index_in_stack.map(|i| i as u32),
             is_expanded_in_stack: pane_info.is_expanded_in_stack,
+            uuid: pane_info.uuid,
         })
     }
 }
@@ -3103,6 +3105,7 @@ fn serialize_session_update_event_with_non_default_values() {
             stack_id: Some(1),
             index_in_stack: Some(0),
             is_expanded_in_stack: true,
+            uuid: String::new(),
         },
         PaneInfo {
             id: 1,
@@ -3134,6 +3137,7 @@ fn serialize_session_update_event_with_non_default_values() {
             stack_id: Some(1),
             index_in_stack: Some(1),
             is_expanded_in_stack: false,
+            uuid: String::new(),
         },
     ];
     panes.insert(0, panes_list);
