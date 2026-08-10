@@ -4,7 +4,7 @@ use crate::input::theme::Themes;
 #[allow(unused_imports)]
 use crate::{
     cli::{CliArgs, Command, SessionCommand, Sessions},
-    consts::{FEATURES, VERSION, ZELLIJ_CACHE_DIR, ZELLIJ_DEFAULT_THEMES},
+    consts::{FEATURES, VERSION, ZELLIJ_CACHE_DIR, ZELLIJ_DEFAULT_THEMES, ZELLIJ_SOCK_DIR},
     data::LayoutInfo,
     errors::prelude::*,
     home::*,
@@ -490,6 +490,7 @@ impl Setup {
             .unwrap();
         }
         writeln!(&mut message, "[CACHE DIR]: {}", ZELLIJ_CACHE_DIR.display()).unwrap();
+        writeln!(&mut message, "[SOCKET DIR]: {}", ZELLIJ_SOCK_DIR.display()).unwrap();
         writeln!(&mut message, "[DATA DIR]: \"{}\"", data_dir.display()).unwrap();
         writeln!(&mut message, "[PLUGIN DIR]: \"{}\"", plugin_dir.display()).unwrap();
         if !cfg!(feature = "disable_automatic_asset_installation") {
