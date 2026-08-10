@@ -615,6 +615,13 @@ load_plugins {
 //
 // osc8_hyperlinks false
 
+// How long a pane that rang the bell has to stay focused before its [!] notification clears,
+// in milliseconds
+// The dwell restarts if the pane rings again while it is focused
+// Default: 0 (the notification clears the moment the pane is focused)
+//
+// bell_clear_delay_ms 1000
+
 // The template of the terminal title (OSC 0) set for the focused pane
 // Placeholders: {host} (this machine's short hostname), {session} (the session name, or its
 // session_aliases entry if it has one) and {pane} (the pane title)

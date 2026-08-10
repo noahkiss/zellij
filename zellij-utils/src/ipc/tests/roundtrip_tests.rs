@@ -456,6 +456,7 @@ fn test_client_messages() {
                 plugin_watch: None,
                 snapshot_dir: None,
                 session_snapshot_limit: None,
+                bell_clear_delay_ms: None,
                 terminal_title_template: None,
                 session_aliases: None,
                 session_restart_drop_env: None,

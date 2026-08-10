@@ -78,6 +78,7 @@ pub enum BackgroundJob {
     StopFlashTabBell(usize), // usize = tab_id
     StartNestedGuestPing(PaneId),
     StopNestedGuestPing(PaneId),
+    ClearPaneBellAfterDwell(PaneId, u64), // u64 - the dwell in milliseconds
     Exit,
 }
 
@@ -111,6 +112,9 @@ impl From<&BackgroundJob> for BackgroundJobContext {
             BackgroundJob::StopFlashTabBell(..) => BackgroundJobContext::StopFlashTabBell,
             BackgroundJob::StartNestedGuestPing(..) => BackgroundJobContext::StartNestedGuestPing,
             BackgroundJob::StopNestedGuestPing(..) => BackgroundJobContext::StopNestedGuestPing,
+            BackgroundJob::ClearPaneBellAfterDwell(..) => {
+                BackgroundJobContext::ClearPaneBellAfterDwell
+            },
             BackgroundJob::Exit => BackgroundJobContext::Exit,
         }
     }
@@ -648,6 +652,16 @@ pub(crate) fn background_jobs_main(
                                 ScreenInstruction::ClearPaneFrameColorOverride(pane_ids_clone),
                             );
                         }
+                    }
+                });
+            },
+            BackgroundJob::ClearPaneBellAfterDwell(pane_id, delay_ms) => {
+                runtime.spawn({
+                    let senders = bus.senders.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let _ =
+                            senders.send_to_screen(ScreenInstruction::ClearBellAfterDwell(pane_id));
                     }
                 });
             },

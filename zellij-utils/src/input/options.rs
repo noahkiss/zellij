@@ -75,6 +75,11 @@ pub enum PaneFrameStyle {
     Full,
     Titles,
     None,
+    // fork addition: `titles` with a horizontal rule behind the title and no
+    // box-drawing separators between panes
+    #[serde(rename = "top_only")]
+    #[value(name = "top_only")]
+    TopOnly,
 }
 
 impl Default for PaneFrameStyle {
@@ -89,7 +94,13 @@ impl PaneFrameStyle {
     }
 
     pub fn draws_titles(&self) -> bool {
-        matches!(self, PaneFrameStyle::Titles)
+        matches!(self, PaneFrameStyle::Titles | PaneFrameStyle::TopOnly)
+    }
+
+    /// Fork addition: `top_only` is `titles` with a rule behind the title and
+    /// no separators between panes.
+    pub fn is_top_only(&self) -> bool {
+        matches!(self, PaneFrameStyle::TopOnly)
     }
 
     pub fn from_options(options: &Options) -> Self {
@@ -98,6 +109,7 @@ impl PaneFrameStyle {
         }
         match options.pane_frame_style {
             Some(PaneFrameStyle::Full) => PaneFrameStyle::Full,
+            Some(PaneFrameStyle::TopOnly) => PaneFrameStyle::TopOnly,
             _ => PaneFrameStyle::Titles,
         }
     }
@@ -110,8 +122,9 @@ impl FromStr for PaneFrameStyle {
             "full" => Ok(PaneFrameStyle::Full),
             "titles" => Ok(PaneFrameStyle::Titles),
             "none" => Ok(PaneFrameStyle::None),
+            "top_only" => Ok(PaneFrameStyle::TopOnly),
             e => Err(format!(
-                "Unknown pane frame style: '{}' (expected 'full', 'titles' or 'none')",
+                "Unknown pane frame style: '{}' (expected 'full', 'titles', 'none' or 'top_only')",
                 e
             )
             .into()),
@@ -268,6 +281,14 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub session_snapshot_limit: Option<usize>,
+
+    /// How long a pane that rang the bell has to stay focused before its notification is
+    /// cleared, in milliseconds. Default is 0 - the notification clears the moment the pane is
+    /// focused.
+    /// config.kdl only - it is read by the server, so there is nothing for a CLI flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub bell_clear_delay_ms: Option<u64>,
 
     /// The template of the terminal title (OSC 0) of the focused pane. Knows the {host},
     /// {session} and {pane} placeholders, anything else is literal text. Placeholders that come
@@ -601,6 +622,7 @@ impl Options {
             .or(self.scrollback_lines_to_serialize);
         let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
         let session_snapshot_limit = other.session_snapshot_limit.or(self.session_snapshot_limit);
+        let bell_clear_delay_ms = other.bell_clear_delay_ms.or(self.bell_clear_delay_ms);
         let terminal_title_template = other
             .terminal_title_template
             .or_else(|| self.terminal_title_template.clone());
@@ -699,6 +721,7 @@ impl Options {
             scrollback_lines_to_serialize,
             snapshot_dir,
             session_snapshot_limit,
+            bell_clear_delay_ms,
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
@@ -792,6 +815,7 @@ impl Options {
         let session_snapshot_limit = other
             .session_snapshot_limit
             .or_else(|| self.session_snapshot_limit.clone());
+        let bell_clear_delay_ms = other.bell_clear_delay_ms.or(self.bell_clear_delay_ms);
         let terminal_title_template = other
             .terminal_title_template
             .or_else(|| self.terminal_title_template.clone());
@@ -890,6 +914,7 @@ impl Options {
             scrollback_lines_to_serialize,
             snapshot_dir,
             session_snapshot_limit,
+            bell_clear_delay_ms,
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
