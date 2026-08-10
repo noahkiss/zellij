@@ -1,7 +1,8 @@
 # zellij (noahkiss fork)
 
-A personal fork of [zellij](https://github.com/zellij-org/zellij), based on **v0.44.3**, carrying a
-small patch queue aimed at the plugin development loop and a few session-lifecycle papercuts.
+A personal fork of [zellij](https://github.com/zellij-org/zellij), rebased onto upstream `main` at
+commit **f42ca3c79** (upstream workspace version **0.45.0**), carrying a curated patch set aimed at
+the plugin development loop and a few session-lifecycle papercuts.
 
 **This fork is not accepting issues or pull requests, and none of these patches have been submitted
 upstream.** If you found it by accident, you want [the real thing](https://github.com/zellij-org/zellij).
@@ -31,7 +32,7 @@ Two things can make an install or upgrade fail in ways the output does not expla
   installed copy is newer and prints `… 3 already installed` instead of upgrading. Check with
   `brew list --versions zellij-nkmk`: if it reports a bare number, the one-time fix is
   `brew uninstall zellij-nkmk && brew install noahkiss/tap/zellij-nkmk`. Kegs named
-  `0.44.3-nkmk.<n>` upgrade normally from then on.
+  `<upstream>-nkmk.<n>` upgrade normally from then on.
 - **Untrusted-tap gate.** Newer Homebrew refuses to load formulae from a third-party tap until
   it is trusted: `brew trust noahkiss/tap` (or `brew trust --formula noahkiss/tap/zellij-nkmk`).
 
@@ -44,8 +45,9 @@ and manages sessions started by a stock build of the same contract, and the reve
 
 ## Versioning
 
-`<upstream version>-nkmk.<fork counter>`, e.g. `0.44.3-nkmk.1`. `zellij --version` reports the fork
-version, so an install can be verified. The counter resets when the upstream base moves.
+`<upstream version>-nkmk.<fork counter>`, e.g. `0.45.0-nkmk.1`. `zellij --version` reports the fork
+version, so an install can be verified. The counter resets when the upstream workspace version
+moves; a rebase within the same upstream version does not reset it.
 
 Because the version keys `$ZELLIJ_CACHE_DIR/<version>`, the fork does not share plugin artifact or
 release-note caches with an upstream build of the same version.
@@ -233,6 +235,10 @@ a stack looks like on screen.
   are pinned to a single row.
 
 Floating and suppressed panes report `null`/`false` for all three stack fields.
+
+One upstream quirk to expect when reading a stack: with the 0.45 stack-list rendering, a collapsed
+member of a stack reports `is_suppressed = true`. That is upstream's own accounting of what is
+currently drawn, not a fork behaviour — read `stack_id` and `index_in_stack` for membership.
 
 This is not the same thing as the neighbouring `index_in_pane_group`, which tracks the multi-select
 grouping feature (Ctrl+click marking, `TogglePaneInGroup`) and is empty unless the user has staged
@@ -1543,6 +1549,11 @@ Each pane gets one title line and no box around it. The fork used to ship this a
 it. Anything that reads `pane_frame_style` — the CLI `SetPaneFrameStyle`, the keybinding, the plugin
 API — takes `top_only` as well.
 
+This is a fork-only *value* of an upstream key, which is stricter than a fork-only key. A stock
+build ignores a key it does not know, but rejects a value it does not know: stock 0.45 fails the
+whole config with `Invalid value for pane_frame_style: 'top_only'`. Keep it out of a config file
+that a stock 0.45 build also reads.
+
 `top_only` **is** `titles`, with two differences:
 
 1. **The title line is a horizontal rule.** `titles` leaves the line blank around the title unless
@@ -1565,8 +1576,8 @@ Add it later if the ragged edge grates.
 
 ## Assessed and deliberately not built
 
-- **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships in
-  v0.44.3 as a CLI/IPC surface — `zellij subscribe --format json` pushes per-pane render updates as
+- **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
+  upstream as a CLI/IPC surface — `zellij subscribe --format json` pushes per-pane render updates as
   they happen (no polling, works on plugin panes, `--ansi` and `--scrollback` supported), and
   `list-panes --json` / `list-tabs --json` / `zellij action` cover the tree and mutations. See
   [docs/web-api-assessment.md](docs/web-api-assessment.md) for the seams, per-endpoint costs, and
@@ -1582,9 +1593,11 @@ Add it later if the ragged edge grates.
 
 ## Working on this fork
 
-`upstream` points at `zellij-org/zellij`. Each patch is its own commit on top of the `v0.44.3` tag,
-so moving to a newer upstream tag is a rebase onto that tag. The two config-surface patches (the
-watcher and the permission grants) share plumbing and land as one commit.
+`upstream` points at `zellij-org/zellij`. Each patch is its own commit on top of the recorded
+upstream base, currently `f42ca3c79` on upstream `main`. Moving to a newer base is
+`git fetch upstream && git rebase --onto upstream/main f42ca3c79`, then recording the new base
+here. The two config-surface patches (the watcher and the permission grants) share plumbing and
+land as one commit.
 
 ```
 cargo build --release
@@ -1609,8 +1622,9 @@ intel mac, no Windows.
 
 1. Land the patches, bump the workspace version in `Cargo.toml` (and the `zellij-client` /
    `zellij-server` pins), `cargo build --release` once so `Cargo.lock` is current, commit.
-2. `git tag v<version> && git push origin main --tags`. Tags are immutable once a formula pins
-   them — never move one.
+2. `git push origin main`, wait for the **`Rust`** workflow to go green — it builds the plugins
+   from source, which `Release` does not — then `git tag v<version> && git push origin v<version>`.
+   Tags are immutable once a formula pins them — never move one.
 3. Watch the run: `gh run watch -R noahkiss/zellij $(gh run list -R noahkiss/zellij --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')`.
 4. Bump `Formula/zellij-nkmk.rb` in the tap: `version`, the URLs, and the `sha256`
    values. The shas are on the release as `<asset>.sha256`. `-D -` does **not** stream to stdout —
@@ -1635,5 +1649,5 @@ ever restored, the runner label is `macos-15-intel` — GitHub retired `macos-13
 To rebuild an existing tag (workflow changes, a lost asset):
 
 ```
-gh workflow run release.yml -R noahkiss/zellij -f tag=v0.44.3-nkmk.3
+gh workflow run release.yml -R noahkiss/zellij -f tag=v0.45.0-nkmk.1
 ```
