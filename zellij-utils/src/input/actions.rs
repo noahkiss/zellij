@@ -939,7 +939,7 @@ impl Action {
                 }]),
             },
             CliAction::DumpLayout => Ok(vec![Action::DumpLayout]),
-            CliAction::SaveSession => Ok(vec![Action::SaveSession]),
+            CliAction::SaveSession { .. } => Ok(vec![Action::SaveSession]),
             CliAction::EditScrollback { pane_id, ansi } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = PaneId::from_str(&pane_id_str)

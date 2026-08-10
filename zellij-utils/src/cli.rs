@@ -350,6 +350,23 @@ pub enum Sessions {
         #[clap(short, long)]
         force_run_commands: bool,
 
+        /// Ignore any resurrection snapshot for this session and build it fresh from the layout
+        #[clap(long)]
+        no_resurrect: bool,
+
+        /// Rebuild the session from an archived snapshot instead of resurrecting it in place.
+        /// Takes a snapshot id (a unique prefix is enough) and defaults to the newest snapshot
+        /// for this session name
+        #[clap(
+            long,
+            value_name = "ID",
+            value_parser,
+            num_args(0..=1),
+            require_equals(false),
+            default_missing_value("latest")
+        )]
+        restore: Option<String>,
+
         /// Authentication token for remote sessions
         #[clap(short('t'), long, value_parser)]
         token: Option<String>,
@@ -397,6 +414,10 @@ pub enum Sessions {
         #[clap(short, long)]
         force: bool,
     },
+
+    /// Inspect and restore archived session snapshots
+    #[clap(subcommand)]
+    Snapshot(SnapshotCli),
 
     /// Kill all sessions
     #[clap(visible_alias = "ka")]
@@ -686,6 +707,63 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
 }
 
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+pub enum SnapshotCli {
+    /// List archived snapshots, newest first
+    #[clap(visible_alias = "ls")]
+    List {
+        /// Only snapshots of this session name
+        #[clap(long, value_parser)]
+        session: Option<String>,
+
+        /// Print the list as JSON
+        #[clap(long)]
+        json: bool,
+    },
+    /// Print a snapshot's layout
+    Show {
+        /// The snapshot id, or a unique prefix of one
+        #[clap(value_parser)]
+        id: String,
+    },
+    /// Rebuild a session from a snapshot
+    Restore {
+        /// The snapshot id, a unique prefix of one, or `latest`
+        #[clap(value_parser)]
+        id: String,
+
+        /// Restore under this session name instead of the one the snapshot was taken from
+        #[clap(long, value_parser)]
+        session: Option<String>,
+    },
+    /// Delete a snapshot
+    Rm {
+        /// The snapshot id, or a unique prefix of one
+        #[clap(value_parser)]
+        id: String,
+    },
+    /// Adopt saved layouts left in the cache by other versions or contract versions
+    Import {
+        /// A session_info directory, or a single session folder, to import instead of the cache
+        #[clap(long, value_parser)]
+        from: Option<PathBuf>,
+
+        /// Report what would be imported without writing anything
+        #[clap(long)]
+        dry_run: bool,
+
+        /// Delete each source folder once it has been imported
+        #[clap(long)]
+        prune_source: bool,
+    },
+    /// Delete all but the newest snapshots of each session
+    Prune {
+        /// How many snapshots to keep per session name, defaults to session_snapshot_limit
+        #[clap(long, value_parser)]
+        keep: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum CliAction {
     /// Write bytes to the terminal.
     Write {
@@ -787,7 +865,11 @@ pub enum CliAction {
     /// Dump current layout to stdout
     DumpLayout,
     /// Save the current session state to disk immediately
-    SaveSession,
+    SaveSession {
+        /// Also copy the saved state into the snapshot archive, as a manual snapshot
+        #[clap(long)]
+        archive: bool,
+    },
     /// Open the pane scrollback in your default editor
     EditScrollback {
         /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
@@ -1248,7 +1330,11 @@ pub enum CliAction {
     },
     /// Move the focused tab in the specified direction. [right|left]
     MoveTab {
-        #[clap(value_parser, required_unless_present = "to_index", conflicts_with = "to_index")]
+        #[clap(
+            value_parser,
+            required_unless_present = "to_index",
+            conflicts_with = "to_index"
+        )]
         direction: Option<Direction>,
         /// Move the tab to this absolute position (0-based), clamped to the last position
         #[clap(long, value_parser)]
