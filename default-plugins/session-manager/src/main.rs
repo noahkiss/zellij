@@ -1,18 +1,22 @@
+mod client_list;
 mod new_session_info;
 mod resurrectable_sessions;
 mod session_list;
 mod single_screen;
+mod snapshot_picker;
 mod ui;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 use zellij_tile::prelude::*;
 
+use client_list::ClientList;
 use new_session_info::NewSessionInfo;
 use single_screen::{DeleteTarget, SingleScreenMode, SingleScreenState, UnifiedSearchResult};
 use ui::{
     components::{
-        render_controls_line, render_error, render_new_session_block, render_prompt,
-        render_renaming_session_screen, render_screen_toggle, render_single_screen_prompt,
+        render_client_list_controls, render_controls_line, render_error, render_new_session_block,
+        render_prompt, render_renaming_session_screen, render_screen_toggle,
+        render_session_list_notice, render_single_screen_prompt, render_snapshot_picker_controls,
         render_unified_results, render_unsaved_changes_line, Colors,
     },
     welcome_screen::{render_banner, render_welcome_boundaries},
@@ -21,6 +25,7 @@ use ui::{
 
 use resurrectable_sessions::ResurrectableSessions;
 use session_list::SessionList;
+use snapshot_picker::{PickerSourceKind, SnapshotPicker};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 enum ActiveScreen {
@@ -56,9 +61,65 @@ pub(crate) struct State {
     current_session_last_saved_time: Option<u64>,
     is_visible: bool,
     refresh_timer_armed: bool,
+    /// Why the last session-list poll came back with nothing, if it failed.
+    ///
+    /// The poll runs once a second and its failure is otherwise invisible: the list stays empty
+    /// forever with no indication that anything went wrong. Keep it out of `error`, which is a
+    /// modal that swallows the next keypress - a failure that re-arms every second would make the
+    /// plugin untypeable.
+    session_list_error: Option<String>,
+    /// The clients attached to the current session, shown over the session list on `Ctrl+l`.
+    client_list: ClientList,
+    show_client_list: bool,
+    /// Every session shape worth reopening - live or archived - shown over the session list on
+    /// `Ctrl+e`, with the tabs and panes of the selected one beside it.
+    snapshot_picker: SnapshotPicker,
+    show_snapshot_picker: bool,
+    /// The archive as the server last reported it.
+    ///
+    /// Kept beside the picker rather than inside it because the picker is rebuilt from both this
+    /// and the live session list, and those two arrive in separate events.
+    snapshots: Vec<SessionSnapshotInfo>,
 }
 
 register_plugin!(State);
+
+/// Kill/delete the selected session: `Delete`, or `Ctrl+k` where `Delete` cannot be typed.
+///
+/// A Mac keyboard without a numeric pad has no Delete key. The label above Backspace says
+/// "delete" but sends Backspace, and `fn+Backspace` - which macOS documents as forward-delete -
+/// does not arrive here as `BareKey::Delete`. So on the fork's own machines the only destructive
+/// action in this plugin was simply unreachable.
+///
+/// `Ctrl+k` for "kill", the one unclaimed mnemonic: `Ctrl+w/f/c/r/d/x/a`, Tab, Esc, Enter, the
+/// arrows and Backspace are all taken here, and every unmodified character is filter input.
+///
+/// Written as a guard rather than an or-pattern because each key needs its OWN modifier test. A
+/// single shared guard would accept `Ctrl+Delete` and, far worse, a bare `k` - which is filter
+/// typing, so the first search for a session with a k in its name would delete one instead.
+fn is_kill_key(key: &KeyWithModifier) -> bool {
+    match key.bare_key {
+        BareKey::Delete => key.has_no_modifiers(),
+        BareKey::Char('k') => key.has_modifiers(&[KeyModifier::Ctrl]),
+        _ => false,
+    }
+}
+
+/// What to say instead of a session list that has no room left to draw in.
+///
+/// The list is given whatever rows remain after the prompt and the help lines. In a short pane that
+/// is none, and the list simply vanished - the same silence as a failed poll, from a cause the user
+/// can fix in a second by making the pane taller.
+fn pane_too_short_notice(hidden_sessions: usize) -> String {
+    if hidden_sessions == 1 {
+        String::from("1 session hidden: the pane is too short to show the list.")
+    } else {
+        format!(
+            "{} sessions hidden: the pane is too short to show the list.",
+            hidden_sessions
+        )
+    }
+}
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
@@ -86,6 +147,9 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
             EventType::Timer,
             EventType::Visible,
+            EventType::ListClients,
+            EventType::ListSnapshots,
+            EventType::SnapshotRestoreFailed,
         ]);
         rename_plugin_pane(get_plugin_ids().plugin_id, "Session Manager");
         self.refresh_session_list();
@@ -136,6 +200,18 @@ impl ZellijPlugin for State {
                 if self.refresh_session_list() {
                     should_render = true;
                 }
+                if self.show_client_list {
+                    // clients attach and detach without any event of their own, so the open list
+                    // is only as current as its last poll
+                    list_clients();
+                }
+                if self.show_snapshot_picker {
+                    // a snapshot is cut by another server entirely - a shutdown, a delete, a
+                    // `save-session --archive` elsewhere - so nothing here would ever hear about it
+                    list_snapshots();
+                    self.snapshot_picker
+                        .update(&self.sessions.session_ui_infos, &self.snapshots);
+                }
                 self.arm_refresh_timer();
             },
             Event::Visible(is_visible) => {
@@ -159,6 +235,24 @@ impl ZellijPlugin for State {
             },
             Event::Key(key) => {
                 should_render = self.handle_key(key);
+            },
+            Event::ListClients(clients) => {
+                self.client_list.update(clients);
+                should_render = self.show_client_list;
+            },
+            Event::SnapshotRestoreFailed(error) => {
+                // the picker has already closed itself and hidden the plugin by the time a refusal
+                // races back, so re-open it: an error drawn over a hidden pane is no error at all
+                self.show_snapshot_picker = true;
+                self.show_error(&error);
+                should_render = true;
+            },
+            Event::ListSnapshots(snapshots) => {
+                self.snapshots = snapshots;
+                self.snapshot_picker.mark_answered();
+                self.snapshot_picker
+                    .update(&self.sessions.session_ui_infos, &self.snapshots);
+                should_render = self.show_snapshot_picker;
             },
             Event::PermissionRequestResult(_result) => {
                 should_render = true;
@@ -230,7 +324,13 @@ impl ZellijPlugin for State {
                 );
             },
             ActiveScreen::AttachToSession => {
-                if let Some(new_session_name) = self.renaming_session_name.as_ref() {
+                if self.show_snapshot_picker {
+                    self.snapshot_picker
+                        .render(height, width.saturating_sub(7), x, y + 2);
+                } else if self.show_client_list {
+                    self.client_list
+                        .render(height, width.saturating_sub(7), x, y + 2);
+                } else if let Some(new_session_name) = self.renaming_session_name.as_ref() {
                     render_renaming_session_screen(&new_session_name, height, width, x, y + 2);
                 } else if self.show_kill_all_sessions_warning {
                     self.render_kill_all_sessions_warning(height, width, x, y);
@@ -245,6 +345,17 @@ impl ZellijPlugin for State {
                     for (i, line) in list.iter().enumerate() {
                         print!("\u{1b}[{};{}H{}", y + i + 5, x, line.render());
                     }
+                    if let Some(notice) = self.session_list_notice() {
+                        render_session_list_notice(&notice, width.saturating_sub(7), x, y + 5);
+                    } else if room_for_list == 0 && !self.sessions.session_ui_infos.is_empty() {
+                        let hidden = self.sessions.session_ui_infos.len();
+                        render_session_list_notice(
+                            &pane_too_short_notice(hidden),
+                            width.saturating_sub(7),
+                            x,
+                            y + 3,
+                        );
+                    }
                 }
             },
             ActiveScreen::ResurrectSession => {
@@ -253,7 +364,14 @@ impl ZellijPlugin for State {
             ActiveScreen::SingleScreen => {
                 match self.single_screen_state.mode {
                     SingleScreenMode::SearchAndSelect => {
-                        if let Some(new_session_name) = self.renaming_session_name.as_ref() {
+                        if self.show_snapshot_picker {
+                            self.snapshot_picker.render(height, width, x, y);
+                        } else if self.show_client_list {
+                            let content_width = std::cmp::min(width, 90);
+                            let x_centered = x + (width.saturating_sub(content_width)) / 2;
+                            self.client_list
+                                .render(height, content_width, x_centered, y);
+                        } else if let Some(new_session_name) = self.renaming_session_name.as_ref() {
                             render_renaming_session_screen(new_session_name, height, width, x, y);
                         } else if self.show_kill_all_sessions_warning {
                             self.render_kill_all_sessions_warning(height, width, x, y);
@@ -309,6 +427,25 @@ impl ZellijPlugin for State {
                                 x_centered,
                                 y_offset + 2,
                             );
+                            if let Some(notice) = self.session_list_notice() {
+                                render_session_list_notice(
+                                    &notice,
+                                    content_width,
+                                    x_centered,
+                                    y_offset + 3,
+                                );
+                            } else if max_table_rows.saturating_sub(1) == 0
+                                && !self.single_screen_state.render_cache.rows.is_empty()
+                            {
+                                // one row of the table is its header, so a single row shows nothing
+                                let hidden = self.single_screen_state.render_cache.rows.len();
+                                render_session_list_notice(
+                                    &pane_too_short_notice(hidden),
+                                    content_width,
+                                    x_centered,
+                                    y_offset + 2,
+                                );
+                            }
                         }
                     },
                     SingleScreenMode::SelectingLayout => {
@@ -400,6 +537,16 @@ impl ZellijPlugin for State {
         }
         if let Some(error) = self.error.as_ref() {
             render_error(&error, height, width, x, y);
+        } else if self.show_snapshot_picker {
+            render_snapshot_picker_controls(
+                self.snapshot_picker.restore_as.is_some(),
+                width,
+                self.colors,
+                x + 1,
+                rows.saturating_sub(1),
+            );
+        } else if self.show_client_list {
+            render_client_list_controls(width, self.colors, x + 1, rows.saturating_sub(1));
         } else if (self.active_screen == ActiveScreen::AttachToSession
             || self.active_screen == ActiveScreen::SingleScreen)
             && !self.is_welcome_screen
@@ -436,6 +583,232 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    /// Show the snapshot picker and ask the server for the archive.
+    ///
+    /// The answer arrives as `Event::ListSnapshots`, so the archive half of the list is empty for
+    /// one frame; the live half is already known. It clears first rather than showing the previous
+    /// answer, because a snapshot listed here may have been pruned since it was last read.
+    fn open_snapshot_picker(&mut self) {
+        self.show_snapshot_picker = true;
+        self.snapshots.clear();
+        self.snapshot_picker.clear();
+        self.snapshot_picker
+            .update(&self.sessions.session_ui_infos, &self.snapshots);
+        list_snapshots();
+    }
+    /// Keys for the snapshot picker. Returns whether anything changed on screen.
+    ///
+    /// Bare characters are filter input here, as on every screen in this plugin except the client
+    /// list, so every action needs a modifier or a named key.
+    fn handle_snapshot_picker_key(&mut self, key: KeyWithModifier) -> bool {
+        if self.snapshot_picker.restore_as.is_some() {
+            return self.handle_restore_as_key(key);
+        }
+        match key.bare_key {
+            BareKey::Down if key.has_no_modifiers() => {
+                self.snapshot_picker.move_selection_down();
+                true
+            },
+            BareKey::Up if key.has_no_modifiers() => {
+                self.snapshot_picker.move_selection_up();
+                true
+            },
+            BareKey::Enter if key.has_no_modifiers() => self.open_selected_picker_entry(),
+            BareKey::Char('r') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.open_restore_as_prompt()
+            },
+            BareKey::Backspace if key.has_no_modifiers() => {
+                let mut search_term = self.snapshot_picker.search_term.clone();
+                search_term.pop();
+                self.snapshot_picker.update_search_term(search_term);
+                true
+            },
+            BareKey::Esc if key.has_no_modifiers() => {
+                self.close_snapshot_picker();
+                true
+            },
+            BareKey::Char('e') | BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.close_snapshot_picker();
+                true
+            },
+            BareKey::Char(character) if key.has_no_modifiers() => {
+                let mut search_term = self.snapshot_picker.search_term.clone();
+                search_term.push(character);
+                self.snapshot_picker.update_search_term(search_term);
+                true
+            },
+            _ => false,
+        }
+    }
+    fn close_snapshot_picker(&mut self) {
+        self.show_snapshot_picker = false;
+        self.snapshot_picker.restore_as = None;
+    }
+    /// Attach to the selected live session, or restore the selected snapshot under its own name.
+    ///
+    /// A row the picker has already marked as blocked reports why rather than trying: restoring
+    /// over a running session would silently attach to it instead, and a layout that does not parse
+    /// would land the user in an empty session.
+    fn open_selected_picker_entry(&mut self) -> bool {
+        let Some((source, entry)) = self.snapshot_picker.selected_row() else {
+            self.show_error("Nothing selected.");
+            return true;
+        };
+        if let Some(blocked) = entry.blocked.clone() {
+            let is_snapshot = source.kind == PickerSourceKind::Snapshots;
+            self.show_error(&if is_snapshot {
+                format!("{} Use <Ctrl r> to restore it under another name.", blocked)
+            } else {
+                blocked
+            });
+            return true;
+        }
+        let name = entry.name.clone();
+        let id = entry.id.clone();
+        match source.kind {
+            PickerSourceKind::LiveSessions => switch_session_with_focus(&name, None, None),
+            PickerSourceKind::Snapshots => restore_snapshot(&id, None),
+        }
+        self.close_snapshot_picker();
+        if self.is_welcome_screen {
+            // the welcome screen has done its job and now we need to quit this temporary session so
+            // as not to leave garbage sessions behind
+            quit_zellij();
+        } else {
+            hide_self();
+        }
+        true
+    }
+    /// Ask for a name to restore the selected snapshot under.
+    ///
+    /// The way out of a name collision, and the way to rehearse a restore beside a session that is
+    /// still running - the same thing `snapshot restore --session` is for. It starts empty rather
+    /// than prefilled with the taken name, since that name is exactly the one that will not work.
+    fn open_restore_as_prompt(&mut self) -> bool {
+        match self.snapshot_picker.selected_row() {
+            Some((source, _entry)) if source.kind == PickerSourceKind::Snapshots => {
+                self.snapshot_picker.restore_as = Some(String::new());
+            },
+            Some(_) => {
+                self.show_error("Only a snapshot can be restored under another name.");
+            },
+            None => {
+                self.show_error("Must select a snapshot before restoring it.");
+            },
+        }
+        true
+    }
+    fn handle_restore_as_key(&mut self, key: KeyWithModifier) -> bool {
+        let Some(restore_as) = self.snapshot_picker.restore_as.as_mut() else {
+            return false;
+        };
+        match key.bare_key {
+            BareKey::Enter if key.has_no_modifiers() => {
+                let new_name = restore_as.clone();
+                if new_name.is_empty() {
+                    self.show_error("New name must not be empty.");
+                    return true;
+                }
+                if new_name.contains('/') {
+                    self.show_error("Session names cannot contain '/'");
+                    return true;
+                }
+                if self.sessions.has_session(&new_name) {
+                    self.show_error("A session by this name already exists.");
+                    return true;
+                }
+                let Some(id) = self
+                    .snapshot_picker
+                    .selected()
+                    .map(|entry| entry.id.clone())
+                else {
+                    self.show_error("Nothing selected.");
+                    return true;
+                };
+                restore_snapshot(&id, Some(&new_name));
+                self.close_snapshot_picker();
+                if self.is_welcome_screen {
+                    quit_zellij();
+                } else {
+                    hide_self();
+                }
+                true
+            },
+            BareKey::Esc if key.has_no_modifiers() => {
+                self.snapshot_picker.restore_as = None;
+                true
+            },
+            BareKey::Backspace if key.has_no_modifiers() => {
+                restore_as.pop();
+                true
+            },
+            BareKey::Char(character) if key.has_no_modifiers() => {
+                restore_as.push(character);
+                true
+            },
+            _ => false,
+        }
+    }
+    /// Show the client list and ask the server to fill it.
+    ///
+    /// The answer arrives as `Event::ListClients`, so the list is empty for one frame. It clears
+    /// first rather than showing the previous answer, because a stale client list is exactly the
+    /// kind of thing someone would act on.
+    fn open_client_list(&mut self) {
+        self.show_client_list = true;
+        self.client_list.clear();
+        list_clients();
+    }
+    /// Keys for the client list. Returns whether anything changed on screen.
+    ///
+    /// Nothing here is filter input - this screen has no search term - so a bare character is free
+    /// to carry an action, which is true nowhere else in this plugin.
+    fn handle_client_list_key(&mut self, key: KeyWithModifier) -> bool {
+        match key.bare_key {
+            BareKey::Down if key.has_no_modifiers() => {
+                self.client_list.move_selection_down();
+                true
+            },
+            BareKey::Up if key.has_no_modifiers() => {
+                self.client_list.move_selection_up();
+                true
+            },
+            BareKey::Char('d') if key.has_no_modifiers() => self.detach_selected_client(),
+            BareKey::Esc if key.has_no_modifiers() => {
+                self.show_client_list = false;
+                true
+            },
+            BareKey::Char('l') | BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                // both need the same modifier test, so one guard is right here - unlike the
+                // kill key, where a shared guard would have swallowed a bare character
+                self.show_client_list = false;
+                true
+            },
+            _ => false,
+        }
+    }
+    /// Detach the selected client, except when it is the one driving this plugin.
+    ///
+    /// Detaching yourself from here is refused rather than confirmed: the session's own detach
+    /// binding already does it, and it is the one row where the screen reporting the outcome
+    /// disappears along with the client.
+    fn detach_selected_client(&mut self) -> bool {
+        match self.client_list.selected() {
+            Some(client) if client.is_current_client => {
+                self.show_error("This is the client you are typing in. Use the session's detach key to detach it.");
+            },
+            Some(client) => {
+                let client_id = client.client_id;
+                detach_clients(&[client_id]);
+                self.client_list.remove(client_id);
+                list_clients();
+            },
+            None => {
+                self.show_error("Must select a client before detaching it.");
+            },
+        }
+        true
+    }
     fn reset_selected_index(&mut self) {
         self.sessions.reset_selected_index();
     }
@@ -523,6 +896,12 @@ impl State {
     }
     fn handle_attach_to_session(&mut self, key: KeyWithModifier) -> bool {
         let mut should_render = false;
+        if self.show_snapshot_picker {
+            return self.handle_snapshot_picker_key(key);
+        }
+        if self.show_client_list {
+            return self.handle_client_list_key(key);
+        }
         if self.show_kill_all_sessions_warning {
             match key.bare_key {
                 BareKey::Char('y') if key.has_no_modifiers() => {
@@ -616,7 +995,7 @@ impl State {
                     self.renaming_session_name = Some(String::new());
                     should_render = true;
                 },
-                BareKey::Delete if key.has_no_modifiers() => {
+                BareKey::Delete | BareKey::Char('k') if is_kill_key(&key) => {
                     if let Some(selected_session_name) = self.sessions.get_selected_session_name() {
                         let was_searching = self.sessions.is_searching;
                         let prev_search_idx = self.sessions.selected_search_index;
@@ -654,6 +1033,14 @@ impl State {
                 },
                 BareKey::Char('x') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                     disconnect_other_clients()
+                },
+                BareKey::Char('l') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                    self.open_client_list();
+                    should_render = true;
+                },
+                BareKey::Char('e') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                    self.open_snapshot_picker();
+                    should_render = true;
                 },
                 BareKey::Char('c') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                     if !self.search_term.is_empty() {
@@ -727,7 +1114,7 @@ impl State {
                 self.toggle_active_screen();
                 should_render = true;
             },
-            BareKey::Delete if key.has_no_modifiers() => {
+            BareKey::Delete | BareKey::Char('k') if is_kill_key(&key) => {
                 self.resurrectable_sessions.delete_selected_session();
                 should_render = true;
             },
@@ -753,6 +1140,14 @@ impl State {
     }
     fn handle_single_screen_search_key(&mut self, key: KeyWithModifier) -> bool {
         let mut should_render = false;
+
+        if self.show_snapshot_picker {
+            return self.handle_snapshot_picker_key(key);
+        }
+
+        if self.show_client_list {
+            return self.handle_client_list_key(key);
+        }
 
         // Handle kill-all warning overlay first
         if self.show_kill_all_sessions_warning {
@@ -870,7 +1265,7 @@ impl State {
                 self.renaming_session_name = Some(String::new());
                 should_render = true;
             },
-            BareKey::Delete if key.has_no_modifiers() => {
+            BareKey::Delete | BareKey::Char('k') if is_kill_key(&key) => {
                 let selected = self
                     .single_screen_state
                     .get_selected_result()
@@ -914,6 +1309,14 @@ impl State {
             },
             BareKey::Char('x') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                 disconnect_other_clients();
+            },
+            BareKey::Char('l') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.open_client_list();
+                should_render = true;
+            },
+            BareKey::Char('e') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
+                self.open_snapshot_picker();
+                should_render = true;
             },
             BareKey::Char('a') if key.has_modifiers(&[KeyModifier::Ctrl]) => {
                 if !self.is_welcome_screen {
@@ -1252,6 +1655,32 @@ impl State {
             ActiveScreen::SingleScreen => ActiveScreen::SingleScreen, // no-op
         };
     }
+    /// What to draw where the session list would be, when the list has nothing to show.
+    ///
+    /// A failed poll is not the only way the list ends up empty: the server's scan drops a session
+    /// silently when its socket has no matching `session-metadata.kdl`, or when that file does not
+    /// parse, and reports success with an empty list. Say so either way - an empty list with no
+    /// explanation is the bug this exists to end.
+    fn session_list_notice(&self) -> Option<String> {
+        if let Some(error) = self.session_list_error.as_ref() {
+            return Some(format!("Session list unavailable: {}", error));
+        }
+        if self.is_welcome_screen {
+            // the welcome screen hides the current session on purpose, so empty is normal here
+            return None;
+        }
+        if self.sessions.session_ui_infos.is_empty()
+            && self
+                .resurrectable_sessions
+                .all_resurrectable_sessions
+                .is_empty()
+        {
+            return Some(String::from(
+                "No sessions found: the server's scan of its socket and session-info dirs returned none.",
+            ));
+        }
+        None
+    }
     fn show_error(&mut self, error_text: &str) {
         self.error = Some(error_text.to_owned());
     }
@@ -1271,8 +1700,18 @@ impl State {
 
     fn refresh_session_list(&mut self) -> bool {
         let snapshot = match get_session_list() {
-            Ok(snapshot) => snapshot,
-            Err(_) => return false,
+            Ok(snapshot) => {
+                self.session_list_error = None;
+                snapshot
+            },
+            Err(e) => {
+                let is_new = self.session_list_error.as_deref() != Some(e.as_str());
+                if is_new {
+                    eprintln!("session-manager: failed to get the session list: {}", e);
+                    self.session_list_error = Some(e);
+                }
+                return is_new;
+            },
         };
         for session_info in &snapshot.live_sessions {
             if session_info.is_current_session {

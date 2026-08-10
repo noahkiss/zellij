@@ -1408,6 +1408,23 @@ pub fn render_error(error_text: &str, rows: usize, columns: usize, x: usize, y: 
     );
 }
 
+/// Draw a one-line notice where the session list would be.
+///
+/// The list area is empty whenever there is something to say here, so the notice costs nothing and
+/// is the only place a user ever sees why the list is empty.
+pub fn render_session_list_notice(notice: &str, columns: usize, x: usize, y: usize) {
+    if columns == 0 {
+        return;
+    }
+    print_text_with_coordinates(
+        Text::new(notice.to_owned()).color_range(3, ..),
+        x,
+        y,
+        Some(columns),
+        None,
+    );
+}
+
 pub fn render_renaming_session_screen(
     new_session_name: &str,
     rows: usize,
@@ -1440,6 +1457,72 @@ pub fn render_renaming_session_screen(
     }
 }
 
+/// The help line for the client list, which has its own keys and none of the list's.
+///
+/// It replaces the normal controls line rather than adding to it: every key it names is only bound
+/// while the client list is up, and naming keys that do nothing is worse than naming none.
+pub fn render_client_list_controls(max_cols: usize, colors: Colors, x: usize, y: usize) {
+    let arrows = colors.shortcuts("<↓↑>");
+    let navigate = colors.bold("Select");
+    let detach = colors.shortcuts("<d>");
+    let detach_text = colors.bold("Detach client");
+    let back = colors.shortcuts("<ESC>");
+    let back_text = colors.bold("Back");
+
+    // "Help: <↓↑> - Select, <d> - Detach client, <ESC> - Back" = 54 chars
+    if max_cols > 54 {
+        print!(
+            "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {detach} - {detach_text}, {back} - {back_text}"
+        );
+    } else if max_cols >= 14 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{detach}/{back}");
+    }
+}
+
+/// The help line for the snapshot picker, which binds its own keys while it is up.
+///
+/// The name prompt gets a line of its own: while it is open every key it does not consume is
+/// filter input, and offering `<Ctrl r>` there would name a key that does nothing.
+pub fn render_snapshot_picker_controls(
+    is_naming: bool,
+    max_cols: usize,
+    colors: Colors,
+    x: usize,
+    y: usize,
+) {
+    let back = colors.shortcuts("<ESC>");
+    if is_naming {
+        let confirm = colors.shortcuts("<ENTER>");
+        let confirm_text = colors.bold("Restore under this name");
+        let back_text = colors.bold("Cancel");
+        // "Help: <ENTER> - Restore under this name, <ESC> - Cancel" = 55 chars
+        if max_cols > 55 {
+            print!("\u{1b}[m\u{1b}[{y};{x}HHelp: {confirm} - {confirm_text}, {back} - {back_text}");
+        } else if max_cols >= 14 {
+            print!("\u{1b}[m\u{1b}[{y};{x}H{confirm}/{back}");
+        }
+        return;
+    }
+    let arrows = colors.shortcuts("<↓↑>");
+    let navigate = colors.bold("Select");
+    let open = colors.shortcuts("<ENTER>");
+    let open_text = colors.bold("Open");
+    let rename = colors.shortcuts("<Ctrl r>");
+    let rename_text = colors.bold("Restore as");
+    let back_text = colors.bold("Back");
+
+    // "Help: <↓↑> - Select, <ENTER> - Open, <Ctrl r> - Restore as, <ESC> - Back" = 72 chars
+    if max_cols > 72 {
+        print!(
+            "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {open} - {open_text}, {rename} - {rename_text}, {back} - {back_text}"
+        );
+    } else if max_cols >= 26 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{open}/{rename}/{back}");
+    } else if max_cols >= 14 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{open}/{back}");
+    }
+}
+
 pub fn render_controls_line(
     active_screen: ActiveScreen,
     max_cols: usize,
@@ -1467,13 +1550,25 @@ pub fn render_controls_line(
             let disconnect = colors.shortcuts("<Ctrl x>");
             let disconnect_text = colors.bold("Disconnect others");
             let kill = colors.shortcuts("<Del>");
+            // Mac keyboards without a numpad have no Delete key, so the wide help advertises the
+            // alias too. Only the wide tier: the compact one is already over its own budget.
+            let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill");
             let kill_all = colors.shortcuts("<Ctrl d>");
             let kill_all_text = colors.bold("Kill all");
+            let clients = colors.shortcuts("<Ctrl l>");
+            let clients_text = colors.bold("Clients");
 
-            if max_cols > 90 {
+            // the client list is the only entry that fits nowhere but the widest tier: it is new,
+            // and displacing an existing key to advertise it would be a bad trade
+            if max_cols > 117 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill} - {kill_text}, {kill_all} - {kill_all_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}, {clients} - {clients_text}"
+                );
+                true
+            } else if max_cols > 97 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}"
                 );
                 true
             } else if max_cols >= 28 {
@@ -1489,13 +1584,14 @@ pub fn render_controls_line(
             let enter = colors.shortcuts("<ENTER>");
             let select = colors.bold("Resurrect");
             let del = colors.shortcuts("<DEL>");
+            let del_wide = colors.shortcuts("<DEL/Ctrl k>");
             let del_text = colors.bold("Delete");
             let del_all = colors.shortcuts("<Ctrl d>");
             let del_all_text = colors.bold("Delete all");
 
-            if max_cols > 83 {
+            if max_cols > 90 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del} - {del_text}, {del_all} - {del_all_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del_wide} - {del_text}, {del_all} - {del_all_text}"
                 );
                 true
             } else if max_cols >= 28 {
@@ -1512,12 +1608,23 @@ pub fn render_controls_line(
             let disconnect_full_text = colors.bold("Disconnect others");
             let disconnect_short_text = colors.bold("Disconnect");
             let kill = colors.shortcuts("<Del>");
+            // Mac keyboards without a numpad have no Delete key, so the widest tier advertises
+            // the alias. The narrower tiers keep "<Del>" rather than lose a whole entry to it.
+            let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill/Delete");
+            let clients = colors.shortcuts("<Ctrl l>");
+            let clients_text = colors.bold("Clients");
 
-            // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del> - Kill/Delete" = 76 chars
-            if max_cols > 76 {
+            // Widest: the full line plus ", <Ctrl l> - Clients" = 103 chars
+            if max_cols > 103 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill} - {kill_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}, {clients} - {clients_text}"
+                );
+                true
+            // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del/Ctrl k> - Kill/Delete" = 83 chars
+            } else if max_cols > 83 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}"
                 );
                 true
             // Medium: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect, <Del> - Kill/Delete" = 69 chars
