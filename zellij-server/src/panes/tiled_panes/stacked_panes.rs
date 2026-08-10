@@ -165,6 +165,27 @@ impl<'a> StackedPanes<'a> {
             .map(|(pane_id, _pane_position)| *pane_id)
             .collect())
     }
+    /// The pane at the OTHER end of `pane_id`'s stack, for a focus move that ran out of stack.
+    ///
+    /// Travelling up wraps to the bottom pane and travelling down wraps to the top - the only
+    /// reading of "wrap" under which holding one key keeps cycling in one direction.
+    /// `positions_in_stack` is ordered top to bottom, so the two ends are its last and first
+    /// entries.
+    ///
+    /// `None` when there is nowhere to go: a pane in no stack, or a stack holding only this pane,
+    /// which would otherwise wrap onto itself and report a focus change that never happened.
+    pub fn far_end_of_stack(&self, pane_id: &PaneId, going_up: bool) -> Option<PaneId> {
+        let positions_in_stack = self.positions_in_stack(pane_id).ok()?;
+        let (far_end, _geom) = if going_up {
+            positions_in_stack.last()?
+        } else {
+            positions_in_stack.first()?
+        };
+        if far_end == pane_id {
+            return None;
+        }
+        Some(*far_end)
+    }
     pub fn flexible_pane_id_in_stack(&self, pane_id_in_stack: &PaneId) -> Option<PaneId> {
         let all_stacked_pane_positions = self.positions_in_stack(pane_id_in_stack).ok()?;
         all_stacked_pane_positions
