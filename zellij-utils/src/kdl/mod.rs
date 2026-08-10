@@ -760,6 +760,7 @@ impl Action {
                     PaneFrameStyle::Full => "full",
                     PaneFrameStyle::Titles => "titles",
                     PaneFrameStyle::None => "none",
+                    PaneFrameStyle::TopOnly => "top_only",
                 };
                 node.push(style);
                 Some(node)
@@ -2995,6 +2996,9 @@ impl Options {
         let session_snapshot_limit =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "session_snapshot_limit")
                 .map(|(v, _)| v.max(0) as usize);
+        let bell_clear_delay_ms =
+            kdl_property_first_arg_as_i64_or_error!(kdl_options, "bell_clear_delay_ms")
+                .map(|(delay, _entry)| delay.max(0) as u64);
         let terminal_title_template =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "terminal_title_template")
                 .map(|(template, _entry)| template.to_string());
@@ -3165,6 +3169,7 @@ impl Options {
             scrollback_lines_to_serialize,
             snapshot_dir,
             session_snapshot_limit,
+            bell_clear_delay_ms,
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
@@ -3524,6 +3529,13 @@ impl Options {
             node
         })
     }
+    fn bell_clear_delay_ms_to_kdl(&self) -> Option<KdlNode> {
+        self.bell_clear_delay_ms.map(|delay| {
+            let mut node = KdlNode::new("bell_clear_delay_ms");
+            node.push(KdlValue::Base10(delay as i64));
+            node
+        })
+    }
     fn terminal_title_template_to_kdl(&self) -> Option<KdlNode> {
         self.terminal_title_template
             .as_ref()
@@ -3783,12 +3795,13 @@ impl Options {
     }
     fn pane_frame_style_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         let comment_text = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             " ",
             "// Set the pane frame style when pane_frames is enabled",
             "// Options:",
             "//   - full",
             "//   - titles (default)",
+            "//   - top_only (titles on a horizontal rule, no separators between panes)",
             "// ",
         );
 
@@ -3797,6 +3810,7 @@ impl Options {
                 PaneFrameStyle::Full => "full",
                 PaneFrameStyle::Titles => "titles",
                 PaneFrameStyle::None => "none",
+                PaneFrameStyle::TopOnly => "top_only",
             }
         };
 
@@ -5029,6 +5043,9 @@ impl Options {
         }
         if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
             nodes.push(session_snapshot_limit);
+        }
+        if let Some(bell_clear_delay_ms) = self.bell_clear_delay_ms_to_kdl() {
+            nodes.push(bell_clear_delay_ms);
         }
         if let Some(terminal_title_template) = self.terminal_title_template_to_kdl() {
             nodes.push(terminal_title_template);
@@ -6986,6 +7003,10 @@ impl PaneInfo {
             index_in_pane_group: Default::default(), // we don't serialize this
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
         };
         Ok((tab_position, pane_info))
     }
@@ -7136,6 +7157,10 @@ fn serialize_and_deserialize_session_info_with_data() {
             index_in_pane_group: Default::default(), // we don't serialize this
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
         },
         PaneInfo {
             id: 1,
@@ -7163,6 +7188,10 @@ fn serialize_and_deserialize_session_info_with_data() {
             index_in_pane_group: Default::default(), // we don't serialize this
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: None,
+            index_in_stack: None,
+            is_expanded_in_stack: false,
         },
     ];
     let mut panes = HashMap::new();
@@ -8308,6 +8337,23 @@ fn plugin_permissions_survive_a_config_round_trip() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(config.plugin_permissions, deserialized.plugin_permissions);
+}
+
+#[test]
+fn bell_clear_delay_config_parsing() {
+    let config = Config::from_kdl("bell_clear_delay_ms 1000", None).unwrap();
+    assert_eq!(config.options.bell_clear_delay_ms, Some(1000));
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn bell_clear_delay_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.bell_clear_delay_ms, None);
 }
 
 #[test]
