@@ -2169,6 +2169,9 @@ fn init_session(
                 .clone()
                 .or_else(|| default_layout_dir());
             let background_plugins = config.background_plugins.clone();
+            let plugin_permissions = std::sync::Arc::new(config.plugin_permissions.clone());
+            // this fork watches loaded plugin .wasm files by default - it is the point of the fork
+            let plugin_watch = config_options.plugin_watch.unwrap_or(true);
             let session_env_vars = session_env_vars.clone();
             move || {
                 plugin_thread_main(
@@ -2186,6 +2189,8 @@ fn init_session(
                     plugin_aliases,
                     default_mode,
                     default_keybinds,
+                    plugin_permissions,
+                    plugin_watch,
                     background_plugins,
                     client_id,
                 )

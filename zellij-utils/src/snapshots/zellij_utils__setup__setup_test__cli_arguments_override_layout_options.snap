@@ -18,6 +18,7 @@ Options {
         true,
     ),
     pane_frame_style: None,
+    plugin_watch: None,
     mirror_session: None,
     on_force_close: None,
     scroll_buffer_size: None,
