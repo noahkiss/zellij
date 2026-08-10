@@ -646,6 +646,44 @@ fn process_is_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// What a delete found to remove, and whether the server it belonged to went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletedSession {
+    /// `false` if the server was still running when the wait ran out.
+    pub killed: bool,
+    /// `false` if there was no session_info folder to remove - the session was already gone.
+    pub found: bool,
+}
+
+/// Delete the session, and say what was there to delete.
+///
+/// Whether finding nothing is a failure is the CALLER's question, not this function's: to
+/// `delete-session` it is a name that does not exist, and to `session down` it is the state that
+/// was asked for. Both need the same removal, so only the verdict is left to them.
+pub fn delete_session_reporting(
+    name: &str,
+    force: bool,
+    snapshot_settings: &SnapshotSettings,
+    wait: KillWait,
+) -> DeletedSession {
+    let killed = if force {
+        kill_and_wait(name, wait)
+    } else {
+        true
+    };
+    let mut found = true;
+    if let Err(e) = remove_session_info_folder(name, snapshot_settings) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            found = false;
+        } else {
+            log::error!("Failed to remove session {:?}: {:?}", name, e);
+        }
+    } else {
+        println!("Session: {:?} successfully deleted.", name);
+    }
+    DeletedSession { killed, found }
+}
+
 /// Delete the session. Returns `false` if the server was still running when the wait ran out.
 pub fn delete_session(
     name: &str,
@@ -653,22 +691,12 @@ pub fn delete_session(
     snapshot_settings: &SnapshotSettings,
     wait: KillWait,
 ) -> bool {
-    let killed = if force {
-        kill_and_wait(name, wait)
-    } else {
-        true
-    };
-    if let Err(e) = remove_session_info_folder(name, snapshot_settings) {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            eprintln!("Session: {:?} not found.", name);
-            process::exit(2);
-        } else {
-            log::error!("Failed to remove session {:?}: {:?}", name, e);
-        }
-    } else {
-        println!("Session: {:?} successfully deleted.", name);
+    let deleted = delete_session_reporting(name, force, snapshot_settings, wait);
+    if !deleted.found {
+        eprintln!("Session: {:?} not found.", name);
+        process::exit(2);
     }
-    killed
+    deleted.killed
 }
 
 const DELETE_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
