@@ -1821,6 +1821,10 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
                 .collect(),
             default_fg: protobuf_pane_info.default_fg,
             default_bg: protobuf_pane_info.default_bg,
+            program_title: protobuf_pane_info.program_title,
+            stack_id: protobuf_pane_info.stack_id.map(|s| s as usize),
+            index_in_stack: protobuf_pane_info.index_in_stack.map(|i| i as usize),
+            is_expanded_in_stack: protobuf_pane_info.is_expanded_in_stack,
         })
     }
 }
@@ -1866,6 +1870,10 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
                 .collect(),
             default_fg: pane_info.default_fg,
             default_bg: pane_info.default_bg,
+            program_title: pane_info.program_title,
+            stack_id: pane_info.stack_id.map(|s| s as u32),
+            index_in_stack: pane_info.index_in_stack.map(|i| i as u32),
+            is_expanded_in_stack: pane_info.is_expanded_in_stack,
         })
     }
 }
@@ -2959,6 +2967,10 @@ fn serialize_session_update_event_with_non_default_values() {
             index_in_pane_group: index_in_pane_group_1,
             default_fg: None,
             default_bg: None,
+            program_title: Some("i am an osc title".to_owned()),
+            stack_id: Some(1),
+            index_in_stack: Some(0),
+            is_expanded_in_stack: true,
         },
         PaneInfo {
             id: 1,
@@ -2986,6 +2998,10 @@ fn serialize_session_update_event_with_non_default_values() {
             index_in_pane_group: index_in_pane_group_2,
             default_fg: None,
             default_bg: None,
+            program_title: None,
+            stack_id: Some(1),
+            index_in_stack: Some(1),
+            is_expanded_in_stack: false,
         },
     ];
     panes.insert(0, panes_list);

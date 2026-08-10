@@ -90,7 +90,7 @@ use crate::{
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction, PluginRenderAsset},
     pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
     pty_writer::PtyWriteInstruction,
-    tab::{GuestChoiceIndicator, SuppressedPanes, Tab},
+    tab::{GuestChoiceIndicator, SuppressedPanes, Tab, CANNOT_STACK_WITHOUT_ANCHOR},
     thread_bus::Bus,
     ui::loading_indication::LoadingIndication,
     ClientId, ServerInstruction,
@@ -4943,6 +4943,7 @@ impl Screen {
                 tab_name: tab.name.clone(),
                 pane_command: None,
                 pane_cwd: None,
+                pane_pid: None,
             }
         }
 
@@ -7782,6 +7783,27 @@ pub(crate) fn screen_thread_main(
                 set_blocking,
             ) => {
                 completion_tx.as_mut().map(|c| c.set_affected_pane_id(pid));
+
+                // A stacked pane with no explicit target has to join some client's focused pane.
+                // With no client connected there is none, and the tab refuses the pane and closes
+                // the pty it was given - but a non-blocking `new-pane` reports its pane as soon as
+                // the pty spawns, so by the time the tab refuses, this notification has already
+                // been dropped as a success. Report the refusal here, while the channel is still
+                // ours to signal; the tab still does the refusing and the cleanup.
+                if !start_suppressed
+                    && screen.get_first_client_id().is_none()
+                    && matches!(
+                        new_pane_placement,
+                        NewPanePlacement::Stacked {
+                            pane_id_to_stack_under: None,
+                            ..
+                        }
+                    )
+                {
+                    if let Some(mut completion_tx) = completion_tx.take() {
+                        completion_tx.set_error_message(CANNOT_STACK_WITHOUT_ANCHOR.to_owned());
+                    }
+                }
 
                 let blocking_notification = if set_blocking { completion_tx } else { None };
 

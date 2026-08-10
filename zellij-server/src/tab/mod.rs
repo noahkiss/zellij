@@ -156,6 +156,13 @@ pub const MIN_TERMINAL_WIDTH: usize = 5;
 
 const MAX_PENDING_VTE_EVENTS: usize = 7000;
 
+/// Why a stacked pane was refused, and the invocation that works instead. Reported both by the tab
+/// that refuses the pane and, for non-blocking calls whose notification is signalled before the tab
+/// runs, by the screen.
+pub const CANNOT_STACK_WITHOUT_ANCHOR: &str =
+    "cannot stack a pane: no client is attached and no target pane was given. Pass \
+     --near-current-pane with ZELLIJ_PANE_ID set to the pane to stack under.";
+
 type HoldForCommand = Option<RunCommand>;
 pub type SuppressedPanes = HashMap<PaneId, (bool, Box<dyn Pane>)>; // bool => is scrollback editor
 
@@ -713,6 +720,11 @@ pub trait Pane {
     fn stack_list_entry_label(&self) -> String {
         self.current_title()
     }
+    /// The title the program running in this pane set for itself (OSC 0/2), regardless of any
+    /// user-assigned pane name
+    fn program_title(&self) -> Option<String> {
+        None
+    }
     fn custom_title(&self) -> Option<String>;
     fn has_explicit_title(&self) -> bool {
         false
@@ -1141,6 +1153,41 @@ impl Tab {
             next_synthetic_stack_id += 1;
         }
         synthetic_geoms
+    }
+    /// Stack membership of every pane that belongs to a stack list, as
+    /// `(stack id, index in the stack, is the expanded member)`.
+    ///
+    /// A stack list keeps its collapsed members in `suppressed_panes`, so no member's own geom
+    /// describes the stack. This derives the same view the layout serializer builds.
+    fn stack_list_membership(&self) -> HashMap<PaneId, (usize, usize, bool)> {
+        let mut membership = HashMap::new();
+        if self.stack_lists.is_empty() {
+            return membership;
+        }
+        let synthetic_geoms = self.stack_list_serialization_geoms();
+        for list in self.stack_lists.values() {
+            for (index_in_stack, member) in list.members.iter().enumerate() {
+                if let Some(stack_id) = synthetic_geoms.get(member).and_then(|geom| geom.stacked) {
+                    membership.insert(*member, (stack_id, index_in_stack, *member == list.visible));
+                }
+            }
+        }
+        membership
+    }
+    fn apply_stack_list_membership(
+        membership: &HashMap<PaneId, (usize, usize, bool)>,
+        pane_info: &mut PaneInfo,
+    ) {
+        let pane_id = if pane_info.is_plugin {
+            PaneId::Plugin(pane_info.id)
+        } else {
+            PaneId::Terminal(pane_info.id)
+        };
+        if let Some((stack_id, index_in_stack, is_expanded_in_stack)) = membership.get(&pane_id) {
+            pane_info.stack_id = Some(*stack_id);
+            pane_info.index_in_stack = Some(*index_in_stack);
+            pane_info.is_expanded_in_stack = *is_expanded_in_stack;
+        }
     }
     pub fn hidden_stack_list_members_for_serialization(
         &self,
@@ -2962,6 +3009,23 @@ impl Tab {
         borderless: Option<bool>,
     ) -> Result<()> {
         let err_context = || format!("failed to create new pane with id {pid:?}");
+
+        // A stack needs an anchor: either an explicit pane to stack under, or a client whose
+        // focused pane we can stack onto. With neither - `--stacked` against a session nobody is
+        // attached to - there is nothing to stack against, so refuse before building the pane.
+        // The pty was already spawned by the time we get here, so it has to be closed as well or
+        // it outlives the pane that was never created.
+        if !start_suppressed && pane_id_to_stack_under.is_none() && client_id.is_none() {
+            log::error!("{}", CANNOT_STACK_WITHOUT_ANCHOR);
+            if let Some(mut blocking_notification) = blocking_notification {
+                blocking_notification.set_error_message(CANNOT_STACK_WITHOUT_ANCHOR.to_owned());
+            }
+            self.senders
+                .send_to_pty(PtyInstruction::ClosePane(pid, None))
+                .with_context(err_context)?;
+            return Ok(());
+        }
+
         if should_focus_pane {
             self.hide_floating_panes();
         }
@@ -3062,6 +3126,8 @@ impl Tab {
             } else if let Some(client_id) = client_id {
                 self.add_stacked_pane_to_active_pane(new_pane, pid, client_id, should_focus_pane)
             } else {
+                // unreachable: the guard at the top of this function already refused this case
+                // and closed the pty
                 log::error!("Must have client id or pane id to stack pane");
                 return Ok(());
             }
@@ -5514,6 +5580,7 @@ impl Tab {
     pub fn get_pane_info(&self, pane_id: PaneId) -> Option<PaneInfo> {
         let current_pane_group: HashMap<ClientId, Vec<PaneId>> =
             { self.current_pane_group.borrow().clone_inner() };
+        let stack_list_membership = self.stack_list_membership();
 
         // Check tiled panes
         if let Some(pane) = self.tiled_panes.get_pane(pane_id) {
@@ -5524,6 +5591,8 @@ impl Tab {
             info.is_fullscreen = self.tiled_panes.fullscreen_is_active();
             info.is_floating = false;
             info.is_suppressed = false;
+            info.index_in_stack = self.tiled_panes.index_in_stack(&pane_id);
+            Self::apply_stack_list_membership(&stack_list_membership, &mut info);
             return Some(info);
         }
 
@@ -5534,6 +5603,8 @@ impl Tab {
             info.is_fullscreen = self.floating_panes.fullscreen_pane_id() == Some(pane_id);
             info.is_floating = true;
             info.is_suppressed = false;
+            info.stack_id = None;
+            info.is_expanded_in_stack = false;
             return Some(info);
         }
 
@@ -5544,6 +5615,11 @@ impl Tab {
             info.is_fullscreen = false;
             info.is_floating = false;
             info.is_suppressed = true;
+            // a suppressed pane keeps the geometry it had before being suppressed, which can still
+            // name a stack it is no longer a visible member of
+            info.stack_id = None;
+            info.is_expanded_in_stack = false;
+            Self::apply_stack_list_membership(&stack_list_membership, &mut info);
             return Some(info);
         }
 
@@ -7141,7 +7217,13 @@ impl Tab {
             pane_info_for_suppressed_pane.is_suppressed = true;
             pane_info_for_suppressed_pane.is_focused = false;
             pane_info_for_suppressed_pane.is_fullscreen = false;
+            pane_info_for_suppressed_pane.stack_id = None;
+            pane_info_for_suppressed_pane.is_expanded_in_stack = false;
             pane_info.push(pane_info_for_suppressed_pane);
+        }
+        let stack_list_membership = self.stack_list_membership();
+        for info in pane_info.iter_mut() {
+            Self::apply_stack_list_membership(&stack_list_membership, info);
         }
         pane_info
     }
@@ -7970,6 +8052,10 @@ pub fn pane_info_for_pane(
         .and_then(|(x, y, is_visible)| if is_visible { Some((x, y)) } else { None });
     pane_info.is_selectable = pane.selectable();
     pane_info.title = pane.current_title();
+    pane_info.program_title = pane.program_title();
+    let geom = pane.position_and_size();
+    pane_info.stack_id = geom.stacked;
+    pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();
     pane_info.exited = pane.exited();
     pane_info.exit_status = pane.exit_status();
     pane_info.is_held = pane.is_held();

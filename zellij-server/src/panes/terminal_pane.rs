@@ -1135,6 +1135,9 @@ impl Pane for TerminalPane {
     fn stack_list_entry_label(&self) -> String {
         self.title_with_bell_indicator(self.current_title())
     }
+    fn program_title(&self) -> Option<String> {
+        self.grid.title.clone()
+    }
     fn custom_title(&self) -> Option<String> {
         if self.pane_name.is_empty() {
             None
