@@ -263,6 +263,19 @@ load_plugins {
     // "https://example.com/my-plugin.wasm"
 }
 
+// Permissions to grant a plugin before it asks for them, keyed by the plugin's location
+// Only local plugins can be pre-granted, and each one must be listed on its own - wildcards are
+// rejected. The location may be written as a bare path or in the file: form a layout uses, and ~
+// and $VAR in it are expanded (see the note on paths further down); what is matched is the path it
+// expands to
+//
+// plugin_permissions {
+//     "file:~/.config/zellij/plugins/my-plugin.wasm" {
+//         ReadApplicationState
+//         ChangeApplicationState
+//     }
+// }
+
 // Choose what to do when zellij receives SIGTERM, SIGINT, SIGQUIT or SIGHUP
 // eg. when terminal window with an active zellij session is closed
 // (Requires restart)
@@ -287,6 +300,14 @@ load_plugins {
 //    - false (Default)
 //
 // simplified_ui true
+
+// Paths in this file - default_shell, default_cwd, default_layout, layout_dir, theme_dir,
+// scrollback_editor, snapshot_dir, web_server_cert, web_server_key and the plugin locations in
+// plugin_permissions - are expanded like a layout's paths are:
+//   ~ and ~/... become the home directory
+//   $VAR and ${VAR} become the value of that environment variable
+// A path with no ~ and no $ is used exactly as written. If the expansion cannot be done (an
+// environment variable that is not set), the path is kept as written and zellij still starts
 
 // Choose the path to the default shell that zellij will use for opening new panes
 // Default: $SHELL
