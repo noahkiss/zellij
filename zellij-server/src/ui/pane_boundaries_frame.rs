@@ -96,6 +96,8 @@ pub struct FrameParams {
     pub frame_geom_override: Option<PaneGeom>,
     pub stack_list_entry: Option<StackListEntry>,
     pub blank_title: bool,
+    // fork addition: `pane_frame_style top_only`
+    pub top_only_frames: bool,
     pub mouse_scroll_resize: bool,
     pub dimmed: bool,
     pub guest_choice_indicator: Option<GuestChoiceIndicator>,
@@ -131,6 +133,8 @@ pub struct PaneFrame {
     mouse_scroll_resize: bool,
     dimmed: bool,
     guest_choice_indicator: Option<GuestChoiceIndicator>,
+    // fork addition: `pane_frame_style top_only`
+    top_only_frames: bool,
 }
 
 impl PaneFrame {
@@ -169,6 +173,7 @@ impl PaneFrame {
             mouse_scroll_resize: frame_params.mouse_scroll_resize,
             dimmed: frame_params.dimmed,
             guest_choice_indicator: frame_params.guest_choice_indicator,
+            top_only_frames: frame_params.top_only_frames,
         }
     }
     pub fn is_pinned(mut self, is_pinned: bool) -> Self {
@@ -1041,7 +1046,8 @@ impl PaneFrame {
             left_length
         };
         let right_start = width.saturating_sub(right_length).max(middle_end);
-        let fill_character = if self.pane_is_stacked {
+        // fork addition: `top_only` fills the title line with a rule, like a stacked pane does
+        let fill_character = if self.pane_is_stacked || self.top_only_frames {
             foreground_color(boundary_type::HORIZONTAL, self.color)
                 .into_iter()
                 .next()
@@ -1478,6 +1484,7 @@ mod tests {
                 frame_geom_override: None,
                 stack_list_entry: None,
                 blank_title: false,
+                top_only_frames: false,
                 mouse_scroll_resize,
                 dimmed: false,
                 guest_choice_indicator: None,

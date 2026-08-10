@@ -1272,6 +1272,8 @@ pub enum PaneFrameStyle {
     Full = 0,
     Titles = 1,
     None = 2,
+    /// fork addition, reserved range (see FORK.md)
+    TopOnly = 100,
 }
 impl PaneFrameStyle {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1283,6 +1285,7 @@ impl PaneFrameStyle {
             PaneFrameStyle::Full => "Full",
             PaneFrameStyle::Titles => "Titles",
             PaneFrameStyle::None => "None",
+            PaneFrameStyle::TopOnly => "TopOnly",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1291,6 +1294,7 @@ impl PaneFrameStyle {
             "Full" => Some(Self::Full),
             "Titles" => Some(Self::Titles),
             "None" => Some(Self::None),
+            "TopOnly" => Some(Self::TopOnly),
             _ => None,
         }
     }

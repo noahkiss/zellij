@@ -9124,6 +9124,7 @@ pub(crate) fn screen_thread_main(
                     PaneFrameStyle::Full => PaneFrameStyle::Titles,
                     PaneFrameStyle::Titles => PaneFrameStyle::None,
                     PaneFrameStyle::None => PaneFrameStyle::Full,
+                    PaneFrameStyle::TopOnly => PaneFrameStyle::None,
                 };
                 for tab in screen.tabs.values_mut() {
                     tab.set_pane_frames(screen.pane_frame_style);

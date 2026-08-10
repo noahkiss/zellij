@@ -3290,6 +3290,7 @@ impl Into<ProtobufPaneFrameStyle> for crate::input::options::PaneFrameStyle {
             crate::input::options::PaneFrameStyle::Full => ProtobufPaneFrameStyle::Full,
             crate::input::options::PaneFrameStyle::Titles => ProtobufPaneFrameStyle::Titles,
             crate::input::options::PaneFrameStyle::None => ProtobufPaneFrameStyle::None,
+            crate::input::options::PaneFrameStyle::TopOnly => ProtobufPaneFrameStyle::TopOnly,
         }
     }
 }
@@ -3300,6 +3301,7 @@ impl Into<crate::input::options::PaneFrameStyle> for ProtobufPaneFrameStyle {
             ProtobufPaneFrameStyle::Full => crate::input::options::PaneFrameStyle::Full,
             ProtobufPaneFrameStyle::Titles => crate::input::options::PaneFrameStyle::Titles,
             ProtobufPaneFrameStyle::None => crate::input::options::PaneFrameStyle::None,
+            ProtobufPaneFrameStyle::TopOnly => crate::input::options::PaneFrameStyle::TopOnly,
         }
     }
 }
