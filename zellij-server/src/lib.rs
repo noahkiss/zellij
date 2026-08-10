@@ -12,6 +12,7 @@ pub mod panes;
 pub mod tab;
 
 pub mod background_jobs;
+mod bell_dwell;
 mod global_async_runtime;
 mod logging_pipe;
 mod mobile_web;
@@ -471,6 +472,7 @@ impl SessionMetaData {
                     mouse_scroll_resize: new_config.options.mouse_scroll_resize.unwrap_or(true),
                     mouse_hover_effects: new_config.options.mouse_hover_effects.unwrap_or(true),
                     visual_bell: new_config.options.visual_bell.unwrap_or(true),
+                    bell_clear_delay_ms: new_config.options.bell_clear_delay_ms.unwrap_or(0),
                     focus_follows_mouse: new_config.options.focus_follows_mouse.unwrap_or(false),
                     mouse_click_through: new_config.options.mouse_click_through.unwrap_or(false),
                     osc133_command_selection: new_config
@@ -861,7 +863,7 @@ mod session_state_tests {
 /// data has been dropped.
 static SNAPSHOT_SETTINGS: std::sync::OnceLock<SnapshotSettings> = std::sync::OnceLock::new();
 
-fn snapshot_settings() -> SnapshotSettings {
+pub(crate) fn snapshot_settings() -> SnapshotSettings {
     SNAPSHOT_SETTINGS
         .get()
         .cloned()
@@ -937,6 +939,13 @@ pub fn start_server_impl(
     install_panic_hook: bool,
 ) {
     envs::set_zellij("0".to_string());
+
+    // Settle macOS's file-access decisions about THIS executable, so the upgrade that lost the
+    // grants is what asks for them back. A launcher-created session has no terminal emulator to
+    // inherit grants from, and they are keyed to the executable's versioned path, so each upgrade
+    // starts with none. Returns at once - it must never block startup on a consent dialog.
+    // No-op off macOS.
+    zellij_utils::session_lifecycle::probe_protected_locations();
 
     // the socket is named after the session, and this is the only place the server learns its own
     // name without asking a thread that may already be shutting down
