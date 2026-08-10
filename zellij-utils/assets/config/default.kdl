@@ -615,6 +615,23 @@ load_plugins {
 //
 // osc8_hyperlinks false
 
+// The template of the terminal title (OSC 0) set for the focused pane
+// Placeholders: {host} (this machine's short hostname), {session} (the session name, or its
+// session_aliases entry if it has one) and {pane} (the pane title)
+// Anything else is literal text - unknown placeholders (eg. {nope}) are left as they are
+// A placeholder that comes out empty takes the literal text around it with it, so no dangling
+// separator is left behind
+// Default: "{session} | {pane}"
+//
+// terminal_title_template "{host} - {session} | {pane}"
+
+// What the {session} placeholder of terminal_title_template renders instead of the session name
+// Session names that are not listed here render as they are
+//
+// session_aliases {
+//     my-session "MS"
+// }
+
 // A command to run (will be wrapped with sh -c and provided the RESURRECT_COMMAND env variable)
 // after Zellij attempts to discover a command inside a pane when resurrecting sessions, the STDOUT
 // of this command will be used instead of the discovered RESURRECT_COMMAND

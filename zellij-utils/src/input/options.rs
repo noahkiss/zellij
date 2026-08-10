@@ -3,6 +3,7 @@ use crate::cli::Command;
 use crate::data::{InputMode, WebSharing};
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -251,6 +252,24 @@ pub struct Options {
     #[clap(long, value_parser)]
     #[serde(default)]
     pub scrollback_lines_to_serialize: Option<usize>,
+
+    /// The template of the terminal title (OSC 0) of the focused pane. Knows the {host},
+    /// {session} and {pane} placeholders, anything else is literal text. Placeholders that come
+    /// out empty take the literal text around them with them, so that no dangling separator is
+    /// left behind. Default is "{session} | {pane}".
+    /// config.kdl only - it is read by the server at session start, so there is nothing for a CLI
+    /// flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub terminal_title_template: Option<String>,
+
+    /// What to render instead of the session name in the {session} placeholder of
+    /// terminal_title_template, keyed by session name. Session names that are not in here render
+    /// as they are.
+    /// config.kdl only, like terminal_title_template.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_aliases: Option<BTreeMap<String, String>>,
 
     /// Whether to use ANSI styled underlines
     #[clap(long, value_parser)]
@@ -541,6 +560,12 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or(self.scrollback_lines_to_serialize);
+        let terminal_title_template = other
+            .terminal_title_template
+            .or_else(|| self.terminal_title_template.clone());
+        let session_aliases = other
+            .session_aliases
+            .or_else(|| self.session_aliases.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -625,6 +650,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            terminal_title_template,
+            session_aliases,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -710,6 +737,12 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or_else(|| self.scrollback_lines_to_serialize.clone());
+        let terminal_title_template = other
+            .terminal_title_template
+            .or_else(|| self.terminal_title_template.clone());
+        let session_aliases = other
+            .session_aliases
+            .or_else(|| self.session_aliases.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -794,6 +827,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            terminal_title_template,
+            session_aliases,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,

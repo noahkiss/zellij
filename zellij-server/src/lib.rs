@@ -76,7 +76,9 @@ use zellij_utils::{
         plugins::PluginAliases,
     },
     ipc::{ClientAttributes, ExitReason, ServerToClientMsg},
-    shared::{default_palette, web_server_base_url},
+    shared::{
+        default_palette, set_terminal_title_format, web_server_base_url, TerminalTitleFormat,
+    },
 };
 
 pub type ClientId = u16;
@@ -1026,6 +1028,9 @@ pub fn start_server_impl(
                     },
                 };
 
+                set_terminal_title_format(TerminalTitleFormat::from_options(
+                    &runtime_config_options,
+                ));
                 info!("FirstClientConnected: initializing session");
                 let mut session = init_session(
                     os_input.clone(),
