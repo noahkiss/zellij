@@ -6,6 +6,7 @@ use crate::plugins::pipes::{
 use crate::plugins::plugin_loader::PluginLoader;
 use crate::plugins::plugin_map::{AtomicEvent, PluginEnv, PluginMap, RunningPlugin, Subscriptions};
 
+use super::watch_plugin_files::PluginFileWatcher;
 use crate::plugins::plugin_worker::MessageToWorker;
 use crate::plugins::watch_filesystem::watch_filesystem;
 use crate::plugins::zellij_exports::{wasi_read_string, wasi_write_object};
@@ -28,7 +29,7 @@ use zellij_utils::data::{
 };
 use zellij_utils::downloader::Downloader;
 use zellij_utils::input::keybinds::Keybinds;
-use zellij_utils::input::permission::PermissionCache;
+use zellij_utils::input::permission::{PermissionCache, PluginPermissions};
 use zellij_utils::plugin_api::event::ProtobufEvent;
 
 use prost::Message;
@@ -107,6 +108,7 @@ pub struct LoadingContext {
     pub layout_dir: Option<PathBuf>,
     pub default_mode: InputMode,
     pub keybinds: Keybinds,
+    pub plugin_permissions: Arc<PluginPermissions>,
     pub plugin_dir: PathBuf,
     pub size: Size,
 }
@@ -151,6 +153,7 @@ impl LoadingContext {
             default_shell: wasm_bridge.default_shell.clone(),
             layout_dir: wasm_bridge.layout_dir.clone(),
             keybinds,
+            plugin_permissions: wasm_bridge.plugin_permissions.clone(),
             default_mode,
             plugin_own_data_dir,
             plugin_own_cache_dir,
@@ -196,6 +199,8 @@ pub struct WasmBridge {
     available_layout_errors: Vec<LayoutWithError>,
     default_mode: InputMode,
     default_keybinds: Keybinds,
+    plugin_permissions: Arc<PluginPermissions>,
+    plugin_file_watcher: Option<PluginFileWatcher>,
     keybinds: HashMap<ClientId, Keybinds>,
     base_modes: HashMap<ClientId, InputMode>,
     downloader: Downloader,
@@ -217,12 +222,25 @@ impl WasmBridge {
         available_layout_errors: Vec<LayoutWithError>,
         default_mode: InputMode,
         default_keybinds: Keybinds,
+        plugin_permissions: Arc<PluginPermissions>,
+        plugin_watch: bool,
     ) -> Self {
         let plugin_map = Arc::new(Mutex::new(PluginMap::default()));
         let connected_clients: Arc<Mutex<Vec<ClientId>>> = Arc::new(Mutex::new(vec![]));
         let plugin_cache: Arc<Mutex<HashMap<PathBuf, Module>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let watcher = None;
+        let plugin_file_watcher = if plugin_watch {
+            match PluginFileWatcher::new(senders.clone()) {
+                Ok(plugin_file_watcher) => Some(plugin_file_watcher),
+                Err(e) => {
+                    log::error!("Failed to start the plugin file watcher: {}", e);
+                    None
+                },
+            }
+        } else {
+            None
+        };
         let downloader = Downloader::new(ZELLIJ_CACHE_DIR.to_path_buf());
         let max_threads = num_cpus::get().max(4).min(16);
         let plugin_executor = Arc::new(PinnedExecutor::new(
@@ -258,6 +276,8 @@ impl WasmBridge {
             available_layout_errors,
             default_mode,
             default_keybinds,
+            plugin_permissions,
+            plugin_file_watcher,
             keybinds: HashMap::new(),
             base_modes: HashMap::new(),
             downloader,
@@ -331,6 +351,7 @@ impl WasmBridge {
                 self.cached_resizes_for_pending_plugins
                     .insert(plugin_id, (size.rows, size.cols));
                 self.loading_plugins.insert((plugin_id, run.clone()));
+                self.watch_plugin_file(&run);
 
                 // Clone for threaded contexts
                 let plugin_executor = self.plugin_executor.clone();
@@ -586,18 +607,9 @@ impl WasmBridge {
             return Ok(());
         };
 
-        let (rows, columns) = self.size_of_plugin_id(plugin_id).unwrap_or((0, 0));
-        self.cached_events_for_pending_plugins
-            .insert(plugin_id, vec![]);
-        self.cached_resizes_for_pending_plugins
-            .insert(plugin_id, (rows, columns));
-
-        let mut loading_indication = LoadingIndication::new(run_plugin.location.to_string());
-        self.start_plugin_loading_indication(&[plugin_id], &loading_indication);
-        self.loading_plugins.insert((plugin_id, run_plugin.clone()));
-
-        let plugin_executor = self.plugin_executor.clone();
-
+        // everything that can refuse the reload is checked before any pending state is created:
+        // a bail after the fact orphans the cached-events entry and the loading_plugins entry,
+        // which starves the still-running instance and wedges later reloads for this location
         let Some(first_client_id) = self.get_first_client_id() else {
             log::error!("No connected clients, cannot reload plugin.");
             return Ok(());
@@ -606,18 +618,30 @@ impl WasmBridge {
             log::error!("Could not find running plugin with id: {}", plugin_id);
             return Ok(());
         };
-        let tab_index = self.tab_index_of_plugin_id(plugin_id);
-        let Some(size) = self.size_of_plugin_id(plugin_id) else {
+        let Some((rows, columns)) = self.size_of_plugin_id(plugin_id) else {
             log::error!(
                 "Could not find size of running plugin with id: {}",
                 plugin_id
             );
             return Ok(());
         };
+        let tab_index = self.tab_index_of_plugin_id(plugin_id);
         let size = Size {
-            rows: size.0,
-            cols: size.1,
+            rows,
+            cols: columns,
         };
+
+        self.cached_events_for_pending_plugins
+            .insert(plugin_id, vec![]);
+        self.cached_resizes_for_pending_plugins
+            .insert(plugin_id, (rows, columns));
+
+        let mut loading_indication = LoadingIndication::new(run_plugin.location.to_string());
+        self.start_plugin_loading_indication(&[plugin_id], &loading_indication);
+        self.loading_plugins.insert((plugin_id, run_plugin.clone()));
+        self.watch_plugin_file(&run_plugin);
+
+        let plugin_executor = self.plugin_executor.clone();
 
         let cwd = self.cwd_of_plugin_id(plugin_id);
 
@@ -673,8 +697,19 @@ impl WasmBridge {
             return Ok(());
         }
 
-        let plugin_ids = self
-            .all_plugin_ids_for_plugin_location(&run_plugin.location, &run_plugin.configuration)?;
+        // an exact (location, configuration) match is preferred, but a CLI reload issued without a
+        // matching -c would otherwise find nothing and fall through to spawning a stray pane. Fall
+        // back to matching on location alone so `zellij action start-or-reload-plugin <path>`
+        // reloads what is actually running.
+        let plugin_ids = match self
+            .all_plugin_ids_for_plugin_location(&run_plugin.location, &run_plugin.configuration)
+        {
+            Ok(plugin_ids) => plugin_ids,
+            Err(e) => match self.all_plugin_ids_for_plugin_location_only(&run_plugin.location) {
+                Ok(plugin_ids) => plugin_ids,
+                Err(_) => return Err(e),
+            },
+        };
         for plugin_id in &plugin_ids {
             self.reload_plugin_with_id(*plugin_id)?;
         }
@@ -713,6 +748,7 @@ impl WasmBridge {
             let loading_indication = LoadingIndication::new(run_plugin.location.to_string());
             self.start_plugin_loading_indication(&[plugin_id], &loading_indication);
             self.loading_plugins.insert((plugin_id, run_plugin.clone()));
+            self.watch_plugin_file(&run_plugin);
 
             let plugin_executor = self.plugin_executor.clone();
 
@@ -1367,8 +1403,30 @@ impl WasmBridge {
         )]));
     }
 
+    fn watch_plugin_file(&mut self, run_plugin: &RunPlugin) {
+        if let Some(plugin_file_watcher) = self.plugin_file_watcher.as_mut() {
+            plugin_file_watcher.watch(run_plugin);
+        }
+    }
+    /// Reload every plugin whose .wasm just changed on disk. The reload path skips the in-memory
+    /// module cache, so running instances swap to the new code rather than to the module compiled
+    /// when the session started.
+    pub fn reload_changed_plugin_files(&mut self, changed_paths: Vec<PathBuf>) {
+        let Some(plugin_file_watcher) = self.plugin_file_watcher.as_ref() else {
+            return;
+        };
+        for run_plugin in plugin_file_watcher.plugins_for_changed_paths(&changed_paths) {
+            log::info!("Reloading changed plugin: {}", run_plugin.location);
+            if let Err(e) = self.reload_plugin(&run_plugin) {
+                log::error!("Failed to reload changed plugin: {}", e);
+            }
+        }
+    }
     pub fn cleanup(&mut self) {
         self.loading_plugins.clear();
+        if let Some(plugin_file_watcher) = self.plugin_file_watcher.take() {
+            plugin_file_watcher.stop();
+        }
 
         let plugin_ids = self.plugin_map.lock().unwrap().plugin_ids();
         for plugin_id in &plugin_ids {
@@ -1604,10 +1662,16 @@ impl WasmBridge {
         Ok(())
     }
     fn plugin_is_currently_being_loaded(&self, plugin_location: &RunPluginLocation) -> bool {
-        self.loading_plugins
-            .iter()
-            .find(|(_plugin_id, run_plugin)| &run_plugin.location == plugin_location)
-            .is_some()
+        self.loading_plugins.iter().any(|(plugin_id, run_plugin)| {
+            // a plugin parked on an unanswered permission prompt is not loading, it is waiting
+            // on a human, and it never leaves loading_plugins until that human answers. Treating
+            // it as "currently loading" parks every later reload for this location for the rest
+            // of the session.
+            &run_plugin.location == plugin_location
+                && !self
+                    .plugin_ids_waiting_for_permission_request
+                    .contains(plugin_id)
+        })
     }
     fn plugin_id_of_loading_plugin(
         &self,
@@ -1635,6 +1699,15 @@ impl WasmBridge {
             .lock()
             .unwrap()
             .all_plugin_ids_for_plugin_location(plugin_location, plugin_configuration)
+    }
+    fn all_plugin_ids_for_plugin_location_only(
+        &self,
+        plugin_location: &RunPluginLocation,
+    ) -> Result<Vec<PluginId>> {
+        self.plugin_map
+            .lock()
+            .unwrap()
+            .all_plugin_ids_for_plugin_location_only(plugin_location)
     }
     pub fn all_plugin_and_client_ids_for_plugin_location(
         &mut self,
@@ -1779,22 +1852,30 @@ impl WasmBridge {
 
         let mut running_plugin = running_plugin.lock().unwrap();
 
-        let permissions = if status == PermissionStatus::Granted {
-            permissions
-        } else {
-            vec![]
-        };
+        let granted = status == PermissionStatus::Granted;
+        let effective_permissions = if granted { permissions.clone() } else { vec![] };
 
         running_plugin
             .store
             .data_mut()
-            .set_permissions(HashSet::from_iter(permissions.clone()));
+            .set_permissions(HashSet::from_iter(effective_permissions));
+
+        let location = running_plugin.store.data().plugin.location.to_string();
+
+        // a grant that came from config.kdl is not runtime state and must not leak into the cache
+        // file, where a later deny could prune it
+        if granted && self.plugin_permissions.all_granted(&location, &permissions) {
+            return Ok(());
+        }
 
         let mut permission_cache = PermissionCache::from_path_or_default(cache_path);
-        permission_cache.cache(
-            running_plugin.store.data().plugin.location.to_string(),
-            permissions,
-        );
+        if granted {
+            permission_cache.cache(location, permissions);
+        } else {
+            // only the denied permissions are dropped - a deny used to write an empty list, wiping
+            // every unrelated grant this plugin already had
+            permission_cache.revoke(location, &permissions);
+        }
 
         permission_cache.write_to_file().with_context(err_context)
     }

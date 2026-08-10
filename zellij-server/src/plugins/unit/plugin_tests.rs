@@ -373,6 +373,8 @@ fn create_plugin_thread(
                 InputMode::Normal,
                 Keybinds::default(),
                 Default::default(),
+                false,
+                Default::default(),
                 initiating_client_id,
             )
             .expect("TEST")
@@ -460,6 +462,8 @@ fn create_plugin_thread_with_server_receiver(
                 PluginAliases::default(),
                 InputMode::Normal,
                 Keybinds::default(),
+                Default::default(),
+                false,
                 Default::default(),
                 initiating_client_id,
             )
@@ -557,6 +561,8 @@ fn create_plugin_thread_with_pty_receiver(
                 InputMode::Normal,
                 Keybinds::default(),
                 Default::default(),
+                false,
+                Default::default(),
                 initiating_client_id,
             )
             .expect("TEST")
@@ -645,6 +651,8 @@ fn create_plugin_thread_with_background_jobs_receiver(
                 PluginAliases::default(),
                 InputMode::Normal,
                 Keybinds::default(),
+                Default::default(),
+                false,
                 Default::default(),
                 initiating_client_id,
             )

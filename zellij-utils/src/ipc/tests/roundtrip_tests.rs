@@ -452,6 +452,8 @@ fn test_client_messages() {
             config_dir: Some(PathBuf::from("/path/to/config/dir")),
             should_ignore_config: true,
             configuration_options: Some(Options {
+                // config-file only, not carried over the contract
+                plugin_watch: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),
