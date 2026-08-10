@@ -72,6 +72,8 @@ enum EventType {
     SoftKeyboardVisibilityChanged = 47;
     HintText = 48;
     ActivePaneScroll = 49;
+    ListSnapshots = 50;
+    SnapshotRestoreFailed = 51;
 }
 
 message EventNameList {
@@ -123,6 +125,8 @@ message Event {
     SoftKeyboardVisibilityChangedPayload soft_keyboard_visibility_changed_payload = 41;
     HintTextPayload hint_text_payload = 42;
     ActivePaneScrollPayload active_pane_scroll_payload = 43;
+    ListSnapshotsPayload list_snapshots_payload = 44;
+    SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 45;
   }
 }
 
@@ -142,6 +146,37 @@ message StyledText {
 
 message StyledTextIndices {
   repeated uint32 indices = 1;
+}
+
+message SnapshotRestoreFailedPayload {
+  string error = 1;
+}
+
+message ListSnapshotsPayload {
+  repeated SessionSnapshotInfo snapshot_info = 1;
+}
+
+message SessionSnapshotInfo {
+  string id = 1;
+  string session_name = 2;
+  uint64 saved_at = 3;
+  string reason = 4;
+  string zellij_version = 5;
+  uint32 tab_count = 6;
+  uint32 pane_count = 7;
+  repeated SnapshotTabInfo tabs = 8;
+  optional string layout_error = 9;
+}
+
+message SnapshotTabInfo {
+  optional string name = 1;
+  repeated SnapshotPaneInfo panes = 2;
+}
+
+message SnapshotPaneInfo {
+  optional string name = 1;
+  optional string command = 2;
+  bool is_floating = 3;
 }
 
 message HostTerminalThemeChangedPayload {

@@ -1665,6 +1665,18 @@ pub fn pipe_message_to_plugin(message_to_plugin: MessageToPlugin) {
     unsafe { host_run_plugin_command() };
 }
 
+/// Detach the given clients from the current session, leaving the session running.
+///
+/// The ids are the ones reported by `Event::ListClients`. This is the selective form of
+/// [`disconnect_other_clients`]: it detaches exactly the clients named, and a caller may include
+/// its own client id to detach itself.
+pub fn detach_clients(client_ids: &[ClientId]) {
+    let plugin_command = PluginCommand::DetachClients(client_ids.to_vec());
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
 /// Disconnect all other clients from the current session
 pub fn disconnect_other_clients() {
     let plugin_command = PluginCommand::DisconnectOtherClients;
@@ -1806,6 +1818,37 @@ pub fn parse_layout(layout_string: &str) -> Result<LayoutMetadata, LayoutParsing
 /// Event::ListClients (note: this event must be subscribed to)
 pub fn list_clients() {
     let plugin_command = PluginCommand::ListClients;
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+/// Get the session snapshot archive back as an `Event::ListSnapshots` (note: this event must be
+/// subscribed to).
+///
+/// Each entry carries its sidecar - id, session name, when and why it was cut, and its tab and
+/// pane counts - plus the tabs and panes of the saved layout, or the reason that layout no longer
+/// parses. Reading the archive walks a directory tree and parses every layout in it, so ask for it
+/// while a picker is open rather than on a schedule.
+pub fn list_snapshots() {
+    let plugin_command = PluginCommand::ListSnapshots;
+    let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
+    object_to_stdout(&protobuf_plugin_command.encode_to_vec());
+    unsafe { host_run_plugin_command() };
+}
+
+/// Rebuild a session from an archived snapshot, by id.
+///
+/// `session_name` restores under a different name, exactly as `zellij snapshot restore --session`
+/// does; `None` uses the name the snapshot was archived under. On success the calling client
+/// switches to the restored session, so nothing comes back. A refusal - an id that matches nothing,
+/// a layout that will not parse, or a name that is already running - arrives as
+/// `Event::SnapshotRestoreFailed` (note: that event must be subscribed to).
+pub fn restore_snapshot(snapshot_id: &str, session_name: Option<&str>) {
+    let plugin_command = PluginCommand::RestoreSnapshot {
+        snapshot_id: snapshot_id.to_owned(),
+        session_name: session_name.map(|name| name.to_owned()),
+    };
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
