@@ -173,6 +173,12 @@ pub struct Options {
     #[clap(long, value_enum, hide_possible_values = true, value_parser)]
     #[serde(default)]
     pub pane_frame_style: Option<PaneFrameStyle>,
+    /// Reload plugins automatically when their .wasm file changes on disk (true or false).
+    /// config.kdl only - it is read by the server at session start, so there is nothing for a CLI
+    /// flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub plugin_watch: Option<bool>,
     #[clap(long, value_parser)]
     #[serde(default)]
     /// Mirror session when multiple users are connected (true or false)
@@ -442,6 +448,7 @@ impl Options {
         let mouse_mode = other.mouse_mode.or(self.mouse_mode);
         let pane_frames = other.pane_frames.or(self.pane_frames);
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
+        let plugin_watch = other.plugin_watch.or(self.plugin_watch);
         let auto_layout = other.auto_layout.or(self.auto_layout);
         let mirror_session = other.mirror_session.or(self.mirror_session);
         let simplified_ui = other.simplified_ui.or(self.simplified_ui);
@@ -536,6 +543,7 @@ impl Options {
             mouse_mode,
             pane_frames,
             pane_frame_style,
+            plugin_watch,
             mirror_session,
             on_force_close,
             scroll_buffer_size,
@@ -599,6 +607,7 @@ impl Options {
         let mouse_mode = merge_bool(other.mouse_mode, self.mouse_mode);
         let pane_frames = merge_bool(other.pane_frames, self.pane_frames);
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
+        let plugin_watch = merge_bool(other.plugin_watch, self.plugin_watch);
         let auto_layout = merge_bool(other.auto_layout, self.auto_layout);
         let mirror_session = merge_bool(other.mirror_session, self.mirror_session);
         let session_serialization =
@@ -693,6 +702,7 @@ impl Options {
             mouse_mode,
             pane_frames,
             pane_frame_style,
+            plugin_watch,
             mirror_session,
             on_force_close,
             scroll_buffer_size,
