@@ -4,7 +4,10 @@ use crate::home::find_default_config_dir;
 use directories::ProjectDirs;
 use include_dir::{include_dir, Dir};
 use lazy_static::lazy_static;
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 use uuid::Uuid;
 
 pub const ZELLIJ_CONFIG_FILE_ENV: &str = "ZELLIJ_CONFIG_FILE";
@@ -106,6 +109,21 @@ lazy_static! {
     pub static ref ZELLIJ_SESSION_INFO_CACHE_DIR: PathBuf = ZELLIJ_CACHE_DIR
         .join(CLIENT_SERVER_CONTRACT_DIR.clone())
         .join("session_info");
+    /// Where state that must outlive the cache lives.
+    ///
+    /// Session snapshots are state, not cache: they have to survive a cache wipe, an upgrade and a
+    /// client/server contract bump. `$XDG_STATE_HOME` is checked by hand because `directories`
+    /// honours the XDG variables on Linux but ignores them on macOS, where it hardcodes the
+    /// `Library` paths - checking it ourselves is what makes a Mac with XDG variables exported
+    /// behave like the Linux boxes. Explicit configuration wins, platform convention is the
+    /// fallback.
+    pub static ref ZELLIJ_STATE_DIR: PathBuf = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .map(|p| p.join("zellij"))
+        .or_else(|| ZELLIJ_PROJ_DIR.state_dir().map(Path::to_path_buf))
+        .unwrap_or_else(|| ZELLIJ_PROJ_DIR.data_dir().to_path_buf());
+    pub static ref ZELLIJ_SNAPSHOT_DIR: PathBuf = ZELLIJ_STATE_DIR.join("snapshots");
     pub static ref ZELLIJ_PLUGIN_ARTIFACT_DIR: PathBuf = ZELLIJ_CACHE_DIR.join(VERSION);
     pub static ref ZELLIJ_SEEN_RELEASE_NOTES_CACHE_FILE: PathBuf =
         ZELLIJ_CACHE_DIR.join(VERSION).join("seen_release_notes");

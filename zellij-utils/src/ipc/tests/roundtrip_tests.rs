@@ -447,6 +447,8 @@ fn test_client_messages() {
             configuration_options: Some(Options {
                 // config-file only, not carried over the contract
                 plugin_watch: None,
+                snapshot_dir: None,
+                session_snapshot_limit: None,
                 terminal_title_template: None,
                 session_aliases: None,
                 simplified_ui: Some(true),

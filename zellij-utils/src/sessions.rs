@@ -7,6 +7,7 @@ use crate::{
     envs,
     input::layout::Layout,
     ipc::{ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg},
+    session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
 };
 use anyhow;
 use humantime::format_duration;
@@ -81,6 +82,38 @@ pub fn get_sessions_in_other_socket_dirs() -> Vec<(std::path::PathBuf, Vec<Strin
             }
         })
         .collect()
+}
+
+/// The client/server contract versions a session by this name has a socket under, other than the
+/// one this binary speaks.
+///
+/// The socket path is contract-scoped and the wire format genuinely differs across a contract bump,
+/// so a mismatched client attaching to a live server is a protocol violation rather than a path
+/// problem. The right response is a better failure, which needs to know the mismatch is there.
+/// Nothing is probed: another contract's server would not understand the question.
+pub fn session_in_other_contract_versions(name: &str) -> Vec<usize> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    let mut contracts: Vec<usize> = socket_dir_candidates()
+        .into_iter()
+        .flat_map(|root| fs::read_dir(&root).into_iter().flatten().flatten())
+        .filter_map(|entry| {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if dir_name == *CLIENT_SERVER_CONTRACT_DIR {
+                return None;
+            }
+            let contract = dir_name.strip_prefix("contract_version_")?.parse().ok()?;
+            let socket = entry.path().join(name);
+            if is_ipc_socket(&fs::metadata(&socket).ok()?.file_type()) {
+                Some(contract)
+            } else {
+                None
+            }
+        })
+        .collect();
+    contracts.sort_unstable();
+    contracts.dedup();
+    contracts
 }
 
 /// Every socket directory a listing consulted: the one this binary resolved, then the ones a
@@ -451,7 +484,7 @@ pub fn kill_session(name: &str) {
     };
 }
 
-pub fn delete_session(name: &str, force: bool) {
+pub fn delete_session(name: &str, force: bool, snapshot_settings: &SnapshotSettings) {
     if force {
         use crate::consts::ipc_connect;
         let path = &*ZELLIJ_SOCK_DIR.join(name);
@@ -476,7 +509,7 @@ pub fn delete_session(name: &str, force: bool) {
         });
         wait_for_session_to_exit(name);
     }
-    if let Err(e) = remove_session_info_folder(name) {
+    if let Err(e) = remove_session_info_folder(name, snapshot_settings) {
         if e.kind() == std::io::ErrorKind::NotFound {
             eprintln!("Session: {:?} not found.", name);
             process::exit(2);
@@ -513,9 +546,24 @@ fn wait_for_session_to_exit(name: &str) {
     );
 }
 
-/// Remove the session_info folder, then keep sweeping it briefly in case the exiting server writes
-/// its snapshot back after the socket has already gone.
-fn remove_session_info_folder(name: &str) -> std::io::Result<()> {
+/// Archive the session's shape, remove the session_info folder, then keep sweeping it briefly in
+/// case the exiting server writes its snapshot back after the socket has already gone.
+///
+/// Archiving first is what turns the destructive path into the capturing one: deleting a session is
+/// exactly the operation that later motivates restoring it. The server usually archives the same
+/// shape on its way out, and the archive drops a copy identical to the newest one, so an ordinary
+/// `delete-session --force` still leaves one snapshot rather than two.
+fn remove_session_info_folder(
+    name: &str,
+    snapshot_settings: &SnapshotSettings,
+) -> std::io::Result<()> {
+    if let Err(e) = archive_session_info(name, SnapshotReason::Delete, snapshot_settings) {
+        log::error!(
+            "Failed to archive session {:?} before deleting it: {}",
+            name,
+            e
+        );
+    }
     let folder = session_info_folder_for_session(name);
     std::fs::remove_dir_all(&folder)?;
     let deadline = std::time::Instant::now() + DELETE_SESSION_SWEEP_DURATION;
