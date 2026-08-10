@@ -7457,7 +7457,8 @@ pub fn send_cli_move_tab_with_tab_id() {
     mock_screen.new_tab(TiledPaneLayout::default());
     std::thread::sleep(std::time::Duration::from_millis(100));
     let cli_action = CliAction::MoveTab {
-        direction: Direction::Right,
+        direction: Some(Direction::Right),
+        to_index: None,
         tab_id: Some(0),
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
@@ -7488,6 +7489,89 @@ pub fn move_tab_by_id_verifies_screen_state() {
     screen.move_tab_by_id(0, Direction::Right).expect("TEST");
     assert_eq!(screen.get_tab_by_id(0).unwrap().position, original_pos_1);
     assert_eq!(screen.get_tab_by_id(1).unwrap().position, original_pos_0);
+}
+
+#[test]
+pub fn move_tab_to_index_shifts_the_tabs_in_between() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    new_tab(&mut screen, 3, 2);
+    new_tab(&mut screen, 4, 3);
+
+    // 0,1,2,3 -> 1,2,3,0
+    screen.move_tab_to_index(0, 3).expect("TEST");
+    assert_eq!(screen.get_tab_by_id(0).unwrap().position, 3);
+    assert_eq!(screen.get_tab_by_id(1).unwrap().position, 0);
+    assert_eq!(screen.get_tab_by_id(2).unwrap().position, 1);
+    assert_eq!(screen.get_tab_by_id(3).unwrap().position, 2);
+
+    // and back again, this time moving left
+    screen.move_tab_to_index(0, 0).expect("TEST");
+    assert_eq!(screen.get_tab_by_id(0).unwrap().position, 0);
+    assert_eq!(screen.get_tab_by_id(1).unwrap().position, 1);
+    assert_eq!(screen.get_tab_by_id(2).unwrap().position, 2);
+    assert_eq!(screen.get_tab_by_id(3).unwrap().position, 3);
+}
+
+#[test]
+pub fn move_tab_to_index_clamps_an_out_of_range_index() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    new_tab(&mut screen, 3, 2);
+
+    screen.move_tab_to_index(0, 100).expect("TEST");
+    assert_eq!(screen.get_tab_by_id(0).unwrap().position, 2);
+    assert_eq!(screen.get_tab_by_id(1).unwrap().position, 0);
+    assert_eq!(screen.get_tab_by_id(2).unwrap().position, 1);
+}
+
+#[test]
+pub fn move_tab_to_index_resolves_the_active_tab_without_a_tab_id() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    new_tab(&mut screen, 3, 2);
+
+    // the client's own active tab
+    screen.go_to_tab(3, client_id).expect("TEST");
+    assert_eq!(
+        screen.tab_id_for_absolute_move(None, client_id),
+        Some(2),
+        "resolves the requesting client's active tab"
+    );
+
+    // a client that never registered still resolves, through the connected client
+    assert_eq!(
+        screen.tab_id_for_absolute_move(None, 42),
+        Some(2),
+        "resolves through a connected client for an unknown client id"
+    );
+
+    // and a detached session, with no connected clients at all, still resolves
+    screen.remove_client(client_id).expect("TEST");
+    assert_eq!(
+        screen.tab_id_for_absolute_move(None, client_id),
+        Some(2),
+        "resolves the last focused tab when no client is connected"
+    );
+
+    // an explicit tab id that does not exist resolves to nothing, so the caller can report it
+    assert_eq!(screen.tab_id_for_absolute_move(Some(99), client_id), None);
 }
 
 // ==========================================

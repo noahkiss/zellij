@@ -2135,6 +2135,16 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::MoveTabToIndex { id, index } => {
+            senders
+                .send_to_screen(ScreenInstruction::MoveTabToIndex(
+                    id.map(|id| id as usize),
+                    index as usize,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
     }
     let result = wait_for_action_completion(completion_rx, &action_name, wait_forever);
     if let Some(error_message) = &result.error_message {
