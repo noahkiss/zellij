@@ -11,13 +11,21 @@ use zellij_client::{
 
 use zellij_utils::sessions::{
     assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
-    generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
-    get_sessions_sorted_by_mtime, kill_session as kill_session_impl, match_session_name,
-    print_sessions, print_sessions_with_index, resurrection_layout, session_exists,
-    session_listing_error_message, validate_session_name, ActiveSession, SessionNameMatch,
+    discard_resurrection_snapshot, generate_unique_session_name, get_active_session,
+    get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
+    kill_session as kill_session_impl, match_session_name, print_sessions,
+    print_sessions_with_index, resurrection_layout, session_exists,
+    session_in_other_contract_versions, session_listing_error_message, validate_session_name,
+    ActiveSession, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
+use zellij_utils::consts::{CLIENT_SERVER_CONTRACT_VERSION, VERSION};
+use zellij_utils::session_snapshot::{
+    archive_session_info, archive_session_info_folder, importable_folders, is_already_archived,
+    legacy_session_info_dirs, list_snapshots, prune_all, remove_snapshot, resolve_snapshot,
+    unimported_legacy_layout_count, Snapshot, SnapshotReason, SnapshotSettings,
+};
 
 #[cfg(feature = "web_server_capability")]
 use zellij_client::web_client::start_web_client as start_web_client_impl;
@@ -33,7 +41,7 @@ use zellij_utils::web_authentication_tokens::{
 use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
-    cli::{CliArgs, Command, SessionCommand, Sessions},
+    cli::{CliArgs, Command, SessionCommand, Sessions, SnapshotCli},
     data::ConnectToSession,
     envs,
     input::{
@@ -76,7 +84,277 @@ pub(crate) fn kill_all_sessions(yes: bool) {
     }
 }
 
-pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
+pub(crate) fn snapshot_settings(opts: &CliArgs) -> SnapshotSettings {
+    SnapshotSettings::from_options(get_config_options_from_cli_args(opts).ok().as_ref())
+}
+
+/// A session that exists under another client/server contract is invisible to this binary, and the
+/// bare "no session with that name" is misleading about why. Name the mismatch, and the way out.
+fn print_contract_mismatch_help(session_name: &str, config_options: Option<&Options>) {
+    let contracts = session_in_other_contract_versions(session_name);
+    if contracts.is_empty() {
+        return;
+    }
+    let contracts: Vec<String> = contracts.iter().map(|c| c.to_string()).collect();
+    eprintln!(
+        "Session '{}' is running under client/server contract {}; this binary speaks {}.",
+        session_name,
+        contracts.join(", "),
+        CLIENT_SERVER_CONTRACT_VERSION
+    );
+    let settings = SnapshotSettings::from_options(config_options);
+    if resolve_snapshot(&settings, "latest", Some(session_name)).is_ok() {
+        eprintln!("Its layout was captured - rebuild it with:");
+        eprintln!(
+            "    zellij snapshot restore latest --session {}",
+            session_name
+        );
+    }
+}
+
+fn resolve_snapshot_or_exit(
+    settings: &SnapshotSettings,
+    id: &str,
+    session_name: Option<&str>,
+) -> Snapshot {
+    match resolve_snapshot(settings, id, session_name) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(2);
+        },
+    }
+}
+
+/// The upstream release a fork version is built on, eg. `0.44.3` for `0.44.3-nkmk.4`.
+fn upstream_base_version(version: &str) -> &str {
+    version.split('-').next().unwrap_or(version)
+}
+
+/// Say so and continue. A snapshot from another upstream base may still restore perfectly; refusing
+/// on the strength of a version string would be a guess in the unhelpful direction.
+fn report_snapshot_version_drift(snapshot: &Snapshot) {
+    let snapshot_version = snapshot.meta.zellij_version.as_str();
+    if snapshot_version.is_empty() {
+        return;
+    }
+    if upstream_base_version(snapshot_version) != upstream_base_version(VERSION) {
+        eprintln!(
+            "Note: snapshot {} was written by zellij {}, this binary is {}. Restoring anyway.",
+            snapshot.id, snapshot_version, VERSION
+        );
+    }
+}
+
+pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
+    let settings = snapshot_settings(&opts);
+    match snapshot_cli {
+        SnapshotCli::List { session, json } => {
+            list_snapshots_command(&settings, session.as_deref(), json);
+        },
+        SnapshotCli::Show { id } => {
+            let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            match std::fs::read_to_string(snapshot.layout_file()) {
+                Ok(raw) => print!("{}", raw),
+                Err(e) => {
+                    eprintln!("Failed to read {}: {}", snapshot.layout_file().display(), e);
+                    process::exit(2);
+                },
+            }
+        },
+        SnapshotCli::Restore { id, session } => {
+            let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            let target_session_name = session.unwrap_or_else(|| snapshot.session_name.clone());
+            // a restore is an attach that takes its layout from the archive, so it goes through the
+            // same path rather than a parallel one
+            let mut opts = opts;
+            opts.session = None;
+            opts.command = Some(Command::Sessions(Sessions::Attach {
+                session_name: Some(target_session_name),
+                create: true,
+                create_background: false,
+                force_run_commands: false,
+                no_resurrect: false,
+                restore: Some(snapshot.id),
+                index: None,
+                options: None,
+                token: None,
+                remember: false,
+                forget: false,
+                ca_cert: None,
+                insecure: false,
+            }));
+            start_client(opts);
+        },
+        SnapshotCli::Rm { id } => {
+            let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            match remove_snapshot(&snapshot) {
+                Ok(()) => println!("Deleted snapshot {}", snapshot.id),
+                Err(e) => {
+                    eprintln!("Failed to delete snapshot {}: {}", snapshot.id, e);
+                    process::exit(2);
+                },
+            }
+        },
+        SnapshotCli::Import {
+            from,
+            dry_run,
+            prune_source,
+        } => {
+            import_snapshots_command(&settings, from, dry_run, prune_source);
+        },
+        SnapshotCli::Prune { keep } => {
+            let keep = keep.unwrap_or(settings.limit);
+            let removed = prune_all(&settings, keep);
+            println!(
+                "Pruned {} snapshot(s), keeping {} per session.",
+                removed.len(),
+                keep
+            );
+        },
+    }
+    process::exit(0);
+}
+
+fn import_snapshots_command(
+    settings: &SnapshotSettings,
+    from: Option<PathBuf>,
+    dry_run: bool,
+    prune_source: bool,
+) {
+    let dirs = match from {
+        Some(from) => vec![from],
+        None => legacy_session_info_dirs(),
+    };
+    let folders = importable_folders(&dirs);
+    if folders.is_empty() {
+        println!("Nothing to import.");
+        return;
+    }
+    let mut imported = 0;
+    let mut skipped = 0;
+    for folder in folders {
+        if dry_run {
+            if is_already_archived(settings, &folder) {
+                println!(
+                    "would skip  {} ({}) - already in the archive",
+                    folder.session_name, folder.from
+                );
+                skipped += 1;
+            } else {
+                println!("would import {} ({})", folder.session_name, folder.from);
+                imported += 1;
+            }
+            continue;
+        }
+        match archive_session_info_folder(
+            &folder.path,
+            &folder.session_name,
+            SnapshotReason::Imported,
+            settings,
+            Some(folder.from.clone()),
+        ) {
+            Ok(Some(snapshot)) => {
+                println!(
+                    "imported {} ({}) as {}",
+                    folder.session_name, folder.from, snapshot.id
+                );
+                imported += 1;
+            },
+            Ok(None) => {
+                println!(
+                    "skipped  {} ({}) - already in the archive",
+                    folder.session_name, folder.from
+                );
+                skipped += 1;
+            },
+            Err(e) => {
+                eprintln!("failed to import {}: {}", folder.path.display(), e);
+                continue;
+            },
+        }
+        if prune_source {
+            if let Err(e) = std::fs::remove_dir_all(&folder.path) {
+                eprintln!("failed to remove {}: {}", folder.path.display(), e);
+            }
+        }
+    }
+    println!("{} imported, {} already present.", imported, skipped);
+}
+
+fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, json: bool) {
+    let snapshots = list_snapshots(settings, session);
+    if json {
+        let entries: Vec<String> = snapshots
+            .iter()
+            .map(|snapshot| {
+                // trial-parse rather than trust: a layout a newer binary rejects is still a text
+                // file a human can repair, and finding that out at list time beats finding it out
+                // at restore time
+                let layout_error = snapshot.layout().err();
+                format!(
+                    r#"{{"id":{:?},"session_name":{:?},"saved_at":{},"zellij_version":{:?},"contract_version":{},"reason":{:?},"tabs":{},"panes":{},"path":{:?},"layout_error":{}}}"#,
+                    snapshot.id,
+                    snapshot.session_name,
+                    snapshot.meta.saved_at,
+                    snapshot.meta.zellij_version,
+                    snapshot.meta.contract_version,
+                    snapshot.meta.reason.as_str(),
+                    snapshot.meta.tabs,
+                    snapshot.meta.panes,
+                    snapshot.path.display().to_string(),
+                    match layout_error {
+                        Some(e) => format!("{:?}", e),
+                        None => "null".to_owned(),
+                    }
+                )
+            })
+            .collect();
+        println!("[{}]", entries.join(","));
+        return;
+    }
+    if snapshots.is_empty() {
+        eprintln!("No snapshots in {}.", settings.dir.display());
+        print_legacy_layout_hint(settings);
+        return;
+    }
+    println!(
+        "{:<24}  {:<20}  {:<14}  {:<9}  {:>4}  {:>5}",
+        "ID", "SESSION", "SAVED", "REASON", "TABS", "PANES"
+    );
+    for snapshot in snapshots {
+        let unparseable = if snapshot.layout().is_err() {
+            "  (layout does not parse)"
+        } else {
+            ""
+        };
+        println!(
+            "{:<24}  {:<20}  {:<14}  {:<9}  {:>4}  {:>5}{}",
+            snapshot.id,
+            snapshot.session_name,
+            snapshot.saved_at_description(),
+            snapshot.meta.reason.as_str(),
+            snapshot.meta.tabs,
+            snapshot.meta.panes,
+            unparseable
+        );
+    }
+    print_legacy_layout_hint(settings);
+}
+
+/// Say that adoptable layouts exist; never adopt them. Silently relocating a user's files is the
+/// kind of helpfulness that is indistinguishable from data loss when it goes wrong.
+fn print_legacy_layout_hint(settings: &SnapshotSettings) {
+    let count = unimported_legacy_layout_count(settings);
+    if count > 0 {
+        eprintln!(
+            "\n{} saved layout(s) from another version or contract are not in the archive. Adopt them with:\n    zellij snapshot import",
+            count
+        );
+    }
+}
+
+pub(crate) fn delete_all_sessions(yes: bool, force: bool, opts: &CliArgs) {
     use std::collections::BTreeMap;
     use zellij_server::background_jobs::scan_session_list_default_dirs;
 
@@ -116,7 +394,7 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
         }
     }
     for session in &dead_sessions {
-        delete_session_impl(&session.0, force);
+        delete_session_impl(&session.0, force, &snapshot_settings(opts));
     }
     process::exit(0);
 }
@@ -135,7 +413,7 @@ pub(crate) fn kill_session(target_session: &Option<String>) {
     }
 }
 
-pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
+pub(crate) fn delete_session(target_session: &Option<String>, force: bool, opts: &CliArgs) {
     match target_session {
         Some(target_session) => {
             if let Err(e) = validate_session_name(target_session) {
@@ -143,7 +421,7 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
                 process::exit(1);
             }
             assert_dead_session(target_session, force);
-            delete_session_impl(target_session, force);
+            delete_session_impl(target_session, force, &snapshot_settings(opts));
             process::exit(0);
         },
         None => {
@@ -515,6 +793,15 @@ fn attach_with_cli_client(
 ) {
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // `save-session --archive` is a client-side addition to the existing action: the action itself
+    // is unchanged and synchronous, so the archive copy is taken once it has returned. Nothing
+    // about it crosses the client/server contract.
+    let should_archive = matches!(
+        cli_action,
+        zellij_utils::cli::CliAction::SaveSession { archive: true }
+    );
+    let snapshot_settings =
+        SnapshotSettings::from_options(config.as_ref().map(|config| &config.options));
     match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
         Ok(actions) => {
             let exit_status = zellij_client::cli_client::start_cli_client(
@@ -522,6 +809,17 @@ fn attach_with_cli_client(
                 session_name,
                 actions,
             );
+            if should_archive {
+                match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)
+                {
+                    Ok(Some(snapshot)) => println!("Archived snapshot {}", snapshot.id),
+                    Ok(None) => println!("Nothing new to archive."),
+                    Err(e) => {
+                        eprintln!("Failed to archive the session: {}", e);
+                        std::process::exit(2);
+                    },
+                }
+            }
             std::process::exit(exit_status);
         },
         Err(e) => {
@@ -587,6 +885,7 @@ fn attach_with_session_name(
             },
             Ok(SessionNameMatch::None) => {
                 eprintln!("No session with the name '{}' found!", prefix);
+                print_contract_mismatch_help(prefix, Some(&config_options));
                 process::exit(1);
             },
             Err(kind) => {
@@ -658,6 +957,8 @@ pub(crate) fn start_client(opts: CliArgs) {
                     create: true,
                     create_background: false,
                     force_run_commands: false,
+                    no_resurrect: false,
+                    restore: None,
                     index: None,
                     options: None,
                     token: None,
@@ -693,6 +994,8 @@ pub(crate) fn start_client(opts: CliArgs) {
             create,
             create_background,
             force_run_commands,
+            no_resurrect,
+            restore,
             index,
             options,
             token,
@@ -753,7 +1056,46 @@ pub(crate) fn start_client(opts: CliArgs) {
                         .as_ref()
                         .and_then(|s| session_exists(&s).ok())
                         .unwrap_or(false);
-                    let resurrection_layout =
+                    // --restore is the counterpart to --no-resurrect: three explicit behaviours for
+                    // a dead name - resurrect from the in-place file (default), start clean
+                    // (--no-resurrect), or rebuild from a chosen snapshot
+                    let snapshot_to_restore = restore.as_ref().map(|id| {
+                        if session_exists {
+                            eprintln!(
+                                "Session '{}' is running, so there is nothing to restore into.",
+                                session_name.as_deref().unwrap_or_default()
+                            );
+                            process::exit(2);
+                        }
+                        resolve_snapshot_or_exit(
+                            &SnapshotSettings::from_options(Some(&config_options)),
+                            id,
+                            session_name.as_deref(),
+                        )
+                    });
+                    // --no-resurrect makes the snapshot invisible to the rest of this
+                    // decision, so the session is built from the layout instead of from whatever
+                    // shape it happened to have when it died
+                    let resurrection_layout = if let Some(snapshot) = snapshot_to_restore.as_ref() {
+                        report_snapshot_version_drift(snapshot);
+                        match snapshot.layout() {
+                            Ok(layout) => Some(layout),
+                            Err(e) => {
+                                eprintln!("Cannot restore snapshot {}: {}", snapshot.id, e);
+                                process::exit(2);
+                            },
+                        }
+                    } else if no_resurrect {
+                        // the snapshot is discarded rather than merely ignored: leaving it on disk
+                        // would keep the session name taken by a dead session and block the fresh
+                        // start the flag asks for
+                        if !session_exists {
+                            if let Some(session_name) = session_name.as_ref() {
+                                discard_resurrection_snapshot(session_name);
+                            }
+                        }
+                        None
+                    } else {
                         session_name
                             .as_ref()
                             .and_then(|s| match resurrection_layout(&s) {
@@ -762,7 +1104,8 @@ pub(crate) fn start_client(opts: CliArgs) {
                                     eprintln!("{}", e);
                                     process::exit(2);
                                 },
-                            });
+                            })
+                    };
                     if (create || should_create_detached)
                         && !session_exists
                         && resurrection_layout.is_none()
@@ -774,9 +1117,13 @@ pub(crate) fn start_client(opts: CliArgs) {
                             if force_run_commands {
                                 resurrection_layout.recursively_add_start_suspended(Some(false));
                             }
+                            let path_to_layout = match snapshot_to_restore.as_ref() {
+                                Some(snapshot) => snapshot.layout_file(),
+                                None => session_layout_cache_file_name(session_name.as_ref()),
+                            };
                             ClientInfo::Resurrect(
                                 session_name.clone(),
-                                session_layout_cache_file_name(session_name.as_ref()),
+                                path_to_layout,
                                 force_run_commands,
                                 new_session_cwd.clone(),
                             )

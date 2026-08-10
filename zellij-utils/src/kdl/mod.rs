@@ -2861,6 +2861,11 @@ impl Options {
         let scrollback_lines_to_serialize =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "scrollback_lines_to_serialize")
                 .map(|(v, _)| v as usize);
+        let snapshot_dir = kdl_property_first_arg_as_string_or_error!(kdl_options, "snapshot_dir")
+            .map(|(string, _entry)| expand_path(string));
+        let session_snapshot_limit =
+            kdl_property_first_arg_as_i64_or_error!(kdl_options, "session_snapshot_limit")
+                .map(|(v, _)| v.max(0) as usize);
         let terminal_title_template =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "terminal_title_template")
                 .map(|(template, _entry)| template.to_string());
@@ -3037,6 +3042,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
             terminal_title_template,
             session_aliases,
             styled_underlines,
@@ -3382,6 +3389,20 @@ impl Options {
         } else {
             None
         }
+    }
+    fn snapshot_dir_to_kdl(&self) -> Option<KdlNode> {
+        self.snapshot_dir.as_ref().map(|snapshot_dir| {
+            let mut node = KdlNode::new("snapshot_dir");
+            node.push(KdlValue::String(snapshot_dir.display().to_string()));
+            node
+        })
+    }
+    fn session_snapshot_limit_to_kdl(&self) -> Option<KdlNode> {
+        self.session_snapshot_limit.map(|limit| {
+            let mut node = KdlNode::new("session_snapshot_limit");
+            node.push(KdlValue::Base10(limit as i64));
+            node
+        })
     }
     fn terminal_title_template_to_kdl(&self) -> Option<KdlNode> {
         self.terminal_title_template
@@ -4826,6 +4847,12 @@ impl Options {
         }
         if let Some(theme_dir) = self.theme_dir_to_kdl(add_comments) {
             nodes.push(theme_dir);
+        }
+        if let Some(snapshot_dir) = self.snapshot_dir_to_kdl() {
+            nodes.push(snapshot_dir);
+        }
+        if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
+            nodes.push(session_snapshot_limit);
         }
         if let Some(terminal_title_template) = self.terminal_title_template_to_kdl() {
             nodes.push(terminal_title_template);
@@ -8256,6 +8283,7 @@ fn path_options_are_expanded() {
         layout_dir "~/.config/zellij/layouts"
         theme_dir "${HOME}/.config/zellij/themes"
         scrollback_editor "~/bin/my-editor"
+        snapshot_dir "~/.local/state/zellij/snapshots"
         web_server_cert "~/.config/zellij/cert.pem"
         web_server_key "/etc/zellij/key.pem"
     "#;
@@ -8286,6 +8314,13 @@ fn path_options_are_expanded() {
     assert_eq!(
         options.scrollback_editor,
         Some(PathBuf::from(format!("{}/bin/my-editor", home)))
+    );
+    assert_eq!(
+        options.snapshot_dir,
+        Some(PathBuf::from(format!(
+            "{}/.local/state/zellij/snapshots",
+            home
+        )))
     );
     assert_eq!(
         options.web_server_cert,

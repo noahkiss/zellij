@@ -253,6 +253,21 @@ pub struct Options {
     #[serde(default)]
     pub scrollback_lines_to_serialize: Option<usize>,
 
+    /// Where the session snapshot archive lives. Defaults to the state directory
+    /// ($XDG_STATE_HOME/zellij/snapshots, else the platform convention).
+    /// config.kdl only - it is read wherever a snapshot is written or listed, so there is nothing
+    /// for a CLI flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
+
+    /// How many snapshots to keep per session name, oldest pruned first. Default is 10, 0 turns
+    /// the archive off.
+    /// config.kdl only, like snapshot_dir.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_snapshot_limit: Option<usize>,
+
     /// The template of the terminal title (OSC 0) of the focused pane. Knows the {host},
     /// {session} and {pane} placeholders, anything else is literal text. Placeholders that come
     /// out empty take the literal text around them with them, so that no dangling separator is
@@ -560,6 +575,8 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or(self.scrollback_lines_to_serialize);
+        let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
+        let session_snapshot_limit = other.session_snapshot_limit.or(self.session_snapshot_limit);
         let terminal_title_template = other
             .terminal_title_template
             .or_else(|| self.terminal_title_template.clone());
@@ -650,6 +667,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
             terminal_title_template,
             session_aliases,
             styled_underlines,
@@ -737,6 +756,10 @@ impl Options {
         let scrollback_lines_to_serialize = other
             .scrollback_lines_to_serialize
             .or_else(|| self.scrollback_lines_to_serialize.clone());
+        let snapshot_dir = other.snapshot_dir.or_else(|| self.snapshot_dir.clone());
+        let session_snapshot_limit = other
+            .session_snapshot_limit
+            .or_else(|| self.session_snapshot_limit.clone());
         let terminal_title_template = other
             .terminal_title_template
             .or_else(|| self.terminal_title_template.clone());
@@ -827,6 +850,8 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
             terminal_title_template,
             session_aliases,
             styled_underlines,
