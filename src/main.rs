@@ -241,6 +241,8 @@ fn main() {
         commands::list_aliases(opts);
     } else if let Some(Command::Sessions(Sessions::Watch { ref session_name })) = opts.command {
         commands::watch_session(session_name.clone(), opts);
+    } else if let Some(Command::Sessions(Sessions::Snapshot(snapshot_cli))) = opts.command.clone() {
+        commands::snapshot_command(snapshot_cli, opts);
     } else if let Some(Command::Sessions(Sessions::KillAllSessions { yes })) = opts.command {
         commands::kill_all_sessions(yes);
     } else if let Some(Command::Sessions(Sessions::KillSession { ref target_session })) =
@@ -249,13 +251,13 @@ fn main() {
         commands::kill_session(target_session);
     } else if let Some(Command::Sessions(Sessions::DeleteAllSessions { yes, force })) = opts.command
     {
-        commands::delete_all_sessions(yes, force);
+        commands::delete_all_sessions(yes, force, &opts);
     } else if let Some(Command::Sessions(Sessions::DeleteSession {
         ref target_session,
         force,
     })) = opts.command
     {
-        commands::delete_session(target_session, force);
+        commands::delete_session(target_session, force, &opts);
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);
     } else if opts.layout.is_some() || opts.layout_string.is_some() {
