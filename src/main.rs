@@ -10,6 +10,7 @@ use zellij_utils::{
     envs,
     input::config::Config,
     logging::*,
+    sessions::KillWait,
     setup::Setup,
     shared::web_server_base_url_from_config,
 };
@@ -243,21 +244,41 @@ fn main() {
         commands::watch_session(session_name.clone(), opts);
     } else if let Some(Command::Sessions(Sessions::Snapshot(snapshot_cli))) = opts.command.clone() {
         commands::snapshot_command(snapshot_cli, opts);
-    } else if let Some(Command::Sessions(Sessions::KillAllSessions { yes })) = opts.command {
-        commands::kill_all_sessions(yes);
-    } else if let Some(Command::Sessions(Sessions::KillSession { ref target_session })) =
-        opts.command
+    } else if let Some(Command::Sessions(Sessions::KillAllSessions {
+        yes,
+        no_wait,
+        wait_timeout,
+    })) = opts.command
     {
-        commands::kill_session(target_session);
-    } else if let Some(Command::Sessions(Sessions::DeleteAllSessions { yes, force })) = opts.command
+        commands::kill_all_sessions(yes, KillWait::from_cli(no_wait, wait_timeout));
+    } else if let Some(Command::Sessions(Sessions::KillSession {
+        ref target_session,
+        no_wait,
+        wait_timeout,
+    })) = opts.command
     {
-        commands::delete_all_sessions(yes, force, &opts);
+        commands::kill_session(target_session, KillWait::from_cli(no_wait, wait_timeout));
+    } else if let Some(Command::Sessions(Sessions::DeleteAllSessions {
+        yes,
+        force,
+        no_wait,
+        wait_timeout,
+    })) = opts.command
+    {
+        commands::delete_all_sessions(yes, force, KillWait::from_cli(no_wait, wait_timeout), &opts);
     } else if let Some(Command::Sessions(Sessions::DeleteSession {
         ref target_session,
         force,
+        no_wait,
+        wait_timeout,
     })) = opts.command
     {
-        commands::delete_session(target_session, force, &opts);
+        commands::delete_session(
+            target_session,
+            force,
+            KillWait::from_cli(no_wait, wait_timeout),
+            &opts,
+        );
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);
     } else if opts.layout.is_some() || opts.layout_string.is_some() {
