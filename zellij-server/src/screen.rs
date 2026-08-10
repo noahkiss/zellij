@@ -947,6 +947,7 @@ pub enum ScreenInstruction {
     FocusHostSession(ClientId, Option<NotificationEnd>),
     FocusGuestSession(ClientId, Option<NotificationEnd>),
     ToggleHostFullscreen(ClientId, Option<NotificationEnd>),
+    MoveTabToIndex(Option<usize>, usize, ClientId, Option<NotificationEnd>),
 }
 
 impl From<&ScreenInstruction> for ScreenContext {
@@ -1346,6 +1347,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::FocusHostSession(..) => ScreenContext::FocusHostSession,
             ScreenInstruction::FocusGuestSession(..) => ScreenContext::FocusGuestSession,
             ScreenInstruction::ToggleHostFullscreen(..) => ScreenContext::ToggleHostFullscreen,
+            ScreenInstruction::MoveTabToIndex(..) => ScreenContext::MoveTabToIndex,
         }
     }
 }
@@ -5904,6 +5906,64 @@ impl Screen {
         } else {
             log::error!("Tab with id {} not found", tab_id);
         }
+        Ok(())
+    }
+
+    /// The tab an absolute move applies to: the explicit `tab_id` when given, otherwise the
+    /// session's active tab. Returns None only when nothing resolves, which the caller reports.
+    ///
+    /// The active-tab lookup mirrors the chain `add_client` uses, because a detached session has
+    /// no connected clients at all and asking only the client map would resolve to nothing.
+    fn tab_id_for_absolute_move(
+        &self,
+        tab_id: Option<usize>,
+        client_id: ClientId,
+    ) -> Option<usize> {
+        if let Some(tab_id) = tab_id {
+            return self.tabs.contains_key(&tab_id).then_some(tab_id);
+        }
+        if let Some(tab_id) = self.active_tab_ids.get(&client_id) {
+            return Some(*tab_id);
+        }
+        if let Some((_client_id, tab_id)) = self.active_tab_ids.iter().next() {
+            return Some(*tab_id);
+        }
+        if self.tabs.contains_key(&self.global_last_active_tab_id) {
+            return Some(self.global_last_active_tab_id);
+        }
+        self.tabs.keys().next().copied()
+    }
+
+    /// Moves a tab to an absolute position, shifting the tabs in between rather than swapping.
+    ///
+    /// `new_position` is clamped to the last position, so a consumer that drags a tab past the
+    /// end lands it there rather than erroring.
+    pub fn move_tab_to_index(&mut self, tab_id: usize, new_position: usize) -> Result<()> {
+        if self.tabs.len() < 2 {
+            return Ok(());
+        }
+        let Some(old_position) = self.tabs.get(&tab_id).map(|t| t.position) else {
+            log::error!("Tab with id {} not found", tab_id);
+            return Ok(());
+        };
+        let new_position = new_position.min(self.tabs.len() - 1);
+        if new_position == old_position {
+            return Ok(());
+        }
+
+        for tab in self.tabs.values_mut() {
+            if tab.id == tab_id {
+                tab.position = new_position;
+            } else if old_position < new_position {
+                if tab.position > old_position && tab.position <= new_position {
+                    tab.position -= 1;
+                }
+            } else if tab.position >= new_position && tab.position < old_position {
+                tab.position += 1;
+            }
+        }
+        self.log_and_report_session_state()
+            .context("failed to move tab to index")?;
         Ok(())
     }
 
@@ -12661,6 +12721,34 @@ pub(crate) fn screen_thread_main(
                 let _ = screen.bus.senders.send_to_server(
                     ServerInstruction::EmitNestedSessionFrameToClient(client_id, payload),
                 );
+            },
+            ScreenInstruction::MoveTabToIndex(tab_id, index, client_id, mut _completion_tx) => {
+                if pending_tab_ids.is_empty() {
+                    match screen.tab_id_for_absolute_move(tab_id, client_id) {
+                        Some(resolved_tab_id) => {
+                            screen.move_tab_to_index(resolved_tab_id, index)?;
+                            screen.render(None)?;
+                        },
+                        None => {
+                            let error_message = match tab_id {
+                                Some(tab_id) => format!("Tab with id {} not found", tab_id),
+                                None => "Could not find a tab to move".to_string(),
+                            };
+                            log::error!("{}", error_message);
+                            if let Some(ref mut c) = _completion_tx {
+                                c.set_exit_status(1);
+                                c.set_error_message(error_message);
+                            }
+                        },
+                    }
+                } else {
+                    pending_events_waiting_for_tab.push(ScreenInstruction::MoveTabToIndex(
+                        tab_id,
+                        index,
+                        client_id,
+                        _completion_tx,
+                    ));
+                }
             },
         }
     }

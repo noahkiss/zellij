@@ -2216,7 +2216,9 @@ impl TiledPanes {
                 );
                 let next_index = pane_grid
                     .next_selectable_pane_id_below(&active_pane_id, false)
-                    .or_else(|| pane_grid.progress_stack_down_if_in_stack(&active_pane_id));
+                    .or_else(|| pane_grid.progress_stack_down_if_in_stack(&active_pane_id))
+                    // at the bottom of a stack with nothing below it, come round to the top
+                    .or_else(|| pane_grid.wrap_stack_focus(&active_pane_id, false));
                 match next_index {
                     Some(p) => {
                         // render previously active pane so that its frame does not remain actively
@@ -2267,7 +2269,9 @@ impl TiledPanes {
                 );
                 let next_index = pane_grid
                     .next_selectable_pane_id_above(&active_pane_id, false)
-                    .or_else(|| pane_grid.progress_stack_up_if_in_stack(&active_pane_id));
+                    .or_else(|| pane_grid.progress_stack_up_if_in_stack(&active_pane_id))
+                    // at the top of a stack with nothing above it, come round to the bottom
+                    .or_else(|| pane_grid.wrap_stack_focus(&active_pane_id, true));
                 match next_index {
                     Some(p) => {
                         // render previously active pane so that its frame does not remain actively
