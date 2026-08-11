@@ -1026,7 +1026,10 @@ impl PaneFrame {
             .saturating_sub(middle_length / 2)
             .max(left_length);
         let middle_start = if middle.is_some() {
-            if right_length > 0 {
+            // fork addition: `top_only` keeps the pre-0.45 left-aligned title
+            if self.top_only_frames {
+                left_length
+            } else if right_length > 0 {
                 let scroll_start = width.saturating_sub(right_length);
                 let centered_end = centered_start + middle_length;
                 if centered_end > scroll_start {
