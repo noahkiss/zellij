@@ -33,6 +33,8 @@ struct App {
     error: Option<String>,
     /// The running server's binary path, handed over in the plugin configuration
     server_exe: Option<String>,
+    /// Set when the server runs on a host where the binary path is worth explaining (macOS)
+    server_exe_hint: Option<String>,
 }
 
 impl Default for App {
@@ -47,6 +49,7 @@ impl Default for App {
                 base_mode.clone(),
                 false,
                 None,
+                None,
             ),
             link_executable,
             zellij_version,
@@ -60,6 +63,7 @@ impl Default for App {
             waiting_for_config_to_be_written: false,
             error: None,
             server_exe: None,
+            server_exe_hint: None,
         }
     }
 }
@@ -94,6 +98,7 @@ impl ZellijPlugin for App {
         // zellij-server/src/plugins/plugin_loader.rs), so it names the binary that is actually
         // running, symlinks resolved
         self.server_exe = configuration.get("zellij_exe").cloned();
+        self.server_exe_hint = configuration.get("zellij_exe_hint").cloned();
         self.active_page = if self.is_startup_tip {
             let mut rng = rng();
             self.tip_index = rng.random_range(0..=MAX_TIP_INDEX);
@@ -109,6 +114,7 @@ impl ZellijPlugin for App {
                 self.base_mode.clone(),
                 self.is_release_notes,
                 self.server_exe.clone(),
+                self.server_exe_hint.clone(),
             )
         };
     }
@@ -259,6 +265,7 @@ impl App {
                     self.base_mode.clone(),
                     self.is_release_notes,
                     self.server_exe.clone(),
+                    self.server_exe_hint.clone(),
                 );
                 should_render = true;
             }

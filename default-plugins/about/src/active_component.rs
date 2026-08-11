@@ -105,6 +105,11 @@ impl ActiveComponent {
     pub fn clear_hover(&mut self) {
         self.is_active = false;
     }
+    /// Forget where this was last drawn, so a component left out of a render stops answering
+    /// clicks and hovers aimed at the place it used to occupy.
+    pub fn clear_rendered_coordinates(&mut self) {
+        self.last_rendered_coordinates = None;
+    }
 }
 
 #[derive(Debug)]
