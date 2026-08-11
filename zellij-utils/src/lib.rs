@@ -34,6 +34,7 @@ pub mod logging; // Requires log4rs
 pub mod nested_session;
 #[cfg(all(not(target_family = "wasm"), feature = "web_server_capability"))]
 pub mod remote_session_tokens;
+pub mod resurrect_command_hints;
 #[cfg(not(target_family = "wasm"))]
 pub mod session_lifecycle;
 pub mod session_service;

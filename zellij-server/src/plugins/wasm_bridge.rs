@@ -2163,6 +2163,7 @@ fn check_event_permission(
         | Event::TabUpdate(..)
         | Event::PaneUpdate(..)
         | Event::SessionUpdate(..)
+        | Event::ListSnapshots(..)
         | Event::CopyToClipboard(..)
         | Event::SystemClipboardFailure
         | Event::CommandPaneOpened(..)

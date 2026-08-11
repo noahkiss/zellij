@@ -13855,3 +13855,58 @@ pub fn reported_pixel_dimensions_are_applied_to_existing_ptys() {
         resizes_after_reply
     );
 }
+
+// Fork addition: `top_only` sits outside upstream's three-way toggle cycle. Leaving it for
+// `none` must not be one-way.
+#[test]
+fn toggle_pane_frames_round_trips_top_only() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    screen.pane_frame_style = PaneFrameStyle::TopOnly;
+    screen.pane_frame_style_before_none = PaneFrameStyle::TopOnly;
+
+    screen.cycle_pane_frame_style();
+    assert_eq!(
+        screen.pane_frame_style,
+        PaneFrameStyle::None,
+        "top_only toggles frames off"
+    );
+
+    screen.cycle_pane_frame_style();
+    assert_eq!(
+        screen.pane_frame_style,
+        PaneFrameStyle::TopOnly,
+        "toggling again comes back to top_only"
+    );
+}
+
+#[test]
+fn toggle_pane_frames_keeps_the_upstream_cycle() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    screen.pane_frame_style = PaneFrameStyle::Full;
+    screen.pane_frame_style_before_none = PaneFrameStyle::Full;
+
+    let cycle: Vec<PaneFrameStyle> = (0..4)
+        .map(|_| {
+            screen.cycle_pane_frame_style();
+            screen.pane_frame_style
+        })
+        .collect();
+    assert_eq!(
+        cycle,
+        vec![
+            PaneFrameStyle::Titles,
+            PaneFrameStyle::None,
+            PaneFrameStyle::Full,
+            PaneFrameStyle::Titles,
+        ],
+        "full -> titles -> none -> full is unchanged"
+    );
+}
