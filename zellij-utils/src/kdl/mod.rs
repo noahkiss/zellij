@@ -19,6 +19,9 @@ use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermiss
 use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
+use crate::resurrect_command_hints::{
+    ResurrectCommandHint, ResurrectCommandHints, HINT_PLACEHOLDER,
+};
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
 use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
@@ -3010,6 +3013,10 @@ impl Options {
             Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
             None => None,
         };
+        let resurrect_command_hints = match kdl_options.get("resurrect_command_hints") {
+            Some(kdl_hints) => Some(Self::resurrect_command_hints_from_kdl(kdl_hints)?),
+            None => None,
+        };
         let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
             Some(kdl_drop_env) => Some(
                 kdl_string_arguments!(kdl_drop_env)
@@ -3174,6 +3181,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            resurrect_command_hints,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3722,6 +3730,118 @@ impl Options {
         }
 
         node.set_children(init_systems);
+        Some(node)
+    }
+    /// The `resurrect_command_hints` block: how to record a resumable command when a session is
+    /// serialized.
+    ///
+    /// ```kdl
+    /// resurrect_command_hints {
+    ///     claude { match "claude"; env "CLAUDE_CODE_SESSION_ID"; rewrite "claude --resume {}" }
+    /// }
+    /// ```
+    ///
+    /// The block name (`claude` here) is a label - it names the hint in errors and logs and takes
+    /// no part in matching. All three entries are required, and `rewrite` must contain the `{}`
+    /// placeholder: a rewrite without one throws away the value the whole hint exists to find, so
+    /// it is a config mistake rather than a choice. It is checked here, at parse time, so that
+    /// `zellij setup --check` reports it rather than a serialization that quietly does nothing.
+    fn resurrect_command_hints_from_kdl(
+        kdl_hints: &KdlNode,
+    ) -> Result<ResurrectCommandHints, ConfigError> {
+        let mut hints = ResurrectCommandHints::default();
+        for kdl_hint in
+            kdl_children_nodes_or_error!(kdl_hints, "empty resurrect_command_hints block")
+        {
+            let name = kdl_name!(kdl_hint).to_owned();
+            let mut match_command: Option<String> = None;
+            let mut env: Option<String> = None;
+            let mut rewrite: Option<String> = None;
+            for entry in kdl_children_nodes_or_error!(
+                kdl_hint,
+                format!("empty resurrect_command_hints entry: {:?}", name)
+            ) {
+                let entry_name = kdl_name!(entry);
+                let value = kdl_first_entry_as_string!(entry)
+                    .ok_or(ConfigError::new_kdl_error(
+                        format!(
+                            "resurrect_command_hints {:?}: {:?} needs a string value",
+                            name, entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    ))?
+                    .to_owned();
+                match entry_name {
+                    "match" => match_command = Some(value),
+                    "env" => env = Some(value),
+                    "rewrite" => rewrite = Some(value),
+                    other => {
+                        return Err(ConfigError::new_kdl_error(
+                            format!(
+                                "Unknown resurrect_command_hints entry: {:?} (expected match, env \
+                                 or rewrite)",
+                                other
+                            ),
+                            entry.span().offset(),
+                            entry.span().len(),
+                        ))
+                    },
+                }
+            }
+            let missing = |field: &str| {
+                ConfigError::new_kdl_error(
+                    format!("resurrect_command_hints {:?} has no {}", name, field),
+                    kdl_hint.span().offset(),
+                    kdl_hint.span().len(),
+                )
+            };
+            let match_command = match_command.ok_or_else(|| missing("match"))?;
+            let env = env.ok_or_else(|| missing("env"))?;
+            let rewrite = rewrite.ok_or_else(|| missing("rewrite"))?;
+            if !rewrite.contains(HINT_PLACEHOLDER) {
+                return Err(ConfigError::new_kdl_error(
+                    format!(
+                        "resurrect_command_hints {:?}: rewrite {:?} has no {} placeholder for the \
+                         value of {:?}",
+                        name, rewrite, HINT_PLACEHOLDER, env
+                    ),
+                    kdl_hint.span().offset(),
+                    kdl_hint.span().len(),
+                ));
+            }
+            hints.push(ResurrectCommandHint {
+                name,
+                match_command,
+                env,
+                rewrite,
+            });
+        }
+        Ok(hints)
+    }
+    fn resurrect_command_hints_to_kdl(&self) -> Option<KdlNode> {
+        let hints = self.resurrect_command_hints.as_ref()?;
+        if hints.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("resurrect_command_hints");
+        let mut children = KdlDocument::new();
+        for hint in &hints.hints {
+            let mut entries = KdlDocument::new();
+            for (name, value) in [
+                ("match", &hint.match_command),
+                ("env", &hint.env),
+                ("rewrite", &hint.rewrite),
+            ] {
+                let mut entry = KdlNode::new(name);
+                entry.push(KdlValue::String(value.to_owned()));
+                entries.nodes_mut().push(entry);
+            }
+            let mut hint_node = KdlNode::new(hint.name.as_str());
+            hint_node.set_children(entries);
+            children.nodes_mut().push(hint_node);
+        }
+        node.set_children(children);
         Some(node)
     }
     fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
@@ -5058,6 +5178,9 @@ impl Options {
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
+        }
+        if let Some(resurrect_command_hints) = self.resurrect_command_hints_to_kdl() {
+            nodes.push(resurrect_command_hints);
         }
         if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
             nodes.push(plugin_watch);
@@ -8660,6 +8783,121 @@ fn pin_exe_refuses_a_value_that_is_neither() {
 fn session_service_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_service, None);
+}
+
+#[test]
+fn resurrect_command_hints_config_parsing() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+    opencode {
+        match "opencode"
+        env "OPENCODE_SESSION_ID"
+        rewrite "opencode --session {}"
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![
+            ResurrectCommandHint {
+                name: "claude".to_owned(),
+                match_command: "claude".to_owned(),
+                env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+                rewrite: "claude --resume {}".to_owned(),
+            },
+            ResurrectCommandHint {
+                name: "opencode".to_owned(),
+                match_command: "opencode".to_owned(),
+                env: "OPENCODE_SESSION_ID".to_owned(),
+                rewrite: "opencode --session {}".to_owned(),
+            },
+        ]
+    );
+
+    // the round trip the configuration plugin performs when it rewrites config.kdl
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn resurrect_command_hints_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.resurrect_command_hints, None);
+}
+
+/// Every way of writing a hint that cannot do anything is refused at parse time, so that
+/// `zellij setup --check` reports it rather than serialization quietly recording the bare command.
+#[test]
+fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
+    let offenders = [
+        (
+            "resurrect_command_hints {
+    claude {
+        env \"X\"
+        rewrite \"claude {}\"
+    }
+}",
+            "match",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        rewrite \"claude {}\"
+    }
+}",
+            "env",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+    }
+}",
+            "rewrite",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+        rewrite \"claude --resume\"
+    }
+}",
+            "placeholder",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+        rewrite \"claude {}\"
+        resume \"yes\"
+    }
+}",
+            "resume",
+        ),
+    ];
+    for (config, expected) in offenders {
+        let error = format!("{:?}", Config::from_kdl(config, None).unwrap_err());
+        assert!(
+            error.contains(expected),
+            "{:?} should have been refused for {:?}, got: {}",
+            config,
+            expected,
+            error
+        );
+    }
 }
 
 /// The entries the generator owns are rejected where a person can see it - at parse time, so that

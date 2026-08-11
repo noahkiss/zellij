@@ -1,6 +1,7 @@
 //! Handles cli and configuration options
 use crate::cli::Command;
 use crate::data::{InputMode, WebSharing};
+use crate::resurrect_command_hints::ResurrectCommandHints;
 use crate::session_service::SessionServiceOptions;
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -331,6 +332,16 @@ pub struct Options {
     #[serde(default)]
     pub session_service: Option<SessionServiceOptions>,
 
+    /// How to record the command of a pane running a tool that keeps its own session state, so
+    /// that a resurrected pane offers to RESUME that state instead of starting over. A hint names
+    /// a command, an environment variable the tool exports, and what to record when the variable
+    /// is found in the pane's processes. Unset means record every command as it is - which is what
+    /// zellij has always done, and what a pane whose hint does not apply still gets.
+    /// config.kdl only - it is read by the server when it serializes a session.
+    #[clap(skip)]
+    #[serde(default)]
+    pub resurrect_command_hints: Option<ResurrectCommandHints>,
+
     /// Whether to use ANSI styled underlines
     #[clap(long, value_parser)]
     #[serde(default)]
@@ -575,6 +586,9 @@ impl Options {
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
+        let resurrect_command_hints = other
+            .resurrect_command_hints
+            .or_else(|| self.resurrect_command_hints.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -659,6 +673,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            resurrect_command_hints,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -758,6 +773,9 @@ impl Options {
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
+        let resurrect_command_hints = other
+            .resurrect_command_hints
+            .or_else(|| self.resurrect_command_hints.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -842,6 +860,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            resurrect_command_hints,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
