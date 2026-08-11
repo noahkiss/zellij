@@ -672,6 +672,149 @@ pub fn unimported_legacy_layout_count(settings: &SnapshotSettings) -> usize {
         .count()
 }
 
+/// The archive as a plugin sees it, newest first.
+///
+/// Reads the sidecar of every snapshot and parses every saved layout, so it costs one directory
+/// walk plus one KDL parse per snapshot. That is why nothing calls it on a schedule: it answers
+/// `PluginCommand::ListSnapshots`, which a plugin sends while a picker is actually open.
+///
+/// A snapshot whose layout will not parse is still listed, carrying the parse error - the layout is
+/// a text file a human can repair, and the picker saying so beats a restore failing later. Only a
+/// directory with no layout file at all is dropped, and never silently: see
+/// [`report_skipped_snapshots`].
+pub fn snapshot_infos(settings: &SnapshotSettings) -> Vec<crate::data::SessionSnapshotInfo> {
+    let mut skipped_this_pass: std::collections::HashMap<String, String> = Default::default();
+    let infos = list_snapshots(settings, None)
+        .into_iter()
+        .filter_map(|snapshot| {
+            let layout_file = snapshot.layout_file();
+            if !layout_file.is_file() {
+                skipped_this_pass.insert(
+                    snapshot.path.display().to_string(),
+                    format!("it has no {}", SNAPSHOT_LAYOUT_FILE_NAME),
+                );
+                return None;
+            }
+            Some(snapshot_info(&snapshot))
+        })
+        .collect();
+    report_skipped_snapshots(skipped_this_pass);
+    infos
+}
+
+/// One archived snapshot described for a plugin: the sidecar, plus the saved layout's tabs and
+/// panes when it parses.
+pub fn snapshot_info(snapshot: &Snapshot) -> crate::data::SessionSnapshotInfo {
+    let (tabs, layout_error) = match snapshot.layout() {
+        Ok(layout) => (tabs_of_layout(&layout), None),
+        Err(e) => (vec![], Some(e)),
+    };
+    crate::data::SessionSnapshotInfo {
+        id: snapshot.id.clone(),
+        session_name: snapshot.session_name.clone(),
+        saved_at: snapshot.meta.saved_at,
+        reason: snapshot.meta.reason.to_string(),
+        zellij_version: snapshot.meta.zellij_version.clone(),
+        // from the sidecar rather than from the layout, so a snapshot whose layout will not parse
+        // still reports its size instead of reading as empty
+        tab_count: snapshot.meta.tabs,
+        pane_count: snapshot.meta.panes,
+        tabs,
+        layout_error,
+    }
+}
+
+fn tabs_of_layout(layout: &crate::input::layout::Layout) -> Vec<crate::data::SnapshotTabInfo> {
+    layout
+        .tabs
+        .iter()
+        .map(|(name, tiled, floating)| {
+            let mut panes = vec![];
+            collect_tiled_panes(tiled, &mut panes);
+            for floating_pane in floating {
+                panes.push(crate::data::SnapshotPaneInfo {
+                    name: floating_pane.name.clone(),
+                    command: run_description(&floating_pane.run),
+                    is_floating: true,
+                });
+            }
+            crate::data::SnapshotTabInfo {
+                name: name.clone(),
+                panes,
+            }
+        })
+        .collect()
+}
+
+/// The panes of one tab, in the order the layout lists them.
+///
+/// A `TiledPaneLayout` is a tree whose inner nodes are splits rather than panes, so only the leaves
+/// are collected - counting the nodes would report a tab of two panes as four.
+fn collect_tiled_panes(
+    pane: &crate::input::layout::TiledPaneLayout,
+    panes: &mut Vec<crate::data::SnapshotPaneInfo>,
+) {
+    if pane.children.is_empty() {
+        panes.push(crate::data::SnapshotPaneInfo {
+            name: pane.name.clone(),
+            command: run_description(&pane.run),
+            is_floating: false,
+        });
+        return;
+    }
+    for child in &pane.children {
+        collect_tiled_panes(child, panes);
+    }
+}
+
+/// What a pane runs, in one line, or `None` for a pane that carries no command at all.
+///
+/// `None` rather than a placeholder: a pane with no `run` is the default shell, and the caller is
+/// better placed than this function to decide what to call that.
+fn run_description(run: &Option<crate::input::layout::Run>) -> Option<String> {
+    use crate::input::layout::Run;
+    match run {
+        Some(Run::Command(run_command)) => {
+            let mut description = run_command.command.display().to_string();
+            for arg in &run_command.args {
+                description.push(' ');
+                description.push_str(arg);
+            }
+            Some(description)
+        },
+        Some(Run::EditFile(path, _line, _cwd)) => Some(format!("edit {}", path.display())),
+        Some(Run::Plugin(plugin)) => Some(format!("plugin {}", plugin.location_string())),
+        Some(Run::Cwd(_)) | None => None,
+    }
+}
+
+/// Why each snapshot directory is currently unreadable, so the same fault is logged once.
+static SKIPPED_SNAPSHOTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+/// Name the archive directories this pass dropped, once each.
+///
+/// A directory under the archive that holds no `session-layout.kdl` cannot be restored, so it is
+/// left out of the list a picker draws - and a silent drop is exactly the fault the session-list
+/// scan spent months hiding. The gating map is the same shape as that scan's: one line as a
+/// directory enters the dropped state, another only if the reason changes, and a directory read
+/// successfully again is forgotten, so a recurrence is reported rather than swallowed. Without it
+/// a picker left open would log one identical line per poll.
+fn report_skipped_snapshots(skipped_this_pass: std::collections::HashMap<String, String>) {
+    let previously_skipped = SKIPPED_SNAPSHOTS.get_or_init(Default::default);
+    let mut previously_skipped = match previously_skipped.lock() {
+        Ok(previously_skipped) => previously_skipped,
+        Err(poisoned) => poisoned.into_inner(), // a poisoned log-gating map is no reason to panic
+    };
+    for (path, reason) in &skipped_this_pass {
+        if previously_skipped.get(path) != Some(reason) {
+            log::warn!("snapshot {} cannot be listed: {}", path, reason);
+        }
+    }
+    *previously_skipped = skipped_this_pass;
+}
+
 /// Prune every session in the archive.
 pub fn prune_all(settings: &SnapshotSettings, keep: usize) -> Vec<Snapshot> {
     archived_session_names(settings)
@@ -975,6 +1118,180 @@ mod tests {
             ids[0]
         );
         assert!(resolve_snapshot(&settings, "nope", None).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_snapshot_info_carries_the_tabs_and_panes_of_its_layout() {
+        let (settings, root) = temp_settings("snapshot-infos");
+        let source = root.join("session_info");
+        write_session_info_folder(
+            &source,
+            r#"layout {
+                tab name="editing" {
+                    pane
+                    pane command="nvim" {
+                        args "src/main.rs"
+                    }
+                }
+                tab name="logs" {
+                    pane name="tail" command="tail" {
+                        args "-f" "/var/log/syslog"
+                    }
+                }
+            }
+            "#,
+        );
+        archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Manual,
+            &settings,
+            None,
+        )
+        .unwrap()
+        .expect("a snapshot should have been written");
+
+        let infos = snapshot_infos(&settings);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert_eq!(info.session_name, "a-session");
+        assert_eq!(info.reason, "manual");
+        assert_eq!(info.layout_error, None);
+        let tab_names: Vec<Option<String>> = info.tabs.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(
+            tab_names,
+            vec![Some("editing".to_owned()), Some("logs".to_owned())]
+        );
+        assert_eq!(info.tabs[0].panes.len(), 2, "both panes of the first tab");
+        assert_eq!(info.tabs[0].panes[0].command, None, "a default-shell pane");
+        assert_eq!(
+            info.tabs[0].panes[1].command,
+            Some("nvim src/main.rs".to_owned()),
+            "the command and its args, in one line"
+        );
+        assert_eq!(info.tabs[1].panes[0].name, Some("tail".to_owned()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_the_leaves_of_a_split_are_panes() {
+        let (settings, root) = temp_settings("snapshot-leaves");
+        let source = root.join("session_info");
+        // one tab, one vertical split, two panes - four nodes in the tree
+        write_session_info_folder(
+            &source,
+            r#"layout {
+                tab name="split" {
+                    pane split_direction="vertical" {
+                        pane
+                        pane
+                    }
+                }
+            }
+            "#,
+        );
+        archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Manual,
+            &settings,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        let infos = snapshot_infos(&settings);
+        assert_eq!(
+            infos[0].tabs[0].panes.len(),
+            2,
+            "the split itself is not a pane"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_layout_that_does_not_parse_is_listed_with_its_error() {
+        let (settings, root) = temp_settings("snapshot-bad-layout");
+        let source = root.join("session_info");
+        write_session_info_folder(&source, "layout {\n    tab\n}\n");
+        let snapshot = archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Manual,
+            &settings,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        // break the archived copy, leaving the sidecar intact
+        std::fs::write(snapshot.layout_file(), "this is not a layout {{{").unwrap();
+
+        let infos = snapshot_infos(&settings);
+        assert_eq!(infos.len(), 1, "it is listed rather than dropped");
+        assert!(
+            infos[0].layout_error.is_some(),
+            "and it says why it cannot be restored"
+        );
+        assert_eq!(
+            infos[0].tab_count, 1,
+            "the size still comes from the sidecar"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_with_no_layout_is_skipped() {
+        let (settings, root) = temp_settings("snapshot-no-layout");
+        let source = root.join("session_info");
+        write_session_info_folder(&source, "layout {\n    tab\n}\n");
+        let snapshot = archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Manual,
+            &settings,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        std::fs::remove_file(snapshot.layout_file()).unwrap();
+
+        assert!(
+            snapshot_infos(&settings).is_empty(),
+            "there is nothing here to restore"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_newest_snapshot_is_listed_first() {
+        let (settings, root) = temp_settings("snapshot-info-order");
+        for i in 0..3 {
+            let source = root.join(format!("session_info_{}", i));
+            write_session_info_folder(&source, &format!("layout {{\n    tab name=\"{}\"\n}}\n", i));
+            archive_session_info_folder(
+                &source,
+                "a-session",
+                SnapshotReason::Manual,
+                &settings,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let infos = snapshot_infos(&settings);
+        assert_eq!(infos.len(), 3);
+        let names: Vec<Option<String>> =
+            infos.iter().map(|info| info.tabs[0].name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("2".to_owned()),
+                Some("1".to_owned()),
+                Some("0".to_owned())
+            ]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

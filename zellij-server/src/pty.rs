@@ -7,6 +7,7 @@ use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
+    resurrect_hints::ProcessTree,
     screen::{ScreenInstruction, TabOverrideResult},
     session_layout_metadata::SessionLayoutMetadata,
     thread_bus::{Bus, ThreadSenders},
@@ -30,6 +31,7 @@ use zellij_utils::{
         },
     },
     pane_size::Size,
+    resurrect_command_hints::ResurrectCommandHints,
     session_serialization,
 };
 
@@ -138,6 +140,7 @@ pub enum PtyInstruction {
         client_id: ClientId,
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
+        resurrect_command_hints: Option<ResurrectCommandHints>,
     },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
@@ -204,6 +207,7 @@ pub(crate) struct Pty {
     task_handles: HashMap<u32, JoinHandle<()>>, // terminal_id to join-handle
     default_editor: Option<PathBuf>,
     post_command_discovery_hook: Option<String>,
+    resurrect_command_hints: Option<ResurrectCommandHints>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -863,9 +867,14 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::Reconfigure {
                 default_editor,
                 post_command_discovery_hook,
+                resurrect_command_hints,
                 client_id: _,
             } => {
-                pty.reconfigure(default_editor, post_command_discovery_hook);
+                pty.reconfigure(
+                    default_editor,
+                    post_command_discovery_hook,
+                    resurrect_command_hints,
+                );
             },
             PtyInstruction::SendSigintToPaneId(pane_id) => {
                 pty.send_sigint_to_pane(pane_id);
@@ -912,6 +921,7 @@ impl Pty {
         debug_to_file: bool,
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
+        resurrect_command_hints: Option<ResurrectCommandHints>,
     ) -> Self {
         Pty {
             active_panes: HashMap::new(),
@@ -922,6 +932,7 @@ impl Pty {
             default_editor,
             originating_plugins: HashMap::new(),
             post_command_discovery_hook,
+            resurrect_command_hints,
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
@@ -1992,6 +2003,34 @@ impl Pty {
         session_layout_metadata.update_terminal_cwds(terminal_ids_to_cwds);
         session_layout_metadata.update_default_editor(&self.default_editor);
         session_layout_metadata.detect_editor_panes();
+        self.apply_resurrect_command_hints(session_layout_metadata, &panes);
+    }
+    /// Rewrites the commands `resurrect_command_hints` applies to, once the commands themselves
+    /// have been discovered.
+    ///
+    /// It runs here, in the pty thread, because this is the thread that knows a pane's pid - and
+    /// last, after the rest of discovery, so that it decides against the command that would
+    /// otherwise have been recorded.
+    fn apply_resurrect_command_hints(
+        &self,
+        session_layout_metadata: &mut SessionLayoutMetadata,
+        panes: &[(u32, u32)],
+    ) {
+        let Some(hints) = self
+            .resurrect_command_hints
+            .as_ref()
+            .filter(|hints| !hints.is_empty())
+        else {
+            return;
+        };
+        let terminal_ids_to_pids: HashMap<u32, u32> = panes.iter().copied().collect();
+        // one process-table read for the whole session, not one per pane
+        let process_tree = ProcessTree::read();
+        session_layout_metadata.apply_resurrect_command_hints(hints, |terminal_id, var| {
+            terminal_ids_to_pids
+                .get(&terminal_id)
+                .and_then(|pid| process_tree.find_env(*pid, var))
+        });
     }
     pub fn fill_plugin_cwd(
         &self,
@@ -2191,9 +2230,11 @@ impl Pty {
         &mut self,
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
+        resurrect_command_hints: Option<ResurrectCommandHints>,
     ) {
         self.default_editor = default_editor;
         self.post_command_discovery_hook = post_command_discovery_hook;
+        self.resurrect_command_hints = resurrect_command_hints;
     }
 
     pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
