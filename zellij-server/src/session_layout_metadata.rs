@@ -10,6 +10,7 @@ use zellij_utils::{
     input::command::RunCommand,
     input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
     input::plugins::PluginAliases,
+    resurrect_command_hints::ResurrectCommandHints,
     session_serialization::{
         extract_command_and_args, extract_edit_and_line_number, extract_plugin_and_config,
         GlobalLayoutManifest, PaneLayoutManifest, TabLayoutManifest,
@@ -62,37 +63,25 @@ impl SessionLayoutMetadata {
         }
     }
     pub fn list_clients_metadata(&self) -> String {
-        let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
-        for tab in &self.tabs {
-            let panes = if tab.hide_floating_panes {
-                &tab.tiled_panes
-            } else {
-                &tab.floating_panes
-            };
-            for pane in panes {
-                for focused_client in &pane.focused_clients {
-                    clients_metadata.insert(
-                        *focused_client,
-                        ClientMetadata {
-                            pane_id: pane.id.clone(),
-                            command: pane.run.clone(),
-                        },
-                    );
-                }
-            }
-        }
-
-        ClientMetadata::render_many(clients_metadata, &self.default_editor)
+        ClientMetadata::render_many(self.all_clients_metadata(), &self.default_editor)
     }
+    /// Every client this layout knows about, and the pane each one is focused on.
+    ///
+    /// Both pane layers are read, not just the one on screen: floating panes are visible per tab
+    /// while focus is per client, so a client focused on a tiled pane in a tab where someone else
+    /// has floating panes up is a client with no row at all if only one layer is read. The layer
+    /// that is off screen goes in first, so a client that appears in both - its focus in the
+    /// hidden layer being only a memory of where it will return - is described by the layer it is
+    /// actually looking at.
     pub fn all_clients_metadata(&self) -> BTreeMap<ClientId, ClientMetadata> {
         let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
         for tab in &self.tabs {
-            let panes = if tab.hide_floating_panes {
-                &tab.tiled_panes
+            let (hidden_panes, visible_panes) = if tab.hide_floating_panes {
+                (&tab.floating_panes, &tab.tiled_panes)
             } else {
-                &tab.floating_panes
+                (&tab.tiled_panes, &tab.floating_panes)
             };
-            for pane in panes {
+            for pane in hidden_panes.iter().chain(visible_panes.iter()) {
                 for focused_client in &pane.focused_clients {
                     clients_metadata.insert(
                         *focused_client,
@@ -451,6 +440,67 @@ impl SessionLayoutMetadata {
             }
             for pane in tab.floating_panes.iter_mut() {
                 upgrade_pane(pane);
+            }
+        }
+    }
+    /// Rewrites the recorded command of any pane a `resurrect_command_hints` entry applies to, so
+    /// that the resurrected pane offers to resume the tool's session instead of starting a new one.
+    ///
+    /// `read_env` is the seam over the platform: it is handed a terminal id and a variable name and
+    /// returns the value found in that pane's processes. Everything the hints decide is here;
+    /// everything about processes is on the other side of that closure.
+    ///
+    /// A pane is left exactly as it was whenever anything does not line up - no hint matches, the
+    /// variable is not set, the template holds no command. There is no failure mode: a hint that
+    /// does not resolve gives the same snapshot the feature would have produced by not existing.
+    pub fn apply_resurrect_command_hints<F>(
+        &mut self,
+        hints: &ResurrectCommandHints,
+        mut read_env: F,
+    ) where
+        F: FnMut(u32, &str) -> Option<String>,
+    {
+        if hints.is_empty() {
+            return;
+        }
+        for tab in self.tabs.iter_mut() {
+            for pane in tab
+                .tiled_panes
+                .iter_mut()
+                .chain(tab.floating_panes.iter_mut())
+            {
+                let PaneId::Terminal(terminal_id) = pane.id else {
+                    continue;
+                };
+                let Some(Run::Command(run_command)) = pane.run.as_ref() else {
+                    continue;
+                };
+                let Some(hint) = hints.hint_for(&run_command.command.display().to_string()) else {
+                    continue;
+                };
+                let Some(env_value) = read_env(terminal_id, &hint.env) else {
+                    continue;
+                };
+                let Some((command, args)) = hint.expand(&env_value) else {
+                    log::debug!(
+                        "resurrect_command_hints {:?}: rewrite {:?} holds no command",
+                        hint.name,
+                        hint.rewrite
+                    );
+                    continue;
+                };
+                let mut rewritten = RunCommand::new(PathBuf::from(command));
+                rewritten.args = args;
+                rewritten.cwd = run_command.cwd.clone();
+                rewritten.hold_on_close = run_command.hold_on_close;
+                rewritten.hold_on_start = run_command.hold_on_start;
+                log::debug!(
+                    "resurrect_command_hints {:?}: recording {:?} for terminal {}",
+                    hint.name,
+                    rewritten.command,
+                    terminal_id
+                );
+                pane.run = Some(Run::Command(rewritten));
             }
         }
     }
@@ -890,6 +940,179 @@ mod tests {
         );
     }
 
+    fn hints(entries: &[(&str, &str, &str)]) -> ResurrectCommandHints {
+        let mut hints = ResurrectCommandHints::default();
+        for (match_command, env, rewrite) in entries {
+            hints.push(
+                zellij_utils::resurrect_command_hints::ResurrectCommandHint {
+                    name: match_command.to_string(),
+                    match_command: match_command.to_string(),
+                    env: env.to_string(),
+                    rewrite: rewrite.to_string(),
+                },
+            );
+        }
+        hints
+    }
+
+    fn session_with_panes(panes: Vec<PaneLayoutMetadata>) -> SessionLayoutMetadata {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, panes, vec![]);
+        meta
+    }
+
+    /// The env-reading seam every test below stands in for: a fixed answer, so that what is
+    /// exercised is the decision and not the platform.
+    fn env_always(value: Option<&str>) -> impl FnMut(u32, &str) -> Option<String> {
+        let value = value.map(|v| v.to_string());
+        move |_terminal_id, _var| value.clone()
+    }
+
+    #[test]
+    fn rewrites_a_matching_command_when_the_variable_is_found() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec![])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            env_always(Some("abc-123")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()]);
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn matches_a_command_by_its_basename() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "/opt/homebrew/bin/claude",
+            vec!["--verbose"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            env_always(Some("abc-123")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                // the recorded arguments are replaced, not appended to - the rewrite is the whole
+                // command line the resurrected pane offers
+                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()]);
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leaves_the_command_alone_when_the_variable_is_missing() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["--verbose"])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            env_always(None),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                assert_eq!(rc.args, vec!["--verbose".to_owned()]);
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leaves_an_unmatched_command_alone_and_never_reads_its_environment() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "htop", vec![])]);
+        let mut reads = 0;
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            |_terminal_id, _var| {
+                reads += 1;
+                Some("abc-123".to_owned())
+            },
+        );
+        assert_eq!(reads, 0, "an unmatched pane must cost no process lookup");
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => assert_eq!(rc.command, PathBuf::from("htop")),
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn expands_a_placeholder_that_sits_in_an_argument() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "opencode", vec![])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[(
+                "opencode",
+                "OPENCODE_SESSION_ID",
+                "opencode --session={} --continue",
+            )]),
+            env_always(Some("xyz")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("opencode"));
+                assert_eq!(
+                    rc.args,
+                    vec!["--session=xyz".to_owned(), "--continue".to_owned()]
+                );
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_hints_configured_changes_nothing() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec![])]);
+        meta.apply_resurrect_command_hints(
+            &ResurrectCommandHints::default(),
+            env_always(Some("abc-123")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("claude"));
+                assert!(rc.args.is_empty());
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_pane_running_no_command_is_untouched() {
+        let mut pane = make_command_pane(1, "claude", vec![]);
+        pane.run = None;
+        let mut meta = session_with_panes(vec![pane]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            env_always(Some("abc-123")),
+        );
+        assert_eq!(get_first_tiled_run(&meta), None);
+    }
+
+    #[test]
+    fn floating_panes_are_rewritten_too() {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![],
+            vec![make_command_pane(1, "claude", vec![])],
+        );
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            env_always(Some("abc-123")),
+        );
+        match meta.tabs[0].floating_panes[0].run.as_ref() {
+            Some(Run::Command(rc)) => {
+                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()])
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
     #[test]
     fn absolute_file_path_preserved() {
         let pane = make_command_pane(1, "nvim", vec!["/home/user/file.txt"]);
@@ -903,5 +1126,92 @@ mod tests {
                 None
             ))
         );
+    }
+
+    fn make_focused_pane(id: PaneId, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            id,
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            !focused_clients.is_empty(),
+            None,
+            focused_clients,
+            None,
+            None,
+        )
+    }
+
+    fn focused_pane_ids(meta: &SessionLayoutMetadata) -> Vec<(ClientId, PaneId)> {
+        meta.all_clients_metadata()
+            .into_iter()
+            .map(|(client_id, client_metadata)| (client_id, client_metadata.get_pane_id()))
+            .collect()
+    }
+
+    #[test]
+    fn client_list_covers_both_pane_layers() {
+        // client 2 is focused on a tiled pane while the tab shows floating panes: floating
+        // visibility is per tab, focus is per client, so this is not a contradiction
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+        assert_eq!(
+            focused_pane_ids(&meta),
+            vec![(1, PaneId::Plugin(3)), (2, PaneId::Terminal(1))]
+        );
+    }
+
+    #[test]
+    fn client_list_describes_a_client_by_the_layer_it_sees() {
+        // the same client is remembered by both layers - only the one on screen is where it is
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![1]);
+        let floating = make_focused_pane(PaneId::Terminal(2), vec![1]);
+
+        let mut floating_shown = SessionLayoutMetadata::default();
+        floating_shown.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![tiled.clone()],
+            vec![floating.clone()],
+        );
+        assert_eq!(
+            focused_pane_ids(&floating_shown),
+            vec![(1, PaneId::Terminal(2))]
+        );
+
+        let mut floating_hidden = SessionLayoutMetadata::default();
+        floating_hidden.add_tab("tab1".to_string(), true, true, vec![tiled], vec![floating]);
+        assert_eq!(
+            focused_pane_ids(&floating_hidden),
+            vec![(1, PaneId::Terminal(1))]
+        );
+    }
+
+    #[test]
+    fn rendered_client_list_names_every_client() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+        let rendered = meta.list_clients_metadata();
+        assert_eq!(rendered.lines().count(), 3, "a header and two clients");
+        assert!(rendered.contains("plugin_3"), "{}", rendered);
+        assert!(rendered.contains("terminal_1"), "{}", rendered);
+    }
+
+    #[test]
+    fn removing_a_plugin_takes_the_clients_focused_on_it() {
+        // why the client list must not drop the plugin that asked for it: the pane it would drop
+        // is the pane its clients are looking at
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1, 2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![], vec![floating]);
+        assert_eq!(meta.all_clients_metadata().len(), 2);
+        meta.remove_plugin_from_layout(3);
+        assert!(meta.all_clients_metadata().is_empty());
     }
 }
