@@ -1554,13 +1554,17 @@ build ignores a key it does not know, but rejects a value it does not know: stoc
 whole config with `Invalid value for pane_frame_style: 'top_only'`. Keep it out of a config file
 that a stock 0.45 build also reads.
 
-`top_only` **is** `titles`, with two differences:
+`top_only` **is** `titles`, with three differences:
 
 1. **The title line is a horizontal rule.** `titles` leaves the line blank around the title unless
    the pane is stacked; `top_only` fills it with `─` always. One condition in
    `compose_bracketed_title`.
 2. **No separators between panes.** `titles` draws `│` and `├─` from `Boundaries` along every pane
    edge; `top_only` draws none. `render_pane_boundaries` returns early.
+3. **A single pane still gets its rule.** `titles` hides the title row when a tab holds one
+   selectable non-borderless tiled pane; `top_only` promises one rule per pane, so it keeps it.
+   Two conditions in `tiled_panes/mod.rs` — `single_selectable_tiled_pane` in `set_pane_frames`
+   (the row the layout reserves) and `omit_pane_title` in `render` (the row it draws).
 
 Everywhere else the two behave identically, deliberately: `draws_titles()` answers `true` for both,
 so `top_only` follows the `titles` branch through the layout, offset and stacking code without a

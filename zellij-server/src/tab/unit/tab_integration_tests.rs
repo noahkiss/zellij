@@ -15697,3 +15697,64 @@ fn hidden_cursor_still_emits_cup_for_host_terminal_positioning() {
         "Show-cursor sequence must not be present when app has hidden the cursor"
     );
 }
+
+// Fork addition: `top_only` draws one rule per pane at all times. Upstream's single-pane
+// title suppression applies to `titles` only.
+#[test]
+fn single_pane_top_only_frame_style_draws_title_row() {
+    let size = Size { cols: 40, rows: 6 };
+    let client_id = 1;
+    let mut tab = create_new_tab(size, ModeInfo::default());
+    tab.set_pane_frames(PaneFrameStyle::TopOnly);
+    tab.handle_pty_bytes(1, Vec::from("I am a single pane".as_bytes()))
+        .unwrap();
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+    let snapshot = take_snapshot(
+        output.serialize().unwrap().get(&client_id).unwrap(),
+        size.rows,
+        size.cols,
+        Palette::default(),
+    );
+    let first_row = snapshot.lines().next().unwrap();
+    assert!(
+        first_row.contains('─'),
+        "top_only must draw its rule for a single pane, got: {:?}",
+        first_row
+    );
+    assert!(
+        snapshot
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("I am a single pane"),
+        "pane content must start below the rule, got: {:?}",
+        snapshot
+    );
+    assert_snapshot!(snapshot);
+}
+
+#[test]
+fn single_pane_titles_frame_style_omits_title_row() {
+    let size = Size { cols: 40, rows: 6 };
+    let client_id = 1;
+    let mut tab = create_new_tab(size, ModeInfo::default());
+    tab.set_pane_frames(PaneFrameStyle::Titles);
+    tab.handle_pty_bytes(1, Vec::from("I am a single pane".as_bytes()))
+        .unwrap();
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+    let snapshot = take_snapshot(
+        output.serialize().unwrap().get(&client_id).unwrap(),
+        size.rows,
+        size.cols,
+        Palette::default(),
+    );
+    let first_row = snapshot.lines().next().unwrap();
+    assert!(
+        first_row.contains("I am a single pane"),
+        "titles must keep suppressing the title row for a single pane, got: {:?}",
+        first_row
+    );
+    assert_snapshot!(snapshot);
+}
