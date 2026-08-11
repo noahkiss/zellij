@@ -1569,34 +1569,13 @@ pub fn render_controls_line(
             let kill_text = colors.bold("Kill");
             let kill_all = colors.shortcuts("<Ctrl d>");
             let kill_all_text = colors.bold("Kill all");
-            let disconnect_short_text = colors.bold("Disconnect");
-            let clients = colors.shortcuts("<Ctrl l>");
-            let clients_text = colors.bold("Clients");
-
-            // the client list is worth a shorter word elsewhere on the line: a key nobody can see
-            // is a key nobody presses, and this screen is the one place two clients are visible at
-            // all. So the tiers below give up "others" and the <Ctrl k> alias to keep it, and the
-            // compact tier names it too - only the narrowest width drops it
-            if max_cols > 117 {
-                print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}, {clients} - {clients_text}"
-                );
-                true
-            // Shortened: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect, <Del> - Kill, <Ctrl d> - Kill all, <Ctrl l> - Clients" = 101 chars
-            } else if max_cols > 101 {
-                print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}, {kill_all} - {kill_all_text}, {clients} - {clients_text}"
-                );
-                true
-            } else if max_cols > 97 {
+            // <Ctrl l> is named on the save line below, its one home - naming it here too made
+            // it show twice at ordinary widths
+            if max_cols > 97 {
                 print!(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}"
                 );
                 true
-            // Compact: "<Ctrl r>/<Ctrl x>/<Del>/<Ctrl d>/<Ctrl l>" = 41 chars
-            } else if max_cols >= 41 {
-                print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{kill_all}/{clients}");
-                false
             } else if max_cols >= 28 {
                 print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{kill_all}");
                 false
@@ -1638,25 +1617,11 @@ pub fn render_controls_line(
             // the alias. The narrower tiers keep "<Del>" rather than lose a whole entry to it.
             let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill/Delete");
-            let clients = colors.shortcuts("<Ctrl l>");
-            let clients_text = colors.bold("Clients");
 
-            // Widest: the full line plus ", <Ctrl l> - Clients" = 103 chars
-            if max_cols > 103 {
-                print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}, {clients} - {clients_text}"
-                );
-                true
-            // Shortened: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect, <Del> - Kill/Delete, <Ctrl l> - Clients" = 87
-            // chars. A floating session manager is about this wide, so this is the tier most
-            // people read: it gives up "others" and the <Ctrl k> alias to name the client list
-            } else if max_cols > 87 {
-                print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}, {clients} - {clients_text}"
-                );
-                true
+            // <Ctrl l> is named on the save line below, its one home - naming it here too made
+            // it show twice at ordinary widths
             // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del/Ctrl k> - Kill/Delete" = 83 chars
-            } else if max_cols > 83 {
+            if max_cols > 83 {
                 print!(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}"
                 );
@@ -1667,10 +1632,6 @@ pub fn render_controls_line(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}"
                 );
                 true
-            // Compact: "<Ctrl r>/<Ctrl x>/<Del>/<Ctrl l>" = 32 chars
-            } else if max_cols >= 32 {
-                print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{clients}");
-                false
             // Narrowest: "<Ctrl r>/<Ctrl x>/<Del>" = 23 chars
             } else if max_cols >= 23 {
                 print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}");
