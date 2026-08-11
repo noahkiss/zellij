@@ -21,8 +21,9 @@ impl Page {
         zellij_version: String,
         _base_mode: Rc<RefCell<InputMode>>,
         is_release_notes: bool,
+        server_exe: Option<String>,
     ) -> Self {
-        Page::new()
+        let page = Page::new()
             .main_screen()
             .with_title(main_screen_title(zellij_version.clone(), is_release_notes))
             .with_bulletin_list(BulletinList::new(whats_new_title()).with_items(vec![
@@ -121,16 +122,32 @@ impl Page {
                         "https://github.com/sponsors/imsnif".to_owned(),
                         link_executable.clone(),
                     )),
-            ])])
-            .with_help(if is_release_notes {
-                Box::new(|hovering_over_link, menu_item_is_selected| {
-                    release_notes_main_help(hovering_over_link, menu_item_is_selected)
-                })
-            } else {
-                Box::new(|hovering_over_link, menu_item_is_selected| {
-                    main_screen_help_text(hovering_over_link, menu_item_is_selected)
-                })
+            ])]);
+        // the binary the server is actually running, so it can be copied into macOS System
+        // Settings -> Privacy & Security -> Full Disk Access (Cmd+Shift+G in the file picker)
+        let page = match server_exe {
+            // the path gets a line to itself: it is the part that is copied, and sharing a line
+            // with a label costs it those columns and truncates a long path into a wrong one
+            Some(server_exe) => page.with_paragraph(vec![
+                ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
+                    Text::new("Server binary (macOS: grant Full Disk Access to this path):")
+                        .color_range(2, ..),
+                ))]),
+                ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
+                    Text::new(server_exe),
+                ))]),
+            ]),
+            None => page,
+        };
+        page.with_help(if is_release_notes {
+            Box::new(|hovering_over_link, menu_item_is_selected| {
+                release_notes_main_help(hovering_over_link, menu_item_is_selected)
             })
+        } else {
+            Box::new(|hovering_over_link, menu_item_is_selected| {
+                main_screen_help_text(hovering_over_link, menu_item_is_selected)
+            })
+        })
     }
     fn new_windows_support() -> Page {
         Page::new()

@@ -26,9 +26,45 @@ use crate::{
 use zellij_utils::plugin_api::action::ProtobufPluginConfiguration;
 use zellij_utils::{
     consts::ZELLIJ_TMP_DIR, data::InputMode, errors::prelude::*, input::command::TerminalAction,
-    input::keybinds::Keybinds, input::permission::PluginPermissions, input::plugins::PluginConfig,
-    pane_size::Size,
+    input::keybinds::Keybinds, input::layout::PluginUserConfiguration,
+    input::layout::RunPluginLocation, input::permission::PluginPermissions,
+    input::plugins::PluginConfig, pane_size::Size, session_lifecycle::own_executable_path,
 };
+
+/// The configuration key the `zellij:about` plugin reads the server's own binary path from.
+const SERVER_EXE_CONFIG_KEY: &str = "zellij_exe";
+
+/// The path of the server binary, resolved once per server process.
+///
+/// `current_exe()` is asked on the SERVER side on purpose: the about plugin exists to tell a macOS
+/// user which binary to hand Full Disk Access to, and TCC grants follow the process that actually
+/// opens the file - the server - never the client that launched it.
+fn server_exe_path() -> Option<&'static str> {
+    static SERVER_EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SERVER_EXE
+        .get_or_init(|| own_executable_path().map(|path| path.display().to_string()))
+        .as_deref()
+}
+
+/// Hand a plugin the configuration it should see at load time.
+///
+/// The stored `PluginConfig` is left alone: its configuration is half of the key the plugin map
+/// dedupes and focuses instances by, so injecting into it would make every launch-or-focus of the
+/// about plugin miss the running one and open another pane. Only the copy sent to `load()` grows a
+/// key, and only for the plugin that asked for it.
+fn configuration_for_load(plugin_config: &PluginConfig) -> PluginUserConfiguration {
+    let mut configuration = plugin_config.initial_userspace_configuration.clone();
+    let is_about_plugin = matches!(
+        &plugin_config.location,
+        RunPluginLocation::Zellij(tag) if tag.to_string() == "about"
+    );
+    if is_about_plugin && !configuration.inner().contains_key(SERVER_EXE_CONFIG_KEY) {
+        if let Some(server_exe) = server_exe_path() {
+            configuration.insert(SERVER_EXE_CONFIG_KEY, server_exe);
+        }
+    }
+    configuration
+}
 
 /// Open a directory as a `File` handle for WASI pre-opening.
 /// On Windows, `FILE_FLAG_BACKUP_SEMANTICS` is required to open directories.
@@ -221,12 +257,10 @@ impl<'a> PluginLoader<'a> {
             .call(&mut plugin.lock().unwrap().store, ())
             .with_context(err_context)?;
 
-        let protobuf_plugin_configuration: ProtobufPluginConfiguration = self
-            .plugin_config
-            .initial_userspace_configuration
-            .clone()
-            .try_into()
-            .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
+        let protobuf_plugin_configuration: ProtobufPluginConfiguration =
+            configuration_for_load(&self.plugin_config)
+                .try_into()
+                .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
         let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
         wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
             .with_context(err_context)?;
@@ -490,4 +524,45 @@ fn create_optimized_store_limits() -> StoreLimits {
         .tables(16) // Small table element limit
         .trap_on_grow_failure(true) // Fail fast on resource exhaustion
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin_config(location: &str) -> PluginConfig {
+        PluginConfig {
+            path: PathBuf::new(),
+            _allow_exec_host_cmd: false,
+            location: RunPluginLocation::parse(location, None).unwrap(),
+            initial_userspace_configuration: Default::default(),
+            initial_cwd: None,
+        }
+    }
+
+    #[test]
+    fn about_plugin_is_told_the_server_binary_path() {
+        let configuration = configuration_for_load(&plugin_config("zellij:about"));
+        let injected = configuration.inner().get(SERVER_EXE_CONFIG_KEY);
+        assert_eq!(injected.map(|path| path.as_str()), server_exe_path());
+    }
+
+    #[test]
+    fn an_explicit_value_is_left_alone() {
+        let mut plugin_config = plugin_config("zellij:about");
+        plugin_config
+            .initial_userspace_configuration
+            .insert(SERVER_EXE_CONFIG_KEY, "/somewhere/else");
+        let configuration = configuration_for_load(&plugin_config);
+        assert_eq!(
+            configuration.inner().get(SERVER_EXE_CONFIG_KEY),
+            Some(&String::from("/somewhere/else"))
+        );
+    }
+
+    #[test]
+    fn other_plugins_are_untouched() {
+        let configuration = configuration_for_load(&plugin_config("zellij:status-bar"));
+        assert!(configuration.inner().is_empty());
+    }
 }
