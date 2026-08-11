@@ -20,8 +20,6 @@ pub struct CachedRowData {
     pub indices: Vec<usize>,
     pub original_index: usize,
     pub kind: CachedRowKind,
-    /// The session this plugin runs in. Rendered like any other row, but never selectable.
-    pub is_current: bool,
     // Pre-formatted strings (computed once, reused across renders)
     pub full_details: String,
     pub abbr_details: String,
@@ -57,7 +55,7 @@ pub struct DetailsColorRanges {
 #[derive(Default)]
 pub struct UnifiedResultsRenderCache {
     /// One row per result, with pre-formatted strings. The current session is
-    /// included and marked `is_current`; it renders but never takes selection.
+    /// included, tagged `<CURRENT>` in place of an action tag.
     pub rows: Vec<CachedRowData>,
     /// Max column widths across all cached rows.
     pub full_name_width: usize,
@@ -162,7 +160,6 @@ impl UnifiedResultsRenderCache {
                         indices: indices.clone(),
                         original_index: orig_i,
                         kind: CachedRowKind::Active,
-                        is_current,
                         full_details,
                         abbr_details,
                         full_tag,
@@ -221,7 +218,6 @@ impl UnifiedResultsRenderCache {
                         indices: indices.clone(),
                         original_index: orig_i,
                         kind: CachedRowKind::Resurrectable,
-                        is_current: false,
                         full_details,
                         abbr_details,
                         full_tag: "[RESURRECT]",
@@ -966,8 +962,7 @@ pub fn render_unified_results(
 
     let visible_count = end - start;
     for (row_index, row) in cache.rows[start..end].iter().enumerate() {
-        // the current session is drawn but never selected, whatever the index says
-        let is_selected = !row.is_current && filtered_selected == Some(start + row_index);
+        let is_selected = filtered_selected == Some(start + row_index);
 
         // Name cell — use cached string, only truncate if needed
         let display_name = match name_max_width {

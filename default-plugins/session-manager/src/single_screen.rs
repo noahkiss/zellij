@@ -154,20 +154,6 @@ impl SingleScreenState {
 
         self.render_cache.rebuild(&self.unified_results);
         self.restore_selection(previously_selected_name);
-        self.nudge_selection_off_current_session();
-    }
-
-    /// Keep the cursor off the current session's row.
-    ///
-    /// Movement already skips it, but the index restores (`restore_selection` by name,
-    /// `restore_selection_after_delete` by clamped position) can land on it. Now that the
-    /// row is drawn, a selection there would be visible and Enter-able, so push it away.
-    fn nudge_selection_off_current_session(&mut self) {
-        if let Some(index) = self.selected_index {
-            if self.is_current_session(index) {
-                self.selected_index = self.next_selectable_down(index);
-            }
-        }
     }
 
     fn previously_selected_name(&self) -> Option<String> {
@@ -198,7 +184,6 @@ impl SingleScreenState {
             previous_index,
             self.unified_results.len(),
         );
-        self.nudge_selection_off_current_session();
     }
 
     fn collect_all_sessions(
@@ -266,65 +251,29 @@ impl SingleScreenState {
         }
     }
 
-    fn is_current_session(&self, index: usize) -> bool {
-        matches!(
-            self.unified_results.get(index),
-            Some(UnifiedSearchResult::ActiveSession {
-                is_current_session: true,
-                ..
-            })
-        )
-    }
-
-    fn next_selectable_down(&self, from: usize) -> Option<usize> {
-        let len = self.unified_results.len();
-        for offset in 1..=len {
-            let candidate = (from + offset) % len;
-            if !self.is_current_session(candidate) {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
-    fn next_selectable_up(&self, from: usize) -> Option<usize> {
-        let len = self.unified_results.len();
-        for offset in 1..=len {
-            let candidate = (from + len - offset) % len;
-            if !self.is_current_session(candidate) {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
+    /// Selection wraps over every row, the current session included. The current session is
+    /// a valid target for rename, kill and the rest; only attaching to it is refused, and
+    /// that refusal belongs at the attach site, not here.
     pub fn move_selection_down(&mut self) {
-        if self.unified_results.is_empty() {
+        let len = self.unified_results.len();
+        if len == 0 {
             return;
         }
-        match self.selected_index {
-            None => {
-                self.selected_index =
-                    self.next_selectable_down(self.unified_results.len().saturating_sub(1));
-            },
-            Some(i) => {
-                self.selected_index = self.next_selectable_down(i);
-            },
-        }
+        self.selected_index = Some(match self.selected_index {
+            None => 0,
+            Some(i) => (i + 1) % len,
+        });
     }
 
     pub fn move_selection_up(&mut self) {
-        if self.unified_results.is_empty() {
+        let len = self.unified_results.len();
+        if len == 0 {
             return;
         }
-        match self.selected_index {
-            None => {
-                self.selected_index = self.next_selectable_up(0);
-            },
-            Some(i) => {
-                self.selected_index = self.next_selectable_up(i);
-            },
-        }
+        self.selected_index = Some(match self.selected_index {
+            None => len - 1,
+            Some(i) => (i + len - 1) % len,
+        });
     }
 
     pub fn tab_complete(
@@ -348,14 +297,9 @@ impl SingleScreenState {
         }
     }
 
-    /// The entry under the cursor, or `None`. The current session is never returned:
-    /// it is drawn in the list but is not an action target.
     pub fn get_selected_result(&self) -> Option<&UnifiedSearchResult> {
-        let index = self.selected_index?;
-        if self.is_current_session(index) {
-            return None;
-        }
-        self.unified_results.get(index)
+        self.selected_index
+            .and_then(|i| self.unified_results.get(i))
     }
 
     pub fn transition_to_layout_selection(&mut self) {
@@ -743,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_1_down_from_none_selects_first_non_current() {
+    fn test_3_1_down_from_none_selects_the_first_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -751,11 +695,11 @@ mod tests {
         );
         state.selected_index = None;
         state.move_selection_down();
-        assert_eq!(state.selected_index, Some(1));
+        assert_eq!(state.selected_index, Some(0)); // the current session, and that is fine
     }
 
     #[test]
-    fn test_3_2_down_from_last_wraps_to_first_non_current() {
+    fn test_3_2_down_from_last_wraps_to_first() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -763,11 +707,11 @@ mod tests {
         );
         state.selected_index = Some(2); // other-b, the last
         state.move_selection_down();
-        assert_eq!(state.selected_index, Some(0)); // wraps, skips current at 1
+        assert_eq!(state.selected_index, Some(0));
     }
 
     #[test]
-    fn test_3_3_up_from_none_selects_last_non_current() {
+    fn test_3_3_up_from_none_selects_the_last_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -779,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_4_up_from_first_wraps_to_last_non_current() {
+    fn test_3_4_up_from_first_wraps_to_last() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -787,7 +731,7 @@ mod tests {
         );
         state.selected_index = Some(0);
         state.move_selection_up();
-        assert_eq!(state.selected_index, Some(2)); // wraps, skips current
+        assert_eq!(state.selected_index, Some(2));
     }
 
     #[test]
@@ -796,9 +740,9 @@ mod tests {
         setup_results_with_current(&mut state, &[("current", true)]);
         state.selected_index = None;
         state.move_selection_down();
-        assert_eq!(state.selected_index, None);
+        assert_eq!(state.selected_index, Some(0));
         state.move_selection_up();
-        assert_eq!(state.selected_index, None);
+        assert_eq!(state.selected_index, Some(0));
     }
 
     #[test]
@@ -813,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_7_sequential_down_visits_all_non_current() {
+    fn test_3_7_sequential_down_visits_every_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -829,7 +773,9 @@ mod tests {
         state.move_selection_down();
         assert_eq!(state.selected_index, Some(0)); // "a"
         state.move_selection_down();
-        assert_eq!(state.selected_index, Some(2)); // "b", skip current at 1
+        assert_eq!(state.selected_index, Some(1)); // "current", reachable like any other row
+        state.move_selection_down();
+        assert_eq!(state.selected_index, Some(2)); // "b"
         state.move_selection_down();
         assert_eq!(state.selected_index, Some(3)); // "c"
         state.move_selection_down();
@@ -839,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_8_sequential_up_visits_all_non_current_in_reverse() {
+    fn test_3_8_sequential_up_visits_every_row_in_reverse() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -859,7 +805,9 @@ mod tests {
         state.move_selection_up();
         assert_eq!(state.selected_index, Some(2)); // "b"
         state.move_selection_up();
-        assert_eq!(state.selected_index, Some(0)); // "a", skip current at 1
+        assert_eq!(state.selected_index, Some(1)); // "current"
+        state.move_selection_up();
+        assert_eq!(state.selected_index, Some(0)); // "a"
         state.move_selection_up();
         assert_eq!(state.selected_index, Some(4)); // "d", wrapped
     }
@@ -1018,7 +966,6 @@ mod tests {
             .iter()
             .find(|r| r.session_name == "current-sess")
             .expect("current session row");
-        assert!(current_row.is_current);
         assert_eq!(current_row.full_tag, "<CURRENT>");
         assert_eq!(current_row.abbr_tag, "<C>");
     }
@@ -1042,37 +989,55 @@ mod tests {
     }
 
     #[test]
-    fn test_6_3_selection_movement_never_lands_on_current_row() {
+    fn test_6_3_selection_movement_reaches_the_current_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
-            &[
-                ("a", false),
-                ("current", true),
-                ("b", false),
-                ("c", false),
-            ],
+            &[("a", false), ("current", true), ("b", false)],
         );
+
         state.selected_index = None;
-        for _ in 0..12 {
+        let mut visited_going_down = vec![];
+        for _ in 0..3 {
             state.move_selection_down();
-            let index = state.selected_index.expect("a selectable row exists");
-            assert!(!state.is_current_session(index));
+            visited_going_down.push(state.selected_index);
         }
+        assert_eq!(
+            visited_going_down,
+            vec![Some(0), Some(1), Some(2)],
+            "down must stop on the current row too"
+        );
+
         state.selected_index = None;
-        for _ in 0..12 {
+        let mut visited_going_up = vec![];
+        for _ in 0..3 {
             state.move_selection_up();
-            let index = state.selected_index.expect("a selectable row exists");
-            assert!(!state.is_current_session(index));
+            visited_going_up.push(state.selected_index);
         }
+        assert_eq!(visited_going_up, vec![Some(2), Some(1), Some(0)]);
     }
 
     #[test]
-    fn test_6_4_current_row_is_never_an_action_target() {
+    fn test_6_4_the_current_row_is_an_action_target() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(&mut state, &[("a", false), ("current", true)]);
         state.selected_index = Some(1);
-        assert!(state.get_selected_result().is_none());
+
+        // rename, kill and disconnect all route through the selected result
+        let selected = state.get_selected_result().expect("current row selectable");
+        assert_eq!(selected.session_name(), "current");
+        match selected.as_delete_target() {
+            DeleteTarget::Active(name) => assert_eq!(name, "current"),
+            DeleteTarget::Resurrectable(_) => panic!("the current session is live"),
+        }
+        // ...and attach is the one action that refuses it, guarded at the dispatch site
+        assert!(matches!(
+            selected,
+            UnifiedSearchResult::ActiveSession {
+                is_current_session: true,
+                ..
+            }
+        ));
     }
 
     #[test]

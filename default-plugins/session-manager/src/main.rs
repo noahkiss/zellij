@@ -1568,10 +1568,13 @@ impl State {
                                     is_current_session, ..
                                 } => {
                                     if *is_current_session {
-                                        self.show_error("Already attached...");
-                                    } else {
-                                        switch_session_with_focus(&session_name, None, None);
+                                        // the only action the current session refuses. Say so and
+                                        // stay put - clearing the search or hiding the plugin here
+                                        // would throw away the user's place and the notice with it
+                                        self.show_error("Already attached to this session.");
+                                        return;
                                     }
+                                    switch_session_with_focus(&session_name, None, None);
                                 },
                                 UnifiedSearchResult::ResurrectableSession { .. } => {
                                     switch_session(Some(&session_name));
@@ -1607,7 +1610,7 @@ impl State {
                             // Check exact match against active sessions
                             if self.sessions.has_session(&typed_name) {
                                 if self.session_name.as_deref() == Some(&typed_name) {
-                                    self.show_error("Already attached...");
+                                    self.show_error("Already attached to this session.");
                                 } else {
                                     switch_session_with_focus(&typed_name, None, None);
                                     if self.is_welcome_screen {
