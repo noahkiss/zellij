@@ -8407,7 +8407,6 @@ fn config_options_to_string_without_options() {
 }
 
 #[test]
-#[test]
 fn nested_session_handling_kdl_round_trip_for_every_variant() {
     use crate::input::options::NestedSessionHandling;
     let cases = [

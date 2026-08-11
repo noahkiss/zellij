@@ -1690,10 +1690,7 @@ impl State {
             return None;
         }
         let live_sessions = self.sessions.session_ui_infos.len();
-        let exited_sessions = self
-            .resurrectable_sessions
-            .all_resurrectable_sessions
-            .len();
+        let exited_sessions = self.resurrectable_sessions.all_resurrectable_sessions.len();
         if live_sessions == 0 && exited_sessions == 0 {
             return Some(String::from(
                 "No sessions to show: the server's scan of its socket and session-info dirs returned 0 live and 0 exited.",

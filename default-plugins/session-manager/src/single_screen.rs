@@ -949,7 +949,10 @@ mod tests {
         let mut state = SingleScreenState::default();
         state.search_term = String::new();
         let active = vec![make_active_session("current-sess", 1, 1, 1, true, 100)];
-        let resurrectable = vec![make_resurrectable("res-a", 50), make_resurrectable("res-b", 60)];
+        let resurrectable = vec![
+            make_resurrectable("res-a", 50),
+            make_resurrectable("res-b", 60),
+        ];
         state.update_search_term(&active, &resurrectable);
 
         let names: Vec<&str> = state
@@ -991,10 +994,7 @@ mod tests {
     #[test]
     fn test_6_3_selection_movement_reaches_the_current_row() {
         let mut state = SingleScreenState::default();
-        setup_results_with_current(
-            &mut state,
-            &[("a", false), ("current", true), ("b", false)],
-        );
+        setup_results_with_current(&mut state, &[("a", false), ("current", true), ("b", false)]);
 
         state.selected_index = None;
         let mut visited_going_down = vec![];
