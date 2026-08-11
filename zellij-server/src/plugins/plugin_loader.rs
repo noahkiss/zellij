@@ -34,6 +34,16 @@ use zellij_utils::{
 /// The configuration key the `zellij:about` plugin reads the server's own binary path from.
 const SERVER_EXE_CONFIG_KEY: &str = "zellij_exe";
 
+/// The configuration key that asks the about plugin to say what the path is FOR.
+///
+/// Only macOS has a Full Disk Access panel to paste the path into, and only the host running the
+/// server knows whether this is macOS - the client may well be somewhere else. So the server, not
+/// the plugin, decides whether the hint is worth a line. The plugin owns the wording.
+const SERVER_EXE_HINT_CONFIG_KEY: &str = "zellij_exe_hint";
+
+/// The hint the about plugin renders on macOS hosts.
+const FULL_DISK_ACCESS_HINT: &str = "full_disk_access";
+
 /// The path of the server binary, resolved once per server process.
 ///
 /// `current_exe()` is asked on the SERVER side on purpose: the about plugin exists to tell a macOS
@@ -61,6 +71,13 @@ fn configuration_for_load(plugin_config: &PluginConfig) -> PluginUserConfigurati
     if is_about_plugin && !configuration.inner().contains_key(SERVER_EXE_CONFIG_KEY) {
         if let Some(server_exe) = server_exe_path() {
             configuration.insert(SERVER_EXE_CONFIG_KEY, server_exe);
+            if cfg!(target_os = "macos")
+                && !configuration
+                    .inner()
+                    .contains_key(SERVER_EXE_HINT_CONFIG_KEY)
+            {
+                configuration.insert(SERVER_EXE_HINT_CONFIG_KEY, FULL_DISK_ACCESS_HINT);
+            }
         }
     }
     configuration
@@ -564,5 +581,29 @@ mod tests {
     fn other_plugins_are_untouched() {
         let configuration = configuration_for_load(&plugin_config("zellij:status-bar"));
         assert!(configuration.inner().is_empty());
+    }
+
+    #[test]
+    fn the_full_disk_access_hint_is_a_macos_thing() {
+        let configuration = configuration_for_load(&plugin_config("zellij:about"));
+        let hint = configuration.inner().get(SERVER_EXE_HINT_CONFIG_KEY);
+        if cfg!(target_os = "macos") {
+            assert_eq!(hint, Some(&String::from(FULL_DISK_ACCESS_HINT)));
+        } else {
+            assert_eq!(hint, None);
+        }
+    }
+
+    #[test]
+    fn an_explicit_hint_is_left_alone() {
+        let mut plugin_config = plugin_config("zellij:about");
+        plugin_config
+            .initial_userspace_configuration
+            .insert(SERVER_EXE_HINT_CONFIG_KEY, "something_else");
+        let configuration = configuration_for_load(&plugin_config);
+        assert_eq!(
+            configuration.inner().get(SERVER_EXE_HINT_CONFIG_KEY),
+            Some(&String::from("something_else"))
+        );
     }
 }

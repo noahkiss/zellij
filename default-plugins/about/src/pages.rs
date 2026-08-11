@@ -1,6 +1,7 @@
 use zellij_tile::prelude::*;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::active_component::{ActiveComponent, ClickAction};
@@ -9,6 +10,8 @@ use crate::active_component::{ActiveComponent, ClickAction};
 pub struct Page {
     title: Option<Text>,
     components_to_render: Vec<RenderedComponent>,
+    /// Indices into `components_to_render` that a pane too short for the page must still show
+    essential_components: HashSet<usize>,
     has_hover: bool,
     hovering_over_link: bool,
     menu_item_is_selected: bool,
@@ -22,6 +25,7 @@ impl Page {
         _base_mode: Rc<RefCell<InputMode>>,
         is_release_notes: bool,
         server_exe: Option<String>,
+        server_exe_hint: Option<String>,
     ) -> Self {
         let page = Page::new()
             .main_screen()
@@ -123,15 +127,16 @@ impl Page {
                         link_executable.clone(),
                     )),
             ])]);
-        // the binary the server is actually running, so it can be copied into macOS System
-        // Settings -> Privacy & Security -> Full Disk Access (Cmd+Shift+G in the file picker)
+        // the binary the server is actually running. The server sends the hint only from a macOS
+        // host, where the path is copied into System Settings -> Privacy & Security -> Full Disk
+        // Access (Cmd+Shift+G in the file picker); elsewhere the path answers "which build is this
+        // session running" and needs no explaining.
         let page = match server_exe {
             // the path gets a line to itself: it is the part that is copied, and sharing a line
             // with a label costs it those columns and truncates a long path into a wrong one
-            Some(server_exe) => page.with_paragraph(vec![
+            Some(server_exe) => page.with_essential_paragraph(vec![
                 ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
-                    Text::new("Server binary (macOS: grant Full Disk Access to this path):")
-                        .color_range(2, ..),
+                    server_binary_label(server_exe_hint.is_some()),
                 ))]),
                 ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
                     Text::new(server_exe),
@@ -447,6 +452,7 @@ impl Page {
         Page {
             title: None,
             components_to_render: vec![],
+            essential_components: HashSet::new(),
             has_hover: false,
             hovering_over_link: false,
             menu_item_is_selected: false,
@@ -470,6 +476,12 @@ impl Page {
         self.components_to_render
             .push(RenderedComponent::Paragraph(paragraph));
         self
+    }
+    /// A paragraph that a pane too short for the whole page keeps at the cost of the rest.
+    pub fn with_essential_paragraph(mut self, paragraph: Vec<ComponentLine>) -> Self {
+        self.essential_components
+            .insert(self.components_to_render.len());
+        self.with_paragraph(paragraph)
     }
     pub fn with_help(mut self, help_text_fn: Box<dyn Fn(bool, bool) -> Text>) -> Self {
         self.components_to_render
@@ -654,12 +666,16 @@ impl Page {
         }
         column_count
     }
-    pub fn ui_row_count(&mut self) -> usize {
+    /// The rows the page wants, given the components a short pane made it give up.
+    fn ui_row_count_without(&self, hidden: &HashSet<usize>) -> usize {
         let mut row_count = 0;
         if self.title.is_some() {
             row_count += 1;
         }
-        for rendered_component in &self.components_to_render {
+        for (index, rendered_component) in self.components_to_render.iter().enumerate() {
+            if hidden.contains(&index) {
+                continue;
+            }
             match rendered_component {
                 RenderedComponent::BulletinList(bulletin_list) => {
                     row_count += bulletin_list.len();
@@ -671,12 +687,43 @@ impl Page {
                                                           // the UI container
             }
         }
-        row_count += self.components_to_render.len();
+        row_count += self.components_to_render.len() - hidden.len();
         row_count
     }
+    /// Which components to leave out of a pane too short to hold the page.
+    ///
+    /// The page is a fixed block centered in the pane, so whatever does not fit falls off the
+    /// bottom and is never seen - which is fine for a decorative list and not fine for a line a
+    /// user opened this page to copy. Give up the biggest thing that is not essential first, so
+    /// the "What's new" list goes before a one-line paragraph does, until the rest fits.
+    fn components_to_hide(&self, rows: usize) -> HashSet<usize> {
+        let mut hidden = HashSet::new();
+        while self.ui_row_count_without(&hidden) > rows {
+            let biggest_expendable = self
+                .components_to_render
+                .iter()
+                .enumerate()
+                .filter(|(index, component)| {
+                    !hidden.contains(index)
+                        && !self.essential_components.contains(index)
+                        && !matches!(component, RenderedComponent::HelpText(_))
+                })
+                .max_by_key(|(index, component)| (component.row_count(), *index));
+            match biggest_expendable {
+                Some((index, _)) => {
+                    hidden.insert(index);
+                },
+                // everything left is essential: it overflows, which beats hiding the point of the
+                // page
+                None => break,
+            }
+        }
+        hidden
+    }
     pub fn render(&mut self, rows: usize, columns: usize, error: &Option<String>) {
+        let hidden = self.components_to_hide(rows);
         let base_x = columns.saturating_sub(self.ui_column_count()) / 2;
-        let base_y = rows.saturating_sub(self.ui_row_count()) / 2;
+        let base_y = rows.saturating_sub(self.ui_row_count_without(&hidden)) / 2;
         let mut current_y = base_y;
         if let Some(title) = &self.title {
             print_text_with_coordinates(
@@ -688,7 +735,12 @@ impl Page {
             );
             current_y += 2;
         }
-        for rendered_component in &mut self.components_to_render {
+        for (index, rendered_component) in self.components_to_render.iter_mut().enumerate() {
+            if hidden.contains(&index) {
+                // a component that did not render must not stay clickable where it used to be
+                rendered_component.clear_rendered_coordinates();
+                continue;
+            }
             let is_help = match rendered_component {
                 RenderedComponent::HelpText(_) => true,
                 _ => false,
@@ -726,6 +778,16 @@ fn render_error(error: &str, y: usize) {
         None,
         None,
     );
+}
+
+/// The label above the server binary path, saying what the path is for when there is something to
+/// say. Only a macOS host sends the hint, because only macOS has a panel to paste the path into.
+fn server_binary_label(with_full_disk_access_hint: bool) -> Text {
+    if with_full_disk_access_hint {
+        Text::new("Server binary (macOS: grant Full Disk Access to this path):").color_range(2, ..)
+    } else {
+        Text::new("Server binary:").color_range(2, ..)
+    }
 }
 
 fn changelog_link_unselected(version: String) -> Text {
@@ -970,6 +1032,27 @@ impl RenderedComponent {
         }
         rendered_rows
     }
+    /// Rows this takes inside the UI container. Help text sits outside it and so costs none.
+    pub fn row_count(&self) -> usize {
+        match self {
+            RenderedComponent::HelpText(_) => 0,
+            RenderedComponent::BulletinList(bulletin_list) => bulletin_list.len(),
+            RenderedComponent::Paragraph(paragraph) => paragraph.len(),
+        }
+    }
+    pub fn clear_rendered_coordinates(&mut self) {
+        match self {
+            RenderedComponent::HelpText(_) => {},
+            RenderedComponent::BulletinList(bulletin_list) => {
+                bulletin_list.clear_rendered_coordinates()
+            },
+            RenderedComponent::Paragraph(paragraph) => {
+                for component_line in paragraph {
+                    component_line.clear_rendered_coordinates();
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -991,6 +1074,11 @@ impl BulletinList {
     }
     pub fn len(&self) -> usize {
         self.items.len() + 1 // 1 for the title
+    }
+    pub fn clear_rendered_coordinates(&mut self) {
+        for item in &mut self.items {
+            item.clear_rendered_coordinates();
+        }
     }
     pub fn column_count(&self) -> usize {
         let mut column_count = 0;
@@ -1128,5 +1216,94 @@ impl ComponentLine {
 impl ComponentLine {
     pub fn new(components: Vec<ActiveComponent>) -> Self {
         ComponentLine { components }
+    }
+    pub fn clear_rendered_coordinates(&mut self) {
+        for component in &mut self.components {
+            component.clear_rendered_coordinates();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SERVER_EXE: &str = "/opt/homebrew/Cellar/zellij/0.45.0/bin/zellij";
+
+    fn main_screen() -> Page {
+        Page::new_main_screen(
+            Rc::new(RefCell::new(String::from("open"))),
+            String::from("0.45.0"),
+            Rc::new(RefCell::new(InputMode::Normal)),
+            false,
+            Some(String::from(SERVER_EXE)),
+            Some(String::from("full_disk_access")),
+        )
+    }
+
+    /// The index of the paragraph holding the server binary path, which is the last one added
+    fn server_binary_paragraph(page: &Page) -> usize {
+        *page
+            .essential_components
+            .iter()
+            .next()
+            .expect("the main screen marks the server binary paragraph essential")
+    }
+
+    #[test]
+    fn a_pane_that_fits_the_page_hides_nothing() {
+        let page = main_screen();
+        assert_eq!(page.ui_row_count_without(&HashSet::new()), 18);
+        assert!(page.components_to_hide(18).is_empty());
+        assert!(page.components_to_hide(40).is_empty());
+    }
+
+    #[test]
+    fn a_short_pane_gives_up_the_whats_new_list_first() {
+        let page = main_screen();
+        let hidden = page.components_to_hide(17);
+        assert_eq!(hidden.len(), 1, "one component is enough at 17 rows");
+        assert!(!hidden.contains(&server_binary_paragraph(&page)));
+        assert!(page.ui_row_count_without(&hidden) <= 17);
+    }
+
+    #[test]
+    fn the_server_binary_survives_a_pane_too_short_for_anything_else() {
+        let page = main_screen();
+        for rows in 1..=17 {
+            let hidden = page.components_to_hide(rows);
+            assert!(
+                !hidden.contains(&server_binary_paragraph(&page)),
+                "the server binary paragraph was hidden at {} rows",
+                rows
+            );
+        }
+        // title, spacing and the two lines of the paragraph itself, and nothing else left to drop
+        assert_eq!(page.ui_row_count_without(&page.components_to_hide(1)), 5);
+    }
+
+    #[test]
+    fn a_page_without_a_server_binary_still_trims() {
+        let page = Page::new_main_screen(
+            Rc::new(RefCell::new(String::from("open"))),
+            String::from("0.45.0"),
+            Rc::new(RefCell::new(InputMode::Normal)),
+            false,
+            None,
+            None,
+        );
+        assert!(page.essential_components.is_empty());
+        assert_eq!(page.ui_row_count_without(&HashSet::new()), 15);
+        // the list alone buys 9 rows; below that the two remaining paragraphs go too
+        assert_eq!(page.components_to_hide(6).len(), 1);
+        assert_eq!(page.components_to_hide(3).len(), 3);
+    }
+
+    #[test]
+    fn the_hint_is_the_only_difference_between_hosts() {
+        let with_hint = server_binary_label(true);
+        let without_hint = server_binary_label(false);
+        assert!(format!("{:?}", with_hint).contains("Full Disk Access"));
+        assert!(!format!("{:?}", without_hint).contains("Full Disk Access"));
     }
 }
