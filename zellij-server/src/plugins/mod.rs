@@ -916,12 +916,15 @@ pub(crate) fn plugin_thread_main(
                 let default_editor = session_layout_metadata.default_editor.clone();
                 for (client_metadata_id, client_metadata) in clients_metadata.iter_mut() {
                     let is_current_client = client_metadata_id == &client_id;
-                    client_list_for_plugin.push(ClientInfo::new(
-                        *client_metadata_id,
-                        client_metadata.get_pane_id().into(),
-                        client_metadata.stringify_command(&default_editor),
-                        is_current_client,
-                    ));
+                    client_list_for_plugin.push(
+                        ClientInfo::new(
+                            *client_metadata_id,
+                            client_metadata.get_pane_id().into(),
+                            client_metadata.stringify_command(&default_editor),
+                            is_current_client,
+                        )
+                        .with_terminal_size(client_metadata.terminal_size()),
+                    );
                 }
                 let updates = vec![(
                     Some(plugin_id),

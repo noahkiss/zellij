@@ -241,6 +241,10 @@ message ClientInfo {
   PaneId pane_id = 2;
   string running_command = 3;
   bool is_current_client = 4;
+  // fork-only fields start at 100, leaving 5.. free for upstream
+  // the client's terminal size, absent when the server has not recorded one yet
+  optional uint32 terminal_rows = 100;
+  optional uint32 terminal_cols = 101;
 }
 
 message FailedToWriteConfigToDiskPayload {
