@@ -1076,6 +1076,20 @@ mod tests {
     }
 
     #[test]
+    fn test_6_6_every_result_becomes_a_row() {
+        let mut state = SingleScreenState::default();
+        state.search_term = String::new();
+        let active = vec![
+            make_active_session("current-sess", 1, 1, 1, true, 100),
+            make_active_session("other-sess", 1, 1, 1, false, 200),
+        ];
+        let resurrectable = vec![make_resurrectable("res-a", 50)];
+        state.update_search_term(&active, &resurrectable);
+        assert_eq!(state.render_cache.rows.len(), state.unified_results.len());
+        assert_eq!(state.render_cache.dropped_rows, 0);
+    }
+
+    #[test]
     fn test_6_5_tab_complete_still_skips_the_current_session() {
         let mut state = SingleScreenState::default();
         let active = vec![

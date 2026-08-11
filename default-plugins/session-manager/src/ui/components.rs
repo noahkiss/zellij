@@ -64,6 +64,12 @@ pub struct UnifiedResultsRenderCache {
     pub full_details_width: usize,
     pub abbr_details_width: usize,
     pub full_tag_width: usize,
+    /// Results the last rebuild did not turn into rows.
+    ///
+    /// Expected to be zero: every result gets a row. A non-zero count means the
+    /// render layer swallowed a session the server did report, which is the
+    /// failure the caller turns into a visible notice instead of silence.
+    pub dropped_rows: usize,
 }
 
 impl UnifiedResultsRenderCache {
@@ -246,6 +252,8 @@ impl UnifiedResultsRenderCache {
 
             self.rows.push(row);
         }
+
+        self.dropped_rows = results.len().saturating_sub(self.rows.len());
     }
 }
 
