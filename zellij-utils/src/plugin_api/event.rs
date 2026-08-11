@@ -54,6 +54,7 @@ use crate::data::{
 
 use crate::errors::prelude::*;
 use crate::input::actions::Action;
+use crate::pane_size::Size;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
@@ -644,6 +645,17 @@ impl TryFrom<ProtobufEvent> for Event {
 impl TryFrom<ProtobufClientInfo> for ClientInfo {
     type Error = &'static str;
     fn try_from(protobuf_client_info: ProtobufClientInfo) -> Result<Self, &'static str> {
+        let terminal_size = match (
+            protobuf_client_info.terminal_rows,
+            protobuf_client_info.terminal_cols,
+        ) {
+            (Some(rows), Some(cols)) => Some(Size {
+                rows: rows as usize,
+                cols: cols as usize,
+            }),
+            // a half-filled size is no size: report nothing rather than a made-up dimension
+            _ => None,
+        };
         Ok(ClientInfo::new(
             protobuf_client_info.client_id as u16,
             protobuf_client_info
@@ -652,7 +664,8 @@ impl TryFrom<ProtobufClientInfo> for ClientInfo {
                 .try_into()?,
             protobuf_client_info.running_command,
             protobuf_client_info.is_current_client,
-        ))
+        )
+        .with_terminal_size(terminal_size))
     }
 }
 
@@ -664,6 +677,8 @@ impl TryFrom<ClientInfo> for ProtobufClientInfo {
             pane_id: Some(client_info.pane_id.try_into()?),
             running_command: client_info.running_command,
             is_current_client: client_info.is_current_client,
+            terminal_rows: client_info.terminal_size.map(|size| size.rows as u32),
+            terminal_cols: client_info.terminal_size.map(|size| size.cols as u32),
         })
     }
 }
@@ -3493,5 +3508,59 @@ impl TryFrom<SelectedText> for ProtobufSelectedText {
             start: Some(selected_text.start.try_into()?),
             end: Some(selected_text.end.try_into()?),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_info(terminal_size: Option<Size>) -> ClientInfo {
+        ClientInfo::new(3, PaneId::Terminal(7), "zsh".to_owned(), true)
+            .with_terminal_size(terminal_size)
+    }
+
+    fn protobuf_client_info(
+        terminal_rows: Option<u32>,
+        terminal_cols: Option<u32>,
+    ) -> ProtobufClientInfo {
+        ProtobufClientInfo {
+            client_id: 3,
+            pane_id: Some(PaneId::Terminal(7).try_into().unwrap()),
+            running_command: "zsh".to_owned(),
+            is_current_client: true,
+            terminal_rows,
+            terminal_cols,
+        }
+    }
+
+    #[test]
+    fn client_info_roundtrips_through_protobuf() {
+        for size in [
+            Some(Size {
+                rows: 40,
+                cols: 160,
+            }),
+            None,
+        ] {
+            let client_info = client_info(size);
+            let protobuf: ProtobufClientInfo = client_info.clone().try_into().unwrap();
+            let roundtripped: ClientInfo = protobuf.try_into().unwrap();
+            assert_eq!(client_info, roundtripped);
+        }
+    }
+
+    #[test]
+    fn a_client_info_written_without_the_size_tags_reads_as_no_size() {
+        // an older plugin or server never writes the fork-only tags, so they arrive absent
+        let client_info: ClientInfo = protobuf_client_info(None, None).try_into().unwrap();
+        assert_eq!(client_info.terminal_size, None);
+        assert_eq!(client_info.terminal_area(), None);
+    }
+
+    #[test]
+    fn half_a_size_is_no_size() {
+        let client_info: ClientInfo = protobuf_client_info(Some(40), None).try_into().unwrap();
+        assert_eq!(client_info.terminal_size, None);
     }
 }

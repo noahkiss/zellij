@@ -6,7 +6,7 @@ use crate::input::layout::{
     Layout, PercentOrFixed, Run, RunPlugin, RunPluginLocation, RunPluginOrAlias,
 };
 pub use crate::input::options::PaneFrameStyle;
-use crate::pane_size::PaneGeom;
+use crate::pane_size::{PaneGeom, Size};
 use crate::position::Position;
 use crate::shared::{colors as default_colors, eightbit_to_rgb};
 use clap::ValueEnum;
@@ -2418,6 +2418,13 @@ pub struct ClientInfo {
     pub pane_id: PaneId,
     pub running_command: String,
     pub is_current_client: bool,
+    /// The size of this client's terminal, when the server knows it.
+    ///
+    /// A session is sized to its smallest attached client, so this is what tells a human which
+    /// client is shrinking the grid for everyone else. `None` when the server has not yet
+    /// recorded a size for the client - a client that has attached but not yet been sized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_size: Option<Size>,
 }
 
 /// One pane of an archived snapshot, as the saved layout describes it.
@@ -2480,7 +2487,20 @@ impl ClientInfo {
             pane_id,
             running_command,
             is_current_client,
+            terminal_size: None,
         }
+    }
+    /// Record the size of this client's terminal.
+    pub fn with_terminal_size(mut self, terminal_size: Option<Size>) -> Self {
+        self.terminal_size = terminal_size;
+        self
+    }
+    /// Cell count of this client's terminal, for comparing clients against each other.
+    ///
+    /// `None` for a client whose size the server has not recorded, so an unknown size never
+    /// wins a "smallest client" comparison.
+    pub fn terminal_area(&self) -> Option<usize> {
+        self.terminal_size.map(|size| size.rows * size.cols)
     }
 }
 
