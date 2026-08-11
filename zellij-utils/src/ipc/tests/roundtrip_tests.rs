@@ -455,6 +455,7 @@ fn test_client_messages() {
                 session_restart_drop_env: None,
                 session_service: None,
                 resurrect_command_hints: None,
+                default_floating_size: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),
