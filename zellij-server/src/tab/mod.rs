@@ -1303,6 +1303,24 @@ impl Tab {
         self.set_should_clear_display_before_rendering();
     }
     fn move_focus_within_stack_list(&mut self, client_id: ClientId, down: bool) -> bool {
+        self.select_focus_within_stack_list(client_id, down, false)
+    }
+    /// Fork addition: the stack focus wrap, for stack-list rendering. The members a wrap
+    /// would land on are suppressed rather than in the grid, so `wrap_stack_focus` (which
+    /// works on in-grid stacks) sees a stack of one here and does nothing.
+    ///
+    /// Like its in-grid counterpart this is the **third** fallback: callers reach it only
+    /// after the ordinary in-list step and the grid move have both failed, so a stack list
+    /// with a neighbour above still lets you leave it upwards rather than wrapping.
+    fn wrap_focus_within_stack_list(&mut self, client_id: ClientId, down: bool) -> bool {
+        self.select_focus_within_stack_list(client_id, down, true)
+    }
+    fn select_focus_within_stack_list(
+        &mut self,
+        client_id: ClientId,
+        down: bool,
+        wrap: bool,
+    ) -> bool {
         let active_pane_id = match self.tiled_panes.get_active_pane_id(client_id) {
             Some(id) => id,
             None => return false,
@@ -1323,12 +1341,23 @@ impl Tab {
                 Some(r) => r,
                 None => return false,
             };
+            // a one-member list must not wrap onto itself: that reports a focus change
+            // that never happened
+            let member_count = list.members.len();
             let target_rank = if down {
-                rank + 1
-            } else if rank == 0 {
-                return false;
-            } else {
+                if rank + 1 < member_count {
+                    rank + 1
+                } else if wrap && member_count > 1 {
+                    0
+                } else {
+                    return false;
+                }
+            } else if rank > 0 {
                 rank - 1
+            } else if wrap && member_count > 1 {
+                member_count - 1
+            } else {
+                return false;
             };
             match list.members.get(target_rank) {
                 Some(member) => *member,
@@ -5373,7 +5402,12 @@ impl Tab {
             {
                 return Ok(true);
             }
-            Ok(self.tiled_panes.move_focus_down(client_id))
+            if self.tiled_panes.move_focus_down(client_id) {
+                return Ok(true);
+            }
+            // at the bottom of a stack list with nothing below it, come round to the top
+            Ok(self.stacked_pane_list_is_active()
+                && self.wrap_focus_within_stack_list(client_id, true))
         }
     }
     pub fn move_focus_up(&mut self, client_id: ClientId) -> Result<bool> {
@@ -5399,7 +5433,12 @@ impl Tab {
             {
                 return Ok(true);
             }
-            Ok(self.tiled_panes.move_focus_up(client_id))
+            if self.tiled_panes.move_focus_up(client_id) {
+                return Ok(true);
+            }
+            // at the top of a stack list with nothing above it, come round to the bottom
+            Ok(self.stacked_pane_list_is_active()
+                && self.wrap_focus_within_stack_list(client_id, false))
         }
     }
     // returns a boolean that indicates whether the focus moved

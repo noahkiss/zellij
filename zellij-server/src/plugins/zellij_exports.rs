@@ -448,6 +448,7 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     },
                     PluginCommand::MessageToPlugin(message) => message_to_plugin(env, message)?,
                     PluginCommand::DisconnectOtherClients => disconnect_other_clients(env),
+                    PluginCommand::DetachClients(client_ids) => detach_clients(env, client_ids),
                     PluginCommand::KillSessions(session_list) => kill_sessions(session_list),
                     PluginCommand::KillSessionsAndReply(session_list) => {
                         kill_sessions_and_reply(env, session_list)
@@ -601,6 +602,11 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                         write_config_to_disk,
                     } => rebind_keys(env, keys_to_rebind, keys_to_unbind, write_config_to_disk)?,
                     PluginCommand::ListClients => list_clients(env),
+                    PluginCommand::ListSnapshots => list_snapshots(env),
+                    PluginCommand::RestoreSnapshot {
+                        snapshot_id,
+                        session_name,
+                    } => restore_snapshot(env, snapshot_id, session_name)?,
                     PluginCommand::ChangeHostFolder(new_host_folder) => {
                         change_host_folder(env, new_host_folder)
                     },
@@ -3398,6 +3404,16 @@ fn rename_session(env: &PluginEnv, new_session_name: String) {
     }
 }
 
+fn detach_clients(env: &PluginEnv, client_ids: Vec<crate::ClientId>) {
+    if client_ids.is_empty() {
+        return;
+    }
+    let _ = env
+        .senders
+        .send_to_server(ServerInstruction::DetachSession(client_ids, None))
+        .context("failed to send detach clients instruction");
+}
+
 fn disconnect_other_clients(env: &PluginEnv) {
     let _ = env
         .senders
@@ -3895,6 +3911,99 @@ fn get_tab_info(env: &PluginEnv, tab_id: usize) {
 fn list_clients(env: &PluginEnv) {
     let _ = env.senders.to_screen.as_ref().map(|sender| {
         sender.send(ScreenInstruction::ListClientsToPlugin(
+            env.plugin_id,
+            env.client_id,
+        ))
+    });
+}
+
+/// Rebuild a session from an archived snapshot.
+///
+/// A restore is an attach that takes its layout from the archive rather than from the cache, so
+/// this is `SwitchSession` with the snapshot's layout file - the same shape `zellij snapshot
+/// restore` builds on the client side, and the same one the resurrection path has always used.
+///
+/// Every refusal is reported. Restoring into a name that is already running is refused rather than
+/// silently turning into an attach, which is what would happen: the session exists, so the layout
+/// would be ignored and the user would get the running session instead of the shape they picked.
+/// That matches `attach --restore`, which refuses the same case.
+fn restore_snapshot(
+    env: &PluginEnv,
+    snapshot_id: String,
+    session_name: Option<String>,
+) -> Result<()> {
+    use zellij_utils::session_snapshot::resolve_snapshot;
+    let settings = crate::snapshot_settings();
+    let snapshot = match resolve_snapshot(&settings, &snapshot_id, None) {
+        Ok(snapshot) => snapshot,
+        Err(e) => return report_snapshot_restore_failure(env, e),
+    };
+    let target_session_name = session_name.unwrap_or_else(|| snapshot.session_name.clone());
+    if target_session_name.contains('/') {
+        return report_snapshot_restore_failure(
+            env,
+            String::from("Session names cannot contain '/'"),
+        );
+    }
+    if zellij_utils::sessions::session_exists(&target_session_name).unwrap_or(false) {
+        return report_snapshot_restore_failure(
+            env,
+            format!(
+                "Session '{}' is running, so there is nothing to restore into.",
+                target_session_name
+            ),
+        );
+    }
+    // trial-parse before switching: once the client has been told to switch there is no screen
+    // left to report a layout that will not parse, and the session it lands in would be empty
+    if let Err(e) = snapshot.layout() {
+        return report_snapshot_restore_failure(
+            env,
+            format!("Cannot restore snapshot {}: {}", snapshot.id, e),
+        );
+    }
+    let connect_to_session = ConnectToSession {
+        name: Some(target_session_name),
+        tab_position: None,
+        pane_id: None,
+        layout: Some(LayoutInfo::File(
+            snapshot.layout_file().display().to_string(),
+            LayoutMetadata::default(),
+        )),
+        cwd: None,
+    };
+    env.senders
+        .send_to_server(ServerInstruction::SwitchSession(
+            connect_to_session,
+            env.client_id,
+            None,
+        ))
+        .context("failed to send restore snapshot instruction")
+}
+
+/// Tell the plugin why nothing was restored.
+///
+/// A restore that works needs no answer - the client is already switching away - so this channel
+/// carries refusals only, and it exists because the alternative is a keypress that does nothing.
+fn report_snapshot_restore_failure(env: &PluginEnv, error: String) -> Result<()> {
+    log::warn!("Failed to restore snapshot: {}", error);
+    let _ = env.senders.send_to_plugin(PluginInstruction::Update(vec![(
+        Some(env.plugin_id),
+        Some(env.client_id),
+        Event::SnapshotRestoreFailed(error),
+    )]));
+    Ok(())
+}
+
+/// Ask the plugin thread for the session snapshot archive.
+///
+/// Sent on rather than answered here because reading the archive means walking a directory tree
+/// and parsing every saved layout in it, and this runs inside the plugin's own host call - work
+/// that belongs on the thread that already serialises plugin answers. Unlike the client list there
+/// is no screen state involved, so it never reaches the screen thread at all.
+fn list_snapshots(env: &PluginEnv) {
+    let _ = env.senders.to_plugin.as_ref().map(|sender| {
+        sender.send(PluginInstruction::ListSnapshotsToPlugin(
             env.plugin_id,
             env.client_id,
         ))
@@ -5568,6 +5677,8 @@ fn check_command_permission(
         | PluginCommand::FloatMultiplePanes(..)
         | PluginCommand::EmbedMultiplePanes(..)
         | PluginCommand::ReplacePaneWithExistingPane(..)
+        | PluginCommand::DetachClients(..)
+        | PluginCommand::RestoreSnapshot { .. }
         | PluginCommand::KillSessions(..)
         | PluginCommand::KillSessionsAndReply(..)
         | PluginCommand::DeleteDeadSessionAndReply(..)
@@ -5589,6 +5700,7 @@ fn check_command_permission(
         | PluginCommand::CliPipeOutput(..) => PermissionType::ReadCliPipes,
         PluginCommand::MessageToPlugin(..) => PermissionType::MessageAndLaunchOtherPlugins,
         PluginCommand::ListClients
+        | PluginCommand::ListSnapshots
         | PluginCommand::DumpSessionLayout { .. }
         | PluginCommand::GetPanePid { .. }
         | PluginCommand::GetPaneRunningCommand { .. }

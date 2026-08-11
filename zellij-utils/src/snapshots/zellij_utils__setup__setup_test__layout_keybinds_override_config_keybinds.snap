@@ -125,6 +125,7 @@ Config {
         session_aliases: None,
         session_restart_drop_env: None,
         session_service: None,
+        resurrect_command_hints: None,
         styled_underlines: None,
         serialization_interval: None,
         disable_session_metadata: None,

@@ -1534,6 +1534,10 @@ pub(crate) struct Screen {
     default_mode_info: ModeInfo, // TODO: restructure ModeInfo to prevent this duplication
     style: Style,
     pane_frame_style: PaneFrameStyle,
+    /// Fork addition: the last frame style that was not `none`. `TogglePaneFrames` cycles
+    /// through upstream's three styles, which leaves no way back to `top_only`; this is how
+    /// a `top_only` user round-trips.
+    pane_frame_style_before_none: PaneFrameStyle,
     auto_layout: bool,
     session_serialization: bool,
     serialize_pane_viewport: bool,
@@ -1738,6 +1742,7 @@ impl Screen {
             mode_info: BTreeMap::new(),
             default_mode_info: mode_info,
             pane_frame_style,
+            pane_frame_style_before_none: pane_frame_style,
             auto_layout,
             session_is_mirrored,
             copy_options,
@@ -6870,6 +6875,34 @@ impl Screen {
         }
         let _ = self.log_and_report_session_state();
     }
+    /// Fork addition: record the current frame style unless it is `none`, so
+    /// `TogglePaneFrames` can come back to it. Call before leaving the current style.
+    pub fn remember_pane_frame_style(&mut self) {
+        if !matches!(self.pane_frame_style, PaneFrameStyle::None) {
+            self.pane_frame_style_before_none = self.pane_frame_style;
+        }
+    }
+    /// Advance to the next frame style for `TogglePaneFrames`.
+    ///
+    /// Upstream cycles `full → titles → none → full`. Fork addition: `top_only` is outside
+    /// that cycle, so leaving it for `none` used to be one-way. Coming back from `none` now
+    /// returns to `top_only` when that is the style we left.
+    pub fn cycle_pane_frame_style(&mut self) {
+        let next_pane_frame_style = match self.pane_frame_style {
+            PaneFrameStyle::Full => PaneFrameStyle::Titles,
+            PaneFrameStyle::Titles => PaneFrameStyle::None,
+            PaneFrameStyle::TopOnly => PaneFrameStyle::None,
+            PaneFrameStyle::None => {
+                if self.pane_frame_style_before_none.is_top_only() {
+                    PaneFrameStyle::TopOnly
+                } else {
+                    PaneFrameStyle::Full
+                }
+            },
+        };
+        self.remember_pane_frame_style();
+        self.pane_frame_style = next_pane_frame_style;
+    }
     pub fn reconfigure(
         &mut self,
         new_keybinds: Keybinds,
@@ -6920,6 +6953,7 @@ impl Screen {
         self.copy_options.command = copy_command.clone();
         self.copy_options.copy_on_select = copy_on_select;
         self.pane_frame_style = pane_frame_style;
+        self.remember_pane_frame_style();
         self.advanced_mouse_actions = advanced_mouse_actions;
         self.mouse_scroll_resize = mouse_scroll_resize;
         self.mouse_hover_effects = mouse_hover_effects;
@@ -9700,12 +9734,7 @@ pub(crate) fn screen_thread_main(
                 _completion_tx, // the action ends here, dropping this will release anything
                                 // waiting for it
             ) => {
-                screen.pane_frame_style = match screen.pane_frame_style {
-                    PaneFrameStyle::Full => PaneFrameStyle::Titles,
-                    PaneFrameStyle::Titles => PaneFrameStyle::None,
-                    PaneFrameStyle::None => PaneFrameStyle::Full,
-                    PaneFrameStyle::TopOnly => PaneFrameStyle::None,
-                };
+                screen.cycle_pane_frame_style();
                 for tab in screen.tabs.values_mut() {
                     tab.set_pane_frames(screen.pane_frame_style);
                     tab.update_input_modes()?;
@@ -9715,6 +9744,7 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::SetPaneFrameStyle(pane_frame_style, _completion_tx) => {
                 screen.pane_frame_style = pane_frame_style;
+                screen.remember_pane_frame_style();
                 for tab in screen.tabs.values_mut() {
                     tab.set_pane_frames(screen.pane_frame_style);
                     tab.update_input_modes()?;
