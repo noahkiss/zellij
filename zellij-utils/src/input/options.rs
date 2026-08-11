@@ -1,6 +1,7 @@
 //! Handles cli and configuration options
 use crate::cli::Command;
-use crate::data::{InputMode, WebSharing};
+use crate::data::{FloatingPaneCoordinates, InputMode, WebSharing};
+use crate::input::layout::PercentOrFixed;
 use crate::session_service::SessionServiceOptions;
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,44 @@ use std::str::FromStr;
 use std::net::IpAddr;
 
 pub const DEFAULT_WORD_SEPARATORS: &str = "[]{}<>()";
+
+/// The size a floating pane gets when nothing asks for a specific one.
+///
+/// Without this, every floating pane that carries no coordinates of its own - the session
+/// manager, the plugin manager, a bare `NewFloatingPane` - lands at half the viewport, which is
+/// small enough that those plugins truncate the very columns the user opened them to read. A
+/// `None` field keeps the built-in size for that axis, so an absent block is byte-identical to
+/// upstream behaviour.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct DefaultFloatingSize {
+    #[serde(default)]
+    pub width: Option<PercentOrFixed>,
+    #[serde(default)]
+    pub height: Option<PercentOrFixed>,
+}
+
+impl DefaultFloatingSize {
+    pub fn is_empty(&self) -> bool {
+        self.width.is_none() && self.height.is_none()
+    }
+    /// Fill in the width/height the caller did not ask for, leaving anything explicit alone.
+    pub fn apply_to(
+        &self,
+        coordinates: Option<FloatingPaneCoordinates>,
+    ) -> Option<FloatingPaneCoordinates> {
+        if self.is_empty() {
+            return coordinates;
+        }
+        let mut coordinates = coordinates.unwrap_or_default();
+        if coordinates.width.is_none() {
+            coordinates.width = self.width.clone();
+        }
+        if coordinates.height.is_none() {
+            coordinates.height = self.height.clone();
+        }
+        Some(coordinates)
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Deserialize, Serialize, ValueEnum)]
 pub enum OnForceClose {
@@ -331,6 +370,12 @@ pub struct Options {
     #[serde(default)]
     pub session_service: Option<SessionServiceOptions>,
 
+    /// The size floating panes get when nothing asks for a specific one.
+    /// config.kdl only - it is a nested block, which no CLI flag can express.
+    #[clap(skip)]
+    #[serde(default)]
+    pub default_floating_size: Option<DefaultFloatingSize>,
+
     /// Whether to use ANSI styled underlines
     #[clap(long, value_parser)]
     #[serde(default)]
@@ -575,6 +620,10 @@ impl Options {
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
+        let default_floating_size = other
+            .default_floating_size
+            .clone()
+            .or_else(|| self.default_floating_size.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -659,6 +708,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -758,6 +808,10 @@ impl Options {
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
+        let default_floating_size = other
+            .default_floating_size
+            .clone()
+            .or_else(|| self.default_floating_size.clone());
         let styled_underlines = other.styled_underlines.or(self.styled_underlines);
         let serialization_interval = other.serialization_interval.or(self.serialization_interval);
         let disable_session_metadata = other
@@ -842,6 +896,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -904,5 +959,72 @@ mod tests {
             PaneFrameStyle::None
         );
         assert!("bogus".parse::<PaneFrameStyle>().is_err());
+    }
+
+    #[test]
+    fn an_empty_default_floating_size_changes_nothing() {
+        let default_floating_size = DefaultFloatingSize::default();
+        assert!(default_floating_size.is_empty());
+        assert_eq!(default_floating_size.apply_to(None), None);
+        let explicit = FloatingPaneCoordinates::default().with_width_percent(30);
+        assert_eq!(
+            default_floating_size.apply_to(Some(explicit.clone())),
+            Some(explicit)
+        );
+    }
+
+    #[test]
+    fn default_floating_size_fills_in_absent_coordinates() {
+        let default_floating_size = DefaultFloatingSize {
+            width: Some(PercentOrFixed::Percent(90)),
+            height: Some(PercentOrFixed::Percent(80)),
+        };
+        let filled = default_floating_size.apply_to(None).unwrap();
+        assert_eq!(filled.width, Some(PercentOrFixed::Percent(90)));
+        assert_eq!(filled.height, Some(PercentOrFixed::Percent(80)));
+        assert_eq!(filled.x, None, "position is left to the caller");
+        assert_eq!(filled.y, None);
+    }
+
+    #[test]
+    fn an_explicit_size_wins_over_the_default_axis_by_axis() {
+        let default_floating_size = DefaultFloatingSize {
+            width: Some(PercentOrFixed::Percent(90)),
+            height: Some(PercentOrFixed::Percent(80)),
+        };
+        let asked_for_width_only = FloatingPaneCoordinates::default().with_width_percent(30);
+        let filled = default_floating_size
+            .apply_to(Some(asked_for_width_only))
+            .unwrap();
+        assert_eq!(filled.width, Some(PercentOrFixed::Percent(30)));
+        assert_eq!(filled.height, Some(PercentOrFixed::Percent(80)));
+    }
+
+    #[test]
+    fn a_default_floating_size_recenters_the_pane() {
+        use crate::pane_size::{PaneGeom, Viewport};
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            rows: 50,
+            cols: 200,
+        };
+        // what `find_room_for_new_pane` hands back with no config: half the viewport, centered
+        let mut geom = PaneGeom::default();
+        geom.x = 50;
+        geom.y = 13;
+        geom.cols.set_inner(100);
+        geom.rows.set_inner(25);
+
+        let default_floating_size = DefaultFloatingSize {
+            width: Some(PercentOrFixed::Percent(90)),
+            height: Some(PercentOrFixed::Percent(80)),
+        };
+        geom.adjust_coordinates(default_floating_size.apply_to(None).unwrap(), viewport);
+
+        assert_eq!(geom.cols.as_usize(), 180);
+        assert_eq!(geom.rows.as_usize(), 40);
+        assert_eq!(geom.x, 10, "still centered horizontally");
+        assert_eq!(geom.y, 5, "still centered vertically");
     }
 }

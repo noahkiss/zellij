@@ -13,7 +13,7 @@ use crate::input::layout::{
     Layout, PercentOrFixed, PluginUserConfiguration, RunPlugin, RunPluginOrAlias, TabLayoutInfo,
 };
 use crate::input::options::{
-    Clipboard, OnForceClose, Options, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
+    Clipboard, DefaultFloatingSize, OnForceClose, Options, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermissions};
 use crate::input::plugins::PluginAliases;
@@ -3010,6 +3010,12 @@ impl Options {
             Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
             None => None,
         };
+        let default_floating_size = match kdl_options.get("default_floating_size") {
+            Some(kdl_default_floating_size) => Some(Self::default_floating_size_from_kdl(
+                kdl_default_floating_size,
+            )?),
+            None => None,
+        };
         let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
             Some(kdl_drop_env) => Some(
                 kdl_string_arguments!(kdl_drop_env)
@@ -3174,6 +3180,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3588,6 +3595,99 @@ impl Options {
             session_aliases.insert(session_name.into(), alias.to_string());
         }
         Ok(session_aliases)
+    }
+    /// The `default_floating_size` block: the size a floating pane gets when it asks for none.
+    ///
+    /// Both entries are optional and independent, so a config can widen floating panes without
+    /// touching their height. A bad value is an error here, at parse time, rather than a silently
+    /// ignored key - a floating pane that quietly stayed half-size would look like the feature
+    /// does not work.
+    fn default_floating_size_from_kdl(
+        kdl_default_floating_size: &KdlNode,
+    ) -> Result<DefaultFloatingSize, ConfigError> {
+        let mut default_floating_size = DefaultFloatingSize::default();
+        for entry in kdl_children_nodes_or_error!(
+            kdl_default_floating_size,
+            "empty default_floating_size block"
+        ) {
+            let entry_name = kdl_name!(entry);
+            let raw_value = entry
+                .entries()
+                .iter()
+                .next()
+                .and_then(|e| {
+                    e.value()
+                        .as_string()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.value().as_i64().map(|i| i.to_string()))
+                })
+                .ok_or_else(|| {
+                    ConfigError::new_kdl_error(
+                        format!(
+                            "default_floating_size {} needs a value, eg. {} \"80%\"",
+                            entry_name, entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    )
+                })?;
+            let size = PercentOrFixed::from_str(&raw_value)
+                .ok()
+                .filter(|size| !size.is_zero())
+                .ok_or_else(|| {
+                    ConfigError::new_kdl_error(
+                        format!(
+                            "Invalid default_floating_size {}: {:?} (expected a percent like \
+                             \"80%\" or a column/row count like \"120\", and not zero)",
+                            entry_name, raw_value
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    )
+                })?;
+            match entry_name {
+                "width" => default_floating_size.width = Some(size),
+                "height" => default_floating_size.height = Some(size),
+                _ => {
+                    return Err(ConfigError::new_kdl_error(
+                        format!(
+                            "Unknown default_floating_size entry: {:?} (expected width or height)",
+                            entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    ))
+                },
+            }
+        }
+        Ok(default_floating_size)
+    }
+    fn default_floating_size_to_kdl(&self) -> Option<KdlNode> {
+        let default_floating_size = self.default_floating_size.as_ref()?;
+        if default_floating_size.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("default_floating_size");
+        let mut entries = KdlDocument::new();
+        for (name, size) in [
+            ("width", &default_floating_size.width),
+            ("height", &default_floating_size.height),
+        ] {
+            if let Some(size) = size {
+                let mut entry = KdlNode::new(name);
+                match size {
+                    PercentOrFixed::Percent(percent) => {
+                        entry.push(format!("{}%", percent));
+                    },
+                    PercentOrFixed::Fixed(fixed) => {
+                        entry.push(KdlValue::Base10(*fixed as i64));
+                    },
+                };
+                entries.nodes_mut().push(entry);
+            }
+        }
+        node.set_children(entries);
+        Some(node)
     }
     /// The `session_service` block: extra directives for the unit `zellij session enable` writes.
     ///
@@ -5058,6 +5158,9 @@ impl Options {
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
+        }
+        if let Some(default_floating_size) = self.default_floating_size_to_kdl() {
+            nodes.push(default_floating_size);
         }
         if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
             nodes.push(plugin_watch);
@@ -8417,6 +8520,77 @@ fn session_restart_drop_env_config_parsing() {
 fn session_restart_drop_env_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_restart_drop_env, None);
+}
+
+#[test]
+fn default_floating_size_config_parsing() {
+    let config_with_default_floating_size = r#"
+        default_floating_size {
+            width "90%"
+            height "80%"
+        }
+    "#;
+    let config = Config::from_kdl(config_with_default_floating_size, None).unwrap();
+    let default_floating_size = config.options.default_floating_size.clone().unwrap();
+    assert_eq!(
+        default_floating_size.width,
+        Some(PercentOrFixed::Percent(90))
+    );
+    assert_eq!(
+        default_floating_size.height,
+        Some(PercentOrFixed::Percent(80))
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn default_floating_size_accepts_fixed_and_a_single_axis() {
+    let config = Config::from_kdl(
+        r#"
+        default_floating_size {
+            width 120
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let default_floating_size = config.options.default_floating_size.clone().unwrap();
+    assert_eq!(
+        default_floating_size.width,
+        Some(PercentOrFixed::Fixed(120))
+    );
+    assert_eq!(default_floating_size.height, None);
+
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn default_floating_size_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.default_floating_size, None);
+}
+
+#[test]
+fn default_floating_size_rejects_bad_values() {
+    for bad in [
+        r#"default_floating_size { width "0%" }"#,
+        r#"default_floating_size { width "120%" }"#,
+        r#"default_floating_size { width "wide" }"#,
+        r#"default_floating_size { depth "80%" }"#,
+        r#"default_floating_size { width }"#,
+    ] {
+        assert!(
+            Config::from_kdl(bad, None).is_err(),
+            "expected {:?} to be rejected",
+            bad
+        );
+    }
 }
 
 #[test]

@@ -593,6 +593,18 @@ load_plugins {
 //
 // bell_clear_delay_ms 1000
 
+// The size a floating pane gets when nothing asks for a specific one - the session manager, the
+// plugin manager, a bare NewFloatingPane
+// Each entry is a percent of the viewport ("80%") or a column/row count (120), and each is
+// optional: an unset axis keeps the built-in size, which is half the viewport
+// A pane that asks for its own width or height still gets it; the pane stays centred
+// Default: unset (half the viewport)
+//
+// default_floating_size {
+//     width "90%"
+//     height "90%"
+// }
+
 // The template of the terminal title (OSC 0) set for the focused pane
 // Placeholders: {host} (this machine's short hostname), {session} (the session name, or its
 // session_aliases entry if it has one) and {pane} (the pane title)
