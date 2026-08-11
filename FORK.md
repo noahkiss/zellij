@@ -1575,6 +1575,11 @@ a neighbour to its right ends its rule one column short. Closing that gap means 
 upstream's pane-layout arithmetic, which is the code most likely to move under us at the next sync.
 Add it later if the ragged edge grates.
 
+`TogglePaneFrames` cycles `full → titles → none → full`, which has no seat for a fourth style.
+`top_only` toggles to `none` and back to `top_only`: `Screen` remembers the last style that was
+not `none` (`pane_frame_style_before_none`) and `cycle_pane_frame_style` returns to it when it
+was `top_only`. Every other starting point keeps upstream's cycle.
+
 `PaneFrameStyle::TopOnly` carries protobuf tag **100** in both `pane_frame_style.proto` and
 `event.proto` — a fork-reserved number, far from the next one upstream would take.
 
