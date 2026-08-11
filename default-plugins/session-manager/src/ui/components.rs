@@ -1728,6 +1728,16 @@ pub fn render_unsaved_changes_line(
     let separator = " - ";
     let space = " ";
 
+    // The client list lives here, not only on the controls line above.
+    //
+    // That line is a queue of keys that all belong to the session under the cursor, and at a
+    // floating pane's real width the queue is already full - <Ctrl l> was the entry that fell off
+    // the end, which is how a key stays unknown. This line has one key and a timestamp, so it has
+    // the room, and giving up "Save current session for resurrection" made more of it.
+    let clients_shortcut = "<Ctrl l>";
+    let clients_action_text = "Clients";
+    let list_separator = ", ";
+
     let time_text = match last_saved_timestamp {
         Some(timestamp) => {
             let elapsed = format_elapsed_time(timestamp);
@@ -1736,39 +1746,42 @@ pub fn render_unsaved_changes_line(
         None => "(not saved)".to_string(),
     };
 
-    // Calculate component widths
-    let shortcut_width = shortcut_text.width();
-    let separator_width = separator.width();
-    let space_width = space.width();
-    let time_width = time_text.width();
-
-    // Calculate total widths for each display mode
     // Format: "{shortcut}{separator}{action}{space}{time}"
-    let medium_width =
-        shortcut_width + separator_width + medium_action_text.width() + space_width + time_width;
-    let short_width =
-        shortcut_width + separator_width + short_action_text.width() + space_width + time_width;
-    let minimal_width = shortcut_width + space_width + time_width;
+    let save_medium = format!(
+        "{}{}{}{}{}",
+        shortcut_text, separator, medium_action_text, space, time_text
+    );
+    let save_short = format!(
+        "{}{}{}{}{}",
+        shortcut_text, separator, short_action_text, space, time_text
+    );
+    let save_minimal = format!("{}{}{}", shortcut_text, space, time_text);
 
-    // Select appropriate message based on available width
-    let msg = if max_cols >= medium_width {
-        format!(
-            "{}{}{}{}{}",
-            shortcut_text, separator, medium_action_text, space, time_text
-        )
-    } else if max_cols >= short_width {
-        format!(
-            "{}{}{}{}{}",
-            shortcut_text, separator, short_action_text, space, time_text
-        )
-    } else if max_cols >= minimal_width {
-        format!("{}{}{}", shortcut_text, space, time_text)
+    let clients_full = format!("{}{}{}", clients_shortcut, separator, clients_action_text);
+    let clients_full_width = list_separator.width() + clients_full.width();
+    let clients_bare_width = list_separator.width() + clients_shortcut.width();
+
+    // The save half gives up its words first, and then the client list gives up its own: a key
+    // that is named nowhere else on the screen outranks a verb the timestamp already implies
+    let msg = if max_cols >= save_medium.width() + clients_full_width {
+        format!("{}{}{}", save_medium, list_separator, clients_full)
+    } else if max_cols >= save_short.width() + clients_full_width {
+        format!("{}{}{}", save_short, list_separator, clients_full)
+    } else if max_cols >= save_minimal.width() + clients_full_width {
+        format!("{}{}{}", save_minimal, list_separator, clients_full)
+    } else if max_cols >= save_minimal.width() + clients_bare_width {
+        format!("{}{}{}", save_minimal, list_separator, clients_shortcut)
+    } else if max_cols >= save_short.width() {
+        save_short
+    } else if max_cols >= save_minimal.width() {
+        save_minimal
     } else {
         return; // Not enough space to render
     };
 
     let text = Text::new(&msg)
         .color_substring(3, shortcut_text)
+        .color_substring(3, clients_shortcut)
         .color_substring(2, &time_text);
     print_text_with_coordinates(text, x, y, None, None);
 }
