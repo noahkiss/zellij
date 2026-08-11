@@ -62,37 +62,25 @@ impl SessionLayoutMetadata {
         }
     }
     pub fn list_clients_metadata(&self) -> String {
-        let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
-        for tab in &self.tabs {
-            let panes = if tab.hide_floating_panes {
-                &tab.tiled_panes
-            } else {
-                &tab.floating_panes
-            };
-            for pane in panes {
-                for focused_client in &pane.focused_clients {
-                    clients_metadata.insert(
-                        *focused_client,
-                        ClientMetadata {
-                            pane_id: pane.id.clone(),
-                            command: pane.run.clone(),
-                        },
-                    );
-                }
-            }
-        }
-
-        ClientMetadata::render_many(clients_metadata, &self.default_editor)
+        ClientMetadata::render_many(self.all_clients_metadata(), &self.default_editor)
     }
+    /// Every client this layout knows about, and the pane each one is focused on.
+    ///
+    /// Both pane layers are read, not just the one on screen: floating panes are visible per tab
+    /// while focus is per client, so a client focused on a tiled pane in a tab where someone else
+    /// has floating panes up is a client with no row at all if only one layer is read. The layer
+    /// that is off screen goes in first, so a client that appears in both - its focus in the
+    /// hidden layer being only a memory of where it will return - is described by the layer it is
+    /// actually looking at.
     pub fn all_clients_metadata(&self) -> BTreeMap<ClientId, ClientMetadata> {
         let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
         for tab in &self.tabs {
-            let panes = if tab.hide_floating_panes {
-                &tab.tiled_panes
+            let (hidden_panes, visible_panes) = if tab.hide_floating_panes {
+                (&tab.floating_panes, &tab.tiled_panes)
             } else {
-                &tab.floating_panes
+                (&tab.tiled_panes, &tab.floating_panes)
             };
-            for pane in panes {
+            for pane in hidden_panes.iter().chain(visible_panes.iter()) {
                 for focused_client in &pane.focused_clients {
                     clients_metadata.insert(
                         *focused_client,
@@ -903,5 +891,92 @@ mod tests {
                 None
             ))
         );
+    }
+
+    fn make_focused_pane(id: PaneId, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            id,
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            !focused_clients.is_empty(),
+            None,
+            focused_clients,
+            None,
+            None,
+        )
+    }
+
+    fn focused_pane_ids(meta: &SessionLayoutMetadata) -> Vec<(ClientId, PaneId)> {
+        meta.all_clients_metadata()
+            .into_iter()
+            .map(|(client_id, client_metadata)| (client_id, client_metadata.get_pane_id()))
+            .collect()
+    }
+
+    #[test]
+    fn client_list_covers_both_pane_layers() {
+        // client 2 is focused on a tiled pane while the tab shows floating panes: floating
+        // visibility is per tab, focus is per client, so this is not a contradiction
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+        assert_eq!(
+            focused_pane_ids(&meta),
+            vec![(1, PaneId::Plugin(3)), (2, PaneId::Terminal(1))]
+        );
+    }
+
+    #[test]
+    fn client_list_describes_a_client_by_the_layer_it_sees() {
+        // the same client is remembered by both layers - only the one on screen is where it is
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![1]);
+        let floating = make_focused_pane(PaneId::Terminal(2), vec![1]);
+
+        let mut floating_shown = SessionLayoutMetadata::default();
+        floating_shown.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![tiled.clone()],
+            vec![floating.clone()],
+        );
+        assert_eq!(
+            focused_pane_ids(&floating_shown),
+            vec![(1, PaneId::Terminal(2))]
+        );
+
+        let mut floating_hidden = SessionLayoutMetadata::default();
+        floating_hidden.add_tab("tab1".to_string(), true, true, vec![tiled], vec![floating]);
+        assert_eq!(
+            focused_pane_ids(&floating_hidden),
+            vec![(1, PaneId::Terminal(1))]
+        );
+    }
+
+    #[test]
+    fn rendered_client_list_names_every_client() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+        let rendered = meta.list_clients_metadata();
+        assert_eq!(rendered.lines().count(), 3, "a header and two clients");
+        assert!(rendered.contains("plugin_3"), "{}", rendered);
+        assert!(rendered.contains("terminal_1"), "{}", rendered);
+    }
+
+    #[test]
+    fn removing_a_plugin_takes_the_clients_focused_on_it() {
+        // why the client list must not drop the plugin that asked for it: the pane it would drop
+        // is the pane its clients are looking at
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1, 2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![], vec![floating]);
+        assert_eq!(meta.all_clients_metadata().len(), 2);
+        meta.remove_plugin_from_layout(3);
+        assert!(meta.all_clients_metadata().is_empty());
     }
 }

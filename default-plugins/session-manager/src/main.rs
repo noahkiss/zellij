@@ -121,6 +121,22 @@ fn pane_too_short_notice(hidden_sessions: usize) -> String {
     }
 }
 
+/// What to say when the list drew fewer rows than the search returned.
+///
+/// The render cache builds one row per result, so this cannot happen today. If it starts
+/// happening again, the user sees a short list with nothing to explain it - say the count
+/// out loud instead, so a dropped session reads as a bug rather than as an absence.
+fn rows_dropped_notice(dropped_rows: usize) -> String {
+    if dropped_rows == 1 {
+        String::from("1 session hidden: the list drew fewer rows than the search returned.")
+    } else {
+        format!(
+            "{} sessions hidden: the list drew fewer rows than the search returned.",
+            dropped_rows
+        )
+    }
+}
+
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.is_welcome_screen = configuration
@@ -1552,10 +1568,13 @@ impl State {
                                     is_current_session, ..
                                 } => {
                                     if *is_current_session {
-                                        self.show_error("Already attached...");
-                                    } else {
-                                        switch_session_with_focus(&session_name, None, None);
+                                        // the only action the current session refuses. Say so and
+                                        // stay put - clearing the search or hiding the plugin here
+                                        // would throw away the user's place and the notice with it
+                                        self.show_error("Already attached to this session.");
+                                        return;
                                     }
+                                    switch_session_with_focus(&session_name, None, None);
                                 },
                                 UnifiedSearchResult::ResurrectableSession { .. } => {
                                     switch_session(Some(&session_name));
@@ -1591,7 +1610,7 @@ impl State {
                             // Check exact match against active sessions
                             if self.sessions.has_session(&typed_name) {
                                 if self.session_name.as_deref() == Some(&typed_name) {
-                                    self.show_error("Already attached...");
+                                    self.show_error("Already attached to this session.");
                                 } else {
                                     switch_session_with_focus(&typed_name, None, None);
                                     if self.is_welcome_screen {
@@ -1659,8 +1678,9 @@ impl State {
     ///
     /// A failed poll is not the only way the list ends up empty: the server's scan drops a session
     /// silently when its socket has no matching `session-metadata.kdl`, or when that file does not
-    /// parse, and reports success with an empty list. Say so either way - an empty list with no
-    /// explanation is the bug this exists to end.
+    /// parse, and reports success with an empty list. The render layer can drop rows too. Report
+    /// the counts each layer actually produced - an empty list with no explanation is the bug this
+    /// exists to end, and a confident claim about a layer we did not measure is the same bug.
     fn session_list_notice(&self) -> Option<String> {
         if let Some(error) = self.session_list_error.as_ref() {
             return Some(format!("Session list unavailable: {}", error));
@@ -1669,15 +1689,19 @@ impl State {
             // the welcome screen hides the current session on purpose, so empty is normal here
             return None;
         }
-        if self.sessions.session_ui_infos.is_empty()
-            && self
-                .resurrectable_sessions
-                .all_resurrectable_sessions
-                .is_empty()
-        {
+        let live_sessions = self.sessions.session_ui_infos.len();
+        let exited_sessions = self
+            .resurrectable_sessions
+            .all_resurrectable_sessions
+            .len();
+        if live_sessions == 0 && exited_sessions == 0 {
             return Some(String::from(
-                "No sessions found: the server's scan of its socket and session-info dirs returned none.",
+                "No sessions to show: the server's scan of its socket and session-info dirs returned 0 live and 0 exited.",
             ));
+        }
+        let dropped_rows = self.single_screen_state.render_cache.dropped_rows;
+        if !self.is_multi_screen && dropped_rows > 0 {
+            return Some(rows_dropped_notice(dropped_rows));
         }
         None
     }
@@ -1880,6 +1904,23 @@ impl State {
             confirmation_y_location,
             None,
             None,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_row_is_counted_out_loud() {
+        assert_eq!(
+            rows_dropped_notice(1),
+            "1 session hidden: the list drew fewer rows than the search returned."
+        );
+        assert_eq!(
+            rows_dropped_notice(3),
+            "3 sessions hidden: the list drew fewer rows than the search returned."
         );
     }
 }
