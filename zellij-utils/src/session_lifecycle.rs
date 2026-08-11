@@ -1166,6 +1166,18 @@ pub fn own_executable() -> Option<ExecutableIdentity> {
     std::env::current_exe().ok().map(identify_executable)
 }
 
+/// The path of the binary running right now, with symlinks resolved.
+///
+/// macOS keys a TCC grant (Full Disk Access and friends) to the RESOLVED executable, so anything
+/// that shows a user which binary to grant has to name this path. A package manager installs the
+/// binary in a versioned directory and puts a symlink on PATH; `current_exe()` hands back the
+/// symlink, which is a path TCC never records. Falls back to the unresolved path, which is still
+/// truer than nothing when the resolve fails.
+pub fn own_executable_path() -> Option<PathBuf> {
+    let path = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// What a pass over the pinned copy did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinOutcome {
@@ -1359,18 +1371,13 @@ pub fn classify_tcc_probe(error: Option<std::io::ErrorKind>) -> TccProbe {
 /// Blocking. Call [`probe_protected_locations`] instead unless the wait is wanted.
 #[cfg(target_os = "macos")]
 pub fn probe_protected_locations_now() {
-    // TCC keys a grant to the RESOLVED executable, so the warning has to name that path and not the
-    // one this process was started through. A package manager installs the binary in a versioned
-    // directory and puts a symlink on PATH; `current_exe()` hands back the symlink, which is a path
-    // TCC never records. Naming it sends the reader to a settings entry that will never appear.
+    // The warning has to name the resolved path, not the one this process was started through -
+    // see `own_executable_path`. Naming the symlink sends the reader to a settings entry that will
+    // never appear.
     fn responsible_executable_path() -> String {
-        let Ok(path) = std::env::current_exe() else {
-            return String::from("<unknown>");
-        };
-        std::fs::canonicalize(&path)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        own_executable_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| String::from("<unknown>"))
     }
 
     let Some(dirs) = directories::BaseDirs::new() else {

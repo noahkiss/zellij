@@ -31,6 +31,8 @@ struct App {
     tip_index: usize,
     waiting_for_config_to_be_written: bool,
     error: Option<String>,
+    /// The running server's binary path, handed over in the plugin configuration
+    server_exe: Option<String>,
 }
 
 impl Default for App {
@@ -44,6 +46,7 @@ impl Default for App {
                 "".to_owned(),
                 base_mode.clone(),
                 false,
+                None,
             ),
             link_executable,
             zellij_version,
@@ -56,6 +59,7 @@ impl Default for App {
             tip_index: 0,
             waiting_for_config_to_be_written: false,
             error: None,
+            server_exe: None,
         }
     }
 }
@@ -86,6 +90,10 @@ impl ZellijPlugin for App {
         *self.zellij_version.borrow_mut() = get_zellij_version();
         self.change_own_title();
         self.query_link_executable();
+        // the server injects this at load time (see `configuration_for_load` in
+        // zellij-server/src/plugins/plugin_loader.rs), so it names the binary that is actually
+        // running, symlinks resolved
+        self.server_exe = configuration.get("zellij_exe").cloned();
         self.active_page = if self.is_startup_tip {
             let mut rng = rng();
             self.tip_index = rng.random_range(0..=MAX_TIP_INDEX);
@@ -100,6 +108,7 @@ impl ZellijPlugin for App {
                 self.zellij_version.borrow().clone(),
                 self.base_mode.clone(),
                 self.is_release_notes,
+                self.server_exe.clone(),
             )
         };
     }
@@ -249,6 +258,7 @@ impl App {
                     self.zellij_version.borrow().clone(),
                     self.base_mode.clone(),
                     self.is_release_notes,
+                    self.server_exe.clone(),
                 );
                 should_render = true;
             }
