@@ -15758,3 +15758,144 @@ fn single_pane_titles_frame_style_omits_title_row() {
     );
     assert_snapshot!(snapshot);
 }
+
+// Fork addition: focus wraps around the ends of a stack. These cover the stack-list
+// rendering, where the members a wrap lands on are suppressed rather than in the grid.
+fn single_stack_layout() -> (TiledPaneLayout, Vec<(u32, Option<RunCommand>)>) {
+    let base_layout = r#"
+        layout {
+            pane stacked=true {
+                pane focus=true
+                pane
+                pane
+            }
+        }
+    "#;
+    let (base_layout, _base_floating_layout) =
+        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
+            .unwrap()
+            .template
+            .unwrap();
+    let new_terminal_ids = vec![(1, None), (2, None), (3, None)];
+    (base_layout, new_terminal_ids)
+}
+
+fn stack_below_a_plain_pane_layout() -> (TiledPaneLayout, Vec<(u32, Option<RunCommand>)>) {
+    let base_layout = r#"
+        layout {
+            pane split_direction="horizontal" {
+                pane
+                pane stacked=true {
+                    pane focus=true
+                    pane
+                    pane
+                }
+            }
+        }
+    "#;
+    let (base_layout, _base_floating_layout) =
+        Layout::from_kdl(base_layout, Some("file_name.kdl".into()), None, None)
+            .unwrap()
+            .template
+            .unwrap();
+    let new_terminal_ids = vec![(1, None), (2, None), (3, None), (4, None)];
+    (base_layout, new_terminal_ids)
+}
+
+#[test]
+fn stack_list_focus_up_from_the_top_wraps_to_the_bottom() {
+    let size = Size {
+        cols: 150,
+        rows: 40,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab_with_stacked_pane_list(
+        size,
+        ModeInfo::default(),
+        true,
+        Some(single_stack_layout()),
+    );
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+
+    assert_eq!(
+        tab.get_active_pane_id(client_id),
+        Some(PaneId::Terminal(1)),
+        "focus starts at the top of the stack list"
+    );
+    assert!(
+        tab.move_focus_up(client_id).unwrap(),
+        "moving up from the top of a stack list moves focus"
+    );
+    assert_eq!(
+        tab.get_active_pane_id(client_id),
+        Some(PaneId::Terminal(3)),
+        "up from the top comes round to the bottom"
+    );
+}
+
+#[test]
+fn stack_list_focus_down_from_the_bottom_wraps_to_the_top() {
+    let size = Size {
+        cols: 150,
+        rows: 40,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab_with_stacked_pane_list(
+        size,
+        ModeInfo::default(),
+        true,
+        Some(single_stack_layout()),
+    );
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+
+    tab.move_focus_down(client_id).unwrap();
+    tab.move_focus_down(client_id).unwrap();
+    assert_eq!(
+        tab.get_active_pane_id(client_id),
+        Some(PaneId::Terminal(3)),
+        "focus walks to the bottom of the stack list"
+    );
+    assert!(
+        tab.move_focus_down(client_id).unwrap(),
+        "moving down from the bottom of a stack list moves focus"
+    );
+    assert_eq!(
+        tab.get_active_pane_id(client_id),
+        Some(PaneId::Terminal(1)),
+        "down from the bottom comes round to the top"
+    );
+}
+
+#[test]
+fn stack_list_focus_leaves_the_stack_before_it_wraps() {
+    // the wrap is the third fallback, after the in-list step and the grid move: a stack
+    // list with a neighbour above must still let you leave it upwards
+    let size = Size {
+        cols: 150,
+        rows: 40,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab_with_stacked_pane_list(
+        size,
+        ModeInfo::default(),
+        true,
+        Some(stack_below_a_plain_pane_layout()),
+    );
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+
+    let focused_before = tab.get_active_pane_id(client_id).unwrap();
+    assert!(
+        tab.stack_list_id_of_member(&focused_before).is_some(),
+        "focus starts on the top member of the stack list"
+    );
+    assert!(tab.move_focus_up(client_id).unwrap());
+    let focused_after = tab.get_active_pane_id(client_id).unwrap();
+    assert!(
+        tab.stack_list_id_of_member(&focused_after).is_none(),
+        "focus left the stack list for the pane above it instead of wrapping, got: {:?}",
+        focused_after
+    );
+}

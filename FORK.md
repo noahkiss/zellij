@@ -1459,6 +1459,13 @@ and make `move_focus_up` return `true` having moved nothing.
 `expand_pane` does the move rather than `move_up`/`move_down`: those step between neighbours, and
 this jump crosses the whole stack at once. Three tests in `stacked_panes_tests.rs`.
 
+The wrap covers **both** stack renderings. Upstream 0.45 added stack lists (`stacked_pane_list`,
+default on), which keep every member but the visible one in `Tab::suppressed_panes` rather than in
+the grid — so `wrap_stack_focus` sees a stack of one there and does nothing. `Tab` gets its own
+`wrap_focus_within_stack_list`, in the same third position: `Tab::move_focus_up`/`_down` try the
+in-list step, then the grid move, then the wrap. Three more tests in `tab_integration_tests.rs`, one
+of them holding that order — a stack list with a pane above it still leaves upwards.
+
 ### macOS decides about file access at server start, not weeks later (macOS only)
 
 Found on a real machine. In a pane of a launcher-created session:
