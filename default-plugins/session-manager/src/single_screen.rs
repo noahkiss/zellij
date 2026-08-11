@@ -251,65 +251,29 @@ impl SingleScreenState {
         }
     }
 
-    fn is_current_session(&self, index: usize) -> bool {
-        matches!(
-            self.unified_results.get(index),
-            Some(UnifiedSearchResult::ActiveSession {
-                is_current_session: true,
-                ..
-            })
-        )
-    }
-
-    fn next_selectable_down(&self, from: usize) -> Option<usize> {
-        let len = self.unified_results.len();
-        for offset in 1..=len {
-            let candidate = (from + offset) % len;
-            if !self.is_current_session(candidate) {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
-    fn next_selectable_up(&self, from: usize) -> Option<usize> {
-        let len = self.unified_results.len();
-        for offset in 1..=len {
-            let candidate = (from + len - offset) % len;
-            if !self.is_current_session(candidate) {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-
+    /// Selection wraps over every row, the current session included. The current session is
+    /// a valid target for rename, kill and the rest; only attaching to it is refused, and
+    /// that refusal belongs at the attach site, not here.
     pub fn move_selection_down(&mut self) {
-        if self.unified_results.is_empty() {
+        let len = self.unified_results.len();
+        if len == 0 {
             return;
         }
-        match self.selected_index {
-            None => {
-                self.selected_index =
-                    self.next_selectable_down(self.unified_results.len().saturating_sub(1));
-            },
-            Some(i) => {
-                self.selected_index = self.next_selectable_down(i);
-            },
-        }
+        self.selected_index = Some(match self.selected_index {
+            None => 0,
+            Some(i) => (i + 1) % len,
+        });
     }
 
     pub fn move_selection_up(&mut self) {
-        if self.unified_results.is_empty() {
+        let len = self.unified_results.len();
+        if len == 0 {
             return;
         }
-        match self.selected_index {
-            None => {
-                self.selected_index = self.next_selectable_up(0);
-            },
-            Some(i) => {
-                self.selected_index = self.next_selectable_up(i);
-            },
-        }
+        self.selected_index = Some(match self.selected_index {
+            None => len - 1,
+            Some(i) => (i + len - 1) % len,
+        });
     }
 
     pub fn tab_complete(
@@ -723,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_1_down_from_none_selects_first_non_current() {
+    fn test_3_1_down_from_none_selects_the_first_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -731,11 +695,11 @@ mod tests {
         );
         state.selected_index = None;
         state.move_selection_down();
-        assert_eq!(state.selected_index, Some(1));
+        assert_eq!(state.selected_index, Some(0)); // the current session, and that is fine
     }
 
     #[test]
-    fn test_3_2_down_from_last_wraps_to_first_non_current() {
+    fn test_3_2_down_from_last_wraps_to_first() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -743,11 +707,11 @@ mod tests {
         );
         state.selected_index = Some(2); // other-b, the last
         state.move_selection_down();
-        assert_eq!(state.selected_index, Some(0)); // wraps, skips current at 1
+        assert_eq!(state.selected_index, Some(0));
     }
 
     #[test]
-    fn test_3_3_up_from_none_selects_last_non_current() {
+    fn test_3_3_up_from_none_selects_the_last_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -759,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_4_up_from_first_wraps_to_last_non_current() {
+    fn test_3_4_up_from_first_wraps_to_last() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -767,7 +731,7 @@ mod tests {
         );
         state.selected_index = Some(0);
         state.move_selection_up();
-        assert_eq!(state.selected_index, Some(2)); // wraps, skips current
+        assert_eq!(state.selected_index, Some(2));
     }
 
     #[test]
@@ -776,9 +740,9 @@ mod tests {
         setup_results_with_current(&mut state, &[("current", true)]);
         state.selected_index = None;
         state.move_selection_down();
-        assert_eq!(state.selected_index, None);
+        assert_eq!(state.selected_index, Some(0));
         state.move_selection_up();
-        assert_eq!(state.selected_index, None);
+        assert_eq!(state.selected_index, Some(0));
     }
 
     #[test]
@@ -793,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_7_sequential_down_visits_all_non_current() {
+    fn test_3_7_sequential_down_visits_every_row() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -809,7 +773,9 @@ mod tests {
         state.move_selection_down();
         assert_eq!(state.selected_index, Some(0)); // "a"
         state.move_selection_down();
-        assert_eq!(state.selected_index, Some(2)); // "b", skip current at 1
+        assert_eq!(state.selected_index, Some(1)); // "current", reachable like any other row
+        state.move_selection_down();
+        assert_eq!(state.selected_index, Some(2)); // "b"
         state.move_selection_down();
         assert_eq!(state.selected_index, Some(3)); // "c"
         state.move_selection_down();
@@ -819,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn test_3_8_sequential_up_visits_all_non_current_in_reverse() {
+    fn test_3_8_sequential_up_visits_every_row_in_reverse() {
         let mut state = SingleScreenState::default();
         setup_results_with_current(
             &mut state,
@@ -839,7 +805,9 @@ mod tests {
         state.move_selection_up();
         assert_eq!(state.selected_index, Some(2)); // "b"
         state.move_selection_up();
-        assert_eq!(state.selected_index, Some(0)); // "a", skip current at 1
+        assert_eq!(state.selected_index, Some(1)); // "current"
+        state.move_selection_up();
+        assert_eq!(state.selected_index, Some(0)); // "a"
         state.move_selection_up();
         assert_eq!(state.selected_index, Some(4)); // "d", wrapped
     }
@@ -970,5 +938,132 @@ mod tests {
         state.transition_to_search();
         assert_eq!(state.search_term, "my-new-session");
         assert_eq!(state.mode, SingleScreenMode::SearchAndSelect);
+    }
+
+    // ---------------------------------------------------------------
+    // Section 6: Current Session Visibility
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_6_1_rebuild_renders_the_current_session_row() {
+        let mut state = SingleScreenState::default();
+        state.search_term = String::new();
+        let active = vec![make_active_session("current-sess", 1, 1, 1, true, 100)];
+        let resurrectable = vec![make_resurrectable("res-a", 50), make_resurrectable("res-b", 60)];
+        state.update_search_term(&active, &resurrectable);
+
+        let names: Vec<&str> = state
+            .render_cache
+            .rows
+            .iter()
+            .map(|r| r.session_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["current-sess", "res-a", "res-b"]);
+
+        let current_row = state
+            .render_cache
+            .rows
+            .iter()
+            .find(|r| r.session_name == "current-sess")
+            .expect("current session row");
+        assert_eq!(current_row.full_tag, "<CURRENT>");
+        assert_eq!(current_row.abbr_tag, "<C>");
+    }
+
+    #[test]
+    fn test_6_2_current_session_row_appears_in_filtered_results() {
+        let mut state = SingleScreenState::default();
+        let active = vec![
+            make_active_session("current-sess", 1, 1, 1, true, 100),
+            make_active_session("other-sess", 1, 1, 1, false, 200),
+        ];
+        state.search_term = "current".to_string();
+        state.update_search_term(&active, &[]);
+        let names: Vec<&str> = state
+            .render_cache
+            .rows
+            .iter()
+            .map(|r| r.session_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["current-sess"]);
+    }
+
+    #[test]
+    fn test_6_3_selection_movement_reaches_the_current_row() {
+        let mut state = SingleScreenState::default();
+        setup_results_with_current(
+            &mut state,
+            &[("a", false), ("current", true), ("b", false)],
+        );
+
+        state.selected_index = None;
+        let mut visited_going_down = vec![];
+        for _ in 0..3 {
+            state.move_selection_down();
+            visited_going_down.push(state.selected_index);
+        }
+        assert_eq!(
+            visited_going_down,
+            vec![Some(0), Some(1), Some(2)],
+            "down must stop on the current row too"
+        );
+
+        state.selected_index = None;
+        let mut visited_going_up = vec![];
+        for _ in 0..3 {
+            state.move_selection_up();
+            visited_going_up.push(state.selected_index);
+        }
+        assert_eq!(visited_going_up, vec![Some(2), Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn test_6_4_the_current_row_is_an_action_target() {
+        let mut state = SingleScreenState::default();
+        setup_results_with_current(&mut state, &[("a", false), ("current", true)]);
+        state.selected_index = Some(1);
+
+        // rename, kill and disconnect all route through the selected result
+        let selected = state.get_selected_result().expect("current row selectable");
+        assert_eq!(selected.session_name(), "current");
+        match selected.as_delete_target() {
+            DeleteTarget::Active(name) => assert_eq!(name, "current"),
+            DeleteTarget::Resurrectable(_) => panic!("the current session is live"),
+        }
+        // ...and attach is the one action that refuses it, guarded at the dispatch site
+        assert!(matches!(
+            selected,
+            UnifiedSearchResult::ActiveSession {
+                is_current_session: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_6_6_every_result_becomes_a_row() {
+        let mut state = SingleScreenState::default();
+        state.search_term = String::new();
+        let active = vec![
+            make_active_session("current-sess", 1, 1, 1, true, 100),
+            make_active_session("other-sess", 1, 1, 1, false, 200),
+        ];
+        let resurrectable = vec![make_resurrectable("res-a", 50)];
+        state.update_search_term(&active, &resurrectable);
+        assert_eq!(state.render_cache.rows.len(), state.unified_results.len());
+        assert_eq!(state.render_cache.dropped_rows, 0);
+    }
+
+    #[test]
+    fn test_6_5_tab_complete_still_skips_the_current_session() {
+        let mut state = SingleScreenState::default();
+        let active = vec![
+            make_active_session("current-sess", 1, 1, 1, true, 100),
+            make_active_session("other-sess", 1, 1, 1, false, 200),
+        ];
+        state.search_term = String::new();
+        state.update_search_term(&active, &[]);
+        state.tab_complete(&active, &[]);
+        assert_eq!(state.search_term, "other-sess");
     }
 }

@@ -54,13 +54,20 @@ pub struct DetailsColorRanges {
 /// and timer re-renders reuse the cached data.
 #[derive(Default)]
 pub struct UnifiedResultsRenderCache {
-    /// Filtered rows (current session excluded), with pre-formatted strings.
+    /// One row per result, with pre-formatted strings. The current session is
+    /// included, tagged `<CURRENT>` in place of an action tag.
     pub rows: Vec<CachedRowData>,
     /// Max column widths across all cached rows.
     pub full_name_width: usize,
     pub full_details_width: usize,
     pub abbr_details_width: usize,
     pub full_tag_width: usize,
+    /// Results the last rebuild did not turn into rows.
+    ///
+    /// Expected to be zero: every result gets a row. A non-zero count means the
+    /// render layer swallowed a session the server did report, which is the
+    /// failure the caller turns into a visible notice instead of silence.
+    pub dropped_rows: usize,
 }
 
 impl UnifiedResultsRenderCache {
@@ -80,10 +87,6 @@ impl UnifiedResultsRenderCache {
                     ..
                 }
             );
-            if is_current {
-                continue;
-            }
-
             let row = match result {
                 UnifiedSearchResult::ActiveSession {
                     indices,
@@ -144,6 +147,14 @@ impl UnifiedResultsRenderCache {
                     let full_details_width = full_details.width();
                     let abbr_details_width = abbr_details.width();
 
+                    // The current session cannot be attached to from inside itself, so it
+                    // carries the marker from the multi-screen UI instead of an action tag.
+                    let (full_tag, abbr_tag) = if is_current {
+                        ("<CURRENT>", "<C>")
+                    } else {
+                        ("[ATTACH]", "[A]")
+                    };
+
                     CachedRowData {
                         session_name: session_name.clone(),
                         indices: indices.clone(),
@@ -151,12 +162,12 @@ impl UnifiedResultsRenderCache {
                         kind: CachedRowKind::Active,
                         full_details,
                         abbr_details,
-                        full_tag: "[ATTACH]",
-                        abbr_tag: "[A]",
+                        full_tag,
+                        abbr_tag,
                         name_width,
                         full_details_width,
                         abbr_details_width,
-                        full_tag_width: "[ATTACH]".len(),
+                        full_tag_width: full_tag.len(),
                         details_color_ranges: full_details_ranges,
                         abbr_details_color_ranges: abbr_details_ranges,
                     }
@@ -237,6 +248,8 @@ impl UnifiedResultsRenderCache {
 
             self.rows.push(row);
         }
+
+        self.dropped_rows = results.len().saturating_sub(self.rows.len());
     }
 }
 

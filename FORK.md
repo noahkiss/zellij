@@ -1459,6 +1459,13 @@ and make `move_focus_up` return `true` having moved nothing.
 `expand_pane` does the move rather than `move_up`/`move_down`: those step between neighbours, and
 this jump crosses the whole stack at once. Three tests in `stacked_panes_tests.rs`.
 
+The wrap covers **both** stack renderings. Upstream 0.45 added stack lists (`stacked_pane_list`,
+default on), which keep every member but the visible one in `Tab::suppressed_panes` rather than in
+the grid — so `wrap_stack_focus` sees a stack of one there and does nothing. `Tab` gets its own
+`wrap_focus_within_stack_list`, in the same third position: `Tab::move_focus_up`/`_down` try the
+in-list step, then the grid move, then the wrap. Three more tests in `tab_integration_tests.rs`, one
+of them holding that order — a stack list with a pane above it still leaves upwards.
+
 ### macOS decides about file access at server start, not weeks later (macOS only)
 
 Found on a real machine. In a pane of a launcher-created session:
@@ -1554,13 +1561,17 @@ build ignores a key it does not know, but rejects a value it does not know: stoc
 whole config with `Invalid value for pane_frame_style: 'top_only'`. Keep it out of a config file
 that a stock 0.45 build also reads.
 
-`top_only` **is** `titles`, with two differences:
+`top_only` **is** `titles`, with three differences:
 
 1. **The title line is a horizontal rule.** `titles` leaves the line blank around the title unless
    the pane is stacked; `top_only` fills it with `─` always. One condition in
    `compose_bracketed_title`.
 2. **No separators between panes.** `titles` draws `│` and `├─` from `Boundaries` along every pane
    edge; `top_only` draws none. `render_pane_boundaries` returns early.
+3. **A single pane still gets its rule.** `titles` hides the title row when a tab holds one
+   selectable non-borderless tiled pane; `top_only` promises one rule per pane, so it keeps it.
+   Two conditions in `tiled_panes/mod.rs` — `single_selectable_tiled_pane` in `set_pane_frames`
+   (the row the layout reserves) and `omit_pane_title` in `render` (the row it draws).
 
 Everywhere else the two behave identically, deliberately: `draws_titles()` answers `true` for both,
 so `top_only` follows the `titles` branch through the layout, offset and stacking code without a
@@ -1570,6 +1581,11 @@ What that costs: the layout still reserves the column the separators would have 
 a neighbour to its right ends its rule one column short. Closing that gap means re-entering
 upstream's pane-layout arithmetic, which is the code most likely to move under us at the next sync.
 Add it later if the ragged edge grates.
+
+`TogglePaneFrames` cycles `full → titles → none → full`, which has no seat for a fourth style.
+`top_only` toggles to `none` and back to `top_only`: `Screen` remembers the last style that was
+not `none` (`pane_frame_style_before_none`) and `cycle_pane_frame_style` returns to it when it
+was `top_only`. Every other starting point keeps upstream's cycle.
 
 `PaneFrameStyle::TopOnly` carries protobuf tag **100** in both `pane_frame_style.proto` and
 `event.proto` — a fork-reserved number, far from the next one upstream would take.
