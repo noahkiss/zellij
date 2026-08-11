@@ -269,6 +269,12 @@ pub struct ClientInfo {
     pub running_command: ::prost::alloc::string::String,
     #[prost(bool, tag="4")]
     pub is_current_client: bool,
+    /// fork-only fields start at 100, leaving 5.. free for upstream
+    /// the client's terminal size, absent when the server has not recorded one yet
+    #[prost(uint32, optional, tag="100")]
+    pub terminal_rows: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag="101")]
+    pub terminal_cols: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

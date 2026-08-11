@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_utils::common_path::common_path_all;
-use zellij_utils::pane_size::PaneGeom;
+use zellij_utils::pane_size::{PaneGeom, Size};
 use zellij_utils::{
     data::{LayoutMetadata, PaneMetadata, TabMetadata},
     input::command::RunCommand,
@@ -23,6 +23,9 @@ pub struct SessionLayoutMetadata {
     pub default_shell: Option<PathBuf>,
     pub default_editor: Option<PathBuf>,
     tabs: Vec<TabLayoutMetadata>,
+    /// Terminal size per attached client, as `Screen` last recorded it. Carried here because the
+    /// client list is assembled in the plugin thread, which has no view of `Screen`'s state.
+    client_sizes: BTreeMap<ClientId, Size>,
 }
 
 impl SessionLayoutMetadata {
@@ -76,6 +79,7 @@ impl SessionLayoutMetadata {
                         ClientMetadata {
                             pane_id: pane.id.clone(),
                             command: pane.run.clone(),
+                            terminal_size: self.client_sizes.get(focused_client).copied(),
                         },
                     );
                 }
@@ -83,6 +87,10 @@ impl SessionLayoutMetadata {
         }
 
         ClientMetadata::render_many(clients_metadata, &self.default_editor)
+    }
+    /// Record the terminal size of every attached client, keyed by client id.
+    pub fn set_client_sizes(&mut self, client_sizes: BTreeMap<ClientId, Size>) {
+        self.client_sizes = client_sizes;
     }
     pub fn all_clients_metadata(&self) -> BTreeMap<ClientId, ClientMetadata> {
         let mut clients_metadata: BTreeMap<ClientId, ClientMetadata> = BTreeMap::new();
@@ -99,6 +107,7 @@ impl SessionLayoutMetadata {
                         ClientMetadata {
                             pane_id: pane.id.clone(),
                             command: pane.run.clone(),
+                            terminal_size: self.client_sizes.get(focused_client).copied(),
                         },
                     );
                 }
@@ -627,8 +636,12 @@ impl PaneLayoutMetadata {
 pub struct ClientMetadata {
     pane_id: PaneId,
     command: Option<Run>,
+    terminal_size: Option<Size>,
 }
 impl ClientMetadata {
+    pub fn terminal_size(&self) -> Option<Size> {
+        self.terminal_size
+    }
     pub fn stringify_pane_id(&self) -> String {
         match self.pane_id {
             PaneId::Terminal(terminal_id) => format!("terminal_{}", terminal_id),
@@ -903,5 +916,69 @@ mod tests {
                 None
             ))
         );
+    }
+
+    fn pane_focused_by(terminal_id: u32, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            PaneId::Terminal(terminal_id),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            !focused_clients.is_empty(),
+            None,
+            focused_clients,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn each_client_carries_the_size_of_its_own_terminal() {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            true,
+            vec![pane_focused_by(1, vec![1]), pane_focused_by(2, vec![2])],
+            vec![],
+        );
+        let mut client_sizes = BTreeMap::new();
+        client_sizes.insert(
+            1,
+            Size {
+                rows: 50,
+                cols: 200,
+            },
+        );
+        client_sizes.insert(2, Size { rows: 20, cols: 60 });
+        meta.set_client_sizes(client_sizes);
+
+        let clients = meta.all_clients_metadata();
+        assert_eq!(
+            clients.get(&1).and_then(|c| c.terminal_size()),
+            Some(Size {
+                rows: 50,
+                cols: 200
+            })
+        );
+        assert_eq!(
+            clients.get(&2).and_then(|c| c.terminal_size()),
+            Some(Size { rows: 20, cols: 60 })
+        );
+    }
+
+    #[test]
+    fn a_client_the_server_has_not_sized_reports_no_size() {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            true,
+            vec![pane_focused_by(1, vec![1])],
+            vec![],
+        );
+        let clients = meta.all_clients_metadata();
+        assert_eq!(clients.get(&1).and_then(|c| c.terminal_size()), None);
     }
 }

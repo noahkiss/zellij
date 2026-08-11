@@ -6971,6 +6971,13 @@ impl Screen {
         if let Some(default_shell) = default_shell {
             session_layout_metadata.update_default_shell(default_shell);
         }
+        // the client list is built in the plugin thread, which cannot see these sizes otherwise
+        session_layout_metadata.set_client_sizes(
+            self.client_sizes
+                .iter()
+                .map(|(client_id, size)| (*client_id, *size))
+                .collect(),
+        );
         let first_client_id = self.get_first_client_id();
         let active_tab_index =
             first_client_id.and_then(|client_id| self.active_tab_ids.get(&client_id));
