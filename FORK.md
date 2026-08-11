@@ -1306,7 +1306,7 @@ and a failure that re-arms every second would make the plugin untypeable.
 A successful poll that simply returns nothing gets a line too:
 
 ```
-No sessions found: the server's scan of its socket and session-info dirs returned none.
+No sessions to show: the server's scan of its socket and session-info dirs returned 0 live and 0 exited.
 ```
 
 That case is the more likely one, and it is not an error anywhere in the server. The scan pairs each
@@ -1315,8 +1315,34 @@ whose file is missing or does not parse — silently, reporting success with an 
 ls`, which reads the sockets alone, keeps listing the session throughout. A user seeing a full
 `zellij ls` and an empty picker is looking at exactly that mismatch.
 
+The line reports the two counts the scan produced rather than asserting a cause. It used to claim
+the scan had returned nothing, which it could not know: the renderer was free to drop rows the scan
+*had* returned, and did. Those now have a notice of their own:
+
+```
+2 sessions hidden: the list drew fewer rows than the search returned.
+```
+
+The render cache counts the results it turns into rows and subtracts, so a row lost between the
+search and the screen reads as a bug instead of as an absence. This was the silent case that made
+the empty list unfalsifiable for so long.
+
 The welcome screen is exempt: it hides the current session deliberately, so an empty list there is
 normal.
+
+**The session you are in is drawn like any other row**, tagged `<CURRENT>` (`<C>` in a narrow pane)
+where the `[ATTACH]` tag would be. The single-screen list used to drop it in the render cache, so a
+user looking for their own session found nothing and could not tell a wrong list from a missing
+session. Upstream leaves it out on purpose — the single-screen session manager
+([#4821](https://github.com/zellij-org/zellij/pull/4821)) inherited the welcome screen's rule of
+never listing the session you are already in. That is right for a welcome screen and wrong for a
+picker someone opened to manage sessions.
+
+The row is fully selectable. An earlier pass made it visible but unselectable, which traded one dead
+end for another: rename, kill and the client actions all route through the selection, so a row the
+cursor refused to land on could not be acted on at all, and skipping past it read as a glitch. Only
+the one action that cannot work is refused — `ENTER` says `Already attached to this session.` and
+stays put. Kill, rename and `Ctrl+x` keep their meanings; Tab-complete still passes over it.
 
 A third silence has the same cure. The list gets whatever rows remain after the prompt and the help
 lines, and in a short pane that is none — the list vanished with no hint that height was the reason:
@@ -1647,6 +1673,180 @@ that can forget it, and it is read through the `Pane::pane_uuid` trait method.
 `PaneInfo` crosses the plugin API, so `event.proto` gains `string uuid = 30` and its generated Rust
 is regenerated (`cargo xtask build`). `list-panes --json` gets the field for free - `PaneListEntry`
 flattens `PaneInfo`. The client/server contract has no `PaneInfo` and is untouched.
+
+### The about page names the binary macOS must trust
+
+`Ctrl+o` then `a` now ends with the path of the executable the **server** is running:
+
+```
+Server binary (macOS: grant Full Disk Access to this path):
+/Users/<user>/.local/share/zellij/zellij-pinned
+```
+
+The section above explains why that path matters on macOS: TCC keys a path-based client on its
+absolute path, so the string that has to be typed into Full Disk Access is a specific file, not
+"zellij". Until now the only way to learn it was a log line the user had to know to look for. It is
+on the one page whose whole job is telling you what you are running.
+
+The path is **resolved**. `current_exe()` returns whatever was invoked — usually a package manager's
+symlink on `PATH` — while TCC records the target, so the server canonicalizes before it hands the
+value over (`own_executable_path` in `session_lifecycle.rs`, shared with the startup probe rather
+than copied).
+
+**It arrives as plugin configuration, injected at the load seam.** `configuration_for_load`
+(`plugins/plugin_loader.rs`) adds the key `zellij_exe` to the configuration copy written into the
+plugin's memory immediately before `load()`. Not to the stored `PluginConfig`: that
+`initial_userspace_configuration` is half the key the plugin map dedupes and focuses instances by,
+so injecting there would make every `launch-or-focus-plugin zellij:about` miss the running instance
+and open a second pane. The load seam is the funnel every instantiation path goes through, including
+the clone made for each additional client. No `PluginCommand`, no `.proto`, no `zellij-tile` change.
+
+**The macOS hint is decided by the server, not the plugin**, through a second key
+`zellij_exe_hint`. The host running the server is the one TCC has an opinion about, and a client can
+be somewhere else entirely; the plugin has no way to ask. Off macOS the label is just
+`Server binary:`. Both variants cost the same two rows, and the path keeps its own line on either —
+sharing a line with the label costs it those columns, and the page truncates rather than wraps,
+which would hand the user a wrong path to paste.
+
+**It survives a short pane.** The page is a fixed block centred in whatever rows it has, and
+anything past the bottom is never drawn — the main screen wants exactly 18 rows, and one pane frame
+or a nested session's bars is enough to push the last component off. A paragraph can now be marked
+essential; `components_to_hide` drops the largest non-essential component first — the nine-row
+"What's new" list long before a one-line paragraph — until the page fits, and never drops an
+essential one or the help text. The path stays visible down to five interior rows. A component that
+did not draw also clears its rendered coordinates, so it stops answering clicks where it used to be.
+
+One limit: the about pane is a fixed 90 columns, so a path beyond roughly 78 characters is cut. Real
+install paths fit; a development build's path inside a deep worktree does not.
+
+### The session manager's client list actually lists clients
+
+`Ctrl+l` reported no attached clients, whatever the truth was — for one client and for two, on every
+machine, since the list was added:
+
+```
+Clients attached to this session: 0
+The server reports no attached clients
+```
+
+The server builds that answer from a layout snapshot, and the plugin-facing path removed the
+requesting plugin's own pane from the snapshot first. That rule belongs to the layout *dump*, which
+nobody wants the session manager written into, and this path inherited it by passing
+`Some(plugin_id)` where `zellij action list-clients` passes `None` — which is exactly why the CLI
+was right all along. The session manager is a floating pane, and zellij focuses a new floating pane
+for every client in the tab, so that one pane was the focused pane of *every* attached client.
+Removing it removed the whole list.
+
+The list also read one pane layer per tab — floating when floating panes were on screen, tiled
+otherwise. Floating visibility is per tab while focus is per client, so a client focused on a tiled
+pane in a tab where someone else had floating panes up had no row anywhere. Both layers are read
+now, the off-screen one first, so a client remembered by both is described by the layer it is
+actually looking at.
+
+**Each row also carries that client's terminal size**, because a session is sized to its smallest
+attached client and nothing said which client that was:
+
+```
+     Client          Focused pane   Size    Running
+<↓↑> 1               terminal 14    160x40  zsh
+     2 (this client) terminal 7     100x28  nvim FORK.md
+```
+
+The smallest client by area is drawn in the emphasis colour — the same one the `(this client)`
+marker uses — so the terminal shrinking everyone else's grid is the one that stands out. The mark is
+withheld when every sized client is the same size, since a highlight that always fires says nothing,
+and a client whose size the server never recorded never wins the comparison.
+
+The value is `Screen`'s own `client_sizes` map, the same one `recompute_tab_size` takes the minimum
+of, so the number on screen is the number that decides the grid. It rides to the plugin thread on
+`SessionLayoutMetadata`, which already made that trip for `ListClients` — no new instruction, no new
+thread message.
+
+`ClientInfo` crosses the plugin protobuf, which this fork normally avoids. The two fields take
+fork-reserved tags **100** and **101** in `message ClientInfo`, leaving the low numbers free for
+upstream, and both are optional and read **both-or-none**: an older plugin against a newer server,
+or the reverse, reports no size rather than half of one.
+
+### Resume hints for serialized commands (`resurrect_command_hints`)
+
+A resurrected pane holds the command it was running, and `ENTER` re-runs it. For a tool keyed by a
+session id — a coding agent, a REPL that keeps state — re-running the bare command starts a *new*
+session and the old work becomes unreachable. The pane comes back; what was in it does not.
+
+A hint names a command, the environment variable that tool exports, and what to record instead when
+that variable is found among the pane's processes:
+
+```kdl
+resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+    opencode {
+        match "opencode"
+        env "OPENCODE_SESSION_ID"
+        rewrite "opencode --session {}"
+    }
+}
+```
+
+`match` compares against the **basename** of the recorded command, exactly, so one hint covers both
+`claude` and `/opt/homebrew/bin/claude` and does not cover `claude-code`. `rewrite` is split on
+whitespace into a command and its arguments — it is not a shell string, so quoting and pipes mean
+nothing — and must contain `{}`, checked at parse time so `zellij setup --check` reports a hint that
+could never apply. The first matching hint wins; the block names are labels only.
+
+The variable is read from the pane's pid and every process under it, breadth first, first one that
+has it wins: `/proc/<pid>/environ` on Linux, `sysctl(KERN_PROCARGS2)` on macOS — the same call
+`ps -E` makes, which the kernel serves for a process of the same uid — and nothing at all on any
+other platform. One process-table read serves the whole pass.
+
+Best-effort throughout: no hint, no variable, or no platform each record the command unchanged, at
+debug log level. Nothing here can fail a serialization.
+
+Config-file only and unset by default, so a config without the block behaves exactly as before. It
+reaches the pty thread through the existing `Reconfigure` message, so **a config save applies to the
+next serialization** without restarting the session.
+
+Note the KDL constraint that bites here: every node needs a `;` or a newline after it, the last one
+before a closing brace included, so the one-line form `{ match "x"; env "Y"; rewrite "z" }` does not
+parse. Use the multi-line form above.
+
+### `default_floating_size` — a bigger default for floating panes
+
+A floating pane that carries no coordinates of its own lands at half the viewport
+(`half_size_middle_geom`, `floating_pane_grid.rs`). Half a viewport is not enough for the plugins
+that open that way: the session manager truncates session names and its client list, the plugin
+manager truncates paths. The information is there; the pane is too small to show it.
+
+Nothing in config.kdl reached that geometry, and a keybinding cannot reach it either.
+`LaunchOrFocusPlugin` and `LaunchPlugin` have no coordinates on the action at all, and the KDL action
+parser reads `x`/`y`/`width`/`height` only inside the `Run` branch. A keybind that spells out
+`width "90%"` passes `setup --check` cleanly and is then ignored — the worst kind of no.
+
+```kdl
+default_floating_size {
+    width "90%"
+    height "85%"
+}
+```
+
+Each axis is optional and independent, and a value is either a percent of the viewport or a fixed
+column/row count. Zero, over 100%, non-numeric and unknown keys are all parse errors, so a typo is
+reported rather than dropped. The block fills in only the axes the caller left open, inside
+`Tab::add_floating_pane`, where every floating pane is born — a pane that asked for its own width
+still gets it, and the pane recentres on whatever size it ends up with.
+
+The value reaches tabs as an `Rc<RefCell<_>>` shared with `Screen`, the way `stacked_resize` does, so
+**a config save applies** to panes opened after it, with no per-tab update chain.
+
+An absent block leaves the coordinates untouched, so upstream behaviour is byte-identical. Safe in a
+config a stock build also reads: this is a fork-only *key*, which stock zellij ignores.
+
+Two floating panes stay their own size on purpose: the about page and the first-run wizard resize
+themselves to 90×20 after opening, through `change_floating_panes_coordinates`, which never passes
+through `add_floating_pane`.
 
 ## Assessed and deliberately not built
 
