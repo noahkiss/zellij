@@ -1569,14 +1569,23 @@ pub fn render_controls_line(
             let kill_text = colors.bold("Kill");
             let kill_all = colors.shortcuts("<Ctrl d>");
             let kill_all_text = colors.bold("Kill all");
+            let disconnect_short_text = colors.bold("Disconnect");
             let clients = colors.shortcuts("<Ctrl l>");
             let clients_text = colors.bold("Clients");
 
-            // the client list is the only entry that fits nowhere but the widest tier: it is new,
-            // and displacing an existing key to advertise it would be a bad trade
+            // the client list is worth a shorter word elsewhere on the line: a key nobody can see
+            // is a key nobody presses, and this screen is the one place two clients are visible at
+            // all. So the tiers below give up "others" and the <Ctrl k> alias to keep it, and the
+            // compact tier names it too - only the narrowest width drops it
             if max_cols > 117 {
                 print!(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}, {clients} - {clients_text}"
+                );
+                true
+            // Shortened: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect, <Del> - Kill, <Ctrl d> - Kill all, <Ctrl l> - Clients" = 101 chars
+            } else if max_cols > 101 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}, {kill_all} - {kill_all_text}, {clients} - {clients_text}"
                 );
                 true
             } else if max_cols > 97 {
@@ -1584,6 +1593,10 @@ pub fn render_controls_line(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}"
                 );
                 true
+            // Compact: "<Ctrl r>/<Ctrl x>/<Del>/<Ctrl d>/<Ctrl l>" = 41 chars
+            } else if max_cols >= 41 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{kill_all}/{clients}");
+                false
             } else if max_cols >= 28 {
                 print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{kill_all}");
                 false
@@ -1634,6 +1647,14 @@ pub fn render_controls_line(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}, {clients} - {clients_text}"
                 );
                 true
+            // Shortened: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect, <Del> - Kill/Delete, <Ctrl l> - Clients" = 87
+            // chars. A floating session manager is about this wide, so this is the tier most
+            // people read: it gives up "others" and the <Ctrl k> alias to name the client list
+            } else if max_cols > 87 {
+                print!(
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}, {clients} - {clients_text}"
+                );
+                true
             // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del/Ctrl k> - Kill/Delete" = 83 chars
             } else if max_cols > 83 {
                 print!(
@@ -1646,7 +1667,11 @@ pub fn render_controls_line(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}"
                 );
                 true
-            // Compact: "<Ctrl r>/<Ctrl x>/<Del>" = 23 chars
+            // Compact: "<Ctrl r>/<Ctrl x>/<Del>/<Ctrl l>" = 32 chars
+            } else if max_cols >= 32 {
+                print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}/{clients}");
+                false
+            // Narrowest: "<Ctrl r>/<Ctrl x>/<Del>" = 23 chars
             } else if max_cols >= 23 {
                 print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}");
                 false
@@ -1693,8 +1718,11 @@ pub fn render_unsaved_changes_line(
     last_saved_timestamp: Option<u64>,
 ) {
     // Declare all text components
+    //
+    // "Save current session for resurrection" used to sit here as a wider tier. It said in six
+    // words what "Save session" says in two, on a line whose useful half is the timestamp beside
+    // it, so it went - nothing else on this screen spells out what it does either
     let shortcut_text = "<Ctrl a>";
-    let full_action_text = "Save current session for resurrection";
     let medium_action_text = "Save session";
     let short_action_text = "Save";
     let separator = " - ";
@@ -1716,8 +1744,6 @@ pub fn render_unsaved_changes_line(
 
     // Calculate total widths for each display mode
     // Format: "{shortcut}{separator}{action}{space}{time}"
-    let full_width =
-        shortcut_width + separator_width + full_action_text.width() + space_width + time_width;
     let medium_width =
         shortcut_width + separator_width + medium_action_text.width() + space_width + time_width;
     let short_width =
@@ -1725,12 +1751,7 @@ pub fn render_unsaved_changes_line(
     let minimal_width = shortcut_width + space_width + time_width;
 
     // Select appropriate message based on available width
-    let msg = if max_cols >= full_width {
-        format!(
-            "{}{}{}{}{}",
-            shortcut_text, separator, full_action_text, space, time_text
-        )
-    } else if max_cols >= medium_width {
+    let msg = if max_cols >= medium_width {
         format!(
             "{}{}{}{}{}",
             shortcut_text, separator, medium_action_text, space, time_text
