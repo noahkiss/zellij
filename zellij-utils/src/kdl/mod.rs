@@ -13,12 +13,15 @@ use crate::input::layout::{
     Layout, PercentOrFixed, PluginUserConfiguration, RunPlugin, RunPluginOrAlias, TabLayoutInfo,
 };
 use crate::input::options::{
-    Clipboard, OnForceClose, Options, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
+    Clipboard, DefaultFloatingSize, OnForceClose, Options, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermissions};
 use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
+use crate::resurrect_command_hints::{
+    ResurrectCommandHint, ResurrectCommandHints, HINT_PLACEHOLDER,
+};
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
 use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
@@ -3010,6 +3013,16 @@ impl Options {
             Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
             None => None,
         };
+        let resurrect_command_hints = match kdl_options.get("resurrect_command_hints") {
+            Some(kdl_hints) => Some(Self::resurrect_command_hints_from_kdl(kdl_hints)?),
+            None => None,
+        };
+        let default_floating_size = match kdl_options.get("default_floating_size") {
+            Some(kdl_default_floating_size) => Some(Self::default_floating_size_from_kdl(
+                kdl_default_floating_size,
+            )?),
+            None => None,
+        };
         let session_restart_drop_env = match kdl_options.get("session_restart_drop_env") {
             Some(kdl_drop_env) => Some(
                 kdl_string_arguments!(kdl_drop_env)
@@ -3179,6 +3192,8 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
+            resurrect_command_hints,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -3595,6 +3610,99 @@ impl Options {
         }
         Ok(session_aliases)
     }
+    /// The `default_floating_size` block: the size a floating pane gets when it asks for none.
+    ///
+    /// Both entries are optional and independent, so a config can widen floating panes without
+    /// touching their height. A bad value is an error here, at parse time, rather than a silently
+    /// ignored key - a floating pane that quietly stayed half-size would look like the feature
+    /// does not work.
+    fn default_floating_size_from_kdl(
+        kdl_default_floating_size: &KdlNode,
+    ) -> Result<DefaultFloatingSize, ConfigError> {
+        let mut default_floating_size = DefaultFloatingSize::default();
+        for entry in kdl_children_nodes_or_error!(
+            kdl_default_floating_size,
+            "empty default_floating_size block"
+        ) {
+            let entry_name = kdl_name!(entry);
+            let raw_value = entry
+                .entries()
+                .iter()
+                .next()
+                .and_then(|e| {
+                    e.value()
+                        .as_string()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.value().as_i64().map(|i| i.to_string()))
+                })
+                .ok_or_else(|| {
+                    ConfigError::new_kdl_error(
+                        format!(
+                            "default_floating_size {} needs a value, eg. {} \"80%\"",
+                            entry_name, entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    )
+                })?;
+            let size = PercentOrFixed::from_str(&raw_value)
+                .ok()
+                .filter(|size| !size.is_zero())
+                .ok_or_else(|| {
+                    ConfigError::new_kdl_error(
+                        format!(
+                            "Invalid default_floating_size {}: {:?} (expected a percent like \
+                             \"80%\" or a column/row count like \"120\", and not zero)",
+                            entry_name, raw_value
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    )
+                })?;
+            match entry_name {
+                "width" => default_floating_size.width = Some(size),
+                "height" => default_floating_size.height = Some(size),
+                _ => {
+                    return Err(ConfigError::new_kdl_error(
+                        format!(
+                            "Unknown default_floating_size entry: {:?} (expected width or height)",
+                            entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    ))
+                },
+            }
+        }
+        Ok(default_floating_size)
+    }
+    fn default_floating_size_to_kdl(&self) -> Option<KdlNode> {
+        let default_floating_size = self.default_floating_size.as_ref()?;
+        if default_floating_size.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("default_floating_size");
+        let mut entries = KdlDocument::new();
+        for (name, size) in [
+            ("width", &default_floating_size.width),
+            ("height", &default_floating_size.height),
+        ] {
+            if let Some(size) = size {
+                let mut entry = KdlNode::new(name);
+                match size {
+                    PercentOrFixed::Percent(percent) => {
+                        entry.push(format!("{}%", percent));
+                    },
+                    PercentOrFixed::Fixed(fixed) => {
+                        entry.push(KdlValue::Base10(*fixed as i64));
+                    },
+                };
+                entries.nodes_mut().push(entry);
+            }
+        }
+        node.set_children(entries);
+        Some(node)
+    }
     /// The `session_service` block: extra directives for the unit `zellij session enable` writes.
     ///
     /// Every entry is passed through verbatim - zellij models neither schema - so the only thing
@@ -3728,6 +3836,118 @@ impl Options {
         }
 
         node.set_children(init_systems);
+        Some(node)
+    }
+    /// The `resurrect_command_hints` block: how to record a resumable command when a session is
+    /// serialized.
+    ///
+    /// ```kdl
+    /// resurrect_command_hints {
+    ///     claude { match "claude"; env "CLAUDE_CODE_SESSION_ID"; rewrite "claude --resume {}" }
+    /// }
+    /// ```
+    ///
+    /// The block name (`claude` here) is a label - it names the hint in errors and logs and takes
+    /// no part in matching. All three entries are required, and `rewrite` must contain the `{}`
+    /// placeholder: a rewrite without one throws away the value the whole hint exists to find, so
+    /// it is a config mistake rather than a choice. It is checked here, at parse time, so that
+    /// `zellij setup --check` reports it rather than a serialization that quietly does nothing.
+    fn resurrect_command_hints_from_kdl(
+        kdl_hints: &KdlNode,
+    ) -> Result<ResurrectCommandHints, ConfigError> {
+        let mut hints = ResurrectCommandHints::default();
+        for kdl_hint in
+            kdl_children_nodes_or_error!(kdl_hints, "empty resurrect_command_hints block")
+        {
+            let name = kdl_name!(kdl_hint).to_owned();
+            let mut match_command: Option<String> = None;
+            let mut env: Option<String> = None;
+            let mut rewrite: Option<String> = None;
+            for entry in kdl_children_nodes_or_error!(
+                kdl_hint,
+                format!("empty resurrect_command_hints entry: {:?}", name)
+            ) {
+                let entry_name = kdl_name!(entry);
+                let value = kdl_first_entry_as_string!(entry)
+                    .ok_or(ConfigError::new_kdl_error(
+                        format!(
+                            "resurrect_command_hints {:?}: {:?} needs a string value",
+                            name, entry_name
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    ))?
+                    .to_owned();
+                match entry_name {
+                    "match" => match_command = Some(value),
+                    "env" => env = Some(value),
+                    "rewrite" => rewrite = Some(value),
+                    other => {
+                        return Err(ConfigError::new_kdl_error(
+                            format!(
+                                "Unknown resurrect_command_hints entry: {:?} (expected match, env \
+                                 or rewrite)",
+                                other
+                            ),
+                            entry.span().offset(),
+                            entry.span().len(),
+                        ))
+                    },
+                }
+            }
+            let missing = |field: &str| {
+                ConfigError::new_kdl_error(
+                    format!("resurrect_command_hints {:?} has no {}", name, field),
+                    kdl_hint.span().offset(),
+                    kdl_hint.span().len(),
+                )
+            };
+            let match_command = match_command.ok_or_else(|| missing("match"))?;
+            let env = env.ok_or_else(|| missing("env"))?;
+            let rewrite = rewrite.ok_or_else(|| missing("rewrite"))?;
+            if !rewrite.contains(HINT_PLACEHOLDER) {
+                return Err(ConfigError::new_kdl_error(
+                    format!(
+                        "resurrect_command_hints {:?}: rewrite {:?} has no {} placeholder for the \
+                         value of {:?}",
+                        name, rewrite, HINT_PLACEHOLDER, env
+                    ),
+                    kdl_hint.span().offset(),
+                    kdl_hint.span().len(),
+                ));
+            }
+            hints.push(ResurrectCommandHint {
+                name,
+                match_command,
+                env,
+                rewrite,
+            });
+        }
+        Ok(hints)
+    }
+    fn resurrect_command_hints_to_kdl(&self) -> Option<KdlNode> {
+        let hints = self.resurrect_command_hints.as_ref()?;
+        if hints.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("resurrect_command_hints");
+        let mut children = KdlDocument::new();
+        for hint in &hints.hints {
+            let mut entries = KdlDocument::new();
+            for (name, value) in [
+                ("match", &hint.match_command),
+                ("env", &hint.env),
+                ("rewrite", &hint.rewrite),
+            ] {
+                let mut entry = KdlNode::new(name);
+                entry.push(KdlValue::String(value.to_owned()));
+                entries.nodes_mut().push(entry);
+            }
+            let mut hint_node = KdlNode::new(hint.name.as_str());
+            hint_node.set_children(entries);
+            children.nodes_mut().push(hint_node);
+        }
+        node.set_children(children);
         Some(node)
     }
     fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
@@ -5093,6 +5313,12 @@ impl Options {
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
+        }
+        if let Some(resurrect_command_hints) = self.resurrect_command_hints_to_kdl() {
+            nodes.push(resurrect_command_hints);
+        }
+        if let Some(default_floating_size) = self.default_floating_size_to_kdl() {
+            nodes.push(default_floating_size);
         }
         if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
             nodes.push(plugin_watch);
@@ -8221,7 +8447,6 @@ fn config_options_to_string_without_options() {
 }
 
 #[test]
-#[test]
 fn nested_session_handling_kdl_round_trip_for_every_variant() {
     use crate::input::options::NestedSessionHandling;
     let cases = [
@@ -8457,6 +8682,77 @@ fn session_restart_drop_env_config_parsing() {
 fn session_restart_drop_env_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_restart_drop_env, None);
+}
+
+#[test]
+fn default_floating_size_config_parsing() {
+    let config_with_default_floating_size = r#"
+        default_floating_size {
+            width "90%"
+            height "80%"
+        }
+    "#;
+    let config = Config::from_kdl(config_with_default_floating_size, None).unwrap();
+    let default_floating_size = config.options.default_floating_size.clone().unwrap();
+    assert_eq!(
+        default_floating_size.width,
+        Some(PercentOrFixed::Percent(90))
+    );
+    assert_eq!(
+        default_floating_size.height,
+        Some(PercentOrFixed::Percent(80))
+    );
+
+    // Test serialization roundtrip
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn default_floating_size_accepts_fixed_and_a_single_axis() {
+    let config = Config::from_kdl(
+        r#"
+        default_floating_size {
+            width 120
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let default_floating_size = config.options.default_floating_size.clone().unwrap();
+    assert_eq!(
+        default_floating_size.width,
+        Some(PercentOrFixed::Fixed(120))
+    );
+    assert_eq!(default_floating_size.height, None);
+
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn default_floating_size_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.default_floating_size, None);
+}
+
+#[test]
+fn default_floating_size_rejects_bad_values() {
+    for bad in [
+        r#"default_floating_size { width "0%" }"#,
+        r#"default_floating_size { width "120%" }"#,
+        r#"default_floating_size { width "wide" }"#,
+        r#"default_floating_size { depth "80%" }"#,
+        r#"default_floating_size { width }"#,
+    ] {
+        assert!(
+            Config::from_kdl(bad, None).is_err(),
+            "expected {:?} to be rejected",
+            bad
+        );
+    }
 }
 
 #[test]
@@ -8700,6 +8996,121 @@ fn pin_exe_refuses_a_value_that_is_neither() {
 fn session_service_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_service, None);
+}
+
+#[test]
+fn resurrect_command_hints_config_parsing() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+    opencode {
+        match "opencode"
+        env "OPENCODE_SESSION_ID"
+        rewrite "opencode --session {}"
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![
+            ResurrectCommandHint {
+                name: "claude".to_owned(),
+                match_command: "claude".to_owned(),
+                env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+                rewrite: "claude --resume {}".to_owned(),
+            },
+            ResurrectCommandHint {
+                name: "opencode".to_owned(),
+                match_command: "opencode".to_owned(),
+                env: "OPENCODE_SESSION_ID".to_owned(),
+                rewrite: "opencode --session {}".to_owned(),
+            },
+        ]
+    );
+
+    // the round trip the configuration plugin performs when it rewrites config.kdl
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn resurrect_command_hints_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.resurrect_command_hints, None);
+}
+
+/// Every way of writing a hint that cannot do anything is refused at parse time, so that
+/// `zellij setup --check` reports it rather than serialization quietly recording the bare command.
+#[test]
+fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
+    let offenders = [
+        (
+            "resurrect_command_hints {
+    claude {
+        env \"X\"
+        rewrite \"claude {}\"
+    }
+}",
+            "match",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        rewrite \"claude {}\"
+    }
+}",
+            "env",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+    }
+}",
+            "rewrite",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+        rewrite \"claude --resume\"
+    }
+}",
+            "placeholder",
+        ),
+        (
+            "resurrect_command_hints {
+    claude {
+        match \"claude\"
+        env \"X\"
+        rewrite \"claude {}\"
+        resume \"yes\"
+    }
+}",
+            "resume",
+        ),
+    ];
+    for (config, expected) in offenders {
+        let error = format!("{:?}", Config::from_kdl(config, None).unwrap_err());
+        assert!(
+            error.contains(expected),
+            "{:?} should have been refused for {:?}, got: {}",
+            config,
+            expected,
+            error
+        );
+    }
 }
 
 /// The entries the generator owns are rejected where a person can see it - at parse time, so that

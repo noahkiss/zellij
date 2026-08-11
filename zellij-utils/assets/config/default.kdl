@@ -654,6 +654,34 @@ load_plugins {
 //     }
 // }
 
+// How to record the command of a pane that is running a tool with its own session state, so that
+// a resurrected pane offers to RESUME that state instead of starting over
+// A pane comes back holding the command it was running, and Enter re-runs it - which for a coding
+// agent or any tool keyed by a session id starts a NEW session and leaves the old work unreachable
+// Each block is one hint. Its name is a label; matching never looks at it
+// - match:   compared against the BASENAME of the recorded command, exactly. `claude` matches a
+//            pane running `claude` and one running `/opt/homebrew/bin/claude`, not `claude-code`
+// - env:     the variable to look for, in the pane's process and every process under it. The first
+//            one that has it wins. Read from /proc on Linux and from sysctl(KERN_PROCARGS2) on
+//            macOS; on any other platform nothing is found and the command is recorded as it is
+// - rewrite: what to record instead, with `{}` standing for the variable's value. Split on
+//            whitespace into a command and its arguments - it is not passed to a shell
+// A hint that does not match, or whose variable is not set, records the command unchanged
+// Default: no hints, every command recorded as it is
+//
+// resurrect_command_hints {
+//     claude {
+//         match "claude"
+//         env "CLAUDE_CODE_SESSION_ID"
+//         rewrite "claude --resume {}"
+//     }
+//     opencode {
+//         match "opencode"
+//         env "OPENCODE_SESSION_ID"
+//         rewrite "opencode --session {}"
+//     }
+// }
+
 // A command to run (will be wrapped with sh -c and provided the RESURRECT_COMMAND env variable)
 // after Zellij attempts to discover a command inside a pane when resurrecting sessions, the STDOUT
 // of this command will be used instead of the discovered RESURRECT_COMMAND

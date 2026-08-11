@@ -21,6 +21,7 @@ mod pane_groups;
 mod plugins;
 mod pty;
 mod pty_writer;
+mod resurrect_hints;
 mod route;
 mod screen;
 mod session_layout_metadata;
@@ -509,6 +510,7 @@ impl SessionMetaData {
                     client_id,
                     default_editor: new_config.options.scrollback_editor,
                     post_command_discovery_hook: new_config.options.post_command_discovery_hook,
+                    resurrect_command_hints: new_config.options.resurrect_command_hints,
                 })
                 .unwrap();
         }
@@ -2251,6 +2253,7 @@ fn init_session(
                 cli_assets.is_debug,
                 config_options.scrollback_editor.clone(),
                 config_options.post_command_discovery_hook.clone(),
+                config_options.resurrect_command_hints.clone(),
             );
 
             move || pty_thread_main(pty, layout.clone()).fatal()

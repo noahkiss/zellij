@@ -32,11 +32,11 @@ pub use super::generated_api::api::{
         CustomRgbHighlight as ProtobufCustomRgbHighlight,
         DeleteAllDeadSessionsResponse as ProtobufDeleteAllDeadSessionsResponse,
         DeleteDeadSessionResponse as ProtobufDeleteDeadSessionResponse, DeleteLayoutPayload,
-        DeleteLayoutResponse as ProtobufDeleteLayoutResponse, DumpLayoutPayload,
-        DumpLayoutResponse as ProtobufDumpLayoutResponse, DumpSessionLayoutPayload,
-        DumpSessionLayoutResponse as ProtobufDumpSessionLayoutResponse, EditLayoutPayload,
-        EditLayoutResponse as ProtobufEditLayoutResponse, EditScrollbackForPaneWithIdPayload,
-        EmbedMultiplePanesPayload, EnvVariable, ExecCmdPayload,
+        DeleteLayoutResponse as ProtobufDeleteLayoutResponse, DetachClientsPayload,
+        DumpLayoutPayload, DumpLayoutResponse as ProtobufDumpLayoutResponse,
+        DumpSessionLayoutPayload, DumpSessionLayoutResponse as ProtobufDumpSessionLayoutResponse,
+        EditLayoutPayload, EditLayoutResponse as ProtobufEditLayoutResponse,
+        EditScrollbackForPaneWithIdPayload, EmbedMultiplePanesPayload, EnvVariable, ExecCmdPayload,
         FixedOrPercent as ProtobufFixedOrPercent,
         FixedOrPercentValue as ProtobufFixedOrPercentValue, FloatMultiplePanesPayload,
         FloatingPaneCoordinates as ProtobufFloatingPaneCoordinates,
@@ -115,9 +115,10 @@ pub use super::generated_api::api::{
         RenameLayoutResponse as ProtobufRenameLayoutResponse, RenameTabWithIdPayload,
         RenameWebLoginTokenPayload, RenameWebTokenResponse, ReplacePaneWithExistingPanePayload,
         RequestPluginPermissionPayload, RerunCommandPanePayload, ResizePaneIdWithDirectionPayload,
-        ResizePayload, RevokeAllWebTokensResponse, RevokeTokenResponse, RevokeWebLoginTokenPayload,
-        RunActionPayload, RunCommandPayload, RunningCommand as ProtobufRunningCommand,
-        SaveLayoutPayload, SaveLayoutResponse as ProtobufSaveLayoutResponse, SaveSessionPayload,
+        ResizePayload, RestoreSnapshotPayload, RevokeAllWebTokensResponse, RevokeTokenResponse,
+        RevokeWebLoginTokenPayload, RunActionPayload, RunCommandPayload,
+        RunningCommand as ProtobufRunningCommand, SaveLayoutPayload,
+        SaveLayoutResponse as ProtobufSaveLayoutResponse, SaveSessionPayload,
         SaveSessionResponse as ProtobufSaveSessionResponse, ScrollDownInPaneIdPayload,
         ScrollToBottomInPaneIdPayload, ScrollToTopInPaneIdPayload, ScrollUpInPaneIdPayload,
         SessionListSnapshot as ProtobufSessionListSnapshot, SetFloatingPanePinnedPayload,
@@ -1477,6 +1478,14 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
                 None => Ok(PluginCommand::DisconnectOtherClients),
                 _ => Err("Mismatched payload for DisconnectOtherClients"),
             },
+            Some(CommandName::DetachClients) => match protobuf_plugin_command.payload {
+                Some(Payload::DetachClientsPayload(DetachClientsPayload { client_ids })) => {
+                    Ok(PluginCommand::DetachClients(
+                        client_ids.into_iter().map(|c| c as u16).collect(),
+                    ))
+                },
+                _ => Err("Mismatched payload for DetachClients"),
+            },
             Some(CommandName::KillSessions) => match protobuf_plugin_command.payload {
                 Some(Payload::KillSessionsPayload(KillSessionsPayload { session_names })) => {
                     Ok(PluginCommand::KillSessions(session_names))
@@ -2014,6 +2023,20 @@ impl TryFrom<ProtobufPluginCommand> for PluginCommand {
             Some(CommandName::ListClients) => match protobuf_plugin_command.payload {
                 Some(_) => Err("ListClients should have no payload, found a payload"),
                 None => Ok(PluginCommand::ListClients),
+            },
+            Some(CommandName::ListSnapshots) => match protobuf_plugin_command.payload {
+                Some(_) => Err("ListSnapshots should have no payload, found a payload"),
+                None => Ok(PluginCommand::ListSnapshots),
+            },
+            Some(CommandName::RestoreSnapshot) => match protobuf_plugin_command.payload {
+                Some(Payload::RestoreSnapshotPayload(RestoreSnapshotPayload {
+                    snapshot_id,
+                    session_name,
+                })) => Ok(PluginCommand::RestoreSnapshot {
+                    snapshot_id,
+                    session_name,
+                }),
+                _ => Err("Mismatched payload for RestoreSnapshot"),
             },
             Some(CommandName::ChangeHostFolder) => match protobuf_plugin_command.payload {
                 Some(Payload::ChangeHostFolderPayload(change_host_folder_payload)) => {
@@ -3394,6 +3417,12 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
                 name: CommandName::DisconnectOtherClients as i32,
                 payload: None,
             }),
+            PluginCommand::DetachClients(client_ids) => Ok(ProtobufPluginCommand {
+                name: CommandName::DetachClients as i32,
+                payload: Some(Payload::DetachClientsPayload(DetachClientsPayload {
+                    client_ids: client_ids.into_iter().map(|c| c as u32).collect(),
+                })),
+            }),
             PluginCommand::KillSessions(session_names) => Ok(ProtobufPluginCommand {
                 name: CommandName::KillSessions as i32,
                 payload: Some(Payload::KillSessionsPayload(KillSessionsPayload {
@@ -3868,6 +3897,20 @@ impl TryFrom<PluginCommand> for ProtobufPluginCommand {
             PluginCommand::ListClients => Ok(ProtobufPluginCommand {
                 name: CommandName::ListClients as i32,
                 payload: None,
+            }),
+            PluginCommand::ListSnapshots => Ok(ProtobufPluginCommand {
+                name: CommandName::ListSnapshots as i32,
+                payload: None,
+            }),
+            PluginCommand::RestoreSnapshot {
+                snapshot_id,
+                session_name,
+            } => Ok(ProtobufPluginCommand {
+                name: CommandName::RestoreSnapshot as i32,
+                payload: Some(Payload::RestoreSnapshotPayload(RestoreSnapshotPayload {
+                    snapshot_id,
+                    session_name,
+                })),
             }),
             PluginCommand::ChangeHostFolder(new_host_folder) => Ok(ProtobufPluginCommand {
                 name: CommandName::ChangeHostFolder as i32,

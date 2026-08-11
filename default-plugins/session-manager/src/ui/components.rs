@@ -54,13 +54,20 @@ pub struct DetailsColorRanges {
 /// and timer re-renders reuse the cached data.
 #[derive(Default)]
 pub struct UnifiedResultsRenderCache {
-    /// Filtered rows (current session excluded), with pre-formatted strings.
+    /// One row per result, with pre-formatted strings. The current session is
+    /// included, tagged `<CURRENT>` in place of an action tag.
     pub rows: Vec<CachedRowData>,
     /// Max column widths across all cached rows.
     pub full_name_width: usize,
     pub full_details_width: usize,
     pub abbr_details_width: usize,
     pub full_tag_width: usize,
+    /// Results the last rebuild did not turn into rows.
+    ///
+    /// Expected to be zero: every result gets a row. A non-zero count means the
+    /// render layer swallowed a session the server did report, which is the
+    /// failure the caller turns into a visible notice instead of silence.
+    pub dropped_rows: usize,
 }
 
 impl UnifiedResultsRenderCache {
@@ -80,10 +87,6 @@ impl UnifiedResultsRenderCache {
                     ..
                 }
             );
-            if is_current {
-                continue;
-            }
-
             let row = match result {
                 UnifiedSearchResult::ActiveSession {
                     indices,
@@ -144,6 +147,14 @@ impl UnifiedResultsRenderCache {
                     let full_details_width = full_details.width();
                     let abbr_details_width = abbr_details.width();
 
+                    // The current session cannot be attached to from inside itself, so it
+                    // carries the marker from the multi-screen UI instead of an action tag.
+                    let (full_tag, abbr_tag) = if is_current {
+                        ("<CURRENT>", "<C>")
+                    } else {
+                        ("[ATTACH]", "[A]")
+                    };
+
                     CachedRowData {
                         session_name: session_name.clone(),
                         indices: indices.clone(),
@@ -151,12 +162,12 @@ impl UnifiedResultsRenderCache {
                         kind: CachedRowKind::Active,
                         full_details,
                         abbr_details,
-                        full_tag: "[ATTACH]",
-                        abbr_tag: "[A]",
+                        full_tag,
+                        abbr_tag,
                         name_width,
                         full_details_width,
                         abbr_details_width,
-                        full_tag_width: "[ATTACH]".len(),
+                        full_tag_width: full_tag.len(),
                         details_color_ranges: full_details_ranges,
                         abbr_details_color_ranges: abbr_details_ranges,
                     }
@@ -237,6 +248,8 @@ impl UnifiedResultsRenderCache {
 
             self.rows.push(row);
         }
+
+        self.dropped_rows = results.len().saturating_sub(self.rows.len());
     }
 }
 
@@ -1408,6 +1421,23 @@ pub fn render_error(error_text: &str, rows: usize, columns: usize, x: usize, y: 
     );
 }
 
+/// Draw a one-line notice where the session list would be.
+///
+/// The list area is empty whenever there is something to say here, so the notice costs nothing and
+/// is the only place a user ever sees why the list is empty.
+pub fn render_session_list_notice(notice: &str, columns: usize, x: usize, y: usize) {
+    if columns == 0 {
+        return;
+    }
+    print_text_with_coordinates(
+        Text::new(notice.to_owned()).color_range(3, ..),
+        x,
+        y,
+        Some(columns),
+        None,
+    );
+}
+
 pub fn render_renaming_session_screen(
     new_session_name: &str,
     rows: usize,
@@ -1440,6 +1470,72 @@ pub fn render_renaming_session_screen(
     }
 }
 
+/// The help line for the client list, which has its own keys and none of the list's.
+///
+/// It replaces the normal controls line rather than adding to it: every key it names is only bound
+/// while the client list is up, and naming keys that do nothing is worse than naming none.
+pub fn render_client_list_controls(max_cols: usize, colors: Colors, x: usize, y: usize) {
+    let arrows = colors.shortcuts("<↓↑>");
+    let navigate = colors.bold("Select");
+    let detach = colors.shortcuts("<d>");
+    let detach_text = colors.bold("Detach client");
+    let back = colors.shortcuts("<ESC>");
+    let back_text = colors.bold("Back");
+
+    // "Help: <↓↑> - Select, <d> - Detach client, <ESC> - Back" = 54 chars
+    if max_cols > 54 {
+        print!(
+            "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {detach} - {detach_text}, {back} - {back_text}"
+        );
+    } else if max_cols >= 14 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{detach}/{back}");
+    }
+}
+
+/// The help line for the snapshot picker, which binds its own keys while it is up.
+///
+/// The name prompt gets a line of its own: while it is open every key it does not consume is
+/// filter input, and offering `<Ctrl r>` there would name a key that does nothing.
+pub fn render_snapshot_picker_controls(
+    is_naming: bool,
+    max_cols: usize,
+    colors: Colors,
+    x: usize,
+    y: usize,
+) {
+    let back = colors.shortcuts("<ESC>");
+    if is_naming {
+        let confirm = colors.shortcuts("<ENTER>");
+        let confirm_text = colors.bold("Restore under this name");
+        let back_text = colors.bold("Cancel");
+        // "Help: <ENTER> - Restore under this name, <ESC> - Cancel" = 55 chars
+        if max_cols > 55 {
+            print!("\u{1b}[m\u{1b}[{y};{x}HHelp: {confirm} - {confirm_text}, {back} - {back_text}");
+        } else if max_cols >= 14 {
+            print!("\u{1b}[m\u{1b}[{y};{x}H{confirm}/{back}");
+        }
+        return;
+    }
+    let arrows = colors.shortcuts("<↓↑>");
+    let navigate = colors.bold("Select");
+    let open = colors.shortcuts("<ENTER>");
+    let open_text = colors.bold("Open");
+    let rename = colors.shortcuts("<Ctrl r>");
+    let rename_text = colors.bold("Restore as");
+    let back_text = colors.bold("Back");
+
+    // "Help: <↓↑> - Select, <ENTER> - Open, <Ctrl r> - Restore as, <ESC> - Back" = 72 chars
+    if max_cols > 72 {
+        print!(
+            "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {open} - {open_text}, {rename} - {rename_text}, {back} - {back_text}"
+        );
+    } else if max_cols >= 26 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{open}/{rename}/{back}");
+    } else if max_cols >= 14 {
+        print!("\u{1b}[m\u{1b}[{y};{x}H{arrows}/{open}/{back}");
+    }
+}
+
 pub fn render_controls_line(
     active_screen: ActiveScreen,
     max_cols: usize,
@@ -1467,13 +1563,17 @@ pub fn render_controls_line(
             let disconnect = colors.shortcuts("<Ctrl x>");
             let disconnect_text = colors.bold("Disconnect others");
             let kill = colors.shortcuts("<Del>");
+            // Mac keyboards without a numpad have no Delete key, so the wide help advertises the
+            // alias too. Only the wide tier: the compact one is already over its own budget.
+            let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill");
             let kill_all = colors.shortcuts("<Ctrl d>");
             let kill_all_text = colors.bold("Kill all");
-
-            if max_cols > 90 {
+            // <Ctrl l> is named on the save line below, its one home - naming it here too made
+            // it show twice at ordinary widths
+            if max_cols > 97 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill} - {kill_text}, {kill_all} - {kill_all_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}"
                 );
                 true
             } else if max_cols >= 28 {
@@ -1489,13 +1589,14 @@ pub fn render_controls_line(
             let enter = colors.shortcuts("<ENTER>");
             let select = colors.bold("Resurrect");
             let del = colors.shortcuts("<DEL>");
+            let del_wide = colors.shortcuts("<DEL/Ctrl k>");
             let del_text = colors.bold("Delete");
             let del_all = colors.shortcuts("<Ctrl d>");
             let del_all_text = colors.bold("Delete all");
 
-            if max_cols > 83 {
+            if max_cols > 90 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del} - {del_text}, {del_all} - {del_all_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del_wide} - {del_text}, {del_all} - {del_all_text}"
                 );
                 true
             } else if max_cols >= 28 {
@@ -1512,12 +1613,17 @@ pub fn render_controls_line(
             let disconnect_full_text = colors.bold("Disconnect others");
             let disconnect_short_text = colors.bold("Disconnect");
             let kill = colors.shortcuts("<Del>");
+            // Mac keyboards without a numpad have no Delete key, so the widest tier advertises
+            // the alias. The narrower tiers keep "<Del>" rather than lose a whole entry to it.
+            let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill/Delete");
 
-            // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del> - Kill/Delete" = 76 chars
-            if max_cols > 76 {
+            // <Ctrl l> is named on the save line below, its one home - naming it here too made
+            // it show twice at ordinary widths
+            // Full: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect others, <Del/Ctrl k> - Kill/Delete" = 83 chars
+            if max_cols > 83 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill} - {kill_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}"
                 );
                 true
             // Medium: "Help: <Ctrl r> - Rename, <Ctrl x> - Disconnect, <Del> - Kill/Delete" = 69 chars
@@ -1526,7 +1632,7 @@ pub fn render_controls_line(
                     "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_short_text}, {kill} - {kill_text}"
                 );
                 true
-            // Compact: "<Ctrl r>/<Ctrl x>/<Del>" = 23 chars
+            // Narrowest: "<Ctrl r>/<Ctrl x>/<Del>" = 23 chars
             } else if max_cols >= 23 {
                 print!("\u{1b}[m\u{1b}[{y};{x}H{rename}/{disconnect}/{kill}");
                 false
@@ -1573,12 +1679,25 @@ pub fn render_unsaved_changes_line(
     last_saved_timestamp: Option<u64>,
 ) {
     // Declare all text components
+    //
+    // "Save current session for resurrection" used to sit here as a wider tier. It said in six
+    // words what "Save session" says in two, on a line whose useful half is the timestamp beside
+    // it, so it went - nothing else on this screen spells out what it does either
     let shortcut_text = "<Ctrl a>";
-    let full_action_text = "Save current session for resurrection";
     let medium_action_text = "Save session";
     let short_action_text = "Save";
     let separator = " - ";
     let space = " ";
+
+    // The client list lives here, not only on the controls line above.
+    //
+    // That line is a queue of keys that all belong to the session under the cursor, and at a
+    // floating pane's real width the queue is already full - <Ctrl l> was the entry that fell off
+    // the end, which is how a key stays unknown. This line has one key and a timestamp, so it has
+    // the room, and giving up "Save current session for resurrection" made more of it.
+    let clients_shortcut = "<Ctrl l>";
+    let clients_action_text = "Clients";
+    let list_separator = ", ";
 
     let time_text = match last_saved_timestamp {
         Some(timestamp) => {
@@ -1588,46 +1707,42 @@ pub fn render_unsaved_changes_line(
         None => "(not saved)".to_string(),
     };
 
-    // Calculate component widths
-    let shortcut_width = shortcut_text.width();
-    let separator_width = separator.width();
-    let space_width = space.width();
-    let time_width = time_text.width();
-
-    // Calculate total widths for each display mode
     // Format: "{shortcut}{separator}{action}{space}{time}"
-    let full_width =
-        shortcut_width + separator_width + full_action_text.width() + space_width + time_width;
-    let medium_width =
-        shortcut_width + separator_width + medium_action_text.width() + space_width + time_width;
-    let short_width =
-        shortcut_width + separator_width + short_action_text.width() + space_width + time_width;
-    let minimal_width = shortcut_width + space_width + time_width;
+    let save_medium = format!(
+        "{}{}{}{}{}",
+        shortcut_text, separator, medium_action_text, space, time_text
+    );
+    let save_short = format!(
+        "{}{}{}{}{}",
+        shortcut_text, separator, short_action_text, space, time_text
+    );
+    let save_minimal = format!("{}{}{}", shortcut_text, space, time_text);
 
-    // Select appropriate message based on available width
-    let msg = if max_cols >= full_width {
-        format!(
-            "{}{}{}{}{}",
-            shortcut_text, separator, full_action_text, space, time_text
-        )
-    } else if max_cols >= medium_width {
-        format!(
-            "{}{}{}{}{}",
-            shortcut_text, separator, medium_action_text, space, time_text
-        )
-    } else if max_cols >= short_width {
-        format!(
-            "{}{}{}{}{}",
-            shortcut_text, separator, short_action_text, space, time_text
-        )
-    } else if max_cols >= minimal_width {
-        format!("{}{}{}", shortcut_text, space, time_text)
+    let clients_full = format!("{}{}{}", clients_shortcut, separator, clients_action_text);
+    let clients_full_width = list_separator.width() + clients_full.width();
+    let clients_bare_width = list_separator.width() + clients_shortcut.width();
+
+    // The save half gives up its words first, and then the client list gives up its own: a key
+    // that is named nowhere else on the screen outranks a verb the timestamp already implies
+    let msg = if max_cols >= save_medium.width() + clients_full_width {
+        format!("{}{}{}", save_medium, list_separator, clients_full)
+    } else if max_cols >= save_short.width() + clients_full_width {
+        format!("{}{}{}", save_short, list_separator, clients_full)
+    } else if max_cols >= save_minimal.width() + clients_full_width {
+        format!("{}{}{}", save_minimal, list_separator, clients_full)
+    } else if max_cols >= save_minimal.width() + clients_bare_width {
+        format!("{}{}{}", save_minimal, list_separator, clients_shortcut)
+    } else if max_cols >= save_short.width() {
+        save_short
+    } else if max_cols >= save_minimal.width() {
+        save_minimal
     } else {
         return; // Not enough space to render
     };
 
     let text = Text::new(&msg)
         .color_substring(3, shortcut_text)
+        .color_substring(3, clients_shortcut)
         .color_substring(2, &time_text);
     print_text_with_coordinates(text, x, y, None, None);
 }
