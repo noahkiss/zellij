@@ -154,6 +154,20 @@ impl SingleScreenState {
 
         self.render_cache.rebuild(&self.unified_results);
         self.restore_selection(previously_selected_name);
+        self.nudge_selection_off_current_session();
+    }
+
+    /// Keep the cursor off the current session's row.
+    ///
+    /// Movement already skips it, but the index restores (`restore_selection` by name,
+    /// `restore_selection_after_delete` by clamped position) can land on it. Now that the
+    /// row is drawn, a selection there would be visible and Enter-able, so push it away.
+    fn nudge_selection_off_current_session(&mut self) {
+        if let Some(index) = self.selected_index {
+            if self.is_current_session(index) {
+                self.selected_index = self.next_selectable_down(index);
+            }
+        }
     }
 
     fn previously_selected_name(&self) -> Option<String> {
@@ -184,6 +198,7 @@ impl SingleScreenState {
             previous_index,
             self.unified_results.len(),
         );
+        self.nudge_selection_off_current_session();
     }
 
     fn collect_all_sessions(
@@ -333,9 +348,14 @@ impl SingleScreenState {
         }
     }
 
+    /// The entry under the cursor, or `None`. The current session is never returned:
+    /// it is drawn in the list but is not an action target.
     pub fn get_selected_result(&self) -> Option<&UnifiedSearchResult> {
-        self.selected_index
-            .and_then(|i| self.unified_results.get(i))
+        let index = self.selected_index?;
+        if self.is_current_session(index) {
+            return None;
+        }
+        self.unified_results.get(index)
     }
 
     pub fn transition_to_layout_selection(&mut self) {
@@ -970,5 +990,101 @@ mod tests {
         state.transition_to_search();
         assert_eq!(state.search_term, "my-new-session");
         assert_eq!(state.mode, SingleScreenMode::SearchAndSelect);
+    }
+
+    // ---------------------------------------------------------------
+    // Section 6: Current Session Visibility
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_6_1_rebuild_renders_the_current_session_row() {
+        let mut state = SingleScreenState::default();
+        state.search_term = String::new();
+        let active = vec![make_active_session("current-sess", 1, 1, 1, true, 100)];
+        let resurrectable = vec![make_resurrectable("res-a", 50), make_resurrectable("res-b", 60)];
+        state.update_search_term(&active, &resurrectable);
+
+        let names: Vec<&str> = state
+            .render_cache
+            .rows
+            .iter()
+            .map(|r| r.session_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["current-sess", "res-a", "res-b"]);
+
+        let current_row = state
+            .render_cache
+            .rows
+            .iter()
+            .find(|r| r.session_name == "current-sess")
+            .expect("current session row");
+        assert!(current_row.is_current);
+        assert_eq!(current_row.full_tag, "<CURRENT>");
+        assert_eq!(current_row.abbr_tag, "<C>");
+    }
+
+    #[test]
+    fn test_6_2_current_session_row_appears_in_filtered_results() {
+        let mut state = SingleScreenState::default();
+        let active = vec![
+            make_active_session("current-sess", 1, 1, 1, true, 100),
+            make_active_session("other-sess", 1, 1, 1, false, 200),
+        ];
+        state.search_term = "current".to_string();
+        state.update_search_term(&active, &[]);
+        let names: Vec<&str> = state
+            .render_cache
+            .rows
+            .iter()
+            .map(|r| r.session_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["current-sess"]);
+    }
+
+    #[test]
+    fn test_6_3_selection_movement_never_lands_on_current_row() {
+        let mut state = SingleScreenState::default();
+        setup_results_with_current(
+            &mut state,
+            &[
+                ("a", false),
+                ("current", true),
+                ("b", false),
+                ("c", false),
+            ],
+        );
+        state.selected_index = None;
+        for _ in 0..12 {
+            state.move_selection_down();
+            let index = state.selected_index.expect("a selectable row exists");
+            assert!(!state.is_current_session(index));
+        }
+        state.selected_index = None;
+        for _ in 0..12 {
+            state.move_selection_up();
+            let index = state.selected_index.expect("a selectable row exists");
+            assert!(!state.is_current_session(index));
+        }
+    }
+
+    #[test]
+    fn test_6_4_current_row_is_never_an_action_target() {
+        let mut state = SingleScreenState::default();
+        setup_results_with_current(&mut state, &[("a", false), ("current", true)]);
+        state.selected_index = Some(1);
+        assert!(state.get_selected_result().is_none());
+    }
+
+    #[test]
+    fn test_6_5_tab_complete_still_skips_the_current_session() {
+        let mut state = SingleScreenState::default();
+        let active = vec![
+            make_active_session("current-sess", 1, 1, 1, true, 100),
+            make_active_session("other-sess", 1, 1, 1, false, 200),
+        ];
+        state.search_term = String::new();
+        state.update_search_term(&active, &[]);
+        state.tab_complete(&active, &[]);
+        assert_eq!(state.search_term, "other-sess");
     }
 }

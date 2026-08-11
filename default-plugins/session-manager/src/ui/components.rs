@@ -20,6 +20,8 @@ pub struct CachedRowData {
     pub indices: Vec<usize>,
     pub original_index: usize,
     pub kind: CachedRowKind,
+    /// The session this plugin runs in. Rendered like any other row, but never selectable.
+    pub is_current: bool,
     // Pre-formatted strings (computed once, reused across renders)
     pub full_details: String,
     pub abbr_details: String,
@@ -54,7 +56,8 @@ pub struct DetailsColorRanges {
 /// and timer re-renders reuse the cached data.
 #[derive(Default)]
 pub struct UnifiedResultsRenderCache {
-    /// Filtered rows (current session excluded), with pre-formatted strings.
+    /// One row per result, with pre-formatted strings. The current session is
+    /// included and marked `is_current`; it renders but never takes selection.
     pub rows: Vec<CachedRowData>,
     /// Max column widths across all cached rows.
     pub full_name_width: usize,
@@ -80,10 +83,6 @@ impl UnifiedResultsRenderCache {
                     ..
                 }
             );
-            if is_current {
-                continue;
-            }
-
             let row = match result {
                 UnifiedSearchResult::ActiveSession {
                     indices,
@@ -144,19 +143,28 @@ impl UnifiedResultsRenderCache {
                     let full_details_width = full_details.width();
                     let abbr_details_width = abbr_details.width();
 
+                    // The current session cannot be attached to from inside itself, so it
+                    // carries the marker from the multi-screen UI instead of an action tag.
+                    let (full_tag, abbr_tag) = if is_current {
+                        ("<CURRENT>", "<C>")
+                    } else {
+                        ("[ATTACH]", "[A]")
+                    };
+
                     CachedRowData {
                         session_name: session_name.clone(),
                         indices: indices.clone(),
                         original_index: orig_i,
                         kind: CachedRowKind::Active,
+                        is_current,
                         full_details,
                         abbr_details,
-                        full_tag: "[ATTACH]",
-                        abbr_tag: "[A]",
+                        full_tag,
+                        abbr_tag,
                         name_width,
                         full_details_width,
                         abbr_details_width,
-                        full_tag_width: "[ATTACH]".len(),
+                        full_tag_width: full_tag.len(),
                         details_color_ranges: full_details_ranges,
                         abbr_details_color_ranges: abbr_details_ranges,
                     }
@@ -207,6 +215,7 @@ impl UnifiedResultsRenderCache {
                         indices: indices.clone(),
                         original_index: orig_i,
                         kind: CachedRowKind::Resurrectable,
+                        is_current: false,
                         full_details,
                         abbr_details,
                         full_tag: "[RESURRECT]",
@@ -949,7 +958,8 @@ pub fn render_unified_results(
 
     let visible_count = end - start;
     for (row_index, row) in cache.rows[start..end].iter().enumerate() {
-        let is_selected = filtered_selected == Some(start + row_index);
+        // the current session is drawn but never selected, whatever the index says
+        let is_selected = !row.is_current && filtered_selected == Some(start + row_index);
 
         // Name cell — use cached string, only truncate if needed
         let display_name = match name_max_width {
