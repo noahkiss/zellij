@@ -2066,6 +2066,57 @@ runs a series of focus moves in each of the four frame styles and holds that eve
 exactly one size, never a one-row size; the other holds the other side, that a tab resized while a
 member was collapsed reaches that member when it is focused.
 
+### Two bars ship in the binary (`slim-tab-bar`, `slim-keybinds`)
+
+`default-plugins/slim-tab-bar/` and `default-plugins/slim-keybinds/` are builtin plugins of this
+fork, built by xtask, embedded in the binary and named in `BUILTIN_PLUGIN_NAMES`. A layout asks for
+them the way it asks for any builtin:
+
+```kdl
+pane size=1 borderless=true {
+    plugin location="zellij:slim-tab-bar"
+}
+```
+
+They arrived as separate repos (`zj-slim-bar`, `zj-slim-keybinds`) loaded through `file:` paths, and
+they are recreations of zellij's own `tab-bar` and `status-bar`/`compact-bar` — replacements for
+builtins, in the same category as the things they replace. Sources moved in, not artifacts: bundled
+has to mean rebuildable. `zj-slim-bar` became `slim-tab-bar` on the way, because the `zj-` prefix
+namespaced an external repo and there is nothing left to namespace.
+
+What that buys: no `.wasm` to track in dotfiles, no plugin directory to keep in step, a bar that
+cannot go stale against the binary that loads it, a bar on a bare machine with no dotfiles, and one
+rebase instead of three. It costs about 3.6MB of binary, most of it the IANA timezone database the
+tab bar's clock carries.
+
+**Neither bar calls `request_permission` any more, and that is the point.** A builtin's permission
+checks short-circuit to `Granted` (`wasm_bridge.rs`, `zellij_exports.rs`), so a request only ever
+raised a prompt — in a bar, a pane nobody can focus to answer it. Zellij's own bars have never had
+one. The permission cache is no longer written for either bar.
+
+### A builtin can be developed like any other plugin (`builtin_plugin_dir`)
+
+Bundling would otherwise trade away this fork's headline feature for exactly the plugins most likely
+to be edited: a builtin lives in the binary, so `plugin_watch` had nothing to watch.
+
+`builtin_plugin_dir "<path>"` makes the server load `<path>/<name>.wasm` for a builtin when that
+file is there, and `plugin_watch` then watches it like any `file:` plugin — edit, `cargo build
+--target wasm32-wasip1 --release`, and the running bar swaps to the new code.
+
+- A builtin with no file in the directory still loads its embedded copy, so overriding one plugin
+  leaves the rest alone.
+- An unreadable override falls back to the embedded copy with a warning instead of failing the load,
+  because a half-written `.wasm` mid-build must not take a bar down; the watcher reloads it when the
+  build finishes.
+- Only names in `BUILTIN_PLUGIN_NAMES` can be overridden — the directory must not silently shadow
+  anything else.
+- config.kdl only, and a development override: production runs the embedded copy, which is what
+  makes a builtin version-locked to its binary in the first place.
+
+The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) because the two places
+that need it — resolving a builtin's bytes and watching its file — sit on different threads and
+neither carries the config.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

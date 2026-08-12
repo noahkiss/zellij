@@ -2340,6 +2340,11 @@ fn init_session(
             let plugin_permissions = std::sync::Arc::new(config.plugin_permissions.clone());
             // this fork watches loaded plugin .wasm files by default - it is the point of the fork
             let plugin_watch = config_options.plugin_watch.unwrap_or(true);
+            // and a built-in can be developed the same way when a directory is configured to hold
+            // its .wasm - recorded here, where the config is, for the loader and the watcher both
+            zellij_utils::input::plugins::set_builtin_plugin_dir(
+                config_options.builtin_plugin_dir.clone(),
+            );
             // the about plugin names the binary a user should grant permissions to, and `pin_exe`
             // is the config saying where that binary is kept - read here, where the config is
             let pinned_exe = configured_pinned_exe(config_options.session_service.as_ref());
