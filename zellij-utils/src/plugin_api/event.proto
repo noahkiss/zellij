@@ -245,6 +245,8 @@ message ClientInfo {
   // the client's terminal size, absent when the server has not recorded one yet
   optional uint32 terminal_rows = 100;
   optional uint32 terminal_cols = 101;
+  // the terminal device the client is attached to, absent when it has none
+  optional string tty = 102;
 }
 
 message FailedToWriteConfigToDiskPayload {

@@ -2425,6 +2425,14 @@ pub struct ClientInfo {
     /// recorded a size for the client - a client that has attached but not yet been sized.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_size: Option<Size>,
+    /// The terminal device this client is attached to (`/dev/ttys004`), when it has one.
+    ///
+    /// The hostname would be the wrong thing to carry: a zellij client is always local to its
+    /// server, so an ssh or mosh attach would report the server's own host for every client. The
+    /// tty is what actually names the terminal a human is sitting at. `None` for a client with no
+    /// controlling terminal - a web client, a CLI action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
 }
 
 /// One pane of an archived snapshot, as the saved layout describes it.
@@ -2488,11 +2496,17 @@ impl ClientInfo {
             running_command,
             is_current_client,
             terminal_size: None,
+            tty: None,
         }
     }
     /// Record the size of this client's terminal.
     pub fn with_terminal_size(mut self, terminal_size: Option<Size>) -> Self {
         self.terminal_size = terminal_size;
+        self
+    }
+    /// Record the terminal device this client is attached to.
+    pub fn with_tty(mut self, tty: Option<String>) -> Self {
+        self.tty = tty;
         self
     }
     /// Cell count of this client's terminal, for comparing clients against each other.

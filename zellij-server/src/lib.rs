@@ -1073,6 +1073,7 @@ pub fn start_server_impl(
 
                 let client_attributes = ClientAttributes {
                     size: cli_assets.terminal_window_size,
+                    tty: cli_assets.tty.clone(),
                     style: Style {
                         colors: config
                             .theme_config(runtime_config_options.theme.as_ref())
@@ -1132,6 +1133,17 @@ pub fn start_server_impl(
                     .send_to_screen(ScreenInstruction::RecomputeTabSize(
                         client_id,
                         client_attributes.size,
+                    ))
+                    .unwrap();
+                session_data
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .senders
+                    .send_to_screen(ScreenInstruction::SetClientTty(
+                        client_id,
+                        client_attributes.tty.clone(),
                     ))
                     .unwrap();
 
@@ -1249,6 +1261,7 @@ pub fn start_server_impl(
 
                 let client_attributes = ClientAttributes {
                     size: cli_assets.terminal_window_size,
+                    tty: cli_assets.tty.clone(),
                     style: Style {
                         colors: config
                             .theme_config(runtime_config_options.theme.as_ref())
@@ -1275,6 +1288,13 @@ pub fn start_server_impl(
                     is_web_client,
                 );
 
+                session_data
+                    .senders
+                    .send_to_screen(ScreenInstruction::SetClientTty(
+                        client_id,
+                        client_attributes.tty.clone(),
+                    ))
+                    .unwrap();
                 session_data
                     .senders
                     .send_to_screen(ScreenInstruction::AddClient(

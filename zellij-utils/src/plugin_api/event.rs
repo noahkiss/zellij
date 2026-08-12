@@ -665,7 +665,8 @@ impl TryFrom<ProtobufClientInfo> for ClientInfo {
             protobuf_client_info.running_command,
             protobuf_client_info.is_current_client,
         )
-        .with_terminal_size(terminal_size))
+        .with_terminal_size(terminal_size)
+        .with_tty(protobuf_client_info.tty))
     }
 }
 
@@ -679,6 +680,7 @@ impl TryFrom<ClientInfo> for ProtobufClientInfo {
             is_current_client: client_info.is_current_client,
             terminal_rows: client_info.terminal_size.map(|size| size.rows as u32),
             terminal_cols: client_info.terminal_size.map(|size| size.cols as u32),
+            tty: client_info.tty,
         })
     }
 }
@@ -3531,6 +3533,7 @@ mod tests {
             is_current_client: true,
             terminal_rows,
             terminal_cols,
+            tty: None,
         }
     }
 

@@ -603,6 +603,12 @@ pub enum ScreenInstruction {
         Option<usize>,       // tab position to focus
         Option<(u32, bool)>, // (pane_id, is_plugin) => pane_id to focus
     ),
+    /// The terminal device a client is attached to, as the client reported it at startup.
+    ///
+    /// Its own instruction because the two ways a client arrives - creating the session and
+    /// attaching to one - reach `Screen` through different messages, and the tty is equally true
+    /// of both. `None` is a client with no controlling terminal.
+    SetClientTty(ClientId, Option<String>),
     RemoveClient(ClientId),
     UpdateSearch(Vec<u8>, ClientId, Option<NotificationEnd>),
     SearchDown(ClientId, Option<NotificationEnd>),
@@ -1096,6 +1102,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::Copy(..) => ScreenContext::Copy,
             ScreenInstruction::ToggleTab(..) => ScreenContext::ToggleTab,
             ScreenInstruction::AddClient(..) => ScreenContext::AddClient,
+            ScreenInstruction::SetClientTty(..) => ScreenContext::SetClientTty,
             ScreenInstruction::RemoveClient(..) => ScreenContext::RemoveClient,
             ScreenInstruction::UpdateSearch(..) => ScreenContext::UpdateSearch,
             ScreenInstruction::SearchDown(..) => ScreenContext::SearchDown,
@@ -1493,6 +1500,8 @@ pub(crate) struct Screen {
     /// The indices of this [`Screen`]'s active [`Tab`]s.
     active_tab_ids: BTreeMap<ClientId, usize>,
     client_sizes: HashMap<ClientId, Size>,
+    /// The terminal device each client is attached to, for the session's client list
+    client_ttys: HashMap<ClientId, String>,
     global_last_active_tab_id: usize,
     tab_history: BTreeMap<ClientId, Vec<usize>>,
     pane_history: BTreeMap<ClientId, Vec<PaneId>>,
@@ -1696,6 +1705,7 @@ impl Screen {
             connected_clients: Rc::new(RefCell::new(HashMap::new())),
             active_tab_ids: BTreeMap::new(),
             client_sizes: HashMap::new(),
+            client_ttys: HashMap::new(),
             global_last_active_tab_id: 0,
             tabs: BTreeMap::new(),
             last_single_pane_tab_names: HashMap::new(),
@@ -2255,6 +2265,13 @@ impl Screen {
 
     pub fn set_client_size(&mut self, client_id: ClientId, size: Size) {
         self.client_sizes.insert(client_id, size);
+    }
+
+    pub fn set_client_tty(&mut self, client_id: ClientId, tty: Option<String>) {
+        match tty {
+            Some(tty) => self.client_ttys.insert(client_id, tty),
+            None => self.client_ttys.remove(&client_id),
+        };
     }
 
     fn size_for_client(&self, client_id: Option<ClientId>) -> Size {
@@ -7072,6 +7089,12 @@ impl Screen {
                 .map(|(client_id, size)| (*client_id, *size))
                 .collect(),
         );
+        session_layout_metadata.set_client_ttys(
+            self.client_ttys
+                .iter()
+                .map(|(client_id, tty)| (*client_id, tty.clone()))
+                .collect(),
+        );
         let first_client_id = self.get_first_client_id();
         let active_tab_index =
             first_client_id.and_then(|client_id| self.active_tab_ids.get(&client_id));
@@ -9776,6 +9799,9 @@ pub(crate) fn screen_thread_main(
             ) => {
                 screen.toggle_tab(client_id)?;
                 screen.render(None)?;
+            },
+            ScreenInstruction::SetClientTty(client_id, tty) => {
+                screen.set_client_tty(client_id, tty);
             },
             ScreenInstruction::AddClient(
                 client_id,
