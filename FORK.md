@@ -1904,6 +1904,54 @@ a switch also fires `ModeUpdate` and `PaneUpdate`, the plugin redraws for those 
 redraw satisfies the wait before the tab-aware one exists. Fixing it needs a render to say which
 event it answers, which `PluginRenderAsset` does not carry.
 
+### Notices the server draws over the viewport
+
+Two facts are true of a whole session, actionable, and invisible everywhere else:
+
+```
+                        ⚠ Full Disk Access not granted for /Users/<user>/Library/…/zellij/bin/zellij
+                        ⚠ session 'main' runs a superseded build - `zellij session restart main`
+```
+
+They are drawn by the **server**, top-right, after the panes have rendered. That placement is the
+whole design:
+
+- **It wins every frame.** Composited after pane rendering, so an alt-screen application repainting
+  underneath cannot clobber it.
+- **`dump-screen` never sees it.** Nothing is written into any pane's grid, so transcript reads and
+  content matching are exactly what they were.
+- **It costs no layout.** No pane gives up a row.
+- **A plugin could not do it.** Almost all zellij chrome is plugins - tab bar, status bar - and a
+  user who has replaced theirs would never see a notice living in a bundled one.
+
+Narrow viewports truncate with an ellipsis and, below 24 columns, draw nothing: a notice that
+wrapped across the top of the panes would be worse than no notice.
+
+Both questions are re-asked every 30 seconds, because both answers change under a running server -
+an FDA toggle takes effect immediately, and an upgrade can replace the binary at any time. When the
+answer changes, every tab is forced to re-render: output is diffed between frames, so a notice that
+simply stopped being drawn would leave its glyphs on screen.
+
+**Full Disk Access** (`expect_full_disk_access true`, macOS, off by default) opens the same
+FDA-gated file the startup probe uses last and reports a refusal. Opt-in, because only the user
+knows whether they mean zellij to hold that permission - and where they do, its absence IS the
+actionable fact whether or not it was ever granted. The notice names the path, because the grant is
+keyed to that exact file and [auto-registration was not observed to
+happen](#the-about-page-names-the-binary-macos-must-trust).
+
+**A superseded build** (`stale_build_notice`, on by default) is asked of the path this server was
+STARTED FROM: the file being gone, or holding a different build than the one running, is proof.
+Comparing against whatever `zellij` is on `PATH` would call a deliberately-mixed setup stale
+forever. Two platform details make this precise rather than lucky: a package manager's upgrade
+deletes the old versioned directory, and Linux reports a deleted binary's path with a ` (deleted)`
+suffix, so the file "not existing" is exactly the case that matters. A binary that is merely
+RENAMED is followed, and correctly says nothing.
+
+The one addition is for `pin_exe`: a pinned copy cannot be written over while it is being executed,
+so an upgrade can never change it under a running server and the rule above can never fire. There -
+and only there - the binary on `PATH` is the intended source of that copy, so it is what gets
+compared.
+
 ### `pin_exe` covers a session you started by hand
 
 [`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe) keeps a copy of the binary at a path zellij owns,

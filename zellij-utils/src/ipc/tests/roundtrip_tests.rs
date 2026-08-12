@@ -450,6 +450,8 @@ fn test_client_messages() {
             configuration_options: Some(Options {
                 // config-file only, not carried over the contract
                 plugin_watch: None,
+                expect_full_disk_access: None,
+                stale_build_notice: None,
                 snapshot_dir: None,
                 session_snapshot_limit: None,
                 bell_clear_delay_ms: None,
