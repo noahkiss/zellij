@@ -11717,3 +11717,46 @@ fn toggle_pane_frames_keeps_the_upstream_cycle() {
         "full -> titles -> none -> full is unchanged"
     );
 }
+
+#[test]
+fn a_moved_tab_is_serialized_where_it_was_moved_to() {
+    // the layout a session is restored from lists tabs in serialization order, so this order is
+    // the one a restarted session comes back in
+    let mut screen = create_fixed_size_screen();
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let before_move = screen.get_layout_metadata(None, None).tab_names();
+
+    screen.move_active_tab_to_left(1).expect("TEST");
+
+    let after_move = screen.get_layout_metadata(None, None).tab_names();
+    assert_eq!(
+        after_move,
+        before_move.into_iter().rev().collect::<Vec<_>>(),
+        "the serialized order follows the move, not the order the tabs were created in"
+    );
+}
+
+#[test]
+fn switching_tabs_is_not_a_change_to_the_tab_list() {
+    // the tab list reaching plugins in tabs the user is not looking at is gated on this: a switch
+    // must not count, or the frequent case pays for the rare one (upstream #4918)
+    let mut screen = create_fixed_size_screen();
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let before = screen.tab_structure();
+
+    screen.switch_tab_prev(None, true, 1).expect("TEST");
+    assert_eq!(
+        screen.tab_structure(),
+        before,
+        "switching tabs leaves the tab list alone"
+    );
+
+    screen.move_active_tab_to_left(1).expect("TEST");
+    assert_ne!(
+        screen.tab_structure(),
+        before,
+        "moving a tab changes it, so every tab's plugins hear about it"
+    );
+}

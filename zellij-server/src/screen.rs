@@ -1545,6 +1545,14 @@ pub(crate) struct Screen {
     web_server_ip: IpAddr,
     web_server_port: u16,
     render_blocker: RenderBlocker,
+    /// The tab list as the plugins in EVERY tab last saw it: (id, position, name) per tab.
+    ///
+    /// A `TabUpdate` normally reaches only the active tab's plugins (upstream #4918 - the frequent
+    /// case is a tab switch, and updating every tab's plugins on each one was a measured
+    /// regression). That leaves every other tab's tab-bar holding a stale list, which is drawn for
+    /// one frame when the user arrives there. Comparing against this tells the rare case - the tab
+    /// list actually changed - from the frequent one, so only the rare case pays for the broadcast.
+    last_reported_tab_structure: Option<Vec<(usize, usize, String)>>,
     watcher_clients: HashMap<ClientId, WatcherState>,
     followed_client_id: Option<ClientId>,
     cached_layouts: Vec<LayoutInfo>,
@@ -1734,6 +1742,7 @@ impl Screen {
             web_server_ip,
             web_server_port,
             render_blocker: RenderBlocker::new(100),
+            last_reported_tab_structure: None,
             watcher_clients: HashMap::new(),
             followed_client_id: None,
             cached_layouts: vec![],
@@ -4911,6 +4920,17 @@ impl Screen {
             };
             tab_infos_for_screen_state.insert(tab.position, tab_info_for_screen);
         }
+        // the tab list itself changed - so every tab's plugins need to hear it, not just the
+        // active one's, or the tabs the user is not looking at keep drawing the old list until
+        // they are visited (and then visibly correct themselves)
+        let tab_structure = self.tab_structure();
+        let tab_structure_changed = self
+            .last_reported_tab_structure
+            .as_ref()
+            .map(|last| last != &tab_structure)
+            .unwrap_or(true);
+        self.last_reported_tab_structure = Some(tab_structure);
+
         for (client_id, active_tab_index) in self.active_tab_ids.iter() {
             let mut plugin_tab_updates = vec![];
             for tab in self.tabs.values() {
@@ -4957,7 +4977,11 @@ impl Screen {
                 plugin_tab_updates.push(tab_info_for_plugins);
             }
             plugin_tab_updates.sort_by(|a, b| a.position.cmp(&b.position));
-            let target_plugin_ids = self.targeted_plugin_ids(*client_id, EventType::TabUpdate);
+            let target_plugin_ids = if tab_structure_changed {
+                self.all_tab_plugin_ids(*client_id, EventType::TabUpdate)
+            } else {
+                self.targeted_plugin_ids(*client_id, EventType::TabUpdate)
+            };
             for plugin_id in target_plugin_ids {
                 plugin_updates.push((
                     Some(plugin_id),
@@ -4966,6 +4990,7 @@ impl Screen {
                 ));
             }
         }
+
         self.bus
             .senders
             .send_to_plugin(PluginInstruction::Update(plugin_updates))
@@ -5782,6 +5807,32 @@ impl Screen {
     /// Collect plugin IDs that should receive a broadcast event for a given client.
     /// Returns plugin IDs from the client's active tab plus background plugins
     /// subscribed to the given event type.
+    /// The tab list as a plugin drawing a tab bar sees it: one entry per tab, id, position, name.
+    ///
+    /// Deliberately excludes which tab is active and everything else that changes while the tabs
+    /// themselves do not - this exists to tell "the tab list changed" from "something else did",
+    /// and the something else is the frequent case.
+    fn tab_structure(&self) -> Vec<(usize, usize, String)> {
+        self.tabs
+            .values()
+            .map(|tab| (tab.id, tab.position, tab.name.clone()))
+            .collect()
+    }
+    /// Every tab's plugins, plus the background plugins `targeted_plugin_ids` would have picked.
+    ///
+    /// For the events where the tabs a user is NOT looking at have to be right the moment they
+    /// become visible - which is only the ones that change the tab list itself.
+    fn all_tab_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
+        let mut plugin_ids = self.targeted_plugin_ids(client_id, event_type);
+        for tab in self.tabs.values() {
+            for plugin_id in tab.get_plugin_ids() {
+                if !plugin_ids.contains(&plugin_id) {
+                    plugin_ids.push(plugin_id);
+                }
+            }
+        }
+        plugin_ids
+    }
     fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
         let mut plugin_ids = Vec::new();
         // Active-tab plugins
@@ -7025,12 +7076,19 @@ impl Screen {
         let active_tab_index =
             first_client_id.and_then(|client_id| self.active_tab_ids.get(&client_id));
 
-        // Filter tabs based on optional tab_index parameter
-        let tabs_to_process: Vec<_> = self
+        // Filter tabs based on optional tab_index parameter.
+        //
+        // Sorted by position, not by the id `self.tabs` is keyed on: the two agree until a tab is
+        // moved, and after that the id order is the order the tabs were CREATED in. A layout
+        // recreates tabs in the order it lists them, so serializing in id order hands a restored
+        // session its tabs back in creation order - a moved tab silently jumps back to where it
+        // started, every restart. Position is what the tab bar draws and what the user moved.
+        let mut tabs_to_process: Vec<_> = self
             .tabs
             .iter()
             .filter(|(idx, _)| tab_index.map_or(true, |target| **idx == target))
             .collect();
+        tabs_to_process.sort_by_key(|(_, tab)| tab.position);
 
         for (tab_index, tab) in tabs_to_process {
             let tab_is_focused = active_tab_index == Some(&tab_index);
@@ -10121,9 +10179,12 @@ pub(crate) fn screen_thread_main(
                 drop(completion_tx); // action ends here, notify the action initiator
             },
             ScreenInstruction::QueryTabNames(client_id, completion_tx) => {
-                let tab_names = screen
-                    .get_tabs_mut()
-                    .values()
+                // in the order the tab bar draws them: the map is keyed by stable id, which stops
+                // matching the display order the moment a tab is moved
+                let mut tabs: Vec<_> = screen.get_tabs_mut().values().collect();
+                tabs.sort_by_key(|tab| tab.position);
+                let tab_names = tabs
+                    .iter()
                     .map(|tab| tab.name.clone())
                     .collect::<Vec<String>>();
                 screen.bus.senders.send_to_server(ServerInstruction::Log(

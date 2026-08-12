@@ -200,6 +200,15 @@ impl SessionLayoutMetadata {
 }
 
 impl SessionLayoutMetadata {
+    /// The tab names in the order they were added - which is the order a restored session gets
+    /// its tabs back in.
+    #[cfg(test)]
+    pub fn tab_names(&self) -> Vec<String> {
+        self.tabs
+            .iter()
+            .map(|tab| tab.name.clone().unwrap_or_default())
+            .collect()
+    }
     pub fn add_tab(
         &mut self,
         name: String,

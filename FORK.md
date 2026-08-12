@@ -1846,6 +1846,59 @@ Note the KDL constraint that bites here: every node needs a `;` or a newline aft
 before a closing brace included, so the one-line form `{ match "x"; env "Y"; rewrite "z" }` does not
 parse. Use the multi-line form above.
 
+### What a pane is running, when the shell has no job control
+
+`resurrect_command_hints` above, and the plain "this pane was running X" line under it, both rest on
+zellij knowing what a pane runs. On a machine whose shell has job control off (`setopt no_monitor`,
+`set +m`) it never knew: **no pane in any snapshot carried a command**, and no hint ever fired.
+
+Discovery asks the terminal for its foreground process group (`tcgetpgrp` on the pty master) and
+drops the answer when it equals the pane's shell pid. That test is right when job control is on — an
+idle shell IS the foreground group, and a foreground job gets a group of its own. With job control
+off the shell never moves a job out of its own group, so a pane running an agent for hours is
+indistinguishable, by process group alone, from a pane sitting at a prompt. Everything then fell
+through to the shell itself, which discovery recognises as the default shell and records as nothing.
+
+Those panes are now asked about their **children** instead — the same ppid-based answer the Windows
+arm already gives, for the same reason (Windows has no controlling-terminal foreground group). An
+idle shell has no children and still records nothing; a shell running something has one. Where a
+shell has several, the newest wins: the one a user is looking at is the one they started last.
+
+The process-group lookup stays first and unchanged, so nothing about a job-controlled shell changes.
+
+### Tabs come back in the order they were left in
+
+A session restored from a snapshot got its tabs back in **creation** order, so every tab that had
+ever been moved jumped back to where it started — once per restart, quietly, with the serialized
+layout agreeing with the wrong order.
+
+`screen.tabs` is keyed by stable tab id; the display order lives in `tab.position`. The two agree
+until a tab is moved. `get_layout_metadata` iterated the map, so what it wrote was id order — and a
+layout recreates tabs in the order it lists them. `query-tab-names` read the same map the same way,
+which is worse than it sounds: it is the command you would reach for to check the order, and it
+confirmed the wrong one. Both now sort by position.
+
+### A tab bar in a tab you are not looking at
+
+Moving, renaming, adding or closing a tab left every *other* tab's tab-bar plugin drawing the old
+list. Arriving at one of those tabs drew the stale list for a frame (~10ms, the repaint debounce)
+before it corrected itself — visible as a flicker, since the tab names shift.
+
+`targeted_plugin_ids` sends `TabUpdate` to the active tab's plugins only, which is upstream
+`12ee60753` (#4918) and correct for the frequent case: the event fires on nearly every state change,
+and updating every tab's plugins each time was a measured regression when switching tabs. It is only
+wrong for the rare one. The update now reaches every tab's plugins when the tab list actually
+changed — decided by comparing `(id, position, name)` per tab against what was last reported — and
+the active tab's alone otherwise. A switch changes none of those, so switching stays exactly as
+cheap as upstream made it. Measured on a 5-tab session: the frame drawn on arrival is correct, and
+takes the same ~20ms to appear as before.
+
+The active-tab **highlight** is still one frame behind on arrival, and is left that way. The plugin
+only learns it is active after the switch, and making the frame wait for that redraw does not work:
+a switch also fires `ModeUpdate` and `PaneUpdate`, the plugin redraws for those first, and that
+redraw satisfies the wait before the tab-aware one exists. Fixing it needs a render to say which
+event it answers, which `PluginRenderAsset` does not carry.
+
 ### `default_floating_size` — a bigger default for floating panes
 
 A floating pane that carries no coordinates of its own lands at half the viewport

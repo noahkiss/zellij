@@ -631,45 +631,21 @@ impl ServerOsApi for ServerOsInputOutput {
         post_hook: &Option<String>,
     ) -> HashMap<u32, Vec<String>> {
         let mut terminal_to_fg_pid: HashMap<u32, u32> = HashMap::new();
+        // panes the foreground process group cannot answer for. It equals the shell's own group
+        // both when the shell sits idle and when the shell runs jobs inside its own group, which
+        // is what a shell with job control off does - so these are asked about their children
+        // instead, and an idle shell answers that question with nothing.
+        let mut panes_to_scan: Vec<(u32, u32)> = Vec::new();
         for &(terminal_id, shell_pid) in panes {
-            if let Some(fpgid) = self.pty_backend.tcgetpgrp(terminal_id) {
-                if fpgid > 0 && fpgid as u32 != shell_pid {
+            match self.pty_backend.tcgetpgrp(terminal_id) {
+                Some(fpgid) if fpgid > 0 && fpgid as u32 != shell_pid => {
                     terminal_to_fg_pid.insert(terminal_id, fpgid as u32);
-                }
+                },
+                _ => panes_to_scan.push((terminal_id, shell_pid)),
             }
         }
-        if terminal_to_fg_pid.is_empty() {
-            return HashMap::new();
-        }
-
-        let sysinfo_pids: Vec<sysinfo::Pid> = terminal_to_fg_pid
-            .values()
-            .map(|&p| sysinfo::Pid::from_u32(p))
-            .collect();
-        let mut system_info = System::new();
-        let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
-        system_info.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&sysinfo_pids),
-            false,
-            refresh_kind,
-        );
-
-        let mut cmds = HashMap::new();
-        for (terminal_id, fg_pid) in terminal_to_fg_pid {
-            let Some(process) = system_info.process(sysinfo::Pid::from_u32(fg_pid)) else {
-                continue;
-            };
-            let command: Vec<String> = process
-                .cmd()
-                .iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect();
-            if command.is_empty() {
-                continue;
-            }
-            let command = apply_post_command_hook(command, post_hook);
-            cmds.insert(terminal_id, command);
-        }
+        let mut cmds = foreground_cmds_by_pid(&terminal_to_fg_pid, post_hook);
+        cmds.extend(foreground_cmds_by_child(&panes_to_scan, post_hook));
         cmds
     }
 
@@ -779,6 +755,121 @@ impl Drop for ResizeCache {
                 log::error!("Failed to apply cached resizes: {}", e);
             });
     }
+}
+
+/// The command of each pane's foreground process, looked up by pid.
+///
+/// The precise half: a shell with job control moves a foreground job into its own process group,
+/// and the terminal names that group, so there is exactly one process to ask about.
+#[cfg(unix)]
+fn foreground_cmds_by_pid(
+    terminal_to_fg_pid: &HashMap<u32, u32>,
+    post_hook: &Option<String>,
+) -> HashMap<u32, Vec<String>> {
+    if terminal_to_fg_pid.is_empty() {
+        return HashMap::new();
+    }
+
+    let sysinfo_pids: Vec<sysinfo::Pid> = terminal_to_fg_pid
+        .values()
+        .map(|&p| sysinfo::Pid::from_u32(p))
+        .collect();
+    let mut system_info = System::new();
+    let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    system_info.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&sysinfo_pids),
+        false,
+        refresh_kind,
+    );
+
+    let mut cmds = HashMap::new();
+    for (&terminal_id, &fg_pid) in terminal_to_fg_pid {
+        let Some(process) = system_info.process(sysinfo::Pid::from_u32(fg_pid)) else {
+            continue;
+        };
+        let command: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        if command.is_empty() {
+            continue;
+        }
+        let command = apply_post_command_hook(command, post_hook);
+        cmds.insert(terminal_id, command);
+    }
+    cmds
+}
+
+/// The command of each pane's newest child process, for the panes the foreground process group
+/// could not answer for.
+///
+/// A shell running with job control off (`setopt no_monitor`, `set +m`) keeps its jobs in its
+/// own process group, so the terminal reports the shell's group whether or not anything is
+/// running - and the precise lookup above discards it as "just the shell". What still
+/// distinguishes the two is children: an idle shell has none, so it records nothing, which is
+/// the same answer it gave before. The newest child wins, because the one a user is looking at
+/// is the one they started last.
+#[cfg(unix)]
+fn foreground_cmds_by_child(
+    panes: &[(u32, u32)],
+    post_hook: &Option<String>,
+) -> HashMap<u32, Vec<String>> {
+    if panes.is_empty() {
+        return HashMap::new();
+    }
+
+    // the whole table, because a child is found by its parent and only the table knows who
+    // that is - one read for every pane that needs one, as ProcessTree does for hints
+    let mut system_info = System::new();
+    let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    system_info.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+
+    let mut children_by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
+    for (pid, process) in system_info.processes() {
+        if let Some(parent) = process.parent() {
+            children_by_parent
+                .entry(parent.as_u32())
+                .or_default()
+                .push((pid.as_u32(), process.start_time()));
+        }
+    }
+
+    let mut cmds = HashMap::new();
+    for &(terminal_id, shell_pid) in panes {
+        let Some(children) = children_by_parent.get(&shell_pid) else {
+            continue;
+        };
+        let Some(child_pid) = newest_child(children) else {
+            continue;
+        };
+        let Some(process) = system_info.process(sysinfo::Pid::from_u32(child_pid)) else {
+            continue;
+        };
+        let command: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        if command.is_empty() {
+            continue;
+        }
+        cmds.insert(terminal_id, apply_post_command_hook(command, post_hook));
+    }
+    cmds
+}
+
+/// The most recently started of a shell's children, as `(pid, start_time)` pairs.
+///
+/// Start time is seconds on every platform sysinfo reports it for, so two children started in the
+/// same second tie - broken by the higher pid, which is the later of the two often enough to beat
+/// picking arbitrarily.
+#[cfg(unix)]
+fn newest_child(children: &[(u32, u64)]) -> Option<u32> {
+    children
+        .iter()
+        .max_by_key(|(pid, start_time)| (*start_time, *pid))
+        .map(|(pid, _)| *pid)
 }
 
 fn apply_post_command_hook(command: Vec<String>, post_hook: &Option<String>) -> Vec<String> {
