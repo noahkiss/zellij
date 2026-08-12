@@ -1,0 +1,13 @@
+[package]
+name = "slim-keybinds"
+version = "0.2.0"
+authors = ["Noah Kiss"]
+description = "Minimal single-line keybind-hint bar, derived live from the keybind table"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Visible width of a hint block: raw ANSI means we do the measuring, and chars().count()
+# is wrong for CJK and combining marks. Same crate zellij's own bars use.
+unicode-width = { workspace = true }
+zellij-tile = { path = "../../zellij-tile" }
