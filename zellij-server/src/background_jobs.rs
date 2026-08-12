@@ -125,6 +125,9 @@ static FLASH_DURATION_MS: u64 = 400; // Doherty threshold
 static PLUGIN_ANIMATION_OFFSET_DURATION_MD: u64 = 500;
 static SESSION_METADATA_WRITE_INTERVAL_MS: u64 = 1000;
 static UPDATE_AND_REPORT_CWDS_INTERVAL_MS: u64 = 1000;
+/// How often the server re-asks whether Full Disk Access is granted and whether its own binary has
+/// been superseded. Slow on purpose: neither changes often, and both cost a syscall.
+static STATUS_NOTICES_INTERVAL_MS: u64 = 30_000;
 static DEFAULT_SERIALIZATION_INTERVAL: u64 = 60000;
 static REPAINT_DELAY_MS: u64 = 10;
 static HELP_TEXT_DEBOUNCE_DURATION: u64 = 5000;
@@ -208,6 +211,22 @@ pub(crate) fn background_jobs_main(
             loop {
                 ticker.tick().await;
                 let _ = senders.send_to_pty(PtyInstruction::UpdateAndReportCwds);
+            }
+        });
+    }
+
+    {
+        // The two facts the status overlay reports can both change under a running server: an FDA
+        // toggle takes effect immediately, and an upgrade can replace the binary this server was
+        // started from at any time. Asked on a slow timer rather than per frame - one file open
+        // and, at most, one executable header read.
+        let senders = bus.senders.clone();
+        runtime.spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_millis(STATUS_NOTICES_INTERVAL_MS));
+            loop {
+                ticker.tick().await;
+                let _ = senders.send_to_screen(ScreenInstruction::RecheckStatusNotices);
             }
         });
     }
