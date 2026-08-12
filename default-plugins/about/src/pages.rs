@@ -1,6 +1,7 @@
 use zellij_tile::prelude::*;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use zellij_tile::prelude::actions::Action;
@@ -20,10 +21,31 @@ pub enum PageKind {
     Other,
 }
 
+/// What the main screen says about the binary this session runs, as the server described it.
+#[derive(Debug, Clone, Default)]
+pub struct ServerBinary {
+    /// Where the running server actually is, symlinks resolved
+    pub running: String,
+    /// A path that still names this program after an upgrade - the pinned copy, or a name on PATH
+    /// leading to the same file. Absent when the running path is the steadiest one there is.
+    pub stable: Option<String>,
+    /// Set by a macOS host, where the path is pasted into Full Disk Access
+    pub full_disk_access_hint: bool,
+}
+
+impl ServerBinary {
+    /// The path `<c>` copies: the one the user is being told to act on.
+    pub fn path_to_copy(&self) -> &str {
+        self.stable.as_deref().unwrap_or(&self.running)
+    }
+}
+
 #[derive(Debug)]
 pub struct Page {
     title: Option<Text>,
     components_to_render: Vec<RenderedComponent>,
+    /// Indices into `components_to_render` that a pane too short for the page must still show
+    essential_components: HashSet<usize>,
     has_hover: bool,
     hovering_over_link: bool,
     menu_item_is_selected: bool,
@@ -38,6 +60,7 @@ impl Page {
         base_mode: Rc<RefCell<InputMode>>,
         is_release_notes: bool,
         keybinding_state: Rc<RefCell<KeybindingState>>,
+        server_binary: Option<ServerBinary>,
     ) -> Self {
         let has_missing_binds = keybinding_state.borrow().has_missing_binds();
         let main_screen_builder: Rc<dyn Fn() -> Page> = Rc::new({
@@ -45,6 +68,7 @@ impl Page {
             let zellij_version = zellij_version.clone();
             let base_mode = base_mode.clone();
             let keybinding_state = keybinding_state.clone();
+            let server_binary = server_binary.clone();
             move || {
                 Page::new_main_screen(
                     link_executable.clone(),
@@ -52,6 +76,7 @@ impl Page {
                     base_mode.clone(),
                     is_release_notes,
                     keybinding_state.clone(),
+                    server_binary.clone(),
                 )
             }
         });
@@ -129,46 +154,66 @@ impl Page {
                         move || Page::new_pane_focus(keybinding_state, main_screen_builder)
                     })),
                 ]));
-        page.with_paragraph(vec![ComponentLine::new(vec![
-            ActiveComponent::new(TextOrCustomRender::Text(Text::new("Full Changelog: "))),
-            ActiveComponent::new(TextOrCustomRender::Text(changelog_link_unselected(
-                zellij_version.clone(),
-            )))
-            .with_hover(TextOrCustomRender::CustomRender(
-                Box::new(changelog_link_selected(zellij_version.clone())),
-                Box::new(changelog_link_selected_len(zellij_version.clone())),
-            ))
-            .with_left_click_action(ClickAction::new_open_link(
-                format!(
-                    "https://github.com/zellij-org/zellij/releases/tag/v{}",
-                    zellij_version.clone()
-                ),
-                link_executable.clone(),
-            )),
-        ])])
-        .with_paragraph(vec![ComponentLine::new(vec![
-            ActiveComponent::new(TextOrCustomRender::Text(support_the_developer_text())),
-            ActiveComponent::new(TextOrCustomRender::Text(sponsors_link_text_unselected()))
+        let page = page
+            .with_paragraph(vec![ComponentLine::new(vec![
+                ActiveComponent::new(TextOrCustomRender::Text(Text::new("Full Changelog: "))),
+                ActiveComponent::new(TextOrCustomRender::Text(changelog_link_unselected(
+                    zellij_version.clone(),
+                )))
                 .with_hover(TextOrCustomRender::CustomRender(
-                    Box::new(sponsors_link_text_selected),
-                    Box::new(sponsors_link_text_selected_len),
+                    Box::new(changelog_link_selected(zellij_version.clone())),
+                    Box::new(changelog_link_selected_len(zellij_version.clone())),
                 ))
                 .with_left_click_action(ClickAction::new_open_link(
-                    "https://github.com/sponsors/imsnif".to_owned(),
+                    format!(
+                        "https://github.com/zellij-org/zellij/releases/tag/v{}",
+                        zellij_version.clone()
+                    ),
                     link_executable.clone(),
                 )),
-        ])])
-        .with_help(if is_release_notes {
+            ])])
+            .with_paragraph(vec![ComponentLine::new(vec![
+                ActiveComponent::new(TextOrCustomRender::Text(support_the_developer_text())),
+                ActiveComponent::new(TextOrCustomRender::Text(sponsors_link_text_unselected()))
+                    .with_hover(TextOrCustomRender::CustomRender(
+                        Box::new(sponsors_link_text_selected),
+                        Box::new(sponsors_link_text_selected_len),
+                    ))
+                    .with_left_click_action(ClickAction::new_open_link(
+                        "https://github.com/sponsors/imsnif".to_owned(),
+                        link_executable.clone(),
+                    )),
+            ])]);
+        // the binary the server is actually running, and the path to act on where the two differ.
+        // The server sends the hint only from a macOS host, where the path is copied into System
+        // Settings -> Privacy & Security -> Full Disk Access (Cmd+Shift+G in the file picker);
+        // elsewhere the paths answer "which build is this session running" and where it stays put.
+        let has_path_to_copy = server_binary.is_some();
+        let page = match server_binary {
+            // every path gets a line to itself: it is the part that is copied, and sharing a line
+            // with a label costs it those columns and truncates a long path into a wrong one
+            Some(server_binary) => {
+                page.with_essential_paragraph(server_binary_lines(server_binary))
+            },
+            None => page,
+        };
+        page.with_help(if is_release_notes {
             Box::new(move |hovering_over_link, menu_item_is_selected| {
                 release_notes_main_help(
                     hovering_over_link,
                     menu_item_is_selected,
                     has_missing_binds,
+                    has_path_to_copy,
                 )
             })
         } else {
             Box::new(move |hovering_over_link, menu_item_is_selected| {
-                main_screen_help_text(hovering_over_link, menu_item_is_selected, has_missing_binds)
+                main_screen_help_text(
+                    hovering_over_link,
+                    menu_item_is_selected,
+                    has_missing_binds,
+                    has_path_to_copy,
+                )
             })
         })
     }
@@ -830,6 +875,7 @@ impl Page {
         Page {
             title: None,
             components_to_render: vec![],
+            essential_components: HashSet::new(),
             has_hover: false,
             hovering_over_link: false,
             menu_item_is_selected: false,
@@ -858,6 +904,12 @@ impl Page {
         self.components_to_render
             .push(RenderedComponent::Paragraph(paragraph));
         self
+    }
+    /// A paragraph that a pane too short for the whole page keeps at the cost of the rest.
+    pub fn with_essential_paragraph(mut self, paragraph: Vec<ComponentLine>) -> Self {
+        self.essential_components
+            .insert(self.components_to_render.len());
+        self.with_paragraph(paragraph)
     }
     pub fn with_help(mut self, help_text_fn: Box<dyn Fn(bool, bool) -> Text>) -> Self {
         self.components_to_render
@@ -1044,12 +1096,16 @@ impl Page {
         }
         column_count
     }
-    pub fn ui_row_count(&mut self) -> usize {
+    /// The rows the page wants, given the components a short pane made it give up.
+    fn ui_row_count_without(&self, hidden: &HashSet<usize>) -> usize {
         let mut row_count = 0;
         if self.title.is_some() {
             row_count += 1;
         }
-        for rendered_component in &self.components_to_render {
+        for (index, rendered_component) in self.components_to_render.iter().enumerate() {
+            if hidden.contains(&index) {
+                continue;
+            }
             match rendered_component {
                 RenderedComponent::BulletinList(bulletin_list) => {
                     row_count += bulletin_list.len();
@@ -1061,12 +1117,43 @@ impl Page {
                                                           // the UI container
             }
         }
-        row_count += self.components_to_render.len();
+        row_count += self.components_to_render.len() - hidden.len();
         row_count
     }
+    /// Which components to leave out of a pane too short to hold the page.
+    ///
+    /// The page is a fixed block centered in the pane, so whatever does not fit falls off the
+    /// bottom and is never seen - which is fine for a decorative list and not fine for a line a
+    /// user opened this page to copy. Give up the biggest thing that is not essential first, so
+    /// the "What's new" list goes before a one-line paragraph does, until the rest fits.
+    fn components_to_hide(&self, rows: usize) -> HashSet<usize> {
+        let mut hidden = HashSet::new();
+        while self.ui_row_count_without(&hidden) > rows {
+            let biggest_expendable = self
+                .components_to_render
+                .iter()
+                .enumerate()
+                .filter(|(index, component)| {
+                    !hidden.contains(index)
+                        && !self.essential_components.contains(index)
+                        && !matches!(component, RenderedComponent::HelpText(_))
+                })
+                .max_by_key(|(index, component)| (component.row_count(), *index));
+            match biggest_expendable {
+                Some((index, _)) => {
+                    hidden.insert(index);
+                },
+                // everything left is essential: it overflows, which beats hiding the point of the
+                // page
+                None => break,
+            }
+        }
+        hidden
+    }
     pub fn render(&mut self, rows: usize, columns: usize, error: &Option<String>) {
+        let hidden = self.components_to_hide(rows);
         let base_x = columns.saturating_sub(self.ui_column_count()) / 2;
-        let base_y = rows.saturating_sub(self.ui_row_count()) / 2;
+        let base_y = rows.saturating_sub(self.ui_row_count_without(&hidden)) / 2;
         let mut current_y = base_y;
         if let Some(title) = &self.title {
             print_text_with_coordinates(
@@ -1078,7 +1165,12 @@ impl Page {
             );
             current_y += 2;
         }
-        for rendered_component in &mut self.components_to_render {
+        for (index, rendered_component) in self.components_to_render.iter_mut().enumerate() {
+            if hidden.contains(&index) {
+                // a component that did not render must not stay clickable where it used to be
+                rendered_component.clear_rendered_coordinates();
+                continue;
+            }
             let is_help = match rendered_component {
                 RenderedComponent::HelpText(_) => true,
                 _ => false,
@@ -1116,6 +1208,59 @@ fn render_error(error: &str, y: usize) {
         None,
         None,
     );
+}
+
+/// The label above the server binary path, saying what the path is for when there is something to
+/// say. Only a macOS host sends the hint, because only macOS has a panel to paste the path into.
+fn server_binary_label(with_full_disk_access_hint: bool) -> Text {
+    if with_full_disk_access_hint {
+        Text::new("Server binary (macOS: grant Full Disk Access to this path):").color_range(2, ..)
+    } else {
+        Text::new("Server binary:").color_range(2, ..)
+    }
+}
+
+/// The label above the upgrade-proof path, which is shown only when it names a second file.
+///
+/// It is the path worth writing down, so it says what it is good for: on macOS a permission grant
+/// follows the file, and a versioned path loses the grant at every upgrade.
+fn stable_binary_label(with_full_disk_access_hint: bool) -> Text {
+    if with_full_disk_access_hint {
+        Text::new("Grant Full Disk Access to this path instead - it survives upgrades:")
+            .color_range(2, ..)
+    } else {
+        Text::new("Stable path (survives upgrades):").color_range(2, ..)
+    }
+}
+
+/// The lines of the server binary paragraph: one label and one path per binary named.
+fn server_binary_lines(server_binary: ServerBinary) -> Vec<ComponentLine> {
+    let ServerBinary {
+        running,
+        stable,
+        full_disk_access_hint,
+    } = server_binary;
+    let mut lines = vec![
+        ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
+            // with a steadier path below it, this line answers "which build is running" only
+            match stable {
+                Some(_) => Text::new("Server binary (running):").color_range(2, ..),
+                None => server_binary_label(full_disk_access_hint),
+            },
+        ))]),
+        ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
+            Text::new(running),
+        ))]),
+    ];
+    if let Some(stable) = stable {
+        lines.push(ComponentLine::new(vec![ActiveComponent::new(
+            TextOrCustomRender::Text(stable_binary_label(full_disk_access_hint)),
+        )]));
+        lines.push(ComponentLine::new(vec![ActiveComponent::new(
+            TextOrCustomRender::Text(Text::new(stable)),
+        )]));
+    }
+    lines
 }
 
 fn changelog_link_unselected(version: String) -> Text {
@@ -1187,10 +1332,14 @@ fn main_screen_title(version: String, is_release_notes: bool) -> Text {
     }
 }
 
+/// What the copy binding adds to a help line, when the page has a path worth copying.
+const COPY_PATH_HELP: &str = ", <c> - Copy Path";
+
 fn main_screen_help_text(
     hovering_over_link: bool,
     menu_item_is_selected: bool,
     has_missing_binds: bool,
+    has_path_to_copy: bool,
 ) -> Text {
     if hovering_over_link {
         return link_hover_help();
@@ -1206,6 +1355,9 @@ fn main_screen_help_text(
     if !menu_item_is_selected {
         help_text.push_str(", <?> - Usage Tips");
     }
+    if has_path_to_copy {
+        help_text.push_str(COPY_PATH_HELP);
+    }
     color_help_keys(help_text)
 }
 
@@ -1213,6 +1365,7 @@ fn release_notes_main_help(
     hovering_over_link: bool,
     menu_item_is_selected: bool,
     has_missing_binds: bool,
+    has_path_to_copy: bool,
 ) -> Text {
     if hovering_over_link {
         return link_hover_help();
@@ -1225,6 +1378,9 @@ fn release_notes_main_help(
         help_text.push_str(", <u> - Update Keybindings");
     }
     help_text.push_str(", <ESC> - Dismiss");
+    if has_path_to_copy {
+        help_text.push_str(COPY_PATH_HELP);
+    }
     color_help_keys(help_text)
 }
 
@@ -1236,6 +1392,7 @@ fn color_help_keys(help_text: String) -> Text {
         .color_substring(1, "<u>")
         .color_substring(1, "<ESC>")
         .color_substring(1, "<?>")
+        .color_substring(1, "<c>")
 }
 
 fn link_hover_help() -> Text {
@@ -1363,6 +1520,27 @@ impl RenderedComponent {
         }
         rendered_rows
     }
+    /// Rows this takes inside the UI container. Help text sits outside it and so costs none.
+    pub fn row_count(&self) -> usize {
+        match self {
+            RenderedComponent::HelpText(_) => 0,
+            RenderedComponent::BulletinList(bulletin_list) => bulletin_list.len(),
+            RenderedComponent::Paragraph(paragraph) => paragraph.len(),
+        }
+    }
+    pub fn clear_rendered_coordinates(&mut self) {
+        match self {
+            RenderedComponent::HelpText(_) => {},
+            RenderedComponent::BulletinList(bulletin_list) => {
+                bulletin_list.clear_rendered_coordinates()
+            },
+            RenderedComponent::Paragraph(paragraph) => {
+                for component_line in paragraph {
+                    component_line.clear_rendered_coordinates();
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1384,6 +1562,11 @@ impl BulletinList {
     }
     pub fn len(&self) -> usize {
         self.items.len() + 1 // 1 for the title
+    }
+    pub fn clear_rendered_coordinates(&mut self) {
+        for item in &mut self.items {
+            item.clear_rendered_coordinates();
+        }
     }
     pub fn column_count(&self) -> usize {
         let mut column_count = 0;
@@ -1513,5 +1696,139 @@ impl ComponentLine {
 impl ComponentLine {
     pub fn new(components: Vec<ActiveComponent>) -> Self {
         ComponentLine { components }
+    }
+    pub fn clear_rendered_coordinates(&mut self) {
+        for component in &mut self.components {
+            component.clear_rendered_coordinates();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SERVER_EXE: &str = "/opt/homebrew/Cellar/zellij/0.45.0/bin/zellij";
+    const STABLE_EXE: &str = "/Users/someone/Library/Application Support/zellij/bin/zellij";
+
+    fn server_binary(stable: Option<&str>) -> ServerBinary {
+        ServerBinary {
+            running: String::from(SERVER_EXE),
+            stable: stable.map(String::from),
+            full_disk_access_hint: true,
+        }
+    }
+
+    fn main_screen() -> Page {
+        main_screen_with(Some(server_binary(None)))
+    }
+
+    fn main_screen_with(server_binary: Option<ServerBinary>) -> Page {
+        Page::new_main_screen(
+            Rc::new(RefCell::new(String::from("open"))),
+            String::from("0.45.0"),
+            Rc::new(RefCell::new(InputMode::Normal)),
+            false,
+            Rc::new(RefCell::new(KeybindingState::default())),
+            server_binary,
+        )
+    }
+
+    /// The index of the paragraph holding the server binary path, which is the last one added
+    fn server_binary_paragraph(page: &Page) -> usize {
+        *page
+            .essential_components
+            .iter()
+            .next()
+            .expect("the main screen marks the server binary paragraph essential")
+    }
+
+    #[test]
+    fn a_pane_that_fits_the_page_hides_nothing() {
+        let page = main_screen();
+        assert_eq!(page.ui_row_count_without(&HashSet::new()), 18);
+        assert!(page.components_to_hide(18).is_empty());
+        assert!(page.components_to_hide(40).is_empty());
+    }
+
+    #[test]
+    fn a_short_pane_gives_up_the_whats_new_list_first() {
+        let page = main_screen();
+        let hidden = page.components_to_hide(17);
+        assert_eq!(hidden.len(), 1, "one component is enough at 17 rows");
+        assert!(!hidden.contains(&server_binary_paragraph(&page)));
+        assert!(page.ui_row_count_without(&hidden) <= 17);
+    }
+
+    #[test]
+    fn the_server_binary_survives_a_pane_too_short_for_anything_else() {
+        let page = main_screen();
+        for rows in 1..=17 {
+            let hidden = page.components_to_hide(rows);
+            assert!(
+                !hidden.contains(&server_binary_paragraph(&page)),
+                "the server binary paragraph was hidden at {} rows",
+                rows
+            );
+        }
+        // title, spacing and the two lines of the paragraph itself, and nothing else left to drop
+        assert_eq!(page.ui_row_count_without(&page.components_to_hide(1)), 5);
+    }
+
+    #[test]
+    fn a_page_without_a_server_binary_still_trims() {
+        let page = main_screen_with(None);
+        assert!(page.essential_components.is_empty());
+        assert_eq!(page.ui_row_count_without(&HashSet::new()), 15);
+        // the list alone buys 9 rows; below that the two remaining paragraphs go too
+        assert_eq!(page.components_to_hide(6).len(), 1);
+        assert_eq!(page.components_to_hide(3).len(), 3);
+    }
+
+    #[test]
+    fn a_stable_path_is_a_second_labelled_line() {
+        let page = main_screen_with(Some(server_binary(Some(STABLE_EXE))));
+        let rendered = format!("{:?}", page.components_to_render);
+        assert!(rendered.contains(SERVER_EXE), "the running binary is shown");
+        assert!(rendered.contains(STABLE_EXE), "the stable path is shown");
+        // two labels and two paths, where one binary gets one label and one path
+        assert_eq!(page.ui_row_count_without(&HashSet::new()), 20);
+    }
+
+    #[test]
+    fn both_paths_survive_a_pane_too_short_for_anything_else() {
+        let page = main_screen_with(Some(server_binary(Some(STABLE_EXE))));
+        let paragraph = server_binary_paragraph(&page);
+        for rows in 1..=19 {
+            assert!(
+                !page.components_to_hide(rows).contains(&paragraph),
+                "the server binary paragraph was hidden at {} rows",
+                rows
+            );
+        }
+        // title, spacing and the four lines of the paragraph itself, and nothing else left to drop
+        assert_eq!(page.ui_row_count_without(&page.components_to_hide(1)), 7);
+    }
+
+    #[test]
+    fn the_stable_path_is_the_one_copied() {
+        assert_eq!(server_binary(Some(STABLE_EXE)).path_to_copy(), STABLE_EXE);
+        assert_eq!(server_binary(None).path_to_copy(), SERVER_EXE);
+    }
+
+    #[test]
+    fn the_copy_hint_is_shown_only_with_a_path_to_copy() {
+        let with_path = format!("{:?}", main_screen_help_text(false, false, false, true));
+        let without_path = format!("{:?}", main_screen_help_text(false, false, false, false));
+        assert!(with_path.contains("Copy Path"));
+        assert!(!without_path.contains("Copy Path"));
+    }
+
+    #[test]
+    fn the_hint_is_the_only_difference_between_hosts() {
+        let with_hint = server_binary_label(true);
+        let without_hint = server_binary_label(false);
+        assert!(format!("{:?}", with_hint).contains("Full Disk Access"));
+        assert!(!format!("{:?}", without_hint).contains("Full Disk Access"));
     }
 }

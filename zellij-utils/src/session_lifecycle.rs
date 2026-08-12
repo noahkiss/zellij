@@ -1166,6 +1166,18 @@ pub fn own_executable() -> Option<ExecutableIdentity> {
     std::env::current_exe().ok().map(identify_executable)
 }
 
+/// The path of the binary running right now, with symlinks resolved.
+///
+/// macOS keys a TCC grant (Full Disk Access and friends) to the RESOLVED executable, so anything
+/// that shows a user which binary to grant has to name this path. A package manager installs the
+/// binary in a versioned directory and puts a symlink on PATH; `current_exe()` hands back the
+/// symlink, which is a path TCC never records. Falls back to the unresolved path, which is still
+/// truer than nothing when the resolve fails.
+pub fn own_executable_path() -> Option<PathBuf> {
+    let path = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// What a pass over the pinned copy did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinOutcome {
@@ -1281,6 +1293,116 @@ pub fn build_mismatch_warning(name: &str) -> Option<String> {
     ))
 }
 
+/// The notice a running server should show about its own build being superseded, if any.
+///
+/// A server keeps the binary it started with for the whole life of the session, so an upgrade
+/// reaches nothing until the session is restarted - and nothing else says so, which is how a
+/// machine sits on a superseded build for days while everyone believes the upgrade took effect.
+///
+/// Asked of the path this server was STARTED FROM, which is what makes the answer trustworthy
+/// rather than a guess: the file being gone, or holding a different build than the one running, is
+/// proof that what is installed there is no longer what is running. Comparing against whatever
+/// `zellij` happens to be on `PATH` would call a deliberately-mixed setup stale forever.
+///
+/// The one addition is for [`pin_exe`](crate::session_service::configured_pinned_exe): a pinned
+/// copy cannot be written over while it is being executed, so an upgrade CANNOT change it under a
+/// running server and rule two can never fire. There the binary on `PATH` is the intended source
+/// of that copy, so it is the right thing to compare against.
+pub fn stale_build_notice(session_name: &str, pinned_exe: Option<&Path>) -> Option<String> {
+    let running_path = std::env::current_exe().ok()?;
+    let running = own_executable()?;
+
+    let superseded = if !running_path.exists() {
+        // the upgrade took the whole versioned directory with it
+        true
+    } else if compare_builds(
+        Some(&running),
+        Some(&identify_executable(running_path.clone())),
+    ) == BuildMatch::Different
+    {
+        true
+    } else if pinned_exe.map_or(false, |pinned| same_executable_path(pinned, &running_path)) {
+        installed_on_path(&running_path).map_or(false, |installed| {
+            compare_builds(Some(&running), Some(&installed)) == BuildMatch::Different
+        })
+    } else {
+        false
+    };
+
+    if !superseded {
+        return None;
+    }
+    Some(format!(
+        "⚠ session '{}' runs a superseded build - `zellij session restart {}`",
+        session_name, session_name
+    ))
+}
+
+/// The build of the `PATH` entry that shares this binary's file name, if there is one.
+fn installed_on_path(running_path: &Path) -> Option<ExecutableIdentity> {
+    let name = running_path.file_name()?;
+    crate::session_service::path_dirs()
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .map(identify_executable)
+}
+
+/// Two spellings of one file, for paths that both exist.
+fn same_executable_path(one: &Path, other: &Path) -> bool {
+    one == other
+        || match (one.canonicalize(), other.canonicalize()) {
+            (Ok(one), Ok(other)) => one == other,
+            _ => false,
+        }
+}
+
+/// Whether Full Disk Access is granted to THIS binary, asked fresh.
+///
+/// Cheap enough to ask on a timer, which it has to be: an FDA toggle takes effect on a live
+/// process, so a session that was refused at startup can be granted while it runs and a cached
+/// answer would keep telling the user to fix something they have already fixed.
+///
+/// `None` means the question was not answered - the file is missing, or the failure was not a
+/// permission one. It is not the same as "denied" and must never be reported as one.
+#[cfg(target_os = "macos")]
+pub fn full_disk_access_granted() -> Option<bool> {
+    let dirs = directories::BaseDirs::new()?;
+    // the same file the startup probe uses last: reachable only with Full Disk Access, and reading
+    // nothing out of it - the open IS the question
+    let gated = dirs
+        .home_dir()
+        .join("Library/Application Support/com.apple.TCC/TCC.db");
+    let error = std::fs::File::open(&gated).err().map(|e| e.kind());
+    match classify_tcc_probe(error) {
+        TccProbe::Reachable => Some(true),
+        TccProbe::Refused => Some(false),
+        TccProbe::Absent | TccProbe::Inconclusive => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn full_disk_access_granted() -> Option<bool> {
+    // there is no such permission to be missing
+    None
+}
+
+/// The notice a session should show about Full Disk Access, if any.
+///
+/// Names the path, because the grant is keyed to that exact file and auto-registration was not
+/// observed to happen - the user may have to add it by hand, and a notice that does not name it
+/// sends them hunting through a versioned package directory.
+pub fn full_disk_access_notice() -> Option<String> {
+    if full_disk_access_granted()? {
+        return None;
+    }
+    let path = own_executable_path()?;
+    Some(format!(
+        "⚠ Full Disk Access not granted for {}",
+        path.display()
+    ))
+}
+
 /// Say it, at most once for the life of this process.
 ///
 /// A client talks to its server many times over; the mismatch is one fact about the session and is
@@ -1293,6 +1415,147 @@ pub fn warn_if_server_build_differs(name: &str) {
         }
     });
 }
+
+/// What one probe of a TCC-protected location found.
+///
+/// The interesting distinction is not allowed-vs-refused, it is whether a DECISION EXISTS. macOS
+/// asks the user once per client and remembers the answer forever; a refusal therefore means the
+/// question has already been put and answered, and putting it again is not possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TccProbe {
+    /// Opened. Either a grant exists, or none was needed, or the user has just been asked and said
+    /// yes - from here the three are indistinguishable, and none of them is a problem.
+    Reachable,
+    /// macOS refused. A decision is already recorded as denied, so nothing prompted and nothing
+    /// will.
+    Refused,
+    /// Not there to probe. Says nothing about permissions.
+    Absent,
+    /// Some other I/O failure. NOT a permission answer - do not report it as one.
+    Inconclusive,
+}
+
+/// Classify a probe from the error it did or did not produce.
+///
+/// Split from the probing so the mapping can be tested on any platform: the part worth getting
+/// right is that only `PermissionDenied` means refused, and every other failure is inconclusive
+/// rather than quietly folded in with it.
+pub fn classify_tcc_probe(error: Option<std::io::ErrorKind>) -> TccProbe {
+    match error {
+        None => TccProbe::Reachable,
+        Some(std::io::ErrorKind::PermissionDenied) => TccProbe::Refused,
+        Some(std::io::ErrorKind::NotFound) => TccProbe::Absent,
+        Some(_) => TccProbe::Inconclusive,
+    }
+}
+
+/// Touch every TCC-protected location a session needs, so macOS decides about THIS binary now.
+///
+/// A session created by a launcher has no terminal emulator above it, and macOS attributes a pane's
+/// file access to the responsible process - which is this binary, not the shell and not whatever the
+/// user ran. Proof from a real machine: a denial recorded while running `ls` and `codex` was written
+/// against the zellij executable's path, not against theirs.
+///
+/// That attribution is the whole problem, because TCC keys a path-based client on its ABSOLUTE PATH.
+/// A package manager puts each release in its own versioned directory, so every upgrade is a client
+/// macOS has never seen, holding none of the grants the last one earned. The user does not connect
+/// the two: they upgrade zellij, and a week later an unrelated tool fails with "Operation not
+/// permitted" in a directory that worked yesterday.
+///
+/// Probing at server start puts the decision back where it belongs - next to the upgrade that caused
+/// it, while the user is still looking. Two kinds of location, which behave differently and are both
+/// worth touching:
+///
+/// - **Files & Folders** (Downloads, Desktop, Documents). Promptable. With no decision on record the
+///   probe raises the ordinary consent dialog, and one click restores what the previous version had.
+/// - **Full Disk Access**. NOT promptable - Apple offers no API to request it, and the attempt was
+///   NOT observed to list the client in that settings pane either: four controlled tests on a clean
+///   slate produced no row, from the server process and from a pane descendant alike. So the FDA
+///   half of this probe has no demonstrated effect, and the path still has to be added by hand. It
+///   is kept because the attempt is free and the log line tells the user which path to add.
+///
+/// Deliberately silent about success and best-effort throughout: this reports a fault, it does not
+/// gate a session on one. A refusal is logged rather than raised because the process that will
+/// actually hit the wall is a pane's, minutes or days later, and nothing here can intercept it.
+///
+/// Blocking. Call [`probe_protected_locations`] instead unless the wait is wanted.
+#[cfg(target_os = "macos")]
+pub fn probe_protected_locations_now() {
+    // The warning has to name the resolved path, not the one this process was started through -
+    // see `own_executable_path`. Naming the symlink sends the reader to a settings entry that will
+    // never appear.
+    fn responsible_executable_path() -> String {
+        own_executable_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| String::from("<unknown>"))
+    }
+
+    let Some(dirs) = directories::BaseDirs::new() else {
+        return;
+    };
+    let home = dirs.home_dir();
+
+    // The FDA-gated path goes last: it always refuses without a grant, and going first would put a
+    // refusal at the top of the log every single start, ahead of the ones that mean something.
+    let locations = [
+        home.join("Downloads"),
+        home.join("Desktop"),
+        home.join("Documents"),
+        home.join("Library/Application Support/com.apple.TCC/TCC.db"),
+    ];
+
+    for path in locations {
+        // read_dir opens the directory, which is where TCC intercepts; File::open does the same for
+        // the db. Neither reads an entry - the open IS the probe.
+        let error = if path.is_dir() {
+            std::fs::read_dir(&path).err()
+        } else {
+            std::fs::File::open(&path).err()
+        }
+        .map(|e| e.kind());
+
+        if classify_tcc_probe(error) == TccProbe::Refused {
+            log::warn!(
+                "macOS refuses this server access to {}. Every pane will see \"Operation not \
+                 permitted\" there, whatever it runs. The grant is keyed to this exact executable \
+                 path, so an upgrade loses it: {}. Files & Folders records a refusal permanently \
+                 and stops asking - REMOVE the zellij entry under System Settings > Privacy & \
+                 Security > Files and Folders to be asked again. Full Disk Access is never asked \
+                 for, only toggled, and has to be added by hand at that path.",
+                path.display(),
+                responsible_executable_path()
+            );
+        }
+    }
+}
+
+/// Start the probe on its own thread and return at once.
+///
+/// The probe MUST NOT run on the caller's thread. A promptable location with no decision on record
+/// blocks inside the open until someone answers the consent dialog - measured at about 100 seconds
+/// on one machine, and once until the machine was rebooted. The caller is the server's main thread,
+/// so a waiting dialog means the session never appears at all, and every retry is refused as a
+/// second server. The failure names nothing near its cause.
+///
+/// This gives up an ordering guarantee: panes now spawn while a decision may still be pending. It
+/// costs nothing, because TCC coalesces. Measured on a machine with no decision on record: two
+/// processes touching the same protected directory, one pending dialog, and BOTH waited - neither
+/// was refused. So a pane that touches a protected directory in those first seconds waits alongside
+/// the probe and proceeds once the user answers.
+#[cfg(target_os = "macos")]
+pub fn probe_protected_locations() {
+    let _ = std::thread::Builder::new()
+        .name("tcc_probe".to_string())
+        .spawn(probe_protected_locations_now);
+}
+
+/// Everywhere else has no TCC, so there is nothing to decide.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_protected_locations() {}
+
+/// Everywhere else has no TCC, so there is nothing to decide.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_protected_locations_now() {}
 
 #[cfg(test)]
 mod tests {
@@ -1766,6 +2029,41 @@ mod tests {
             ),
             BuildMatch::Same
         );
+    }
+
+    #[test]
+    fn only_permission_denied_is_a_refusal() {
+        use std::io::ErrorKind;
+        assert_eq!(
+            classify_tcc_probe(Some(ErrorKind::PermissionDenied)),
+            TccProbe::Refused
+        );
+        assert_eq!(classify_tcc_probe(None), TccProbe::Reachable);
+        assert_eq!(
+            classify_tcc_probe(Some(ErrorKind::NotFound)),
+            TccProbe::Absent
+        );
+    }
+
+    #[test]
+    fn other_failures_do_not_masquerade_as_a_refusal() {
+        // A busy disk or a broken symlink says nothing about consent. Reporting either as a
+        // refusal would send the user to a settings pane that cannot help them.
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(classify_tcc_probe(Some(kind)), TccProbe::Inconclusive);
+        }
+    }
+
+    #[test]
+    fn probing_is_safe_to_call_anywhere() {
+        // Off macOS this is empty, and on macOS it must survive a missing home, an absent
+        // directory and a refusal without propagating any of them. A session is never gated on it.
+        probe_protected_locations_now();
+        probe_protected_locations();
     }
 
     /// The smallest ELF file that carries a build id: a header, one `PT_NOTE` program header, and

@@ -25,10 +25,125 @@ use crate::{
 
 use zellij_utils::plugin_api::action::ProtobufPluginConfiguration;
 use zellij_utils::{
-    consts::ZELLIJ_TMP_DIR, data::InputMode, errors::prelude::*, input::command::TerminalAction,
-    input::keybinds::Keybinds, input::permission::PluginPermissions, input::plugins::PluginConfig,
+    consts::ZELLIJ_TMP_DIR,
+    data::InputMode,
+    errors::prelude::*,
+    input::command::TerminalAction,
+    input::keybinds::Keybinds,
+    input::layout::PluginUserConfiguration,
+    input::layout::RunPluginLocation,
+    input::permission::PluginPermissions,
+    input::plugins::PluginConfig,
     pane_size::Size,
+    session_lifecycle::own_executable_path,
+    session_service::{path_dirs, resolve_service_exe, ServiceExe},
 };
+
+/// The configuration key the `zellij:about` plugin reads the server's own binary path from.
+const SERVER_EXE_CONFIG_KEY: &str = "zellij_exe";
+
+/// The configuration key the `zellij:about` plugin reads the upgrade-proof path from.
+///
+/// Only set when it names a different file from the running binary: a path equal to the one
+/// already shown is a second line that says nothing.
+const SERVER_EXE_STABLE_CONFIG_KEY: &str = "zellij_exe_stable";
+
+/// The configuration key that asks the about plugin to say what the path is FOR.
+///
+/// Only macOS has a Full Disk Access panel to paste the path into, and only the host running the
+/// server knows whether this is macOS - the client may well be somewhere else. So the server, not
+/// the plugin, decides whether the hint is worth a line. The plugin owns the wording.
+const SERVER_EXE_HINT_CONFIG_KEY: &str = "zellij_exe_hint";
+
+/// The hint the about plugin renders on macOS hosts.
+const FULL_DISK_ACCESS_HINT: &str = "full_disk_access";
+
+/// The path of the server binary, resolved once per server process.
+///
+/// `current_exe()` is asked on the SERVER side on purpose: the about plugin exists to tell a macOS
+/// user which binary to hand Full Disk Access to, and TCC grants follow the process that actually
+/// opens the file - the server - never the client that launched it.
+fn server_exe_path() -> Option<&'static str> {
+    static SERVER_EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SERVER_EXE
+        .get_or_init(|| own_executable_path().map(|path| path.display().to_string()))
+        .as_deref()
+}
+
+/// The pinned copy the config asks for, recorded by the server before the plugin thread starts.
+///
+/// The config lives where the server is set up and nowhere near a plugin load, and threading it
+/// through the plugin thread's arguments for one string is a poor trade. `None` means the config
+/// was read and asks for no pin - the same as never having been set, which is what a test gets.
+static CONFIGURED_PINNED_EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Tell the plugin side where `pin_exe` points, once, at server startup.
+pub fn record_configured_pinned_exe(pinned_exe: Option<PathBuf>) {
+    let _ = CONFIGURED_PINNED_EXE.set(pinned_exe);
+}
+
+/// A path that keeps naming this program after an upgrade, when one exists and is not the path the
+/// server is already showing.
+///
+/// The running binary is the honest answer to "which build is this", but it is the wrong path to
+/// write down: a package manager installs into a versioned directory, so the resolved path is gone
+/// at the next upgrade - and on macOS a Full Disk Access grant is recorded against the file, so a
+/// versioned path re-asks for the grant every time. The pinned copy, then a name on PATH that
+/// leads to this same file, are the paths that survive. Same order as the one a generated service
+/// unit uses, and for the same reason.
+///
+/// A pinned path with no file at it is not offered: `session up` installs that copy, and a machine
+/// that has never run it would be told to grant access to something that does not exist.
+fn stable_server_exe() -> Option<&'static str> {
+    static STABLE_EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    STABLE_EXE
+        .get_or_init(|| {
+            let current_exe = std::env::current_exe().ok()?;
+            let pinned = CONFIGURED_PINNED_EXE
+                .get()
+                .cloned()
+                .flatten()
+                .filter(|pinned| pinned.exists());
+            match resolve_service_exe(None, pinned, &current_exe, &path_dirs()) {
+                // nothing steadier than where the binary already is
+                ServiceExe::Resolved(_) => None,
+                steadier => Some(steadier.path().display().to_string()),
+            }
+        })
+        .as_deref()
+}
+
+/// Hand a plugin the configuration it should see at load time.
+///
+/// The stored `PluginConfig` is left alone: its configuration is half of the key the plugin map
+/// dedupes and focuses instances by, so injecting into it would make every launch-or-focus of the
+/// about plugin miss the running one and open another pane. Only the copy sent to `load()` grows a
+/// key, and only for the plugin that asked for it.
+fn configuration_for_load(plugin_config: &PluginConfig) -> PluginUserConfiguration {
+    let mut configuration = plugin_config.initial_userspace_configuration.clone();
+    let is_about_plugin = matches!(
+        &plugin_config.location,
+        RunPluginLocation::Zellij(tag) if tag.to_string() == "about"
+    );
+    if is_about_plugin && !configuration.inner().contains_key(SERVER_EXE_CONFIG_KEY) {
+        if let Some(server_exe) = server_exe_path() {
+            configuration.insert(SERVER_EXE_CONFIG_KEY, server_exe);
+            if let Some(stable_exe) = stable_server_exe() {
+                if stable_exe != server_exe {
+                    configuration.insert(SERVER_EXE_STABLE_CONFIG_KEY, stable_exe);
+                }
+            }
+            if cfg!(target_os = "macos")
+                && !configuration
+                    .inner()
+                    .contains_key(SERVER_EXE_HINT_CONFIG_KEY)
+            {
+                configuration.insert(SERVER_EXE_HINT_CONFIG_KEY, FULL_DISK_ACCESS_HINT);
+            }
+        }
+    }
+    configuration
+}
 
 /// Open a directory as a `File` handle for WASI pre-opening.
 /// On Windows, `FILE_FLAG_BACKUP_SEMANTICS` is required to open directories.
@@ -221,12 +336,10 @@ impl<'a> PluginLoader<'a> {
             .call(&mut plugin.lock().unwrap().store, ())
             .with_context(err_context)?;
 
-        let protobuf_plugin_configuration: ProtobufPluginConfiguration = self
-            .plugin_config
-            .initial_userspace_configuration
-            .clone()
-            .try_into()
-            .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
+        let protobuf_plugin_configuration: ProtobufPluginConfiguration =
+            configuration_for_load(&self.plugin_config)
+                .try_into()
+                .map_err(|e| anyhow!("Failed to serialize user configuration: {:?}", e))?;
         let protobuf_bytes = protobuf_plugin_configuration.encode_to_vec();
         wasi_write_object(plugin.lock().unwrap().store.data(), &protobuf_bytes)
             .with_context(err_context)?;
@@ -490,4 +603,69 @@ fn create_optimized_store_limits() -> StoreLimits {
         .tables(16) // Small table element limit
         .trap_on_grow_failure(true) // Fail fast on resource exhaustion
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin_config(location: &str) -> PluginConfig {
+        PluginConfig {
+            path: PathBuf::new(),
+            _allow_exec_host_cmd: false,
+            location: RunPluginLocation::parse(location, None).unwrap(),
+            initial_userspace_configuration: Default::default(),
+            initial_cwd: None,
+        }
+    }
+
+    #[test]
+    fn about_plugin_is_told_the_server_binary_path() {
+        let configuration = configuration_for_load(&plugin_config("zellij:about"));
+        let injected = configuration.inner().get(SERVER_EXE_CONFIG_KEY);
+        assert_eq!(injected.map(|path| path.as_str()), server_exe_path());
+    }
+
+    #[test]
+    fn an_explicit_value_is_left_alone() {
+        let mut plugin_config = plugin_config("zellij:about");
+        plugin_config
+            .initial_userspace_configuration
+            .insert(SERVER_EXE_CONFIG_KEY, "/somewhere/else");
+        let configuration = configuration_for_load(&plugin_config);
+        assert_eq!(
+            configuration.inner().get(SERVER_EXE_CONFIG_KEY),
+            Some(&String::from("/somewhere/else"))
+        );
+    }
+
+    #[test]
+    fn other_plugins_are_untouched() {
+        let configuration = configuration_for_load(&plugin_config("zellij:status-bar"));
+        assert!(configuration.inner().is_empty());
+    }
+
+    #[test]
+    fn the_full_disk_access_hint_is_a_macos_thing() {
+        let configuration = configuration_for_load(&plugin_config("zellij:about"));
+        let hint = configuration.inner().get(SERVER_EXE_HINT_CONFIG_KEY);
+        if cfg!(target_os = "macos") {
+            assert_eq!(hint, Some(&String::from(FULL_DISK_ACCESS_HINT)));
+        } else {
+            assert_eq!(hint, None);
+        }
+    }
+
+    #[test]
+    fn an_explicit_hint_is_left_alone() {
+        let mut plugin_config = plugin_config("zellij:about");
+        plugin_config
+            .initial_userspace_configuration
+            .insert(SERVER_EXE_HINT_CONFIG_KEY, "something_else");
+        let configuration = configuration_for_load(&plugin_config);
+        assert_eq!(
+            configuration.inner().get(SERVER_EXE_HINT_CONFIG_KEY),
+            Some(&String::from("something_else"))
+        );
+    }
 }
