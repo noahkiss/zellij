@@ -593,6 +593,21 @@ load_plugins {
 //
 // bell_clear_delay_ms 1000
 
+// Watch the .wasm file of every loaded plugin and reload the plugin when the file changes
+// Written for plugin development: rebuild the plugin and the running pane picks it up, with no
+// session restart and no re-adding the pane
+// Changes are debounced (300ms) and the path is canonicalized, so a build that replaces the file
+// rather than writing it in place is still noticed
+// Default: true
+//
+// plugin_watch false
+
+// How many snapshots `zellij session down` and the snapshot commands keep per session
+// The oldest are removed once the count is above this
+// Default: 10
+//
+// session_snapshot_limit 25
+
 // The size a floating pane gets when nothing asks for a specific one - the session manager, the
 // plugin manager, a bare NewFloatingPane
 // Each entry is a percent of the viewport ("80%") or a column/row count (120), and each is
