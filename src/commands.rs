@@ -949,6 +949,17 @@ pub(crate) fn start_client(opts: CliArgs) {
         },
     };
 
+    // `pin_exe` covered only the generated service unit until now, so a session started by typing
+    // `zellij` ran a server from the package manager's versioned path - a new TCC subject after
+    // every upgrade, which is exactly what the pin exists to prevent. Decided once here, where the
+    // config is, and only for the server: the client stays the binary the user typed.
+    #[cfg(unix)]
+    zellij_client::record_pinned_server_exe(
+        zellij_utils::session_service::server_exe_for_interactive_launch(
+            config_options.session_service.as_ref(),
+        ),
+    );
+
     let mut reconnect_to_session: Option<ConnectToSession> = None;
     let os_input = get_os_input(get_client_os_input);
     loop {
