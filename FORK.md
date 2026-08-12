@@ -1619,6 +1619,11 @@ was `top_only`. Every other starting point keeps upstream's cycle.
 `PaneFrameStyle::TopOnly` carries protobuf tag **100** in both `pane_frame_style.proto` and
 `event.proto` — a fork-reserved number, far from the next one upstream would take.
 
+**Floating panes obey it too**, which they did not at first. A floating pane draws its frame through
+its own render path, which builds a `PaneContentsAndUi` of its own and never called
+`set_top_only_frames` — so the title row was reserved and a full frame's rule was drawn into it. The
+floating path now passes the style it already had in scope, exactly as the tiled path does.
+
 ### A dwell before a focused pane's bell clears (`bell_clear_delay_ms`)
 
 ```kdl
@@ -1898,6 +1903,29 @@ only learns it is active after the switch, and making the frame wait for that re
 a switch also fires `ModeUpdate` and `PaneUpdate`, the plugin redraws for those first, and that
 redraw satisfies the wait before the tab-aware one exists. Fixing it needs a render to say which
 event it answers, which `PluginRenderAsset` does not carry.
+
+### `pin_exe` covers a session you started by hand
+
+[`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe) keeps a copy of the binary at a path zellij owns,
+so macOS records its permission grants against a file an upgrade does not move. For a while that
+covered only the generated service unit — and a session started by typing `zellij` therefore ran a
+server from the package manager's versioned path, which is a client TCC has never seen. Full Disk
+Access was re-granted after every upgrade for every session the launcher did not start, which is
+most of them. The feature looked broken because it was, for the way sessions actually get created.
+
+The **server** is redirected, and only the server: it owns the panes and opens the files, so it is
+the process the grant has to name, and the client is gone from TCC's point of view the moment it has
+spawned one. What the user typed keeps running as the client, and `zellij --version` still answers
+for the binary on `PATH`.
+
+The copy is brought up to date first, by the same `install_pinned_exe` `session up` uses — written
+over in place, because a new inode at that path is a new client with none of the grants. When it
+cannot be updated, the current binary is used and the reason is printed. The ordinary cause is
+another session's server already running the pinned copy, and the fallback is not politeness: a
+pinned copy of a different build is a server that would not speak to its client.
+
+The path is decided once, in `start_client`, where the config is, and reaches `spawn_server` through
+a `OnceLock` rather than through the `ClientOsApi` trait and its test fake.
 
 ### `default_floating_size` — a bigger default for floating panes
 
