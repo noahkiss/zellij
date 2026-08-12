@@ -981,6 +981,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
         Ok(Self {
             // config-file only, deliberately not carried over the client/server contract
             plugin_watch: None,
+            expect_full_disk_access: None,
+            stale_build_notice: None,
             snapshot_dir: None,
             session_snapshot_limit: None,
             bell_clear_delay_ms: None,

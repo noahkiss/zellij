@@ -1293,6 +1293,116 @@ pub fn build_mismatch_warning(name: &str) -> Option<String> {
     ))
 }
 
+/// The notice a running server should show about its own build being superseded, if any.
+///
+/// A server keeps the binary it started with for the whole life of the session, so an upgrade
+/// reaches nothing until the session is restarted - and nothing else says so, which is how a
+/// machine sits on a superseded build for days while everyone believes the upgrade took effect.
+///
+/// Asked of the path this server was STARTED FROM, which is what makes the answer trustworthy
+/// rather than a guess: the file being gone, or holding a different build than the one running, is
+/// proof that what is installed there is no longer what is running. Comparing against whatever
+/// `zellij` happens to be on `PATH` would call a deliberately-mixed setup stale forever.
+///
+/// The one addition is for [`pin_exe`](crate::session_service::configured_pinned_exe): a pinned
+/// copy cannot be written over while it is being executed, so an upgrade CANNOT change it under a
+/// running server and rule two can never fire. There the binary on `PATH` is the intended source
+/// of that copy, so it is the right thing to compare against.
+pub fn stale_build_notice(session_name: &str, pinned_exe: Option<&Path>) -> Option<String> {
+    let running_path = std::env::current_exe().ok()?;
+    let running = own_executable()?;
+
+    let superseded = if !running_path.exists() {
+        // the upgrade took the whole versioned directory with it
+        true
+    } else if compare_builds(
+        Some(&running),
+        Some(&identify_executable(running_path.clone())),
+    ) == BuildMatch::Different
+    {
+        true
+    } else if pinned_exe.map_or(false, |pinned| same_executable_path(pinned, &running_path)) {
+        installed_on_path(&running_path).map_or(false, |installed| {
+            compare_builds(Some(&running), Some(&installed)) == BuildMatch::Different
+        })
+    } else {
+        false
+    };
+
+    if !superseded {
+        return None;
+    }
+    Some(format!(
+        "⚠ session '{}' runs a superseded build - `zellij session restart {}`",
+        session_name, session_name
+    ))
+}
+
+/// The build of the `PATH` entry that shares this binary's file name, if there is one.
+fn installed_on_path(running_path: &Path) -> Option<ExecutableIdentity> {
+    let name = running_path.file_name()?;
+    crate::session_service::path_dirs()
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .map(identify_executable)
+}
+
+/// Two spellings of one file, for paths that both exist.
+fn same_executable_path(one: &Path, other: &Path) -> bool {
+    one == other
+        || match (one.canonicalize(), other.canonicalize()) {
+            (Ok(one), Ok(other)) => one == other,
+            _ => false,
+        }
+}
+
+/// Whether Full Disk Access is granted to THIS binary, asked fresh.
+///
+/// Cheap enough to ask on a timer, which it has to be: an FDA toggle takes effect on a live
+/// process, so a session that was refused at startup can be granted while it runs and a cached
+/// answer would keep telling the user to fix something they have already fixed.
+///
+/// `None` means the question was not answered - the file is missing, or the failure was not a
+/// permission one. It is not the same as "denied" and must never be reported as one.
+#[cfg(target_os = "macos")]
+pub fn full_disk_access_granted() -> Option<bool> {
+    let dirs = directories::BaseDirs::new()?;
+    // the same file the startup probe uses last: reachable only with Full Disk Access, and reading
+    // nothing out of it - the open IS the question
+    let gated = dirs
+        .home_dir()
+        .join("Library/Application Support/com.apple.TCC/TCC.db");
+    let error = std::fs::File::open(&gated).err().map(|e| e.kind());
+    match classify_tcc_probe(error) {
+        TccProbe::Reachable => Some(true),
+        TccProbe::Refused => Some(false),
+        TccProbe::Absent | TccProbe::Inconclusive => None,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn full_disk_access_granted() -> Option<bool> {
+    // there is no such permission to be missing
+    None
+}
+
+/// The notice a session should show about Full Disk Access, if any.
+///
+/// Names the path, because the grant is keyed to that exact file and auto-registration was not
+/// observed to happen - the user may have to add it by hand, and a notice that does not name it
+/// sends them hunting through a versioned package directory.
+pub fn full_disk_access_notice() -> Option<String> {
+    if full_disk_access_granted()? {
+        return None;
+    }
+    let path = own_executable_path()?;
+    Some(format!(
+        "⚠ Full Disk Access not granted for {}",
+        path.display()
+    ))
+}
+
 /// Say it, at most once for the life of this process.
 ///
 /// A client talks to its server many times over; the mismatch is one fact about the session and is
