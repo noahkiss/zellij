@@ -147,6 +147,11 @@ pub const BUILTIN_PLUGIN_NAMES: &[&str] = &[
     "multiple-select",
     "layout-manager",
     "link",
+    // Fork-added bars. They replace `tab-bar` and `status-bar`/`compact-bar`, so they are
+    // built-ins in the same sense those are: sources in `default-plugins/`, built by xtask,
+    // embedded in the binary, and version-locked to it.
+    "slim-tab-bar",
+    "slim-keybinds",
 ];
 
 #[cfg(not(target_family = "wasm"))]
@@ -211,6 +216,8 @@ mod not_wasm {
                 add_plugin!(assets, "multiple-select.wasm");
                 add_plugin!(assets, "layout-manager.wasm");
                 add_plugin!(assets, "link.wasm");
+                add_plugin!(assets, "slim-tab-bar.wasm");
+                add_plugin!(assets, "slim-keybinds.wasm");
             }
             assets
         };
