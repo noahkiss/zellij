@@ -275,6 +275,9 @@ pub struct ClientInfo {
     pub terminal_rows: ::core::option::Option<u32>,
     #[prost(uint32, optional, tag="101")]
     pub terminal_cols: ::core::option::Option<u32>,
+    /// the terminal device the client is attached to, absent when it has none
+    #[prost(string, optional, tag="102")]
+    pub tty: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

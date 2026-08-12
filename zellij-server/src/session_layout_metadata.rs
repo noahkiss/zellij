@@ -27,6 +27,9 @@ pub struct SessionLayoutMetadata {
     /// Terminal size per attached client, as `Screen` last recorded it. Carried here because the
     /// client list is assembled in the plugin thread, which has no view of `Screen`'s state.
     client_sizes: BTreeMap<ClientId, Size>,
+    /// Terminal device per attached client, same reason as `client_sizes`: assembled in the
+    /// plugin thread, which has no view of `Screen`'s state.
+    client_ttys: BTreeMap<ClientId, String>,
 }
 
 impl SessionLayoutMetadata {
@@ -72,6 +75,9 @@ impl SessionLayoutMetadata {
     pub fn set_client_sizes(&mut self, client_sizes: BTreeMap<ClientId, Size>) {
         self.client_sizes = client_sizes;
     }
+    pub fn set_client_ttys(&mut self, client_ttys: BTreeMap<ClientId, String>) {
+        self.client_ttys = client_ttys;
+    }
     /// Every client this layout knows about, and the pane each one is focused on.
     ///
     /// Both pane layers are read, not just the one on screen: floating panes are visible per tab
@@ -96,6 +102,7 @@ impl SessionLayoutMetadata {
                             pane_id: pane.id.clone(),
                             command: pane.run.clone(),
                             terminal_size: self.client_sizes.get(focused_client).copied(),
+                            tty: self.client_ttys.get(focused_client).cloned(),
                         },
                     );
                 }
@@ -695,10 +702,14 @@ pub struct ClientMetadata {
     pane_id: PaneId,
     command: Option<Run>,
     terminal_size: Option<Size>,
+    tty: Option<String>,
 }
 impl ClientMetadata {
     pub fn terminal_size(&self) -> Option<Size> {
         self.terminal_size
+    }
+    pub fn tty(&self) -> Option<String> {
+        self.tty.clone()
     }
     pub fn stringify_pane_id(&self) -> String {
         match self.pane_id {

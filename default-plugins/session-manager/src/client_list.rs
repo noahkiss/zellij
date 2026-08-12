@@ -97,8 +97,14 @@ impl ClientList {
         }
         let max_rows = rows.saturating_sub(3);
         let throttling_area = self.throttling_area();
-        let mut table =
-            Table::new().add_row(vec![" ", "Client", "Focused pane", "Size", "Running"]);
+        let mut table = Table::new().add_row(vec![
+            " ",
+            "Client",
+            "Terminal",
+            "Focused pane",
+            "Size",
+            "Running",
+        ]);
         for (i, client) in self.clients.iter().enumerate() {
             if i >= max_rows {
                 break;
@@ -121,6 +127,7 @@ impl ClientList {
                 // the one row `Detach` refuses
                 client_cell = client_cell.color_range(2, id_len..);
             }
+            let mut tty_cell = Text::new(tty_description(client.tty.as_deref())).color_range(1, ..);
             let mut pane_cell = Text::new(pane_description(&client.pane_id)).color_range(1, ..);
             // the smallest client sizes the whole session, so it gets the same emphasis colour
             // the current client marker uses - it is the row a user is looking for
@@ -137,6 +144,7 @@ impl ClientList {
                     .color_range(3, ..);
             if is_selected {
                 client_cell = client_cell.selected();
+                tty_cell = tty_cell.selected();
                 pane_cell = pane_cell.selected();
                 size_cell = size_cell.selected();
                 command_cell = command_cell.selected();
@@ -144,6 +152,7 @@ impl ClientList {
             table = table.add_styled_row(vec![
                 arrow_cell,
                 client_cell,
+                tty_cell,
                 pane_cell,
                 size_cell,
                 command_cell,
@@ -179,6 +188,19 @@ fn command_budget(columns: usize) -> usize {
 ///
 /// Blank rather than a placeholder when the server has no size for the client - an empty cell
 /// reads as "not known", where a `0x0` would read as a real and alarming measurement.
+/// The terminal a client is sitting at, with the `/dev/` every one of them shares taken off.
+///
+/// Only that prefix: `pts/10` keeps its subdirectory because the last component alone is a bare
+/// number, which sits next to a column of client ids and reads as one. A client with no
+/// controlling terminal - a web client, a CLI action - gets a dash rather than a blank, so the row
+/// does not look truncated.
+fn tty_description(tty: Option<&str>) -> String {
+    match tty {
+        Some(tty) => tty.strip_prefix("/dev/").unwrap_or(tty).to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
 fn size_description(terminal_size: Option<Size>) -> String {
     match terminal_size {
         Some(size) => format!("{}x{}", size.cols, size.rows),
@@ -342,5 +364,29 @@ mod tests {
             sized_client(3, 160, 40),
         ]);
         assert_eq!(list.throttling_area(), Some(80 * 24));
+    }
+}
+
+#[cfg(test)]
+mod tty_column_tests {
+    use super::*;
+
+    #[test]
+    fn a_tty_loses_the_prefix_every_client_shares() {
+        // the column competes for width with the running command, and /dev/ says nothing
+        assert_eq!(tty_description(Some("/dev/ttys004")), "ttys004");
+        // pts keeps its subdirectory: "3" alone would read as a client id
+        assert_eq!(tty_description(Some("/dev/pts/3")), "pts/3");
+    }
+
+    #[test]
+    fn a_client_with_no_terminal_says_so() {
+        // a web client and a CLI action have none, and a blank cell reads as a truncated row
+        assert_eq!(tty_description(None), "-");
+    }
+
+    #[test]
+    fn an_unusual_spelling_is_left_alone() {
+        assert_eq!(tty_description(Some("console")), "console");
     }
 }
