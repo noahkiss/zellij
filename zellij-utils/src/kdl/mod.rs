@@ -2955,6 +2955,12 @@ impl Options {
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_mode").map(|(v, _)| v);
         let plugin_watch =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "plugin_watch").map(|(v, _)| v);
+        let expect_full_disk_access =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "expect_full_disk_access")
+                .map(|(v, _)| v);
+        let stale_build_notice =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "stale_build_notice")
+                .map(|(v, _)| v);
         let scroll_buffer_size =
             kdl_property_first_arg_as_i64_or_error!(kdl_options, "scroll_buffer_size")
                 .map(|(scroll_buffer_size, _entry)| scroll_buffer_size as usize);
@@ -3169,6 +3175,8 @@ impl Options {
             theme_dir,
             mouse_mode,
             plugin_watch,
+            expect_full_disk_access,
+            stale_build_notice,
             pane_frames,
             pane_frame_style,
             mirror_session,
@@ -3949,6 +3957,20 @@ impl Options {
         }
         node.set_children(children);
         Some(node)
+    }
+    fn expect_full_disk_access_to_kdl(&self) -> Option<KdlNode> {
+        self.expect_full_disk_access.map(|expect| {
+            let mut node = KdlNode::new("expect_full_disk_access");
+            node.push(KdlValue::Bool(expect));
+            node
+        })
+    }
+    fn stale_build_notice_to_kdl(&self) -> Option<KdlNode> {
+        self.stale_build_notice.map(|notice| {
+            let mut node = KdlNode::new("stale_build_notice");
+            node.push(KdlValue::Bool(notice));
+            node
+        })
     }
     fn plugin_watch_to_kdl(&self) -> Option<KdlNode> {
         self.plugin_watch.map(|plugin_watch| {
@@ -5322,6 +5344,12 @@ impl Options {
         }
         if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
             nodes.push(plugin_watch);
+        }
+        if let Some(expect_full_disk_access) = self.expect_full_disk_access_to_kdl() {
+            nodes.push(expect_full_disk_access);
+        }
+        if let Some(stale_build_notice) = self.stale_build_notice_to_kdl() {
+            nodes.push(stale_build_notice);
         }
         if let Some(mouse_mode) = self.mouse_mode_to_kdl(add_comments) {
             nodes.push(mouse_mode);
