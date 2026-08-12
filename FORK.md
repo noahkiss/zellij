@@ -1587,7 +1587,7 @@ build ignores a key it does not know, but rejects a value it does not know: stoc
 whole config with `Invalid value for pane_frame_style: 'top_only'`. Keep it out of a config file
 that a stock 0.45 build also reads.
 
-`top_only` **is** `titles`, with three differences:
+`top_only` **is** `titles`, with four differences:
 
 1. **The title line is a horizontal rule.** `titles` leaves the line blank around the title unless
    the pane is stacked; `top_only` fills it with `─` always. One condition in
@@ -1598,6 +1598,9 @@ that a stock 0.45 build also reads.
    selectable non-borderless tiled pane; `top_only` promises one rule per pane, so it keeps it.
    Two conditions in `tiled_panes/mod.rs` — `single_selectable_tiled_pane` in `set_pane_frames`
    (the row the layout reserves) and `omit_pane_title` in `render` (the row it draws).
+4. **The title stays on the left.** Upstream's frames-off renderer centers the pane title
+   (`compose_bracketed_title`, new in 0.45's #5318); `top_only` keeps the pre-0.45 left-aligned
+   title, one arm in the same function. `titles` keeps upstream's centered look.
 
 Everywhere else the two behave identically, deliberately: `draws_titles()` answers `true` for both,
 so `top_only` follows the `titles` branch through the layout, offset and stacking code without a
@@ -1847,6 +1850,62 @@ config a stock build also reads: this is a fork-only *key*, which stock zellij i
 Two floating panes stay their own size on purpose: the about page and the first-run wizard resize
 themselves to 90×20 after opening, through `change_floating_panes_coordinates`, which never passes
 through `add_floating_pane`.
+
+### Moving focus inside a stack no longer makes the shells reprint
+
+Every focus move between the members of a stack made **both** shells print a fresh prompt. Three
+moves down and back left four prompts in each pane, and a stack used as a working set of shells
+filled with them.
+
+Nothing was written into the panes: the reprints were the shells answering `SIGWINCH`. A focus move
+inside a stack collapses one member to its one-row header and expands another, and both of those row
+counts were pushed to the panes' ptys. A collapsed member was told it had **one** row, and the pane
+it handed the space to was told the size it already had; the collapse alone is enough, and each move
+signalled two shells.
+
+The stack arithmetic is not the culprit, and neither is the 0.45 rework
+(#5331, #5337, #5342, #5379): a collapsed member has been one fixed row since long before it, and
+`set_pane_frames` has always ended by resizing every pane's pty. What decides the outcome is the *content offset*. With
+`full` frames the single row is entirely frame, so the member's content height comes out at zero, and
+a zero never reaches the terminal — the unix `set_terminal_size` is gated on non-zero rows. Drop the
+box and that same row is one row of content, which does reach it. So the bug is upstream's, older
+than 0.45 and reported against 0.43 (zellij-org/zellij#4047), and frames-on was only ever protected
+by accident.
+
+What 0.45 changed is who lands on which path. `PaneFrameStyle::from_options` reads `titles` for
+everything except `pane_frames false` and an explicit `pane_frame_style "full"` — so the default, and
+even a deliberate `pane_frames true`, now takes the frames-off path that was always broken. Measured
+on this fork before the fix, three focus moves in a two-pane stack:
+
+| frame setting | prompts per pane |
+| --- | --- |
+| default (`titles`) | 4 |
+| `pane_frames true` | 4 |
+| `pane_frame_style "full"` | 1 |
+| `pane_frame_style "top_only"` | 4 |
+| `pane_frames false` | 4 |
+
+Both stack renderings reprinted, classic and stack list. The fork's 0.44 `top_only` was clean for the
+same accidental reason: it rode the old frames-on override, where 0.45's `top_only` is a `titles`
+variant.
+
+The fix says what the accident said, on purpose. A pane collapsed to its stack header has no content
+area, so `set_pane_frames` takes its content rows to zero and leaves its pty alone. The pane keeps —
+in its grid and in its terminal — the size it had while expanded, so re-expanding to the same
+geometry writes the same size back and the shell hears nothing. A stack that genuinely changed size
+while the pane was collapsed (a column resize, a moved stack) is picked up on the way out of the
+header, as one legitimate resize.
+
+`PaneGeom::is_collapsed_stack_member` names the state — stacked, fixed, one row — and the branch sits
+at the single point every layout pass goes through, so no caller has to remember it and every frame
+style is covered by construction, `full` included: it now skips the resize outright instead of
+sending a zero for the os layer to drop. Both stack renderings end up quiet, classic and stack list;
+the list's row-swap is untouched.
+
+Two tests in `tab_integration_tests.rs`, both driving a real stack through the mock pty writer: one
+runs a series of focus moves in each of the four frame styles and holds that every member is given
+exactly one size, never a one-row size; the other holds the other side, that a tab resized while a
+member was collapsed reaches that member when it is focused.
 
 ## Assessed and deliberately not built
 

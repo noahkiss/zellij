@@ -696,6 +696,19 @@ impl TiledPanes {
                 }
             }
 
+            if pane.current_geom().is_collapsed_stack_member() {
+                // Fork addition: a collapsed member is one row of title, so it has no content
+                // area. Take its content rows down to zero and leave its pty alone: the grid and
+                // the pty both keep the size the pane had while expanded, and re-expanding to the
+                // same geometry writes the same size back - no SIGWINCH, so the shell does not
+                // reprint its prompt on every focus move within the stack. A stack that really did
+                // change size while the pane was collapsed is picked up on the way out.
+                let mut collapsed_offset = pane.get_content_offset();
+                collapsed_offset.top = collapsed_offset.top.max(1);
+                pane.set_content_offset(collapsed_offset);
+                continue;
+            }
+
             resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
         }
         self.reset_boundaries();
