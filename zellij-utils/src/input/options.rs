@@ -234,6 +234,17 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub plugin_watch: Option<bool>,
+    /// Load built-in plugins from this directory instead of from the binary, when a matching
+    /// `<name>.wasm` is there. `plugin_watch` then watches that file, so a bundled bar hot-reloads
+    /// the same way a `file:` plugin does.
+    ///
+    /// A development override: production runs the embedded copy, which is what makes a built-in
+    /// version-locked to the binary. A name with no file in the directory falls back to the
+    /// embedded one, so overriding one plugin does not disturb the rest.
+    /// config.kdl only - it is read by the server as it loads a plugin.
+    #[clap(skip)]
+    #[serde(default)]
+    pub builtin_plugin_dir: Option<PathBuf>,
     /// Say so in the session when Full Disk Access is missing (macOS only, true or false).
     ///
     /// Opt-in, because the notice is only meaningful where the user has decided zellij should
@@ -601,6 +612,9 @@ impl Options {
         let pane_frames = other.pane_frames.or(self.pane_frames);
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let plugin_watch = other.plugin_watch.or(self.plugin_watch);
+        let builtin_plugin_dir = other
+            .builtin_plugin_dir
+            .or_else(|| self.builtin_plugin_dir.clone());
         let expect_full_disk_access = other
             .expect_full_disk_access
             .or(self.expect_full_disk_access);
@@ -725,6 +739,7 @@ impl Options {
             pane_frames,
             pane_frame_style,
             plugin_watch,
+            builtin_plugin_dir,
             expect_full_disk_access,
             stale_build_notice,
             mirror_session,
@@ -801,6 +816,9 @@ impl Options {
         let pane_frames = merge_bool(other.pane_frames, self.pane_frames);
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let plugin_watch = merge_bool(other.plugin_watch, self.plugin_watch);
+        let builtin_plugin_dir = other
+            .builtin_plugin_dir
+            .or_else(|| self.builtin_plugin_dir.clone());
         let expect_full_disk_access =
             merge_bool(other.expect_full_disk_access, self.expect_full_disk_access);
         let stale_build_notice = merge_bool(other.stale_build_notice, self.stale_build_notice);
@@ -926,6 +944,7 @@ impl Options {
             pane_frames,
             pane_frame_style,
             plugin_watch,
+            builtin_plugin_dir,
             expect_full_disk_access,
             stale_build_notice,
             mirror_session,
