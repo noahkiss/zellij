@@ -466,6 +466,7 @@ impl SessionMetaData {
                     stacked_resize: new_config.options.stacked_resize.unwrap_or(true),
                     stacked_pane_list: new_config.options.stacked_pane_list.unwrap_or(true),
                     default_editor: new_config.options.scrollback_editor.clone(),
+                    default_floating_size: new_config.options.default_floating_size.clone(),
                     advanced_mouse_actions: new_config
                         .options
                         .advanced_mouse_actions

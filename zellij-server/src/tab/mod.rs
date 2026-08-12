@@ -23,7 +23,7 @@ use zellij_utils::data::{
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
-use zellij_utils::input::options::DEFAULT_WORD_SEPARATORS;
+use zellij_utils::input::options::{DefaultFloatingSize, DEFAULT_WORD_SEPARATORS};
 use zellij_utils::position::Position;
 use zellij_utils::position::{Column, Line};
 use zellij_utils::shared::clean_string_from_control_and_linebreak;
@@ -225,6 +225,9 @@ pub(crate) struct Tab {
     connected_clients: Rc<RefCell<HashSet<ClientId>>>,
     pane_frame_style: PaneFrameStyle,
     auto_layout: bool,
+    /// Fork addition: the fallback size for a floating pane that carries no coordinates of its
+    /// own. Shared with `Screen` so a config reload reaches every tab without a per-tab update.
+    default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
     pending_vte_events: HashMap<u32, Vec<VteBytes>>,
     pub selecting_with_mouse_in_pane: Option<PaneId>, // this is only pub for the tests
     pane_being_resized_with_mouse: Option<PaneResizeState>,
@@ -860,6 +863,7 @@ impl Tab {
         character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
         stacked_resize: Rc<RefCell<bool>>,
         stacked_pane_list: Rc<RefCell<bool>>,
+        default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
         sixel_image_store: Rc<RefCell<SixelImageStore>>,
         kitty_image_store: Rc<RefCell<KittyImageStore>>,
         os_api: Box<dyn ServerOsApi>,
@@ -992,6 +996,7 @@ impl Tab {
             default_mode_info,
             pane_frame_style,
             auto_layout,
+            default_floating_size,
             pending_vte_events: HashMap::new(),
             connected_clients,
             selecting_with_mouse_in_pane: None,
@@ -7297,6 +7302,15 @@ impl Tab {
         if self.floating_panes.fullscreen_is_active() {
             self.floating_panes.unset_fullscreen();
         }
+        // fork addition: `default_floating_size` fills in the axes the caller left open, so a
+        // pane that asked for nothing gets the configured size instead of half the viewport.
+        // Anything explicit still wins, and an unset config leaves the coordinates untouched.
+        let floating_pane_coordinates = match self.default_floating_size.borrow().as_ref() {
+            Some(default_floating_size) => {
+                default_floating_size.apply_to(floating_pane_coordinates)
+            },
+            None => floating_pane_coordinates,
+        };
         if let Some(mut new_pane_geom) = self.floating_panes.find_room_for_new_pane() {
             if let Some(floating_pane_coordinates) = &floating_pane_coordinates {
                 let viewport = self.viewport.borrow();

@@ -347,6 +347,7 @@ fn create_new_screen_with_kitty_graphics(
         stacked_resize,
         false,
         None,
+        None,
         false,
         web_sharing,
         advanced_mouse_actions,
@@ -5685,6 +5686,7 @@ fn create_new_screen_with_message_capture(
         stacked_resize,
         false,
         None,
+        None,
         false,
         web_sharing,
         true,
@@ -8880,6 +8882,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         stacked_resize,
         false,
         None,
+        None,
         false,
         web_sharing,
         true,
@@ -9731,6 +9734,7 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
         true,
         false,
         None,
+        None,
         false,
         web_sharing,
         true,
@@ -10264,6 +10268,7 @@ fn create_non_mirrored_screen(size: Size) -> Screen {
         true,  // stacked_resize
         false,
         None,
+        None, // default_floating_size
         false,
         WebSharing::Off,
         true, // advanced_mouse_actions
