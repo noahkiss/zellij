@@ -620,6 +620,15 @@ load_plugins {
 //
 // plugin_watch false
 
+// Load built-in plugins from this directory when a matching <name>.wasm is in it, instead of from
+// the binary - a development override for the bundled plugins, watched by `plugin_watch` like any
+// other plugin file
+// A built-in with no file in the directory still loads its embedded copy, so this overrides one
+// plugin without disturbing the rest
+// Default: unset, every built-in comes from the binary
+//
+// builtin_plugin_dir "~/develop/zellij/target/wasm32-wasip1/release"
+
 // How many snapshots `zellij session down` and the snapshot commands keep per session
 // The oldest are removed once the count is above this
 // Default: 10

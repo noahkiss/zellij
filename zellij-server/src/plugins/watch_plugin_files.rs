@@ -13,6 +13,7 @@ use notify_debouncer_full::{
 use zellij_utils::{
     errors::prelude::Result,
     input::layout::{RunPlugin, RunPluginLocation},
+    input::plugins::builtin_override_for_location,
 };
 
 /// A build writes the .wasm once, but a replace-by-rename still surfaces as several events, and a
@@ -66,12 +67,20 @@ impl PluginFileWatcher {
         })
     }
 
-    /// Start watching this plugin's .wasm, if it is a local file. Idempotent.
+    /// Start watching this plugin's .wasm, if one is on disk. Idempotent.
+    ///
+    /// A built-in normally lives in the binary and has nothing to watch. It gets a file here only
+    /// when `builtin_plugin_dir` points at one - the development override, which is what lets a
+    /// bundled bar hot-reload the way an external plugin does.
     pub fn watch(&mut self, run_plugin: &RunPlugin) {
-        let RunPluginLocation::File(path) = &run_plugin.location else {
-            return;
+        let path = match &run_plugin.location {
+            RunPluginLocation::File(path) => path.clone(),
+            location => match builtin_override_for_location(location) {
+                Some(path) => path,
+                None => return,
+            },
         };
-        let canonical_path = match std::fs::canonicalize(path) {
+        let canonical_path = match std::fs::canonicalize(&path) {
             Ok(canonical_path) => canonical_path,
             Err(e) => {
                 log::warn!(

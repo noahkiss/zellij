@@ -19,6 +19,7 @@ Options {
     ),
     pane_frame_style: None,
     plugin_watch: None,
+    builtin_plugin_dir: None,
     expect_full_disk_access: None,
     stale_build_notice: None,
     mirror_session: None,
