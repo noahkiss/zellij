@@ -371,6 +371,7 @@ web_client {
 // Options:
 //   - full
 //   - titles (default)
+//   - top_only (titles on a horizontal rule, no separators between panes)
 // 
 // pane_frame_style "titles"
  

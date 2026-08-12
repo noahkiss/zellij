@@ -53,8 +53,8 @@ use zellij_utils::input::config::Config;
 use zellij_utils::input::keybinds::{shortcut_for_action, Keybinds};
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::input::options::{
-    Clipboard, HostNotificationProtocol, NestedSessionHandling, PaneFrameStyle,
-    DEFAULT_WORD_SEPARATORS,
+    Clipboard, DefaultFloatingSize, HostNotificationProtocol, NestedSessionHandling,
+    PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::{
     ExitReason, MobileActivePanePayload, MobilePanePayload, MobileSessionPayload,
@@ -810,6 +810,7 @@ pub enum ScreenInstruction {
         host_notification_protocol: HostNotificationProtocol,
         nested_session_handling: NestedSessionHandling,
         dangerously_enable_paste_buffer_read: bool,
+        default_floating_size: Option<DefaultFloatingSize>,
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
@@ -1515,6 +1516,7 @@ pub(crate) struct Screen {
     pixel_dimensions: PixelDimensions,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     stacked_resize: Rc<RefCell<bool>>,
+    default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
     stacked_pane_list: Rc<RefCell<bool>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     kitty_image_store: Rc<RefCell<KittyImageStore>>,
@@ -1694,6 +1696,7 @@ impl Screen {
         stacked_resize: bool,
         stacked_pane_list: bool,
         default_editor: Option<PathBuf>,
+        default_floating_size: Option<DefaultFloatingSize>,
         web_clients_allowed: bool,
         web_sharing: WebSharing,
         advanced_mouse_actions: bool,
@@ -1722,6 +1725,7 @@ impl Screen {
             pixel_dimensions: Default::default(),
             character_cell_size: Rc::new(RefCell::new(None)),
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
+            default_floating_size: Rc::new(RefCell::new(default_floating_size)),
             stacked_pane_list: Rc::new(RefCell::new(stacked_pane_list)),
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
             kitty_image_store: Rc::new(RefCell::new(KittyImageStore::default())),
@@ -4793,6 +4797,7 @@ impl Screen {
             self.character_cell_size.clone(),
             self.stacked_resize.clone(),
             self.stacked_pane_list.clone(),
+            self.default_floating_size.clone(),
             self.sixel_image_store.clone(),
             self.kitty_image_store.clone(),
             self.bus
@@ -6933,6 +6938,7 @@ impl Screen {
         host_notification_protocol: HostNotificationProtocol,
         nested_session_handling: NestedSessionHandling,
         dangerously_enable_paste_buffer_read: bool,
+        default_floating_size: Option<DefaultFloatingSize>,
         client_id: ClientId,
     ) -> Result<()> {
         let should_support_arrow_fonts = !simplified_ui;
@@ -6976,6 +6982,9 @@ impl Screen {
         }
         {
             *self.stacked_pane_list.borrow_mut() = stacked_pane_list;
+        }
+        {
+            *self.default_floating_size.borrow_mut() = default_floating_size;
         }
         if let Some(copy_to_clipboard) = copy_to_clipboard {
             self.copy_options.clipboard = copy_to_clipboard;
@@ -8139,6 +8148,7 @@ pub(crate) fn screen_thread_main(
         .unwrap_or(true);
     let stacked_resize = config_options.stacked_resize.unwrap_or(true);
     let stacked_pane_list = config_options.stacked_pane_list.unwrap_or(true);
+    let default_floating_size = config_options.default_floating_size.clone();
     let web_clients_allowed = config_options
         .web_sharing
         .map(|s| s.web_clients_allowed())
@@ -8197,6 +8207,7 @@ pub(crate) fn screen_thread_main(
         stacked_resize,
         stacked_pane_list,
         default_editor,
+        default_floating_size,
         web_clients_allowed,
         web_sharing,
         advanced_mouse_actions,
@@ -11616,6 +11627,7 @@ pub(crate) fn screen_thread_main(
                 host_notification_protocol,
                 nested_session_handling,
                 dangerously_enable_paste_buffer_read,
+                default_floating_size,
             } => {
                 screen.host_theme_dark_styling = host_theme_dark;
                 screen.host_theme_light_styling = host_theme_light;
@@ -11649,6 +11661,7 @@ pub(crate) fn screen_thread_main(
                         host_notification_protocol,
                         nested_session_handling,
                         dangerously_enable_paste_buffer_read,
+                        default_floating_size,
                         client_id,
                     )
                     .non_fatal();

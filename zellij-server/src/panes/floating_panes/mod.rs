@@ -588,6 +588,10 @@ impl FloatingPanes {
                 mouse_hover_tips,
                 self.dimmed_clients.clone(),
             );
+            // a floating pane draws its own frame through this path rather than the tiled one, so
+            // without this `top_only` reserved the title row here and then drew a full frame's
+            // rule into it
+            pane_contents_and_ui.set_top_only_frames(pane_frame_style.is_top_only());
             for client_id in &connected_clients {
                 let client_mode = self
                     .mode_info

@@ -42,6 +42,8 @@ pub struct PaneContentsAndUi<'a> {
     mouse_scroll_resize: bool,
     mouse_hover_tips: bool,
     dimmed_for_clients: HashSet<ClientId>,
+    // fork addition: `pane_frame_style top_only`
+    top_only_frames: bool,
 }
 
 impl<'a> PaneContentsAndUi<'a> {
@@ -101,6 +103,7 @@ impl<'a> PaneContentsAndUi<'a> {
             mouse_scroll_resize,
             mouse_hover_tips,
             dimmed_for_clients,
+            top_only_frames: false,
         }
     }
     fn frame_is_dimmed_for_client(&self, client_id: ClientId) -> bool {
@@ -108,6 +111,10 @@ impl<'a> PaneContentsAndUi<'a> {
     }
     pub fn set_frame_geom_override(&mut self, frame_geom_override: Option<PaneGeom>) {
         self.frame_geom_override = frame_geom_override;
+    }
+    // fork addition: `top_only` rules the title line and drops the separators between panes
+    pub fn set_top_only_frames(&mut self, top_only_frames: bool) {
+        self.top_only_frames = top_only_frames;
     }
     pub fn set_blank_title(&mut self, blank_title: bool) {
         self.blank_title = blank_title;
@@ -382,6 +389,7 @@ impl<'a> PaneContentsAndUi<'a> {
                 frame_geom_override: self.frame_geom_override,
                 stack_list_entry: stack_list_entry.clone(),
                 blank_title: self.blank_title,
+                top_only_frames: self.top_only_frames,
                 mouse_scroll_resize: self.mouse_scroll_resize,
                 mouse_hover_tips: self.mouse_hover_tips,
                 dimmed: frame_is_dimmed,
@@ -411,6 +419,7 @@ impl<'a> PaneContentsAndUi<'a> {
                 frame_geom_override: self.frame_geom_override,
                 stack_list_entry,
                 blank_title: self.blank_title,
+                top_only_frames: self.top_only_frames,
                 mouse_scroll_resize: self.mouse_scroll_resize,
                 mouse_hover_tips: self.mouse_hover_tips,
                 dimmed: frame_is_dimmed,
@@ -446,6 +455,9 @@ impl<'a> PaneContentsAndUi<'a> {
         pane_is_on_top_of_stack: bool,
         pane_is_on_bottom_of_stack: bool,
     ) {
+        if self.top_only_frames {
+            return;
+        }
         let color = self.frame_color(client_id, client_mode, session_is_mirrored);
         boundaries.add_rect(
             self.pane.as_ref(),
