@@ -6,6 +6,25 @@ use std::rc::Rc;
 
 use crate::active_component::{ActiveComponent, ClickAction};
 
+/// What the main screen says about the binary this session runs, as the server described it.
+#[derive(Debug, Clone, Default)]
+pub struct ServerBinary {
+    /// Where the running server actually is, symlinks resolved
+    pub running: String,
+    /// A path that still names this program after an upgrade - the pinned copy, or a name on PATH
+    /// leading to the same file. Absent when the running path is the steadiest one there is.
+    pub stable: Option<String>,
+    /// Set by a macOS host, where the path is pasted into Full Disk Access
+    pub full_disk_access_hint: bool,
+}
+
+impl ServerBinary {
+    /// The path `<c>` copies: the one the user is being told to act on.
+    pub fn path_to_copy(&self) -> &str {
+        self.stable.as_deref().unwrap_or(&self.running)
+    }
+}
+
 #[derive(Debug)]
 pub struct Page {
     title: Option<Text>,
@@ -24,8 +43,7 @@ impl Page {
         zellij_version: String,
         _base_mode: Rc<RefCell<InputMode>>,
         is_release_notes: bool,
-        server_exe: Option<String>,
-        server_exe_hint: Option<String>,
+        server_binary: Option<ServerBinary>,
     ) -> Self {
         let page = Page::new()
             .main_screen()
@@ -127,30 +145,26 @@ impl Page {
                         link_executable.clone(),
                     )),
             ])]);
-        // the binary the server is actually running. The server sends the hint only from a macOS
-        // host, where the path is copied into System Settings -> Privacy & Security -> Full Disk
-        // Access (Cmd+Shift+G in the file picker); elsewhere the path answers "which build is this
-        // session running" and needs no explaining.
-        let page = match server_exe {
-            // the path gets a line to itself: it is the part that is copied, and sharing a line
+        // the binary the server is actually running, and the path to act on where the two differ.
+        // The server sends the hint only from a macOS host, where the path is copied into System
+        // Settings -> Privacy & Security -> Full Disk Access (Cmd+Shift+G in the file picker);
+        // elsewhere the paths answer "which build is this session running" and where it stays put.
+        let has_path_to_copy = server_binary.is_some();
+        let page = match server_binary {
+            // every path gets a line to itself: it is the part that is copied, and sharing a line
             // with a label costs it those columns and truncates a long path into a wrong one
-            Some(server_exe) => page.with_essential_paragraph(vec![
-                ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
-                    server_binary_label(server_exe_hint.is_some()),
-                ))]),
-                ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
-                    Text::new(server_exe),
-                ))]),
-            ]),
+            Some(server_binary) => {
+                page.with_essential_paragraph(server_binary_lines(server_binary))
+            },
             None => page,
         };
         page.with_help(if is_release_notes {
-            Box::new(|hovering_over_link, menu_item_is_selected| {
-                release_notes_main_help(hovering_over_link, menu_item_is_selected)
+            Box::new(move |hovering_over_link, menu_item_is_selected| {
+                release_notes_main_help(hovering_over_link, menu_item_is_selected, has_path_to_copy)
             })
         } else {
-            Box::new(|hovering_over_link, menu_item_is_selected| {
-                main_screen_help_text(hovering_over_link, menu_item_is_selected)
+            Box::new(move |hovering_over_link, menu_item_is_selected| {
+                main_screen_help_text(hovering_over_link, menu_item_is_selected, has_path_to_copy)
             })
         })
     }
@@ -790,6 +804,49 @@ fn server_binary_label(with_full_disk_access_hint: bool) -> Text {
     }
 }
 
+/// The label above the upgrade-proof path, which is shown only when it names a second file.
+///
+/// It is the path worth writing down, so it says what it is good for: on macOS a permission grant
+/// follows the file, and a versioned path loses the grant at every upgrade.
+fn stable_binary_label(with_full_disk_access_hint: bool) -> Text {
+    if with_full_disk_access_hint {
+        Text::new("Grant Full Disk Access to this path instead - it survives upgrades:")
+            .color_range(2, ..)
+    } else {
+        Text::new("Stable path (survives upgrades):").color_range(2, ..)
+    }
+}
+
+/// The lines of the server binary paragraph: one label and one path per binary named.
+fn server_binary_lines(server_binary: ServerBinary) -> Vec<ComponentLine> {
+    let ServerBinary {
+        running,
+        stable,
+        full_disk_access_hint,
+    } = server_binary;
+    let mut lines = vec![
+        ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
+            // with a steadier path below it, this line answers "which build is running" only
+            match stable {
+                Some(_) => Text::new("Server binary (running):").color_range(2, ..),
+                None => server_binary_label(full_disk_access_hint),
+            },
+        ))]),
+        ComponentLine::new(vec![ActiveComponent::new(TextOrCustomRender::Text(
+            Text::new(running),
+        ))]),
+    ];
+    if let Some(stable) = stable {
+        lines.push(ComponentLine::new(vec![ActiveComponent::new(
+            TextOrCustomRender::Text(stable_binary_label(full_disk_access_hint)),
+        )]));
+        lines.push(ComponentLine::new(vec![ActiveComponent::new(
+            TextOrCustomRender::Text(Text::new(stable)),
+        )]));
+    }
+    lines
+}
+
 fn changelog_link_unselected(version: String) -> Text {
     let full_changelog_text = format!(
         "https://github.com/zellij-org/zellij/releases/tag/v{}",
@@ -872,28 +929,40 @@ fn main_screen_title(version: String, is_release_notes: bool) -> Text {
     }
 }
 
-fn main_screen_help_text(hovering_over_link: bool, menu_item_is_selected: bool) -> Text {
-    if hovering_over_link {
-        let help_text = format!("Help: Click or Shift-Click to open in browser");
-        Text::new(help_text)
-            .color_range(3, 6..=10)
-            .color_range(3, 15..=25)
-    } else if menu_item_is_selected {
-        let help_text = format!("Help: <↓↑> - Navigate, <ENTER> - Learn More, <ESC> - Dismiss");
-        Text::new(help_text)
-            .color_range(1, 6..=9)
-            .color_range(1, 23..=29)
-            .color_range(1, 45..=49)
-    } else {
-        let help_text = format!("Help: <↓↑> - Navigate, <ESC> - Dismiss, <?> - Usage Tips");
-        Text::new(help_text)
-            .color_range(1, 6..=9)
-            .color_range(1, 23..=27)
-            .color_range(1, 40..=42)
+/// What the copy binding adds to a help line, when the page has a path worth copying.
+const COPY_PATH_HELP: &str = ", <c> - Copy Path";
+
+/// Add the copy hint to a help line and colour its key where it lands.
+///
+/// The columns come from the line it is appended to, so a reworded help line cannot leave the
+/// colour pointing at the wrong characters.
+fn with_copy_path_help(
+    help_text: String,
+    has_path_to_copy: bool,
+) -> (String, Option<(usize, usize)>) {
+    if !has_path_to_copy {
+        return (help_text, None);
+    }
+    let key_start = help_text.chars().count() + 2; // past the ", " that leads the hint
+    (
+        format!("{}{}", help_text, COPY_PATH_HELP),
+        Some((key_start, key_start + 2)), // "<c>"
+    )
+}
+
+/// Colour the copy key, if the hint was added at all.
+fn color_copy_path_help(text: Text, copy_key: Option<(usize, usize)>) -> Text {
+    match copy_key {
+        Some((start, end)) => text.color_range(1, start..=end),
+        None => text,
     }
 }
 
-fn release_notes_main_help(hovering_over_link: bool, menu_item_is_selected: bool) -> Text {
+fn main_screen_help_text(
+    hovering_over_link: bool,
+    menu_item_is_selected: bool,
+    has_path_to_copy: bool,
+) -> Text {
     if hovering_over_link {
         let help_text = format!("Help: Click or Shift-Click to open in browser");
         Text::new(help_text)
@@ -901,15 +970,56 @@ fn release_notes_main_help(hovering_over_link: bool, menu_item_is_selected: bool
             .color_range(3, 15..=25)
     } else if menu_item_is_selected {
         let help_text = format!("Help: <↓↑> - Navigate, <ENTER> - Learn More, <ESC> - Dismiss");
+        let (help_text, copy_key) = with_copy_path_help(help_text, has_path_to_copy);
+        color_copy_path_help(
+            Text::new(help_text)
+                .color_range(1, 6..=9)
+                .color_range(1, 23..=29)
+                .color_range(1, 45..=49),
+            copy_key,
+        )
+    } else {
+        let help_text = format!("Help: <↓↑> - Navigate, <ESC> - Dismiss, <?> - Usage Tips");
+        let (help_text, copy_key) = with_copy_path_help(help_text, has_path_to_copy);
+        color_copy_path_help(
+            Text::new(help_text)
+                .color_range(1, 6..=9)
+                .color_range(1, 23..=27)
+                .color_range(1, 40..=42),
+            copy_key,
+        )
+    }
+}
+
+fn release_notes_main_help(
+    hovering_over_link: bool,
+    menu_item_is_selected: bool,
+    has_path_to_copy: bool,
+) -> Text {
+    if hovering_over_link {
+        let help_text = format!("Help: Click or Shift-Click to open in browser");
         Text::new(help_text)
-            .color_range(1, 6..=9)
-            .color_range(1, 23..=29)
-            .color_range(1, 45..=49)
+            .color_range(3, 6..=10)
+            .color_range(3, 15..=25)
+    } else if menu_item_is_selected {
+        let help_text = format!("Help: <↓↑> - Navigate, <ENTER> - Learn More, <ESC> - Dismiss");
+        let (help_text, copy_key) = with_copy_path_help(help_text, has_path_to_copy);
+        color_copy_path_help(
+            Text::new(help_text)
+                .color_range(1, 6..=9)
+                .color_range(1, 23..=29)
+                .color_range(1, 45..=49),
+            copy_key,
+        )
     } else {
         let help_text = format!("Help: <↓↑> - Navigate, <ESC> - Dismiss");
-        Text::new(help_text)
-            .color_range(1, 6..=9)
-            .color_range(1, 23..=27)
+        let (help_text, copy_key) = with_copy_path_help(help_text, has_path_to_copy);
+        color_copy_path_help(
+            Text::new(help_text)
+                .color_range(1, 6..=9)
+                .color_range(1, 23..=27),
+            copy_key,
+        )
     }
 }
 
@@ -1229,15 +1339,27 @@ mod tests {
     use super::*;
 
     const SERVER_EXE: &str = "/opt/homebrew/Cellar/zellij/0.45.0/bin/zellij";
+    const STABLE_EXE: &str = "/Users/someone/Library/Application Support/zellij/bin/zellij";
+
+    fn server_binary(stable: Option<&str>) -> ServerBinary {
+        ServerBinary {
+            running: String::from(SERVER_EXE),
+            stable: stable.map(String::from),
+            full_disk_access_hint: true,
+        }
+    }
 
     fn main_screen() -> Page {
+        main_screen_with(Some(server_binary(None)))
+    }
+
+    fn main_screen_with(server_binary: Option<ServerBinary>) -> Page {
         Page::new_main_screen(
             Rc::new(RefCell::new(String::from("open"))),
             String::from("0.45.0"),
             Rc::new(RefCell::new(InputMode::Normal)),
             false,
-            Some(String::from(SERVER_EXE)),
-            Some(String::from("full_disk_access")),
+            server_binary,
         )
     }
 
@@ -1284,19 +1406,51 @@ mod tests {
 
     #[test]
     fn a_page_without_a_server_binary_still_trims() {
-        let page = Page::new_main_screen(
-            Rc::new(RefCell::new(String::from("open"))),
-            String::from("0.45.0"),
-            Rc::new(RefCell::new(InputMode::Normal)),
-            false,
-            None,
-            None,
-        );
+        let page = main_screen_with(None);
         assert!(page.essential_components.is_empty());
         assert_eq!(page.ui_row_count_without(&HashSet::new()), 15);
         // the list alone buys 9 rows; below that the two remaining paragraphs go too
         assert_eq!(page.components_to_hide(6).len(), 1);
         assert_eq!(page.components_to_hide(3).len(), 3);
+    }
+
+    #[test]
+    fn a_stable_path_is_a_second_labelled_line() {
+        let page = main_screen_with(Some(server_binary(Some(STABLE_EXE))));
+        let rendered = format!("{:?}", page.components_to_render);
+        assert!(rendered.contains(SERVER_EXE), "the running binary is shown");
+        assert!(rendered.contains(STABLE_EXE), "the stable path is shown");
+        // two labels and two paths, where one binary gets one label and one path
+        assert_eq!(page.ui_row_count_without(&HashSet::new()), 20);
+    }
+
+    #[test]
+    fn both_paths_survive_a_pane_too_short_for_anything_else() {
+        let page = main_screen_with(Some(server_binary(Some(STABLE_EXE))));
+        let paragraph = server_binary_paragraph(&page);
+        for rows in 1..=19 {
+            assert!(
+                !page.components_to_hide(rows).contains(&paragraph),
+                "the server binary paragraph was hidden at {} rows",
+                rows
+            );
+        }
+        // title, spacing and the four lines of the paragraph itself, and nothing else left to drop
+        assert_eq!(page.ui_row_count_without(&page.components_to_hide(1)), 7);
+    }
+
+    #[test]
+    fn the_stable_path_is_the_one_copied() {
+        assert_eq!(server_binary(Some(STABLE_EXE)).path_to_copy(), STABLE_EXE);
+        assert_eq!(server_binary(None).path_to_copy(), SERVER_EXE);
+    }
+
+    #[test]
+    fn the_copy_hint_is_shown_only_with_a_path_to_copy() {
+        let with_path = format!("{:?}", main_screen_help_text(false, false, true));
+        let without_path = format!("{:?}", main_screen_help_text(false, false, false));
+        assert!(with_path.contains("Copy Path"));
+        assert!(!without_path.contains("Copy Path"));
     }
 
     #[test]

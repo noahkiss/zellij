@@ -25,14 +25,28 @@ use crate::{
 
 use zellij_utils::plugin_api::action::ProtobufPluginConfiguration;
 use zellij_utils::{
-    consts::ZELLIJ_TMP_DIR, data::InputMode, errors::prelude::*, input::command::TerminalAction,
-    input::keybinds::Keybinds, input::layout::PluginUserConfiguration,
-    input::layout::RunPluginLocation, input::permission::PluginPermissions,
-    input::plugins::PluginConfig, pane_size::Size, session_lifecycle::own_executable_path,
+    consts::ZELLIJ_TMP_DIR,
+    data::InputMode,
+    errors::prelude::*,
+    input::command::TerminalAction,
+    input::keybinds::Keybinds,
+    input::layout::PluginUserConfiguration,
+    input::layout::RunPluginLocation,
+    input::permission::PluginPermissions,
+    input::plugins::PluginConfig,
+    pane_size::Size,
+    session_lifecycle::own_executable_path,
+    session_service::{path_dirs, resolve_service_exe, ServiceExe},
 };
 
 /// The configuration key the `zellij:about` plugin reads the server's own binary path from.
 const SERVER_EXE_CONFIG_KEY: &str = "zellij_exe";
+
+/// The configuration key the `zellij:about` plugin reads the upgrade-proof path from.
+///
+/// Only set when it names a different file from the running binary: a path equal to the one
+/// already shown is a second line that says nothing.
+const SERVER_EXE_STABLE_CONFIG_KEY: &str = "zellij_exe_stable";
 
 /// The configuration key that asks the about plugin to say what the path is FOR.
 ///
@@ -56,6 +70,49 @@ fn server_exe_path() -> Option<&'static str> {
         .as_deref()
 }
 
+/// The pinned copy the config asks for, recorded by the server before the plugin thread starts.
+///
+/// The config lives where the server is set up and nowhere near a plugin load, and threading it
+/// through the plugin thread's arguments for one string is a poor trade. `None` means the config
+/// was read and asks for no pin - the same as never having been set, which is what a test gets.
+static CONFIGURED_PINNED_EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Tell the plugin side where `pin_exe` points, once, at server startup.
+pub fn record_configured_pinned_exe(pinned_exe: Option<PathBuf>) {
+    let _ = CONFIGURED_PINNED_EXE.set(pinned_exe);
+}
+
+/// A path that keeps naming this program after an upgrade, when one exists and is not the path the
+/// server is already showing.
+///
+/// The running binary is the honest answer to "which build is this", but it is the wrong path to
+/// write down: a package manager installs into a versioned directory, so the resolved path is gone
+/// at the next upgrade - and on macOS a Full Disk Access grant is recorded against the file, so a
+/// versioned path re-asks for the grant every time. The pinned copy, then a name on PATH that
+/// leads to this same file, are the paths that survive. Same order as the one a generated service
+/// unit uses, and for the same reason.
+///
+/// A pinned path with no file at it is not offered: `session up` installs that copy, and a machine
+/// that has never run it would be told to grant access to something that does not exist.
+fn stable_server_exe() -> Option<&'static str> {
+    static STABLE_EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    STABLE_EXE
+        .get_or_init(|| {
+            let current_exe = std::env::current_exe().ok()?;
+            let pinned = CONFIGURED_PINNED_EXE
+                .get()
+                .cloned()
+                .flatten()
+                .filter(|pinned| pinned.exists());
+            match resolve_service_exe(None, pinned, &current_exe, &path_dirs()) {
+                // nothing steadier than where the binary already is
+                ServiceExe::Resolved(_) => None,
+                steadier => Some(steadier.path().display().to_string()),
+            }
+        })
+        .as_deref()
+}
+
 /// Hand a plugin the configuration it should see at load time.
 ///
 /// The stored `PluginConfig` is left alone: its configuration is half of the key the plugin map
@@ -71,6 +128,11 @@ fn configuration_for_load(plugin_config: &PluginConfig) -> PluginUserConfigurati
     if is_about_plugin && !configuration.inner().contains_key(SERVER_EXE_CONFIG_KEY) {
         if let Some(server_exe) = server_exe_path() {
             configuration.insert(SERVER_EXE_CONFIG_KEY, server_exe);
+            if let Some(stable_exe) = stable_server_exe() {
+                if stable_exe != server_exe {
+                    configuration.insert(SERVER_EXE_STABLE_CONFIG_KEY, stable_exe);
+                }
+            }
             if cfg!(target_os = "macos")
                 && !configuration
                     .inner()

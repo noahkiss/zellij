@@ -77,6 +77,7 @@ use zellij_utils::{
         plugins::PluginAliases,
     },
     ipc::{ClientAttributes, ExitReason, ServerToClientMsg},
+    session_service::configured_pinned_exe,
     session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
     shared::{
         default_palette, set_terminal_title_format, web_server_base_url, TerminalTitleFormat,
@@ -2318,6 +2319,11 @@ fn init_session(
             let plugin_permissions = std::sync::Arc::new(config.plugin_permissions.clone());
             // this fork watches loaded plugin .wasm files by default - it is the point of the fork
             let plugin_watch = config_options.plugin_watch.unwrap_or(true);
+            // the about plugin names the binary a user should grant permissions to, and `pin_exe`
+            // is the config saying where that binary is kept - read here, where the config is
+            crate::plugins::plugin_loader::record_configured_pinned_exe(configured_pinned_exe(
+                config_options.session_service.as_ref(),
+            ));
             let session_env_vars = session_env_vars.clone();
             move || {
                 plugin_thread_main(
