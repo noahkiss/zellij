@@ -87,6 +87,14 @@ fn workspace_members() -> &'static Vec<WorkspaceMember> {
                 build: true,
             },
             WorkspaceMember {
+                crate_name: "default-plugins/slim-tab-bar",
+                build: true,
+            },
+            WorkspaceMember {
+                crate_name: "default-plugins/slim-keybinds",
+                build: true,
+            },
+            WorkspaceMember {
                 crate_name: "zellij-utils",
                 build: false,
             },

@@ -14,6 +14,49 @@ use crate::consts::BUILTIN_PLUGIN_NAMES;
 pub use crate::data::PluginTag;
 use crate::errors::prelude::*;
 
+/// The configured `builtin_plugin_dir`, set once by the server as it starts.
+///
+/// A `OnceLock` rather than an argument threaded through `resolve_wasm_bytes`, because the two
+/// places that need it - loading a built-in and watching its file - reach it from different
+/// threads and neither carries the config.
+#[cfg(not(target_family = "wasm"))]
+static BUILTIN_PLUGIN_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the configured `builtin_plugin_dir`. The first call wins; later ones are ignored.
+#[cfg(not(target_family = "wasm"))]
+pub fn set_builtin_plugin_dir(dir: Option<PathBuf>) {
+    let _ = BUILTIN_PLUGIN_DIR.set(dir);
+}
+
+/// The overriding `.wasm` for this built-in name, if one is configured AND on disk.
+///
+/// Absent file means no override: overriding one built-in must not break the others, and a
+/// directory holding a single bar is the normal case.
+#[cfg(not(target_family = "wasm"))]
+pub fn builtin_plugin_override(name: &str) -> Option<PathBuf> {
+    builtin_plugin_override_in(BUILTIN_PLUGIN_DIR.get()?.as_ref()?, name)
+}
+
+/// The same lookup against a given directory. Split out because the configured one is a `OnceLock`
+/// and a test process only gets to set it once.
+#[cfg(not(target_family = "wasm"))]
+pub fn builtin_plugin_override_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    if !BUILTIN_PLUGIN_NAMES.contains(&name) {
+        return None;
+    }
+    let path = dir.join(name).with_extension("wasm");
+    path.is_file().then_some(path)
+}
+
+/// The overriding `.wasm` for a plugin location, if it is a built-in and one is configured.
+#[cfg(not(target_family = "wasm"))]
+pub fn builtin_override_for_location(location: &RunPluginLocation) -> Option<PathBuf> {
+    match location {
+        RunPluginLocation::Zellij(tag) => builtin_plugin_override(&tag.to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 pub struct PluginAliases {
     pub aliases: BTreeMap<String, RunPlugin>,
@@ -127,6 +170,30 @@ impl PluginConfig {
         // and since the user will only get to see it when loading a plugin failed, we may as well
         // spell it out right here.
         let mut last_err: Result<Vec<u8>> = Err(anyhow!("failed to load plugin from disk"));
+
+        // A configured `builtin_plugin_dir` outranks the embedded copy, so that a bundled plugin
+        // can be developed the way a `file:` one is. Read failures fall through to the embedded
+        // asset rather than failing the load: a half-written .wasm mid-build must not take the bar
+        // down, and the watcher will reload it when the build finishes.
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(override_path) = builtin_override_for_location(&self.location) {
+            match fs::read(&override_path) {
+                Ok(bytes) => {
+                    log::debug!(
+                        "Loaded builtin plugin '{}' from {}",
+                        self.path.display(),
+                        override_path.display()
+                    );
+                    return Ok(bytes);
+                },
+                Err(e) => log::warn!(
+                    "Cannot read builtin plugin override {}, using the embedded copy: {}",
+                    override_path.display(),
+                    e
+                ),
+            }
+        }
+
         for path in paths {
             // Check if the plugin path matches an entry in the asset map. If so, load it directly
             // from memory, don't bother with the disk.
@@ -208,4 +275,51 @@ pub enum PluginsConfigError {
     InvalidUrlScheme(Url),
     #[error("Could not find plugin at the path: '{0:?}'")]
     InvalidPluginLocation(PathBuf),
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod builtin_override_test {
+    use super::*;
+
+    fn temp_dir_with(files: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zellij-builtin-override-{}-{}",
+            std::process::id(),
+            files.join("-")
+        ));
+        let _ = fs::create_dir_all(&dir);
+        for file in files {
+            let _ = fs::write(dir.join(file), b"not really wasm");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_file_in_the_directory_overrides_the_embedded_plugin() {
+        let dir = temp_dir_with(&["tab-bar.wasm"]);
+        assert_eq!(
+            builtin_plugin_override_in(&dir, "tab-bar"),
+            Some(dir.join("tab-bar.wasm"))
+        );
+    }
+
+    #[test]
+    fn a_builtin_with_no_file_there_keeps_the_embedded_one() {
+        // overriding one plugin must not disturb the rest, so an absent file is not an error
+        let dir = temp_dir_with(&["tab-bar.wasm"]);
+        assert_eq!(builtin_plugin_override_in(&dir, "status-bar"), None);
+    }
+
+    #[test]
+    fn only_builtin_names_can_be_overridden() {
+        // otherwise the directory would silently shadow plugins loaded from anywhere else
+        let dir = temp_dir_with(&["not-a-builtin.wasm"]);
+        assert_eq!(builtin_plugin_override_in(&dir, "not-a-builtin"), None);
+    }
+
+    #[test]
+    fn the_bundled_bars_are_builtin_names() {
+        assert!(BUILTIN_PLUGIN_NAMES.contains(&"slim-tab-bar"));
+        assert!(BUILTIN_PLUGIN_NAMES.contains(&"slim-keybinds"));
+    }
 }
