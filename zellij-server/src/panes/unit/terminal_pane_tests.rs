@@ -1035,3 +1035,64 @@ pub fn guest_modal_no_modal_passes_input_through() {
         Some(crate::tab::AdjustedInput::WriteBytesToTerminal(_))
     ));
 }
+
+/// A pane with the given pid, built the way the tests above build one.
+#[cfg(test)]
+fn pane_with_pid(pid: u32) -> TerminalPane {
+    let mut fake_win_size = PaneGeom::default();
+    fake_win_size.cols.set_inner(121);
+    fake_win_size.rows.set_inner(20);
+    TerminalPane::new(
+        pid,
+        fake_win_size,
+        Style::default(),
+        0,
+        String::new(),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(SixelImageStore::default())),
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        Rc::new(RefCell::new(Palette::default())),
+        Rc::new(RefCell::new(HashMap::new())),
+        None,
+        None,
+        false,
+        true,
+        true,
+        true,
+        false,
+        None,
+    )
+}
+
+#[test]
+fn a_pane_uuid_is_unique_to_the_pane() {
+    // the uuid exists to name a pane across a restart, so two panes must never share one
+    let first = pane_with_pid(1);
+    let second = pane_with_pid(2);
+    assert_ne!(first.pane_uuid(), second.pane_uuid());
+    assert_ne!(first.pane_uuid(), uuid::Uuid::nil());
+}
+
+#[test]
+fn a_pane_uuid_outlives_the_reuse_of_its_id() {
+    // zellij hands a closed pane's id to the next pane. The uuid is what tells them apart, so a
+    // second pane with the SAME pid must still get its own
+    let first = pane_with_pid(7);
+    let first_uuid = first.pane_uuid();
+    drop(first);
+    let reused = pane_with_pid(7);
+    assert_ne!(reused.pane_uuid(), first_uuid);
+}
+
+#[test]
+fn a_pane_uuid_does_not_change_under_the_pane() {
+    // it is read on every serialization pass; a value that moved would name a different pane each
+    // time it was written down
+    let mut pane = pane_with_pid(1);
+    let at_creation = pane.pane_uuid();
+    pane.handle_pty_bytes(b"some output\r\n".to_vec());
+    pane.set_geom(PaneGeom::default());
+    pane.rename(b"renamed".to_vec());
+    assert_eq!(pane.pane_uuid(), at_creation);
+}
