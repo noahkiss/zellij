@@ -1722,6 +1722,36 @@ did not draw also clears its rendered coordinates, so it stops answering clicks 
 One limit: the about pane is a fixed 90 columns, so a path beyond roughly 78 characters is cut. Real
 install paths fit; a development build's path inside a deep worktree does not.
 
+**A second line names the path that survives an upgrade.** The resolved path answers "which build is
+this session running", and that is all it is good for: a package manager installs into a versioned
+directory, so the path the about page showed is gone at the next upgrade — and on macOS the Full
+Disk Access grant went with it, because TCC records the grant against the file. So the page shows
+both, when they differ:
+
+```
+Server binary (running):
+/home/linuxbrew/.linuxbrew/Cellar/zellij-nkmk/0.45.0-nkmk.4/bin/zellij
+Grant Full Disk Access to this path instead - it survives upgrades:
+/home/<user>/.local/share/zellij/bin/zellij
+```
+
+The second path is chosen by `resolve_service_exe` — the same function, in the same order, that
+decides what a generated service unit execs: the [pinned copy](#a-pinned-copy-of-the-binary-pin_exe)
+first, then a name on `PATH` whose canonical target is this same file. Nothing steadier found, or a
+pinned path with no file at it, and the line is left off entirely rather than pointing at something
+that does not exist; off macOS the label is `Stable path (survives upgrades):`.
+
+`pin_exe` is a config key and the plugin thread holds no config, so the server records it once at
+startup (`record_configured_pinned_exe`), where it already reads `config_options`. The plugin gets
+the answer as a third configuration key, `zellij_exe_stable`, through the same load seam.
+
+**`<c>` copies the path.** Nothing in the about pane could be selected with the mouse, so the one
+value on it a user has to act on had to be retyped by hand. `<c>` on the main screen copies the
+stable path, or the running one where there is no stable path, and the help line says so — the key's
+columns are computed from the line it is appended to rather than counted out, so a reworded help
+line cannot leave the colour pointing at the wrong characters. Built-in plugins are granted every
+permission, so `WriteToClipboard` costs no prompt.
+
 ### The session manager's client list actually lists clients
 
 `Ctrl+l` reported no attached clients, whatever the truth was — for one client and for two, on every

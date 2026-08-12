@@ -1,6 +1,6 @@
 mod pinned_executor;
 mod pipes;
-mod plugin_loader;
+pub(crate) mod plugin_loader;
 mod plugin_map;
 mod plugin_worker;
 mod wasm_bridge;
