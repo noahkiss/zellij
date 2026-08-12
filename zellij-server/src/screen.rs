@@ -7025,12 +7025,19 @@ impl Screen {
         let active_tab_index =
             first_client_id.and_then(|client_id| self.active_tab_ids.get(&client_id));
 
-        // Filter tabs based on optional tab_index parameter
-        let tabs_to_process: Vec<_> = self
+        // Filter tabs based on optional tab_index parameter.
+        //
+        // Sorted by position, not by the id `self.tabs` is keyed on: the two agree until a tab is
+        // moved, and after that the id order is the order the tabs were CREATED in. A layout
+        // recreates tabs in the order it lists them, so serializing in id order hands a restored
+        // session its tabs back in creation order - a moved tab silently jumps back to where it
+        // started, every restart. Position is what the tab bar draws and what the user moved.
+        let mut tabs_to_process: Vec<_> = self
             .tabs
             .iter()
             .filter(|(idx, _)| tab_index.map_or(true, |target| **idx == target))
             .collect();
+        tabs_to_process.sort_by_key(|(_, tab)| tab.position);
 
         for (tab_index, tab) in tabs_to_process {
             let tab_is_focused = active_tab_index == Some(&tab_index);
@@ -10121,9 +10128,12 @@ pub(crate) fn screen_thread_main(
                 drop(completion_tx); // action ends here, notify the action initiator
             },
             ScreenInstruction::QueryTabNames(client_id, completion_tx) => {
-                let tab_names = screen
-                    .get_tabs_mut()
-                    .values()
+                // in the order the tab bar draws them: the map is keyed by stable id, which stops
+                // matching the display order the moment a tab is moved
+                let mut tabs: Vec<_> = screen.get_tabs_mut().values().collect();
+                tabs.sort_by_key(|tab| tab.position);
+                let tab_names = tabs
+                    .iter()
                     .map(|tab| tab.name.clone())
                     .collect::<Vec<String>>();
                 screen.bus.senders.send_to_server(ServerInstruction::Log(
