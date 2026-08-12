@@ -839,6 +839,7 @@ impl From<crate::input::cli_assets::CliAssets>
             configuration_options: cli_assets.configuration_options.map(|o| o.into()),
             layout: cli_assets.layout.map(|l| l.into()),
             terminal_window_size: Some(cli_assets.terminal_window_size.into()),
+            tty: cli_assets.tty.clone(),
             data_dir: cli_assets.data_dir.map(|p| p.to_string_lossy().to_string()),
             is_debug: cli_assets.is_debug,
             max_panes: cli_assets.max_panes.map(|m| m as u32),
@@ -875,6 +876,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::CliAssets>
             force_run_layout_commands: cli_assets.force_run_layout_commands,
             cwd: cli_assets.cwd.map(PathBuf::from),
             host_terminal_env: cli_assets.host_terminal_env.into_iter().collect(),
+            tty: cli_assets.tty,
         })
     }
 }
@@ -1003,6 +1005,8 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
         Ok(Self {
             // config-file only, deliberately not carried over the client/server contract
             plugin_watch: None,
+            expect_full_disk_access: None,
+            stale_build_notice: None,
             snapshot_dir: None,
             session_snapshot_limit: None,
             bell_clear_delay_ms: None,

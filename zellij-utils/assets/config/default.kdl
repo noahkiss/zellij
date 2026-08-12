@@ -622,6 +622,24 @@ load_plugins {
 //
 // bell_clear_delay_ms 1000
 
+// Say so, over the top-right of the viewport, when this machine's Full Disk Access is missing
+// (macOS only)
+// Opt-in, because only you know whether you mean zellij to hold that permission - and where you
+// do, the permission being absent IS the actionable fact: macOS keys the grant to an absolute
+// path, so every upgrade into a versioned directory silently invalidates it
+// The notice names the path, because that is what has to be added by hand
+// Default: false
+//
+// expect_full_disk_access true
+
+// Say so, over the top-right of the viewport, when this session's server is running a superseded
+// build
+// A server keeps the binary it started with for the whole life of the session, so an upgrade
+// reaches nothing until the session is restarted, and nothing else says so
+// Default: true
+//
+// stale_build_notice false
+
 // Watch the .wasm file of every loaded plugin and reload the plugin when the file changes
 // Written for plugin development: rebuild the plugin and the running pane picks it up, with no
 // session restart and no re-adding the pane

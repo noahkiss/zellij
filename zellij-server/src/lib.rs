@@ -26,6 +26,7 @@ mod resurrect_hints;
 mod route;
 mod screen;
 mod session_layout_metadata;
+mod status_notices;
 mod terminal_bytes;
 mod thread_bus;
 mod ui;
@@ -78,6 +79,7 @@ use zellij_utils::{
         plugins::PluginAliases,
     },
     ipc::{ClientAttributes, ExitReason, ServerToClientMsg},
+    session_service::configured_pinned_exe,
     session_snapshot::{archive_session_info, SnapshotReason, SnapshotSettings},
     shared::{
         default_palette, set_terminal_title_format, web_server_base_url, TerminalTitleFormat,
@@ -1086,6 +1088,7 @@ pub fn start_server_impl(
 
                 let client_attributes = ClientAttributes {
                     size: cli_assets.terminal_window_size,
+                    tty: cli_assets.tty.clone(),
                     style: Style {
                         colors: config
                             .theme_config(runtime_config_options.theme.as_ref())
@@ -1145,6 +1148,17 @@ pub fn start_server_impl(
                     .send_to_screen(ScreenInstruction::RecomputeTabSize(
                         client_id,
                         client_attributes.size,
+                    ))
+                    .unwrap();
+                session_data
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .senders
+                    .send_to_screen(ScreenInstruction::SetClientTty(
+                        client_id,
+                        client_attributes.tty.clone(),
                     ))
                     .unwrap();
 
@@ -1270,6 +1284,7 @@ pub fn start_server_impl(
 
                 let client_attributes = ClientAttributes {
                     size: cli_assets.terminal_window_size,
+                    tty: cli_assets.tty.clone(),
                     style: Style {
                         colors: config
                             .theme_config(runtime_config_options.theme.as_ref())
@@ -1301,6 +1316,13 @@ pub fn start_server_impl(
                     .send_to_screen(ScreenInstruction::SetClientHostTerminalEnv(
                         client_id,
                         host_terminal_env,
+                    ))
+                    .unwrap();
+                session_data
+                    .senders
+                    .send_to_screen(ScreenInstruction::SetClientTty(
+                        client_id,
+                        client_attributes.tty.clone(),
                     ))
                     .unwrap();
                 session_data
@@ -2361,6 +2383,17 @@ fn init_session(
             let plugin_permissions = std::sync::Arc::new(config.plugin_permissions.clone());
             // this fork watches loaded plugin .wasm files by default - it is the point of the fork
             let plugin_watch = config_options.plugin_watch.unwrap_or(true);
+            // the about plugin names the binary a user should grant permissions to, and `pin_exe`
+            // is the config saying where that binary is kept - read here, where the config is
+            let pinned_exe = configured_pinned_exe(config_options.session_service.as_ref());
+            crate::plugins::plugin_loader::record_configured_pinned_exe(pinned_exe.clone());
+            // the same reason for the status overlay: it asks its questions from Screen, whose
+            // constructor takes thirty arguments already
+            crate::status_notices::record_settings(crate::status_notices::NoticeSettings {
+                expect_full_disk_access: config_options.expect_full_disk_access.unwrap_or(false),
+                stale_build_notice: config_options.stale_build_notice.unwrap_or(true),
+                pinned_exe,
+            });
             let session_env_vars = session_env_vars.clone();
             move || {
                 plugin_thread_main(

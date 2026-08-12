@@ -14,7 +14,7 @@ use tips::MAX_TIP_INDEX;
 
 use crate::active_component::ActiveComponent;
 use crate::keybindings::{apply_missing_binds, ApplyStatus, Feature, KeybindingState};
-use crate::pages::{ComponentLine, PageKind, TextOrCustomRender};
+use crate::pages::{ComponentLine, PageKind, ServerBinary, TextOrCustomRender};
 
 const UI_ROWS: usize = 20;
 const UI_COLUMNS: usize = 90;
@@ -34,6 +34,8 @@ struct App {
     tip_index: usize,
     waiting_for_config_to_be_written: bool,
     error: Option<String>,
+    /// The binary paths the server handed over in the plugin configuration
+    server_binary: Option<ServerBinary>,
 }
 
 impl Default for App {
@@ -49,6 +51,7 @@ impl Default for App {
                 base_mode.clone(),
                 false,
                 keybinding_state.clone(),
+                None,
             ),
             link_executable,
             zellij_version,
@@ -62,6 +65,7 @@ impl Default for App {
             tip_index: 0,
             waiting_for_config_to_be_written: false,
             error: None,
+            server_binary: None,
         }
     }
 }
@@ -92,6 +96,17 @@ impl ZellijPlugin for App {
         *self.zellij_version.borrow_mut() = get_zellij_version();
         self.change_own_title();
         self.query_link_executable();
+        // the server injects these at load time (see `configuration_for_load` in
+        // zellij-server/src/plugins/plugin_loader.rs): the binary that is actually running with
+        // symlinks resolved, and the path that outlives an upgrade where the two differ
+        self.server_binary = configuration
+            .get("zellij_exe")
+            .cloned()
+            .map(|running| ServerBinary {
+                running,
+                stable: configuration.get("zellij_exe_stable").cloned(),
+                full_disk_access_hint: configuration.contains_key("zellij_exe_hint"),
+            });
         self.active_page = if self.is_startup_tip {
             let mut rng = rng();
             self.tip_index = rng.random_range(0..=MAX_TIP_INDEX);
@@ -202,6 +217,7 @@ impl App {
             self.base_mode.clone(),
             self.is_release_notes,
             self.keybinding_state.clone(),
+            self.server_binary.clone(),
         )
     }
     fn main_screen_builder(&self) -> Rc<dyn Fn() -> Page> {
@@ -210,6 +226,7 @@ impl App {
         let base_mode = self.base_mode.clone();
         let keybinding_state = self.keybinding_state.clone();
         let is_release_notes = self.is_release_notes;
+        let server_binary = self.server_binary.clone();
         Rc::new(move || {
             Page::new_main_screen(
                 link_executable.clone(),
@@ -217,6 +234,7 @@ impl App {
                 base_mode.clone(),
                 is_release_notes,
                 keybinding_state.clone(),
+                server_binary.clone(),
             )
         })
     }
@@ -371,6 +389,15 @@ impl App {
         {
             self.active_page = self.main_screen();
             should_render = true;
+        } else if key.bare_key == BareKey::Char('c')
+            && key.has_no_modifiers()
+            && self.active_page.is_main_screen
+        {
+            // the page shows a path a user is meant to act on, and no part of the page can be
+            // selected with the mouse - so without this the path has to be retyped by hand
+            if let Some(server_binary) = &self.server_binary {
+                copy_to_clipboard(server_binary.path_to_copy().to_owned());
+            }
         } else if key.bare_key == BareKey::Esc && key.has_no_modifiers() {
             if self.active_page.is_main_screen {
                 close_self();

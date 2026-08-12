@@ -234,6 +234,19 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub plugin_watch: Option<bool>,
+    /// Say so in the session when Full Disk Access is missing (macOS only, true or false).
+    ///
+    /// Opt-in, because the notice is only meaningful where the user has decided zellij should
+    /// have that permission - and on that machine the permission being absent IS the actionable
+    /// fact, whether or not it was ever granted before.
+    #[clap(skip)]
+    #[serde(default)]
+    pub expect_full_disk_access: Option<bool>,
+    /// Say so in the session when the server is running a superseded build (true or false,
+    /// default true).
+    #[clap(skip)]
+    #[serde(default)]
+    pub stale_build_notice: Option<bool>,
     #[clap(long, value_parser)]
     #[serde(default)]
     /// Mirror session when multiple users are connected (true or false)
@@ -644,6 +657,10 @@ impl Options {
         let pane_frames = other.pane_frames.or(self.pane_frames);
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let plugin_watch = other.plugin_watch.or(self.plugin_watch);
+        let expect_full_disk_access = other
+            .expect_full_disk_access
+            .or(self.expect_full_disk_access);
+        let stale_build_notice = other.stale_build_notice.or(self.stale_build_notice);
         let auto_layout = other.auto_layout.or(self.auto_layout);
         let mirror_session = other.mirror_session.or(self.mirror_session);
         let simplified_ui = other.simplified_ui.or(self.simplified_ui);
@@ -768,6 +785,8 @@ impl Options {
             pane_frames,
             pane_frame_style,
             plugin_watch,
+            expect_full_disk_access,
+            stale_build_notice,
             mirror_session,
             on_force_close,
             scroll_buffer_size,
@@ -844,6 +863,9 @@ impl Options {
         let pane_frames = merge_bool(other.pane_frames, self.pane_frames);
         let pane_frame_style = other.pane_frame_style.or(self.pane_frame_style);
         let plugin_watch = merge_bool(other.plugin_watch, self.plugin_watch);
+        let expect_full_disk_access =
+            merge_bool(other.expect_full_disk_access, self.expect_full_disk_access);
+        let stale_build_notice = merge_bool(other.stale_build_notice, self.stale_build_notice);
         let auto_layout = merge_bool(other.auto_layout, self.auto_layout);
         let mirror_session = merge_bool(other.mirror_session, self.mirror_session);
         let session_serialization =
@@ -970,6 +992,8 @@ impl Options {
             pane_frames,
             pane_frame_style,
             plugin_watch,
+            expect_full_disk_access,
+            stale_build_notice,
             mirror_session,
             on_force_close,
             scroll_buffer_size,
