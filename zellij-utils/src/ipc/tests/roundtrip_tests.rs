@@ -412,6 +412,7 @@ fn test_client_messages() {
             config_file_path: Some(PathBuf::from("/path/to/config/file.kdl")),
             config_dir: Some(PathBuf::from("/path/to/config/dir")),
             should_ignore_config: true,
+            tty: Some(String::from("/dev/pts/3")),
             configuration_options: None,
             layout: None,
             terminal_window_size: Size { rows: 80, cols: 42 },
@@ -428,6 +429,7 @@ fn test_client_messages() {
             config_file_path: Some(PathBuf::from("/path/to/config/file.kdl")),
             config_dir: Some(PathBuf::from("/path/to/config/dir")),
             should_ignore_config: true,
+            tty: Some(String::from("/dev/pts/3")),
             configuration_options: Some(Options::default()),
             layout: None,
             terminal_window_size: Size { rows: 80, cols: 42 },
@@ -444,9 +446,12 @@ fn test_client_messages() {
             config_file_path: Some(PathBuf::from("/path/to/config/file.kdl")),
             config_dir: Some(PathBuf::from("/path/to/config/dir")),
             should_ignore_config: true,
+            tty: Some(String::from("/dev/pts/3")),
             configuration_options: Some(Options {
                 // config-file only, not carried over the contract
                 plugin_watch: None,
+                expect_full_disk_access: None,
+                stale_build_notice: None,
                 snapshot_dir: None,
                 session_snapshot_limit: None,
                 bell_clear_delay_ms: None,
