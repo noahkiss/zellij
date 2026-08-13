@@ -733,6 +733,14 @@ pub trait Pane {
     }
     /// The uuid given to this pane when it was created. Unlike the pane id, it is never reused.
     fn pane_uuid(&self) -> Uuid;
+    /// The uuid of the pane this one continues, when it was built from a serialized session.
+    ///
+    /// A restored pane is a new pane and says so with a new `pane_uuid`; this names what it came
+    /// from, for a consumer that wants to carry state across the restart deliberately.
+    fn restored_from(&self) -> Option<String> {
+        None
+    }
+    fn set_restored_from(&mut self, _restored_from: Option<String>) {}
     fn custom_title(&self) -> Option<String>;
     fn has_explicit_title(&self) -> bool {
         false
@@ -8121,6 +8129,7 @@ pub fn pane_info_for_pane(
     pane_info.title = pane.current_title();
     pane_info.program_title = pane.program_title();
     pane_info.uuid = pane.pane_uuid().to_string();
+    pane_info.restored_from = pane.restored_from().unwrap_or_default();
     let geom = pane.position_and_size();
     pane_info.stack_id = geom.stacked;
     pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();

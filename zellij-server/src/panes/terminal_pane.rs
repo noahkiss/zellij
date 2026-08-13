@@ -135,6 +135,8 @@ pub struct TerminalPane {
     pub pid: u32,
     /// Given at creation, never reused - see `Pane::pane_uuid`
     uuid: Uuid,
+    /// Set when this pane was built from a serialized session - see `Pane::restored_from`
+    restored_from: Option<String>,
     pub selectable: bool,
     pub geom: PaneGeom,
     pub geom_override: Option<PaneGeom>,
@@ -679,6 +681,12 @@ impl Pane for TerminalPane {
     }
     fn pane_uuid(&self) -> Uuid {
         self.uuid
+    }
+    fn restored_from(&self) -> Option<String> {
+        self.restored_from.clone()
+    }
+    fn set_restored_from(&mut self, restored_from: Option<String>) {
+        self.restored_from = restored_from;
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
@@ -1384,6 +1392,7 @@ impl TerminalPane {
         }
         TerminalPane {
             uuid: Uuid::new_v4(),
+            restored_from: None,
             frame: HashMap::new(),
             content_offset: Offset::default(),
             pid,

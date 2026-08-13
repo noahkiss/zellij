@@ -4623,6 +4623,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::TiledPaneLay
         });
 
         Ok(TiledPaneLayout {
+            // Not carried across this contract: `restored_from` is provenance the SERVER assigns
+            // when it rebuilds a pane from a serialized session, never something a sender declares.
+            restored_from: None,
             children_split_direction,
             name: layout.name,
             children: children?,
@@ -4659,6 +4662,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::FloatingPane
         let y = layout.y.map(|y| y.try_into()).transpose()?;
 
         Ok(crate::input::layout::FloatingPaneLayout {
+            // Not carried across this contract: `restored_from` is provenance the SERVER assigns
+            // when it rebuilds a pane from a serialized session, never something a sender declares.
+            restored_from: None,
             name: layout.name,
             height,
             width,

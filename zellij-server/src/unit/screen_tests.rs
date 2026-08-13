@@ -8034,6 +8034,379 @@ pub fn background_plugin_receives_broadcasts_regardless_of_active_tab() {
     );
 }
 
+#[derive(Default, Debug)]
+struct BackgroundPluginDelivery {
+    pane_updates: usize,
+    tab_updates: usize,
+    max_pane_updates_per_batch: usize,
+    max_tab_updates_per_batch: usize,
+    last_tab_update_len: Option<usize>,
+}
+
+/// Count the PaneUpdate/TabUpdate events delivered to one background plugin. A batch is one
+/// PluginInstruction::Update, i.e. one state change, so the per-batch maxima catch a background
+/// plugin being served once per connected client instead of once per change.
+fn background_plugin_delivery(
+    instructions: &[PluginInstruction],
+    plugin_id: u32,
+) -> BackgroundPluginDelivery {
+    let mut delivery = BackgroundPluginDelivery::default();
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            let mut pane_updates_in_batch = 0;
+            let mut tab_updates_in_batch = 0;
+            for (pid, _cid, event) in updates {
+                if pid != &Some(plugin_id) {
+                    continue;
+                }
+                match event {
+                    Event::PaneUpdate(..) => pane_updates_in_batch += 1,
+                    Event::TabUpdate(tab_infos) => {
+                        tab_updates_in_batch += 1;
+                        delivery.last_tab_update_len = Some(tab_infos.len());
+                    },
+                    _ => {},
+                }
+            }
+            delivery.pane_updates += pane_updates_in_batch;
+            delivery.tab_updates += tab_updates_in_batch;
+            delivery.max_pane_updates_per_batch = delivery
+                .max_pane_updates_per_batch
+                .max(pane_updates_in_batch);
+            delivery.max_tab_updates_per_batch =
+                delivery.max_tab_updates_per_batch.max(tab_updates_in_batch);
+        }
+    }
+    delivery
+}
+
+fn subscribe_background_plugin(mock_screen: &MockScreen, plugin_id: u32, client_id: u16) {
+    let mut subscriptions = HashSet::new();
+    subscriptions.insert(EventType::PaneUpdate);
+    subscriptions.insert(EventType::TabUpdate);
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdateBackgroundPluginSubscriptions(
+            plugin_id,
+            client_id,
+            subscriptions,
+        ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
+/// A two-pane tab, so that closing one pane is a state change that does not close the tab.
+fn two_pane_layout() -> TiledPaneLayout {
+    let mut layout = TiledPaneLayout::default();
+    layout.children_split_direction = SplitDirection::Vertical;
+    layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    layout
+}
+
+#[test]
+pub fn background_plugin_receives_updates_with_no_clients_attached() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // detach the only client, then change state
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0,
+        "background plugin should receive PaneUpdate with no clients attached, got: {:?}",
+        delivery
+    );
+    assert!(
+        delivery.tab_updates > 0,
+        "background plugin should receive TabUpdate with no clients attached, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "background plugin should receive one TabUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_receives_one_update_per_change_with_one_client() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0 && delivery.tab_updates > 0,
+        "background plugin should receive both updates with one client, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "background plugin should receive one TabUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_receives_one_update_per_change_with_two_clients() {
+    // Tab 0: plugin pane 2, Tab 1: two terminal panes. Client 1 stays on tab 1, client 2 goes
+    // to tab 0, so the two clients sit on different tabs.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0 && delivery.tab_updates > 0,
+        "background plugin should receive both updates with two clients, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "two clients must not mean two PaneUpdates for one change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "two clients must not mean two TabUpdates for one change, got: {:?}",
+        delivery
+    );
+    // the background payload is the whole screen state, not one client's view of it
+    assert_eq!(
+        delivery.last_tab_update_len,
+        Some(2),
+        "background TabUpdate should list every tab, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_gets_one_update_when_the_tab_list_changes() {
+    // A change to the tab list goes to EVERY tab's plugins, not just the active tab's. A
+    // background plugin lives in no tab, so that arm must not reach it a second time.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    // moving client 1's tab reorders the tab list
+    let _ = mock_screen.to_screen.send(ScreenInstruction::MoveTabLeft(
+        mock_screen.main_client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let instructions_after_change = &instructions[instructions_before_change..];
+    // plugin 2 sits in a tab neither client has active after the move, so its TabUpdate proves
+    // the tab-list-changed arm ran
+    let tab_plugin_delivery = background_plugin_delivery(instructions_after_change, 2);
+    assert!(
+        tab_plugin_delivery.tab_updates > 0,
+        "the tab list change should reach every tab's plugins, got: {:?}",
+        tab_plugin_delivery
+    );
+
+    let delivery = background_plugin_delivery(instructions_after_change, 99);
+    assert!(
+        delivery.tab_updates > 0,
+        "background plugin should hear that the tab list changed, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "a tab list change must not deliver twice to a background plugin, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
+#[test]
+pub fn background_plugin_receives_updates_after_its_own_client_detaches() {
+    // The failure this guards: a background plugin is addressed by the ClientId it was loaded
+    // with, and that id is recycled. Delivery must not depend on that client still being here.
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // the client the plugin was loaded with leaves, another stays
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery = background_plugin_delivery(&instructions[instructions_before_change..], 99);
+    assert!(
+        delivery.pane_updates > 0,
+        "background plugin should receive PaneUpdate after its own client detached, got: {:?}",
+        delivery
+    );
+    assert!(
+        delivery.tab_updates > 0,
+        "background plugin should receive TabUpdate after its own client detached, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "background plugin should receive one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "background plugin should receive one TabUpdate per change, got: {:?}",
+        delivery
+    );
+}
+
 #[test]
 pub fn tab_switch_only_updates_active_tab_plugins() {
     // Tab 0: plugin pane 2 (from new_tab_with_plugins)

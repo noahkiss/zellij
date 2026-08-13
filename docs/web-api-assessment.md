@@ -1,5 +1,14 @@
 # Assessment: a first-class HTTP/WS API on zellij's web server
 
+> **STALE IN TWO PLACES, found 2026-08-12 (verdict unaffected).** The "Revisited" section says the
+> web control channel accepts only `TerminalResize`/`TerminalMetrics` with no action dispatch: it
+> now also accepts `FocusPane`, `NewPaneInTab`, `NewTab`, `RequestSessionList` and more
+> (`web_client/control_message.rs:13-37`), three of which become real `ClientToServerMsg::Action`
+> values — authenticated action dispatch over the web socket exists today. It also says nothing is
+> reachable over the web surface: `GET /session-list` (`web_client/http_handlers.rs:149`) returns
+> JSON for every live session on the host, behind the existing auth. The seam costs and the security
+> argument below are unchanged; the drift is toward more control surface, not less.
+
 Written 2026-07-30 against v0.44.3. **Verdict: do not build it. The capability that motivated it
 already ships in v0.44.3 as a CLI/IPC surface, and a web API would be sugar over it at the cost of a
 new remote-control attack surface in upstream's most active directory.**

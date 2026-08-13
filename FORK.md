@@ -52,6 +52,11 @@ moves; a rebase within the same upstream version does not reset it.
 Because the version keys `$ZELLIJ_CACHE_DIR/<version>`, the fork does not share plugin artifact or
 release-note caches with an upstream build of the same version.
 
+**The version string is not orderable, so do not gate features on it.** Because the counter resets,
+`0.45.0-nkmk.4` is newer than `0.44.3-nkmk.7` while `4 < 7` — a consumer comparing counters switches
+features OFF on an upgrade, silently. Ask the binary what it has instead:
+[`zellij setup --check --json`](#zellij-setup---check---json).
+
 ## The patch queue
 
 ### Plugin hot-reload (`plugin_watch`, default **on**)
@@ -213,6 +218,45 @@ nothing here was told about cannot be on that list: `zellij session up <name>` s
 table and does see such a server, which is the command to reach for. Fixing the candidate set
 itself is not possible — an arbitrary value exported in another shell is not derivable from this
 one — so naming what *was* searched is the whole of the honest answer.
+
+### `zellij setup --check --json`
+
+```
+zellij setup --check --json | jq -e '.capabilities | index("pane-uuid")'
+```
+
+The build says what it can do, in a form a consumer can read. `--check` alone prints prose and a
+version string, and a version string is the one thing a consumer must not decide on: the fork
+counter resets on an upstream bump, so any comparison of counters gets an upgrade backwards. This
+has already happened — two capabilities went silently dark in a consumer that gated on the counter.
+
+```json
+{
+  "version": "0.45.0-nkmk.4",
+  "base_version": "0.45.0",
+  "fork": "nkmk",
+  "fork_counter": 4,
+  "capabilities": ["capabilities-json", "session-lifecycle", "pane-uuid", "..."],
+  "features": ["vendored_curl", "web_server_capability"],
+  "directories": { "cache_dir": "...", "socket_dir": "...", "config_file": "...", "...": "..." }
+}
+```
+
+- **Gate on the capability names.** They are lower-case, hyphenated, name a surface rather than a
+  patch, and never change meaning: a renamed feature gets a new name and keeps the old one until
+  nothing reads it. `capabilities-json` is in the list so a consumer can tell "this build has no
+  fork features" from "this build is too old to answer".
+- **The version arrives as a pair**, `base_version` plus `fork_counter`, which is the only correct
+  comparison: the base orders normally, the counter orders only within one base. An upstream build
+  reports neither `fork` nor `fork_counter`.
+- `--json` reports `--check`'s directories too, so a consumer that needs the socket directory or the
+  config file stops parsing `[SOCKET DIR]` out of prose.
+
+Output is one JSON document on stdout and nothing else, so `| jq` works. `--json` without `--check`
+is a usage error rather than a silent no-op.
+
+The list is a single const, `CAPABILITIES` in `zellij-utils/src/capabilities.rs`. A new fork feature
+adds one line to it.
 
 ### Pane identity and stack membership in `PaneInfo`
 
@@ -1677,6 +1721,42 @@ What the uuid promises, exactly:
 
 The uuid is generated in `TerminalPane::new` and `PluginPane::new`, so there is no creation path
 that can forget it, and it is read through the `Pane::pane_uuid` trait method.
+
+#### What a restored pane continues (`restored_from`)
+
+The rule above - a restored pane is a new pane and says so with a new uuid - is what stops a
+consumer's pre-restart state reattaching to a pane it no longer describes. It also loses the link
+entirely, and some consumers do want it: "this is the pane that WAS my build shell" is a reasonable
+thing to know after `zellij session restart`.
+
+So the link is reported separately. A pane rebuilt from a serialized session reports
+`restored_from`, the uuid of the pane it continues, alongside its own new `uuid`. Empty for a pane
+that was never restored.
+
+```
+before a restart   uuid f1e5dce9…   restored_from ""
+after it           uuid 9c2fa401…   restored_from "f1e5dce9…"
+```
+
+Provenance, not identity. Nothing keys off it by default: a consumer that wants continuity opts in,
+and one that does not keeps the safe behaviour for free. **Neither is a key across a restart on its
+own** - ids repeat there too - so pair it with the session's creation time, which changes on exactly
+the events that invalidate both id spaces.
+
+**One hop.** A pane restored twice names the incarnation directly before it, not the whole chain
+back to the first. The serialized layout records the pane's uuid at the moment it was written, so
+each restart records one link, and a consumer that wants the full chain keeps it itself.
+
+The uuid travels in the serialized layout as a `pane_uuid` property on the pane node, which is why
+the KDL says `pane_uuid` and the pane reports `restored_from`: at write time it IS the pane's uuid,
+and calling it `restored_from` there would read as a promise that the pane comes back under it.
+`pane_uuid` is written by serialization and never by hand; a hand-written layout simply omits it.
+
+It is deliberately NOT carried on the plugin API's or the client/server contract's layout messages.
+Provenance is something the server assigns when it rebuilds a pane, never something a sender
+declares - a layout that could name its own lineage could lie about it.
+
+`PaneInfo` gains `string restored_from = 31`, so `list-panes --json` reports it for free.
 
 `PaneInfo` crosses the plugin API, so `event.proto` gains `string uuid = 30` and its generated Rust
 is regenerated (`cargo xtask build`). `list-panes --json` gets the field for free - `PaneListEntry`

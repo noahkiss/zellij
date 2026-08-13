@@ -550,6 +550,9 @@ impl<'a> LayoutApplier<'a> {
             new_plugin.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_plugin.handle_pty_bytes("\n\r".as_bytes().into());
         }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_plugin.set_restored_from(layout.restored_from.clone());
 
         new_plugin.set_borderless(layout.borderless.unwrap_or(false));
         if let Some(exclude_from_sync) = layout.exclude_from_sync {
@@ -600,6 +603,9 @@ impl<'a> LayoutApplier<'a> {
             new_pane.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_pane.handle_pty_bytes("\n\r".as_bytes().into());
         }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_pane.set_restored_from(floating_pane_layout.restored_from.clone());
         if floating_pane_layout.borderless.unwrap_or(false) {
             new_pane.set_borderless(true);
         } else {
@@ -657,6 +663,9 @@ impl<'a> LayoutApplier<'a> {
             new_pane.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_pane.handle_pty_bytes("\n\r".as_bytes().into());
         }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_pane.set_restored_from(floating_pane_layout.restored_from.clone());
         if floating_pane_layout.borderless.unwrap_or(false) {
             new_pane.set_borderless(true);
         } else {
@@ -734,6 +743,9 @@ impl<'a> LayoutApplier<'a> {
             new_pane.handle_pty_bytes(pane_initial_contents.as_bytes().into());
             new_pane.handle_pty_bytes("\n\r".as_bytes().into());
         }
+        // Provenance, not identity: the pane keeps its own new uuid and merely names what it
+        // continues. Set on every creation path, so a restored pane says so however it was built.
+        new_pane.set_restored_from(layout.restored_from.clone());
         new_pane.set_borderless(layout.borderless.unwrap_or(false));
         if let Some(exclude_from_sync) = layout.exclude_from_sync {
             new_pane.set_exclude_from_sync(exclude_from_sync);
