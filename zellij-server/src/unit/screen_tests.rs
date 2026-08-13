@@ -8618,6 +8618,90 @@ pub fn background_plugin_receives_one_update_per_change_with_two_clients() {
 }
 
 #[test]
+pub fn plugin_in_a_visible_tab_is_never_served_as_a_background_plugin() {
+    // A plugin loading another plugin into a visible floating pane passes no tab index, so the
+    // plugin thread files the new plugin as background even though its pane sits in a real tab.
+    // It is already served as an active-tab plugin, so it must not be served a second time.
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    // put the only client on the tab holding plugin 2, so the plugin is in its active tab
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::GoToTab(1, Some(main_client_id), None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // plugin 2 is misfiled as a background plugin
+    subscribe_background_plugin(&mock_screen, 2, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let instructions_after_change = &instructions[instructions_before_change..];
+    let delivery = background_plugin_delivery(instructions_after_change, 2);
+    assert!(
+        delivery.pane_updates > 0 && delivery.tab_updates > 0,
+        "the plugin should still be served as an active-tab plugin, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "a visible plugin misfiled as background must get one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "a visible plugin misfiled as background must get one TabUpdate per change, got: {:?}",
+        delivery
+    );
+
+    // the payload must be the per-client one, which excludes the receiving client from
+    // other_focused_clients - the client-independent background payload lists it
+    let mut tab_infos_delivered = vec![];
+    for instruction in instructions_after_change {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if pid == &Some(2) {
+                    if let Event::TabUpdate(tab_infos) = event {
+                        tab_infos_delivered.extend(tab_infos.clone());
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        !tab_infos_delivered.is_empty(),
+        "expected at least one TabUpdate payload for the plugin"
+    );
+    assert!(
+        tab_infos_delivered
+            .iter()
+            .all(|tab_info| tab_info.other_focused_clients.is_empty()),
+        "expected the per-client TabUpdate payload, got: {:?}",
+        tab_infos_delivered
+    );
+}
+
+#[test]
 pub fn background_plugin_gets_one_update_when_the_tab_list_changes() {
     // A change to the tab list goes to EVERY tab's plugins, not just the active tab's. A
     // background plugin lives in no tab, so that arm must not reach it a second time.

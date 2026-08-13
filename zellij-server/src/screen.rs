@@ -5966,11 +5966,11 @@ impl Screen {
         }
         // Notify background plugins subscribed to ModeUpdate
         let mut bg_updates = vec![];
-        for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
-            if subs.contains(&EventType::ModeUpdate) && *bg_cid == client_id {
+        for (bg_pid, bg_cid) in self.background_plugin_ids_subscribed_to(EventType::ModeUpdate) {
+            if bg_cid == client_id {
                 bg_updates.push((
-                    Some(*bg_pid),
-                    Some(*bg_cid),
+                    Some(bg_pid),
+                    Some(bg_cid),
                     Event::ModeUpdate(mode_info.clone()),
                 ));
             }
@@ -6043,14 +6043,22 @@ impl Screen {
     /// loaded with, which the plugin map needs in order to address the instance. That client may
     /// have detached long ago, or the id may since have been recycled to an unrelated client, so
     /// it must never be used to decide *whether* to deliver - only where to deliver to.
+    ///
+    /// A plugin whose pane lives in a tab is not background, whatever the subscription map says:
+    /// the plugin thread files a plugin as background when it was loaded without a tab index, and
+    /// a plugin loading another one into a visible floating pane passes no tab index either. Such
+    /// a plugin is served as an active-tab plugin, so serving it here too would deliver twice. The
+    /// pane can also move between tabs, so tab ownership is checked at dispatch time, not at load.
     fn background_plugin_ids_subscribed_to(
         &self,
         event_type: EventType,
     ) -> Vec<(PluginId, ClientId)> {
+        let plugin_ids_in_tabs = self.all_tab_plugin_ids();
         self.background_plugin_subscriptions
             .iter()
             .filter(|(_, subs)| subs.contains(&event_type))
             .map(|((bg_pid, bg_cid), _)| (*bg_pid, *bg_cid))
+            .filter(|(bg_pid, _)| !plugin_ids_in_tabs.contains(bg_pid))
             .collect()
     }
     /// Collect plugin IDs that should receive a broadcast event for a given client.
@@ -6059,11 +6067,9 @@ impl Screen {
     fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
         let mut plugin_ids = self.active_tab_plugin_ids(client_id);
         // Background plugins subscribed to this event type
-        for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
-            if subs.contains(&event_type) && *bg_cid == client_id {
-                if !plugin_ids.contains(bg_pid) {
-                    plugin_ids.push(*bg_pid);
-                }
+        for (bg_pid, bg_cid) in self.background_plugin_ids_subscribed_to(event_type) {
+            if bg_cid == client_id && !plugin_ids.contains(&bg_pid) {
+                plugin_ids.push(bg_pid);
             }
         }
         plugin_ids
