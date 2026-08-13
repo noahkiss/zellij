@@ -2575,6 +2575,66 @@ pub fn write_to_existing_pane_reports_no_error() {
 }
 
 #[test]
+pub fn close_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn edit_scrollback_for_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::EditScrollbackForPaneWithId(
+            PaneId::Terminal(999),
+            Some(crate::route::NotificationEnd::new(completion_tx)),
+        ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![screen_thread]);
+    let result = completion_rx
+        .try_recv()
+        .expect("no completion result was sent");
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
 pub fn send_cli_send_keys_action_to_screen() {
     let size = Size {
         cols: 121,

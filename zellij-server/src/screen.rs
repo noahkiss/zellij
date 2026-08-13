@@ -9308,7 +9308,7 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::ClosePane(
                 id,
                 client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
+                mut _completion_tx, // the action ends here, dropping this will release anything
                 // waiting for it
                 exit_status,
             ) => {
@@ -9330,10 +9330,18 @@ pub(crate) fn screen_thread_main(
                             }
                         }
                         if !found {
-                            pending_events_waiting_for_pane
-                                .entry(id)
-                                .or_default()
-                                .push(ScreenInstruction::ClosePane(id, None, None, exit_status));
+                            if let Some(ref mut c) = _completion_tx {
+                                // an explicit request (the CLI or a plugin waiting on this)
+                                // names a pane that does not exist - say so rather than
+                                // queueing the close for a pane that may never appear
+                                log::error!("Pane with id {:?} not found", id);
+                                c.set_exit_status(1);
+                                c.set_error_message(format!("Pane with id {:?} not found", id));
+                            } else {
+                                pending_events_waiting_for_pane.entry(id).or_default().push(
+                                    ScreenInstruction::ClosePane(id, None, None, exit_status),
+                                );
+                            }
                         }
                     },
                 }
@@ -11329,11 +11337,21 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut completion_tx = completion_tx;
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx)
+                        tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx.take())
                             .non_fatal();
+                        found = true;
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = completion_tx {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
