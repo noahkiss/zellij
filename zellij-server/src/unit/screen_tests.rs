@@ -176,6 +176,35 @@ fn route_arbitrary_action_to_server(
     .unwrap();
 }
 
+// same as the above, but hands back the completion result so a test can assert on the
+// error message and exit status an action reports
+fn route_arbitrary_action_and_get_result(
+    session_metadata: &SessionMetaData,
+    action: Action,
+    client_id: ClientId,
+) -> crate::route::ActionCompletionResult {
+    let senders = session_metadata.senders.clone();
+    let default_mode = session_metadata
+        .session_configuration
+        .get_client_configuration(&client_id)
+        .options
+        .default_mode
+        .unwrap_or(InputMode::Normal);
+    let (_should_break, result) = route_action(
+        action,
+        client_id,
+        None,
+        None,
+        senders,
+        None,
+        None,
+        default_mode,
+        None,
+    )
+    .unwrap();
+    result.expect("action did not report a completion result")
+}
+
 #[derive(Clone, Default)]
 struct FakeInputOutput {
     fake_filesystem: Arc<Mutex<HashMap<String, String>>>,
@@ -2458,6 +2487,91 @@ pub fn send_cli_write_action_to_screen() {
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
     mock_screen.teardown(vec![pty_writer_thread, screen_thread]);
     assert_snapshot!(format!("{:?}", *received_pty_instructions.lock().unwrap()));
+}
+
+#[test]
+pub fn write_to_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::WriteCharsToPaneId {
+            chars: "input from the cli".into(),
+            pane_id: zellij_utils::data::PaneId::Terminal(999),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn paste_to_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::Paste {
+            chars: "pasted from the cli".into(),
+            pane_id: Some(zellij_utils::data::PaneId::Terminal(999)),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn write_to_existing_pane_reports_no_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::WriteCharsToPaneId {
+            chars: "input from the cli".into(),
+            pane_id: zellij_utils::data::PaneId::Terminal(0),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.exit_status, None);
 }
 
 #[test]

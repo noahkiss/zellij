@@ -11338,13 +11338,22 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+            ScreenInstruction::WriteToPaneId(bytes, pane_id, mut completion) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
                         tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
                             .non_fatal();
+                        found = true;
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = completion {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
@@ -11353,11 +11362,24 @@ pub(crate) fn screen_thread_main(
                 match pane_id {
                     Some(pane_id) => {
                         let all_tabs = screen.get_tabs_mut();
+                        let mut completion = _completion;
+                        let mut found = false;
                         for tab in all_tabs.values_mut() {
                             if tab.has_pane_with_pid(&pane_id) {
-                                tab.paste_to_pane_id(bytes, pane_id, _completion)
+                                tab.paste_to_pane_id(bytes, pane_id, completion.take())
                                     .non_fatal();
+                                found = true;
                                 break;
+                            }
+                        }
+                        if !found {
+                            log::error!("Pane with id {:?} not found", pane_id);
+                            if let Some(ref mut c) = completion {
+                                c.set_exit_status(1);
+                                c.set_error_message(format!(
+                                    "Pane with id {:?} not found",
+                                    pane_id
+                                ));
                             }
                         }
                     },
