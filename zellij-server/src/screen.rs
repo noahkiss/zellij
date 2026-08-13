@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::str;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::route::NotificationEnd;
 
@@ -76,7 +76,7 @@ use zellij_utils::{
 use crate::background_jobs::BackgroundJob;
 use crate::bell_dwell::BellDwellTracker;
 use crate::notifications::NotificationProtocol;
-use crate::os_input_output::ResizeCache;
+use crate::os_input_output::{ResizeCache, SendToClientError};
 use crate::pane_groups::PaneGroups;
 use crate::panes::alacritty_functions::xparse_color;
 use crate::panes::grid::{namespace_notification_id, PendingNotification};
@@ -94,7 +94,7 @@ use crate::{
     panes::LinkHandler,
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction, PluginRenderAsset},
-    pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
+    pty::{get_default_shell, ClientTabIndexOrPaneId, PaneProcessInfo, PtyInstruction, VteBytes},
     pty_writer::PtyWriteInstruction,
     tab::{GuestChoiceIndicator, SuppressedPanes, Tab, CANNOT_STACK_WITHOUT_ANCHOR},
     thread_bus::Bus,
@@ -337,6 +337,9 @@ pub struct TabOverrideResult {
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
     PtyBytes(u32, VteBytes),
+    /// The pty thread's once-a-second report of what each terminal pane is running, keyed by
+    /// terminal id. Screen keeps it only to stamp `PaneInfo`.
+    UpdatePaneProcessInfo(HashMap<u32, PaneProcessInfo>),
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -967,6 +970,7 @@ impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
             ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::UpdatePaneProcessInfo(..) => ScreenContext::UpdatePaneProcessInfo,
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
             ScreenInstruction::RenderToClients => ScreenContext::RenderToClients,
@@ -1640,12 +1644,28 @@ pub(crate) struct Screen {
     nested_session_handling: NestedSessionHandling,
     last_mobile_state_sent: HashMap<ClientId, MobileStatePayload>,
     pane_output_activity: HashMap<PaneId, Instant>,
+    /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
+    /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
+    pane_process_info: HashMap<u32, PaneProcessInfo>,
     mobile_web_prefs: HashMap<ClientId, MobileWebPrefs>,
     client_host_focused: HashMap<ClientId, bool>,
     client_notification_protocols: HashMap<ClientId, NotificationProtocol>,
     host_notification_protocol: HostNotificationProtocol,
     client_host_terminal_env: HashMap<ClientId, BTreeMap<String, String>>,
     bell_dwell: BellDwellTracker,
+}
+
+/// What one pass of `Screen::sweep_bells` found.
+#[derive(Debug, Default)]
+struct BellSweep {
+    /// Panes that newly acquired a pending bell, for the visual flash.
+    panes_to_flash: Vec<PaneId>,
+    /// Tabs whose bell indicator newly lit, for the visual flash.
+    tabs_to_flash: Vec<usize>,
+    /// A bell rang somewhere this pass, so an attached client should hear one.
+    has_bell: bool,
+    /// Recorded bell state changed, so the session state is worth reporting.
+    state_changed: bool,
 }
 
 /// A pending forward waiting to be dispatched once the current in-flight
@@ -1845,6 +1865,7 @@ impl Screen {
             nested_session_handling,
             last_mobile_state_sent: HashMap::new(),
             pane_output_activity: HashMap::new(),
+            pane_process_info: HashMap::new(),
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
             client_notification_protocols: HashMap::new(),
@@ -4201,6 +4222,61 @@ impl Screen {
         Ok(())
     }
 
+    /// Take the bells the panes have latched and turn them into session state.
+    ///
+    /// Separated from rendering because it must run whether or not anyone is attached: a bell that
+    /// is only noticed when a human turns up is no use to a consumer watching a detached session,
+    /// and `PaneInfo.has_pending_bell` would be permanently false for one. What the caller does
+    /// with the returned lists - flashing panes, forwarding an ANSI BEL - is the part that needs a
+    /// client.
+    fn sweep_bells(&mut self) -> BellSweep {
+        let mut sweep = BellSweep::default();
+
+        if self.visual_bell {
+            let active_tab_ids_snapshot: Vec<usize> =
+                self.active_tab_ids.values().copied().collect();
+
+            for tab in self.tabs.values_mut() {
+                let is_active = active_tab_ids_snapshot.contains(&tab.id);
+                let (new_panes, tab_newly_set) = tab.check_and_handle_bell_notifications(is_active);
+                if !new_panes.is_empty() {
+                    sweep.panes_to_flash.extend(new_panes);
+                    sweep.state_changed = true;
+                }
+                if tab_newly_set {
+                    sweep.tabs_to_flash.push(tab.id);
+                    sweep.state_changed = true;
+                }
+            }
+            sweep.has_bell = !sweep.panes_to_flash.is_empty() || !sweep.tabs_to_flash.is_empty();
+        } else {
+            // visual_bell disabled: consume the bell for ANSI BEL forwarding only, recording no
+            // per-pane state - which is what this configuration asked for
+            for tab in self.tabs.values_mut() {
+                if tab.check_and_consume_bells_without_visual_notification() {
+                    sweep.has_bell = true;
+                }
+            }
+        }
+
+        // a pane that rings again while it is focused restarts its bell_clear_delay_ms dwell.
+        // Nothing is focused in a detached session, so this list is empty there.
+        let rang_while_focused: Vec<PaneId> = self
+            .tabs
+            .values_mut()
+            .flat_map(|tab| tab.take_bells_rung_while_focused())
+            .collect();
+        if self.bell_dwell.is_delayed() {
+            let now = Instant::now();
+            for pane_id in rang_while_focused {
+                self.bell_dwell.record_ring(pane_id, now);
+                self.schedule_bell_clear(pane_id);
+            }
+        }
+
+        sweep
+    }
+
     pub fn render_to_clients(&mut self) -> Result<()> {
         // this method does the actual rendering and is triggered by a debounced BackgroundJob (see
         // the render method for more details)
@@ -4218,6 +4294,11 @@ impl Screen {
         let non_watcher_output_was_dirty;
 
         let mut tabs_to_close = vec![];
+
+        // A bell is session state, not a client-side effect. This sweep runs before the client
+        // gate below so that a fully detached session still records which panes rang - the
+        // flashing and the forwarded BEL, which do need a client, stay inside the gate.
+        let bells = self.sweep_bells();
 
         // === PHASE 1: Render for regular clients ===
         if has_regular_clients {
@@ -4260,67 +4341,22 @@ impl Screen {
 
             non_watcher_output_was_dirty = output.is_dirty();
 
-            let mut bell_state_changed = false;
-            let mut has_bell = false;
-
-            if self.visual_bell {
-                let mut panes_to_flash: Vec<PaneId> = vec![];
-                let mut tabs_to_flash: Vec<usize> = vec![];
-
-                let active_tab_ids_snapshot: Vec<usize> =
-                    self.active_tab_ids.values().copied().collect();
-
-                for tab in self.tabs.values_mut() {
-                    let is_active = active_tab_ids_snapshot.contains(&tab.id);
-                    let (new_panes, tab_newly_set) =
-                        tab.check_and_handle_bell_notifications(is_active);
-                    if !new_panes.is_empty() {
-                        panes_to_flash.extend(new_panes);
-                        bell_state_changed = true;
-                    }
-                    if tab_newly_set {
-                        tabs_to_flash.push(tab.id);
-                        bell_state_changed = true;
-                    }
-                }
-
-                has_bell = !panes_to_flash.is_empty() || !tabs_to_flash.is_empty();
-                if !panes_to_flash.is_empty() {
-                    let _ = self
-                        .bus
-                        .senders
-                        .send_to_background_jobs(BackgroundJob::FlashPaneBell(panes_to_flash));
-                }
-                for tab_id in tabs_to_flash {
-                    let _ = self
-                        .bus
-                        .senders
-                        .send_to_background_jobs(BackgroundJob::FlashTabBell(tab_id));
-                }
-            } else {
-                // visual_bell disabled: still detect bell for ANSI BEL forwarding only
-                for tab in self.tabs.values_mut() {
-                    if tab.check_and_consume_bells_without_visual_notification() {
-                        has_bell = true;
-                    }
-                }
+            if !bells.panes_to_flash.is_empty() {
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::FlashPaneBell(
+                        bells.panes_to_flash.clone(),
+                    ));
+            }
+            for tab_id in &bells.tabs_to_flash {
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::FlashTabBell(*tab_id));
             }
 
-            // a pane that rings again while it is focused restarts its bell_clear_delay_ms dwell
-            let rang_while_focused: Vec<PaneId> = self
-                .tabs
-                .values_mut()
-                .flat_map(|tab| tab.take_bells_rung_while_focused())
-                .collect();
-            if self.bell_dwell.is_delayed() {
-                let now = Instant::now();
-                for pane_id in rang_while_focused {
-                    self.bell_dwell.record_ring(pane_id, now);
-                    self.schedule_bell_clear(pane_id);
-                }
-            }
-
-            if has_bell {
+            if bells.has_bell {
                 output.add_post_vte_instruction_to_multiple_clients(
                     self.active_tab_ids.keys().copied(),
                     "\u{7}", // ANSI BEL
@@ -4336,7 +4372,7 @@ impl Screen {
                 }
             }
 
-            if non_watcher_output_was_dirty || has_bell {
+            if non_watcher_output_was_dirty || bells.has_bell {
                 let serialized_output = output.serialize().context(err_context)?;
                 if !serialized_output.is_empty() {
                     let _ = self
@@ -4348,12 +4384,18 @@ impl Screen {
             }
 
             let single_pane_names_changed = self.update_single_pane_tab_names();
-            if bell_state_changed || single_pane_names_changed {
+            if bells.state_changed || single_pane_names_changed {
                 self.log_and_report_session_state()?;
             }
         } else {
             // No regular clients, output is not dirty
             non_watcher_output_was_dirty = false;
+
+            // a pane that rang with nobody attached is exactly the case a headless consumer cares
+            // about, so the state change is reported here too
+            if bells.state_changed {
+                self.log_and_report_session_state()?;
+            }
 
             // No regular clients but subscribers exist — query panes directly
             if !self.pane_render_subscribers.is_empty() {
@@ -5419,9 +5461,9 @@ impl Screen {
             }
             plugin_tab_updates.sort_by(|a, b| a.position.cmp(&b.position));
             let target_plugin_ids = if tab_structure_changed {
-                self.all_tab_plugin_ids(*client_id, EventType::TabUpdate)
+                self.all_tab_plugin_ids()
             } else {
-                self.targeted_plugin_ids(*client_id, EventType::TabUpdate)
+                self.active_tab_plugin_ids(*client_id)
             };
             for plugin_id in target_plugin_ids {
                 plugin_updates.push((
@@ -5431,6 +5473,21 @@ impl Screen {
                 ));
             }
         }
+        // Background plugins get the client-independent tab state once per change, whether or not
+        // any client is attached. The per-client payload above is relative to a client's active
+        // tab and so cannot be reused here, and the tab-list-changed arm above never reaches them
+        // because they live in no tab - so this stays one delivery either way.
+        let background_tab_updates: Vec<TabInfo> =
+            tab_infos_for_screen_state.values().cloned().collect();
+        for (plugin_id, plugin_client_id) in
+            self.background_plugin_ids_subscribed_to(EventType::TabUpdate)
+        {
+            plugin_updates.push((
+                Some(plugin_id),
+                Some(plugin_client_id),
+                Event::TabUpdate(background_tab_updates.clone()),
+            ));
+        }
 
         self.bus
             .senders
@@ -5438,15 +5495,58 @@ impl Screen {
             .context("failed to update tabs")?;
         Ok(tab_infos_for_screen_state.values().cloned().collect())
     }
+    /// A tab's panes, with the fields only Screen can fill stamped onto them.
+    ///
+    /// `Tab` knows a pane's geometry and title; it does not know the pid, the cwd, the command or
+    /// when the pane last emitted output. Every consumer of `PaneInfo` goes through here so that
+    /// none of them has to know that.
+    fn pane_infos_for_tab(&self, tab: &Tab) -> Vec<PaneInfo> {
+        let mut pane_infos = tab.pane_infos();
+        // output activity is held as an `Instant`, which says nothing to a consumer in another
+        // process - anchor it to the wall clock once per call rather than once per pane
+        let now = Instant::now();
+        let epoch_now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since_epoch| since_epoch.as_millis() as u64)
+            .ok();
+        for pane_info in pane_infos.iter_mut() {
+            if pane_info.is_plugin {
+                continue;
+            }
+            if let Some(process_info) = self.pane_process_info.get(&pane_info.id) {
+                pane_info.pane_pid = process_info.pid;
+                pane_info.pane_cwd = process_info
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| cwd.display().to_string());
+                pane_info.pane_command = process_info
+                    .command
+                    .as_ref()
+                    .map(|command| command.join(" "));
+                pane_info.pane_env = process_info.env.clone();
+            }
+            pane_info.last_output_at = epoch_now_ms.and_then(|epoch_now_ms| {
+                self.pane_output_activity
+                    .get(&PaneId::Terminal(pane_info.id))
+                    .map(|last_output| {
+                        let ms_ago = now.saturating_duration_since(*last_output).as_millis() as u64;
+                        epoch_now_ms.saturating_sub(ms_ago)
+                    })
+            });
+        }
+        pane_infos
+    }
     fn generate_and_report_pane_state(&mut self) -> Result<PaneManifest> {
         let mut pane_manifest = PaneManifest::default();
         for tab in self.tabs.values() {
-            pane_manifest.panes.insert(tab.position, tab.pane_infos());
+            pane_manifest
+                .panes
+                .insert(tab.position, self.pane_infos_for_tab(tab));
         }
         let mut plugin_updates = vec![];
         let client_ids: Vec<ClientId> = self.active_tab_ids.keys().copied().collect();
         for client_id in client_ids {
-            let target_plugin_ids = self.targeted_plugin_ids(client_id, EventType::PaneUpdate);
+            let target_plugin_ids = self.active_tab_plugin_ids(client_id);
             for plugin_id in target_plugin_ids {
                 plugin_updates.push((
                     Some(plugin_id),
@@ -5454,6 +5554,17 @@ impl Screen {
                     Event::PaneUpdate(pane_manifest.clone()),
                 ));
             }
+        }
+        // Background plugins get the manifest once per change, whether or not any client is
+        // attached, rather than once per connected client.
+        for (plugin_id, plugin_client_id) in
+            self.background_plugin_ids_subscribed_to(EventType::PaneUpdate)
+        {
+            plugin_updates.push((
+                Some(plugin_id),
+                Some(plugin_client_id),
+                Event::PaneUpdate(pane_manifest.clone()),
+            ));
         }
         if !plugin_updates.is_empty() {
             self.bus
@@ -5476,9 +5587,6 @@ impl Screen {
                 tab_id: tab.id,
                 tab_position: tab.position,
                 tab_name: tab.name.clone(),
-                pane_command: None,
-                pane_cwd: None,
-                pane_pid: None,
             }
         }
 
@@ -5489,7 +5597,7 @@ impl Screen {
         let mut pane_entries = Vec::new();
 
         for tab in self.tabs.values() {
-            let pane_infos = tab.pane_infos();
+            let pane_infos = self.pane_infos_for_tab(tab);
 
             for pane_info in pane_infos {
                 if should_include_pane(&pane_info, show_all) {
@@ -6285,9 +6393,6 @@ impl Screen {
         }
         Ok(())
     }
-    /// Collect plugin IDs that should receive a broadcast event for a given client.
-    /// Returns plugin IDs from the client's active tab plus background plugins
-    /// subscribed to the given event type.
     /// The tab list as a plugin drawing a tab bar sees it: one entry per tab, id, position, name.
     ///
     /// Deliberately excludes which tab is active and everything else that changes while the tabs
@@ -6299,12 +6404,11 @@ impl Screen {
             .map(|tab| (tab.id, tab.position, tab.name.clone()))
             .collect()
     }
-    /// Every tab's plugins, plus the background plugins `targeted_plugin_ids` would have picked.
-    ///
-    /// For the events where the tabs a user is NOT looking at have to be right the moment they
-    /// become visible - which is only the ones that change the tab list itself.
-    fn all_tab_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
-        let mut plugin_ids = self.targeted_plugin_ids(client_id, event_type);
+    /// Every tab's plugins, for the events where the tabs a user is NOT looking at have to be
+    /// right the moment they become visible - which is only the ones that change the tab list
+    /// itself. Holds no background plugins: those have no tab, and are served client-independently.
+    fn all_tab_plugin_ids(&self) -> Vec<PluginId> {
+        let mut plugin_ids = Vec::new();
         for tab in self.tabs.values() {
             for plugin_id in tab.get_plugin_ids() {
                 if !plugin_ids.contains(&plugin_id) {
@@ -6314,14 +6418,37 @@ impl Screen {
         }
         plugin_ids
     }
-    fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
+    /// Collect the plugin IDs living in a client's active tab.
+    fn active_tab_plugin_ids(&self, client_id: ClientId) -> Vec<PluginId> {
         let mut plugin_ids = Vec::new();
-        // Active-tab plugins
         if let Some(active_tab_id) = self.active_tab_ids.get(&client_id) {
             if let Some(tab) = self.tabs.get(active_tab_id) {
                 plugin_ids.extend(tab.get_plugin_ids());
             }
         }
+        plugin_ids
+    }
+    /// Collect the background plugins subscribed to an event type, client-independently.
+    ///
+    /// A background plugin has no client of its own: the ClientId in the key is the id it was
+    /// loaded with, which the plugin map needs in order to address the instance. That client may
+    /// have detached long ago, or the id may since have been recycled to an unrelated client, so
+    /// it must never be used to decide *whether* to deliver - only where to deliver to.
+    fn background_plugin_ids_subscribed_to(
+        &self,
+        event_type: EventType,
+    ) -> Vec<(PluginId, ClientId)> {
+        self.background_plugin_subscriptions
+            .iter()
+            .filter(|(_, subs)| subs.contains(&event_type))
+            .map(|((bg_pid, bg_cid), _)| (*bg_pid, *bg_cid))
+            .collect()
+    }
+    /// Collect plugin IDs that should receive a broadcast event for a given client.
+    /// Returns plugin IDs from the client's active tab plus background plugins
+    /// subscribed to the given event type.
+    fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
+        let mut plugin_ids = self.active_tab_plugin_ids(client_id);
         // Background plugins subscribed to this event type
         for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
             if subs.contains(&event_type) && *bg_cid == client_id {
@@ -7655,6 +7782,7 @@ impl Screen {
                         focused_clients,
                         default_fg,
                         default_bg,
+                        Some(p.pane_uuid().to_string()),
                     )
                 })
                 .collect();
@@ -7696,6 +7824,7 @@ impl Screen {
                         focused_clients,
                         default_fg,
                         default_bg,
+                        Some(p.pane_uuid().to_string()),
                     )
                 })
                 .collect();
@@ -7998,6 +8127,10 @@ impl Screen {
                     ansi,
                 },
             );
+        } else {
+            // a subscribe that named no live pane replaces whatever this client was subscribed
+            // to before, rather than leaving the server and the consumer disagreeing about it
+            self.pane_render_subscribers.remove(&subscriber_client_id);
         }
     }
     fn deliver_to_pane_subscribers_from_report(&mut self, report: &PaneRenderReport) {
@@ -8080,21 +8213,29 @@ impl Screen {
             }
         }
 
-        // Send updates and track dead subscribers
+        // Send updates. A subscriber whose buffer is full is behind, not dead: skip its update
+        // and leave its previous viewport alone, so the next tick re-sends the current contents.
+        // Only a client that is actually gone loses its subscription.
+        let mut busy_subscribers: Vec<ClientId> = Vec::new();
         for (subscriber_id, msg) in &updates_to_send {
             if let Some(os_input) = &self.bus.os_input {
-                if os_input
-                    .send_to_client(*subscriber_id, msg.clone())
-                    .is_err()
-                {
-                    dead_subscribers.push(*subscriber_id);
+                match os_input.try_send_to_client(*subscriber_id, msg.clone()) {
+                    Ok(()) => {},
+                    Err(SendToClientError::ClientBusy) => {
+                        busy_subscribers.push(*subscriber_id);
+                    },
+                    Err(SendToClientError::ClientGone) => {
+                        dead_subscribers.push(*subscriber_id);
+                    },
                 }
             }
         }
 
         // Update previous viewports for successful sends
         for (subscriber_id, msg) in updates_to_send {
-            if dead_subscribers.contains(&subscriber_id) {
+            if dead_subscribers.contains(&subscriber_id)
+                || busy_subscribers.contains(&subscriber_id)
+            {
                 continue;
             }
             if let ServerToClientMsg::PaneRenderUpdate {
@@ -8392,6 +8533,9 @@ pub(crate) fn screen_thread_main(
         let _resize_cache = ResizeCache::new(thread_senders.clone());
 
         match event {
+            ScreenInstruction::UpdatePaneProcessInfo(process_info) => {
+                screen.pane_process_info = process_info;
+            },
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
                 screen
                     .pane_output_activity
@@ -9766,7 +9910,7 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::ClosePane(
                 id,
                 client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
+                mut _completion_tx, // the action ends here, dropping this will release anything
                 // waiting for it
                 exit_status,
             ) => {
@@ -9788,10 +9932,18 @@ pub(crate) fn screen_thread_main(
                             }
                         }
                         if !found {
-                            pending_events_waiting_for_pane
-                                .entry(id)
-                                .or_default()
-                                .push(ScreenInstruction::ClosePane(id, None, None, exit_status));
+                            if let Some(ref mut c) = _completion_tx {
+                                // an explicit request (the CLI or a plugin waiting on this)
+                                // names a pane that does not exist - say so rather than
+                                // queueing the close for a pane that may never appear
+                                log::error!("Pane with id {:?} not found", id);
+                                c.set_exit_status(1);
+                                c.set_error_message(format!("Pane with id {:?} not found", id));
+                            } else {
+                                pending_events_waiting_for_pane.entry(id).or_default().push(
+                                    ScreenInstruction::ClosePane(id, None, None, exit_status),
+                                );
+                            }
                         }
                     },
                 }
@@ -11828,22 +11980,41 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut completion_tx = completion_tx;
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx)
+                        tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx.take())
                             .non_fatal();
+                        found = true;
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = completion_tx {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+            ScreenInstruction::WriteToPaneId(bytes, pane_id, mut completion) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
                         tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
                             .non_fatal();
+                        found = true;
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = completion {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
@@ -11852,11 +12023,24 @@ pub(crate) fn screen_thread_main(
                 match pane_id {
                     Some(pane_id) => {
                         let all_tabs = screen.get_tabs_mut();
+                        let mut completion = _completion;
+                        let mut found = false;
                         for tab in all_tabs.values_mut() {
                             if tab.has_pane_with_pid(&pane_id) {
-                                tab.paste_to_pane_id(bytes, pane_id, _completion)
+                                tab.paste_to_pane_id(bytes, pane_id, completion.take())
                                     .non_fatal();
+                                found = true;
                                 break;
+                            }
+                        }
+                        if !found {
+                            log::error!("Pane with id {:?} not found", pane_id);
+                            if let Some(ref mut c) = completion {
+                                c.set_exit_status(1);
+                                c.set_error_message(format!(
+                                    "Pane with id {:?} not found",
+                                    pane_id
+                                ));
                             }
                         }
                     },

@@ -61,6 +61,11 @@ pub enum ClientType {
 pub struct ClientAttributes {
     pub size: Size,
     pub style: Style,
+    /// The terminal device this client is attached to, as the client reported it.
+    ///
+    /// Fork addition. `None` for a client with no controlling terminal - a web client, a CLI
+    /// action - which is a real answer rather than a missing one.
+    pub tty: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
