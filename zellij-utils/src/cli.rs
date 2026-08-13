@@ -319,6 +319,10 @@ pub enum Sessions {
         /// List the sessions in reverse order (default is ascending order)
         #[clap(short, long)]
         reverse: bool,
+
+        /// Output as JSON (overrides --short and --no-formatting)
+        #[clap(short, long)]
+        json: bool,
     },
     /// List existing plugin aliases
     #[clap(visible_alias = "la")]

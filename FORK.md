@@ -2404,6 +2404,27 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### `zellij ls --json`
+
+```
+zellij ls --json
+```
+
+The session listing was three prose formats — coloured, `--no-formatting`, `--short` — and a consumer
+had to parse one of them. `--json` prints an array instead, and it also reports what the human
+listing never did: `ls` reads the socket directory alone, while each live session writes a
+`session-metadata.kdl` the listing ignored.
+
+Each entry carries `name`, `created_seconds_ago` (the number the human listing formats as "x ago"),
+`is_current` and `is_dead`, plus `connected_clients`, `web_client_count`, `web_clients_allowed`,
+`tab_count` and `pane_count` from that metadata. The metadata fields are omitted, not null, for a
+dead session — it has no server to have written any — and for a live session whose metadata does not
+parse.
+
+`--json` overrides `--short` and `--no-formatting`; `--reverse` still orders the array. No sessions
+prints `[]` on stdout and keeps the existing exit status 1 and the existing note on stderr, so
+nothing but the array ever reaches stdout.
+
 ### `list-clients --json`
 
 ```

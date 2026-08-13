@@ -31,6 +31,7 @@ pub const CAPABILITIES: &[&str] = &[
     "session-kill-wait",      // kill-session/delete-session wait, --wait-timeout, --no-wait
     "attach-no-resurrect",    // zellij attach --no-resurrect
     "ls-exited-marker",       // zellij ls -s marks dead sessions (EXITED)
+    "ls-json",                // zellij ls --json
     "setup-socket-dir",       // setup --check prints [SOCKET DIR]; ls warns about other socket dirs
     "build-mismatch-warning", // a client warns when the running server is another build
     // the snapshot archive
