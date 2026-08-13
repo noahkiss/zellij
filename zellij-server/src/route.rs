@@ -44,6 +44,20 @@ pub struct ActionCompletionResult {
     pub stdout_message: Option<String>,
 }
 
+impl ActionCompletionResult {
+    /// The action did not report success. The CLI turns `error_message` into a line on stderr
+    /// and a non-zero exit.
+    pub fn failed(error_message: String) -> Self {
+        ActionCompletionResult {
+            exit_status: Some(1),
+            affected_pane_id: None,
+            affected_tab_id: None,
+            error_message: Some(error_message),
+            stdout_message: None,
+        }
+    }
+}
+
 pub fn wait_for_action_completion(
     receiver: oneshot::Receiver<ActionCompletionResult>,
     action_name: &str,
@@ -56,13 +70,10 @@ pub fn wait_for_action_completion(
                 Ok(result) => result,
                 Err(e) => {
                     log::error!("Failed to wait for action {}: {}", action_name, e);
-                    ActionCompletionResult {
-                        exit_status: None,
-                        affected_pane_id: None,
-                        affected_tab_id: None,
-                        error_message: None,
-                        stdout_message: None,
-                    }
+                    ActionCompletionResult::failed(format!(
+                        "Action {} ended without reporting a result",
+                        action_name
+                    ))
                 },
             }
         })
@@ -71,19 +82,25 @@ pub fn wait_for_action_completion(
             .block_on(async { tokio::time::timeout(ACTION_COMPLETION_TIMEOUT, receiver).await })
         {
             Ok(Ok(result)) => result,
-            Err(_) | Ok(Err(_)) => {
+            Ok(Err(_)) => {
+                log::error!("Action {} ended without reporting a result", action_name);
+                ActionCompletionResult::failed(format!(
+                    "Action {} ended without reporting a result",
+                    action_name
+                ))
+            },
+            Err(_) => {
                 log::error!(
                     "Action {} did not complete within {:?} timeout",
                     action_name,
                     ACTION_COMPLETION_TIMEOUT
                 );
-                ActionCompletionResult {
-                    exit_status: None,
-                    affected_pane_id: None,
-                    affected_tab_id: None,
-                    error_message: None,
-                    stdout_message: None,
-                }
+                // a timeout is a failure, not a silent success: the action may still be in
+                // flight, so the caller must not read "exited 0" as "this happened"
+                ActionCompletionResult::failed(format!(
+                    "Action {} did not complete within {:?}, the session may be busy",
+                    action_name, ACTION_COMPLETION_TIMEOUT
+                ))
             },
         }
     }
@@ -3409,6 +3426,24 @@ mod tests {
 
         let result = rx.blocking_recv().unwrap();
         assert_eq!(result.affected_tab_id, None);
+    }
+
+    #[test]
+    fn test_action_completion_timeout_reports_an_error() {
+        let (tx, rx) = oneshot::channel();
+        // the sender is held for longer than the timeout, so the wait must give up
+        let result = wait_for_action_completion(rx, "TestAction", false);
+        drop(tx);
+
+        assert_eq!(result.exit_status, Some(1));
+        let error_message = result
+            .error_message
+            .expect("a timed out action must report an error");
+        assert!(
+            error_message.contains("did not complete"),
+            "Expected a timeout error, got: {}",
+            error_message
+        );
     }
 
     #[test]
