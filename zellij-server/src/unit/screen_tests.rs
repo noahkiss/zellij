@@ -27,7 +27,7 @@ use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::position::Position;
 
 use crate::background_jobs::BackgroundJob;
-use crate::os_input_output::AsyncReader;
+use crate::os_input_output::{AsyncReader, SendToClientError};
 use crate::pty_writer::PtyWriteInstruction;
 use std::collections::HashSet;
 use std::env::set_var;
@@ -209,6 +209,9 @@ fn route_arbitrary_action_and_get_result(
 struct FakeInputOutput {
     fake_filesystem: Arc<Mutex<HashMap<String, String>>>,
     server_to_client_messages: Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    // a client listed here fails every try_send_to_client with the given reason, so a test can
+    // stage a slow client or a departed one
+    client_send_state: Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
 }
 
 impl ServerOsApi for FakeInputOutput {
@@ -254,6 +257,17 @@ impl ServerOsApi for FakeInputOutput {
             .or_insert_with(Vec::new)
             .push(msg);
         Ok(())
+    }
+    fn try_send_to_client(
+        &self,
+        client_id: ClientId,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        if let Some(failure) = self.client_send_state.lock().unwrap().get(&client_id) {
+            return Err(*failure);
+        }
+        self.send_to_client(client_id, msg)
+            .map_err(|_| SendToClientError::ClientGone)
     }
     fn new_client(
         &mut self,
@@ -5803,9 +5817,22 @@ fn create_new_screen_with_message_capture(
     Screen,
     Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
 ) {
+    let (screen, messages, _client_send_state) = create_new_screen_with_client_send_state(size);
+    (screen, messages)
+}
+
+// as above, but also hands back the map controlling how sends to each client fail
+fn create_new_screen_with_client_send_state(
+    size: Size,
+) -> (
+    Screen,
+    Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+) {
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     let fake_os_input = FakeInputOutput::default();
     let messages = fake_os_input.server_to_client_messages.clone();
+    let client_send_state = fake_os_input.client_send_state.clone();
     bus.os_input = Some(Box::new(fake_os_input));
     let client_attributes = ClientAttributes {
         size,
@@ -5876,7 +5903,11 @@ fn create_new_screen_with_message_capture(
         web_server_port,
         NestedSessionHandling::default(),
     );
-    (seed_first_client_size(screen, size), messages)
+    (
+        seed_first_client_size(screen, size),
+        messages,
+        client_send_state,
+    )
 }
 
 #[test]
@@ -6013,6 +6044,116 @@ fn subscriber_receives_update_on_changed_viewport() {
         },
         other => panic!("Expected PaneRenderUpdate, got {:?}", other),
     }
+}
+
+#[test]
+fn slow_subscriber_keeps_its_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, messages, client_send_state) = create_new_screen_with_client_send_state(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+
+    // the client is behind, not gone
+    client_send_state
+        .lock()
+        .unwrap()
+        .insert(100, SendToClientError::ClientBusy);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(1),
+        PaneContents {
+            viewport: vec!["changed line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    assert!(
+        screen.pane_render_subscribers.contains_key(&100),
+        "A subscriber that is merely behind must keep its subscription"
+    );
+
+    // once it catches up, the update it missed is sent - it was never marked as delivered
+    client_send_state.lock().unwrap().remove(&100);
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    let msgs = messages.lock().unwrap();
+    let client_msgs = msgs.get(&100).unwrap();
+    assert_eq!(client_msgs.len(), 2);
+    match &client_msgs[1] {
+        ServerToClientMsg::PaneRenderUpdate { viewport, .. } => {
+            assert_eq!(viewport, &vec!["changed line".to_string()]);
+        },
+        other => panic!("Expected PaneRenderUpdate, got {:?}", other),
+    }
+}
+
+#[test]
+fn departed_subscriber_loses_its_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages, client_send_state) = create_new_screen_with_client_send_state(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+
+    client_send_state
+        .lock()
+        .unwrap()
+        .insert(100, SendToClientError::ClientGone);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(1),
+        PaneContents {
+            viewport: vec!["changed line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    assert!(
+        !screen.pane_render_subscribers.contains_key(&100),
+        "A subscriber whose client is gone must be dropped"
+    );
+}
+
+#[test]
+fn resubscribing_to_only_dead_panes_ends_the_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages) = create_new_screen_with_message_capture(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+    assert!(screen.pane_render_subscribers.contains_key(&100));
+
+    // the client asks for panes that do not exist: the old subscription must not survive it
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(999)],
+        None,
+        false,
+    );
+    assert!(
+        !screen.pane_render_subscribers.contains_key(&100),
+        "A subscribe naming no live pane must replace the previous subscription"
+    );
 }
 
 #[test]

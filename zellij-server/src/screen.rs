@@ -74,7 +74,7 @@ use zellij_utils::{
 
 use crate::background_jobs::BackgroundJob;
 use crate::bell_dwell::BellDwellTracker;
-use crate::os_input_output::ResizeCache;
+use crate::os_input_output::{ResizeCache, SendToClientError};
 use crate::pane_groups::PaneGroups;
 use crate::panes::alacritty_functions::xparse_color;
 use crate::panes::nested_session_modal::GuestModalShortcuts;
@@ -7635,6 +7635,10 @@ impl Screen {
                     ansi,
                 },
             );
+        } else {
+            // a subscribe that named no live pane replaces whatever this client was subscribed
+            // to before, rather than leaving the server and the consumer disagreeing about it
+            self.pane_render_subscribers.remove(&subscriber_client_id);
         }
     }
     fn deliver_to_pane_subscribers_from_report(&mut self, report: &PaneRenderReport) {
@@ -7717,21 +7721,29 @@ impl Screen {
             }
         }
 
-        // Send updates and track dead subscribers
+        // Send updates. A subscriber whose buffer is full is behind, not dead: skip its update
+        // and leave its previous viewport alone, so the next tick re-sends the current contents.
+        // Only a client that is actually gone loses its subscription.
+        let mut busy_subscribers: Vec<ClientId> = Vec::new();
         for (subscriber_id, msg) in &updates_to_send {
             if let Some(os_input) = &self.bus.os_input {
-                if os_input
-                    .send_to_client(*subscriber_id, msg.clone())
-                    .is_err()
-                {
-                    dead_subscribers.push(*subscriber_id);
+                match os_input.try_send_to_client(*subscriber_id, msg.clone()) {
+                    Ok(()) => {},
+                    Err(SendToClientError::ClientBusy) => {
+                        busy_subscribers.push(*subscriber_id);
+                    },
+                    Err(SendToClientError::ClientGone) => {
+                        dead_subscribers.push(*subscriber_id);
+                    },
                 }
             }
         }
 
         // Update previous viewports for successful sends
         for (subscriber_id, msg) in updates_to_send {
-            if dead_subscribers.contains(&subscriber_id) {
+            if dead_subscribers.contains(&subscriber_id)
+                || busy_subscribers.contains(&subscriber_id)
+            {
                 continue;
             }
             if let ServerToClientMsg::PaneRenderUpdate {

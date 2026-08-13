@@ -217,6 +217,19 @@ struct ClientSender {
     client_buffer_sender: channels::Sender<ServerToClientMsg>,
 }
 
+/// Why a message could not be handed to a client.
+///
+/// The two are not the same failure: a busy client is still there and will drain its buffer,
+/// while a gone client never will. A push feed that treats the first as the second drops a live
+/// consumer and leaves it holding an open socket that never emits again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendToClientError {
+    /// The client's buffer is full - it is connected, but behind
+    ClientBusy,
+    /// There is no such client, or its channel is closed
+    ClientGone,
+}
+
 impl ClientSender {
     pub fn new(client_id: ClientId, mut sender: IpcSenderWithContext<ServerToClientMsg>) -> Self {
         // FIXME(hartan): This queue is responsible for buffering messages between server and
@@ -246,6 +259,24 @@ impl ClientSender {
             client_id,
             client_buffer_sender,
         }
+    }
+    /// Like `send_or_buffer`, but says which of the two failures happened: a full buffer means
+    /// the client is alive and behind, and the caller may keep it and try again.
+    pub fn try_send_or_buffer(
+        &self,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        self.client_buffer_sender.try_send(msg).map_err(|err| {
+            if let TrySendError::Full(_) = err {
+                log::warn!(
+                    "client {} is processing server messages too slow",
+                    self.client_id
+                );
+                SendToClientError::ClientBusy
+            } else {
+                SendToClientError::ClientGone
+            }
+        })
     }
     pub fn send_or_buffer(&self, msg: ServerToClientMsg) -> Result<()> {
         let err_context = || {
@@ -346,6 +377,16 @@ pub trait ServerOsApi: Send + Sync {
     /// Returns a [`Box`] pointer to this [`ServerOsApi`] struct.
     fn box_clone(&self) -> Box<dyn ServerOsApi>;
     fn send_to_client(&self, client_id: ClientId, msg: ServerToClientMsg) -> Result<()>;
+    /// Like `send_to_client`, but distinguishes a client that is merely behind from one that is
+    /// gone. Callers that would otherwise drop a subscription on any send failure want this.
+    fn try_send_to_client(
+        &self,
+        client_id: ClientId,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        self.send_to_client(client_id, msg)
+            .map_err(|_| SendToClientError::ClientGone)
+    }
     fn new_client(
         &mut self,
         client_id: ClientId,
@@ -497,6 +538,22 @@ impl ServerOsApi for ServerOsInputOutput {
             sender.send_or_buffer(msg).with_context(err_context)
         } else {
             Ok(())
+        }
+    }
+
+    fn try_send_to_client(
+        &self,
+        client_id: ClientId,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        match self.client_senders.lock() {
+            Ok(mut client_senders) => match client_senders.get_mut(&client_id) {
+                Some(sender) => sender.try_send_or_buffer(msg),
+                // send_to_client answers Ok() here for historical reasons; a caller asking this
+                // question needs to hear that the client is not there
+                None => Err(SendToClientError::ClientGone),
+            },
+            Err(_) => Err(SendToClientError::ClientGone),
         }
     }
 
