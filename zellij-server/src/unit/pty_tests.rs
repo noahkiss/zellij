@@ -22,6 +22,8 @@ struct MockOsApi {
     cmds_by_ppid: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// the callback the pty thread hands to a spawn, kept so a test can make the process exit
     quit_cb: Arc<Mutex<Option<QuitCb>>>,
+    /// Every signal this api was asked to deliver, as (pid, signal name).
+    signals: Arc<Mutex<Vec<(u32, &'static str)>>>,
 }
 
 impl MockOsApi {
@@ -31,6 +33,7 @@ impl MockOsApi {
             cmds: Arc::new(Mutex::new(HashMap::new())),
             cmds_by_ppid: Arc::new(Mutex::new(HashMap::new())),
             quit_cb: Arc::new(Mutex::new(None)),
+            signals: Arc::new(Mutex::new(Vec::new())),
         }
     }
     /// Make the process behind the last spawned pane exit with this status.
@@ -40,6 +43,9 @@ impl MockOsApi {
             .as_ref()
             .expect("the pty thread should have handed us a quit callback");
         quit_cb(pane_id, exit_status, RunCommand::default());
+    }
+    fn signals_sent(&self) -> Vec<(u32, &'static str)> {
+        self.signals.lock().unwrap().clone()
     }
     fn set_cwd(&self, pid: u32, path: PathBuf) {
         self.cwds.lock().unwrap().insert(pid, path);
@@ -88,13 +94,16 @@ impl ServerOsApi for MockOsApi {
     fn tcdrain(&self, _: u32) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill(&self, _: u32) -> anyhow::Result<()> {
+    fn kill(&self, pid: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push((pid, "HUP"));
         Ok(())
     }
-    fn force_kill(&self, _: u32) -> anyhow::Result<()> {
+    fn force_kill(&self, pid: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push((pid, "KILL"));
         Ok(())
     }
-    fn send_sigint(&self, _: u32) -> anyhow::Result<()> {
+    fn send_sigint(&self, pid: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push((pid, "INT"));
         Ok(())
     }
     fn box_clone(&self) -> Box<dyn ServerOsApi> {
@@ -608,4 +617,52 @@ fn a_pane_killed_by_a_signal_broadcasts_no_exit_status() {
 
     let events = collect_pane_exited_events(&rx);
     assert_eq!(events, vec![(PaneId::Terminal(1), None)]);
+}
+
+#[test]
+fn each_signal_reaches_the_pane_process() {
+    for (signal, expected) in [
+        (PaneSignal::Int, "INT"),
+        (PaneSignal::Hup, "HUP"),
+        (PaneSignal::Kill, "KILL"),
+    ] {
+        let mock = MockOsApi::new();
+        let recorder = mock.clone();
+        let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+        set_active_terminal(&mut pty, 1, 4242);
+
+        pty.signal_pane(PaneId::Terminal(1), signal).expect("TEST");
+        assert_eq!(recorder.signals_sent(), vec![(4242, expected)]);
+    }
+}
+
+#[test]
+fn signalling_a_pane_that_does_not_exist_is_an_error() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, 4242);
+
+    let result = pty.signal_pane(PaneId::Terminal(7), PaneSignal::Int);
+    assert!(result.is_err(), "no pane 7");
+    assert!(
+        result.unwrap_err().contains("not found"),
+        "the error names the miss"
+    );
+    assert!(
+        recorder.signals_sent().is_empty(),
+        "and nothing was signalled"
+    );
+}
+
+#[test]
+fn a_plugin_pane_has_no_process_to_signal() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, 4242);
+
+    let result = pty.signal_pane(PaneId::Plugin(1), PaneSignal::Kill);
+    assert!(result.is_err(), "a plugin pane runs no process");
+    assert!(recorder.signals_sent().is_empty());
 }

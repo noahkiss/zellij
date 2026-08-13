@@ -1228,6 +1228,7 @@ impl From<crate::input::actions::Action>
             SetPaneColorAction,
             SetPaneFrameStyleAction,
             ShowFloatingPanesAction,
+            SignalPaneAction,
             SkipConfirmAction,
             StackPanesAction,
             StartOrReloadPluginAction,
@@ -2168,6 +2169,12 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::MoveTabToIndex { id, index } => {
                 ActionType::MoveTabToIndex(MoveTabToIndexAction { id, index })
+            },
+            crate::input::actions::Action::SignalPane { pane_id, signal } => {
+                ActionType::SignalPane(SignalPaneAction {
+                    pane_id: Some(pane_id.into()),
+                    signal: pane_signal_to_proto_i32(signal),
+                })
             },
         };
 
@@ -3141,6 +3148,13 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::MoveTabToIndex(a) => Ok(crate::input::actions::Action::MoveTabToIndex {
                 id: a.id,
                 index: a.index,
+            }),
+            ActionType::SignalPane(a) => Ok(crate::input::actions::Action::SignalPane {
+                pane_id: a
+                    .pane_id
+                    .ok_or_else(|| anyhow::anyhow!("SignalPane action must carry a pane id"))?
+                    .try_into()?,
+                signal: pane_signal_from_proto_i32(a.signal)?,
             }),
         }
     }
@@ -4928,5 +4942,26 @@ impl TryFrom<crate::client_server_contract::client_server_contract::RunPluginOrA
                 plugin_alias.try_into()?,
             )),
         }
+    }
+}
+
+/// `PaneSignal` never crosses as the unspecified variant: an unset field is a malformed message,
+/// not a default signal, because the default here would be one that kills something.
+fn pane_signal_to_proto_i32(signal: crate::data::PaneSignal) -> i32 {
+    use crate::client_server_contract::client_server_contract::PaneSignal as ProtobufPaneSignal;
+    match signal {
+        crate::data::PaneSignal::Int => ProtobufPaneSignal::Int as i32,
+        crate::data::PaneSignal::Hup => ProtobufPaneSignal::Hup as i32,
+        crate::data::PaneSignal::Kill => ProtobufPaneSignal::Kill as i32,
+    }
+}
+
+fn pane_signal_from_proto_i32(signal: i32) -> anyhow::Result<crate::data::PaneSignal> {
+    use crate::client_server_contract::client_server_contract::PaneSignal as ProtobufPaneSignal;
+    match ProtobufPaneSignal::try_from(signal) {
+        Ok(ProtobufPaneSignal::Int) => Ok(crate::data::PaneSignal::Int),
+        Ok(ProtobufPaneSignal::Hup) => Ok(crate::data::PaneSignal::Hup),
+        Ok(ProtobufPaneSignal::Kill) => Ok(crate::data::PaneSignal::Kill),
+        _ => Err(anyhow::anyhow!("Unknown pane signal: {}", signal)),
     }
 }

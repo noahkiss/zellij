@@ -1,4 +1,4 @@
-use crate::data::{Direction, InputMode, Resize, UnblockCondition};
+use crate::data::{Direction, InputMode, PaneSignal, Resize, UnblockCondition};
 use crate::setup::Setup;
 use crate::{
     consts::{ZELLIJ_CONFIG_DIR_ENV, ZELLIJ_CONFIG_FILE_ENV},
@@ -1747,6 +1747,17 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
     },
+    /// Send a signal to the process running in a pane
+    ///
+    /// Returns exit code 0 if the signal was sent, 1 if the pane does not exist or runs no process.
+    SignalPane {
+        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        #[clap(short, long, value_parser)]
+        pane_id: String,
+        /// The signal to send [int|hup|kill]
+        #[clap(short, long, value_enum, value_parser, default_value = "int")]
+        signal: PaneSignal,
+    },
     TogglePaneBorderless {
         /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
         #[clap(short, long, value_parser)]
@@ -1814,20 +1825,40 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Parse a command line on a thread with a real stack.
+    ///
+    /// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
+    /// which overflows the 2MB stack the test harness gives a spawned test in a debug build. The
+    /// binary itself parses on the main thread and never sees this.
+    fn parse_cli(args: Vec<String>) -> Result<CliArgs, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || CliArgs::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     fn parse_action(args: &[&str]) -> CliAction {
-        let mut full_args = vec!["zellij", "action"];
-        full_args.extend_from_slice(args);
-        let cli = CliArgs::try_parse_from(full_args).unwrap();
+        let mut full_args = vec!["zellij".to_string(), "action".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        let cli = parse_cli(full_args).unwrap();
         match cli.command {
             Some(Command::Action(action)) => *action,
             other => panic!("Expected Action, got {:?}", other),
         }
     }
 
+    fn action_parse_fails(args: &[&str]) -> bool {
+        let mut full_args = vec!["zellij".to_string(), "action".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        parse_cli(full_args).is_err()
+    }
+
     fn parse_subscribe(args: &[&str]) -> SubscribeCli {
-        let mut full_args = vec!["zellij"];
-        full_args.extend_from_slice(args);
-        let cli = CliArgs::try_parse_from(full_args).unwrap();
+        let mut full_args = vec!["zellij".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        let cli = parse_cli(full_args).unwrap();
         match cli.command {
             Some(Command::Subscribe(s)) => s,
             other => panic!("Expected Subscribe, got {:?}", other),
@@ -1887,8 +1918,47 @@ mod tests {
 
     #[test]
     fn subscribe_requires_pane_id() {
-        let result = CliArgs::try_parse_from(["zellij", "subscribe"]);
+        let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn signal_pane_defaults_to_sigint() {
+        let action = parse_action(&["signal-pane", "--pane-id", "terminal_1"]);
+        match action {
+            CliAction::SignalPane { pane_id, signal } => {
+                assert_eq!(pane_id, "terminal_1");
+                assert_eq!(signal, PaneSignal::Int);
+            },
+            other => panic!("Expected SignalPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn signal_pane_takes_the_named_signal() {
+        for (name, expected) in [
+            ("int", PaneSignal::Int),
+            ("hup", PaneSignal::Hup),
+            ("kill", PaneSignal::Kill),
+        ] {
+            let action = parse_action(&["signal-pane", "--pane-id", "3", "--signal", name]);
+            match action {
+                CliAction::SignalPane { signal, .. } => assert_eq!(signal, expected),
+                other => panic!("Expected SignalPane, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn signal_pane_needs_a_pane_and_rejects_an_unknown_signal() {
+        assert!(action_parse_fails(&["signal-pane"]));
+        assert!(action_parse_fails(&[
+            "signal-pane",
+            "--pane-id",
+            "1",
+            "--signal",
+            "term"
+        ]));
     }
 
     #[test]

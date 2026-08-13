@@ -2404,6 +2404,31 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### `signal-pane` — signal the process in a pane
+
+```
+zellij action signal-pane --pane-id terminal_3               # SIGINT
+zellij action signal-pane --pane-id terminal_3 --signal kill
+```
+
+Plugins could send SIGINT and SIGKILL to a pane; the CLI could not, and `write-chars $'\003'` is not
+the same thing — it asks whatever is reading the pty to interpret a keystroke, which a program that
+has turned off canonical input, or a pane whose reader has wedged, will not do. `--signal` takes
+`int`, `hup` or `kill`, the three the server can already deliver, and defaults to `int`.
+
+`--pane-id` is required: a signal is destructive enough that it should never fall back to whatever
+happens to be focused, and requiring it makes the command safe in a detached session. Naming a pane
+that does not exist, or a plugin pane, which runs no process, exits 1 with the reason rather than
+warning into the log.
+
+The signal goes to the process zellij spawned for the pane — the pane's shell — which is what the
+plugin API has always done. A shell without job control runs its command in that same process, so
+this reaches the command; a shell with job control will handle the signal itself.
+
+This adds an `Action` and therefore a message to the client/server contract. Fork action messages
+start at **tag 160**, leaving 149-159 for upstream, so an upstream bump does not have to renumber
+anything the fork added.
+
 ### `zellij ls --json`
 
 ```

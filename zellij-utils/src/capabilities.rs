@@ -59,6 +59,7 @@ pub const CAPABILITIES: &[&str] = &[
     "list-clients-fixed", // the session manager's client list actually lists clients
     "list-clients-json",  // zellij action list-clients --json
     "move-tab-to-index",  // zellij action move-tab --to-index
+    "signal-pane",        // zellij action signal-pane --pane-id X --signal int|hup|kill
     "go-to-tab-name-no-focus", // zellij action go-to-tab-name --create --no-focus
     "new-pane-stacked-error", // --stacked refuses instead of creating nothing
     "dump-screen-plugin-panes", // dump-screen works on plugin panes

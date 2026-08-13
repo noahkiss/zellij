@@ -286,6 +286,8 @@ message Action {
     ToggleHostFullscreenAction toggle_host_fullscreen = 146;
     FocusGuestSessionAction focus_guest_session = 147;
     MoveTabToIndexAction move_tab_to_index = 148;
+    // fork additions start at 160, leaving room below for upstream
+    SignalPaneAction signal_pane = 160;
   }
 }
 
@@ -1288,3 +1290,12 @@ message PreviousSwapLayoutByTabIdAction { uint64 id = 1; }
 message NextSwapLayoutByTabIdAction { uint64 id = 1; }
 message MoveTabByTabIdAction { uint64 id = 1; Direction direction = 2; }
 message MoveTabToIndexAction { optional uint64 id = 1; uint64 index = 2; }
+
+enum PaneSignal {
+  PANE_SIGNAL_UNSPECIFIED = 0;
+  PANE_SIGNAL_INT = 1;
+  PANE_SIGNAL_HUP = 2;
+  PANE_SIGNAL_KILL = 3;
+}
+
+message SignalPaneAction { PaneId pane_id = 1; PaneSignal signal = 2; }

@@ -8,7 +8,7 @@ use super::layout::{
 use crate::cli::CliAction;
 use crate::data::{
     CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
-    PaneId, Resize, UnblockCondition,
+    PaneId, PaneSignal, Resize, UnblockCondition,
 };
 use crate::data::{FloatingPaneCoordinates, InputMode};
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -573,6 +573,10 @@ pub enum Action {
     ChangeFloatingPaneCoordinates {
         pane_id: PaneId,
         coordinates: FloatingPaneCoordinates,
+    },
+    SignalPane {
+        pane_id: PaneId,
+        signal: PaneSignal,
     },
     TogglePaneBorderless {
         pane_id: PaneId,
@@ -2074,6 +2078,23 @@ impl Action {
                     Err(_e) => {
                         Err(format!(
                             "Malformed pane id: {}, expecting a space separated list of either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                            pane_id
+                        ))
+                    }
+                }
+            },
+            CliAction::SignalPane { pane_id, signal } => {
+                let parsed_pane_id = PaneId::from_str(&pane_id);
+                match parsed_pane_id {
+                    Ok(parsed_pane_id) => {
+                        Ok(vec![Action::SignalPane {
+                            pane_id: parsed_pane_id,
+                            signal,
+                        }])
+                    },
+                    Err(_e) => {
+                        Err(format!(
+                            "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
                             pane_id
                         ))
                     }
