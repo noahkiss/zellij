@@ -12844,6 +12844,123 @@ pub fn pane_info_reports_no_environment_without_an_allowlist() {
     assert!(reported.pane_env.is_empty());
 }
 
+#[test]
+pub fn pane_info_reports_the_alternate_screen_and_an_explicit_title() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // pane 1 opens the alternate screen, as a full-screen program does, and is named by a human
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        1,
+        "\u{1b}[?1049h".as_bytes().to_vec(),
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::RenamePane(
+        PaneId::Terminal(1),
+        "named by a human".as_bytes().to_vec(),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let renamed = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(
+        renamed.is_alternate_screen,
+        "a pane on the alternate screen should say so"
+    );
+    assert!(
+        renamed.has_explicit_title,
+        "a pane a human named should say so"
+    );
+    assert_eq!(renamed.title, "named by a human");
+
+    let untouched = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 0)
+        .expect("terminal pane 0 should be in the manifest");
+    assert!(!untouched.is_alternate_screen);
+    assert!(!untouched.has_explicit_title);
+    assert_eq!(untouched.scrollback_position, 0);
+}
+
+#[test]
+pub fn pane_info_reports_a_pinned_floating_pane() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(3),
+        None,
+        None,
+        None,
+        NewPanePlacement::Floating(None),
+        false,
+        ClientTabIndexOrPaneId::ClientId(main_client_id),
+        None,
+        false,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::SetFloatingPanePinned(
+            PaneId::Terminal(3),
+            true,
+        ));
+    // pinning reports no session state of its own, so ask for one with a change that does
+    let _ = mock_screen.to_screen.send(ScreenInstruction::RenamePane(
+        PaneId::Terminal(0),
+        "report the session".as_bytes().to_vec(),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let pinned = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 3)
+        .expect("the floating pane should be in the manifest");
+    assert!(pinned.is_floating);
+    assert!(pinned.is_pinned, "a pinned floating pane should say so");
+
+    let tiled = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 0)
+        .expect("terminal pane 0 should be in the manifest");
+    assert!(!tiled.is_pinned, "a tiled pane is never pinned");
+}
+
 /// Every `Event::PaneOpened` broadcast to all plugins, in order.
 ///
 /// `PaneOpened` is sent `(None, None)` like `PaneClosed`, so a targeted send would be a bug and

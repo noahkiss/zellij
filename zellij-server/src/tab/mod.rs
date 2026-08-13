@@ -8204,6 +8204,17 @@ pub fn pane_info_for_pane(
     let geom = pane.position_and_size();
     pane_info.stack_id = geom.stacked;
     pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();
+    // fork addition: state the `Pane` trait already answers for every pane, terminal and plugin
+    // alike, and which nothing outside the server could read
+    pane_info.is_pinned = geom.is_pinned;
+    pane_info.logical_position = geom.logical_position;
+    pane_info.is_alternate_screen = pane.is_alternate_mode_active();
+    let (scrollback_position, scrollback_length) = pane.scroll_position();
+    pane_info.scrollback_position = scrollback_position;
+    pane_info.scrollback_length = scrollback_length;
+    pane_info.is_borderless = pane.borderless();
+    pane_info.exclude_from_sync = pane.exclude_from_sync();
+    pane_info.has_explicit_title = pane.has_explicit_title();
     pane_info.exited = pane.exited();
     pane_info.exit_status = pane.exit_status();
     pane_info.is_held = pane.is_held();

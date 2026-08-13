@@ -524,6 +524,14 @@ message PaneInfo {
     optional uint64 last_output_at = 35;
     bool has_pending_bell = 36;
     repeated PaneEnvVar pane_env = 37;
+    bool is_alternate_screen = 38;
+    uint32 scrollback_position = 39;
+    uint32 scrollback_length = 40;
+    bool is_pinned = 41;
+    optional uint32 logical_position = 42;
+    bool is_borderless = 43;
+    bool exclude_from_sync = 44;
+    bool has_explicit_title = 45;
 }
 
 message PaneEnvVar {

@@ -48,11 +48,14 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-env-report",          // report_pane_env, PaneInfo.pane_env
     "pane-program-title",       // PaneInfo.program_title
     "pane-stack-fields",        // PaneInfo.stack_id, index_in_stack, is_expanded_in_stack
-    "pane-opened-event",        // Event::PaneOpened, broadcast from every creation path
-    "client-tty",               // ClientInfo.tty
-    "list-clients-fixed",       // the session manager's client list actually lists clients
-    "move-tab-to-index",        // zellij action move-tab --to-index
-    "new-pane-stacked-error",   // --stacked refuses instead of creating nothing
+    "pane-alt-screen",          // PaneInfo.is_alternate_screen
+    "pane-scrollback-position", // PaneInfo.scrollback_position, scrollback_length
+    "pane-layout-fields", // PaneInfo.is_pinned, logical_position, is_borderless, exclude_from_sync, has_explicit_title
+    "pane-opened-event",  // Event::PaneOpened, broadcast from every creation path
+    "client-tty",         // ClientInfo.tty
+    "list-clients-fixed", // the session manager's client list actually lists clients
+    "move-tab-to-index",  // zellij action move-tab --to-index
+    "new-pane-stacked-error", // --stacked refuses instead of creating nothing
     "dump-screen-plugin-panes", // dump-screen works on plugin panes
     // plugin development loop
     "plugin-watch",       // plugin_watch, hot-reload of file: plugins

@@ -2294,6 +2294,45 @@ The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) b
 that need it — resolving a builtin's bytes and watching its file — sit on different threads and
 neither carries the config.
 
+### Eight more things a pane already knew about itself
+
+```
+zellij action list-panes --all --json
+```
+
+Every one of these was a method on the server's `Pane` trait, answered for terminal and plugin panes
+alike, and readable nowhere outside the server. They are now stamped onto `PaneInfo` beside the
+rest, so they reach the CLI, plugins and peer sessions on the same path:
+
+- `is_alternate_screen` — the program is drawing on the alternate screen, i.e. a full-screen editor,
+  pager or TUI owns the pane rather than a shell sitting at a prompt. The cheapest way to tell those
+  apart, and the reason a pane's scrollback stops growing.
+- `scrollback_position` / `scrollback_length` — how far the pane is scrolled back from the bottom,
+  and how many lines it can scroll through. `0`/`0` for a plugin pane.
+- `is_pinned` — a floating pane pinned above the tiled layer. Always `false` for a tiled pane.
+- `logical_position` — the pane's position in the layout that placed it, which survives resizing and
+  reordering. `null` for a pane no layout placed.
+- `is_borderless` — the pane is drawn with no frame, so it shows no title.
+- `exclude_from_sync` — the pane is left out when the tab syncs input to all its panes.
+- `has_explicit_title` — a human named this pane. `title` is the display title whatever its source
+  and `program_title` is what the program called itself; neither could answer "did someone type
+  this name", which is what a consumer needs before overwriting it.
+
+**`frame_color_override` was assessed and skipped.** The survey read it as "the server already marks
+panes it considers failed and nothing outside sees it", but the mark is a one-second flash: the
+background job that sets it clears it again after `LONG_FLASH_DURATION_MS`
+(`background_jobs.rs`), and the same field also carries the multi-select highlight. A field sampled
+by a once-a-second manifest would report it at random, and the error text that would make it
+meaningful is not on the trait at all. If a "this pane failed" signal is wanted it should be its own
+recorded state, not a render override read sideways.
+
+`session-metadata.kdl` carries six of the eight, so a peer session reports them too. It does not
+carry `scrollback_position` or `scrollback_length`: those describe where one session's own viewport
+sits in a buffer that grows with every line of output, which a reader of another session can neither
+act on nor keep up with, and writing them would rewrite the file for every pane that produced a line.
+
+Proto tags 38-45.
+
 ### `Event::PaneOpened`, the counterpart of `PaneClosed`
 
 `PaneClosed` was the only structural lifecycle event zellij had. It fires from every close path and

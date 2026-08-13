@@ -7314,6 +7314,12 @@ impl PaneInfo {
         let pane_command = optional_string_node!("pane_command");
         let last_output_at = optional_int_node!("last_output_at", u64);
         let has_pending_bell = optional_bool_node!("has_pending_bell").unwrap_or(false);
+        let is_alternate_screen = optional_bool_node!("is_alternate_screen").unwrap_or(false);
+        let is_pinned = optional_bool_node!("is_pinned").unwrap_or(false);
+        let logical_position = optional_int_node!("logical_position", usize);
+        let is_borderless = optional_bool_node!("is_borderless").unwrap_or(false);
+        let exclude_from_sync = optional_bool_node!("exclude_from_sync").unwrap_or(false);
+        let has_explicit_title = optional_bool_node!("has_explicit_title").unwrap_or(false);
 
         let pane_info = PaneInfo {
             restored_from,
@@ -7322,8 +7328,16 @@ impl PaneInfo {
             pane_command,
             last_output_at,
             has_pending_bell,
-            // deliberately not carried - see the note on `encode_to_kdl`
+            is_alternate_screen,
+            is_pinned,
+            logical_position,
+            is_borderless,
+            exclude_from_sync,
+            has_explicit_title,
+            // deliberately not carried - see the notes on `encode_to_kdl`
             pane_env: Default::default(),
+            scrollback_position: 0,
+            scrollback_length: 0,
             id,
             is_plugin,
             is_focused,
@@ -7463,6 +7477,31 @@ impl PaneInfo {
         if self.has_pending_bell {
             bool_node!("has_pending_bell", self.has_pending_bell);
         }
+        // the state the pane trait already held: written only when it says something, the same
+        // rule as above.
+        //
+        // `scrollback_position` and `scrollback_length` are deliberately absent. They describe
+        // where this session's own viewport sits in a buffer that grows with every line of output
+        // - a reader of another session's metadata can neither scroll that pane nor act on the
+        // numbers, and writing them would rewrite this file for every pane that produced a line.
+        if self.is_alternate_screen {
+            bool_node!("is_alternate_screen", self.is_alternate_screen);
+        }
+        if self.is_pinned {
+            bool_node!("is_pinned", self.is_pinned);
+        }
+        if let Some(logical_position) = self.logical_position {
+            int_node!("logical_position", logical_position);
+        }
+        if self.is_borderless {
+            bool_node!("is_borderless", self.is_borderless);
+        }
+        if self.exclude_from_sync {
+            bool_node!("exclude_from_sync", self.exclude_from_sync);
+        }
+        if self.has_explicit_title {
+            bool_node!("has_explicit_title", self.has_explicit_title);
+        }
         kdl_doucment
     }
 }
@@ -7534,6 +7573,14 @@ fn serialize_and_deserialize_session_info_with_data() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
+            is_alternate_screen: false,
+            scrollback_position: 0,
+            scrollback_length: 0,
+            is_pinned: false,
+            logical_position: None,
+            is_borderless: false,
+            exclude_from_sync: false,
+            has_explicit_title: false,
             pane_env: Default::default(),
             id: 1,
             is_plugin: false,
@@ -7573,6 +7620,14 @@ fn serialize_and_deserialize_session_info_with_data() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
+            is_alternate_screen: false,
+            scrollback_position: 0,
+            scrollback_length: 0,
+            is_pinned: false,
+            logical_position: None,
+            is_borderless: false,
+            exclude_from_sync: false,
+            has_explicit_title: false,
             pane_env: Default::default(),
             id: 1,
             is_plugin: true,
@@ -7748,6 +7803,69 @@ fn session_info_round_trip_keeps_the_process_and_activity_fields() {
     assert_eq!(round_tripped_pane.pane_command, pane.pane_command);
     assert_eq!(round_tripped_pane.last_output_at, pane.last_output_at);
     assert!(round_tripped_pane.has_pending_bell);
+}
+
+#[test]
+fn session_info_round_trip_keeps_the_pane_layout_fields() {
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        is_alternate_screen: true,
+        is_pinned: true,
+        logical_position: Some(2),
+        is_borderless: true,
+        exclude_from_sync: true,
+        has_explicit_title: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "layout fields session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert!(round_tripped_pane.is_alternate_screen);
+    assert!(round_tripped_pane.is_pinned);
+    assert_eq!(round_tripped_pane.logical_position, Some(2));
+    assert!(round_tripped_pane.is_borderless);
+    assert!(round_tripped_pane.exclude_from_sync);
+    assert!(round_tripped_pane.has_explicit_title);
+}
+
+/// Where this session's own viewport sits in a growing buffer is of no use to a peer reading the
+/// file, and would rewrite it for every pane that produced a line.
+#[test]
+fn session_metadata_never_carries_the_scrollback_position() {
+    let pane = PaneInfo {
+        id: 3,
+        scrollback_position: 12,
+        scrollback_length: 4000,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane]);
+    let session_info = SessionInfo {
+        name: "scrollback session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    assert!(
+        !serialized.contains("scrollback_position") && !serialized.contains("scrollback_length"),
+        "the scrollback position must not reach session metadata: {}",
+        serialized
+    );
+
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.scrollback_position, 0);
+    assert_eq!(round_tripped_pane.scrollback_length, 0);
 }
 
 /// Reporting an environment variable on the event path was opted into. Writing it to a file every

@@ -2470,6 +2470,53 @@ pub struct PaneInfo {
     /// for a session other than the one reporting it - read it from the session that owns the pane.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pane_env: BTreeMap<String, String>,
+    /// Whether the program in this pane is drawing on the alternate screen
+    ///
+    /// True while a full-screen program (an editor, a pager, a TUI) owns the pane, false for a
+    /// shell sitting at a prompt. Always `false` for plugin panes. It is the cheapest way to tell
+    /// "something interactive is running here" from "this pane is waiting for a command", and it
+    /// is also the reason a pane's scrollback stops growing.
+    #[serde(default)]
+    pub is_alternate_screen: bool,
+    /// How far this pane is scrolled back from the bottom, in lines
+    ///
+    /// `0` means the pane is at the bottom, showing the newest output. Terminal panes only; plugin
+    /// panes report `0`.
+    #[serde(default)]
+    pub scrollback_position: usize,
+    /// How many lines this pane's scrollback holds
+    ///
+    /// The lines above the viewport plus the lines below it, i.e. what `scrollback_position` can
+    /// move through. Terminal panes only; plugin panes report `0`.
+    #[serde(default)]
+    pub scrollback_length: usize,
+    /// Whether this floating pane is pinned above the tiled layer ("always on top")
+    ///
+    /// Only floating panes can be pinned; a tiled pane always reports `false`.
+    #[serde(default)]
+    pub is_pinned: bool,
+    /// The pane's position in the layout that placed it, if it came from one
+    ///
+    /// It survives resizing and reordering, so it is how a pane is matched back to the layout node
+    /// that created it. `None` for a pane that was not placed by a layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_position: Option<usize>,
+    /// Whether this pane is drawn without a frame
+    ///
+    /// Set by a layout (`borderless true`) or by the pane being created borderless. A borderless
+    /// pane has no title bar, so a consumer rendering its own UI knows the pane shows no title.
+    #[serde(default)]
+    pub is_borderless: bool,
+    /// Whether this pane is left out when the tab syncs input to all its panes
+    #[serde(default)]
+    pub exclude_from_sync: bool,
+    /// Whether a human named this pane
+    ///
+    /// `title` is the pane's display title whatever its source - the program's own title, the
+    /// default `Pane #n`, or a name someone typed. This says the last of those is what `title`
+    /// holds, which `title` and `program_title` together cannot answer.
+    #[serde(default)]
+    pub has_explicit_title: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
