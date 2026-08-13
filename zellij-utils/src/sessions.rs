@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow;
 use humantime::format_duration;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -369,11 +370,13 @@ pub fn print_sessions(
     // (session_name, timestamp, is_dead)
     let curr_session = envs::get_session_name().unwrap_or_else(|_| "".into());
     sessions.sort_by(|a, b| {
+        // the age is truncated to whole seconds, so sessions made in the same second tie. Break
+        // the tie on the name, or the listing reorders itself between two runs
         if reverse {
             // sort by `Duration` ascending (newest would be first)
-            a.1.cmp(&b.1)
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
         } else {
-            b.1.cmp(&a.1)
+            b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
         }
     });
     sessions
@@ -733,7 +736,70 @@ fn remove_session_info_folder(
     Ok(())
 }
 
-pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
+/// One session as `zellij ls --json` reports it.
+///
+/// The first four fields are what the human listing shows. The rest come from the session's own
+/// `session-metadata.kdl`, which the server already writes and `ls` never read: they are absent for
+/// a dead session, which has no metadata to read, and for a live session whose metadata this scan
+/// could not parse.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SessionListEntry {
+    pub name: String,
+    /// Age of the session's socket, in seconds. The human listing formats this same number.
+    pub created_seconds_ago: u64,
+    /// True for the session this command was run from.
+    pub is_current: bool,
+    /// True for a resurrectable session - one with a saved layout and no server.
+    pub is_dead: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_clients: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_client_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_clients_allowed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_count: Option<usize>,
+}
+
+/// Build the `ls --json` listing from the session names and the metadata each live session wrote.
+pub fn session_list_entries(
+    sessions: Vec<(String, Duration, bool)>,
+    current_session: &str,
+    live_session_states: &BTreeMap<String, SessionInfo>,
+    reverse: bool,
+) -> Vec<SessionListEntry> {
+    let mut sessions = sessions;
+    sessions.sort_by(|a, b| {
+        // same tie-break as the human listing: the age is whole seconds, and the names arrive out
+        // of a HashMap, so without this two same-second sessions swap places between runs
+        if reverse {
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+        } else {
+            b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+        }
+    });
+    sessions
+        .into_iter()
+        .map(|(name, timestamp, is_dead)| {
+            let info = live_session_states.get(&name);
+            SessionListEntry {
+                created_seconds_ago: timestamp.as_secs(),
+                is_current: name == current_session,
+                is_dead,
+                connected_clients: info.map(|i| i.connected_clients),
+                web_client_count: info.map(|i| i.web_client_count),
+                web_clients_allowed: info.map(|i| i.web_clients_allowed),
+                tab_count: info.map(|i| i.tabs.len()),
+                pane_count: info.map(|i| i.panes.panes.values().map(|p| p.len()).sum()),
+                name,
+            }
+        })
+        .collect()
+}
+
+pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool, json: bool) {
     let exit_code = match get_sessions() {
         Ok(running_sessions) => {
             let resurrectable_sessions = get_resurrectable_sessions();
@@ -744,23 +810,38 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
             for (session_name, duration) in running_sessions {
                 all_sessions.insert(session_name.clone(), (duration, false));
             }
-            if all_sessions.is_empty() {
+            let sessions: Vec<(String, Duration, bool)> = all_sessions
+                .iter()
+                .map(|(name, (timestamp, is_dead))| (name.clone(), timestamp.clone(), *is_dead))
+                .collect();
+            if sessions.is_empty() {
+                // an empty listing is still a listing: a JSON consumer gets an empty array on
+                // stdout, and the human note stays on stderr where it always was
+                if json {
+                    println!("[]");
+                }
                 eprintln!("No active zellij sessions found.");
                 print_searched_socket_dirs();
                 print_other_socket_dir_warning();
                 1
             } else {
-                print_sessions(
-                    all_sessions
-                        .iter()
-                        .map(|(name, (timestamp, is_dead))| {
-                            (name.clone(), timestamp.clone(), *is_dead)
-                        })
-                        .collect(),
-                    no_formatting,
-                    short,
-                    reverse,
-                );
+                if json {
+                    let current_session = envs::get_session_name().unwrap_or_else(|_| "".into());
+                    let live_session_states =
+                        read_live_session_states_default_dirs(&current_session);
+                    let entries = session_list_entries(
+                        sessions,
+                        &current_session,
+                        &live_session_states,
+                        reverse,
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+                    );
+                } else {
+                    print_sessions(sessions, no_formatting, short, reverse);
+                }
                 print_other_socket_dir_warning();
                 0
             }
@@ -1241,3 +1322,100 @@ const NOUNS: &[&'static str] = &[
     "yak",
     "zebra",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::{PaneInfo, PaneManifest, TabInfo};
+
+    fn live(connected_clients: usize, tabs: usize, panes_per_tab: usize) -> SessionInfo {
+        let mut panes = PaneManifest::default();
+        for tab in 0..tabs {
+            panes
+                .panes
+                .insert(tab, vec![PaneInfo::default(); panes_per_tab]);
+        }
+        SessionInfo {
+            tabs: vec![TabInfo::default(); tabs],
+            panes,
+            connected_clients,
+            web_client_count: 1,
+            web_clients_allowed: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_live_session_carries_what_its_metadata_knows() {
+        let mut states = BTreeMap::new();
+        states.insert("alive".to_string(), live(2, 3, 2));
+        let entries = session_list_entries(
+            vec![("alive".to_string(), Duration::from_secs(90), false)],
+            "alive",
+            &states,
+            false,
+        );
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "alive");
+        assert_eq!(entries[0].created_seconds_ago, 90);
+        assert!(entries[0].is_current);
+        assert!(!entries[0].is_dead);
+        assert_eq!(entries[0].connected_clients, Some(2));
+        assert_eq!(entries[0].tab_count, Some(3));
+        assert_eq!(entries[0].pane_count, Some(6));
+        assert_eq!(entries[0].web_clients_allowed, Some(true));
+    }
+
+    #[test]
+    fn a_dead_session_carries_only_what_the_socket_scan_knows() {
+        let entries = session_list_entries(
+            vec![("gone".to_string(), Duration::from_secs(5), true)],
+            "other",
+            &BTreeMap::new(),
+            false,
+        );
+        assert!(entries[0].is_dead);
+        assert!(!entries[0].is_current);
+        assert_eq!(entries[0].connected_clients, None);
+        assert_eq!(entries[0].tab_count, None);
+        // the absent fields are absent from the JSON too, not null
+        let rendered = serde_json::to_string(&entries[0]).expect("TEST");
+        assert!(!rendered.contains("connected_clients"), "{}", rendered);
+    }
+
+    #[test]
+    fn the_listing_is_ordered_by_age_and_reversible() {
+        let sessions = vec![
+            ("old".to_string(), Duration::from_secs(500), false),
+            ("new".to_string(), Duration::from_secs(5), false),
+        ];
+        let names = |reverse| {
+            session_list_entries(sessions.clone(), "", &BTreeMap::new(), reverse)
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false), vec!["old", "new"]);
+        assert_eq!(names(true), vec!["new", "old"]);
+    }
+
+    #[test]
+    fn sessions_of_the_same_age_are_ordered_by_name() {
+        // the age is whole seconds, so sessions made in the same second tie. The names arrive out
+        // of a HashMap, so without a tie-break the listing reorders itself between runs
+        let same_second = Duration::from_secs(42);
+        let sessions = vec![
+            ("charlie".to_string(), same_second, false),
+            ("alpha".to_string(), same_second, false),
+            ("bravo".to_string(), same_second, false),
+        ];
+        let names = |reverse| {
+            session_list_entries(sessions.clone(), "", &BTreeMap::new(), reverse)
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false), vec!["alpha", "bravo", "charlie"]);
+        assert_eq!(names(true), vec!["alpha", "bravo", "charlie"]);
+    }
+}
