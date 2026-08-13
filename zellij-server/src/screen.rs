@@ -11894,6 +11894,19 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
+                if !missing_panes.is_empty() {
+                    // no move: a partial break is worse than nothing
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
+                    continue;
+                }
                 // tab_index is the target tab ID
                 screen.break_multiple_panes_to_tab_with_index(
                     pane_ids,

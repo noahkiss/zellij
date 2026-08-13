@@ -5000,6 +5000,44 @@ pub fn screen_can_break_floating_pane_to_a_new_tab() {
 }
 
 #[test]
+pub fn breaking_panes_to_a_tab_index_reports_a_missing_pane() {
+    // the plugin api reaches this instruction directly, so it gets the same stale-pane-id answer
+    // its two siblings give
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::BreakPanesToTabWithIndex {
+            pane_ids: vec![PaneId::Terminal(999)],
+            tab_index: 0,
+            should_change_focus_to_new_tab: true,
+            client_id: 1,
+            completion_tx: Some(crate::route::NotificationEnd::new(completion_tx)),
+        });
+    let result = crate::route::wait_for_action_completion(
+        completion_rx,
+        "BreakPanesToTabWithIndex",
+        false,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
 pub fn screen_can_break_multiple_stacked_panes_to_a_new_tab() {
     let size = Size { cols: 80, rows: 20 };
     let mut stacked_parent = TiledPaneLayout::default();
