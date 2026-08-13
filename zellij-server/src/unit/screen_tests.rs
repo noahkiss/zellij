@@ -27,7 +27,7 @@ use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::position::Position;
 
 use crate::background_jobs::BackgroundJob;
-use crate::os_input_output::AsyncReader;
+use crate::os_input_output::{AsyncReader, SendToClientError};
 use crate::pty_writer::PtyWriteInstruction;
 use std::collections::HashSet;
 use std::env::set_var;
@@ -176,10 +176,42 @@ fn route_arbitrary_action_to_server(
     .unwrap();
 }
 
+// same as the above, but hands back the completion result so a test can assert on the
+// error message and exit status an action reports
+fn route_arbitrary_action_and_get_result(
+    session_metadata: &SessionMetaData,
+    action: Action,
+    client_id: ClientId,
+) -> crate::route::ActionCompletionResult {
+    let senders = session_metadata.senders.clone();
+    let default_mode = session_metadata
+        .session_configuration
+        .get_client_configuration(&client_id)
+        .options
+        .default_mode
+        .unwrap_or(InputMode::Normal);
+    let (_should_break, result) = route_action(
+        action,
+        client_id,
+        None,
+        None,
+        senders,
+        None,
+        None,
+        default_mode,
+        None,
+    )
+    .unwrap();
+    result.expect("action did not report a completion result")
+}
+
 #[derive(Clone, Default)]
 struct FakeInputOutput {
     fake_filesystem: Arc<Mutex<HashMap<String, String>>>,
     server_to_client_messages: Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    // a client listed here fails every try_send_to_client with the given reason, so a test can
+    // stage a slow client or a departed one
+    client_send_state: Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
 }
 
 impl ServerOsApi for FakeInputOutput {
@@ -225,6 +257,17 @@ impl ServerOsApi for FakeInputOutput {
             .or_insert_with(Vec::new)
             .push(msg);
         Ok(())
+    }
+    fn try_send_to_client(
+        &self,
+        client_id: ClientId,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        if let Some(failure) = self.client_send_state.lock().unwrap().get(&client_id) {
+            return Err(*failure);
+        }
+        self.send_to_client(client_id, msg)
+            .map_err(|_| SendToClientError::ClientGone)
     }
     fn new_client(
         &mut self,
@@ -2458,6 +2501,151 @@ pub fn send_cli_write_action_to_screen() {
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
     mock_screen.teardown(vec![pty_writer_thread, screen_thread]);
     assert_snapshot!(format!("{:?}", *received_pty_instructions.lock().unwrap()));
+}
+
+#[test]
+pub fn write_to_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::WriteCharsToPaneId {
+            chars: "input from the cli".into(),
+            pane_id: zellij_utils::data::PaneId::Terminal(999),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn paste_to_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::Paste {
+            chars: "pasted from the cli".into(),
+            pane_id: Some(zellij_utils::data::PaneId::Terminal(999)),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn write_to_existing_pane_reports_no_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::WriteCharsToPaneId {
+            chars: "input from the cli".into(),
+            pane_id: zellij_utils::data::PaneId::Terminal(0),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.exit_status, None);
+}
+
+#[test]
+pub fn close_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn edit_scrollback_for_missing_pane_reports_an_error() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::EditScrollbackForPaneWithId(
+            PaneId::Terminal(999),
+            Some(crate::route::NotificationEnd::new(completion_tx)),
+        ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![screen_thread]);
+    let result = completion_rx
+        .try_recv()
+        .expect("no completion result was sent");
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
 }
 
 #[test]
@@ -5629,9 +5817,22 @@ fn create_new_screen_with_message_capture(
     Screen,
     Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
 ) {
+    let (screen, messages, _client_send_state) = create_new_screen_with_client_send_state(size);
+    (screen, messages)
+}
+
+// as above, but also hands back the map controlling how sends to each client fail
+fn create_new_screen_with_client_send_state(
+    size: Size,
+) -> (
+    Screen,
+    Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+) {
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     let fake_os_input = FakeInputOutput::default();
     let messages = fake_os_input.server_to_client_messages.clone();
+    let client_send_state = fake_os_input.client_send_state.clone();
     bus.os_input = Some(Box::new(fake_os_input));
     let client_attributes = ClientAttributes {
         size,
@@ -5702,7 +5903,11 @@ fn create_new_screen_with_message_capture(
         web_server_port,
         NestedSessionHandling::default(),
     );
-    (seed_first_client_size(screen, size), messages)
+    (
+        seed_first_client_size(screen, size),
+        messages,
+        client_send_state,
+    )
 }
 
 #[test]
@@ -5839,6 +6044,116 @@ fn subscriber_receives_update_on_changed_viewport() {
         },
         other => panic!("Expected PaneRenderUpdate, got {:?}", other),
     }
+}
+
+#[test]
+fn slow_subscriber_keeps_its_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, messages, client_send_state) = create_new_screen_with_client_send_state(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+
+    // the client is behind, not gone
+    client_send_state
+        .lock()
+        .unwrap()
+        .insert(100, SendToClientError::ClientBusy);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(1),
+        PaneContents {
+            viewport: vec!["changed line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    assert!(
+        screen.pane_render_subscribers.contains_key(&100),
+        "A subscriber that is merely behind must keep its subscription"
+    );
+
+    // once it catches up, the update it missed is sent - it was never marked as delivered
+    client_send_state.lock().unwrap().remove(&100);
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    let msgs = messages.lock().unwrap();
+    let client_msgs = msgs.get(&100).unwrap();
+    assert_eq!(client_msgs.len(), 2);
+    match &client_msgs[1] {
+        ServerToClientMsg::PaneRenderUpdate { viewport, .. } => {
+            assert_eq!(viewport, &vec!["changed line".to_string()]);
+        },
+        other => panic!("Expected PaneRenderUpdate, got {:?}", other),
+    }
+}
+
+#[test]
+fn departed_subscriber_loses_its_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages, client_send_state) = create_new_screen_with_client_send_state(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+
+    client_send_state
+        .lock()
+        .unwrap()
+        .insert(100, SendToClientError::ClientGone);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(1),
+        PaneContents {
+            viewport: vec!["changed line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    assert!(
+        !screen.pane_render_subscribers.contains_key(&100),
+        "A subscriber whose client is gone must be dropped"
+    );
+}
+
+#[test]
+fn resubscribing_to_only_dead_panes_ends_the_subscription() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, _messages) = create_new_screen_with_message_capture(size);
+    new_tab(&mut screen, 1, 0);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+    assert!(screen.pane_render_subscribers.contains_key(&100));
+
+    // the client asks for panes that do not exist: the old subscription must not survive it
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(999)],
+        None,
+        false,
+    );
+    assert!(
+        !screen.pane_render_subscribers.contains_key(&100),
+        "A subscribe naming no live pane must replace the previous subscription"
+    );
 }
 
 #[test]

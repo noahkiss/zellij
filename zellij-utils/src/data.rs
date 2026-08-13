@@ -991,6 +991,10 @@ pub enum Event {
     ),
     RunCommandResult(Option<i32>, Vec<u8>, Vec<u8>, BTreeMap<String, String>), // exit_code, STDOUT, STDERR,
     // context
+    /// The result of a `web_request`. A status of 0 means no HTTP response was received at all -
+    /// the transport failed - and the `x-zellij-error-kind` header names the failure
+    /// (`connection_failed`, `timeout`, `name_resolution`, ...) with the message in the body.
+    /// Any other status is one a server actually sent.
     WebRequestResult(
         u16,
         BTreeMap<String, String>,

@@ -74,7 +74,7 @@ use zellij_utils::{
 
 use crate::background_jobs::BackgroundJob;
 use crate::bell_dwell::BellDwellTracker;
-use crate::os_input_output::ResizeCache;
+use crate::os_input_output::{ResizeCache, SendToClientError};
 use crate::pane_groups::PaneGroups;
 use crate::panes::alacritty_functions::xparse_color;
 use crate::panes::nested_session_modal::GuestModalShortcuts;
@@ -7635,6 +7635,10 @@ impl Screen {
                     ansi,
                 },
             );
+        } else {
+            // a subscribe that named no live pane replaces whatever this client was subscribed
+            // to before, rather than leaving the server and the consumer disagreeing about it
+            self.pane_render_subscribers.remove(&subscriber_client_id);
         }
     }
     fn deliver_to_pane_subscribers_from_report(&mut self, report: &PaneRenderReport) {
@@ -7717,21 +7721,29 @@ impl Screen {
             }
         }
 
-        // Send updates and track dead subscribers
+        // Send updates. A subscriber whose buffer is full is behind, not dead: skip its update
+        // and leave its previous viewport alone, so the next tick re-sends the current contents.
+        // Only a client that is actually gone loses its subscription.
+        let mut busy_subscribers: Vec<ClientId> = Vec::new();
         for (subscriber_id, msg) in &updates_to_send {
             if let Some(os_input) = &self.bus.os_input {
-                if os_input
-                    .send_to_client(*subscriber_id, msg.clone())
-                    .is_err()
-                {
-                    dead_subscribers.push(*subscriber_id);
+                match os_input.try_send_to_client(*subscriber_id, msg.clone()) {
+                    Ok(()) => {},
+                    Err(SendToClientError::ClientBusy) => {
+                        busy_subscribers.push(*subscriber_id);
+                    },
+                    Err(SendToClientError::ClientGone) => {
+                        dead_subscribers.push(*subscriber_id);
+                    },
                 }
             }
         }
 
         // Update previous viewports for successful sends
         for (subscriber_id, msg) in updates_to_send {
-            if dead_subscribers.contains(&subscriber_id) {
+            if dead_subscribers.contains(&subscriber_id)
+                || busy_subscribers.contains(&subscriber_id)
+            {
                 continue;
             }
             if let ServerToClientMsg::PaneRenderUpdate {
@@ -9308,7 +9320,7 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::ClosePane(
                 id,
                 client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
+                mut _completion_tx, // the action ends here, dropping this will release anything
                 // waiting for it
                 exit_status,
             ) => {
@@ -9330,10 +9342,18 @@ pub(crate) fn screen_thread_main(
                             }
                         }
                         if !found {
-                            pending_events_waiting_for_pane
-                                .entry(id)
-                                .or_default()
-                                .push(ScreenInstruction::ClosePane(id, None, None, exit_status));
+                            if let Some(ref mut c) = _completion_tx {
+                                // an explicit request (the CLI or a plugin waiting on this)
+                                // names a pane that does not exist - say so rather than
+                                // queueing the close for a pane that may never appear
+                                log::error!("Pane with id {:?} not found", id);
+                                c.set_exit_status(1);
+                                c.set_error_message(format!("Pane with id {:?} not found", id));
+                            } else {
+                                pending_events_waiting_for_pane.entry(id).or_default().push(
+                                    ScreenInstruction::ClosePane(id, None, None, exit_status),
+                                );
+                            }
                         }
                     },
                 }
@@ -11329,22 +11349,41 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::EditScrollbackForPaneWithId(pane_id, completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut completion_tx = completion_tx;
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx)
+                        tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx.take())
                             .non_fatal();
+                        found = true;
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = completion_tx {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+            ScreenInstruction::WriteToPaneId(bytes, pane_id, mut completion) => {
                 let all_tabs = screen.get_tabs_mut();
+                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
                         tab.write_to_pane_id(&None, bytes, false, pane_id, None, None)
                             .non_fatal();
+                        found = true;
                         break;
+                    }
+                }
+                if !found {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(ref mut c) = completion {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
                 screen.render(None)?;
@@ -11353,11 +11392,24 @@ pub(crate) fn screen_thread_main(
                 match pane_id {
                     Some(pane_id) => {
                         let all_tabs = screen.get_tabs_mut();
+                        let mut completion = _completion;
+                        let mut found = false;
                         for tab in all_tabs.values_mut() {
                             if tab.has_pane_with_pid(&pane_id) {
-                                tab.paste_to_pane_id(bytes, pane_id, _completion)
+                                tab.paste_to_pane_id(bytes, pane_id, completion.take())
                                     .non_fatal();
+                                found = true;
                                 break;
+                            }
+                        }
+                        if !found {
+                            log::error!("Pane with id {:?} not found", pane_id);
+                            if let Some(ref mut c) = completion {
+                                c.set_exit_status(1);
+                                c.set_error_message(format!(
+                                    "Pane with id {:?} not found",
+                                    pane_id
+                                ));
                             }
                         }
                     },
