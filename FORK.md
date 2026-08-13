@@ -2541,7 +2541,15 @@ idempotent in the way a controller wants — the tab is there afterwards, and wh
 something else still is. `--create` still prints the new tab's id, so a script can create the tab and
 then address it.
 
-Without `--create` the flag reduces the command to an existence probe. The flag rides on the existing
+Without `--create` the flag reduces the command to an existence probe, and **stdout carries the
+answer, not the exit code**: the command exits 0 whether or not the tab is there, printing the tab's
+id if it exists and nothing at all if it does not. A script tests the output, not `$?`:
+
+```bash
+if [ -n "$(zellij action go-to-tab-name build --no-focus)" ]; then echo "the tab is there"; fi
+```
+
+The flag rides on the existing
 `GoToTabNameAction` message (field 3), so it adds no message to the client/server contract; the
 plugin API's `focus_or_create_tab` is unchanged and always focuses.
 
