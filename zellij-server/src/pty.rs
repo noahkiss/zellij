@@ -14,7 +14,10 @@ use crate::{
     ClientId, ServerInstruction,
 };
 use std::sync::Arc;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 use tokio::task::JoinHandle;
 use zellij_utils::{
     data::{
@@ -141,6 +144,7 @@ pub enum PtyInstruction {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        report_pane_env: Option<Vec<String>>,
     },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
@@ -198,6 +202,23 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+/// What the pty thread knows about the process it started in a terminal pane.
+///
+/// Everything here comes out of the caches `update_and_report_cwds` refreshes once a second for
+/// panes that produced output - reporting it to Screen costs a message, not a probe. This is the
+/// snapshot half of the pair whose push half is `Event::CwdChanged` / `Event::CommandChanged`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PaneProcessInfo {
+    /// The pid of the pane's own child - the shell, not what the shell is running.
+    pub pid: Option<u32>,
+    pub cwd: Option<PathBuf>,
+    /// The foreground command if there is one, otherwise the pane's shell.
+    pub command: Option<Vec<String>>,
+    /// The variables `report_pane_env` allows, found in the pane's processes. Empty unless the
+    /// configuration names some.
+    pub env: BTreeMap<String, String>,
+}
+
 pub(crate) struct Pty {
     pub active_panes: HashMap<ClientId, PaneId>,
     pub bus: Bus<PtyInstruction>,
@@ -208,6 +229,11 @@ pub(crate) struct Pty {
     default_editor: Option<PathBuf>,
     post_command_discovery_hook: Option<String>,
     resurrect_command_hints: Option<ResurrectCommandHints>,
+    /// The exact env var names `report_pane_env` asks for. Empty means report nothing, which is
+    /// the default and the only safe one - an environment is full of secrets.
+    report_pane_env: Vec<String>,
+    /// terminal_id -> the allowlisted variables last found in that pane's processes
+    terminal_envs: HashMap<u32, BTreeMap<String, String>>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -868,12 +894,14 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 default_editor,
                 post_command_discovery_hook,
                 resurrect_command_hints,
+                report_pane_env,
                 client_id: _,
             } => {
                 pty.reconfigure(
                     default_editor,
                     post_command_discovery_hook,
                     resurrect_command_hints,
+                    report_pane_env,
                 );
             },
             PtyInstruction::SendSigintToPaneId(pane_id) => {
@@ -922,6 +950,7 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        report_pane_env: Option<Vec<String>>,
     ) -> Self {
         Pty {
             active_panes: HashMap::new(),
@@ -933,6 +962,8 @@ impl Pty {
             originating_plugins: HashMap::new(),
             post_command_discovery_hook,
             resurrect_command_hints,
+            report_pane_env: report_pane_env.unwrap_or_default(),
+            terminal_envs: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
@@ -1117,6 +1148,16 @@ impl Pty {
                         )]));
                     }
                 }
+
+                // fork addition: the same news, told to everyone. `CommandPaneExited` above only
+                // reaches the plugin that opened the pane, so a command pane started by a layout
+                // or by the CLI could fail and notify nobody. This is broadcast like `PaneClosed`,
+                // so it survives a fully detached session.
+                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                    None,
+                    None,
+                    Event::PaneExited(pane_id.into(), exit_status),
+                )]));
 
                 if hold_on_close {
                     let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
@@ -1603,7 +1644,14 @@ impl Pty {
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
-            move |pane_id, exit_status, _command| {
+            move |pane_id: PaneId, exit_status, _command| {
+                // fork addition: broadcast the exit, so a pane that a layout started is not the
+                // one kind of pane whose death nobody hears - see the note in `spawn_terminal`
+                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                    None,
+                    None,
+                    Event::PaneExited(pane_id.into(), exit_status),
+                )]));
                 let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
                     pane_id,
                     None,
@@ -1642,6 +1690,15 @@ impl Pty {
                                 )]));
                             }
                         }
+
+                        // fork addition: broadcast the exit, so a command pane that fails is
+                        // visible to a consumer that did not start it - see the note in
+                        // `spawn_terminal`
+                        let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                            None,
+                            None,
+                            Event::PaneExited(pane_id.into(), exit_status),
+                        )]));
 
                         if hold_on_close {
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
@@ -1830,6 +1887,7 @@ impl Pty {
                 self.pane_activity_flags.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
+                self.terminal_envs.remove(&id);
                 self.terminal_foreground_cmds.remove(&id);
                 self.bus
                     .os_input
@@ -1892,6 +1950,14 @@ impl Pty {
                                 )]));
                             }
                         }
+                        // fork addition: broadcast the exit, so a command pane that fails is
+                        // visible to a consumer that did not start it - see the note in
+                        // `spawn_terminal`
+                        let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                            None,
+                            None,
+                            Event::PaneExited(pane_id.into(), exit_status),
+                        )]));
                         if hold_on_close {
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
@@ -2109,7 +2175,79 @@ impl Pty {
         }
     }
 
+    /// The once-a-second tick: refresh what the active panes are doing, then tell Screen.
     pub fn update_and_report_cwds(&mut self) {
+        self.refresh_cwds_and_commands();
+        self.refresh_pane_envs();
+        self.report_pane_process_info();
+    }
+
+    /// Read the allowlisted variables out of every pane's processes.
+    ///
+    /// Costs nothing unless `report_pane_env` names something: the whole pass returns immediately
+    /// on an empty allowlist, which is the default. When it is set, the process table is read once
+    /// for the tick rather than once per pane, because every pane asks it the same question.
+    ///
+    /// The variable lives on a process the shell started, not on the shell, so this walks down
+    /// from the pane's own child - the same problem `resurrect_command_hints` solves, and the same
+    /// code solving it.
+    fn refresh_pane_envs(&mut self) {
+        if self.report_pane_env.is_empty() {
+            self.terminal_envs.clear();
+            return;
+        }
+        let process_tree = ProcessTree::read();
+        let vars = self.report_pane_env.clone();
+        self.terminal_envs = self
+            .id_to_child_pid
+            .iter()
+            .map(|(terminal_id, child_pid)| {
+                (*terminal_id, process_tree.find_all_envs(*child_pid, &vars))
+            })
+            .collect();
+    }
+
+    /// Screen holds no pid, cwd or command of its own - it is told, from these caches, every tick.
+    ///
+    /// The whole map goes every time rather than only the panes that were active, because Screen
+    /// stamps every `PaneInfo` it builds and a pane that has been quiet for an hour still has a
+    /// pid. Building it touches no OS: it is a walk of three `HashMap`s the tick above just filled.
+    fn report_pane_process_info(&self) {
+        let process_info: HashMap<u32, PaneProcessInfo> = self
+            .id_to_child_pid
+            .keys()
+            .copied()
+            .map(|terminal_id| {
+                let foreground = self
+                    .terminal_foreground_cmds
+                    .get(&terminal_id)
+                    .filter(|cmd| !cmd.is_empty());
+                let command = foreground
+                    .or_else(|| self.terminal_cmds.get(&terminal_id))
+                    .filter(|cmd| !cmd.is_empty())
+                    .cloned();
+                (
+                    terminal_id,
+                    PaneProcessInfo {
+                        pid: self.id_to_child_pid.get(&terminal_id).copied(),
+                        cwd: self.terminal_cwds.get(&terminal_id).cloned(),
+                        command,
+                        env: self
+                            .terminal_envs
+                            .get(&terminal_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                )
+            })
+            .collect();
+        let _ = self
+            .bus
+            .senders
+            .send_to_screen(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+    }
+
+    fn refresh_cwds_and_commands(&mut self) {
         use std::sync::atomic::Ordering;
 
         let active_terminal_ids: Vec<u32> = self
@@ -2231,15 +2369,22 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        report_pane_env: Option<Vec<String>>,
     ) {
         self.default_editor = default_editor;
         self.post_command_discovery_hook = post_command_discovery_hook;
         self.resurrect_command_hints = resurrect_command_hints;
+        self.report_pane_env = report_pane_env.unwrap_or_default();
     }
 
+    /// A shell told us its cwd directly, so we do not have to read it off the process.
+    ///
+    /// This used to clear the pane's activity flag, on the reasoning that the cwd was now known and
+    /// needed no probing. But that flag gates the whole tick for the pane, command discovery
+    /// included - so a shell emitting OSC 7 at every prompt could starve its own `pane_command` of
+    /// refreshes. The flag says "this pane produced output", which is still true, and the cost of
+    /// leaving it set is one cwd read the tick would have done for any active pane anyway.
     pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
-        use std::sync::atomic::Ordering;
-
         if self.terminal_cwds.get(&terminal_id) != Some(&path) {
             let pane_id = PaneId::Terminal(terminal_id);
             let focused_client_ids: Vec<ClientId> = self
@@ -2257,9 +2402,6 @@ impl Pty {
                     Event::CwdChanged(pane_id.into(), path.clone(), focused_client_ids),
                 )]));
             self.terminal_cwds.insert(terminal_id, path);
-        }
-        if let Some(flag) = self.pane_activity_flags.get(&terminal_id) {
-            flag.store(false, Ordering::Relaxed);
         }
     }
 

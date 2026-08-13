@@ -46,6 +46,20 @@ pub struct ActionCompletionResult {
     pub stdout_message: Option<String>,
 }
 
+impl ActionCompletionResult {
+    /// The action did not report success. The CLI turns `error_message` into a line on stderr
+    /// and a non-zero exit.
+    pub fn failed(error_message: String) -> Self {
+        ActionCompletionResult {
+            exit_status: Some(1),
+            affected_pane_id: None,
+            affected_tab_id: None,
+            error_message: Some(error_message),
+            stdout_message: None,
+        }
+    }
+}
+
 pub fn wait_for_action_completion(
     receiver: oneshot::Receiver<ActionCompletionResult>,
     action_name: &str,
@@ -58,13 +72,10 @@ pub fn wait_for_action_completion(
                 Ok(result) => result,
                 Err(e) => {
                     log::error!("Failed to wait for action {}: {}", action_name, e);
-                    ActionCompletionResult {
-                        exit_status: None,
-                        affected_pane_id: None,
-                        affected_tab_id: None,
-                        error_message: None,
-                        stdout_message: None,
-                    }
+                    ActionCompletionResult::failed(format!(
+                        "Action {} ended without reporting a result",
+                        action_name
+                    ))
                 },
             }
         })
@@ -73,19 +84,25 @@ pub fn wait_for_action_completion(
             .block_on(async { tokio::time::timeout(ACTION_COMPLETION_TIMEOUT, receiver).await })
         {
             Ok(Ok(result)) => result,
-            Err(_) | Ok(Err(_)) => {
+            Ok(Err(_)) => {
+                log::error!("Action {} ended without reporting a result", action_name);
+                ActionCompletionResult::failed(format!(
+                    "Action {} ended without reporting a result",
+                    action_name
+                ))
+            },
+            Err(_) => {
                 log::error!(
                     "Action {} did not complete within {:?} timeout",
                     action_name,
                     ACTION_COMPLETION_TIMEOUT
                 );
-                ActionCompletionResult {
-                    exit_status: None,
-                    affected_pane_id: None,
-                    affected_tab_id: None,
-                    error_message: None,
-                    stdout_message: None,
-                }
+                // a timeout is a failure, not a silent success: the action may still be in
+                // flight, so the caller must not read "exited 0" as "this happened"
+                ActionCompletionResult::failed(format!(
+                    "Action {} did not complete within {:?}, the session may be busy",
+                    action_name, ACTION_COMPLETION_TIMEOUT
+                ))
             },
         }
     }
@@ -1770,12 +1787,7 @@ pub(crate) fn route_action(
             let maybe_panes =
                 request_panes_from_screen(&senders, show_all).with_context(err_context)?;
 
-            if let Some(mut pane_entries) = maybe_panes {
-                if show_command || show_all || output_json {
-                    enrich_panes_with_pty_data(&mut pane_entries, &senders)
-                        .with_context(err_context)?;
-                }
-
+            if let Some(pane_entries) = maybe_panes {
                 let output_lines = if output_json {
                     format_panes_as_json(&pane_entries)
                 } else {
@@ -3030,89 +3042,6 @@ fn request_current_tab_info_from_screen(
     }
 }
 
-fn enrich_panes_with_pty_data(
-    pane_entries: &mut [PaneListEntry],
-    senders: &ThreadSenders,
-) -> Result<()> {
-    for entry in pane_entries.iter_mut() {
-        if !entry.pane_info.is_plugin {
-            let pane_id = PaneId::Terminal(entry.pane_info.id);
-            enrich_pane_with_running_command(entry, pane_id, senders)?;
-            enrich_pane_with_cwd(entry, pane_id, senders)?;
-            enrich_pane_with_pid(entry, pane_id, senders)?;
-        }
-    }
-    Ok(())
-}
-
-fn enrich_pane_with_running_command(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPaneRunningCommandResponse;
-
-    let (cmd_sender, cmd_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPaneRunningCommand {
-        pane_id,
-        response_channel: cmd_sender,
-    })?;
-
-    if let Ok(GetPaneRunningCommandResponse::Ok(command_vec)) =
-        cmd_receiver.recv_timeout(Duration::from_millis(100))
-    {
-        entry.pane_command = Some(command_vec.join(" "));
-    }
-
-    Ok(())
-}
-
-fn enrich_pane_with_cwd(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPaneCwdResponse;
-
-    let (cwd_sender, cwd_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPaneCwd {
-        pane_id,
-        response_channel: cwd_sender,
-    })?;
-
-    if let Ok(GetPaneCwdResponse::Ok(cwd)) = cwd_receiver.recv_timeout(Duration::from_millis(100)) {
-        entry.pane_cwd = Some(cwd.to_string_lossy().to_string());
-    }
-
-    Ok(())
-}
-
-fn enrich_pane_with_pid(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPanePidResponse;
-
-    let (pid_sender, pid_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPanePid {
-        pane_id,
-        response_channel: pid_sender,
-    })?;
-
-    if let Ok(GetPanePidResponse::Ok(pid)) = pid_receiver.recv_timeout(Duration::from_millis(100)) {
-        entry.pane_pid = Some(pid);
-    }
-
-    Ok(())
-}
-
 fn format_panes_as_json(pane_entries: &[PaneListEntry]) -> Vec<String> {
     vec![serde_json::to_string_pretty(pane_entries).unwrap_or_else(|_| "[]".to_string())]
 }
@@ -3242,6 +3171,7 @@ fn format_pane_type(pane_info: &zellij_utils::data::PaneInfo) -> String {
 
 fn extract_command(entry: &PaneListEntry) -> String {
     entry
+        .pane_info
         .pane_command
         .as_ref()
         .or(entry.pane_info.terminal_command.as_ref())
@@ -3253,6 +3183,7 @@ fn extract_command(entry: &PaneListEntry) -> String {
 
 fn extract_cwd(entry: &PaneListEntry) -> String {
     entry
+        .pane_info
         .pane_cwd
         .as_ref()
         .map(|s| s.as_str())
@@ -3453,6 +3384,24 @@ mod tests {
 
         let result = rx.blocking_recv().unwrap();
         assert_eq!(result.affected_tab_id, None);
+    }
+
+    #[test]
+    fn test_action_completion_timeout_reports_an_error() {
+        let (tx, rx) = oneshot::channel();
+        // the sender is held for longer than the timeout, so the wait must give up
+        let result = wait_for_action_completion(rx, "TestAction", false);
+        drop(tx);
+
+        assert_eq!(result.exit_status, Some(1));
+        let error_message = result
+            .error_message
+            .expect("a timed out action must report an error");
+        assert!(
+            error_message.contains("did not complete"),
+            "Expected a timeout error, got: {}",
+            error_message
+        );
     }
 
     #[test]

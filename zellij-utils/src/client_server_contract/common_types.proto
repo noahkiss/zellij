@@ -813,6 +813,9 @@ message CliAssets {
   optional string cwd = 11;
   map<string, string> host_terminal_env = 12;
   repeated CommandOrPlugin initial_panes = 13;
+  // fork: the terminal device this client is attached to, when it has one. Tag 100 is
+  // fork-reserved, far from the next number upstream would take
+  optional string tty = 100;
 }
 
 message LayoutInfo {

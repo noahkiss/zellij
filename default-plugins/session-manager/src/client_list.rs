@@ -55,6 +55,19 @@ impl ClientList {
             .selected_index
             .min(self.clients.len().saturating_sub(1));
     }
+    /// Cell count of the smallest client, when marking it would tell the user something.
+    ///
+    /// A session is sized to its smallest client, so that client is the one throttling everyone
+    /// else. `None` when no client reports a size, or when every client reporting one is the same
+    /// size - then nothing is being throttled and a highlight would be noise.
+    fn throttling_area(&self) -> Option<usize> {
+        let mut areas = self.clients.iter().filter_map(|c| c.terminal_area());
+        let first = areas.next()?;
+        let (smallest, largest) = areas.fold((first, first), |(small, large), area| {
+            (small.min(area), large.max(area))
+        });
+        (smallest < largest).then_some(smallest)
+    }
     pub fn render(&self, rows: usize, columns: usize, x: usize, y: usize) {
         if rows == 0 || columns == 0 {
             return;
@@ -83,7 +96,15 @@ impl ClientList {
             return;
         }
         let max_rows = rows.saturating_sub(3);
-        let mut table = Table::new().add_row(vec![" ", "Client", "Focused pane", "Running"]);
+        let throttling_area = self.throttling_area();
+        let mut table = Table::new().add_row(vec![
+            " ",
+            "Client",
+            "Terminal",
+            "Focused pane",
+            "Size",
+            "Running",
+        ]);
         for (i, client) in self.clients.iter().enumerate() {
             if i >= max_rows {
                 break;
@@ -106,16 +127,36 @@ impl ClientList {
                 // the one row `Detach` refuses
                 client_cell = client_cell.color_range(2, id_len..);
             }
+            let mut tty_cell = Text::new(tty_description(client.tty.as_deref())).color_range(1, ..);
             let mut pane_cell = Text::new(pane_description(&client.pane_id)).color_range(1, ..);
+            // the smallest client sizes the whole session, so it gets the same emphasis colour
+            // the current client marker uses - it is the row a user is looking for
+            let is_throttling =
+                throttling_area.is_some() && client.terminal_area() == throttling_area;
+            let mut size_cell = Text::new(size_description(client.terminal_size));
+            size_cell = if is_throttling {
+                size_cell.color_range(2, ..)
+            } else {
+                size_cell.color_range(0, ..)
+            };
             let mut command_cell =
                 Text::new(truncate(&client.running_command, command_budget(columns)))
                     .color_range(3, ..);
             if is_selected {
                 client_cell = client_cell.selected();
+                tty_cell = tty_cell.selected();
                 pane_cell = pane_cell.selected();
+                size_cell = size_cell.selected();
                 command_cell = command_cell.selected();
             }
-            table = table.add_styled_row(vec![arrow_cell, client_cell, pane_cell, command_cell]);
+            table = table.add_styled_row(vec![
+                arrow_cell,
+                client_cell,
+                tty_cell,
+                pane_cell,
+                size_cell,
+                command_cell,
+            ]);
         }
         print_table_with_coordinates(table, x, y + 2, Some(columns), None);
         let hidden = self.clients.len().saturating_sub(max_rows);
@@ -137,10 +178,34 @@ impl ClientList {
 
 /// How much room the command column gets before it has to be cut.
 ///
-/// The other three columns are short and bounded; the command is the one that can run to hundreds
+/// The other four columns are short and bounded; the command is the one that can run to hundreds
 /// of characters and push the table past the pane.
 fn command_budget(columns: usize) -> usize {
-    columns.saturating_sub(34).max(10)
+    columns.saturating_sub(45).max(10)
+}
+
+/// A client's terminal size, as a human writes one: columns first.
+///
+/// Blank rather than a placeholder when the server has no size for the client - an empty cell
+/// reads as "not known", where a `0x0` would read as a real and alarming measurement.
+/// The terminal a client is sitting at, with the `/dev/` every one of them shares taken off.
+///
+/// Only that prefix: `pts/10` keeps its subdirectory because the last component alone is a bare
+/// number, which sits next to a column of client ids and reads as one. A client with no
+/// controlling terminal - a web client, a CLI action - gets a dash rather than a blank, so the row
+/// does not look truncated.
+fn tty_description(tty: Option<&str>) -> String {
+    match tty {
+        Some(tty) => tty.strip_prefix("/dev/").unwrap_or(tty).to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
+fn size_description(terminal_size: Option<Size>) -> String {
+    match terminal_size {
+        Some(size) => format!("{}x{}", size.cols, size.rows),
+        None => String::new(),
+    }
 }
 
 fn truncate(text: &str, budget: usize) -> String {
@@ -171,6 +236,10 @@ mod tests {
             "zsh".to_owned(),
             is_current,
         )
+    }
+
+    fn sized_client(id: ClientId, cols: usize, rows: usize) -> ClientInfo {
+        client(id, false).with_terminal_size(Some(Size { rows, cols }))
     }
 
     #[test]
@@ -240,5 +309,84 @@ mod tests {
     #[test]
     fn a_narrow_pane_still_leaves_room_for_a_command() {
         assert_eq!(command_budget(20), 10);
+    }
+
+    #[test]
+    fn a_size_is_written_columns_first() {
+        assert_eq!(
+            size_description(Some(Size {
+                rows: 40,
+                cols: 160
+            })),
+            "160x40"
+        );
+    }
+
+    #[test]
+    fn an_unknown_size_is_blank_rather_than_zero() {
+        assert_eq!(size_description(None), "");
+    }
+
+    #[test]
+    fn the_smallest_client_is_the_one_marked() {
+        let mut list = ClientList::default();
+        list.update(vec![
+            sized_client(1, 160, 40),
+            sized_client(2, 80, 24),
+            sized_client(3, 200, 50),
+        ]);
+        assert_eq!(list.throttling_area(), Some(80 * 24));
+    }
+
+    #[test]
+    fn clients_of_one_size_throttle_nobody() {
+        let mut list = ClientList::default();
+        list.update(vec![sized_client(1, 160, 40), sized_client(2, 160, 40)]);
+        assert_eq!(
+            list.throttling_area(),
+            None,
+            "nothing is being shrunk, so nothing is marked"
+        );
+    }
+
+    #[test]
+    fn a_client_of_unknown_size_never_wins_the_comparison() {
+        let mut list = ClientList::default();
+        list.update(vec![client(1, true), sized_client(2, 80, 24)]);
+        assert_eq!(
+            list.throttling_area(),
+            None,
+            "one known size is not a comparison"
+        );
+        list.update(vec![
+            client(1, true),
+            sized_client(2, 80, 24),
+            sized_client(3, 160, 40),
+        ]);
+        assert_eq!(list.throttling_area(), Some(80 * 24));
+    }
+}
+
+#[cfg(test)]
+mod tty_column_tests {
+    use super::*;
+
+    #[test]
+    fn a_tty_loses_the_prefix_every_client_shares() {
+        // the column competes for width with the running command, and /dev/ says nothing
+        assert_eq!(tty_description(Some("/dev/ttys004")), "ttys004");
+        // pts keeps its subdirectory: "3" alone would read as a client id
+        assert_eq!(tty_description(Some("/dev/pts/3")), "pts/3");
+    }
+
+    #[test]
+    fn a_client_with_no_terminal_says_so() {
+        // a web client and a CLI action have none, and a blank cell reads as a truncated row
+        assert_eq!(tty_description(None), "-");
+    }
+
+    #[test]
+    fn an_unusual_spelling_is_left_alone() {
+        assert_eq!(tty_description(Some("console")), "console");
     }
 }
