@@ -7866,13 +7866,19 @@ impl Screen {
         // Send updates. A subscriber whose buffer is full is behind, not dead: skip its update
         // and leave its previous viewport alone, so the next tick re-sends the current contents.
         // Only a client that is actually gone loses its subscription.
-        let mut busy_subscribers: Vec<ClientId> = Vec::new();
+        //
+        // The skip is per pane, not per subscriber: a channel that fills mid-batch takes some of
+        // a subscriber's panes and refuses the rest, and forgetting what the panes it accepted
+        // now show would re-send those contents on the next tick as if they had changed.
+        let mut busy_updates: Vec<(ClientId, zellij_utils::data::PaneId)> = Vec::new();
         for (subscriber_id, msg) in &updates_to_send {
             if let Some(os_input) = &self.bus.os_input {
                 match os_input.try_send_to_client(*subscriber_id, msg.clone()) {
                     Ok(()) => {},
                     Err(SendToClientError::ClientBusy) => {
-                        busy_subscribers.push(*subscriber_id);
+                        if let ServerToClientMsg::PaneRenderUpdate { pane_id, .. } = msg {
+                            busy_updates.push((*subscriber_id, *pane_id));
+                        }
                     },
                     Err(SendToClientError::ClientGone) => {
                         dead_subscribers.push(*subscriber_id);
@@ -7883,15 +7889,16 @@ impl Screen {
 
         // Update previous viewports for successful sends
         for (subscriber_id, msg) in updates_to_send {
-            if dead_subscribers.contains(&subscriber_id)
-                || busy_subscribers.contains(&subscriber_id)
-            {
+            if dead_subscribers.contains(&subscriber_id) {
                 continue;
             }
             if let ServerToClientMsg::PaneRenderUpdate {
                 pane_id, viewport, ..
             } = msg
             {
+                if busy_updates.contains(&(subscriber_id, pane_id)) {
+                    continue;
+                }
                 if let Some(subscription) = self.pane_render_subscribers.get_mut(&subscriber_id) {
                     subscription.previous_viewports.insert(pane_id, viewport);
                 }

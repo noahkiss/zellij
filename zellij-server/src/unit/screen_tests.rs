@@ -212,6 +212,9 @@ struct FakeInputOutput {
     // a client listed here fails every try_send_to_client with the given reason, so a test can
     // stage a slow client or a departed one
     client_send_state: Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+    // a (client, pane) listed here fails only that pane's render update, so a test can stage a
+    // channel that fills partway through a batch
+    pane_send_state: Arc<Mutex<HashMap<(ClientId, zellij_utils::data::PaneId), SendToClientError>>>,
 }
 
 impl ServerOsApi for FakeInputOutput {
@@ -265,6 +268,16 @@ impl ServerOsApi for FakeInputOutput {
     ) -> std::result::Result<(), SendToClientError> {
         if let Some(failure) = self.client_send_state.lock().unwrap().get(&client_id) {
             return Err(*failure);
+        }
+        if let ServerToClientMsg::PaneRenderUpdate { pane_id, .. } = &msg {
+            if let Some(failure) = self
+                .pane_send_state
+                .lock()
+                .unwrap()
+                .get(&(client_id, *pane_id))
+            {
+                return Err(*failure);
+            }
         }
         self.send_to_client(client_id, msg)
             .map_err(|_| SendToClientError::ClientGone)
@@ -5861,10 +5874,26 @@ fn create_new_screen_with_client_send_state(
     Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
     Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
 ) {
+    let (screen, messages, client_send_state, _pane_send_state) =
+        create_new_screen_with_pane_send_state(size);
+    (screen, messages, client_send_state)
+}
+
+// as above, but the send state can also be staged for one pane of one client
+#[allow(clippy::type_complexity)]
+fn create_new_screen_with_pane_send_state(
+    size: Size,
+) -> (
+    Screen,
+    Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+    Arc<Mutex<HashMap<(ClientId, zellij_utils::data::PaneId), SendToClientError>>>,
+) {
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     let fake_os_input = FakeInputOutput::default();
     let messages = fake_os_input.server_to_client_messages.clone();
     let client_send_state = fake_os_input.client_send_state.clone();
+    let pane_send_state = fake_os_input.pane_send_state.clone();
     bus.os_input = Some(Box::new(fake_os_input));
     let client_attributes = ClientAttributes {
         size,
@@ -5939,6 +5968,7 @@ fn create_new_screen_with_client_send_state(
         seed_first_client_size(screen, size),
         messages,
         client_send_state,
+        pane_send_state,
     )
 }
 
@@ -6125,6 +6155,87 @@ fn slow_subscriber_keeps_its_subscription() {
         },
         other => panic!("Expected PaneRenderUpdate, got {:?}", other),
     }
+}
+
+/// A channel that fills partway through a batch takes some panes and refuses the rest. The panes
+/// it took must not be re-sent on the next tick as if their contents had changed.
+#[test]
+fn a_busy_send_only_skips_the_pane_it_refused() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, messages, _client_send_state, pane_send_state) =
+        create_new_screen_with_pane_send_state(size);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let accepted_pane = zellij_utils::data::PaneId::Terminal(1);
+    let refused_pane = zellij_utils::data::PaneId::Terminal(2);
+
+    screen.subscribe_to_pane_renders(100, vec![accepted_pane, refused_pane], None, false);
+
+    // the channel has room for the first pane and not for the second
+    pane_send_state
+        .lock()
+        .unwrap()
+        .insert((100, refused_pane), SendToClientError::ClientBusy);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        accepted_pane,
+        PaneContents {
+            viewport: vec!["accepted line".to_string()],
+            ..Default::default()
+        },
+    );
+    pane_map.insert(
+        refused_pane,
+        PaneContents {
+            viewport: vec!["refused line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    // the channel drains, and nothing has changed since
+    pane_send_state.lock().unwrap().clear();
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    let msgs = messages.lock().unwrap();
+    let client_msgs = msgs.get(&100).unwrap();
+    let mut viewports_per_pane: HashMap<zellij_utils::data::PaneId, Vec<Vec<String>>> =
+        HashMap::new();
+    for msg in client_msgs {
+        if let ServerToClientMsg::PaneRenderUpdate {
+            pane_id,
+            viewport,
+            is_initial: false,
+            ..
+        } = msg
+        {
+            viewports_per_pane
+                .entry(*pane_id)
+                .or_default()
+                .push(viewport.clone());
+        }
+    }
+    assert_eq!(
+        viewports_per_pane
+            .get(&accepted_pane)
+            .map(|sends| sends.len()),
+        Some(1),
+        "the pane whose update was accepted must not be sent again: {:?}",
+        viewports_per_pane
+    );
+    assert_eq!(
+        viewports_per_pane
+            .get(&refused_pane)
+            .map(|sends| sends.len()),
+        Some(1),
+        "the pane whose update was refused must be sent once the channel drains: {:?}",
+        viewports_per_pane
+    );
+    assert_eq!(
+        viewports_per_pane.get(&refused_pane).unwrap()[0],
+        vec!["refused line".to_string()]
+    );
 }
 
 #[test]
