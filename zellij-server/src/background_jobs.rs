@@ -64,15 +64,26 @@ fn web_request_error_kind(error: &isahc::Error) -> &'static str {
 
 /// The `WebRequestResult` for a request that never got an HTTP response.
 fn web_request_transport_error(error: &isahc::Error, context: BTreeMap<String, String>) -> Event {
+    web_request_transport_failure(web_request_error_kind(error), error.to_string(), context)
+}
+
+/// The `WebRequestResult` for a request that never got an HTTP response, from a failure that has
+/// no `isahc::Error` behind it. A plugin waits on its correlation entry until an answer arrives,
+/// so every web request has to produce one, however it failed.
+fn web_request_transport_failure(
+    error_kind: &str,
+    message: String,
+    context: BTreeMap<String, String>,
+) -> Event {
     let mut headers = BTreeMap::new();
     headers.insert(
         WEB_REQUEST_ERROR_KIND_HEADER.to_owned(),
-        web_request_error_kind(error).to_owned(),
+        error_kind.to_owned(),
     );
     Event::WebRequestResult(
         WEB_REQUEST_TRANSPORT_ERROR_STATUS,
         headers,
-        error.to_string().into_bytes(),
+        message.into_bytes(),
         context,
     )
 }
@@ -176,6 +187,9 @@ static WEB_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const WEB_REQUEST_TRANSPORT_ERROR_STATUS: u16 = 0;
 /// The header naming the transport failure on a `WEB_REQUEST_TRANSPORT_ERROR_STATUS` result.
 pub const WEB_REQUEST_ERROR_KIND_HEADER: &str = "x-zellij-error-kind";
+/// The failure kind for a request that was never sent because the http client could not be built.
+/// It is a property of the session, not of the request, so retrying it will not help.
+pub const WEB_REQUEST_CLIENT_UNAVAILABLE_ERROR_KIND: &str = "client_unavailable";
 static REPAINT_DELAY_MS: u64 = 10;
 static HELP_TEXT_DEBOUNCE_DURATION: u64 = 5000;
 
@@ -472,6 +486,17 @@ pub(crate) fn background_jobs_main(
                         }
                         let Some(http_client) = http_client else {
                             log::error!("Cannot perform http request, likely due to a misconfigured http client");
+                            // the client failed to build once, at startup, so returning here
+                            // would hang every web request this session ever makes
+                            let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                                Some(plugin_id),
+                                Some(client_id),
+                                web_request_transport_failure(
+                                    WEB_REQUEST_CLIENT_UNAVAILABLE_ERROR_KIND,
+                                    "the http client could not be built".to_owned(),
+                                    context,
+                                ),
+                            )]));
                             return;
                         };
 
@@ -1067,6 +1092,35 @@ mod web_request_tests {
                     Some("connection_failed")
                 );
                 assert_eq!(context.get("correlation").map(|s| s.as_str()), Some("1"));
+            },
+            other => panic!("Expected a WebRequestResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unbuildable_http_client_answers_the_request_instead_of_hanging_it() {
+        // the plugin holds a correlation entry until an answer arrives, so a request that was
+        // never sent still has to produce one
+        let mut context = BTreeMap::new();
+        context.insert("correlation".to_owned(), "1".to_owned());
+        match web_request_transport_failure(
+            WEB_REQUEST_CLIENT_UNAVAILABLE_ERROR_KIND,
+            "the http client could not be built".to_owned(),
+            context,
+        ) {
+            Event::WebRequestResult(status, headers, _body, context) => {
+                assert_eq!(status, WEB_REQUEST_TRANSPORT_ERROR_STATUS);
+                assert_eq!(
+                    headers
+                        .get(WEB_REQUEST_ERROR_KIND_HEADER)
+                        .map(|s| s.as_str()),
+                    Some("client_unavailable")
+                );
+                assert_eq!(
+                    context.get("correlation").map(|s| s.as_str()),
+                    Some("1"),
+                    "the correlation must come back so the plugin can close its entry"
+                );
             },
             other => panic!("Expected a WebRequestResult, got {:?}", other),
         }
