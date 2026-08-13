@@ -1027,6 +1027,17 @@ pub enum Event {
     /// be read. A pane that holds after exiting keeps reporting the status on `PaneInfo`; a pane
     /// that closes is then announced by `PaneClosed`, which carries no status of its own.
     PaneExited(PaneId, Option<i32>),
+    /// A plugin crashed and is no longer running
+    ///
+    /// The payload is the plugin's id and the error it died with. It is broadcast to every
+    /// subscribed plugin, so a supervisor hears about a background plugin whose death has no other
+    /// symptom: a background plugin has no pane, so the loading-error indicator zellij draws for a
+    /// crashed plugin has nowhere to go, and a consumer of its output cannot tell a quiet session
+    /// from a dead feed.
+    ///
+    /// Nothing restarts the plugin. Each crash is announced once per plugin id, so a plugin that
+    /// dies again on the next event cannot drive an announcement loop.
+    PluginDied(u32, String), // u32 - plugin_id, String - the error it died with
     EditPaneOpened(u32, Context),              // u32 - terminal_pane_id
     EditPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> - exit code
     CommandPaneReRun(u32, Context),            // u32 - terminal_pane_id, Option<i32> -

@@ -52,6 +52,7 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-scrollback-position", // PaneInfo.scrollback_position, scrollback_length
     "pane-layout-fields", // PaneInfo.is_pinned, logical_position, is_borderless, exclude_from_sync, has_explicit_title
     "pane-exited-event",  // Event::PaneExited, the exit status of any terminal pane
+    "plugin-died-event",  // Event::PluginDied, a crashed plugin says so
     "pane-opened-event",  // Event::PaneOpened, broadcast from every creation path
     "client-tty",         // ClientInfo.tty
     "list-clients-fixed", // the session manager's client list actually lists clients

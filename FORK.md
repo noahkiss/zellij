@@ -2333,6 +2333,31 @@ act on nor keep up with, and writing them would rewrite the file for every pane 
 
 Proto tags 38-45.
 
+### A crashed plugin says so (`Event::PluginDied`)
+
+When a plugin panics, zellij pushes a loading-error indication to the plugin's pane. A background
+plugin has no pane. So a background plugin - the kind that watches a session and forwards what it
+sees - died behind one `log::error!` and nothing else changed: no event, nothing to poll, and a feed
+that has gone quiet looks exactly like a session with nothing to say.
+
+`Event::PluginDied(plugin_id, message)` is broadcast to every subscribed plugin when a plugin
+crashes, carrying the error it died with. A supervisor plugin can therefore notice, and a consumer
+downstream of one can be told.
+
+- **Nothing restarts the plugin.** This is a signal, not a policy; reloading is the caller's
+  decision and belongs where the caller's configuration is.
+- **Each plugin id is announced once.** Announcing a crash sends an event, and delivering an event
+  is how a plugin crashes, so two plugins that die on `PluginDied` would otherwise keep each other
+  crashing forever. A reloaded plugin gets a new id and can be announced again.
+- The pane indicator is unchanged for plugins that have a pane.
+
+`SessionInfo.plugins` deliberately does **not** mark dead plugins, because it does not list live
+ones either: `Screen` builds every `SessionInfo` with an empty map, `populate_plugin_list` has no
+callers anywhere in the tree, and the KDL codec drops the field. Marking a list nobody fills would
+be a fiction; populating it is a separate piece of work.
+
+Proto: `EventType` 54, event payload 48.
+
 ### `Event::PaneExited`, so a failed command pane tells someone
 
 A command pane that fails had exactly one way to say so, and it only worked for one kind of caller:

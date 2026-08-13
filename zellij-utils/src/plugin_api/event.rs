@@ -326,6 +326,12 @@ impl TryFrom<ProtobufEvent> for Event {
                 },
                 _ => Err("Malformed payload for the PaneExited Event"),
             },
+            Some(ProtobufEventType::PluginDied) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::PluginDiedPayload(plugin_died_payload)) => Ok(
+                    Event::PluginDied(plugin_died_payload.plugin_id, plugin_died_payload.message),
+                ),
+                _ => Err("Malformed payload for the PluginDied Event"),
+            },
             Some(ProtobufEventType::EditPaneOpened) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::EditPaneOpenedPayload(command_pane_opened_payload)) => {
                     Ok(Event::EditPaneOpened(
@@ -1059,6 +1065,13 @@ impl TryFrom<Event> for ProtobufEvent {
                 name: ProtobufEventType::PaneOpened as i32,
                 payload: Some(event::Payload::PaneOpenedPayload(PaneOpenedPayload {
                     pane_id: Some(pane_id.try_into()?),
+                })),
+            }),
+            Event::PluginDied(plugin_id, message) => Ok(ProtobufEvent {
+                name: ProtobufEventType::PluginDied as i32,
+                payload: Some(event::Payload::PluginDiedPayload(PluginDiedPayload {
+                    plugin_id,
+                    message,
                 })),
             }),
             Event::PaneExited(pane_id, exit_status) => Ok(ProtobufEvent {
@@ -2427,6 +2440,7 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::PaneClosed => EventType::PaneClosed,
             ProtobufEventType::PaneOpened => EventType::PaneOpened,
             ProtobufEventType::PaneExited => EventType::PaneExited,
+            ProtobufEventType::PluginDied => EventType::PluginDied,
             ProtobufEventType::EditPaneOpened => EventType::EditPaneOpened,
             ProtobufEventType::EditPaneExited => EventType::EditPaneExited,
             ProtobufEventType::CommandPaneReRun => EventType::CommandPaneReRun,
@@ -2489,6 +2503,7 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::PaneClosed => ProtobufEventType::PaneClosed,
             EventType::PaneOpened => ProtobufEventType::PaneOpened,
             EventType::PaneExited => ProtobufEventType::PaneExited,
+            EventType::PluginDied => ProtobufEventType::PluginDied,
             EventType::EditPaneOpened => ProtobufEventType::EditPaneOpened,
             EventType::EditPaneExited => ProtobufEventType::EditPaneExited,
             EventType::CommandPaneReRun => ProtobufEventType::CommandPaneReRun,
@@ -3695,6 +3710,14 @@ mod tests {
             let roundtripped: Event = protobuf.try_into().unwrap();
             assert_eq!(event, roundtripped);
         }
+    }
+
+    #[test]
+    fn plugin_died_roundtrips_through_protobuf() {
+        let event = Event::PluginDied(7, "it panicked".to_owned());
+        let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
+        let roundtripped: Event = protobuf.try_into().unwrap();
+        assert_eq!(event, roundtripped);
     }
 
     #[test]
