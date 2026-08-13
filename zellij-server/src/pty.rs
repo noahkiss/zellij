@@ -2292,9 +2292,14 @@ impl Pty {
         self.resurrect_command_hints = resurrect_command_hints;
     }
 
+    /// A shell told us its cwd directly, so we do not have to read it off the process.
+    ///
+    /// This used to clear the pane's activity flag, on the reasoning that the cwd was now known and
+    /// needed no probing. But that flag gates the whole tick for the pane, command discovery
+    /// included - so a shell emitting OSC 7 at every prompt could starve its own `pane_command` of
+    /// refreshes. The flag says "this pane produced output", which is still true, and the cost of
+    /// leaving it set is one cwd read the tick would have done for any active pane anyway.
     pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
-        use std::sync::atomic::Ordering;
-
         if self.terminal_cwds.get(&terminal_id) != Some(&path) {
             let pane_id = PaneId::Terminal(terminal_id);
             let focused_client_ids: Vec<ClientId> = self
@@ -2312,9 +2317,6 @@ impl Pty {
                     Event::CwdChanged(pane_id.into(), path.clone(), focused_client_ids),
                 )]));
             self.terminal_cwds.insert(terminal_id, path);
-        }
-        if let Some(flag) = self.pane_activity_flags.get(&terminal_id) {
-            flag.store(false, Ordering::Relaxed);
         }
     }
 

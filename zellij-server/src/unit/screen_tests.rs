@@ -12561,3 +12561,95 @@ pub fn a_pane_the_pty_said_nothing_about_reports_no_process_fields() {
     assert_eq!(reported.pane_cwd, None);
     assert_eq!(reported.pane_command, None);
 }
+
+#[test]
+pub fn pane_info_reports_when_a_pane_last_emitted_output() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let before_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(1, "hi".as_bytes().to_vec()));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let after_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let noisy = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    let last_output_at = noisy
+        .last_output_at
+        .expect("a pane that emitted output should report when");
+    assert!(
+        last_output_at >= before_ms && last_output_at <= after_ms,
+        "last_output_at {} should sit between {} and {}",
+        last_output_at,
+        before_ms,
+        after_ms
+    );
+}
+
+#[test]
+pub fn a_silent_pane_reports_no_last_output_time() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let silent = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(silent.last_output_at, None);
+}

@@ -2429,6 +2429,16 @@ pub struct PaneInfo {
     /// does not have to wait for a command to change before it knows what is running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_command: Option<String>,
+    /// When this pane last emitted output, in milliseconds since the Unix epoch
+    ///
+    /// Terminal panes only, and it means bytes arriving from the pty - not a human typing, not the
+    /// pane being focused. `None` for a pane that has produced nothing since the server started.
+    ///
+    /// It is the cheapest liveness signal there is: "is this pane still working" answered without
+    /// reading a single cell of its content. Nothing pushes on output alone, so a consumer sees it
+    /// move on the once-a-second session tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

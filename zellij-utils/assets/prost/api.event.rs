@@ -699,6 +699,8 @@ pub struct PaneInfo {
     pub pane_pid: ::core::option::Option<u32>,
     #[prost(string, optional, tag="34")]
     pub pane_command: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag="35")]
+    pub last_output_at: ::core::option::Option<u64>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

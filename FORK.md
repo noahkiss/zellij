@@ -213,6 +213,31 @@ The fields cross the plugin API, so `event.proto` and its generated Rust are reg
 (`cargo xtask proto`), taking tags 32-34. `session-metadata.kdl` does not carry them, so a peer
 session read through that codec reports them as absent — the same limit the identity fields have.
 
+### `last_output_at`: when a pane last produced output
+
+`PaneInfo.last_output_at` is the time a terminal pane last emitted bytes, in milliseconds since the
+Unix epoch. It is `null` for plugin panes and for a pane that has produced nothing since the server
+started.
+
+It means output, not attention: a human typing does not move it, nor does focusing the pane. That
+makes it the cheapest liveness signal in the tree — "is this pane still working" answered without
+reading a cell of its content, and without spawning a process per pane to scrape one.
+
+The server already recorded the instant on every read from a pty, for the mobile view, and threw the
+wall-clock meaning away. Reporting it costs one clock read per manifest.
+
+Nothing pushes on output alone, so a consumer sees the value move on the once-a-second session tick
+rather than the moment bytes land. That is still an order of magnitude better than sweeping panes
+with `dump-screen`.
+
+Related fix on the same path: a shell emitting OSC 7 (a cwd report) used to clear the pane's
+activity flag in the pty thread. That flag gates the whole once-a-second refresh for the pane,
+command discovery included, so a shell announcing its cwd at every prompt could starve its own
+`pane_command` of updates. The flag now stays set — the pane did produce output — and the extra cwd
+read is one the tick performs for any active pane anyway.
+
+Proto tag 35.
+
 ### The socket directory is visible, and `ls` warns about sessions outside it
 
 Every session operation is scoped to one socket directory, resolved from the environment

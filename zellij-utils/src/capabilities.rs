@@ -43,6 +43,7 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-restored-from",       // PaneInfo.restored_from
     "pane-pid",                 // list-panes --json carries pane_pid
     "pane-process-info",        // PaneInfo.pane_pid, pane_cwd, pane_command
+    "pane-last-output",         // PaneInfo.last_output_at
     "pane-program-title",       // PaneInfo.program_title
     "pane-stack-fields",        // PaneInfo.stack_id, index_in_stack, is_expanded_in_stack
     "client-tty",               // ClientInfo.tty

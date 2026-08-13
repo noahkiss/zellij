@@ -515,6 +515,7 @@ message PaneInfo {
     optional string pane_cwd = 32;
     optional uint32 pane_pid = 33;
     optional string pane_command = 34;
+    optional uint64 last_output_at = 35;
 }
 
 message IndexInPaneGroup {

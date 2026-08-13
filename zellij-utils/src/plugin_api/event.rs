@@ -1975,6 +1975,7 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             pane_cwd: protobuf_pane_info.pane_cwd,
             pane_pid: protobuf_pane_info.pane_pid,
             pane_command: protobuf_pane_info.pane_command,
+            last_output_at: protobuf_pane_info.last_output_at,
         })
     }
 }
@@ -2029,6 +2030,7 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             pane_cwd: pane_info.pane_cwd,
             pane_pid: pane_info.pane_pid,
             pane_command: pane_info.pane_command,
+            last_output_at: pane_info.last_output_at,
         })
     }
 }
@@ -3135,6 +3137,7 @@ fn serialize_session_update_event_with_non_default_values() {
             pane_cwd: Some("/home/user/develop/thing".to_owned()),
             pane_pid: Some(90210),
             pane_command: Some("claude --resume".to_owned()),
+            last_output_at: Some(1_760_000_000_000),
         },
         PaneInfo {
             id: 1,
@@ -3172,6 +3175,7 @@ fn serialize_session_update_event_with_non_default_values() {
             pane_cwd: None,
             pane_pid: None,
             pane_command: None,
+            last_output_at: None,
         },
     ];
     panes.insert(0, panes_list);

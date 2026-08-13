@@ -34,7 +34,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::str;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::route::NotificationEnd;
 
@@ -5101,11 +5101,18 @@ impl Screen {
     }
     /// A tab's panes, with the fields only Screen can fill stamped onto them.
     ///
-    /// `Tab` knows a pane's geometry and title; it does not know the pid, the cwd or the command,
-    /// which arrive from the pty thread on a tick. Every consumer of `PaneInfo` goes through here
-    /// so that none of them has to know that.
+    /// `Tab` knows a pane's geometry and title; it does not know the pid, the cwd, the command or
+    /// when the pane last emitted output. Every consumer of `PaneInfo` goes through here so that
+    /// none of them has to know that.
     fn pane_infos_for_tab(&self, tab: &Tab) -> Vec<PaneInfo> {
         let mut pane_infos = tab.pane_infos();
+        // output activity is held as an `Instant`, which says nothing to a consumer in another
+        // process - anchor it to the wall clock once per call rather than once per pane
+        let now = Instant::now();
+        let epoch_now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since_epoch| since_epoch.as_millis() as u64)
+            .ok();
         for pane_info in pane_infos.iter_mut() {
             if pane_info.is_plugin {
                 continue;
@@ -5121,6 +5128,14 @@ impl Screen {
                     .as_ref()
                     .map(|command| command.join(" "));
             }
+            pane_info.last_output_at = epoch_now_ms.and_then(|epoch_now_ms| {
+                self.pane_output_activity
+                    .get(&PaneId::Terminal(pane_info.id))
+                    .map(|last_output| {
+                        let ms_ago = now.saturating_duration_since(*last_output).as_millis() as u64;
+                        epoch_now_ms.saturating_sub(ms_ago)
+                    })
+            });
         }
         pane_infos
     }
