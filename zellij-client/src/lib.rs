@@ -437,13 +437,54 @@ fn create_ipc_pipe(teardown: Option<TerminalTeardown>) -> PathBuf {
     sock_dir
 }
 
+/// The terminal device this client is attached to, for the session's client list.
+///
+/// `None` is a real answer, not a failure: a web client and a CLI action have no controlling
+/// terminal, and neither does a client whose stdin has been redirected.
+#[cfg(unix)]
+pub fn own_tty() -> Option<String> {
+    use std::os::fd::BorrowedFd;
+    // stdin, because that is the descriptor the client reads its keys from - the one that names
+    // the terminal a human is actually sitting at
+    let stdin = unsafe { BorrowedFd::borrow_raw(0) };
+    nix::unistd::ttyname(stdin)
+        .ok()
+        .map(|path| path.display().to_string())
+}
+
+#[cfg(not(unix))]
+pub fn own_tty() -> Option<String> {
+    None
+}
+
+/// The binary the server is spawned from, when it is not this one.
+///
+/// Set once, before any client work, from the config's `pin_exe` (see
+/// `server_exe_for_interactive_launch`). It lives here rather than travelling through
+/// `spawn_server` because that call is behind the `ClientOsApi` trait, and threading a value
+/// through a trait, its fake, and five call sites to say one thing is a poor trade.
+static PINNED_SERVER_EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Tell the client which binary to start servers from. Only the first call counts.
+pub fn record_pinned_server_exe(server_exe: Option<PathBuf>) {
+    let _ = PINNED_SERVER_EXE.set(server_exe);
+}
+
+/// The binary a new server is started from: the pinned copy if one was recorded, else this one.
+fn server_exe() -> io::Result<PathBuf> {
+    match PINNED_SERVER_EXE.get().cloned().flatten() {
+        Some(pinned) => Ok(pinned),
+        None => current_exe(),
+    }
+}
+
 /// Spawn the Zellij server process.
 ///
 /// On Unix the server daemonizes (double-fork) inside start_server(), so
 /// the intermediate child exits immediately and `cmd.status()` returns.
 #[cfg(not(windows))]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
-    let mut cmd = Command::new(current_exe()?);
+    let mut cmd = Command::new(server_exe()?);
     cmd.arg("--server").arg(socket_path);
     if debug {
         cmd.arg("--debug");
@@ -1017,6 +1058,7 @@ pub fn start_client(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: false,
                 cwd: None,
+                tty: own_tty(),
             };
             (
                 ClientToServerMsg::AttachClient {
@@ -1062,6 +1104,7 @@ pub fn start_client(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: force_run_commands,
                 cwd,
+                tty: own_tty(),
             };
 
             os_input.update_session_name(name);
@@ -1118,6 +1161,7 @@ pub fn start_client(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: false,
                 cwd: layout_cwd,
+                tty: own_tty(),
             };
 
             os_input.update_session_name(name);
@@ -1578,6 +1622,7 @@ pub fn start_server_detached(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: force_run_commands,
                 cwd,
+                tty: own_tty(),
             };
 
             os_input.update_session_name(name);
@@ -1635,6 +1680,7 @@ pub fn start_server_detached(
                 max_panes: cli_args.max_panes,
                 force_run_layout_commands: false,
                 cwd: layout_cwd,
+                tty: own_tty(),
             };
 
             os_input.update_session_name(name);
