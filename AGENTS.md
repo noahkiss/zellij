@@ -255,9 +255,23 @@ that were silently carried by the shell all fail at once.
 
 ## Rolling a new config key out before every machine has the binary
 
-**An unknown key in `config.kdl` is ignored, not an error.** Verified by running a config carrying
-three new keys through the previous release's binary: `setup --check` still reported
+**An unknown TOP-LEVEL key in `config.kdl` is ignored, not an error.** Verified by running a config
+carrying three new keys through the previous release's binary: `setup --check` still reported
 `CONFIG FILE: Well defined`.
+
+**The rule stops at the top level. A block that parses its own children rejects an unknown one, and
+that fails the WHOLE config, not just the block.** `session_service` is the known example:
+
+```
+× Failed to parse Zellij configuration
+╰── Unknown session_service entry: "managed_session" (expected systemd, launchd or pin_exe)
+```
+
+So a key nested inside such a block CANNOT be rolled out ahead of the binary — it has to ship with
+the code that accepts it. Do not generalise a top-level probe to a nested key: test the key you
+actually intend to add, in the position you intend to add it, and re-run `zellij setup --check`
+**before committing**. Getting this wrong breaks every machine that pulls the config, not just the
+one that is behind.
 
 That decides the rollout order for a config-only feature. The key can be added to a shared config
 first and the binaries upgraded afterwards, in any order — machines still on the old build ignore it
