@@ -1149,6 +1149,16 @@ impl Pty {
                     }
                 }
 
+                // fork addition: the same news, told to everyone. `CommandPaneExited` above only
+                // reaches the plugin that opened the pane, so a command pane started by a layout
+                // or by the CLI could fail and notify nobody. This is broadcast like `PaneClosed`,
+                // so it survives a fully detached session.
+                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                    None,
+                    None,
+                    Event::PaneExited(pane_id.into(), exit_status),
+                )]));
+
                 if hold_on_close {
                     let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                         pane_id,
@@ -1634,7 +1644,14 @@ impl Pty {
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
-            move |pane_id, exit_status, _command| {
+            move |pane_id: PaneId, exit_status, _command| {
+                // fork addition: broadcast the exit, so a pane that a layout started is not the
+                // one kind of pane whose death nobody hears - see the note in `spawn_terminal`
+                let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                    None,
+                    None,
+                    Event::PaneExited(pane_id.into(), exit_status),
+                )]));
                 let _ = senders.send_to_screen(ScreenInstruction::ClosePane(
                     pane_id,
                     None,
@@ -1673,6 +1690,15 @@ impl Pty {
                                 )]));
                             }
                         }
+
+                        // fork addition: broadcast the exit, so a command pane that fails is
+                        // visible to a consumer that did not start it - see the note in
+                        // `spawn_terminal`
+                        let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                            None,
+                            None,
+                            Event::PaneExited(pane_id.into(), exit_status),
+                        )]));
 
                         if hold_on_close {
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
@@ -1924,6 +1950,14 @@ impl Pty {
                                 )]));
                             }
                         }
+                        // fork addition: broadcast the exit, so a command pane that fails is
+                        // visible to a consumer that did not start it - see the note in
+                        // `spawn_terminal`
+                        let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                            None,
+                            None,
+                            Event::PaneExited(pane_id.into(), exit_status),
+                        )]));
                         if hold_on_close {
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,

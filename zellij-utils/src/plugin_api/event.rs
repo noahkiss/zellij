@@ -314,6 +314,18 @@ impl TryFrom<ProtobufEvent> for Event {
                 },
                 _ => Err("Malformed payload for the PaneOpened Event"),
             },
+            Some(ProtobufEventType::PaneExited) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::PaneExitedPayload(pane_exited_payload)) => {
+                    let pane_id = pane_exited_payload
+                        .pane_id
+                        .ok_or("Malformed payload for the PaneExited Event")?;
+                    Ok(Event::PaneExited(
+                        PaneId::try_from(pane_id)?,
+                        pane_exited_payload.exit_status,
+                    ))
+                },
+                _ => Err("Malformed payload for the PaneExited Event"),
+            },
             Some(ProtobufEventType::EditPaneOpened) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::EditPaneOpenedPayload(command_pane_opened_payload)) => {
                     Ok(Event::EditPaneOpened(
@@ -1047,6 +1059,13 @@ impl TryFrom<Event> for ProtobufEvent {
                 name: ProtobufEventType::PaneOpened as i32,
                 payload: Some(event::Payload::PaneOpenedPayload(PaneOpenedPayload {
                     pane_id: Some(pane_id.try_into()?),
+                })),
+            }),
+            Event::PaneExited(pane_id, exit_status) => Ok(ProtobufEvent {
+                name: ProtobufEventType::PaneExited as i32,
+                payload: Some(event::Payload::PaneExitedPayload(PaneExitedPayload {
+                    pane_id: Some(pane_id.try_into()?),
+                    exit_status,
                 })),
             }),
             Event::EditPaneOpened(terminal_pane_id, context) => {
@@ -2407,6 +2426,7 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::CommandPaneExited => EventType::CommandPaneExited,
             ProtobufEventType::PaneClosed => EventType::PaneClosed,
             ProtobufEventType::PaneOpened => EventType::PaneOpened,
+            ProtobufEventType::PaneExited => EventType::PaneExited,
             ProtobufEventType::EditPaneOpened => EventType::EditPaneOpened,
             ProtobufEventType::EditPaneExited => EventType::EditPaneExited,
             ProtobufEventType::CommandPaneReRun => EventType::CommandPaneReRun,
@@ -2468,6 +2488,7 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::CommandPaneExited => ProtobufEventType::CommandPaneExited,
             EventType::PaneClosed => ProtobufEventType::PaneClosed,
             EventType::PaneOpened => ProtobufEventType::PaneOpened,
+            EventType::PaneExited => ProtobufEventType::PaneExited,
             EventType::EditPaneOpened => ProtobufEventType::EditPaneOpened,
             EventType::EditPaneExited => ProtobufEventType::EditPaneExited,
             EventType::CommandPaneReRun => ProtobufEventType::CommandPaneReRun,
@@ -3660,6 +3681,16 @@ mod tests {
     fn pane_opened_roundtrips_through_protobuf() {
         for pane_id in [PaneId::Terminal(7), PaneId::Plugin(2)] {
             let event = Event::PaneOpened(pane_id);
+            let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
+            let roundtripped: Event = protobuf.try_into().unwrap();
+            assert_eq!(event, roundtripped);
+        }
+    }
+
+    #[test]
+    fn pane_exited_roundtrips_through_protobuf() {
+        for exit_status in [Some(1), Some(0), None] {
+            let event = Event::PaneExited(PaneId::Terminal(7), exit_status);
             let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
             let roundtripped: Event = protobuf.try_into().unwrap();
             assert_eq!(event, roundtripped);

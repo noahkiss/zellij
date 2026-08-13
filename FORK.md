@@ -2333,6 +2333,27 @@ act on nor keep up with, and writing them would rewrite the file for every pane 
 
 Proto tags 38-45.
 
+### `Event::PaneExited`, so a failed command pane tells someone
+
+A command pane that fails had exactly one way to say so, and it only worked for one kind of caller:
+`Event::CommandPaneExited` goes to the plugin that opened the pane. A pane started by a layout or by
+`zellij action new-pane -- <command>` has no such plugin, so its exit status was read in the pty
+thread and thrown away. `PaneClosed` fired, carrying no status. A build in a background tab could
+fail and nothing outside that tab ever knew.
+
+`Event::PaneExited(PaneId, Option<i32>)` is the same news told to everyone. It is broadcast like
+`PaneClosed`, from every path that spawns a terminal - the interactive one, the layout one and the
+re-run of a held command pane - so it works in a fully detached session. `CommandPaneExited` still
+goes to the originating plugin exactly as before.
+
+- The status is `None` when the process was killed by a signal or the status could not be read.
+  `None` is not zero, and a consumer deciding whether a job succeeded must not treat it as such.
+- It fires for a plain shell exiting too, which is the same event from zellij's point of view.
+- A pane that holds after exiting keeps reporting `exited` and `exit_status` on `PaneInfo`; a pane
+  configured to close is announced by `PaneClosed` immediately afterwards.
+
+Proto: `EventType` 53, event payload 47.
+
 ### `Event::PaneOpened`, the counterpart of `PaneClosed`
 
 `PaneClosed` was the only structural lifecycle event zellij had. It fires from every close path and

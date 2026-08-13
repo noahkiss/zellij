@@ -1015,6 +1015,18 @@ pub enum Event {
     /// is broadcast to every subscribed plugin rather than to the client that asked for the pane.
     /// A pane moved between tabs is not a new pane and does not fire it.
     PaneOpened(PaneId),
+    /// The process in a terminal pane exited, with the status it exited with
+    ///
+    /// It fires for every terminal pane whatever started it - a layout, the CLI, a plugin or the
+    /// user - and it is broadcast to every subscribed plugin rather than to whoever asked for the
+    /// pane. `CommandPaneExited` reports the same thing to the one plugin that opened the pane;
+    /// this is the general signal, and until now a command pane started by a layout could fail
+    /// and tell nobody.
+    ///
+    /// The status is `None` when the process was killed by a signal or the exit status could not
+    /// be read. A pane that holds after exiting keeps reporting the status on `PaneInfo`; a pane
+    /// that closes is then announced by `PaneClosed`, which carries no status of its own.
+    PaneExited(PaneId, Option<i32>),
     EditPaneOpened(u32, Context),              // u32 - terminal_pane_id
     EditPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> - exit code
     CommandPaneReRun(u32, Context),            // u32 - terminal_pane_id, Option<i32> -

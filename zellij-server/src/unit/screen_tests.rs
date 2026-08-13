@@ -12844,6 +12844,53 @@ pub fn pane_info_reports_no_environment_without_an_allowlist() {
     assert!(reported.pane_env.is_empty());
 }
 
+/// The event half of this is in `pty_tests`; this is the state half, read with nobody attached.
+#[test]
+pub fn a_held_command_pane_reports_its_exit_status_with_no_clients_attached() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let run_command = RunCommand {
+        command: PathBuf::from("false"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = mock_screen.to_screen.send(ScreenInstruction::HoldPane(
+        PaneId::Terminal(1),
+        Some(1),
+        run_command,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("a detached session should still report state to a background plugin");
+    let failed = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(failed.exited, "a held pane whose command exited says so");
+    assert_eq!(failed.exit_status, Some(1));
+}
+
 #[test]
 pub fn pane_info_reports_the_alternate_screen_and_an_explicit_title() {
     let size = Size { cols: 80, rows: 10 };

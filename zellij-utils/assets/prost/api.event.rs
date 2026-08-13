@@ -10,7 +10,7 @@ pub struct EventNameList {
 pub struct Event {
     #[prost(enumeration="EventType", tag="1")]
     pub name: i32,
-    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43, 44, 45, 46")]
+    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47")]
     pub payload: ::core::option::Option<event::Payload>,
 }
 /// Nested message and enum types in `Event`.
@@ -106,6 +106,8 @@ pub mod event {
         SnapshotRestoreFailedPayload(super::SnapshotRestoreFailedPayload),
         #[prost(message, tag="46")]
         PaneOpenedPayload(super::PaneOpenedPayload),
+        #[prost(message, tag="47")]
+        PaneExitedPayload(super::PaneExitedPayload),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -306,6 +308,14 @@ pub struct PaneClosedPayload {
 pub struct PaneOpenedPayload {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneExitedPayload {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+    #[prost(int32, optional, tag="2")]
+    pub exit_status: ::core::option::Option<i32>,
 }
 /// duplicate of plugin_command.PaneId because protobuffs don't like recursive imports
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1020,6 +1030,7 @@ pub enum EventType {
     ListSnapshots = 50,
     SnapshotRestoreFailed = 51,
     PaneOpened = 52,
+    PaneExited = 53,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1079,6 +1090,7 @@ impl EventType {
             EventType::ListSnapshots => "ListSnapshots",
             EventType::SnapshotRestoreFailed => "SnapshotRestoreFailed",
             EventType::PaneOpened => "PaneOpened",
+            EventType::PaneExited => "PaneExited",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1135,6 +1147,7 @@ impl EventType {
             "ListSnapshots" => Some(Self::ListSnapshots),
             "SnapshotRestoreFailed" => Some(Self::SnapshotRestoreFailed),
             "PaneOpened" => Some(Self::PaneOpened),
+            "PaneExited" => Some(Self::PaneExited),
             _ => None,
         }
     }

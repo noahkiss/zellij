@@ -13,11 +13,15 @@ use zellij_utils::errors::ErrorContext;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::ipc::{ClientToServerMsg, IpcReceiverWithContext, ServerToClientMsg};
 
+type QuitCb = Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>;
+
 #[derive(Clone)]
 struct MockOsApi {
     cwds: Arc<Mutex<HashMap<u32, PathBuf>>>,
     cmds: Arc<Mutex<HashMap<u32, Vec<String>>>>,
     cmds_by_ppid: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// the callback the pty thread hands to a spawn, kept so a test can make the process exit
+    quit_cb: Arc<Mutex<Option<QuitCb>>>,
 }
 
 impl MockOsApi {
@@ -26,7 +30,16 @@ impl MockOsApi {
             cwds: Arc::new(Mutex::new(HashMap::new())),
             cmds: Arc::new(Mutex::new(HashMap::new())),
             cmds_by_ppid: Arc::new(Mutex::new(HashMap::new())),
+            quit_cb: Arc::new(Mutex::new(None)),
         }
+    }
+    /// Make the process behind the last spawned pane exit with this status.
+    fn exit_last_spawned_pane(&self, pane_id: PaneId, exit_status: Option<i32>) {
+        let quit_cb = self.quit_cb.lock().unwrap();
+        let quit_cb = quit_cb
+            .as_ref()
+            .expect("the pty thread should have handed us a quit callback");
+        quit_cb(pane_id, exit_status, RunCommand::default());
     }
     fn set_cwd(&self, pid: u32, path: PathBuf) {
         self.cwds.lock().unwrap().insert(pid, path);
@@ -59,10 +72,15 @@ impl ServerOsApi for MockOsApi {
     fn spawn_terminal(
         &self,
         _: TerminalAction,
-        _: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
+        quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
         _: Option<PathBuf>,
     ) -> anyhow::Result<(u32, Box<dyn AsyncReader>, Option<u32>)> {
-        unimplemented!()
+        *self.quit_cb.lock().unwrap() = Some(quit_cb);
+        Ok((
+            1,
+            Box::new(crate::os_input_output::NullAsyncReader) as Box<dyn AsyncReader>,
+            Some(100),
+        ))
     }
     fn write_to_tty_stdin(&self, _: u32, buf: &[u8]) -> anyhow::Result<usize> {
         Ok(buf.len())
@@ -522,4 +540,72 @@ fn what_the_environment_says_wins_and_bin_sh_is_still_the_last_resort() {
         PathBuf::from("/bin/zsh")
     );
     assert_eq!(default_shell_from(None, || None), PathBuf::from("/bin/sh"));
+}
+
+fn collect_pane_exited_events(
+    rx: &channels::Receiver<(PluginInstruction, ErrorContext)>,
+) -> Vec<(PaneId, Option<i32>)> {
+    let mut events = Vec::new();
+    while let Ok((instruction, _)) = rx.try_recv() {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (plugin_id, client_id, event) in updates {
+                if let Event::PaneExited(pane_id, exit_status) = event {
+                    assert!(
+                        plugin_id.is_none() && client_id.is_none(),
+                        "PaneExited must be broadcast, not targeted at {:?}/{:?}",
+                        plugin_id,
+                        client_id
+                    );
+                    events.push((pane_id.into(), exit_status));
+                }
+            }
+        }
+    }
+    events
+}
+
+/// A command pane nobody is subscribed to could fail and tell nobody: `CommandPaneExited` goes
+/// only to the plugin that opened the pane, and a layout or the CLI is not a plugin.
+#[test]
+fn a_failed_command_pane_broadcasts_its_exit_status() {
+    let mock = MockOsApi::new();
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock.clone());
+    let run_command = RunCommand {
+        command: PathBuf::from("false"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(run_command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .expect("the mock spawns a terminal");
+    // drain everything the spawn itself reported
+    let _ = collect_pane_exited_events(&rx);
+
+    mock.exit_last_spawned_pane(PaneId::Terminal(1), Some(1));
+
+    let events = collect_pane_exited_events(&rx);
+    assert_eq!(
+        events,
+        vec![(PaneId::Terminal(1), Some(1))],
+        "a command pane that failed should broadcast its exit status"
+    );
+}
+
+/// A process killed by a signal has no exit status, and saying so is not the same as saying zero.
+#[test]
+fn a_pane_killed_by_a_signal_broadcasts_no_exit_status() {
+    let mock = MockOsApi::new();
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock.clone());
+    let _ = pty
+        .spawn_terminal(None, ClientTabIndexOrPaneId::TabIndex(0))
+        .expect("the mock spawns a terminal");
+    let _ = collect_pane_exited_events(&rx);
+
+    mock.exit_last_spawned_pane(PaneId::Terminal(1), None);
+
+    let events = collect_pane_exited_events(&rx);
+    assert_eq!(events, vec![(PaneId::Terminal(1), None)]);
 }

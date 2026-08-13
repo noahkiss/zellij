@@ -75,6 +75,7 @@ enum EventType {
     ListSnapshots = 50;
     SnapshotRestoreFailed = 51;
     PaneOpened = 52;
+    PaneExited = 53;
 }
 
 message EventNameList {
@@ -129,6 +130,7 @@ message Event {
     ListSnapshotsPayload list_snapshots_payload = 44;
     SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 45;
     PaneOpenedPayload pane_opened_payload = 46;
+    PaneExitedPayload pane_exited_payload = 47;
   }
 }
 
@@ -266,6 +268,11 @@ message PaneClosedPayload {
 
 message PaneOpenedPayload {
   PaneId pane_id = 1;
+}
+
+message PaneExitedPayload {
+  PaneId pane_id = 1;
+  optional int32 exit_status = 2;
 }
 
 // duplicate of plugin_command.PaneId because protobuffs don't like recursive imports
