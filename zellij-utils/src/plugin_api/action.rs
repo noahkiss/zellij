@@ -1187,7 +1187,11 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::MoveTabToIndex { .. }
             | Action::SignalPane { .. }
             | Action::BreakPanesToNewTab { .. }
-            | Action::BreakPanesToTabWithId { .. } => {
+            | Action::BreakPanesToTabWithId { .. }
+            | Action::SetPaneFullscreen { .. }
+            | Action::SetPanePinned { .. }
+            | Action::SetPaneFloating { .. }
+            | Action::SetSyncTab { .. } => {
                 Err("These are CLI-only actions, not available in keybindings")
             },
             Action::SwitchToMode { input_mode } => {

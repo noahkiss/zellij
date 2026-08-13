@@ -1831,6 +1831,49 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::SetPaneFullscreen {
+            pane_id,
+            fullscreen,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPaneFullscreen(
+                    pane_id.map(|p| p.into()),
+                    fullscreen,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetPanePinned { pane_id, pinned } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPanePinned(
+                    pane_id.map(|p| p.into()),
+                    pinned,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetPaneFloating { pane_id, floating } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPaneFloating(
+                    pane_id.map(|p| p.into()),
+                    floating,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetSyncTab { tab_id, sync } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetSyncTab(
+                    tab_id.map(|id| id as usize),
+                    sync,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::BreakPanesToNewTab {
             pane_ids,
             name,

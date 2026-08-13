@@ -1228,7 +1228,11 @@ impl From<crate::input::actions::Action>
             SetLightThemeAction,
             SetPaneBorderlessAction,
             SetPaneColorAction,
+            SetPaneFloatingAction,
             SetPaneFrameStyleAction,
+            SetPaneFullscreenAction,
+            SetPanePinnedAction,
+            SetSyncTabAction,
             ShowFloatingPanesAction,
             SignalPaneAction,
             SkipConfirmAction,
@@ -2171,6 +2175,28 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::MoveTabToIndex { id, index } => {
                 ActionType::MoveTabToIndex(MoveTabToIndexAction { id, index })
+            },
+            crate::input::actions::Action::SetPaneFullscreen {
+                pane_id,
+                fullscreen,
+            } => ActionType::SetPaneFullscreen(SetPaneFullscreenAction {
+                pane_id: pane_id.map(|p| p.into()),
+                fullscreen,
+            }),
+            crate::input::actions::Action::SetPanePinned { pane_id, pinned } => {
+                ActionType::SetPanePinned(SetPanePinnedAction {
+                    pane_id: pane_id.map(|p| p.into()),
+                    pinned,
+                })
+            },
+            crate::input::actions::Action::SetPaneFloating { pane_id, floating } => {
+                ActionType::SetPaneFloating(SetPaneFloatingAction {
+                    pane_id: pane_id.map(|p| p.into()),
+                    floating,
+                })
+            },
+            crate::input::actions::Action::SetSyncTab { tab_id, sync } => {
+                ActionType::SetSyncTab(SetSyncTabAction { tab_id, sync })
             },
             crate::input::actions::Action::BreakPanesToNewTab {
                 pane_ids,
@@ -3168,6 +3194,24 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::MoveTabToIndex(a) => Ok(crate::input::actions::Action::MoveTabToIndex {
                 id: a.id,
                 index: a.index,
+            }),
+            ActionType::SetPaneFullscreen(a) => {
+                Ok(crate::input::actions::Action::SetPaneFullscreen {
+                    pane_id: a.pane_id.map(|p| p.try_into()).transpose()?,
+                    fullscreen: a.fullscreen,
+                })
+            },
+            ActionType::SetPanePinned(a) => Ok(crate::input::actions::Action::SetPanePinned {
+                pane_id: a.pane_id.map(|p| p.try_into()).transpose()?,
+                pinned: a.pinned,
+            }),
+            ActionType::SetPaneFloating(a) => Ok(crate::input::actions::Action::SetPaneFloating {
+                pane_id: a.pane_id.map(|p| p.try_into()).transpose()?,
+                floating: a.floating,
+            }),
+            ActionType::SetSyncTab(a) => Ok(crate::input::actions::Action::SetSyncTab {
+                tab_id: a.tab_id,
+                sync: a.sync,
             }),
             ActionType::BreakPanesToNewTab(a) => {
                 Ok(crate::input::actions::Action::BreakPanesToNewTab {

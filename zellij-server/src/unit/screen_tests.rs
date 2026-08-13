@@ -13271,3 +13271,97 @@ pub fn breaking_only_missing_panes_would_leave_an_empty_tab() {
         .expect("TEST");
     assert_eq!(screen.tabs.len(), 2, "a tab was created for nothing");
 }
+
+#[test]
+pub fn setting_sync_is_idempotent_and_says_so() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    let tab = screen.get_tab_by_id(0).expect("TEST");
+    assert!(!tab.is_sync_panes_active(), "off to begin with");
+
+    let tab = screen.get_tab_by_id_mut(0).expect("TEST");
+    assert!(
+        tab.set_sync_panes_is_active(true),
+        "the first call changes it"
+    );
+    assert!(tab.is_sync_panes_active());
+    assert!(
+        !tab.set_sync_panes_is_active(true),
+        "the second call changes nothing"
+    );
+    assert!(tab.is_sync_panes_active(), "and leaves it on");
+    assert!(tab.set_sync_panes_is_active(false), "off again changes it");
+    assert!(!tab.is_sync_panes_active());
+}
+
+#[test]
+pub fn setting_fullscreen_moves_it_rather_than_only_clearing_it() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    let tab = screen.get_tab_by_id_mut(0).expect("TEST");
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        false,
+        NewPanePlacement::default(),
+        Some(1),
+        None,
+    )
+    .expect("TEST");
+
+    assert!(tab.set_pane_fullscreen(PaneId::Terminal(1), true));
+    assert!(tab.pane_is_fullscreen(PaneId::Terminal(1)));
+    assert!(
+        !tab.set_pane_fullscreen(PaneId::Terminal(1), true),
+        "already fullscreen"
+    );
+
+    // the toggle would only clear fullscreen here; the setter hands it to the named pane
+    assert!(tab.set_pane_fullscreen(PaneId::Terminal(2), true));
+    assert!(tab.pane_is_fullscreen(PaneId::Terminal(2)));
+    assert!(!tab.pane_is_fullscreen(PaneId::Terminal(1)));
+
+    assert!(tab.set_pane_fullscreen(PaneId::Terminal(2), false));
+    assert!(!tab.pane_is_fullscreen(PaneId::Terminal(2)));
+    assert!(
+        !tab.set_pane_fullscreen(PaneId::Terminal(2), false),
+        "already not fullscreen"
+    );
+}
+
+#[test]
+pub fn a_setter_with_no_pane_id_resolves_the_focused_pane() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    assert_eq!(
+        screen.tab_id_owning_pane(Some(PaneId::Terminal(1)), client_id),
+        Some((0, PaneId::Terminal(1))),
+        "an explicit id names its own tab"
+    );
+    assert_eq!(
+        screen.tab_id_owning_pane(Some(PaneId::Terminal(9)), client_id),
+        None,
+        "a pane no tab owns resolves to nothing"
+    );
+    assert_eq!(
+        screen.tab_id_owning_pane(None, client_id),
+        Some((0, PaneId::Terminal(1))),
+        "no id means the focused pane"
+    );
+}

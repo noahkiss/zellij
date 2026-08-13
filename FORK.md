@@ -2404,6 +2404,36 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### Idempotent setters for the four remaining toggles
+
+```
+zellij action set-fullscreen on --pane-id terminal_3
+zellij action set-pane-pinned off --pane-id terminal_3
+zellij action set-pane-floating on
+zellij action set-sync-tab off --tab-id 2
+```
+
+Fullscreen, pinned, embed/float and tab sync could only be toggled. A controller that lost track of
+the state could not converge on it without reading first, and the read races anything else touching
+the session. Each now has a set-form, the shape the fork already gave floating-panes, borderless and
+the theme.
+
+The value is positional and boolish: `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0`. `--pane-id` and
+`--tab-id` are optional and default to what the calling client is focused on, so the interactive use
+stays short; naming the target explicitly is what makes the call work in a detached session. The
+toggles are untouched.
+
+Exit status follows `show-floating-panes`: **0** the state changed, **2** it was already so. A target
+that does not exist prints the reason on stderr and exits non-zero — every failing `zellij action`
+exits 2, because the client turns any error message into that one code, so **the message on stderr,
+not the exit status, is what separates a miss from a no-op**. `set-pane-floating` reports a refused
+move — the last tiled pane may not float, and an embed needs room — the same way, because reporting
+"already so" for a move that did not happen would be a lie. `set-fullscreen on` differs from the
+toggle in one more way: when another pane holds fullscreen, it hands fullscreen to the named pane
+instead of merely clearing it.
+
+Four `Action`s, contract tags 163-166.
+
 ### Move a pane between tabs from the CLI (`break-pane`)
 
 ```
@@ -2427,7 +2457,7 @@ Both print the affected tab's id.
 **A pane that no tab owns is now an error rather than a silent skip.** `break_multiple_panes_*`
 drops a pane id it cannot find, so a request naming only stale ids used to move nothing, report
 success, and — for a new tab — leave an empty tab behind. Both instructions now check every pane
-first and exit 1 naming the first miss, changing nothing. A missing `--tab-id` exits 1 the same way.
+first and fail naming the first miss, changing nothing. A missing `--tab-id` fails the same way.
 This applies to the plugin calls that share these instructions too: a plugin passing a stale pane id
 now gets an error instead of a partial move.
 
@@ -2447,8 +2477,8 @@ has turned off canonical input, or a pane whose reader has wedged, will not do. 
 
 `--pane-id` is required: a signal is destructive enough that it should never fall back to whatever
 happens to be focused, and requiring it makes the command safe in a detached session. Naming a pane
-that does not exist, or a plugin pane, which runs no process, exits 1 with the reason rather than
-warning into the log.
+that does not exist, or a plugin pane, which runs no process, fails with the reason on stderr rather
+than warning into the log.
 
 The signal goes to the process zellij spawned for the pane — the pane's shell — which is what the
 plugin API has always done. A shell without job control runs its command in that same process, so

@@ -290,6 +290,10 @@ message Action {
     SignalPaneAction signal_pane = 160;
     BreakPanesToNewTabAction break_panes_to_new_tab = 161;
     BreakPanesToTabWithIdAction break_panes_to_tab_with_id = 162;
+    SetPaneFullscreenAction set_pane_fullscreen = 163;
+    SetPanePinnedAction set_pane_pinned = 164;
+    SetPaneFloatingAction set_pane_floating = 165;
+    SetSyncTabAction set_sync_tab = 166;
   }
 }
 
@@ -1313,3 +1317,8 @@ message BreakPanesToTabWithIdAction {
   uint32 tab_id = 2;
   bool no_focus = 3;
 }
+
+message SetPaneFullscreenAction { optional PaneId pane_id = 1; bool fullscreen = 2; }
+message SetPanePinnedAction { optional PaneId pane_id = 1; bool pinned = 2; }
+message SetPaneFloatingAction { optional PaneId pane_id = 1; bool floating = 2; }
+message SetSyncTabAction { optional uint32 tab_id = 1; bool sync = 2; }

@@ -1747,6 +1747,55 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
     },
+    /// Set whether a pane is fullscreen, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
+    /// exist prints the reason on stderr and exits non-zero.
+    SetFullscreen {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Set whether a floating pane is pinned on top, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
+    /// exist prints the reason on stderr and exits non-zero.
+    SetPanePinned {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Set whether a pane floats or is embedded, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
+    /// exist, or a move the layout refuses (the last tiled pane cannot float), prints the reason
+    /// on stderr and exits non-zero.
+    SetPaneFloating {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Set whether input is synchronised across a tab's panes, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A tab that does not
+    /// exist prints the reason on stderr and exits non-zero.
+    SetSyncTab {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific tab by ID
+        #[clap(short, long, value_parser)]
+        tab_id: Option<usize>,
+    },
     /// Move panes out into a new tab
     ///
     /// Without --pane-id this moves the focused pane. Returns the new tab's ID.
@@ -1763,7 +1812,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Move panes into an existing tab
     ///
-    /// Returns exit code 1 if the tab or any of the panes does not exist.
+    /// A tab or pane that does not exist prints the reason on stderr and exits non-zero.
     BreakPaneToTab {
         /// Move this pane (repeatable)
         #[clap(short, long, value_parser, required(true))]
@@ -1781,7 +1830,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     BreakPaneLeft,
     /// Send a signal to the process running in a pane
     ///
-    /// Returns exit code 0 if the signal was sent, 1 if the pane does not exist or runs no process.
+    /// A pane that does not exist, or a plugin pane, which runs no process, prints the reason on
+    /// stderr and exits non-zero.
     SignalPane {
         /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
         #[clap(short, long, value_parser)]
@@ -1952,6 +2002,42 @@ mod tests {
     fn subscribe_requires_pane_id() {
         let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_setter_takes_a_boolish_value_and_an_optional_target() {
+        match parse_action(&["set-fullscreen", "on", "--pane-id", "terminal_1"]) {
+            CliAction::SetFullscreen { enabled, pane_id } => {
+                assert!(enabled);
+                assert_eq!(pane_id.as_deref(), Some("terminal_1"));
+            },
+            other => panic!("Expected SetFullscreen, got {:?}", other),
+        }
+        match parse_action(&["set-pane-pinned", "false"]) {
+            CliAction::SetPanePinned { enabled, pane_id } => {
+                assert!(!enabled);
+                assert_eq!(pane_id, None, "no target means the focused pane");
+            },
+            other => panic!("Expected SetPanePinned, got {:?}", other),
+        }
+        match parse_action(&["set-pane-floating", "1", "--pane-id", "3"]) {
+            CliAction::SetPaneFloating { enabled, .. } => assert!(enabled),
+            other => panic!("Expected SetPaneFloating, got {:?}", other),
+        }
+        match parse_action(&["set-sync-tab", "off", "--tab-id", "2"]) {
+            CliAction::SetSyncTab { enabled, tab_id } => {
+                assert!(!enabled);
+                assert_eq!(tab_id, Some(2));
+            },
+            other => panic!("Expected SetSyncTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_setter_refuses_a_missing_or_unreadable_value() {
+        assert!(action_parse_fails(&["set-fullscreen"]));
+        assert!(action_parse_fails(&["set-fullscreen", "maybe"]));
+        assert!(action_parse_fails(&["set-sync-tab"]));
     }
 
     #[test]

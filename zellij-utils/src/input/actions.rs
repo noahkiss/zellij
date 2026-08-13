@@ -578,6 +578,22 @@ pub enum Action {
         pane_id: PaneId,
         signal: PaneSignal,
     },
+    SetPaneFullscreen {
+        pane_id: Option<PaneId>,
+        fullscreen: bool,
+    },
+    SetPanePinned {
+        pane_id: Option<PaneId>,
+        pinned: bool,
+    },
+    SetPaneFloating {
+        pane_id: Option<PaneId>,
+        floating: bool,
+    },
+    SetSyncTab {
+        tab_id: Option<u32>,
+        sync: bool,
+    },
     BreakPanesToNewTab {
         pane_ids: Vec<PaneId>,
         name: Option<String>,
@@ -2093,6 +2109,22 @@ impl Action {
                     }
                 }
             },
+            CliAction::SetFullscreen { enabled, pane_id } => Ok(vec![Action::SetPaneFullscreen {
+                pane_id: parse_optional_pane_id(pane_id)?,
+                fullscreen: enabled,
+            }]),
+            CliAction::SetPanePinned { enabled, pane_id } => Ok(vec![Action::SetPanePinned {
+                pane_id: parse_optional_pane_id(pane_id)?,
+                pinned: enabled,
+            }]),
+            CliAction::SetPaneFloating { enabled, pane_id } => Ok(vec![Action::SetPaneFloating {
+                pane_id: parse_optional_pane_id(pane_id)?,
+                floating: enabled,
+            }]),
+            CliAction::SetSyncTab { enabled, tab_id } => Ok(vec![Action::SetSyncTab {
+                tab_id: tab_id.map(|id| id as u32),
+                sync: enabled,
+            }]),
             CliAction::BreakPane {
                 pane_id,
                 name,
@@ -4263,4 +4295,17 @@ fn parse_pane_ids(pane_ids: &[String]) -> Result<Vec<PaneId>, String> {
             })
         })
         .collect()
+}
+
+/// Parse an optional `--pane-id`. `None` means "whatever this client is focused on".
+fn parse_optional_pane_id(pane_id: Option<String>) -> Result<Option<PaneId>, String> {
+    match pane_id {
+        None => Ok(None),
+        Some(pane_id) => PaneId::from_str(&pane_id).map(Some).map_err(|_e| {
+            format!(
+                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                pane_id
+            )
+        }),
+    }
 }

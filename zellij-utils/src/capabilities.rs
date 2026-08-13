@@ -61,6 +61,7 @@ pub const CAPABILITIES: &[&str] = &[
     "move-tab-to-index",  // zellij action move-tab --to-index
     "signal-pane",        // zellij action signal-pane --pane-id X --signal int|hup|kill
     "break-pane-cli",     // zellij action break-pane / break-pane-to-tab / -right / -left
+    "idempotent-setters", // set-fullscreen, set-pane-pinned, set-pane-floating, set-sync-tab
     "go-to-tab-name-no-focus", // zellij action go-to-tab-name --create --no-focus
     "new-pane-stacked-error", // --stacked refuses instead of creating nothing
     "dump-screen-plugin-panes", // dump-screen works on plugin panes
