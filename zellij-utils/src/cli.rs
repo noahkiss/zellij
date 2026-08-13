@@ -1902,6 +1902,22 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
 }
 
+/// Run `f` on a thread with a stack big enough to build the clap tree.
+///
+/// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
+/// which overflows the 2MB stack the test harness gives a spawned test in a debug build. Every test
+/// that builds or parses `CliArgs` must go through here, in this crate and in the `zellij` crate
+/// (`src/tests/cli.rs`) alike: the next `CliAction` subcommand will silently re-break any module
+/// that does not. The binary itself parses on the main thread and never sees this.
+pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,18 +1925,9 @@ mod tests {
     use crate::input::actions::Action;
     use clap::Parser;
 
-    /// Parse a command line on a thread with a real stack.
-    ///
-    /// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
-    /// which overflows the 2MB stack the test harness gives a spawned test in a debug build. The
-    /// binary itself parses on the main thread and never sees this.
+    /// Parse a command line on a thread with a real stack. See [`on_big_stack`].
     fn parse_cli(args: Vec<String>) -> Result<CliArgs, clap::Error> {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || CliArgs::try_parse_from(args))
-            .unwrap()
-            .join()
-            .unwrap()
+        on_big_stack(move || CliArgs::try_parse_from(args))
     }
 
     fn parse_action(args: &[&str]) -> CliAction {
