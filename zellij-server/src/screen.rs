@@ -759,7 +759,7 @@ pub enum ScreenInstruction {
     ),
     SerializeLayoutForResurrection,
     RenameSession(String, ClientId, Option<NotificationEnd>), // String -> new name
-    ListClientsMetadata(Option<PathBuf>, ClientId, Option<NotificationEnd>), // Option<PathBuf> - default shell
+    ListClientsMetadata(Option<PathBuf>, ClientId, bool, Option<NotificationEnd>), // Option<PathBuf> - default shell, bool - render as JSON
     ListPanes {
         show_all: bool,
         response_channel: crossbeam::channel::Sender<ListPanesResponse>,
@@ -8955,7 +8955,12 @@ pub(crate) fn screen_thread_main(
                     ))
                     .with_context(err_context)?;
             },
-            ScreenInstruction::ListClientsMetadata(default_shell, client_id, completion_tx) => {
+            ScreenInstruction::ListClientsMetadata(
+                default_shell,
+                client_id,
+                output_json,
+                completion_tx,
+            ) => {
                 let err_context = || format!("Failed to dump layout");
                 let session_layout_metadata = screen.get_layout_metadata(default_shell, None);
                 screen
@@ -8964,6 +8969,7 @@ pub(crate) fn screen_thread_main(
                     .send_to_plugin(PluginInstruction::ListClientsMetadata(
                         session_layout_metadata,
                         client_id,
+                        output_json,
                         completion_tx,
                     ))
                     .with_context(err_context)?;

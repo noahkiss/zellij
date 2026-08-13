@@ -544,7 +544,9 @@ pub enum Action {
         cwd: Option<PathBuf>,
         pane_title: Option<String>,
     },
-    ListClients,
+    ListClients {
+        output_json: bool,
+    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
@@ -1978,7 +1980,7 @@ impl Action {
                     skip_cache,
                 }])
             },
-            CliAction::ListClients => Ok(vec![Action::ListClients]),
+            CliAction::ListClients { json } => Ok(vec![Action::ListClients { output_json: json }]),
             CliAction::ListPanes {
                 tab,
                 command,

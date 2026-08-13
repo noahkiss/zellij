@@ -138,7 +138,12 @@ pub enum PtyInstruction {
         Option<FloatingPaneCoordinates>,
         Option<NotificationEnd>,
     ),
-    ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
+    ListClientsMetadata(
+        SessionLayoutMetadata,
+        ClientId,
+        bool,
+        Option<NotificationEnd>,
+    ),
     Reconfigure {
         client_id: ClientId,
         default_editor: Option<PathBuf>,
@@ -747,17 +752,20 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::ListClientsMetadata(
                 mut session_layout_metadata,
                 client_id,
+                output_json,
                 completion_tx,
             ) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
+                let rendered = if output_json {
+                    session_layout_metadata.list_clients_metadata_json(client_id)
+                } else {
+                    session_layout_metadata.list_clients_metadata()
+                };
                 pty.bus
                     .senders
                     .send_to_server(ServerInstruction::Log(
-                        vec![format!(
-                            "{}",
-                            session_layout_metadata.list_clients_metadata(),
-                        )],
+                        vec![rendered],
                         client_id,
                         completion_tx,
                     ))

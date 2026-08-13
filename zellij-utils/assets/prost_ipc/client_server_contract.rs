@@ -682,6 +682,8 @@ pub struct BreakPaneLeftAction {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListClientsAction {
+    #[prost(bool, tag="1")]
+    pub output_json: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

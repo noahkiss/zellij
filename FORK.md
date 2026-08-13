@@ -2404,6 +2404,23 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### `list-clients --json`
+
+```
+zellij action list-clients --json
+```
+
+The client list was a human table only, so a controller had to parse fixed-width columns to learn
+who is attached and whose terminal is shrinking the grid. `--json` prints the `ClientInfo` array
+plugins already receive in `Event::ListClients` — `client_id`, `pane_id`, `running_command`,
+`is_current_client`, and the fork's `terminal_size` and `tty` where the server knows them. Nothing
+else goes to stdout, and no clients prints `[]`.
+
+`pane_id` is the serde form of the enum, `{"Terminal": 3}`, because this is the plugin-facing struct
+verbatim rather than a second shape to keep in step. `is_current_client` marks the client that asked;
+`zellij action` is its own short-lived client focused on no pane, so a CLI query marks no row. The
+flag rides on the existing `ListClientsAction` message (field 1) and adds nothing to the contract.
+
 ### `go-to-tab-name --no-focus`
 
 ```

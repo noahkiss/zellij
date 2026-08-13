@@ -2015,7 +2015,7 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::Copy
             | Action::DumpLayout
             | Action::CliPipe { .. }
-            | Action::ListClients
+            | Action::ListClients { .. }
             | Action::ListPanes { .. }
             | Action::StackPanes { pane_ids: _ }
             | Action::ChangeFloatingPaneCoordinates {

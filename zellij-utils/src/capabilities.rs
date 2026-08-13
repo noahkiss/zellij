@@ -56,6 +56,7 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-opened-event",  // Event::PaneOpened, broadcast from every creation path
     "client-tty",         // ClientInfo.tty
     "list-clients-fixed", // the session manager's client list actually lists clients
+    "list-clients-json",  // zellij action list-clients --json
     "move-tab-to-index",  // zellij action move-tab --to-index
     "go-to-tab-name-no-focus", // zellij action go-to-tab-name --create --no-focus
     "new-pane-stacked-error", // --stacked refuses instead of creating nothing

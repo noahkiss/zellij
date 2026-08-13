@@ -1948,8 +1948,8 @@ impl From<crate::input::actions::Action>
                 cwd: cwd.map(|p| p.to_string_lossy().to_string()),
                 pane_title,
             }),
-            crate::input::actions::Action::ListClients => {
-                ActionType::ListClients(ListClientsAction {})
+            crate::input::actions::Action::ListClients { output_json } => {
+                ActionType::ListClients(ListClientsAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2850,7 +2850,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     pane_title: keybind_pipe_action.pane_title,
                 })
             },
-            ActionType::ListClients(_) => Ok(crate::input::actions::Action::ListClients),
+            ActionType::ListClients(a) => Ok(crate::input::actions::Action::ListClients {
+                output_json: a.output_json,
+            }),
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {
                     show_tab: list_panes_action.show_tab,

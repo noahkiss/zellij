@@ -1630,7 +1630,14 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short('t'), long, value_parser, display_order(10))]
         plugin_title: Option<String>,
     },
-    ListClients,
+    /// List the clients attached to this session
+    ///
+    /// Returns: One row per client in a table, or the ClientInfo array with --json
+    ListClients {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// List all panes in the current session
     ///
     /// Returns: Formatted list of panes (table or JSON) to stdout

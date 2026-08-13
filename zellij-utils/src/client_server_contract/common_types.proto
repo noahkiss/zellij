@@ -370,7 +370,9 @@ message QueryTabNamesAction {}
 message BreakPaneAction {}
 message BreakPaneRightAction {}
 message BreakPaneLeftAction {}
-message ListClientsAction {}
+message ListClientsAction {
+  bool output_json = 1;
+}
 message ListPanesAction {
   bool show_tab = 1;
   bool show_command = 2;

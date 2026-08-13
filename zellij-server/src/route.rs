@@ -1732,7 +1732,7 @@ pub(crate) fn route_action(
                 log::error!("Message must have a name");
             }
         },
-        Action::ListClients => {
+        Action::ListClients { output_json } => {
             let default_shell = match default_shell {
                 Some(TerminalAction::RunCommand(run_command)) => Some(run_command.command),
                 _ => None,
@@ -1743,6 +1743,7 @@ pub(crate) fn route_action(
                     cli_client_id.unwrap_or(client_id), // we prefer the cli client here because
                     // this is a cli query and we want to print
                     // it there
+                    output_json,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
