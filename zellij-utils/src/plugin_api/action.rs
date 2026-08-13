@@ -598,6 +598,9 @@ impl TryFrom<ProtobufAction> for Action {
                     Ok(Action::GoToTabName {
                         name: tab_name,
                         create,
+                        // the plugin/keybinding payload has no such field; only the CLI
+                        // asks for a tab without taking focus to it
+                        no_focus: false,
                     })
                 },
                 _ => Err("Wrong payload for Action::GoToTabName"),
@@ -1608,6 +1611,7 @@ impl TryFrom<Action> for ProtobufAction {
             Action::GoToTabName {
                 name: tab_name,
                 create,
+                no_focus: _, // CLI-only, the plugin payload cannot carry it
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::GoToTabName as i32,
                 optional_payload: Some(OptionalPayload::GoToTabNamePayload(GoToTabNamePayload {

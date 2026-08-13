@@ -57,6 +57,7 @@ pub const CAPABILITIES: &[&str] = &[
     "client-tty",         // ClientInfo.tty
     "list-clients-fixed", // the session manager's client list actually lists clients
     "move-tab-to-index",  // zellij action move-tab --to-index
+    "go-to-tab-name-no-focus", // zellij action go-to-tab-name --create --no-focus
     "new-pane-stacked-error", // --stacked refuses instead of creating nothing
     "dump-screen-plugin-panes", // dump-screen works on plugin panes
     // plugin development loop

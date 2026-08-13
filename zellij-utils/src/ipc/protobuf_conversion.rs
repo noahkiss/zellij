@@ -1623,9 +1623,15 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::GoToTab { index } => {
                 ActionType::GoToTab(GoToTabAction { index })
             },
-            crate::input::actions::Action::GoToTabName { name, create } => {
-                ActionType::GoToTabName(GoToTabNameAction { name, create })
-            },
+            crate::input::actions::Action::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => ActionType::GoToTabName(GoToTabNameAction {
+                name,
+                create,
+                no_focus,
+            }),
             crate::input::actions::Action::ToggleTab => ActionType::ToggleTab(ToggleTabAction {}),
             crate::input::actions::Action::TabNameInput { input } => {
                 ActionType::TabNameInput(TabNameInputAction {
@@ -2533,6 +2539,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 Ok(crate::input::actions::Action::GoToTabName {
                     name: go_to_tab_name_action.name,
                     create: go_to_tab_name_action.create,
+                    no_focus: go_to_tab_name_action.no_focus,
                 })
             },
             ActionType::ToggleTab(_) => Ok(crate::input::actions::Action::ToggleTab),

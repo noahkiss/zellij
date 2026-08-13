@@ -999,6 +999,8 @@ pub struct GoToTabNameAction {
     pub name: ::prost::alloc::string::String,
     #[prost(bool, tag="2")]
     pub create: bool,
+    #[prost(bool, tag="3")]
+    pub no_focus: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

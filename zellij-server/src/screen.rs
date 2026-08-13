@@ -500,7 +500,8 @@ pub enum ScreenInstruction {
     GoToTabName(
         String,
         Option<TerminalAction>, // default_shell
-        bool,
+        bool,                   // create the tab if it does not exist
+        bool,                   // leave focus where it is
         Option<ClientId>,
         Option<NotificationEnd>,
     ),
@@ -9751,6 +9752,7 @@ pub(crate) fn screen_thread_main(
                 tab_name,
                 default_shell,
                 create,
+                no_focus,
                 client_id,
                 mut completion_tx,
             ) => {
@@ -9775,7 +9777,14 @@ pub(crate) fn screen_thread_main(
                         .get(&client_id)
                         .copied()
                         .unwrap_or(false);
-                    if let Ok(tab_exists) = screen.go_to_tab_name(tab_name.clone(), client_id) {
+                    // `no_focus` asks only whether the tab is there, so the existence check and
+                    // the focus switch are two calls rather than one
+                    let tab_lookup = if no_focus {
+                        Ok(screen.tabs.values().any(|t| t.name == tab_name))
+                    } else {
+                        screen.go_to_tab_name(tab_name.clone(), client_id)
+                    };
+                    if let Ok(tab_exists) = tab_lookup {
                         screen.render(None)?;
                         if tab_exists {
                             // Tab already exists - find its ID and set in completion
@@ -9789,12 +9798,17 @@ pub(crate) fn screen_thread_main(
                         }
                         if create && !tab_exists {
                             let tab_index = screen.get_new_tab_id();
-                            let should_change_focus_to_new_tab = true;
+                            let should_change_focus_to_new_tab = !no_focus;
+                            let client_id_for_new_tab = if should_change_focus_to_new_tab {
+                                Some(client_id)
+                            } else {
+                                None
+                            };
                             screen.new_tab(
                                 tab_index,
                                 swap_layouts,
                                 Some(tab_name),
-                                Some(client_id),
+                                client_id_for_new_tab,
                             )?;
                             screen
                                 .bus

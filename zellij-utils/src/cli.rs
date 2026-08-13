@@ -1357,6 +1357,9 @@ pub enum CliAction {
         /// Create a tab if one does not exist.
         #[clap(short, long, value_parser)]
         create: bool,
+        /// Leave focus where it is, whether the tab already existed or was just created
+        #[clap(long, value_parser)]
+        no_focus: bool,
     },
     /// Renames the focused pane
     RenameTab {
@@ -1800,6 +1803,16 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn parse_action(args: &[&str]) -> CliAction {
+        let mut full_args = vec!["zellij", "action"];
+        full_args.extend_from_slice(args);
+        let cli = CliArgs::try_parse_from(full_args).unwrap();
+        match cli.command {
+            Some(Command::Action(action)) => *action,
+            other => panic!("Expected Action, got {:?}", other),
+        }
+    }
+
     fn parse_subscribe(args: &[&str]) -> SubscribeCli {
         let mut full_args = vec!["zellij"];
         full_args.extend_from_slice(args);
@@ -1865,5 +1878,36 @@ mod tests {
     fn subscribe_requires_pane_id() {
         let result = CliArgs::try_parse_from(["zellij", "subscribe"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn go_to_tab_name_no_focus() {
+        let action = parse_action(&["go-to-tab-name", "build", "--create", "--no-focus"]);
+        match action {
+            CliAction::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => {
+                assert_eq!(name, "build");
+                assert!(create);
+                assert!(no_focus);
+            },
+            other => panic!("Expected GoToTabName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn go_to_tab_name_focuses_by_default() {
+        let action = parse_action(&["go-to-tab-name", "build"]);
+        match action {
+            CliAction::GoToTabName {
+                create, no_focus, ..
+            } => {
+                assert!(!create);
+                assert!(!no_focus);
+            },
+            other => panic!("Expected GoToTabName, got {:?}", other),
+        }
     }
 }

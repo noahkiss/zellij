@@ -2301,6 +2301,7 @@ fn test_client_messages() {
         action: Action::GoToTabName {
             name: "tab_name".to_owned(),
             create: false,
+            no_focus: false,
         },
         terminal_id: Some(1),
         client_id: Some(100),
@@ -2310,6 +2311,17 @@ fn test_client_messages() {
         action: Action::GoToTabName {
             name: "tab_name".to_owned(),
             create: true,
+            no_focus: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::GoToTabName {
+            name: "tab_name".to_owned(),
+            create: true,
+            no_focus: true,
         },
         terminal_id: Some(1),
         client_id: Some(100),

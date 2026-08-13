@@ -341,6 +341,8 @@ pub enum Action {
     GoToTabName {
         name: String,
         create: bool,
+        /// Do not move focus to the tab, whether it already existed or was just created.
+        no_focus: bool,
     },
     ToggleTab,
     TabNameInput {
@@ -1437,9 +1439,15 @@ impl Action {
                 None => Ok(vec![Action::CloseTab]),
             },
             CliAction::GoToTab { index } => Ok(vec![Action::GoToTab { index }]),
-            CliAction::GoToTabName { name, create } => {
-                Ok(vec![Action::GoToTabName { name, create }])
-            },
+            CliAction::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => Ok(vec![Action::GoToTabName {
+                name,
+                create,
+                no_focus,
+            }]),
             CliAction::RenameTab { name, tab_id } => match tab_id {
                 Some(id) => Ok(vec![Action::RenameTabById {
                     id: id as u64,

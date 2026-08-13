@@ -1089,13 +1089,18 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::GoToTabName { name, create } => {
+        Action::GoToTabName {
+            name,
+            create,
+            no_focus,
+        } => {
             let shell = default_shell.clone();
             senders
                 .send_to_screen(ScreenInstruction::GoToTabName(
                     name,
                     shell,
                     create,
+                    no_focus,
                     Some(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                 ))

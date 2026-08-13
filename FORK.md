@@ -2404,6 +2404,22 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### `go-to-tab-name --no-focus`
+
+```
+zellij action go-to-tab-name build --create --no-focus
+```
+
+"Make sure a tab named X exists" used to be impossible without stealing focus: `--create` focused the
+tab it made, and naming a tab that already existed focused that one. `--no-focus` makes the call
+idempotent in the way a controller wants — the tab is there afterwards, and whoever was looking at
+something else still is. `--create` still prints the new tab's id, so a script can create the tab and
+then address it.
+
+Without `--create` the flag reduces the command to an existence probe. The flag rides on the existing
+`GoToTabNameAction` message (field 3), so it adds no message to the client/server contract; the
+plugin API's `focus_or_create_tab` is unchanged and always focuses.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

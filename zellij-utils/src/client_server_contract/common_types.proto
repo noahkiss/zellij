@@ -551,6 +551,7 @@ message GoToTabAction {
 message GoToTabNameAction {
   string name = 1;
   bool create = 2;
+  bool no_focus = 3;
 }
 
 message TabNameInputAction {
