@@ -282,8 +282,14 @@ running inside the pane's shell answers for a name they both export. That walk i
 `sysctl(KERN_PROCARGS2)` on macOS, nothing anywhere else. Both platforms are supported.
 
 Cost: nothing at all with the list unset, which is the default. With it set, the pty thread reads
-the process table once per second — once for the tick, not once per pane — and one environment per
-process it walks, stopping as soon as every named variable is found.
+the process table once per second — once for the tick, not once per pane — and then one environment
+read per process it walks, **per pane, every tick**. The walk stops early only when every named
+variable has been found. So the cheap case is a pane whose own child exports all of them: one read.
+The expensive case is a name that is **not** there — an agent variable on a pane that is not running
+that agent — which costs a read of the pane's whole process subtree, every second, for as long as
+the pane lives. On macOS each of those reads allocates a `KERN_ARGMAX` buffer, about 1MB, because
+the kernel gives no way to ask how big the blob is. Keep the list short, and expect the panes that
+do not carry the names to be the ones paying for it.
 
 `pane_env` is the one new field that does **not** round-trip through `session-metadata.kdl`. Putting
 it on the event path is something a configuration opted into; writing the values into a file every
