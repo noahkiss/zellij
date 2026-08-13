@@ -195,6 +195,20 @@ fn make_pty_with_plugin_receiver(
     (pty, plugin_rx)
 }
 
+/// A pty whose own instruction channel a test can read, to see what a quit callback sent back.
+fn make_pty_with_pty_receiver(
+    mock: MockOsApi,
+) -> (Pty, channels::Receiver<(PtyInstruction, ErrorContext)>) {
+    let (plugin_tx, _plugin_rx) = channels::unbounded();
+    let (pty_tx, pty_rx) = channels::unbounded();
+    let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    bus.os_input = Some(Box::new(mock));
+    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
+    bus.senders.to_pty = Some(SenderWithContext::new(pty_tx));
+    let pty = Pty::new(bus, false, None, None, None, None);
+    (pty, pty_rx)
+}
+
 fn set_active_terminal(pty: &mut Pty, terminal_id: u32, child_pid: u32) {
     let flag = Arc::new(AtomicBool::new(true));
     pty.id_to_child_pid.insert(terminal_id, child_pid);
@@ -636,6 +650,67 @@ fn each_signal_reaches_the_pane_process() {
     }
 }
 
+/// The pid of a reaped child is the OS's to hand out again, so a pane that outlives its command
+/// must not keep it: signalling it would hit whatever process holds that number now.
+#[test]
+fn a_held_pane_forgets_the_pid_of_its_reaped_child() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, pty_rx) = make_pty_with_pty_receiver(mock.clone());
+    let held_command = RunCommand {
+        command: PathBuf::from("/bin/does-not-matter"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(held_command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .expect("the mock spawns a terminal");
+    assert_eq!(
+        pty.id_to_child_pid.get(&1).copied(),
+        Some(100),
+        "the running pane has a pid"
+    );
+
+    mock.exit_last_spawned_pane(PaneId::Terminal(1), Some(0));
+
+    // the reaping thread owns none of the pty thread's state, so it asks the pty thread to forget
+    let mut forgotten = vec![];
+    while let Ok((instruction, _)) = pty_rx.try_recv() {
+        if let PtyInstruction::ChildProcessExited(terminal_id) = instruction {
+            forgotten.push(terminal_id);
+        }
+    }
+    assert_eq!(
+        forgotten,
+        vec![1],
+        "a held pane's exit should tell the pty thread to forget the child pid"
+    );
+    for terminal_id in forgotten {
+        pty.forget_child_pid(terminal_id);
+    }
+
+    assert!(
+        pty.id_to_child_pid.get(&1).is_none(),
+        "a held pane holds no pid"
+    );
+    match pty.get_pane_pid(PaneId::Terminal(1)) {
+        GetPanePidResponse::Err(_) => {},
+        other => panic!("a held pane should report no pid, got {:?}", other),
+    }
+    let result = pty.signal_pane(PaneId::Terminal(1), PaneSignal::Kill);
+    assert!(
+        result.unwrap_err().contains("no running process"),
+        "signalling a held pane should say there is no process, not signal a recycled pid"
+    );
+    assert!(
+        recorder.signals_sent().is_empty(),
+        "nothing should have been signalled"
+    );
+}
+
 #[test]
 fn signalling_a_pane_that_does_not_exist_is_an_error() {
     let mock = MockOsApi::new();
@@ -646,7 +721,7 @@ fn signalling_a_pane_that_does_not_exist_is_an_error() {
     let result = pty.signal_pane(PaneId::Terminal(7), PaneSignal::Int);
     assert!(result.is_err(), "no pane 7");
     assert!(
-        result.unwrap_err().contains("not found"),
+        result.unwrap_err().contains("no running process"),
         "the error names the miss"
     );
     assert!(
