@@ -1152,6 +1152,8 @@ impl From<crate::input::actions::Action>
             BreakPaneAction,
             BreakPaneLeftAction,
             BreakPaneRightAction,
+            BreakPanesToNewTabAction,
+            BreakPanesToTabWithIdAction,
             ChangeFloatingPaneCoordinatesAction,
             ClearScreenAction,
             ClearScreenByPaneIdAction,
@@ -1263,8 +1265,13 @@ impl From<crate::input::actions::Action>
             SetLightThemeAction,
             SetPaneBorderlessAction,
             SetPaneColorAction,
+            SetPaneFloatingAction,
             SetPaneFrameStyleAction,
+            SetPaneFullscreenAction,
+            SetPanePinnedAction,
+            SetSyncTabAction,
             ShowFloatingPanesAction,
+            SignalPaneAction,
             SkipConfirmAction,
             StackPanesAction,
             StartOrReloadPluginAction,
@@ -1672,9 +1679,15 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::GoToTab { index } => {
                 ActionType::GoToTab(GoToTabAction { index })
             },
-            crate::input::actions::Action::GoToTabName { name, create } => {
-                ActionType::GoToTabName(GoToTabNameAction { name, create })
-            },
+            crate::input::actions::Action::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => ActionType::GoToTabName(GoToTabNameAction {
+                name,
+                create,
+                no_focus,
+            }),
             crate::input::actions::Action::ToggleTab => ActionType::ToggleTab(ToggleTabAction {}),
             crate::input::actions::Action::TabNameInput { input } => {
                 ActionType::TabNameInput(TabNameInputAction {
@@ -1991,8 +2004,8 @@ impl From<crate::input::actions::Action>
                 cwd: cwd.map(|p| p.to_string_lossy().to_string()),
                 pane_title,
             }),
-            crate::input::actions::Action::ListClients => {
-                ActionType::ListClients(ListClientsAction {})
+            crate::input::actions::Action::ListClients { output_json } => {
+                ActionType::ListClients(ListClientsAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2211,6 +2224,52 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::MoveTabToIndex { id, index } => {
                 ActionType::MoveTabToIndex(MoveTabToIndexAction { id, index })
+            },
+            crate::input::actions::Action::SetPaneFullscreen {
+                pane_id,
+                fullscreen,
+            } => ActionType::SetPaneFullscreen(SetPaneFullscreenAction {
+                pane_id: pane_id.map(|p| p.into()),
+                fullscreen,
+            }),
+            crate::input::actions::Action::SetPanePinned { pane_id, pinned } => {
+                ActionType::SetPanePinned(SetPanePinnedAction {
+                    pane_id: pane_id.map(|p| p.into()),
+                    pinned,
+                })
+            },
+            crate::input::actions::Action::SetPaneFloating { pane_id, floating } => {
+                ActionType::SetPaneFloating(SetPaneFloatingAction {
+                    pane_id: pane_id.map(|p| p.into()),
+                    floating,
+                })
+            },
+            crate::input::actions::Action::SetSyncTab { tab_id, sync } => {
+                ActionType::SetSyncTab(SetSyncTabAction { tab_id, sync })
+            },
+            crate::input::actions::Action::BreakPanesToNewTab {
+                pane_ids,
+                name,
+                no_focus,
+            } => ActionType::BreakPanesToNewTab(BreakPanesToNewTabAction {
+                pane_ids: pane_ids.into_iter().map(|id| id.into()).collect(),
+                name,
+                no_focus,
+            }),
+            crate::input::actions::Action::BreakPanesToTabWithId {
+                pane_ids,
+                tab_id,
+                no_focus,
+            } => ActionType::BreakPanesToTabWithId(BreakPanesToTabWithIdAction {
+                pane_ids: pane_ids.into_iter().map(|id| id.into()).collect(),
+                tab_id,
+                no_focus,
+            }),
+            crate::input::actions::Action::SignalPane { pane_id, signal } => {
+                ActionType::SignalPane(SignalPaneAction {
+                    pane_id: Some(pane_id.into()),
+                    signal: pane_signal_to_proto_i32(signal),
+                })
             },
         };
 
@@ -2594,6 +2653,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 Ok(crate::input::actions::Action::GoToTabName {
                     name: go_to_tab_name_action.name,
                     create: go_to_tab_name_action.create,
+                    no_focus: go_to_tab_name_action.no_focus,
                 })
             },
             ActionType::ToggleTab(_) => Ok(crate::input::actions::Action::ToggleTab),
@@ -2904,7 +2964,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     pane_title: keybind_pipe_action.pane_title,
                 })
             },
-            ActionType::ListClients(_) => Ok(crate::input::actions::Action::ListClients),
+            ActionType::ListClients(a) => Ok(crate::input::actions::Action::ListClients {
+                output_json: a.output_json,
+            }),
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {
                     show_tab: list_panes_action.show_tab,
@@ -3193,6 +3255,53 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::MoveTabToIndex(a) => Ok(crate::input::actions::Action::MoveTabToIndex {
                 id: a.id,
                 index: a.index,
+            }),
+            ActionType::SetPaneFullscreen(a) => {
+                Ok(crate::input::actions::Action::SetPaneFullscreen {
+                    pane_id: a.pane_id.map(|p| p.try_into()).transpose()?,
+                    fullscreen: a.fullscreen,
+                })
+            },
+            ActionType::SetPanePinned(a) => Ok(crate::input::actions::Action::SetPanePinned {
+                pane_id: a.pane_id.map(|p| p.try_into()).transpose()?,
+                pinned: a.pinned,
+            }),
+            ActionType::SetPaneFloating(a) => Ok(crate::input::actions::Action::SetPaneFloating {
+                pane_id: a.pane_id.map(|p| p.try_into()).transpose()?,
+                floating: a.floating,
+            }),
+            ActionType::SetSyncTab(a) => Ok(crate::input::actions::Action::SetSyncTab {
+                tab_id: a.tab_id,
+                sync: a.sync,
+            }),
+            ActionType::BreakPanesToNewTab(a) => {
+                Ok(crate::input::actions::Action::BreakPanesToNewTab {
+                    pane_ids: a
+                        .pane_ids
+                        .into_iter()
+                        .map(|id| id.try_into())
+                        .collect::<Result<Vec<_>>>()?,
+                    name: a.name,
+                    no_focus: a.no_focus,
+                })
+            },
+            ActionType::BreakPanesToTabWithId(a) => {
+                Ok(crate::input::actions::Action::BreakPanesToTabWithId {
+                    pane_ids: a
+                        .pane_ids
+                        .into_iter()
+                        .map(|id| id.try_into())
+                        .collect::<Result<Vec<_>>>()?,
+                    tab_id: a.tab_id,
+                    no_focus: a.no_focus,
+                })
+            },
+            ActionType::SignalPane(a) => Ok(crate::input::actions::Action::SignalPane {
+                pane_id: a
+                    .pane_id
+                    .ok_or_else(|| anyhow::anyhow!("SignalPane action must carry a pane id"))?
+                    .try_into()?,
+                signal: pane_signal_from_proto_i32(a.signal)?,
             }),
         }
     }
@@ -4980,5 +5089,26 @@ impl TryFrom<crate::client_server_contract::client_server_contract::RunPluginOrA
                 plugin_alias.try_into()?,
             )),
         }
+    }
+}
+
+/// `PaneSignal` never crosses as the unspecified variant: an unset field is a malformed message,
+/// not a default signal, because the default here would be one that kills something.
+fn pane_signal_to_proto_i32(signal: crate::data::PaneSignal) -> i32 {
+    use crate::client_server_contract::client_server_contract::PaneSignal as ProtobufPaneSignal;
+    match signal {
+        crate::data::PaneSignal::Int => ProtobufPaneSignal::Int as i32,
+        crate::data::PaneSignal::Hup => ProtobufPaneSignal::Hup as i32,
+        crate::data::PaneSignal::Kill => ProtobufPaneSignal::Kill as i32,
+    }
+}
+
+fn pane_signal_from_proto_i32(signal: i32) -> anyhow::Result<crate::data::PaneSignal> {
+    use crate::client_server_contract::client_server_contract::PaneSignal as ProtobufPaneSignal;
+    match ProtobufPaneSignal::try_from(signal) {
+        Ok(ProtobufPaneSignal::Int) => Ok(crate::data::PaneSignal::Int),
+        Ok(ProtobufPaneSignal::Hup) => Ok(crate::data::PaneSignal::Hup),
+        Ok(ProtobufPaneSignal::Kill) => Ok(crate::data::PaneSignal::Kill),
+        _ => Err(anyhow::anyhow!("Unknown pane signal: {}", signal)),
     }
 }

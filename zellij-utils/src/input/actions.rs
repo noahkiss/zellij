@@ -8,7 +8,7 @@ use super::layout::{
 use crate::cli::CliAction;
 use crate::data::{
     CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
-    PaneId, Resize, UnblockCondition,
+    PaneId, PaneSignal, Resize, UnblockCondition,
 };
 use crate::data::{FloatingPaneCoordinates, InputMode};
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -345,6 +345,8 @@ pub enum Action {
     GoToTabName {
         name: String,
         create: bool,
+        /// Do not move focus to the tab, whether it already existed or was just created.
+        no_focus: bool,
     },
     ToggleTab,
     TabNameInput {
@@ -546,7 +548,9 @@ pub enum Action {
         cwd: Option<PathBuf>,
         pane_title: Option<String>,
     },
-    ListClients,
+    ListClients {
+        output_json: bool,
+    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
@@ -573,6 +577,36 @@ pub enum Action {
     ChangeFloatingPaneCoordinates {
         pane_id: PaneId,
         coordinates: FloatingPaneCoordinates,
+    },
+    SignalPane {
+        pane_id: PaneId,
+        signal: PaneSignal,
+    },
+    SetPaneFullscreen {
+        pane_id: Option<PaneId>,
+        fullscreen: bool,
+    },
+    SetPanePinned {
+        pane_id: Option<PaneId>,
+        pinned: bool,
+    },
+    SetPaneFloating {
+        pane_id: Option<PaneId>,
+        floating: bool,
+    },
+    SetSyncTab {
+        tab_id: Option<u32>,
+        sync: bool,
+    },
+    BreakPanesToNewTab {
+        pane_ids: Vec<PaneId>,
+        name: Option<String>,
+        no_focus: bool,
+    },
+    BreakPanesToTabWithId {
+        pane_ids: Vec<PaneId>,
+        tab_id: u32,
+        no_focus: bool,
     },
     TogglePaneBorderless {
         pane_id: PaneId,
@@ -1441,9 +1475,15 @@ impl Action {
                 None => Ok(vec![Action::CloseTab]),
             },
             CliAction::GoToTab { index } => Ok(vec![Action::GoToTab { index }]),
-            CliAction::GoToTabName { name, create } => {
-                Ok(vec![Action::GoToTabName { name, create }])
-            },
+            CliAction::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => Ok(vec![Action::GoToTabName {
+                name,
+                create,
+                no_focus,
+            }]),
             CliAction::RenameTab { name, tab_id } => match tab_id {
                 Some(id) => Ok(vec![Action::RenameTabById {
                     id: id as u64,
@@ -1974,7 +2014,7 @@ impl Action {
                     skip_cache,
                 }])
             },
-            CliAction::ListClients => Ok(vec![Action::ListClients]),
+            CliAction::ListClients { json } => Ok(vec![Action::ListClients { output_json: json }]),
             CliAction::ListPanes {
                 tab,
                 command,
@@ -2068,6 +2108,69 @@ impl Action {
                     Err(_e) => {
                         Err(format!(
                             "Malformed pane id: {}, expecting a space separated list of either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                            pane_id
+                        ))
+                    }
+                }
+            },
+            CliAction::SetFullscreen { enabled, pane_id } => Ok(vec![Action::SetPaneFullscreen {
+                pane_id: parse_optional_pane_id(pane_id)?,
+                fullscreen: enabled,
+            }]),
+            CliAction::SetPanePinned { enabled, pane_id } => Ok(vec![Action::SetPanePinned {
+                pane_id: parse_optional_pane_id(pane_id)?,
+                pinned: enabled,
+            }]),
+            CliAction::SetPaneFloating { enabled, pane_id } => Ok(vec![Action::SetPaneFloating {
+                pane_id: parse_optional_pane_id(pane_id)?,
+                floating: enabled,
+            }]),
+            CliAction::SetSyncTab { enabled, tab_id } => Ok(vec![Action::SetSyncTab {
+                tab_id: tab_id.map(|id| id as u32),
+                sync: enabled,
+            }]),
+            CliAction::BreakPane {
+                pane_id,
+                name,
+                no_focus,
+            } => {
+                if pane_id.is_empty() {
+                    // no explicit target: the focused pane, which is what the keybinding does
+                    return Ok(vec![Action::BreakPane]);
+                }
+                let pane_ids = parse_pane_ids(&pane_id)?;
+                Ok(vec![Action::BreakPanesToNewTab {
+                    pane_ids,
+                    name,
+                    no_focus,
+                }])
+            },
+            CliAction::BreakPaneToTab {
+                pane_id,
+                tab_id,
+                no_focus,
+            } => {
+                let pane_ids = parse_pane_ids(&pane_id)?;
+                Ok(vec![Action::BreakPanesToTabWithId {
+                    pane_ids,
+                    tab_id,
+                    no_focus,
+                }])
+            },
+            CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
+            CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
+            CliAction::SignalPane { pane_id, signal } => {
+                let parsed_pane_id = PaneId::from_str(&pane_id);
+                match parsed_pane_id {
+                    Ok(parsed_pane_id) => {
+                        Ok(vec![Action::SignalPane {
+                            pane_id: parsed_pane_id,
+                            signal,
+                        }])
+                    },
+                    Err(_e) => {
+                        Err(format!(
+                            "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
                             pane_id
                         ))
                     }
@@ -4180,5 +4283,33 @@ mod tests {
             },
             _ => panic!("Expected NewFloatingPluginPane action"),
         }
+    }
+}
+
+/// Parse a list of `--pane-id` values, naming the first one that does not parse.
+fn parse_pane_ids(pane_ids: &[String]) -> Result<Vec<PaneId>, String> {
+    pane_ids
+        .iter()
+        .map(|pane_id| {
+            PaneId::from_str(pane_id).map_err(|_e| {
+                format!(
+                    "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                    pane_id
+                )
+            })
+        })
+        .collect()
+}
+
+/// Parse an optional `--pane-id`. `None` means "whatever this client is focused on".
+fn parse_optional_pane_id(pane_id: Option<String>) -> Result<Option<PaneId>, String> {
+    match pane_id {
+        None => Ok(None),
+        Some(pane_id) => PaneId::from_str(&pane_id).map(Some).map_err(|_e| {
+            format!(
+                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                pane_id
+            )
+        }),
     }
 }
