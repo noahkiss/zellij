@@ -12648,12 +12648,12 @@ pub(crate) fn screen_thread_main(
                 screen.log_and_report_session_state()?;
                 screen.render(None)?;
             },
-            ScreenInstruction::CloseFocusWithPaneId(pane_id, completion_tx) => {
+            ScreenInstruction::CloseFocusWithPaneId(pane_id, mut completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();
                 let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.close_pane_by_pane_id(pane_id, completion_tx)
+                        tab.close_pane_by_pane_id(pane_id, completion_tx.take())
                             .non_fatal();
                         found = true;
                         break;
@@ -12661,6 +12661,10 @@ pub(crate) fn screen_thread_main(
                 }
                 if !found {
                     log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
+                    }
                 }
                 screen.render(None)?;
                 screen.log_and_report_session_state()?;

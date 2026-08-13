@@ -1905,6 +1905,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::PaneId;
+    use crate::input::actions::Action;
     use clap::Parser;
 
     /// Parse a command line on a thread with a real stack.
@@ -2002,6 +2004,24 @@ mod tests {
     fn subscribe_requires_pane_id() {
         let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn close_pane_with_a_pane_id_sends_close_focus_by_pane_id() {
+        // the action this maps to decides which ScreenInstruction reports a missing pane;
+        // `CloseTerminalPane` is a different path and fixing that one does not fix this one
+        let actions = Action::actions_from_cli(
+            parse_action(&["close-pane", "--pane-id", "terminal_9"]),
+            Box::new(PathBuf::new),
+            None,
+        )
+        .expect("TEST");
+        assert_eq!(
+            actions,
+            vec![Action::CloseFocusByPaneId {
+                pane_id: PaneId::Terminal(9)
+            }]
+        );
     }
 
     #[test]

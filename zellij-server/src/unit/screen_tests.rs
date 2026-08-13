@@ -2617,6 +2617,38 @@ pub fn close_missing_pane_reports_an_error() {
 }
 
 #[test]
+pub fn close_pane_by_pane_id_for_missing_pane_reports_an_error() {
+    // `zellij action close-pane --pane-id X` sends CloseFocusByPaneId, NOT CloseTerminalPane:
+    // the two land on different ScreenInstructions, so testing one says nothing about the other
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocusByPaneId {
+            pane_id: zellij_utils::data::PaneId::Terminal(999),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
 pub fn edit_scrollback_for_missing_pane_reports_an_error() {
     let size = Size {
         cols: 121,
