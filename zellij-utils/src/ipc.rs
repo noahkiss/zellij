@@ -412,6 +412,15 @@ impl<T: Serialize> IpcSenderWithContext<T> {
     }
 }
 
+/// Why a message could not be read off an IPC stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcRecvError {
+    /// The peer is gone - the stream ended or the connection broke
+    Disconnected,
+    /// Bytes arrived, but they were not a message we understand
+    Malformed,
+}
+
 /// Receives messages on a stream socket, along with an [`ErrorContext`].
 pub struct IpcReceiverWithContext<T> {
     receiver: io::BufReader<Box<dyn IpcStream>>,
@@ -438,15 +447,31 @@ where
     }
 
     pub fn recv_client_msg(&mut self) -> Option<(ClientToServerMsg, ErrorContext)> {
+        self.try_recv_client_msg().ok()
+    }
+
+    /// As `recv_client_msg`, but says whether the peer went away or sent something unreadable.
+    /// They call for opposite responses: one client is gone, the other is still talking.
+    pub fn try_recv_client_msg(
+        &mut self,
+    ) -> std::result::Result<(ClientToServerMsg, ErrorContext), IpcRecvError> {
         match read_protobuf_message::<ProtoClientToServerMsg>(&mut self.receiver) {
             Ok(proto_msg) => match proto_msg.try_into() {
-                Ok(rust_msg) => Some((rust_msg, ErrorContext::default())),
+                Ok(rust_msg) => Ok((rust_msg, ErrorContext::default())),
                 Err(e) => {
                     warn!("Error converting protobuf to ClientToServerMsg: {:?}", e);
-                    None
+                    Err(IpcRecvError::Malformed)
                 },
             },
-            Err(_e) => None,
+            Err(e) => {
+                if e.downcast_ref::<io::Error>().is_some() {
+                    // the stream ended or broke: there is nobody on the other side to blame for
+                    // a bad message
+                    Err(IpcRecvError::Disconnected)
+                } else {
+                    Err(IpcRecvError::Malformed)
+                }
+            },
         }
     }
 

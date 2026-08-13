@@ -1,16 +1,25 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use clap::{CommandFactory, Parser};
-use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
+use zellij_utils::cli::{on_big_stack, CliArgs, Command, SessionLifecycleCli, Sessions};
+
+/// Parse a command line on a thread with a real stack.
+///
+/// Building the clap tree overflows the stack a test thread gets, so every test in this module goes
+/// through [`on_big_stack`]. See its doc comment in `zellij-utils/src/cli.rs`.
+fn parse_cli(args: &[&str]) -> Result<CliArgs, clap::Error> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    on_big_stack(move || CliArgs::try_parse_from(args))
+}
 
 #[test]
 fn verify_cli() {
-    CliArgs::command().debug_assert();
+    on_big_stack(|| CliArgs::command().debug_assert());
 }
 
 #[test]
 fn web_cli_status_alone_works() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--status"]);
+    let args = parse_cli(&["zellij", "web", "--status"]);
     assert!(args.is_ok());
     if let Ok(CliArgs {
         command: Some(Command::Web(web)),
@@ -26,7 +35,7 @@ fn web_cli_status_alone_works() {
 
 #[test]
 fn web_cli_status_with_timeout_works() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--status", "--timeout", "5"]);
+    let args = parse_cli(&["zellij", "web", "--status", "--timeout", "5"]);
     assert!(args.is_ok());
     if let Ok(CliArgs {
         command: Some(Command::Web(web)),
@@ -43,7 +52,7 @@ fn web_cli_status_with_timeout_works() {
 #[test]
 fn web_cli_timeout_with_status_works() {
     // Test with --timeout before --status (order shouldn't matter)
-    let args = CliArgs::try_parse_from(["zellij", "web", "--timeout", "10", "--status"]);
+    let args = parse_cli(&["zellij", "web", "--timeout", "10", "--status"]);
     assert!(args.is_ok());
     if let Ok(CliArgs {
         command: Some(Command::Web(web)),
@@ -59,25 +68,25 @@ fn web_cli_timeout_with_status_works() {
 
 #[test]
 fn web_cli_timeout_without_status_fails() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--timeout", "5"]);
+    let args = parse_cli(&["zellij", "web", "--timeout", "5"]);
     assert!(args.is_err());
 }
 
 #[test]
 fn web_cli_status_with_start_fails() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--status", "--start"]);
+    let args = parse_cli(&["zellij", "web", "--status", "--start"]);
     assert!(args.is_err());
 }
 
 #[test]
 fn web_cli_status_with_stop_fails() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--status", "--stop"]);
+    let args = parse_cli(&["zellij", "web", "--status", "--stop"]);
     assert!(args.is_err());
 }
 
 #[test]
 fn web_cli_status_with_ip_works() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--status", "--ip", "127.0.0.1"]);
+    let args = parse_cli(&["zellij", "web", "--status", "--ip", "127.0.0.1"]);
     assert!(args.is_ok());
     if let Ok(CliArgs {
         command: Some(Command::Web(web)),
@@ -93,7 +102,7 @@ fn web_cli_status_with_ip_works() {
 
 #[test]
 fn web_cli_status_with_port_works() {
-    let args = CliArgs::try_parse_from(["zellij", "web", "--status", "--port", "9000"]);
+    let args = parse_cli(&["zellij", "web", "--status", "--port", "9000"]);
     assert!(args.is_ok());
     if let Ok(CliArgs {
         command: Some(Command::Web(web)),
@@ -109,7 +118,7 @@ fn web_cli_status_with_port_works() {
 
 #[test]
 fn web_cli_status_with_ip_and_port_works() {
-    let args = CliArgs::try_parse_from([
+    let args = parse_cli(&[
         "zellij", "web", "--status", "--ip", "0.0.0.0", "--port", "9000",
     ]);
     assert!(args.is_ok());
@@ -127,7 +136,7 @@ fn web_cli_status_with_ip_and_port_works() {
 }
 
 fn session_lifecycle_from(args: &[&str]) -> SessionLifecycleCli {
-    match CliArgs::try_parse_from(args) {
+    match parse_cli(args) {
         Ok(CliArgs {
             command: Some(Command::Sessions(Sessions::Session(cli))),
             ..
@@ -175,7 +184,7 @@ fn a_session_name_is_optional_everywhere() {
 
 #[test]
 fn session_restart_cannot_be_both_fresh_and_restored() {
-    assert!(CliArgs::try_parse_from([
+    assert!(parse_cli(&[
         "zellij",
         "session",
         "restart",

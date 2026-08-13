@@ -4942,6 +4942,14 @@ impl Tab {
     pub fn toggle_sync_panes_is_active(&mut self) {
         self.synchronize_is_active = !self.synchronize_is_active;
     }
+    /// Set input synchronisation, reporting whether that changed anything.
+    pub fn set_sync_panes_is_active(&mut self, sync: bool) -> bool {
+        if self.synchronize_is_active == sync {
+            return false;
+        }
+        self.synchronize_is_active = sync;
+        true
+    }
     pub fn mark_active_pane_for_rerender(&mut self, client_id: ClientId) {
         if let Some(active_pane) = self.get_active_pane_mut(client_id) {
             active_pane.set_should_render(true);
@@ -8171,6 +8179,65 @@ impl Tab {
             pane.load_pane_name();
         }
     }
+    /// Whether this pane is pinned, or `None` when the tab does not own it.
+    pub fn pane_is_pinned(&self, pane_id: PaneId) -> Option<bool> {
+        self.get_pane_with_id(pane_id)
+            .map(|pane| pane.current_geom().is_pinned)
+    }
+
+    /// Whether this pane is the one currently taking up the whole tab.
+    ///
+    /// Fullscreen is a property of the tab - one pane at a time - so "is this pane fullscreen"
+    /// means "is this the pane fullscreen is currently held by".
+    pub fn pane_is_fullscreen(&self, pane_id: PaneId) -> bool {
+        self.tiled_panes.fullscreen_pane_id() == Some(pane_id)
+            || self.floating_panes.fullscreen_pane_id() == Some(pane_id)
+    }
+
+    /// Make this pane fullscreen, or take it out of fullscreen. Reports whether that changed
+    /// anything.
+    ///
+    /// Unlike the toggle, asking for fullscreen while a DIFFERENT pane holds it moves fullscreen
+    /// to this one rather than merely clearing it.
+    pub fn set_pane_fullscreen(&mut self, pane_id: PaneId, fullscreen: bool) -> bool {
+        if self.pane_is_fullscreen(pane_id) == fullscreen {
+            return false;
+        }
+        if fullscreen {
+            if self.tiled_panes.fullscreen_is_active() {
+                self.tiled_panes.unset_fullscreen();
+            }
+            if self.floating_panes.fullscreen_is_active() {
+                self.floating_panes.unset_fullscreen();
+            }
+        }
+        self.toggle_pane_fullscreen(pane_id);
+        self.pane_is_fullscreen(pane_id) == fullscreen
+    }
+
+    /// Whether this pane floats, or `None` when the tab does not own it.
+    pub fn pane_is_floating(&self, pane_id: PaneId) -> Option<bool> {
+        if self.floating_panes.panes_contain(&pane_id) {
+            Some(true)
+        } else if self.tiled_panes.panes_contain(&pane_id) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Float or embed this pane. Reports whether that changed anything.
+    ///
+    /// The move can be refused - the last tiled pane may not float, and an embed needs room - so
+    /// the answer is read back from the pane rather than assumed.
+    pub fn set_pane_floating(&mut self, pane_id: PaneId, floating: bool) -> Result<bool> {
+        if self.pane_is_floating(pane_id) == Some(floating) {
+            return Ok(false);
+        }
+        self.toggle_pane_embed_or_floating_for_pane_id(pane_id, None)?;
+        Ok(self.pane_is_floating(pane_id) == Some(floating))
+    }
+
     pub fn toggle_pane_pinned_by_pane_id(&mut self, pane_id: PaneId) {
         if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
             pane.toggle_pinned();

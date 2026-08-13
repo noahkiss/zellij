@@ -33,9 +33,9 @@ use wasm_bridge::WasmBridge;
 
 use zellij_utils::{
     data::{
-        ClientInfo, CommandOrPlugin, Event, EventType, FloatingPaneCoordinates, InputMode,
-        LayoutInfo, LayoutWithError, MessageToPlugin, PermissionStatus, PermissionType,
-        PipeMessage, PipeSource, WebServerStatus,
+        CommandOrPlugin, Event, EventType, FloatingPaneCoordinates, InputMode, LayoutInfo,
+        LayoutWithError, MessageToPlugin, PermissionStatus, PermissionType, PipeMessage,
+        PipeSource, WebServerStatus,
     },
     errors::{prelude::*, ContextType, PluginContext},
     input::{
@@ -141,7 +141,12 @@ pub enum PluginInstruction {
         Option<PathBuf>,
     ),
     DumpLayout(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
-    ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
+    ListClientsMetadata(
+        SessionLayoutMetadata,
+        ClientId,
+        bool,
+        Option<NotificationEnd>,
+    ),
     DumpLayoutToPlugin {
         session_layout_metadata: SessionLayoutMetadata,
         plugin_id: PluginId,
@@ -831,6 +836,7 @@ pub(crate) fn plugin_thread_main(
             PluginInstruction::ListClientsMetadata(
                 mut session_layout_metadata,
                 client_id,
+                output_json,
                 completion_tx,
             ) => {
                 populate_session_layout_metadata(
@@ -842,6 +848,7 @@ pub(crate) fn plugin_thread_main(
                 drop(bus.senders.send_to_pty(PtyInstruction::ListClientsMetadata(
                     session_layout_metadata,
                     client_id,
+                    output_json,
                     completion_tx,
                 )));
             },
@@ -911,22 +918,7 @@ pub(crate) fn plugin_thread_main(
                     &plugin_aliases,
                     None,
                 );
-                let mut clients_metadata = session_layout_metadata.all_clients_metadata();
-                let mut client_list_for_plugin = vec![];
-                let default_editor = session_layout_metadata.default_editor.clone();
-                for (client_metadata_id, client_metadata) in clients_metadata.iter_mut() {
-                    let is_current_client = client_metadata_id == &client_id;
-                    client_list_for_plugin.push(
-                        ClientInfo::new(
-                            *client_metadata_id,
-                            client_metadata.get_pane_id().into(),
-                            client_metadata.stringify_command(&default_editor),
-                            is_current_client,
-                        )
-                        .with_terminal_size(client_metadata.terminal_size())
-                        .with_tty(client_metadata.tty()),
-                    );
-                }
+                let client_list_for_plugin = session_layout_metadata.client_infos(client_id);
                 let updates = vec![(
                     Some(plugin_id),
                     Some(client_id),

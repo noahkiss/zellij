@@ -1,5 +1,6 @@
 use crate::ipc::{
-    ClientToServerMsg, IpcReceiverWithContext, IpcSenderWithContext, ServerToClientMsg,
+    ClientToServerMsg, IpcReceiverWithContext, IpcRecvError, IpcSenderWithContext,
+    ServerToClientMsg,
 };
 use crate::pane_size::Size;
 use interprocess::local_socket::{prelude::*, ListenerOptions};
@@ -245,6 +246,40 @@ fn multiple_messages_in_sequence() {
     assert!(matches!(msg3, ClientToServerMsg::KillSession));
 
     client.join().expect("client thread panicked");
+}
+
+#[test]
+fn closed_connection_reports_disconnected_not_a_bad_message() {
+    let (_guard, name) = new_ipc();
+    let listener = bind_listener(&name);
+
+    let client = std::thread::spawn({
+        let name = name.clone();
+        move || {
+            let stream = connect_stream(&name);
+            let mut sender: IpcSenderWithContext<ClientToServerMsg> =
+                IpcSenderWithContext::new(stream);
+            sender
+                .send_client_msg(ClientToServerMsg::ConnStatus)
+                .expect("send failed");
+        }
+    });
+
+    let stream = listener.incoming().next().unwrap().expect("accept failed");
+    let mut receiver: IpcReceiverWithContext<ClientToServerMsg> =
+        IpcReceiverWithContext::new(stream);
+
+    client.join().expect("client thread panicked");
+    receiver
+        .recv_client_msg()
+        .expect("should receive the message");
+
+    // the peer is gone: reading again must say so, rather than looking like a client that sent
+    // something unreadable
+    assert_eq!(
+        receiver.try_recv_client_msg().err(),
+        Some(IpcRecvError::Disconnected)
+    );
 }
 
 #[test]

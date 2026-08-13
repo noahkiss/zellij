@@ -3105,6 +3105,27 @@ pub enum PaneId {
     Plugin(u32),
 }
 
+/// A signal that can be sent to the process running in a terminal pane.
+///
+/// Only the three the server can already deliver. Writing `0x03` into a pty asks the program to
+/// interpret a keystroke; these go to the process.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneSignal {
+    /// SIGINT, what Ctrl-C sends.
+    Int,
+    /// SIGHUP, what a closing terminal sends.
+    Hup,
+    /// SIGKILL, which cannot be caught.
+    Kill,
+}
+
+impl Default for PaneSignal {
+    fn default() -> Self {
+        PaneSignal::Int
+    }
+}
+
 impl Default for PaneId {
     fn default() -> Self {
         PaneId::Terminal(0)

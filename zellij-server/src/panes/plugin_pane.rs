@@ -80,6 +80,8 @@ pub(crate) struct PluginPane {
     pub pid: u32,
     /// Given at creation, never reused - see `Pane::pane_uuid`
     uuid: Uuid,
+    /// Set when this pane was built from a serialized session - see `Pane::restored_from`
+    restored_from: Option<String>,
     pub should_render: HashMap<ClientId, bool>,
     pub selectable: bool,
     pub geom: PaneGeom,
@@ -140,6 +142,7 @@ impl PluginPane {
         let mut plugin = PluginPane {
             pid,
             uuid: Uuid::new_v4(),
+            restored_from: None,
             should_render: HashMap::new(),
             selectable: true,
             geom: position_and_size,
@@ -543,6 +546,12 @@ impl Pane for PluginPane {
     }
     fn pane_uuid(&self) -> Uuid {
         self.uuid
+    }
+    fn restored_from(&self) -> Option<String> {
+        self.restored_from.clone()
+    }
+    fn set_restored_from(&mut self, restored_from: Option<String>) {
+        self.restored_from = restored_from;
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
