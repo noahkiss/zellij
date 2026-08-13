@@ -331,6 +331,7 @@ has already happened — two capabilities went silently dark in a consumer that 
 
 ```json
 {
+  "scope": "binary",
   "version": "0.45.0-nkmk.4",
   "base_version": "0.45.0",
   "fork": "nkmk",
@@ -347,7 +348,15 @@ has already happened — two capabilities went silently dark in a consumer that 
   fork features" from "this build is too old to answer".
 - **The version arrives as a pair**, `base_version` plus `fork_counter`, which is the only correct
   comparison: the base orders normally, the counter orders only within one base. An upstream build
-  reports neither `fork` nor `fork_counter`.
+  omits `fork` and `fork_counter` entirely — the keys are absent, not null, so `jq -e 'has("fork")'`
+  is the test.
+- **The answer describes the installed binary, not a running server** — that is what `"scope":
+  "binary"` says. Most of these capability names are server-side surfaces, and a session keeps
+  running the server it started with. During the fork's normal upgrade window — a new binary
+  installed, sessions from the old one still up — the binary reports capabilities its own sessions
+  do not have. A consumer gating **per session** must treat the list as an **upper bound** until
+  that session restarts (`zellij session restart <name>`), and fall back when a call the list
+  promised is refused. A consumer gating on "what will the next session have" can read it straight.
 - `--json` reports `--check`'s directories too, so a consumer that needs the socket directory or the
   config file stops parsing `[SOCKET DIR]` out of prose.
 

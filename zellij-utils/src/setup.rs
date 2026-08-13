@@ -302,6 +302,24 @@ pub struct Setup {
     pub exe: Option<PathBuf>,
 }
 
+/// Write the version pair into a capabilities document.
+///
+/// Absent means absent: an upstream build carries no `fork` keys at all, rather than the nulls a
+/// `json!` macro emits for a `None`. A consumer testing `has("fork")` reads that as "not a fork".
+fn insert_version_keys(
+    document: &mut serde_json::Map<String, serde_json::Value>,
+    version: &crate::capabilities::VersionInfo,
+) {
+    document.insert("version".to_owned(), serde_json::json!(version.version));
+    document.insert("base_version".to_owned(), serde_json::json!(version.base));
+    if let Some(fork) = &version.fork {
+        document.insert("fork".to_owned(), serde_json::json!(fork));
+    }
+    if let Some(fork_counter) = version.fork_counter {
+        document.insert("fork_counter".to_owned(), serde_json::json!(fork_counter));
+    }
+}
+
 impl Setup {
     /// Entrypoint from main
     /// Merges options from the config file and the command line options
@@ -475,6 +493,11 @@ impl Setup {
     }
 
     /// The document `setup --check --json` prints.
+    ///
+    /// It describes the BINARY that runs it - hence `"scope": "binary"`. Most capability names are
+    /// server-side surfaces, and a session that started before this binary was installed still
+    /// runs the older server, so a consumer gating per session must treat this list as an upper
+    /// bound until that session restarts.
     pub fn capabilities_document(opts: &CliArgs, config_options: &Options) -> serde_json::Value {
         let data_dir = opts.data_dir.clone().unwrap_or_else(get_default_data_dir);
         let config_dir = opts.config_dir.clone().or_else(find_default_config_dir);
@@ -495,14 +518,19 @@ impl Setup {
         };
 
         let capabilities = crate::capabilities::BuildCapabilities::default();
-        serde_json::json!({
-            "version": capabilities.version.version,
-            "base_version": capabilities.version.base,
-            "fork": capabilities.version.fork,
-            "fork_counter": capabilities.version.fork_counter,
-            "capabilities": capabilities.capabilities,
-            "features": FEATURES,
-            "directories": {
+        let mut document = serde_json::Map::new();
+        // the binary answers for itself. A session started before this binary was installed still
+        // runs the older server, which may not have these capabilities yet
+        document.insert("scope".to_owned(), serde_json::json!("binary"));
+        insert_version_keys(&mut document, &capabilities.version);
+        document.insert(
+            "capabilities".to_owned(),
+            serde_json::json!(capabilities.capabilities),
+        );
+        document.insert("features".to_owned(), serde_json::json!(FEATURES));
+        document.insert(
+            "directories".to_owned(),
+            serde_json::json!({
                 "config_dir": path(&config_dir),
                 "config_file": path(&config_file),
                 "cache_dir": ZELLIJ_CACHE_DIR.display().to_string(),
@@ -511,8 +539,9 @@ impl Setup {
                 "plugin_dir": plugin_dir.display().to_string(),
                 "layout_dir": path(&layout_dir),
                 "system_data_dir": system_data_dir().display().to_string(),
-            },
-        })
+            }),
+        );
+        serde_json::Value::Object(document)
     }
 
     pub fn check_defaults_config(opts: &CliArgs, config_options: &Options) -> std::io::Result<()> {
@@ -849,7 +878,7 @@ fn merge_attach_command_options(
 
 #[cfg(test)]
 mod setup_test {
-    use super::Setup;
+    use super::{insert_version_keys, Setup};
     use crate::cli::{CliArgs, Command};
     use crate::data::LayoutInfo;
     use crate::input::options::Options;
@@ -1085,6 +1114,11 @@ mod setup_test {
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(
+            parsed["scope"].as_str(),
+            Some("binary"),
+            "the document says what it describes: this binary, not a running server"
+        );
+        assert_eq!(
             parsed["version"].as_str(),
             Some(crate::consts::VERSION),
             "the whole version string is reported"
@@ -1120,6 +1154,37 @@ mod setup_test {
         assert!(
             parsed["directories"]["socket_dir"].as_str().is_some(),
             "the directories a consumer needs are machine-readable too"
+        );
+    }
+
+    #[test]
+    fn an_upstream_build_omits_the_fork_keys_rather_than_nulling_them() {
+        // this binary is always a fork build, so exercise the writer directly
+        let mut document = serde_json::Map::new();
+        insert_version_keys(
+            &mut document,
+            &crate::capabilities::VersionInfo::from_version_string("0.45.0"),
+        );
+        assert_eq!(
+            document.get("base_version").and_then(|v| v.as_str()),
+            Some("0.45.0")
+        );
+        assert!(!document.contains_key("fork"), "document: {:?}", document);
+        assert!(
+            !document.contains_key("fork_counter"),
+            "document: {:?}",
+            document
+        );
+
+        let mut document = serde_json::Map::new();
+        insert_version_keys(
+            &mut document,
+            &crate::capabilities::VersionInfo::from_version_string("0.45.0-nkmk.4"),
+        );
+        assert_eq!(document.get("fork").and_then(|v| v.as_str()), Some("nkmk"));
+        assert_eq!(
+            document.get("fork_counter").and_then(|v| v.as_u64()),
+            Some(4)
         );
     }
 }
