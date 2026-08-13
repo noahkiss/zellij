@@ -19,7 +19,7 @@
 //! Every failure here is a debug log and a `None`. Serialization runs on a timer and its job is to
 //! preserve what it can - a hint that cannot be resolved must cost the snapshot nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -102,6 +102,69 @@ impl ProcessTree {
         );
         None
     }
+
+    /// The allowlisted variables carried by `root` or its descendants.
+    ///
+    /// One walk, one read per process, every name resolved from the same blob - resolving each
+    /// name separately would read the same environments once per name. The nearest process to the
+    /// root wins, so a tool started inside the pane's shell shadows the shell for a name they both
+    /// export.
+    pub fn find_all_envs(&self, root: u32, vars: &[String]) -> BTreeMap<String, String> {
+        let mut found = BTreeMap::new();
+        if vars.is_empty() {
+            return found;
+        }
+        for pid in self.descendants(root) {
+            if found.len() == vars.len() {
+                break;
+            }
+            let environ = match read_process_environ(pid) {
+                Some(environ) => environ,
+                None => continue,
+            };
+            for var in vars {
+                if found.contains_key(var) {
+                    continue;
+                }
+                if let Some(value) = env_from_environ(&environ, var) {
+                    found.insert(var.clone(), value);
+                }
+            }
+        }
+        found
+    }
+}
+
+/// One process's environment in the form this platform serves it, ready for `env_from_environ`.
+#[cfg(target_os = "linux")]
+fn read_process_environ(pid: u32) -> Option<Vec<u8>> {
+    std::fs::read(format!("/proc/{}/environ", pid)).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn read_process_environ(pid: u32) -> Option<Vec<u8>> {
+    read_procargs2(pid)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_process_environ(_pid: u32) -> Option<Vec<u8>> {
+    None
+}
+
+/// One variable out of the blob `read_process_environ` returns on this platform.
+#[cfg(target_os = "linux")]
+fn env_from_environ(environ: &[u8], var: &str) -> Option<String> {
+    env_from_nul_list(environ, var)
+}
+
+#[cfg(target_os = "macos")]
+fn env_from_environ(environ: &[u8], var: &str) -> Option<String> {
+    env_from_procargs2(environ, var)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn env_from_environ(_environ: &[u8], _var: &str) -> Option<String> {
+    None
 }
 
 /// One variable out of one process's environment, or `None` if it is not there or not readable.
@@ -331,6 +394,26 @@ mod tests {
             env_from_procargs2(&blob, "SESSION_ID"),
             Some("from-the-environment".to_owned())
         );
+    }
+
+    /// Reads this very process, because the platform code is the whole point of the function and a
+    /// fake process table cannot exercise it. `PATH` is in every process's initial environment.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn allowlisted_variables_are_read_from_a_real_process() {
+        let tree = tree(&[]);
+        let found = tree.find_all_envs(
+            std::process::id(),
+            &["PATH".to_owned(), "NOT_A_REAL_VARIABLE_ZELLIJ".to_owned()],
+        );
+        assert!(found.contains_key("PATH"), "found: {:?}", found.keys());
+        assert!(!found.contains_key("NOT_A_REAL_VARIABLE_ZELLIJ"));
+    }
+
+    #[test]
+    fn an_empty_allowlist_reads_nothing() {
+        let tree = tree(&[(10, &[20])]);
+        assert!(tree.find_all_envs(10, &[]).is_empty());
     }
 
     #[test]

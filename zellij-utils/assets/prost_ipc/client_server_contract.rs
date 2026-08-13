@@ -1357,6 +1357,10 @@ pub struct CliAssets {
     pub force_run_layout_commands: bool,
     #[prost(string, optional, tag="11")]
     pub cwd: ::core::option::Option<::prost::alloc::string::String>,
+    /// fork: the terminal device this client is attached to, when it has one. Tag 100 is
+    /// fork-reserved, far from the next number upstream would take
+    #[prost(string, optional, tag="100")]
+    pub tty: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

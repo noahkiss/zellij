@@ -42,6 +42,7 @@ Options {
     session_restart_drop_env: None,
     session_service: None,
     resurrect_command_hints: None,
+    report_pane_env: None,
     default_floating_size: None,
     styled_underlines: None,
     serialization_interval: None,

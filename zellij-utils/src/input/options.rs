@@ -405,6 +405,16 @@ pub struct Options {
     #[serde(default)]
     pub resurrect_command_hints: Option<ResurrectCommandHints>,
 
+    /// Environment variables to report on every pane, by exact name, so that a consumer of the
+    /// pane list can tell what a pane is - which harness owns it, which session id it holds. The
+    /// environment holds secrets, so this is an allowlist and nothing else: unset means report
+    /// nothing, and there are no default entries. Names only, never patterns - a pattern is how a
+    /// key nobody meant to publish gets published.
+    /// config.kdl only - it is read by the server when it reports pane state.
+    #[clap(skip)]
+    #[serde(default)]
+    pub report_pane_env: Option<Vec<String>>,
+
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
     #[clap(skip)]
@@ -669,6 +679,10 @@ impl Options {
         let resurrect_command_hints = other
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
+        let report_pane_env = other
+            .report_pane_env
+            .clone()
+            .or_else(|| self.report_pane_env.clone());
         let default_floating_size = other
             .default_floating_size
             .clone()
@@ -764,6 +778,7 @@ impl Options {
             session_restart_drop_env,
             session_service,
             resurrect_command_hints,
+            report_pane_env,
             default_floating_size,
             styled_underlines,
             serialization_interval,
@@ -874,6 +889,10 @@ impl Options {
         let resurrect_command_hints = other
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
+        let report_pane_env = other
+            .report_pane_env
+            .clone()
+            .or_else(|| self.report_pane_env.clone());
         let default_floating_size = other
             .default_floating_size
             .clone()
@@ -969,6 +988,7 @@ impl Options {
             session_restart_drop_env,
             session_service,
             resurrect_command_hints,
+            report_pane_env,
             default_floating_size,
             styled_underlines,
             serialization_interval,

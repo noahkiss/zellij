@@ -923,7 +923,8 @@ pub(crate) fn plugin_thread_main(
                             client_metadata.stringify_command(&default_editor),
                             is_current_client,
                         )
-                        .with_terminal_size(client_metadata.terminal_size()),
+                        .with_terminal_size(client_metadata.terminal_size())
+                        .with_tty(client_metadata.tty()),
                     );
                 }
                 let updates = vec![(

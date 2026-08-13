@@ -102,6 +102,7 @@ pub fn create_first_message(
             max_panes: None,
             force_run_layout_commands: false,
             cwd: None,
+            tty: None,
         };
 
         ClientToServerMsg::FirstClientConnected {
@@ -121,6 +122,7 @@ pub fn create_first_message(
             max_panes: None,
             force_run_layout_commands: false,
             cwd: None,
+            tty: None,
         };
         let is_web_client = true;
 

@@ -3041,6 +3041,15 @@ impl Options {
             ),
             None => None,
         };
+        let report_pane_env = match kdl_options.get("report_pane_env") {
+            Some(kdl_report_env) => Some(
+                kdl_string_arguments!(kdl_report_env)
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            ),
+            None => None,
+        };
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -3203,6 +3212,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            report_pane_env,
             session_service,
             resurrect_command_hints,
             default_floating_size,
@@ -3598,6 +3608,18 @@ impl Options {
             aliases.nodes_mut().push(alias_node);
         }
         node.set_children(aliases);
+        Some(node)
+    }
+    /// The `report_pane_env` node: the exact variable names to report on every pane.
+    fn report_pane_env_to_kdl(&self) -> Option<KdlNode> {
+        let names = self.report_pane_env.as_ref()?;
+        if names.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("report_pane_env");
+        for name in names {
+            node.push(KdlValue::String(name.to_owned()));
+        }
         Some(node)
     }
     fn session_restart_drop_env_to_kdl(&self) -> Option<KdlNode> {
@@ -5347,6 +5369,9 @@ impl Options {
         if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
             nodes.push(session_restart_drop_env);
         }
+        if let Some(report_pane_env) = self.report_pane_env_to_kdl() {
+            nodes.push(report_pane_env);
+        }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
         }
@@ -7056,6 +7081,16 @@ impl TabInfo {
         let selectable_floating_panes_count =
             optional_int_node!("selectable_floating_panes_count", usize).unwrap_or(0);
         let tab_id = optional_int_node!("tab_id", usize).unwrap_or(0);
+        macro_rules! optional_bool_node {
+            ($name:expr) => {{
+                kdl_document
+                    .get($name)
+                    .and_then(|n| n.entries().iter().next())
+                    .and_then(|e| e.value().as_bool())
+            }};
+        }
+        let has_bell_notification = optional_bool_node!("has_bell_notification").unwrap_or(false);
+        let is_flashing_bell = optional_bool_node!("is_flashing_bell").unwrap_or(false);
         Ok(TabInfo {
             position,
             name,
@@ -7074,8 +7109,8 @@ impl TabInfo {
             selectable_tiled_panes_count,
             selectable_floating_panes_count,
             tab_id,
-            has_bell_notification: false,
-            is_flashing_bell: false,
+            has_bell_notification,
+            is_flashing_bell,
         })
     }
     pub fn encode_to_kdl(&self) -> KdlDocument {
@@ -7156,6 +7191,18 @@ impl TabInfo {
         let mut tab_id = KdlNode::new("tab_id");
         tab_id.push(self.tab_id as i64);
         kdl_doucment.nodes_mut().push(tab_id);
+
+        // written only when ringing, so a quiet tab's metadata is unchanged
+        if self.has_bell_notification {
+            let mut has_bell_notification = KdlNode::new("has_bell_notification");
+            has_bell_notification.push(self.has_bell_notification);
+            kdl_doucment.nodes_mut().push(has_bell_notification);
+        }
+        if self.is_flashing_bell {
+            let mut is_flashing_bell = KdlNode::new("is_flashing_bell");
+            is_flashing_bell.push(self.is_flashing_bell);
+            kdl_doucment.nodes_mut().push(is_flashing_bell);
+        }
 
         kdl_doucment
     }
@@ -7281,11 +7328,56 @@ impl PaneInfo {
                     _ => None,
                 }
             });
+        macro_rules! optional_bool_node {
+            ($name:expr) => {{
+                kdl_document
+                    .get($name)
+                    .and_then(|n| n.entries().iter().next())
+                    .and_then(|e| e.value().as_bool())
+            }};
+        }
         let terminal_command = optional_string_node!("terminal_command");
         let plugin_url = optional_string_node!("plugin_url");
         let is_selectable = bool_node!("is_selectable");
+        // the identity and stack fields are optional: a pane described by a saved layout has
+        // none of them, and neither does metadata written by an older version
+        let uuid = optional_string_node!("uuid").unwrap_or_default();
+        let restored_from = optional_string_node!("restored_from").unwrap_or_default();
+        let program_title = optional_string_node!("program_title");
+        let default_fg = optional_string_node!("default_fg");
+        let default_bg = optional_string_node!("default_bg");
+        let stack_id = optional_int_node!("stack_id", usize);
+        let index_in_stack = optional_int_node!("index_in_stack", usize);
+        let is_expanded_in_stack = optional_bool_node!("is_expanded_in_stack").unwrap_or(false);
+        let pane_cwd = optional_string_node!("pane_cwd");
+        let pane_pid = optional_int_node!("pane_pid", u32);
+        let pane_command = optional_string_node!("pane_command");
+        let last_output_at = optional_int_node!("last_output_at", u64);
+        let has_pending_bell = optional_bool_node!("has_pending_bell").unwrap_or(false);
+        let is_alternate_screen = optional_bool_node!("is_alternate_screen").unwrap_or(false);
+        let is_pinned = optional_bool_node!("is_pinned").unwrap_or(false);
+        let logical_position = optional_int_node!("logical_position", usize);
+        let is_borderless = optional_bool_node!("is_borderless").unwrap_or(false);
+        let exclude_from_sync = optional_bool_node!("exclude_from_sync").unwrap_or(false);
+        let has_explicit_title = optional_bool_node!("has_explicit_title").unwrap_or(false);
 
         let pane_info = PaneInfo {
+            restored_from,
+            pane_cwd,
+            pane_pid,
+            pane_command,
+            last_output_at,
+            has_pending_bell,
+            is_alternate_screen,
+            is_pinned,
+            logical_position,
+            is_borderless,
+            exclude_from_sync,
+            has_explicit_title,
+            // deliberately not carried - see the notes on `encode_to_kdl`
+            pane_env: Default::default(),
+            scrollback_position: 0,
+            scrollback_length: 0,
             id,
             is_plugin,
             is_focused,
@@ -7309,14 +7401,13 @@ impl PaneInfo {
             plugin_url,
             is_selectable,
             index_in_pane_group: Default::default(), // we don't serialize this
-            default_fg: None,
-            default_bg: None,
-            program_title: None,
-            stack_id: None,
-            index_in_stack: None,
-            is_expanded_in_stack: false,
-            // a pane described by a saved layout is not a live pane and has no uuid yet
-            uuid: String::new(),
+            default_fg,
+            default_bg,
+            program_title,
+            stack_id,
+            index_in_stack,
+            is_expanded_in_stack,
+            uuid,
         };
         Ok((tab_position, pane_info))
     }
@@ -7377,6 +7468,80 @@ impl PaneInfo {
             string_node!("plugin_url", plugin_url.to_string());
         }
         bool_node!("is_selectable", self.is_selectable);
+        // the identity and stack fields, written only when they say something: this codec also
+        // describes panes in saved layouts, which have none of them
+        if !self.uuid.is_empty() {
+            string_node!("uuid", self.uuid.to_string());
+        }
+        if !self.restored_from.is_empty() {
+            string_node!("restored_from", self.restored_from.to_string());
+        }
+        if let Some(program_title) = &self.program_title {
+            string_node!("program_title", program_title.to_string());
+        }
+        if let Some(default_fg) = &self.default_fg {
+            string_node!("default_fg", default_fg.to_string());
+        }
+        if let Some(default_bg) = &self.default_bg {
+            string_node!("default_bg", default_bg.to_string());
+        }
+        if let Some(stack_id) = self.stack_id {
+            int_node!("stack_id", stack_id);
+        }
+        if let Some(index_in_stack) = self.index_in_stack {
+            int_node!("index_in_stack", index_in_stack);
+        }
+        if self.is_expanded_in_stack {
+            bool_node!("is_expanded_in_stack", self.is_expanded_in_stack);
+        }
+        // what the pane is running, and when it last said anything - the same rule again, written
+        // only when there is something to write, so a saved layout's panes are unchanged
+        //
+        // `pane_env` is deliberately absent. Reporting it on the event path is something a
+        // configuration opted into; writing those values into a file on disk, which every session
+        // on the box can read and which outlives the server, is a different exposure and was not
+        // asked for. A peer session's `pane_env` is therefore always empty - read it from the
+        // session that owns the pane.
+        if let Some(pane_cwd) = &self.pane_cwd {
+            string_node!("pane_cwd", pane_cwd.to_string());
+        }
+        if let Some(pane_pid) = self.pane_pid {
+            int_node!("pane_pid", pane_pid);
+        }
+        if let Some(pane_command) = &self.pane_command {
+            string_node!("pane_command", pane_command.to_string());
+        }
+        if let Some(last_output_at) = self.last_output_at {
+            int_node!("last_output_at", last_output_at);
+        }
+        if self.has_pending_bell {
+            bool_node!("has_pending_bell", self.has_pending_bell);
+        }
+        // the state the pane trait already held: written only when it says something, the same
+        // rule as above.
+        //
+        // `scrollback_position` and `scrollback_length` are deliberately absent. They describe
+        // where this session's own viewport sits in a buffer that grows with every line of output
+        // - a reader of another session's metadata can neither scroll that pane nor act on the
+        // numbers, and writing them would rewrite this file for every pane that produced a line.
+        if self.is_alternate_screen {
+            bool_node!("is_alternate_screen", self.is_alternate_screen);
+        }
+        if self.is_pinned {
+            bool_node!("is_pinned", self.is_pinned);
+        }
+        if let Some(logical_position) = self.logical_position {
+            int_node!("logical_position", logical_position);
+        }
+        if self.is_borderless {
+            bool_node!("is_borderless", self.is_borderless);
+        }
+        if self.exclude_from_sync {
+            bool_node!("exclude_from_sync", self.exclude_from_sync);
+        }
+        if self.has_explicit_title {
+            bool_node!("has_explicit_title", self.has_explicit_title);
+        }
         kdl_doucment
     }
 }
@@ -7442,6 +7607,21 @@ fn serialize_and_deserialize_session_info() {
 fn serialize_and_deserialize_session_info_with_data() {
     let panes_list = vec![
         PaneInfo {
+            restored_from: String::new(),
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
+            last_output_at: None,
+            has_pending_bell: false,
+            is_alternate_screen: false,
+            scrollback_position: 0,
+            scrollback_length: 0,
+            is_pinned: false,
+            logical_position: None,
+            is_borderless: false,
+            exclude_from_sync: false,
+            has_explicit_title: false,
+            pane_env: Default::default(),
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -7474,6 +7654,21 @@ fn serialize_and_deserialize_session_info_with_data() {
             uuid: String::new(),
         },
         PaneInfo {
+            restored_from: String::new(),
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
+            last_output_at: None,
+            has_pending_bell: false,
+            is_alternate_screen: false,
+            scrollback_position: 0,
+            scrollback_length: 0,
+            is_pinned: false,
+            logical_position: None,
+            is_borderless: false,
+            exclude_from_sync: false,
+            has_explicit_title: false,
+            pane_env: Default::default(),
             id: 1,
             is_plugin: true,
             is_focused: true,
@@ -7573,6 +7768,175 @@ fn serialize_and_deserialize_session_info_with_data() {
     let deserealized = SessionInfo::from_string(&serialized, "not this session").unwrap();
     assert_eq!(session_info, deserealized);
     insta::assert_snapshot!(serialized);
+}
+
+#[test]
+fn session_info_round_trip_keeps_pane_identity_and_stack_fields() {
+    // session-metadata.kdl is how every peer session is read, so anything this codec drops is
+    // missing from SessionUpdate for all but the current session
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        uuid: "27e1a5a8-0000-4000-8000-0000000000ff".to_owned(),
+        restored_from: "8e0d1c33-0000-4000-8000-0000000000aa".to_owned(),
+        program_title: Some("vim".to_owned()),
+        default_fg: Some("#00e000".to_owned()),
+        default_bg: Some("#001a3a".to_owned()),
+        stack_id: Some(2),
+        index_in_stack: Some(1),
+        is_expanded_in_stack: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "identity session".to_owned(),
+        tabs: vec![TabInfo {
+            name: "tab 1".to_owned(),
+            has_bell_notification: true,
+            is_flashing_bell: true,
+            ..Default::default()
+        }],
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.uuid, pane.uuid);
+    assert_eq!(round_tripped_pane.restored_from, pane.restored_from);
+    assert_eq!(round_tripped_pane.program_title, pane.program_title);
+    assert_eq!(round_tripped_pane.stack_id, pane.stack_id);
+    assert_eq!(round_tripped_pane.index_in_stack, pane.index_in_stack);
+    assert!(round_tripped_pane.is_expanded_in_stack);
+    assert!(deserialized.tabs[0].has_bell_notification);
+}
+
+#[test]
+fn session_info_round_trip_keeps_the_process_and_activity_fields() {
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        pane_cwd: Some("/home/user/develop/thing".to_owned()),
+        pane_pid: Some(90210),
+        pane_command: Some("claude --resume".to_owned()),
+        last_output_at: Some(1_760_000_000_000),
+        has_pending_bell: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "process session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.pane_cwd, pane.pane_cwd);
+    assert_eq!(round_tripped_pane.pane_pid, pane.pane_pid);
+    assert_eq!(round_tripped_pane.pane_command, pane.pane_command);
+    assert_eq!(round_tripped_pane.last_output_at, pane.last_output_at);
+    assert!(round_tripped_pane.has_pending_bell);
+}
+
+#[test]
+fn session_info_round_trip_keeps_the_pane_layout_fields() {
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        is_alternate_screen: true,
+        is_pinned: true,
+        logical_position: Some(2),
+        is_borderless: true,
+        exclude_from_sync: true,
+        has_explicit_title: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "layout fields session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert!(round_tripped_pane.is_alternate_screen);
+    assert!(round_tripped_pane.is_pinned);
+    assert_eq!(round_tripped_pane.logical_position, Some(2));
+    assert!(round_tripped_pane.is_borderless);
+    assert!(round_tripped_pane.exclude_from_sync);
+    assert!(round_tripped_pane.has_explicit_title);
+}
+
+/// Where this session's own viewport sits in a growing buffer is of no use to a peer reading the
+/// file, and would rewrite it for every pane that produced a line.
+#[test]
+fn session_metadata_never_carries_the_scrollback_position() {
+    let pane = PaneInfo {
+        id: 3,
+        scrollback_position: 12,
+        scrollback_length: 4000,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane]);
+    let session_info = SessionInfo {
+        name: "scrollback session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    assert!(
+        !serialized.contains("scrollback_position") && !serialized.contains("scrollback_length"),
+        "the scrollback position must not reach session metadata: {}",
+        serialized
+    );
+
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.scrollback_position, 0);
+    assert_eq!(round_tripped_pane.scrollback_length, 0);
+}
+
+/// Reporting an environment variable on the event path was opted into. Writing it to a file every
+/// session on the box can read, and which outlives the server, was not.
+#[test]
+fn session_metadata_never_carries_the_pane_environment() {
+    let pane = PaneInfo {
+        id: 3,
+        pane_env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane]);
+    let session_info = SessionInfo {
+        name: "env session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    assert!(
+        !serialized.contains("abc-123") && !serialized.contains("CLAUDE_CODE_SESSION_ID"),
+        "the environment must not reach session metadata: {}",
+        serialized
+    );
+
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert!(deserialized.panes.panes.get(&0).unwrap()[0]
+        .pane_env
+        .is_empty());
 }
 
 #[test]
@@ -8724,6 +9088,45 @@ fn session_restart_drop_env_config_parsing() {
 fn session_restart_drop_env_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_restart_drop_env, None);
+}
+
+#[test]
+fn report_pane_env_config_parsing() {
+    let config_with_report_pane_env = r#"
+        report_pane_env "CLAUDE_CODE_SESSION_ID" "MY_TOOL_ID"
+    "#;
+    let config = Config::from_kdl(config_with_report_pane_env, None).unwrap();
+    assert_eq!(
+        config.options.report_pane_env,
+        Some(vec![
+            "CLAUDE_CODE_SESSION_ID".to_string(),
+            "MY_TOOL_ID".to_string()
+        ])
+    );
+}
+
+/// The environment holds secrets, so nothing is reported that was not asked for by name.
+#[test]
+fn report_pane_env_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.report_pane_env, None);
+}
+
+#[test]
+fn report_pane_env_survives_the_kdl_round_trip() {
+    let config = Config::from_kdl(r#"report_pane_env "MY_TOOL_ID""#, None).unwrap();
+    let written: String = config
+        .options
+        .to_kdl(false)
+        .iter()
+        .map(|node| node.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reparsed = Config::from_kdl(&written, None).unwrap();
+    assert_eq!(
+        reparsed.options.report_pane_env,
+        Some(vec!["MY_TOOL_ID".to_string()])
+    );
 }
 
 #[test]

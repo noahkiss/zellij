@@ -21,7 +21,7 @@ pub use super::generated_api::api::{
         LayoutParsingError as ProtobufLayoutParsingError,
         LayoutWithError as ProtobufLayoutWithError, ModeUpdatePayload as ProtobufModeUpdatePayload,
         PaneContents as ProtobufPaneContents, PaneContentsEntry as ProtobufPaneContentsEntry,
-        PaneFrameStyle as ProtobufPaneFrameStyle, PaneId as ProtobufPaneId,
+        PaneEnvVar, PaneFrameStyle as ProtobufPaneFrameStyle, PaneId as ProtobufPaneId,
         PaneInfo as ProtobufPaneInfo, PaneManifest as ProtobufPaneManifest,
         PaneMetadata as ProtobufPaneMetadata,
         PaneRenderReportPayload as ProtobufPaneRenderReportPayload,
@@ -54,6 +54,7 @@ use crate::data::{
 
 use crate::errors::prelude::*;
 use crate::input::actions::Action;
+use crate::pane_size::Size;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
@@ -303,6 +304,33 @@ impl TryFrom<ProtobufEvent> for Event {
                     Ok(Event::PaneClosed(PaneId::try_from(pane_id)?))
                 },
                 _ => Err("Malformed payload for the PaneClosed Event"),
+            },
+            Some(ProtobufEventType::PaneOpened) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::PaneOpenedPayload(pane_opened_payload)) => {
+                    let pane_id = pane_opened_payload
+                        .pane_id
+                        .ok_or("Malformed payload for the PaneOpened Event")?;
+                    Ok(Event::PaneOpened(PaneId::try_from(pane_id)?))
+                },
+                _ => Err("Malformed payload for the PaneOpened Event"),
+            },
+            Some(ProtobufEventType::PaneExited) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::PaneExitedPayload(pane_exited_payload)) => {
+                    let pane_id = pane_exited_payload
+                        .pane_id
+                        .ok_or("Malformed payload for the PaneExited Event")?;
+                    Ok(Event::PaneExited(
+                        PaneId::try_from(pane_id)?,
+                        pane_exited_payload.exit_status,
+                    ))
+                },
+                _ => Err("Malformed payload for the PaneExited Event"),
+            },
+            Some(ProtobufEventType::PluginDied) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::PluginDiedPayload(plugin_died_payload)) => Ok(
+                    Event::PluginDied(plugin_died_payload.plugin_id, plugin_died_payload.message),
+                ),
+                _ => Err("Malformed payload for the PluginDied Event"),
             },
             Some(ProtobufEventType::EditPaneOpened) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::EditPaneOpenedPayload(command_pane_opened_payload)) => {
@@ -644,6 +672,17 @@ impl TryFrom<ProtobufEvent> for Event {
 impl TryFrom<ProtobufClientInfo> for ClientInfo {
     type Error = &'static str;
     fn try_from(protobuf_client_info: ProtobufClientInfo) -> Result<Self, &'static str> {
+        let terminal_size = match (
+            protobuf_client_info.terminal_rows,
+            protobuf_client_info.terminal_cols,
+        ) {
+            (Some(rows), Some(cols)) => Some(Size {
+                rows: rows as usize,
+                cols: cols as usize,
+            }),
+            // a half-filled size is no size: report nothing rather than a made-up dimension
+            _ => None,
+        };
         Ok(ClientInfo::new(
             protobuf_client_info.client_id as u16,
             protobuf_client_info
@@ -652,7 +691,9 @@ impl TryFrom<ProtobufClientInfo> for ClientInfo {
                 .try_into()?,
             protobuf_client_info.running_command,
             protobuf_client_info.is_current_client,
-        ))
+        )
+        .with_terminal_size(terminal_size)
+        .with_tty(protobuf_client_info.tty))
     }
 }
 
@@ -664,6 +705,9 @@ impl TryFrom<ClientInfo> for ProtobufClientInfo {
             pane_id: Some(client_info.pane_id.try_into()?),
             running_command: client_info.running_command,
             is_current_client: client_info.is_current_client,
+            terminal_rows: client_info.terminal_size.map(|size| size.rows as u32),
+            terminal_cols: client_info.terminal_size.map(|size| size.cols as u32),
+            tty: client_info.tty,
         })
     }
 }
@@ -1015,6 +1059,26 @@ impl TryFrom<Event> for ProtobufEvent {
                 name: ProtobufEventType::PaneClosed as i32,
                 payload: Some(event::Payload::PaneClosedPayload(PaneClosedPayload {
                     pane_id: Some(pane_id.try_into()?),
+                })),
+            }),
+            Event::PaneOpened(pane_id) => Ok(ProtobufEvent {
+                name: ProtobufEventType::PaneOpened as i32,
+                payload: Some(event::Payload::PaneOpenedPayload(PaneOpenedPayload {
+                    pane_id: Some(pane_id.try_into()?),
+                })),
+            }),
+            Event::PluginDied(plugin_id, message) => Ok(ProtobufEvent {
+                name: ProtobufEventType::PluginDied as i32,
+                payload: Some(event::Payload::PluginDiedPayload(PluginDiedPayload {
+                    plugin_id,
+                    message,
+                })),
+            }),
+            Event::PaneExited(pane_id, exit_status) => Ok(ProtobufEvent {
+                name: ProtobufEventType::PaneExited as i32,
+                payload: Some(event::Payload::PaneExitedPayload(PaneExitedPayload {
+                    pane_id: Some(pane_id.try_into()?),
+                    exit_status,
                 })),
             }),
             Event::EditPaneOpened(terminal_pane_id, context) => {
@@ -1954,6 +2018,25 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             index_in_stack: protobuf_pane_info.index_in_stack.map(|i| i as usize),
             is_expanded_in_stack: protobuf_pane_info.is_expanded_in_stack,
             uuid: protobuf_pane_info.uuid,
+            restored_from: protobuf_pane_info.restored_from,
+            pane_cwd: protobuf_pane_info.pane_cwd,
+            pane_pid: protobuf_pane_info.pane_pid,
+            pane_command: protobuf_pane_info.pane_command,
+            last_output_at: protobuf_pane_info.last_output_at,
+            has_pending_bell: protobuf_pane_info.has_pending_bell,
+            pane_env: protobuf_pane_info
+                .pane_env
+                .into_iter()
+                .map(|entry| (entry.name, entry.value))
+                .collect(),
+            is_alternate_screen: protobuf_pane_info.is_alternate_screen,
+            scrollback_position: protobuf_pane_info.scrollback_position as usize,
+            scrollback_length: protobuf_pane_info.scrollback_length as usize,
+            is_pinned: protobuf_pane_info.is_pinned,
+            logical_position: protobuf_pane_info.logical_position.map(|p| p as usize),
+            is_borderless: protobuf_pane_info.is_borderless,
+            exclude_from_sync: protobuf_pane_info.exclude_from_sync,
+            has_explicit_title: protobuf_pane_info.has_explicit_title,
         })
     }
 }
@@ -2004,6 +2087,25 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             index_in_stack: pane_info.index_in_stack.map(|i| i as u32),
             is_expanded_in_stack: pane_info.is_expanded_in_stack,
             uuid: pane_info.uuid,
+            restored_from: pane_info.restored_from,
+            pane_cwd: pane_info.pane_cwd,
+            pane_pid: pane_info.pane_pid,
+            pane_command: pane_info.pane_command,
+            last_output_at: pane_info.last_output_at,
+            has_pending_bell: pane_info.has_pending_bell,
+            pane_env: pane_info
+                .pane_env
+                .into_iter()
+                .map(|(name, value)| PaneEnvVar { name, value })
+                .collect(),
+            is_alternate_screen: pane_info.is_alternate_screen,
+            scrollback_position: pane_info.scrollback_position as u32,
+            scrollback_length: pane_info.scrollback_length as u32,
+            is_pinned: pane_info.is_pinned,
+            logical_position: pane_info.logical_position.map(|p| p as u32),
+            is_borderless: pane_info.is_borderless,
+            exclude_from_sync: pane_info.exclude_from_sync,
+            has_explicit_title: pane_info.has_explicit_title,
         })
     }
 }
@@ -2336,6 +2438,9 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::CommandPaneOpened => EventType::CommandPaneOpened,
             ProtobufEventType::CommandPaneExited => EventType::CommandPaneExited,
             ProtobufEventType::PaneClosed => EventType::PaneClosed,
+            ProtobufEventType::PaneOpened => EventType::PaneOpened,
+            ProtobufEventType::PaneExited => EventType::PaneExited,
+            ProtobufEventType::PluginDied => EventType::PluginDied,
             ProtobufEventType::EditPaneOpened => EventType::EditPaneOpened,
             ProtobufEventType::EditPaneExited => EventType::EditPaneExited,
             ProtobufEventType::CommandPaneReRun => EventType::CommandPaneReRun,
@@ -2396,6 +2501,9 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::CommandPaneOpened => ProtobufEventType::CommandPaneOpened,
             EventType::CommandPaneExited => ProtobufEventType::CommandPaneExited,
             EventType::PaneClosed => ProtobufEventType::PaneClosed,
+            EventType::PaneOpened => ProtobufEventType::PaneOpened,
+            EventType::PaneExited => ProtobufEventType::PaneExited,
+            EventType::PluginDied => ProtobufEventType::PluginDied,
             EventType::EditPaneOpened => ProtobufEventType::EditPaneOpened,
             EventType::EditPaneExited => ProtobufEventType::EditPaneExited,
             EventType::CommandPaneReRun => ProtobufEventType::CommandPaneReRun,
@@ -3106,6 +3214,23 @@ fn serialize_session_update_event_with_non_default_values() {
             index_in_stack: Some(0),
             is_expanded_in_stack: true,
             uuid: String::new(),
+            restored_from: String::new(),
+            pane_cwd: Some("/home/user/develop/thing".to_owned()),
+            pane_pid: Some(90210),
+            pane_command: Some("claude --resume".to_owned()),
+            last_output_at: Some(1_760_000_000_000),
+            has_pending_bell: true,
+            pane_env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
+                .into_iter()
+                .collect(),
+            is_alternate_screen: true,
+            scrollback_position: 12,
+            scrollback_length: 4000,
+            is_pinned: true,
+            logical_position: Some(2),
+            is_borderless: true,
+            exclude_from_sync: true,
+            has_explicit_title: true,
         },
         PaneInfo {
             id: 1,
@@ -3138,6 +3263,23 @@ fn serialize_session_update_event_with_non_default_values() {
             index_in_stack: Some(1),
             is_expanded_in_stack: false,
             uuid: String::new(),
+            restored_from: String::new(),
+            // a plugin pane has no process of its own
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
+            last_output_at: None,
+            has_pending_bell: false,
+            pane_env: Default::default(),
+            // a plugin pane draws its own contents, so it has none of this either
+            is_alternate_screen: false,
+            scrollback_position: 0,
+            scrollback_length: 0,
+            is_pinned: false,
+            logical_position: None,
+            is_borderless: false,
+            exclude_from_sync: false,
+            has_explicit_title: false,
         },
     ];
     panes.insert(0, panes_list);
@@ -3493,5 +3635,95 @@ impl TryFrom<SelectedText> for ProtobufSelectedText {
             start: Some(selected_text.start.try_into()?),
             end: Some(selected_text.end.try_into()?),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_info(terminal_size: Option<Size>) -> ClientInfo {
+        ClientInfo::new(3, PaneId::Terminal(7), "zsh".to_owned(), true)
+            .with_terminal_size(terminal_size)
+    }
+
+    fn protobuf_client_info(
+        terminal_rows: Option<u32>,
+        terminal_cols: Option<u32>,
+    ) -> ProtobufClientInfo {
+        ProtobufClientInfo {
+            client_id: 3,
+            pane_id: Some(PaneId::Terminal(7).try_into().unwrap()),
+            running_command: "zsh".to_owned(),
+            is_current_client: true,
+            terminal_rows,
+            terminal_cols,
+            tty: None,
+        }
+    }
+
+    #[test]
+    fn client_info_roundtrips_through_protobuf() {
+        for size in [
+            Some(Size {
+                rows: 40,
+                cols: 160,
+            }),
+            None,
+        ] {
+            let client_info = client_info(size);
+            let protobuf: ProtobufClientInfo = client_info.clone().try_into().unwrap();
+            let roundtripped: ClientInfo = protobuf.try_into().unwrap();
+            assert_eq!(client_info, roundtripped);
+        }
+    }
+
+    #[test]
+    fn a_client_info_written_without_the_size_tags_reads_as_no_size() {
+        // an older plugin or server never writes the fork-only tags, so they arrive absent
+        let client_info: ClientInfo = protobuf_client_info(None, None).try_into().unwrap();
+        assert_eq!(client_info.terminal_size, None);
+        assert_eq!(client_info.terminal_area(), None);
+    }
+
+    #[test]
+    fn half_a_size_is_no_size() {
+        let client_info: ClientInfo = protobuf_client_info(Some(40), None).try_into().unwrap();
+        assert_eq!(client_info.terminal_size, None);
+    }
+
+    #[test]
+    fn pane_opened_roundtrips_through_protobuf() {
+        for pane_id in [PaneId::Terminal(7), PaneId::Plugin(2)] {
+            let event = Event::PaneOpened(pane_id);
+            let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
+            let roundtripped: Event = protobuf.try_into().unwrap();
+            assert_eq!(event, roundtripped);
+        }
+    }
+
+    #[test]
+    fn pane_exited_roundtrips_through_protobuf() {
+        for exit_status in [Some(1), Some(0), None] {
+            let event = Event::PaneExited(PaneId::Terminal(7), exit_status);
+            let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
+            let roundtripped: Event = protobuf.try_into().unwrap();
+            assert_eq!(event, roundtripped);
+        }
+    }
+
+    #[test]
+    fn plugin_died_roundtrips_through_protobuf() {
+        let event = Event::PluginDied(7, "it panicked".to_owned());
+        let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
+        let roundtripped: Event = protobuf.try_into().unwrap();
+        assert_eq!(event, roundtripped);
+    }
+
+    #[test]
+    fn pane_opened_and_pane_closed_are_different_events() {
+        let opened: ProtobufEvent = Event::PaneOpened(PaneId::Terminal(7)).try_into().unwrap();
+        let closed: ProtobufEvent = Event::PaneClosed(PaneId::Terminal(7)).try_into().unwrap();
+        assert_ne!(opened.name, closed.name);
     }
 }
