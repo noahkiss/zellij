@@ -514,6 +514,13 @@ impl WasmBridge {
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
 
+        // a background plugin has no pane whose closing would tell Screen it is gone, so its
+        // subscription entry would otherwise outlive it and have a PaneManifest and a tab list
+        // built for it on every state change, forever
+        let _ = self
+            .senders
+            .send_to_screen(ScreenInstruction::RemoveBackgroundPluginSubscriptions(pid));
+
         // Remove from plugin_map on main thread
         let plugins_to_cleanup: Vec<_> = {
             let mut plugin_map = self.plugin_map.lock().unwrap();
@@ -2267,10 +2274,13 @@ pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: Thread
     // fork addition: a background plugin has no pane, so the loading error above has nowhere to go
     // and its death has no symptom at all - the feed simply goes quiet. Tell every subscribed
     // plugin instead, client-independently. Nothing here restarts anything.
+    // fail open on a poisoned lock: a duplicate announcement is noise, while a lost one leaves a
+    // dead background plugin with no symptom at all, and the poison would silence every crash for
+    // the life of the session
     let is_first_crash = ANNOUNCED_PLUGIN_CRASHES
         .lock()
         .map(|mut announced| announced.insert(plugin_id))
-        .unwrap_or(false);
+        .unwrap_or(true);
     if is_first_crash {
         let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
             None,
@@ -2278,6 +2288,11 @@ pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: Thread
             Event::PluginDied(plugin_id, message),
         )]));
     }
+    // a dead plugin receives nothing, so stop building payloads for it - a crashed background
+    // plugin has no pane whose closing would otherwise tell Screen it is gone
+    let _ = senders.send_to_screen(ScreenInstruction::RemoveBackgroundPluginSubscriptions(
+        plugin_id,
+    ));
 }
 
 pub fn apply_before_close_event_to_plugin(
@@ -2350,6 +2365,11 @@ mod plugin_crash_tests {
         events
     }
 
+    /// `ANNOUNCED_PLUGIN_CRASHES` is a process-global set, shared by every test in this binary and
+    /// never reset. The tests below stay independent only because each uses a plugin id of its own
+    /// (9001, 9002) that nothing else in the binary touches. A new test here MUST pick another
+    /// unused id, or it will see an announcement another test already consumed.
+    ///
     /// A background plugin has no pane, so the loading-error indicator has nowhere to go and its
     /// death is silent - which is indistinguishable from a session with nothing to say.
     #[test]
@@ -2362,7 +2382,8 @@ mod plugin_crash_tests {
     }
 
     /// Announcing a crash sends an event, and delivering an event is how a plugin crashes. One
-    /// announcement per plugin id is what stops that being a loop.
+    /// announcement per plugin id is what stops that being a loop. Uses id 9002, distinct from the
+    /// test above - see the note there about the process-global set.
     #[test]
     fn a_plugin_that_keeps_crashing_is_announced_once() {
         let (senders, rx) = senders_with_plugin_receiver();

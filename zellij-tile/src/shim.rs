@@ -860,6 +860,10 @@ pub fn run_command_with_env_variables_and_cwd(
 /// Make a web request, optionally being notified of its output
 /// if subscribed to the `WebRequestResult` Event, the context will be returned verbatim in this
 /// event and can be used for eg. marking the request_id
+///
+/// The request is given up on after 30 seconds (10 to connect). A request that never got an HTTP
+/// response reports status 0 with an `x-zellij-error-kind` header, so a transport failure is never
+/// mistaken for a status the server sent.
 pub fn web_request<S: AsRef<str>>(
     url: S,
     verb: HttpVerb,

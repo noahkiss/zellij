@@ -212,6 +212,9 @@ struct FakeInputOutput {
     // a client listed here fails every try_send_to_client with the given reason, so a test can
     // stage a slow client or a departed one
     client_send_state: Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+    // a (client, pane) listed here fails only that pane's render update, so a test can stage a
+    // channel that fills partway through a batch
+    pane_send_state: Arc<Mutex<HashMap<(ClientId, zellij_utils::data::PaneId), SendToClientError>>>,
 }
 
 impl ServerOsApi for FakeInputOutput {
@@ -265,6 +268,16 @@ impl ServerOsApi for FakeInputOutput {
     ) -> std::result::Result<(), SendToClientError> {
         if let Some(failure) = self.client_send_state.lock().unwrap().get(&client_id) {
             return Err(*failure);
+        }
+        if let ServerToClientMsg::PaneRenderUpdate { pane_id, .. } = &msg {
+            if let Some(failure) = self
+                .pane_send_state
+                .lock()
+                .unwrap()
+                .get(&(client_id, *pane_id))
+            {
+                return Err(*failure);
+            }
         }
         self.send_to_client(client_id, msg)
             .map_err(|_| SendToClientError::ClientGone)
@@ -2601,6 +2614,38 @@ pub fn close_missing_pane_reports_an_error() {
     let result = route_arbitrary_action_and_get_result(
         &session_metadata,
         Action::CloseTerminalPane { pane_id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn close_pane_by_pane_id_for_missing_pane_reports_an_error() {
+    // `zellij action close-pane --pane-id X` sends CloseFocusByPaneId, NOT CloseTerminalPane:
+    // the two land on different ScreenInstructions, so testing one says nothing about the other
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocusByPaneId {
+            pane_id: zellij_utils::data::PaneId::Terminal(999),
+        },
         client_id,
     );
     mock_screen.teardown(vec![screen_thread]);
@@ -4955,6 +5000,41 @@ pub fn screen_can_break_floating_pane_to_a_new_tab() {
 }
 
 #[test]
+pub fn breaking_panes_to_a_tab_index_reports_a_missing_pane() {
+    // the plugin api reaches this instruction directly, so it gets the same stale-pane-id answer
+    // its two siblings give
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::BreakPanesToTabWithIndex {
+            pane_ids: vec![PaneId::Terminal(999)],
+            tab_index: 0,
+            should_change_focus_to_new_tab: true,
+            client_id: 1,
+            completion_tx: Some(crate::route::NotificationEnd::new(completion_tx)),
+        });
+    let result =
+        crate::route::wait_for_action_completion(completion_rx, "BreakPanesToTabWithIndex", false);
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.exit_status, Some(1));
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' error, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
 pub fn screen_can_break_multiple_stacked_panes_to_a_new_tab() {
     let size = Size { cols: 80, rows: 20 };
     let mut stacked_parent = TiledPaneLayout::default();
@@ -5829,10 +5909,26 @@ fn create_new_screen_with_client_send_state(
     Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
     Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
 ) {
+    let (screen, messages, client_send_state, _pane_send_state) =
+        create_new_screen_with_pane_send_state(size);
+    (screen, messages, client_send_state)
+}
+
+// as above, but the send state can also be staged for one pane of one client
+#[allow(clippy::type_complexity)]
+fn create_new_screen_with_pane_send_state(
+    size: Size,
+) -> (
+    Screen,
+    Arc<Mutex<HashMap<ClientId, Vec<ServerToClientMsg>>>>,
+    Arc<Mutex<HashMap<ClientId, SendToClientError>>>,
+    Arc<Mutex<HashMap<(ClientId, zellij_utils::data::PaneId), SendToClientError>>>,
+) {
     let mut bus: Bus<ScreenInstruction> = Bus::empty();
     let fake_os_input = FakeInputOutput::default();
     let messages = fake_os_input.server_to_client_messages.clone();
     let client_send_state = fake_os_input.client_send_state.clone();
+    let pane_send_state = fake_os_input.pane_send_state.clone();
     bus.os_input = Some(Box::new(fake_os_input));
     let client_attributes = ClientAttributes {
         size,
@@ -5907,6 +6003,7 @@ fn create_new_screen_with_client_send_state(
         seed_first_client_size(screen, size),
         messages,
         client_send_state,
+        pane_send_state,
     )
 }
 
@@ -6093,6 +6190,87 @@ fn slow_subscriber_keeps_its_subscription() {
         },
         other => panic!("Expected PaneRenderUpdate, got {:?}", other),
     }
+}
+
+/// A channel that fills partway through a batch takes some panes and refuses the rest. The panes
+/// it took must not be re-sent on the next tick as if their contents had changed.
+#[test]
+fn a_busy_send_only_skips_the_pane_it_refused() {
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, messages, _client_send_state, pane_send_state) =
+        create_new_screen_with_pane_send_state(size);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    let accepted_pane = zellij_utils::data::PaneId::Terminal(1);
+    let refused_pane = zellij_utils::data::PaneId::Terminal(2);
+
+    screen.subscribe_to_pane_renders(100, vec![accepted_pane, refused_pane], None, false);
+
+    // the channel has room for the first pane and not for the second
+    pane_send_state
+        .lock()
+        .unwrap()
+        .insert((100, refused_pane), SendToClientError::ClientBusy);
+
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        accepted_pane,
+        PaneContents {
+            viewport: vec!["accepted line".to_string()],
+            ..Default::default()
+        },
+    );
+    pane_map.insert(
+        refused_pane,
+        PaneContents {
+            viewport: vec!["refused line".to_string()],
+            ..Default::default()
+        },
+    );
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    // the channel drains, and nothing has changed since
+    pane_send_state.lock().unwrap().clear();
+    screen.deliver_subscriber_updates_from_map(&pane_map, None);
+
+    let msgs = messages.lock().unwrap();
+    let client_msgs = msgs.get(&100).unwrap();
+    let mut viewports_per_pane: HashMap<zellij_utils::data::PaneId, Vec<Vec<String>>> =
+        HashMap::new();
+    for msg in client_msgs {
+        if let ServerToClientMsg::PaneRenderUpdate {
+            pane_id,
+            viewport,
+            is_initial: false,
+            ..
+        } = msg
+        {
+            viewports_per_pane
+                .entry(*pane_id)
+                .or_default()
+                .push(viewport.clone());
+        }
+    }
+    assert_eq!(
+        viewports_per_pane
+            .get(&accepted_pane)
+            .map(|sends| sends.len()),
+        Some(1),
+        "the pane whose update was accepted must not be sent again: {:?}",
+        viewports_per_pane
+    );
+    assert_eq!(
+        viewports_per_pane
+            .get(&refused_pane)
+            .map(|sends| sends.len()),
+        Some(1),
+        "the pane whose update was refused must be sent once the channel drains: {:?}",
+        viewports_per_pane
+    );
+    assert_eq!(
+        viewports_per_pane.get(&refused_pane).unwrap()[0],
+        vec!["refused line".to_string()]
+    );
 }
 
 #[test]
@@ -8582,6 +8760,157 @@ pub fn background_plugin_receives_one_update_per_change_with_two_clients() {
         Some(2),
         "background TabUpdate should list every tab, got: {:?}",
         delivery
+    );
+}
+
+#[test]
+pub fn an_unloaded_background_plugin_stops_being_served() {
+    // the plugin thread sends this when a plugin is unloaded or crashes - a background plugin has
+    // no pane whose closing would otherwise tell Screen the plugin is gone
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // it is served while it is alive
+    let instructions_before_first_change = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let delivery_while_alive = background_plugin_delivery(
+        &received_plugin_instructions.lock().unwrap()[instructions_before_first_change..],
+        99,
+    );
+
+    // it is gone
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveBackgroundPluginSubscriptions(99));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_second_change = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery_after_unload =
+        background_plugin_delivery(&instructions[instructions_before_second_change..], 99);
+    assert!(
+        delivery_while_alive.pane_updates > 0 && delivery_while_alive.tab_updates > 0,
+        "the background plugin should be served while it is alive, got: {:?}",
+        delivery_while_alive
+    );
+    assert_eq!(
+        (
+            delivery_after_unload.pane_updates,
+            delivery_after_unload.tab_updates
+        ),
+        (0, 0),
+        "an unloaded background plugin should receive nothing, got: {:?}",
+        delivery_after_unload
+    );
+}
+
+#[test]
+pub fn plugin_in_a_visible_tab_is_never_served_as_a_background_plugin() {
+    // A plugin loading another plugin into a visible floating pane passes no tab index, so the
+    // plugin thread files the new plugin as background even though its pane sits in a real tab.
+    // It is already served as an active-tab plugin, so it must not be served a second time.
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.new_tab_with_plugins(vec![2]);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    // put the only client on the tab holding plugin 2, so the plugin is in its active tab
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::GoToTab(1, Some(main_client_id), None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // plugin 2 is misfiled as a background plugin
+    subscribe_background_plugin(&mock_screen, 2, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_change = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let instructions_after_change = &instructions[instructions_before_change..];
+    let delivery = background_plugin_delivery(instructions_after_change, 2);
+    assert!(
+        delivery.pane_updates > 0 && delivery.tab_updates > 0,
+        "the plugin should still be served as an active-tab plugin, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_pane_updates_per_batch, 1,
+        "a visible plugin misfiled as background must get one PaneUpdate per change, got: {:?}",
+        delivery
+    );
+    assert_eq!(
+        delivery.max_tab_updates_per_batch, 1,
+        "a visible plugin misfiled as background must get one TabUpdate per change, got: {:?}",
+        delivery
+    );
+
+    // the payload must be the per-client one, which excludes the receiving client from
+    // other_focused_clients - the client-independent background payload lists it
+    let mut tab_infos_delivered = vec![];
+    for instruction in instructions_after_change {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if pid == &Some(2) {
+                    if let Event::TabUpdate(tab_infos) = event {
+                        tab_infos_delivered.extend(tab_infos.clone());
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        !tab_infos_delivered.is_empty(),
+        "expected at least one TabUpdate payload for the plugin"
+    );
+    assert!(
+        tab_infos_delivered
+            .iter()
+            .all(|tab_info| tab_info.other_focused_clients.is_empty()),
+        "expected the per-client TabUpdate payload, got: {:?}",
+        tab_infos_delivered
     );
 }
 
@@ -14133,5 +14462,144 @@ pub fn moving_a_pane_between_layers_does_not_announce_a_new_pane() {
         opened.is_empty(),
         "moving an existing pane must not announce PaneOpened, got: {:?}",
         opened
+    );
+}
+
+#[test]
+pub fn panes_not_found_names_only_the_panes_no_tab_owns() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    assert!(
+        screen
+            .panes_not_found(&[PaneId::Terminal(1), PaneId::Terminal(2)])
+            .is_empty(),
+        "both panes exist, in different tabs"
+    );
+    assert_eq!(
+        screen.panes_not_found(&[PaneId::Terminal(1), PaneId::Terminal(9)]),
+        vec![PaneId::Terminal(9)],
+        "only the missing one is named"
+    );
+    assert_eq!(
+        screen.panes_not_found(&[PaneId::Plugin(1)]),
+        vec![PaneId::Plugin(1)],
+        "a plugin id is not a terminal id"
+    );
+}
+
+#[test]
+pub fn breaking_only_missing_panes_would_leave_an_empty_tab() {
+    // why the handler checks first: the move itself skips a pane it cannot find, so a request
+    // naming nothing real still builds a tab and reports success
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    screen
+        .break_multiple_panes_to_new_tab(vec![PaneId::Terminal(9)], None, false, None, 1)
+        .expect("TEST");
+    assert_eq!(screen.tabs.len(), 2, "a tab was created for nothing");
+}
+
+#[test]
+pub fn setting_sync_is_idempotent_and_says_so() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    let tab = screen.get_tab_by_id(0).expect("TEST");
+    assert!(!tab.is_sync_panes_active(), "off to begin with");
+
+    let tab = screen.get_tab_by_id_mut(0).expect("TEST");
+    assert!(
+        tab.set_sync_panes_is_active(true),
+        "the first call changes it"
+    );
+    assert!(tab.is_sync_panes_active());
+    assert!(
+        !tab.set_sync_panes_is_active(true),
+        "the second call changes nothing"
+    );
+    assert!(tab.is_sync_panes_active(), "and leaves it on");
+    assert!(tab.set_sync_panes_is_active(false), "off again changes it");
+    assert!(!tab.is_sync_panes_active());
+}
+
+#[test]
+pub fn setting_fullscreen_moves_it_rather_than_only_clearing_it() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    let tab = screen.get_tab_by_id_mut(0).expect("TEST");
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        false,
+        NewPanePlacement::default(),
+        Some(1),
+        None,
+    )
+    .expect("TEST");
+
+    assert!(tab.set_pane_fullscreen(PaneId::Terminal(1), true));
+    assert!(tab.pane_is_fullscreen(PaneId::Terminal(1)));
+    assert!(
+        !tab.set_pane_fullscreen(PaneId::Terminal(1), true),
+        "already fullscreen"
+    );
+
+    // the toggle would only clear fullscreen here; the setter hands it to the named pane
+    assert!(tab.set_pane_fullscreen(PaneId::Terminal(2), true));
+    assert!(tab.pane_is_fullscreen(PaneId::Terminal(2)));
+    assert!(!tab.pane_is_fullscreen(PaneId::Terminal(1)));
+
+    assert!(tab.set_pane_fullscreen(PaneId::Terminal(2), false));
+    assert!(!tab.pane_is_fullscreen(PaneId::Terminal(2)));
+    assert!(
+        !tab.set_pane_fullscreen(PaneId::Terminal(2), false),
+        "already not fullscreen"
+    );
+}
+
+#[test]
+pub fn a_setter_with_no_pane_id_resolves_the_focused_pane() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    assert_eq!(
+        screen.tab_id_owning_pane(Some(PaneId::Terminal(1)), client_id),
+        Some((0, PaneId::Terminal(1))),
+        "an explicit id names its own tab"
+    );
+    assert_eq!(
+        screen.tab_id_owning_pane(Some(PaneId::Terminal(9)), client_id),
+        None,
+        "a pane no tab owns resolves to nothing"
+    );
+    assert_eq!(
+        screen.tab_id_owning_pane(None, client_id),
+        Some((0, PaneId::Terminal(1))),
+        "no id means the focused pane"
     );
 }
