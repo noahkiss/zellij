@@ -517,6 +517,12 @@ message PaneInfo {
     optional string pane_command = 34;
     optional uint64 last_output_at = 35;
     bool has_pending_bell = 36;
+    repeated PaneEnvVar pane_env = 37;
+}
+
+message PaneEnvVar {
+  string name = 1;
+  string value = 2;
 }
 
 message IndexInPaneGroup {

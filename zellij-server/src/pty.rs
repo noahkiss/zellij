@@ -14,7 +14,10 @@ use crate::{
     ClientId, ServerInstruction,
 };
 use std::sync::Arc;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 use tokio::task::JoinHandle;
 use zellij_utils::{
     data::{
@@ -141,6 +144,7 @@ pub enum PtyInstruction {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        report_pane_env: Option<Vec<String>>,
     },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
@@ -210,6 +214,9 @@ pub struct PaneProcessInfo {
     pub cwd: Option<PathBuf>,
     /// The foreground command if there is one, otherwise the pane's shell.
     pub command: Option<Vec<String>>,
+    /// The variables `report_pane_env` allows, found in the pane's processes. Empty unless the
+    /// configuration names some.
+    pub env: BTreeMap<String, String>,
 }
 
 pub(crate) struct Pty {
@@ -222,6 +229,11 @@ pub(crate) struct Pty {
     default_editor: Option<PathBuf>,
     post_command_discovery_hook: Option<String>,
     resurrect_command_hints: Option<ResurrectCommandHints>,
+    /// The exact env var names `report_pane_env` asks for. Empty means report nothing, which is
+    /// the default and the only safe one - an environment is full of secrets.
+    report_pane_env: Vec<String>,
+    /// terminal_id -> the allowlisted variables last found in that pane's processes
+    terminal_envs: HashMap<u32, BTreeMap<String, String>>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -882,12 +894,14 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 default_editor,
                 post_command_discovery_hook,
                 resurrect_command_hints,
+                report_pane_env,
                 client_id: _,
             } => {
                 pty.reconfigure(
                     default_editor,
                     post_command_discovery_hook,
                     resurrect_command_hints,
+                    report_pane_env,
                 );
             },
             PtyInstruction::SendSigintToPaneId(pane_id) => {
@@ -936,6 +950,7 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        report_pane_env: Option<Vec<String>>,
     ) -> Self {
         Pty {
             active_panes: HashMap::new(),
@@ -947,6 +962,8 @@ impl Pty {
             originating_plugins: HashMap::new(),
             post_command_discovery_hook,
             resurrect_command_hints,
+            report_pane_env: report_pane_env.unwrap_or_default(),
+            terminal_envs: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
@@ -1844,6 +1861,7 @@ impl Pty {
                 self.pane_activity_flags.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
+                self.terminal_envs.remove(&id);
                 self.terminal_foreground_cmds.remove(&id);
                 self.bus
                     .os_input
@@ -2126,7 +2144,33 @@ impl Pty {
     /// The once-a-second tick: refresh what the active panes are doing, then tell Screen.
     pub fn update_and_report_cwds(&mut self) {
         self.refresh_cwds_and_commands();
+        self.refresh_pane_envs();
         self.report_pane_process_info();
+    }
+
+    /// Read the allowlisted variables out of every pane's processes.
+    ///
+    /// Costs nothing unless `report_pane_env` names something: the whole pass returns immediately
+    /// on an empty allowlist, which is the default. When it is set, the process table is read once
+    /// for the tick rather than once per pane, because every pane asks it the same question.
+    ///
+    /// The variable lives on a process the shell started, not on the shell, so this walks down
+    /// from the pane's own child - the same problem `resurrect_command_hints` solves, and the same
+    /// code solving it.
+    fn refresh_pane_envs(&mut self) {
+        if self.report_pane_env.is_empty() {
+            self.terminal_envs.clear();
+            return;
+        }
+        let process_tree = ProcessTree::read();
+        let vars = self.report_pane_env.clone();
+        self.terminal_envs = self
+            .id_to_child_pid
+            .iter()
+            .map(|(terminal_id, child_pid)| {
+                (*terminal_id, process_tree.find_all_envs(*child_pid, &vars))
+            })
+            .collect();
     }
 
     /// Screen holds no pid, cwd or command of its own - it is told, from these caches, every tick.
@@ -2154,6 +2198,11 @@ impl Pty {
                         pid: self.id_to_child_pid.get(&terminal_id).copied(),
                         cwd: self.terminal_cwds.get(&terminal_id).cloned(),
                         command,
+                        env: self
+                            .terminal_envs
+                            .get(&terminal_id)
+                            .cloned()
+                            .unwrap_or_default(),
                     },
                 )
             })
@@ -2286,10 +2335,12 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        report_pane_env: Option<Vec<String>>,
     ) {
         self.default_editor = default_editor;
         self.post_command_discovery_hook = post_command_discovery_hook;
         self.resurrect_command_hints = resurrect_command_hints;
+        self.report_pane_env = report_pane_env.unwrap_or_default();
     }
 
     /// A shell told us its cwd directly, so we do not have to read it off the process.

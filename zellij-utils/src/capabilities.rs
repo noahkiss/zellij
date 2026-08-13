@@ -45,6 +45,7 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-process-info",        // PaneInfo.pane_pid, pane_cwd, pane_command
     "pane-last-output",         // PaneInfo.last_output_at
     "pane-pending-bell",        // PaneInfo.has_pending_bell, tracked while detached
+    "pane-env-report",          // report_pane_env, PaneInfo.pane_env
     "pane-program-title",       // PaneInfo.program_title
     "pane-stack-fields",        // PaneInfo.stack_id, index_in_stack, is_expanded_in_stack
     "client-tty",               // ClientInfo.tty

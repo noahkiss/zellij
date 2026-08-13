@@ -21,7 +21,7 @@ pub use super::generated_api::api::{
         LayoutParsingError as ProtobufLayoutParsingError,
         LayoutWithError as ProtobufLayoutWithError, ModeUpdatePayload as ProtobufModeUpdatePayload,
         PaneContents as ProtobufPaneContents, PaneContentsEntry as ProtobufPaneContentsEntry,
-        PaneFrameStyle as ProtobufPaneFrameStyle, PaneId as ProtobufPaneId,
+        PaneEnvVar, PaneFrameStyle as ProtobufPaneFrameStyle, PaneId as ProtobufPaneId,
         PaneInfo as ProtobufPaneInfo, PaneManifest as ProtobufPaneManifest,
         PaneMetadata as ProtobufPaneMetadata,
         PaneRenderReportPayload as ProtobufPaneRenderReportPayload,
@@ -1977,6 +1977,11 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             pane_command: protobuf_pane_info.pane_command,
             last_output_at: protobuf_pane_info.last_output_at,
             has_pending_bell: protobuf_pane_info.has_pending_bell,
+            pane_env: protobuf_pane_info
+                .pane_env
+                .into_iter()
+                .map(|entry| (entry.name, entry.value))
+                .collect(),
         })
     }
 }
@@ -2033,6 +2038,11 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             pane_command: pane_info.pane_command,
             last_output_at: pane_info.last_output_at,
             has_pending_bell: pane_info.has_pending_bell,
+            pane_env: pane_info
+                .pane_env
+                .into_iter()
+                .map(|(name, value)| PaneEnvVar { name, value })
+                .collect(),
         })
     }
 }
@@ -3141,6 +3151,9 @@ fn serialize_session_update_event_with_non_default_values() {
             pane_command: Some("claude --resume".to_owned()),
             last_output_at: Some(1_760_000_000_000),
             has_pending_bell: true,
+            pane_env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
+                .into_iter()
+                .collect(),
         },
         PaneInfo {
             id: 1,
@@ -3180,6 +3193,7 @@ fn serialize_session_update_event_with_non_default_values() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
+            pane_env: Default::default(),
         },
     ];
     panes.insert(0, panes_list);

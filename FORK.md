@@ -260,6 +260,31 @@ something the session pushes — as long as the tool in the pane rings the bell.
 
 Proto tag 36.
 
+### `report_pane_env`: named environment variables on every pane
+
+```kdl
+report_pane_env "CLAUDE_CODE_SESSION_ID" "MY_TOOL_ID"
+```
+
+`PaneInfo.pane_env` reports the variables this list names, found in the pane's processes. It answers
+the question a pid alone cannot: *which* instance of a tool is this pane — which agent session, which
+job — without a consumer having to read `/proc` itself or the pane having to announce anything.
+
+**It is an allowlist, and only an allowlist.** Unset means report nothing, there are no default
+entries, and the names are exact — no patterns, because a pattern is how a key nobody meant to
+publish gets published. An environment is full of secrets; the whole of one is never reported.
+
+The value is looked for on the pane's own child and then its descendants, nearest first, so a tool
+running inside the pane's shell answers for a name they both export. That walk is the one
+`resurrect_command_hints` already does, and it is the same code: `/proc/<pid>/environ` on Linux,
+`sysctl(KERN_PROCARGS2)` on macOS, nothing anywhere else. Both platforms are supported.
+
+Cost: nothing at all with the list unset, which is the default. With it set, the pty thread reads
+the process table once per second — once for the tick, not once per pane — and one environment per
+process it walks, stopping as soon as every named variable is found.
+
+Proto tag 37.
+
 ### The socket directory is visible, and `ls` warns about sessions outside it
 
 Every session operation is scoped to one socket directory, resolved from the environment

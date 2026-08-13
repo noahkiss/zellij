@@ -3041,6 +3041,15 @@ impl Options {
             ),
             None => None,
         };
+        let report_pane_env = match kdl_options.get("report_pane_env") {
+            Some(kdl_report_env) => Some(
+                kdl_string_arguments!(kdl_report_env)
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+            ),
+            None => None,
+        };
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -3198,6 +3207,7 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
+            report_pane_env,
             session_service,
             resurrect_command_hints,
             default_floating_size,
@@ -3592,6 +3602,18 @@ impl Options {
             aliases.nodes_mut().push(alias_node);
         }
         node.set_children(aliases);
+        Some(node)
+    }
+    /// The `report_pane_env` node: the exact variable names to report on every pane.
+    fn report_pane_env_to_kdl(&self) -> Option<KdlNode> {
+        let names = self.report_pane_env.as_ref()?;
+        if names.is_empty() {
+            return None;
+        }
+        let mut node = KdlNode::new("report_pane_env");
+        for name in names {
+            node.push(KdlValue::String(name.to_owned()));
+        }
         Some(node)
     }
     fn session_restart_drop_env_to_kdl(&self) -> Option<KdlNode> {
@@ -5311,6 +5333,9 @@ impl Options {
         }
         if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
             nodes.push(session_restart_drop_env);
+        }
+        if let Some(report_pane_env) = self.report_pane_env_to_kdl() {
+            nodes.push(report_pane_env);
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
@@ -7293,6 +7318,7 @@ impl PaneInfo {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
+            pane_env: Default::default(),
             id,
             is_plugin,
             is_focused,
@@ -7480,6 +7506,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
+            pane_env: Default::default(),
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -7518,6 +7545,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
+            pane_env: Default::default(),
             id: 1,
             is_plugin: true,
             is_focused: true,
@@ -8812,6 +8840,45 @@ fn session_restart_drop_env_config_parsing() {
 fn session_restart_drop_env_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_restart_drop_env, None);
+}
+
+#[test]
+fn report_pane_env_config_parsing() {
+    let config_with_report_pane_env = r#"
+        report_pane_env "CLAUDE_CODE_SESSION_ID" "MY_TOOL_ID"
+    "#;
+    let config = Config::from_kdl(config_with_report_pane_env, None).unwrap();
+    assert_eq!(
+        config.options.report_pane_env,
+        Some(vec![
+            "CLAUDE_CODE_SESSION_ID".to_string(),
+            "MY_TOOL_ID".to_string()
+        ])
+    );
+}
+
+/// The environment holds secrets, so nothing is reported that was not asked for by name.
+#[test]
+fn report_pane_env_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.report_pane_env, None);
+}
+
+#[test]
+fn report_pane_env_survives_the_kdl_round_trip() {
+    let config = Config::from_kdl(r#"report_pane_env "MY_TOOL_ID""#, None).unwrap();
+    let written: String = config
+        .options
+        .to_kdl(false)
+        .iter()
+        .map(|node| node.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let reparsed = Config::from_kdl(&written, None).unwrap();
+    assert_eq!(
+        reparsed.options.report_pane_env,
+        Some(vec!["MY_TOOL_ID".to_string()])
+    );
 }
 
 #[test]

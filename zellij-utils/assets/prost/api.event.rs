@@ -703,6 +703,16 @@ pub struct PaneInfo {
     pub last_output_at: ::core::option::Option<u64>,
     #[prost(bool, tag="36")]
     pub has_pending_bell: bool,
+    #[prost(message, repeated, tag="37")]
+    pub pane_env: ::prost::alloc::vec::Vec<PaneEnvVar>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneEnvVar {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

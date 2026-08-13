@@ -2450,6 +2450,16 @@ pub struct PaneInfo {
     /// with no visual notification there is no per-pane bell state to report.
     #[serde(default)]
     pub has_pending_bell: bool,
+    /// Environment variables from this pane's processes, as `report_pane_env` allows
+    ///
+    /// Empty unless the configuration names variables to report, which it does not by default -
+    /// an environment holds secrets, so nothing is reported that was not asked for by exact name.
+    ///
+    /// A value is looked for on the pane's own child and then its descendants, nearest first, so a
+    /// tool running inside the pane's shell answers for a name they both export. Terminal panes
+    /// only, and refreshed on the same once-a-second tick as `pane_cwd`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pane_env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

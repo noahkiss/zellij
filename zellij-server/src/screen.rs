@@ -5161,6 +5161,7 @@ impl Screen {
                     .command
                     .as_ref()
                     .map(|command| command.join(" "));
+                pane_info.pane_env = process_info.env.clone();
             }
             pane_info.last_output_at = epoch_now_ms.and_then(|epoch_now_ms| {
                 self.pane_output_activity
