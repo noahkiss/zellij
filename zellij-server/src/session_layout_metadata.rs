@@ -609,6 +609,7 @@ impl Into<PaneLayoutManifest> for PaneLayoutMetadata {
             pane_contents: self.pane_contents,
             default_fg: self.default_fg,
             default_bg: self.default_bg,
+            pane_uuid: self.pane_uuid,
         }
     }
 }
@@ -635,6 +636,8 @@ pub struct PaneLayoutMetadata {
     focused_clients: Vec<ClientId>,
     default_fg: Option<String>,
     default_bg: Option<String>,
+    /// This pane's uuid, so a pane restored from the serialized layout can name what it continues.
+    pane_uuid: Option<String>,
 }
 
 impl PaneLayoutMetadata {
@@ -649,6 +652,7 @@ impl PaneLayoutMetadata {
         focused_clients: Vec<ClientId>,
         default_fg: Option<String>,
         default_bg: Option<String>,
+        pane_uuid: Option<String>,
     ) -> Self {
         PaneLayoutMetadata {
             id,
@@ -662,6 +666,7 @@ impl PaneLayoutMetadata {
             focused_clients,
             default_fg,
             default_bg,
+            pane_uuid,
         }
     }
     fn to_pane_metadata(&self) -> PaneMetadata {
@@ -783,6 +788,7 @@ mod tests {
             vec![],
             None,
             None,
+            None,
         )
     }
 
@@ -800,6 +806,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             None,
             None,
         )
@@ -1172,6 +1179,7 @@ mod tests {
             focused_clients,
             None,
             None,
+            None,
         )
     }
 
@@ -1257,6 +1265,7 @@ mod tests {
             !focused_clients.is_empty(),
             None,
             focused_clients,
+            None,
             None,
             None,
         )

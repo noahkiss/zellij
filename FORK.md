@@ -1678,6 +1678,42 @@ What the uuid promises, exactly:
 The uuid is generated in `TerminalPane::new` and `PluginPane::new`, so there is no creation path
 that can forget it, and it is read through the `Pane::pane_uuid` trait method.
 
+#### What a restored pane continues (`restored_from`)
+
+The rule above - a restored pane is a new pane and says so with a new uuid - is what stops a
+consumer's pre-restart state reattaching to a pane it no longer describes. It also loses the link
+entirely, and some consumers do want it: "this is the pane that WAS my build shell" is a reasonable
+thing to know after `zellij session restart`.
+
+So the link is reported separately. A pane rebuilt from a serialized session reports
+`restored_from`, the uuid of the pane it continues, alongside its own new `uuid`. Empty for a pane
+that was never restored.
+
+```
+before a restart   uuid f1e5dce9…   restored_from ""
+after it           uuid 9c2fa401…   restored_from "f1e5dce9…"
+```
+
+Provenance, not identity. Nothing keys off it by default: a consumer that wants continuity opts in,
+and one that does not keeps the safe behaviour for free. **Neither is a key across a restart on its
+own** - ids repeat there too - so pair it with the session's creation time, which changes on exactly
+the events that invalidate both id spaces.
+
+**One hop.** A pane restored twice names the incarnation directly before it, not the whole chain
+back to the first. The serialized layout records the pane's uuid at the moment it was written, so
+each restart records one link, and a consumer that wants the full chain keeps it itself.
+
+The uuid travels in the serialized layout as a `pane_uuid` property on the pane node, which is why
+the KDL says `pane_uuid` and the pane reports `restored_from`: at write time it IS the pane's uuid,
+and calling it `restored_from` there would read as a promise that the pane comes back under it.
+`pane_uuid` is written by serialization and never by hand; a hand-written layout simply omits it.
+
+It is deliberately NOT carried on the plugin API's or the client/server contract's layout messages.
+Provenance is something the server assigns when it rebuilds a pane, never something a sender
+declares - a layout that could name its own lineage could lie about it.
+
+`PaneInfo` gains `string restored_from = 31`, so `list-panes --json` reports it for free.
+
 `PaneInfo` crosses the plugin API, so `event.proto` gains `string uuid = 30` and its generated Rust
 is regenerated (`cargo xtask build`). `list-panes --json` gets the field for free - `PaneListEntry`
 flattens `PaneInfo`. The client/server contract has no `PaneInfo` and is untouched.

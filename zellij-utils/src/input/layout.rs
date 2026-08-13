@@ -796,6 +796,13 @@ pub struct FloatingPaneLayout {
     pub logical_position: Option<usize>,
     pub default_fg: Option<String>,
     pub default_bg: Option<String>,
+    /// The uuid of the pane this one continues, when it was built from a serialized session.
+    ///
+    /// A restored pane is a NEW pane - new process, new state - and gets its own new uuid, which is
+    /// what stops a consumer's pre-restart state from silently reattaching to it. This field is the
+    /// other half of that: it says WHICH pane it continues, so a consumer that wants the link can
+    /// make it deliberately. Empty for a pane that was never restored.
+    pub restored_from: Option<String>,
 }
 
 impl FloatingPaneLayout {
@@ -815,6 +822,7 @@ impl FloatingPaneLayout {
             logical_position: None,
             default_fg: None,
             default_bg: None,
+            restored_from: None,
         }
     }
     pub fn add_cwd_to_layout(&mut self, cwd: &PathBuf) {
@@ -861,6 +869,13 @@ pub struct TiledPaneLayout {
     pub pane_initial_contents: Option<String>,
     pub default_fg: Option<String>,
     pub default_bg: Option<String>,
+    /// The uuid of the pane this one continues, when it was built from a serialized session.
+    ///
+    /// A restored pane is a NEW pane - new process, new state - and gets its own new uuid, which is
+    /// what stops a consumer's pre-restart state from silently reattaching to it. This field is the
+    /// other half of that: it says WHICH pane it continues, so a consumer that wants the link can
+    /// make it deliberately. Empty for a pane that was never restored.
+    pub restored_from: Option<String>,
 }
 
 impl TiledPaneLayout {

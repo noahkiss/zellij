@@ -2387,11 +2387,22 @@ pub struct PaneInfo {
     pub is_expanded_in_stack: bool,
     /// A uuid given to this pane when it was created and never given to another pane
     ///
-    /// Pane ids are recycled, so the same `id` can mean a different pane after one closes. The
-    /// uuid does not: it identifies this pane for as long as the server runs, whether the pane is
-    /// tiled, floating or suppressed. It does not survive a server restart or a resurrection -
-    /// what comes back is a new pane, and it says so.
+    /// It identifies this pane for as long as the server runs, whether the pane is tiled, floating
+    /// or suppressed, and survives renaming, moving and stacking. Within one running server the
+    /// terminal id counter is monotonic, so a closed pane's `id` is not reissued either - what the
+    /// uuid adds there is that it also survives everything that changes a pane's id.
+    ///
+    /// It does NOT survive a server restart, a resurrection or a snapshot restore: what comes back
+    /// is a new pane with new state, and it says so with a new uuid. Ids DO repeat across those,
+    /// so neither is identity there - see `restored_from`, and pair it with the session's creation
+    /// time if you need a key that spans a restart.
     pub uuid: String,
+    /// The uuid of the pane this one continues, if it was rebuilt from a serialized session
+    ///
+    /// Empty for a pane that was never restored. One hop only: a pane restored twice names the
+    /// incarnation directly before it, not the whole chain. Use it to carry state across a restart
+    /// deliberately - the new uuid is what stops that happening by accident.
+    pub restored_from: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

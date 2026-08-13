@@ -7245,6 +7245,7 @@ impl Screen {
                         focused_clients,
                         default_fg,
                         default_bg,
+                        Some(p.pane_uuid().to_string()),
                     )
                 })
                 .collect();
@@ -7286,6 +7287,7 @@ impl Screen {
                         focused_clients,
                         default_fg,
                         default_bg,
+                        Some(p.pane_uuid().to_string()),
                     )
                 })
                 .collect();

@@ -7246,6 +7246,7 @@ impl PaneInfo {
         let is_selectable = bool_node!("is_selectable");
 
         let pane_info = PaneInfo {
+            restored_from: String::new(),
             id,
             is_plugin,
             is_focused,
@@ -7402,6 +7403,7 @@ fn serialize_and_deserialize_session_info() {
 fn serialize_and_deserialize_session_info_with_data() {
     let panes_list = vec![
         PaneInfo {
+            restored_from: String::new(),
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -7434,6 +7436,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             uuid: String::new(),
         },
         PaneInfo {
+            restored_from: String::new(),
             id: 1,
             is_plugin: true,
             is_focused: true,

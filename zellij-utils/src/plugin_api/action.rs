@@ -3095,6 +3095,9 @@ impl TryFrom<ProtobufTiledPaneLayout> for TiledPaneLayout {
         });
         let run_instructions_to_ignore = vec![]; // Not serialized in protobuf
         Ok(TiledPaneLayout {
+            // Not carried across this contract: `restored_from` is provenance the SERVER assigns
+            // when it rebuilds a pane from a serialized session, never something a sender declares.
+            restored_from: None,
             children_split_direction,
             name: protobuf.name,
             children,
@@ -3155,6 +3158,9 @@ impl TryFrom<ProtobufFloatingPaneLayout> for FloatingPaneLayout {
         let y = protobuf.y.map(|y| y.try_into()).transpose()?;
         let run = protobuf.run.map(|r| r.try_into()).transpose()?;
         Ok(FloatingPaneLayout {
+            // Not carried across this contract: `restored_from` is provenance the SERVER assigns
+            // when it rebuilds a pane from a serialized session, never something a sender declares.
+            restored_from: None,
             name: protobuf.name,
             height,
             width,
