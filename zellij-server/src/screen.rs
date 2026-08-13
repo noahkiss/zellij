@@ -6392,6 +6392,24 @@ impl Screen {
         }
         Ok(())
     }
+    /// The requested panes no tab owns, in the order they were asked for.
+    ///
+    /// `break_multiple_panes_*` skips a pane it cannot find, so without this check a request naming
+    /// only stale ids moves nothing and reports success - and, for a new tab, leaves an empty tab
+    /// behind.
+    pub fn panes_not_found(&self, pane_ids: &[PaneId]) -> Vec<PaneId> {
+        pane_ids
+            .iter()
+            .copied()
+            .filter(|pane_id| {
+                !self
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_non_suppressed_pane_with_pid(pane_id))
+            })
+            .collect()
+    }
+
     pub fn break_multiple_panes_to_new_tab(
         &mut self,
         pane_ids: Vec<PaneId>,
@@ -11131,10 +11149,24 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
                 // Verify tab exists
                 if screen.get_tab_by_id(tab_id).is_none() {
                     log::error!("Tab with ID {} not found", tab_id);
                     // Don't set affected_tab_id, it will remain None to signal failure
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Tab with id {} not found", tab_id));
+                    }
+                } else if !missing_panes.is_empty() {
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
                 } else {
                     // break_multiple_panes_to_tab_with_index uses tab ID
                     screen.break_multiple_panes_to_tab_with_index(
@@ -11771,6 +11803,19 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
+                if !missing_panes.is_empty() {
+                    // no new tab: an empty one is worse than nothing
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
+                    continue;
+                }
                 let tab_id = screen.break_multiple_panes_to_new_tab(
                     pane_ids,
                     default_shell,

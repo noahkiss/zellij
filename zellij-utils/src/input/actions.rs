@@ -578,6 +578,16 @@ pub enum Action {
         pane_id: PaneId,
         signal: PaneSignal,
     },
+    BreakPanesToNewTab {
+        pane_ids: Vec<PaneId>,
+        name: Option<String>,
+        no_focus: bool,
+    },
+    BreakPanesToTabWithId {
+        pane_ids: Vec<PaneId>,
+        tab_id: u32,
+        no_focus: bool,
+    },
     TogglePaneBorderless {
         pane_id: PaneId,
     },
@@ -2083,6 +2093,36 @@ impl Action {
                     }
                 }
             },
+            CliAction::BreakPane {
+                pane_id,
+                name,
+                no_focus,
+            } => {
+                if pane_id.is_empty() {
+                    // no explicit target: the focused pane, which is what the keybinding does
+                    return Ok(vec![Action::BreakPane]);
+                }
+                let pane_ids = parse_pane_ids(&pane_id)?;
+                Ok(vec![Action::BreakPanesToNewTab {
+                    pane_ids,
+                    name,
+                    no_focus,
+                }])
+            },
+            CliAction::BreakPaneToTab {
+                pane_id,
+                tab_id,
+                no_focus,
+            } => {
+                let pane_ids = parse_pane_ids(&pane_id)?;
+                Ok(vec![Action::BreakPanesToTabWithId {
+                    pane_ids,
+                    tab_id,
+                    no_focus,
+                }])
+            },
+            CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
+            CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
             CliAction::SignalPane { pane_id, signal } => {
                 let parsed_pane_id = PaneId::from_str(&pane_id);
                 match parsed_pane_id {
@@ -4208,4 +4248,19 @@ mod tests {
             _ => panic!("Expected NewFloatingPluginPane action"),
         }
     }
+}
+
+/// Parse a list of `--pane-id` values, naming the first one that does not parse.
+fn parse_pane_ids(pane_ids: &[String]) -> Result<Vec<PaneId>, String> {
+    pane_ids
+        .iter()
+        .map(|pane_id| {
+            PaneId::from_str(pane_id).map_err(|_e| {
+                format!(
+                    "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                    pane_id
+                )
+            })
+        })
+        .collect()
 }

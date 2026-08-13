@@ -1185,7 +1185,9 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::NextSwapLayoutByTabId { .. }
             | Action::MoveTabByTabId { .. }
             | Action::MoveTabToIndex { .. }
-            | Action::SignalPane { .. } => {
+            | Action::SignalPane { .. }
+            | Action::BreakPanesToNewTab { .. }
+            | Action::BreakPanesToTabWithId { .. } => {
                 Err("These are CLI-only actions, not available in keybindings")
             },
             Action::SwitchToMode { input_mode } => {

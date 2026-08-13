@@ -13226,3 +13226,48 @@ pub fn moving_a_pane_between_layers_does_not_announce_a_new_pane() {
         opened
     );
 }
+
+#[test]
+pub fn panes_not_found_names_only_the_panes_no_tab_owns() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    assert!(
+        screen
+            .panes_not_found(&[PaneId::Terminal(1), PaneId::Terminal(2)])
+            .is_empty(),
+        "both panes exist, in different tabs"
+    );
+    assert_eq!(
+        screen.panes_not_found(&[PaneId::Terminal(1), PaneId::Terminal(9)]),
+        vec![PaneId::Terminal(9)],
+        "only the missing one is named"
+    );
+    assert_eq!(
+        screen.panes_not_found(&[PaneId::Plugin(1)]),
+        vec![PaneId::Plugin(1)],
+        "a plugin id is not a terminal id"
+    );
+}
+
+#[test]
+pub fn breaking_only_missing_panes_would_leave_an_empty_tab() {
+    // why the handler checks first: the move itself skips a pane it cannot find, so a request
+    // naming nothing real still builds a tab and reports success
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    screen
+        .break_multiple_panes_to_new_tab(vec![PaneId::Terminal(9)], None, false, None, 1)
+        .expect("TEST");
+    assert_eq!(screen.tabs.len(), 2, "a tab was created for nothing");
+}

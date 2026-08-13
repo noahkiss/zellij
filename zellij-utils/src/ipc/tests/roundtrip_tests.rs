@@ -3029,6 +3029,36 @@ fn test_client_messages() {
         is_cli_client: true,
     });
     test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::BreakPanesToNewTab {
+            pane_ids: vec![PaneId::Terminal(1), PaneId::Plugin(2)],
+            name: Some("build".to_owned()),
+            no_focus: true,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::BreakPanesToNewTab {
+            pane_ids: vec![],
+            name: None,
+            no_focus: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::BreakPanesToTabWithId {
+            pane_ids: vec![PaneId::Terminal(1)],
+            tab_id: 3,
+            no_focus: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::SignalPane {
             pane_id: PaneId::Terminal(1),
             signal: PaneSignal::Int,

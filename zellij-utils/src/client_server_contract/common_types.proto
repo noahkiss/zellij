@@ -288,6 +288,8 @@ message Action {
     MoveTabToIndexAction move_tab_to_index = 148;
     // fork additions start at 160, leaving room below for upstream
     SignalPaneAction signal_pane = 160;
+    BreakPanesToNewTabAction break_panes_to_new_tab = 161;
+    BreakPanesToTabWithIdAction break_panes_to_tab_with_id = 162;
   }
 }
 
@@ -1299,3 +1301,15 @@ enum PaneSignal {
 }
 
 message SignalPaneAction { PaneId pane_id = 1; PaneSignal signal = 2; }
+
+message BreakPanesToNewTabAction {
+  repeated PaneId pane_ids = 1;
+  optional string name = 2;
+  bool no_focus = 3;
+}
+
+message BreakPanesToTabWithIdAction {
+  repeated PaneId pane_ids = 1;
+  uint32 tab_id = 2;
+  bool no_focus = 3;
+}

@@ -1747,6 +1747,38 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
     },
+    /// Move panes out into a new tab
+    ///
+    /// Without --pane-id this moves the focused pane. Returns the new tab's ID.
+    BreakPane {
+        /// Move this pane (repeatable). Defaults to the focused pane.
+        #[clap(short, long, value_parser)]
+        pane_id: Vec<String>,
+        /// Name for the new tab
+        #[clap(short, long, value_parser)]
+        name: Option<String>,
+        /// Leave focus where it is instead of following the panes
+        #[clap(long, value_parser)]
+        no_focus: bool,
+    },
+    /// Move panes into an existing tab
+    ///
+    /// Returns exit code 1 if the tab or any of the panes does not exist.
+    BreakPaneToTab {
+        /// Move this pane (repeatable)
+        #[clap(short, long, value_parser, required(true))]
+        pane_id: Vec<String>,
+        /// The tab to move the panes into
+        #[clap(short, long, value_parser)]
+        tab_id: u32,
+        /// Leave focus where it is instead of following the panes
+        #[clap(long, value_parser)]
+        no_focus: bool,
+    },
+    /// Move the focused pane into a new tab to the right of the current one
+    BreakPaneRight,
+    /// Move the focused pane into a new tab to the left of the current one
+    BreakPaneLeft,
     /// Send a signal to the process running in a pane
     ///
     /// Returns exit code 0 if the signal was sent, 1 if the pane does not exist or runs no process.
@@ -1920,6 +1952,65 @@ mod tests {
     fn subscribe_requires_pane_id() {
         let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn break_pane_takes_several_panes_and_a_name() {
+        let action = parse_action(&[
+            "break-pane",
+            "--pane-id",
+            "terminal_1",
+            "--pane-id",
+            "plugin_2",
+            "--name",
+            "build",
+            "--no-focus",
+        ]);
+        match action {
+            CliAction::BreakPane {
+                pane_id,
+                name,
+                no_focus,
+            } => {
+                assert_eq!(pane_id, vec!["terminal_1", "plugin_2"]);
+                assert_eq!(name.as_deref(), Some("build"));
+                assert!(no_focus);
+            },
+            other => panic!("Expected BreakPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_pane_with_no_target_means_the_focused_pane() {
+        let action = parse_action(&["break-pane"]);
+        match action {
+            CliAction::BreakPane {
+                pane_id, no_focus, ..
+            } => {
+                assert!(pane_id.is_empty());
+                assert!(!no_focus);
+            },
+            other => panic!("Expected BreakPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_pane_to_tab_needs_both_ends() {
+        let action = parse_action(&["break-pane-to-tab", "--pane-id", "3", "--tab-id", "2"]);
+        match action {
+            CliAction::BreakPaneToTab {
+                pane_id,
+                tab_id,
+                no_focus,
+            } => {
+                assert_eq!(pane_id, vec!["3"]);
+                assert_eq!(tab_id, 2);
+                assert!(!no_focus);
+            },
+            other => panic!("Expected BreakPaneToTab, got {:?}", other),
+        }
+        assert!(action_parse_fails(&["break-pane-to-tab", "--tab-id", "2"]));
+        assert!(action_parse_fails(&["break-pane-to-tab", "--pane-id", "3"]));
     }
 
     #[test]

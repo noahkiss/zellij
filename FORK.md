@@ -2404,6 +2404,35 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### Move a pane between tabs from the CLI (`break-pane`)
+
+```
+zellij action break-pane                                          # the focused pane, new tab
+zellij action break-pane --pane-id terminal_3 --name build --no-focus
+zellij action break-pane-to-tab --pane-id terminal_3 --tab-id 2
+zellij action break-pane-right                                    # focused pane, new tab to the right
+zellij action break-pane-left
+```
+
+`Action::BreakPane*` existed and plugins had all three `break_panes_to_*` calls, but the word `break`
+appeared nowhere in `cli.rs`, so reorganising a session across tabs was the one structural edit the
+CLI could not make. All of it is exposed now.
+
+`break-pane` moves panes into a new tab. Without `--pane-id` it moves the focused pane, which is what
+the keybinding does. With one or more `--pane-id` it moves exactly those, which is what makes it work
+in a detached session. `--name` names the new tab and `--no-focus` leaves focus where it is.
+`break-pane-to-tab` moves them into an existing tab and requires both `--pane-id` and `--tab-id`.
+Both print the affected tab's id.
+
+**A pane that no tab owns is now an error rather than a silent skip.** `break_multiple_panes_*`
+drops a pane id it cannot find, so a request naming only stale ids used to move nothing, report
+success, and — for a new tab — leave an empty tab behind. Both instructions now check every pane
+first and exit 1 naming the first miss, changing nothing. A missing `--tab-id` exits 1 the same way.
+This applies to the plugin calls that share these instructions too: a plugin passing a stale pane id
+now gets an error instead of a partial move.
+
+Two `Action`s, contract tags 161 and 162.
+
 ### `signal-pane` — signal the process in a pane
 
 ```

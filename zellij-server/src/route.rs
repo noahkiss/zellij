@@ -1831,6 +1831,38 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::BreakPanesToNewTab {
+            pane_ids,
+            name,
+            no_focus,
+        } => {
+            let default_shell = default_shell.clone();
+            senders
+                .send_to_screen(ScreenInstruction::BreakPanesToNewTab {
+                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
+                    default_shell,
+                    should_change_focus_to_new_tab: !no_focus,
+                    new_tab_name: name,
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::BreakPanesToTabWithId {
+            pane_ids,
+            tab_id,
+            no_focus,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::BreakPanesToTabWithId {
+                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
+                    tab_id: tab_id as usize,
+                    should_change_focus_to_target_tab: !no_focus,
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
         Action::SignalPane { pane_id, signal } => {
             senders
                 .send_to_pty(PtyInstruction::SignalPaneId(
