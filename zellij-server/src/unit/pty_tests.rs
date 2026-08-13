@@ -209,6 +209,32 @@ fn make_pty_with_pty_receiver(
     (pty, pty_rx)
 }
 
+/// A pty whose screen channel a test can read, to see what each tick told Screen.
+fn make_pty_with_screen_receiver(
+    mock: MockOsApi,
+) -> (Pty, channels::Receiver<(ScreenInstruction, ErrorContext)>) {
+    let (plugin_tx, _plugin_rx) = channels::unbounded();
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    bus.os_input = Some(Box::new(mock));
+    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
+    bus.senders.to_screen = Some(SenderWithContext::new(screen_tx));
+    let pty = Pty::new(bus, false, None, None, None, None);
+    (pty, screen_rx)
+}
+
+fn collect_process_info_reports(
+    rx: &channels::Receiver<(ScreenInstruction, ErrorContext)>,
+) -> Vec<HashMap<u32, PaneProcessInfo>> {
+    let mut reports = Vec::new();
+    while let Ok((instruction, _)) = rx.try_recv() {
+        if let ScreenInstruction::UpdatePaneProcessInfo(process_info) = instruction {
+            reports.push(process_info);
+        }
+    }
+    reports
+}
+
 fn set_active_terminal(pty: &mut Pty, terminal_id: u32, child_pid: u32) {
     let flag = Arc::new(AtomicBool::new(true));
     pty.id_to_child_pid.insert(terminal_id, child_pid);
@@ -740,4 +766,48 @@ fn a_plugin_pane_has_no_process_to_signal() {
     let result = pty.signal_pane(PaneId::Plugin(1), PaneSignal::Kill);
     assert!(result.is_err(), "a plugin pane runs no process");
     assert!(recorder.signals_sent().is_empty());
+}
+
+/// An idle session should not wake the screen thread once a second to tell it nothing.
+#[test]
+fn an_unchanged_process_info_map_is_not_reported_again() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cmd(child_pid, vec!["/bin/bash".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp"));
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    pty.update_and_report_cwds();
+    let first = collect_process_info_reports(&screen_rx);
+    assert_eq!(first.len(), 1, "the first tick tells Screen what it found");
+
+    // nothing changed, and the pane produced no output
+    pty.update_and_report_cwds();
+    pty.update_and_report_cwds();
+    assert!(
+        collect_process_info_reports(&screen_rx).is_empty(),
+        "an unchanged map should not be sent again"
+    );
+
+    // the pane runs something new
+    mock.set_foreground_cmd(child_pid, vec!["vim".into()]);
+    pty.pane_activity_flags
+        .get(&1)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    let after_change = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        after_change.len(),
+        1,
+        "a changed map should reach Screen: {:?}",
+        after_change
+    );
+    assert_eq!(
+        after_change[0]
+            .get(&1)
+            .and_then(|info| info.command.clone()),
+        Some(vec!["vim".to_owned()])
+    );
 }

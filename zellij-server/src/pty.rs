@@ -252,6 +252,8 @@ pub(crate) struct Pty {
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
+    /// The last map `report_pane_process_info` sent, so an unchanged tick sends nothing.
+    last_reported_process_info: HashMap<u32, PaneProcessInfo>,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -993,6 +995,7 @@ impl Pty {
             resurrect_command_hints,
             report_pane_env: report_pane_env.unwrap_or_default(),
             terminal_envs: HashMap::new(),
+            last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
@@ -2254,7 +2257,10 @@ impl Pty {
     /// The whole map goes every time rather than only the panes that were active, because Screen
     /// stamps every `PaneInfo` it builds and a pane that has been quiet for an hour still has a
     /// pid. Building it touches no OS: it is a walk of three `HashMap`s the tick above just filled.
-    fn report_pane_process_info(&self) {
+    ///
+    /// A map equal to the last one sent is dropped instead: an idle session would otherwise wake
+    /// the screen thread once a second forever to tell it nothing.
+    fn report_pane_process_info(&mut self) {
         let process_info: HashMap<u32, PaneProcessInfo> = self
             .id_to_child_pid
             .keys()
@@ -2283,6 +2289,10 @@ impl Pty {
                 )
             })
             .collect();
+        if process_info == self.last_reported_process_info {
+            return;
+        }
+        self.last_reported_process_info = process_info.clone();
         let _ = self
             .bus
             .senders
