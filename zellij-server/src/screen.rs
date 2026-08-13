@@ -914,6 +914,7 @@ pub enum ScreenInstruction {
     },
     DesktopNotificationResponse(Vec<u8>, ClientId),
     UpdateBackgroundPluginSubscriptions(PluginId, ClientId, HashSet<EventType>),
+    RemoveBackgroundPluginSubscriptions(PluginId),
     ClearHintTextCache,
     BroadcastModeUpdate(ModeInfo, Option<ClientId>), // ModeInfo, optional specific client_id (None = all clients)
     // Pane-targeting CLI variants
@@ -1276,6 +1277,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             },
             ScreenInstruction::UpdateBackgroundPluginSubscriptions(..) => {
                 ScreenContext::UpdateBackgroundPluginSubscriptions
+            },
+            ScreenInstruction::RemoveBackgroundPluginSubscriptions(..) => {
+                ScreenContext::RemoveBackgroundPluginSubscriptions
             },
             ScreenInstruction::ClearHintTextCache => ScreenContext::ClearHintTextCache,
             ScreenInstruction::BroadcastModeUpdate(..) => ScreenContext::BroadcastModeUpdate,
@@ -12330,6 +12334,13 @@ pub(crate) fn screen_thread_main(
                         .background_plugin_subscriptions
                         .insert((plugin_id, client_id), subscriptions);
                 }
+            },
+            ScreenInstruction::RemoveBackgroundPluginSubscriptions(plugin_id) => {
+                // a plugin that is gone must stop having payloads built for it - every client id
+                // it was ever loaded with goes, since the plugin id is what died
+                screen
+                    .background_plugin_subscriptions
+                    .retain(|(bg_pid, _bg_cid), _| *bg_pid != plugin_id);
             },
             ScreenInstruction::ClearHintTextCache => {
                 for tab in screen.tabs.values_mut() {

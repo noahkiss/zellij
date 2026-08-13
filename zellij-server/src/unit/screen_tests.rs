@@ -8618,6 +8618,73 @@ pub fn background_plugin_receives_one_update_per_change_with_two_clients() {
 }
 
 #[test]
+pub fn an_unloaded_background_plugin_stops_being_served() {
+    // the plugin thread sends this when a plugin is unloaded or crashes - a background plugin has
+    // no pane whose closing would otherwise tell Screen the plugin is gone
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    subscribe_background_plugin(&mock_screen, 99, mock_screen.main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // it is served while it is alive
+    let instructions_before_first_change = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let delivery_while_alive = background_plugin_delivery(
+        &received_plugin_instructions.lock().unwrap()[instructions_before_first_change..],
+        99,
+    );
+
+    // it is gone
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveBackgroundPluginSubscriptions(99));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_second_change = received_plugin_instructions.lock().unwrap().len();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let delivery_after_unload =
+        background_plugin_delivery(&instructions[instructions_before_second_change..], 99);
+    assert!(
+        delivery_while_alive.pane_updates > 0 && delivery_while_alive.tab_updates > 0,
+        "the background plugin should be served while it is alive, got: {:?}",
+        delivery_while_alive
+    );
+    assert_eq!(
+        (
+            delivery_after_unload.pane_updates,
+            delivery_after_unload.tab_updates
+        ),
+        (0, 0),
+        "an unloaded background plugin should receive nothing, got: {:?}",
+        delivery_after_unload
+    );
+}
+
+#[test]
 pub fn plugin_in_a_visible_tab_is_never_served_as_a_background_plugin() {
     // A plugin loading another plugin into a visible floating pane passes no tab index, so the
     // plugin thread files the new plugin as background even though its pane sits in a real tab.

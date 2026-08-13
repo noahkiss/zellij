@@ -480,6 +480,7 @@ pub enum ScreenContext {
     ClearBellAfterDwell,
     PluginSubscribedToAnsiPaneContents,
     UpdateBackgroundPluginSubscriptions,
+    RemoveBackgroundPluginSubscriptions,
     ClearHintTextCache,
     BroadcastModeUpdate,
     SetSoftKeyboard,
