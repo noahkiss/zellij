@@ -33,7 +33,12 @@ use zellij_utils::{
 
 use crate::ClientId;
 
-const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a CLI action waits for the server to report that it finished.
+///
+/// The budget is for the answer, not for the work: an action that takes longer than this is not
+/// cancelled and usually still completes. It is generous because the slow cases are legitimate -
+/// a new tab from a heavy layout, or the first plugin load of a session, which compiles wasm.
+const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ActionCompletionResult {
@@ -55,6 +60,16 @@ impl ActionCompletionResult {
             error_message: Some(error_message),
             stdout_message: None,
         }
+    }
+    /// The wait for the action's result ran out. The exit stays non-zero, because the caller was
+    /// not told the action succeeded - but it is not told the action failed either, since nothing
+    /// cancelled it and it may well complete a moment later.
+    pub fn timed_out(action_name: &str) -> Self {
+        ActionCompletionResult::failed(format!(
+            "Timed out after {:?} waiting for action {} to report a result. \
+             The action was not cancelled and may still complete.",
+            ACTION_COMPLETION_TIMEOUT, action_name
+        ))
     }
 }
 
@@ -90,17 +105,15 @@ pub fn wait_for_action_completion(
                 ))
             },
             Err(_) => {
-                log::error!(
-                    "Action {} did not complete within {:?} timeout",
+                log::warn!(
+                    "Action {} did not report a result within {:?}",
                     action_name,
                     ACTION_COMPLETION_TIMEOUT
                 );
-                // a timeout is a failure, not a silent success: the action may still be in
-                // flight, so the caller must not read "exited 0" as "this happened"
-                ActionCompletionResult::failed(format!(
-                    "Action {} did not complete within {:?}, the session may be busy",
-                    action_name, ACTION_COMPLETION_TIMEOUT
-                ))
+                // the exit stays non-zero: the action may still be in flight, so the caller must
+                // not read "exited 0" as "this happened". It must not read it as "this failed"
+                // either - nothing was cancelled - so the message says which of the two it is
+                ActionCompletionResult::timed_out(action_name)
             },
         }
     }
@@ -3442,19 +3455,28 @@ mod tests {
     }
 
     #[test]
-    fn test_action_completion_timeout_reports_an_error() {
+    fn test_action_completion_timeout_reports_a_timeout_not_a_failure() {
         let (tx, rx) = oneshot::channel();
         // the sender is held for longer than the timeout, so the wait must give up
         let result = wait_for_action_completion(rx, "TestAction", false);
         drop(tx);
 
-        assert_eq!(result.exit_status, Some(1));
+        assert_eq!(
+            result.exit_status,
+            Some(1),
+            "the caller was not told the action succeeded, so the exit stays non-zero"
+        );
         let error_message = result
             .error_message
             .expect("a timed out action must report an error");
         assert!(
-            error_message.contains("did not complete"),
-            "Expected a timeout error, got: {}",
+            error_message.contains("Timed out"),
+            "Expected the message to name the timeout, got: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("may still complete"),
+            "the action is not cancelled, and the message must not claim it failed, got: {}",
             error_message
         );
     }

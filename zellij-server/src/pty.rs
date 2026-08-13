@@ -95,6 +95,8 @@ pub enum PtyInstruction {
         Option<NotificationEnd>,
     ),
     ClosePane(PaneId, Option<NotificationEnd>),
+    /// The child of a held pane was reaped, but the pane itself stays.
+    ChildProcessExited(u32), // u32 - terminal id
     CloseTab(Vec<PaneId>),
     ReRunCommandInPane(PaneId, RunCommand, Option<NotificationEnd>),
     DropToShellInPane {
@@ -184,6 +186,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::UpdateActivePane(..) => PtyContext::UpdateActivePane,
             PtyInstruction::GoToTab(..) => PtyContext::GoToTab,
             PtyInstruction::ClosePane(..) => PtyContext::ClosePane,
+            PtyInstruction::ChildProcessExited(..) => PtyContext::ChildProcessExited,
             PtyInstruction::CloseTab(_) => PtyContext::CloseTab,
             PtyInstruction::NewTab(..) => PtyContext::NewTab,
             PtyInstruction::OverrideLayout(..) => PtyContext::OverrideLayout,
@@ -249,6 +252,8 @@ pub(crate) struct Pty {
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
+    /// The last map `report_pane_process_info` sent, so an unchanged tick sends nothing.
+    last_reported_process_info: HashMap<u32, PaneProcessInfo>,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -616,6 +621,9 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                         completion_tx,
                     ))
                     .with_context(err_context)?;
+            },
+            PtyInstruction::ChildProcessExited(terminal_id) => {
+                pty.forget_child_pid(terminal_id);
             },
             PtyInstruction::ClosePane(id, _completion_tx) => {
                 pty.close_pane(id)
@@ -987,6 +995,7 @@ impl Pty {
             resurrect_command_hints,
             report_pane_env: report_pane_env.unwrap_or_default(),
             terminal_envs: HashMap::new(),
+            last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
             pane_activity_flags: HashMap::new(),
@@ -1183,6 +1192,7 @@ impl Pty {
                 )]));
 
                 if hold_on_close {
+                    forget_reaped_child(&senders, pane_id);
                     let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                         pane_id,
                         exit_status,
@@ -1724,6 +1734,7 @@ impl Pty {
                         )]));
 
                         if hold_on_close {
+                            forget_reaped_child(&senders, pane_id);
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -1889,6 +1900,16 @@ impl Pty {
             Some(Run::Plugin(_)) => Ok(None),
         }
     }
+    /// Forget the pid of a child that has been reaped while its pane stays open.
+    ///
+    /// Only a `hold_on_close` pane gets here: its process exits and the pane waits to be re-run.
+    /// The OS is free to hand that pid number to an unrelated process the moment it is reaped, so
+    /// a held pane must neither report it as `pane_pid` nor let `signal-pane` deliver to it. A
+    /// re-run spawns a fresh process and records the new pid.
+    pub fn forget_child_pid(&mut self, terminal_id: u32) {
+        self.id_to_child_pid.remove(&terminal_id);
+        self.terminal_foreground_cmds.remove(&terminal_id);
+    }
     pub fn close_pane(&mut self, id: PaneId) -> Result<()> {
         let err_context = || format!("failed to close for pane {id:?}");
         match id {
@@ -1982,6 +2003,7 @@ impl Pty {
                             Event::PaneExited(pane_id.into(), exit_status),
                         )]));
                         if hold_on_close {
+                            forget_reaped_child(&senders, pane_id);
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -2235,7 +2257,10 @@ impl Pty {
     /// The whole map goes every time rather than only the panes that were active, because Screen
     /// stamps every `PaneInfo` it builds and a pane that has been quiet for an hour still has a
     /// pid. Building it touches no OS: it is a walk of three `HashMap`s the tick above just filled.
-    fn report_pane_process_info(&self) {
+    ///
+    /// A map equal to the last one sent is dropped instead: an idle session would otherwise wake
+    /// the screen thread once a second forever to tell it nothing.
+    fn report_pane_process_info(&mut self) {
         let process_info: HashMap<u32, PaneProcessInfo> = self
             .id_to_child_pid
             .keys()
@@ -2264,6 +2289,10 @@ impl Pty {
                 )
             })
             .collect();
+        if process_info == self.last_reported_process_info {
+            return;
+        }
+        self.last_reported_process_info = process_info.clone();
         let _ = self
             .bus
             .senders
@@ -2430,8 +2459,10 @@ impl Pty {
 
     /// Send `signal` to the process zellij spawned for `pane_id`.
     ///
-    /// The error names which of the two ways this can miss happened: no such terminal pane, or a
-    /// plugin pane, which has no process to signal.
+    /// The error names which of the ways this can miss happened: a plugin pane, which has no
+    /// process to signal, or no live process for that terminal id - either no such pane, or a
+    /// held pane whose command already exited. A held pane has no pid of its own to signal: the
+    /// one it ran with was reaped, and that number now belongs to the OS to hand out again.
     pub fn signal_pane(&self, pane_id: PaneId, signal: PaneSignal) -> Result<(), String> {
         let terminal_id = match pane_id {
             PaneId::Terminal(terminal_id) => terminal_id,
@@ -2442,10 +2473,12 @@ impl Pty {
                 ))
             },
         };
-        let child_pid = *self
-            .id_to_child_pid
-            .get(&terminal_id)
-            .ok_or_else(|| format!("Pane with id {:?} not found", pane_id))?;
+        let child_pid = *self.id_to_child_pid.get(&terminal_id).ok_or_else(|| {
+            format!(
+                "Pane {:?} has no running process: it was not found, or its command has exited",
+                pane_id
+            )
+        })?;
         let os_input = self
             .bus
             .os_input
@@ -2636,6 +2669,16 @@ impl Drop for Pty {
                 }
             }
         }
+    }
+}
+
+/// Tell the pty thread that a held pane's child was reaped, so it stops holding the pid.
+///
+/// This runs on the thread that reaped the child, which owns none of the pty thread's state, so
+/// it goes back as an instruction. See `Pty::forget_child_pid` for why it matters.
+fn forget_reaped_child(senders: &ThreadSenders, pane_id: PaneId) {
+    if let PaneId::Terminal(terminal_id) = pane_id {
+        let _ = senders.send_to_pty(PtyInstruction::ChildProcessExited(terminal_id));
     }
 }
 

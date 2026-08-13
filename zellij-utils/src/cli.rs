@@ -1902,23 +1902,32 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
 }
 
+/// Run `f` on a thread with a stack big enough to build the clap tree.
+///
+/// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
+/// which overflows the 2MB stack the test harness gives a spawned test in a debug build. Every test
+/// that builds or parses `CliArgs` must go through here, in this crate and in the `zellij` crate
+/// (`src/tests/cli.rs`) alike: the next `CliAction` subcommand will silently re-break any module
+/// that does not. The binary itself parses on the main thread and never sees this.
+pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::PaneId;
+    use crate::input::actions::Action;
     use clap::Parser;
 
-    /// Parse a command line on a thread with a real stack.
-    ///
-    /// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
-    /// which overflows the 2MB stack the test harness gives a spawned test in a debug build. The
-    /// binary itself parses on the main thread and never sees this.
+    /// Parse a command line on a thread with a real stack. See [`on_big_stack`].
     fn parse_cli(args: Vec<String>) -> Result<CliArgs, clap::Error> {
-        std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn(move || CliArgs::try_parse_from(args))
-            .unwrap()
-            .join()
-            .unwrap()
+        on_big_stack(move || CliArgs::try_parse_from(args))
     }
 
     fn parse_action(args: &[&str]) -> CliAction {
@@ -2002,6 +2011,24 @@ mod tests {
     fn subscribe_requires_pane_id() {
         let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn close_pane_with_a_pane_id_sends_close_focus_by_pane_id() {
+        // the action this maps to decides which ScreenInstruction reports a missing pane;
+        // `CloseTerminalPane` is a different path and fixing that one does not fix this one
+        let actions = Action::actions_from_cli(
+            parse_action(&["close-pane", "--pane-id", "terminal_9"]),
+            Box::new(PathBuf::new),
+            None,
+        )
+        .expect("TEST");
+        assert_eq!(
+            actions,
+            vec![Action::CloseFocusByPaneId {
+                pane_id: PaneId::Terminal(9)
+            }]
+        );
     }
 
     #[test]

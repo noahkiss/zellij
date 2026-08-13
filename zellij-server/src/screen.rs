@@ -914,6 +914,7 @@ pub enum ScreenInstruction {
     },
     DesktopNotificationResponse(Vec<u8>, ClientId),
     UpdateBackgroundPluginSubscriptions(PluginId, ClientId, HashSet<EventType>),
+    RemoveBackgroundPluginSubscriptions(PluginId),
     ClearHintTextCache,
     BroadcastModeUpdate(ModeInfo, Option<ClientId>), // ModeInfo, optional specific client_id (None = all clients)
     // Pane-targeting CLI variants
@@ -1276,6 +1277,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             },
             ScreenInstruction::UpdateBackgroundPluginSubscriptions(..) => {
                 ScreenContext::UpdateBackgroundPluginSubscriptions
+            },
+            ScreenInstruction::RemoveBackgroundPluginSubscriptions(..) => {
+                ScreenContext::RemoveBackgroundPluginSubscriptions
             },
             ScreenInstruction::ClearHintTextCache => ScreenContext::ClearHintTextCache,
             ScreenInstruction::BroadcastModeUpdate(..) => ScreenContext::BroadcastModeUpdate,
@@ -5966,11 +5970,11 @@ impl Screen {
         }
         // Notify background plugins subscribed to ModeUpdate
         let mut bg_updates = vec![];
-        for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
-            if subs.contains(&EventType::ModeUpdate) && *bg_cid == client_id {
+        for (bg_pid, bg_cid) in self.background_plugin_ids_subscribed_to(EventType::ModeUpdate) {
+            if bg_cid == client_id {
                 bg_updates.push((
-                    Some(*bg_pid),
-                    Some(*bg_cid),
+                    Some(bg_pid),
+                    Some(bg_cid),
                     Event::ModeUpdate(mode_info.clone()),
                 ));
             }
@@ -6043,14 +6047,22 @@ impl Screen {
     /// loaded with, which the plugin map needs in order to address the instance. That client may
     /// have detached long ago, or the id may since have been recycled to an unrelated client, so
     /// it must never be used to decide *whether* to deliver - only where to deliver to.
+    ///
+    /// A plugin whose pane lives in a tab is not background, whatever the subscription map says:
+    /// the plugin thread files a plugin as background when it was loaded without a tab index, and
+    /// a plugin loading another one into a visible floating pane passes no tab index either. Such
+    /// a plugin is served as an active-tab plugin, so serving it here too would deliver twice. The
+    /// pane can also move between tabs, so tab ownership is checked at dispatch time, not at load.
     fn background_plugin_ids_subscribed_to(
         &self,
         event_type: EventType,
     ) -> Vec<(PluginId, ClientId)> {
+        let plugin_ids_in_tabs = self.all_tab_plugin_ids();
         self.background_plugin_subscriptions
             .iter()
             .filter(|(_, subs)| subs.contains(&event_type))
             .map(|((bg_pid, bg_cid), _)| (*bg_pid, *bg_cid))
+            .filter(|(bg_pid, _)| !plugin_ids_in_tabs.contains(bg_pid))
             .collect()
     }
     /// Collect plugin IDs that should receive a broadcast event for a given client.
@@ -6059,11 +6071,9 @@ impl Screen {
     fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
         let mut plugin_ids = self.active_tab_plugin_ids(client_id);
         // Background plugins subscribed to this event type
-        for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
-            if subs.contains(&event_type) && *bg_cid == client_id {
-                if !plugin_ids.contains(bg_pid) {
-                    plugin_ids.push(*bg_pid);
-                }
+        for (bg_pid, bg_cid) in self.background_plugin_ids_subscribed_to(event_type) {
+            if bg_cid == client_id && !plugin_ids.contains(&bg_pid) {
+                plugin_ids.push(bg_pid);
             }
         }
         plugin_ids
@@ -7856,13 +7866,19 @@ impl Screen {
         // Send updates. A subscriber whose buffer is full is behind, not dead: skip its update
         // and leave its previous viewport alone, so the next tick re-sends the current contents.
         // Only a client that is actually gone loses its subscription.
-        let mut busy_subscribers: Vec<ClientId> = Vec::new();
+        //
+        // The skip is per pane, not per subscriber: a channel that fills mid-batch takes some of
+        // a subscriber's panes and refuses the rest, and forgetting what the panes it accepted
+        // now show would re-send those contents on the next tick as if they had changed.
+        let mut busy_updates: Vec<(ClientId, zellij_utils::data::PaneId)> = Vec::new();
         for (subscriber_id, msg) in &updates_to_send {
             if let Some(os_input) = &self.bus.os_input {
                 match os_input.try_send_to_client(*subscriber_id, msg.clone()) {
                     Ok(()) => {},
                     Err(SendToClientError::ClientBusy) => {
-                        busy_subscribers.push(*subscriber_id);
+                        if let ServerToClientMsg::PaneRenderUpdate { pane_id, .. } = msg {
+                            busy_updates.push((*subscriber_id, *pane_id));
+                        }
                     },
                     Err(SendToClientError::ClientGone) => {
                         dead_subscribers.push(*subscriber_id);
@@ -7873,15 +7889,16 @@ impl Screen {
 
         // Update previous viewports for successful sends
         for (subscriber_id, msg) in updates_to_send {
-            if dead_subscribers.contains(&subscriber_id)
-                || busy_subscribers.contains(&subscriber_id)
-            {
+            if dead_subscribers.contains(&subscriber_id) {
                 continue;
             }
             if let ServerToClientMsg::PaneRenderUpdate {
                 pane_id, viewport, ..
             } = msg
             {
+                if busy_updates.contains(&(subscriber_id, pane_id)) {
+                    continue;
+                }
                 if let Some(subscription) = self.pane_render_subscribers.get_mut(&subscriber_id) {
                     subscription.previous_viewports.insert(pane_id, viewport);
                 }
@@ -11877,6 +11894,19 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
+                if !missing_panes.is_empty() {
+                    // no move: a partial break is worse than nothing
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
+                    continue;
+                }
                 // tab_index is the target tab ID
                 screen.break_multiple_panes_to_tab_with_index(
                     pane_ids,
@@ -12325,6 +12355,13 @@ pub(crate) fn screen_thread_main(
                         .insert((plugin_id, client_id), subscriptions);
                 }
             },
+            ScreenInstruction::RemoveBackgroundPluginSubscriptions(plugin_id) => {
+                // a plugin that is gone must stop having payloads built for it - every client id
+                // it was ever loaded with goes, since the plugin id is what died
+                screen
+                    .background_plugin_subscriptions
+                    .retain(|(bg_pid, _bg_cid), _| *bg_pid != plugin_id);
+            },
             ScreenInstruction::ClearHintTextCache => {
                 for tab in screen.tabs.values_mut() {
                     tab.clear_hint_text_cache();
@@ -12648,12 +12685,12 @@ pub(crate) fn screen_thread_main(
                 screen.log_and_report_session_state()?;
                 screen.render(None)?;
             },
-            ScreenInstruction::CloseFocusWithPaneId(pane_id, completion_tx) => {
+            ScreenInstruction::CloseFocusWithPaneId(pane_id, mut completion_tx) => {
                 let all_tabs = screen.get_tabs_mut();
                 let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.close_pane_by_pane_id(pane_id, completion_tx)
+                        tab.close_pane_by_pane_id(pane_id, completion_tx.take())
                             .non_fatal();
                         found = true;
                         break;
@@ -12661,6 +12698,10 @@ pub(crate) fn screen_thread_main(
                 }
                 if !found {
                     log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
+                    }
                 }
                 screen.render(None)?;
                 screen.log_and_report_session_state()?;

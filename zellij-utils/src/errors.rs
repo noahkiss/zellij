@@ -480,6 +480,7 @@ pub enum ScreenContext {
     ClearBellAfterDwell,
     PluginSubscribedToAnsiPaneContents,
     UpdateBackgroundPluginSubscriptions,
+    RemoveBackgroundPluginSubscriptions,
     ClearHintTextCache,
     BroadcastModeUpdate,
     SetSoftKeyboard,
@@ -521,6 +522,7 @@ pub enum PtyContext {
     GetPaneCwd,
     UpdateAndReportCwds,
     NotifyCwdFromOsc7,
+    ChildProcessExited,
     Exit,
 }
 

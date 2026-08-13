@@ -191,7 +191,9 @@ Terminal panes carry three fields describing what is running in them:
 - `pane_cwd` — its working directory.
 - `pane_command` — the foreground command if there is one, otherwise the pane's shell.
 
-All three are omitted for plugin panes and for a pane the pty thread has not reported on yet.
+All three are omitted for plugin panes, for a pane the pty thread has not reported on yet, and
+for a pane that is being held open after its command exited - the process is gone, and the pid
+it ran with is the OS's to hand out again. Re-running the command gives the pane a new one.
 
 **They are on `PaneInfo`, so plugins get them too.** They were CLI-only for a reason: the CLI
 resolved each one with a blocking round trip to the pty thread per pane, three per pane at a 100ms
@@ -2478,7 +2480,8 @@ has turned off canonical input, or a pane whose reader has wedged, will not do. 
 `--pane-id` is required: a signal is destructive enough that it should never fall back to whatever
 happens to be focused, and requiring it makes the command safe in a detached session. Naming a pane
 that does not exist, or a plugin pane, which runs no process, fails with the reason on stderr rather
-than warning into the log.
+than warning into the log. A pane held open after its command exited fails the same way: its child
+was reaped, and the pid it ran with may since have been given to an unrelated process.
 
 The signal goes to the process zellij spawned for the pane — the pane's shell — which is what the
 plugin API has always done. A shell without job control runs its command in that same process, so
