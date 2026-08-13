@@ -1610,6 +1610,19 @@ pub(crate) struct Screen {
     bell_dwell: BellDwellTracker,
 }
 
+/// What one pass of `Screen::sweep_bells` found.
+#[derive(Debug, Default)]
+struct BellSweep {
+    /// Panes that newly acquired a pending bell, for the visual flash.
+    panes_to_flash: Vec<PaneId>,
+    /// Tabs whose bell indicator newly lit, for the visual flash.
+    tabs_to_flash: Vec<usize>,
+    /// A bell rang somewhere this pass, so an attached client should hear one.
+    has_bell: bool,
+    /// Recorded bell state changed, so the session state is worth reporting.
+    state_changed: bool,
+}
+
 /// A pending forward waiting to be dispatched once the current in-flight
 /// forward's barrier reply (or timeout) arrives.
 #[derive(Debug, Clone)]
@@ -4029,6 +4042,61 @@ impl Screen {
         Ok(())
     }
 
+    /// Take the bells the panes have latched and turn them into session state.
+    ///
+    /// Separated from rendering because it must run whether or not anyone is attached: a bell that
+    /// is only noticed when a human turns up is no use to a consumer watching a detached session,
+    /// and `PaneInfo.has_pending_bell` would be permanently false for one. What the caller does
+    /// with the returned lists - flashing panes, forwarding an ANSI BEL - is the part that needs a
+    /// client.
+    fn sweep_bells(&mut self) -> BellSweep {
+        let mut sweep = BellSweep::default();
+
+        if self.visual_bell {
+            let active_tab_ids_snapshot: Vec<usize> =
+                self.active_tab_ids.values().copied().collect();
+
+            for tab in self.tabs.values_mut() {
+                let is_active = active_tab_ids_snapshot.contains(&tab.id);
+                let (new_panes, tab_newly_set) = tab.check_and_handle_bell_notifications(is_active);
+                if !new_panes.is_empty() {
+                    sweep.panes_to_flash.extend(new_panes);
+                    sweep.state_changed = true;
+                }
+                if tab_newly_set {
+                    sweep.tabs_to_flash.push(tab.id);
+                    sweep.state_changed = true;
+                }
+            }
+            sweep.has_bell = !sweep.panes_to_flash.is_empty() || !sweep.tabs_to_flash.is_empty();
+        } else {
+            // visual_bell disabled: consume the bell for ANSI BEL forwarding only, recording no
+            // per-pane state - which is what this configuration asked for
+            for tab in self.tabs.values_mut() {
+                if tab.check_and_consume_bells_without_visual_notification() {
+                    sweep.has_bell = true;
+                }
+            }
+        }
+
+        // a pane that rings again while it is focused restarts its bell_clear_delay_ms dwell.
+        // Nothing is focused in a detached session, so this list is empty there.
+        let rang_while_focused: Vec<PaneId> = self
+            .tabs
+            .values_mut()
+            .flat_map(|tab| tab.take_bells_rung_while_focused())
+            .collect();
+        if self.bell_dwell.is_delayed() {
+            let now = Instant::now();
+            for pane_id in rang_while_focused {
+                self.bell_dwell.record_ring(pane_id, now);
+                self.schedule_bell_clear(pane_id);
+            }
+        }
+
+        sweep
+    }
+
     pub fn render_to_clients(&mut self) -> Result<()> {
         // this method does the actual rendering and is triggered by a debounced BackgroundJob (see
         // the render method for more details)
@@ -4046,6 +4114,11 @@ impl Screen {
         let non_watcher_output_was_dirty;
 
         let mut tabs_to_close = vec![];
+
+        // A bell is session state, not a client-side effect. This sweep runs before the client
+        // gate below so that a fully detached session still records which panes rang - the
+        // flashing and the forwarded BEL, which do need a client, stay inside the gate.
+        let bells = self.sweep_bells();
 
         // === PHASE 1: Render for regular clients ===
         if has_regular_clients {
@@ -4088,67 +4161,22 @@ impl Screen {
 
             non_watcher_output_was_dirty = output.is_dirty();
 
-            let mut bell_state_changed = false;
-            let mut has_bell = false;
-
-            if self.visual_bell {
-                let mut panes_to_flash: Vec<PaneId> = vec![];
-                let mut tabs_to_flash: Vec<usize> = vec![];
-
-                let active_tab_ids_snapshot: Vec<usize> =
-                    self.active_tab_ids.values().copied().collect();
-
-                for tab in self.tabs.values_mut() {
-                    let is_active = active_tab_ids_snapshot.contains(&tab.id);
-                    let (new_panes, tab_newly_set) =
-                        tab.check_and_handle_bell_notifications(is_active);
-                    if !new_panes.is_empty() {
-                        panes_to_flash.extend(new_panes);
-                        bell_state_changed = true;
-                    }
-                    if tab_newly_set {
-                        tabs_to_flash.push(tab.id);
-                        bell_state_changed = true;
-                    }
-                }
-
-                has_bell = !panes_to_flash.is_empty() || !tabs_to_flash.is_empty();
-                if !panes_to_flash.is_empty() {
-                    let _ = self
-                        .bus
-                        .senders
-                        .send_to_background_jobs(BackgroundJob::FlashPaneBell(panes_to_flash));
-                }
-                for tab_id in tabs_to_flash {
-                    let _ = self
-                        .bus
-                        .senders
-                        .send_to_background_jobs(BackgroundJob::FlashTabBell(tab_id));
-                }
-            } else {
-                // visual_bell disabled: still detect bell for ANSI BEL forwarding only
-                for tab in self.tabs.values_mut() {
-                    if tab.check_and_consume_bells_without_visual_notification() {
-                        has_bell = true;
-                    }
-                }
+            if !bells.panes_to_flash.is_empty() {
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::FlashPaneBell(
+                        bells.panes_to_flash.clone(),
+                    ));
+            }
+            for tab_id in &bells.tabs_to_flash {
+                let _ = self
+                    .bus
+                    .senders
+                    .send_to_background_jobs(BackgroundJob::FlashTabBell(*tab_id));
             }
 
-            // a pane that rings again while it is focused restarts its bell_clear_delay_ms dwell
-            let rang_while_focused: Vec<PaneId> = self
-                .tabs
-                .values_mut()
-                .flat_map(|tab| tab.take_bells_rung_while_focused())
-                .collect();
-            if self.bell_dwell.is_delayed() {
-                let now = Instant::now();
-                for pane_id in rang_while_focused {
-                    self.bell_dwell.record_ring(pane_id, now);
-                    self.schedule_bell_clear(pane_id);
-                }
-            }
-
-            if has_bell {
+            if bells.has_bell {
                 output.add_post_vte_instruction_to_multiple_clients(
                     self.active_tab_ids.keys().copied(),
                     "\u{7}", // ANSI BEL
@@ -4164,7 +4192,7 @@ impl Screen {
                 }
             }
 
-            if non_watcher_output_was_dirty || has_bell {
+            if non_watcher_output_was_dirty || bells.has_bell {
                 let serialized_output = output.serialize().context(err_context)?;
                 if !serialized_output.is_empty() {
                     let _ = self
@@ -4176,12 +4204,18 @@ impl Screen {
             }
 
             let single_pane_names_changed = self.update_single_pane_tab_names();
-            if bell_state_changed || single_pane_names_changed {
+            if bells.state_changed || single_pane_names_changed {
                 self.log_and_report_session_state()?;
             }
         } else {
             // No regular clients, output is not dirty
             non_watcher_output_was_dirty = false;
+
+            // a pane that rang with nobody attached is exactly the case a headless consumer cares
+            // about, so the state change is reported here too
+            if bells.state_changed {
+                self.log_and_report_session_state()?;
+            }
 
             // No regular clients but subscribers exist — query panes directly
             if !self.pane_render_subscribers.is_empty() {

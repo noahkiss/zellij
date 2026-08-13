@@ -2439,6 +2439,17 @@ pub struct PaneInfo {
     /// move on the once-a-second session tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at: Option<u64>,
+    /// Whether this pane has a bell nobody has looked at yet
+    ///
+    /// A pane that rings the terminal bell while it is not focused latches this until a client
+    /// focuses it. It is recorded whether or not anyone is attached, so it is readable from a
+    /// detached session - which is where "this pane wants attention" is worth knowing.
+    ///
+    /// The `title` field carries a ` [!]` suffix for the same condition; read this instead, and
+    /// leave `title` to display. Always `false` when `visual_bell` is off in the configuration:
+    /// with no visual notification there is no per-pane bell state to report.
+    #[serde(default)]
+    pub has_pending_bell: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

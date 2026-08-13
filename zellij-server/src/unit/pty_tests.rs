@@ -455,8 +455,10 @@ fn osc7_no_event_when_unchanged() {
     assert!(events.is_empty(), "no event when osc7 path matches cache");
 }
 
+/// The flag says "this pane produced output", and OSC 7 arrives as output. Clearing it here used
+/// to save one cwd read and cost the pane its whole tick - command discovery included.
 #[test]
-fn osc7_clears_activity_flag() {
+fn osc7_leaves_the_activity_flag_alone() {
     let mock = MockOsApi::new();
     let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
     let flag = Arc::new(AtomicBool::new(true));
@@ -466,16 +468,17 @@ fn osc7_clears_activity_flag() {
     pty.notify_cwd_from_osc7(1, PathBuf::from("/new"));
 
     assert!(
-        !flag.load(Ordering::Relaxed),
-        "osc7 should clear the activity flag"
+        flag.load(Ordering::Relaxed),
+        "osc7 should leave the activity flag set - the pane did produce output"
     );
 }
 
+/// A shell that reports its cwd at every prompt must not starve its own command discovery.
 #[test]
-fn osc7_then_poll_skips_terminal() {
+fn osc7_then_poll_still_discovers_the_command() {
     let mock = MockOsApi::new();
     let child_pid = 100;
-    mock.set_cwd(child_pid, PathBuf::from("/from-proc"));
+    mock.set_cwd(child_pid, PathBuf::from("/from-osc7"));
     mock.set_foreground_cmd(child_pid, vec!["vim".into()]);
     let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
     set_active_terminal(&mut pty, 1, child_pid);
@@ -485,11 +488,12 @@ fn osc7_then_poll_skips_terminal() {
     assert_eq!(osc7_events.len(), 1);
 
     pty.update_and_report_cwds();
-    let cwd_events = collect_cwd_changed_events(&rx);
+    // one drain of the channel, so collect the events this test is about
     let cmd_events = collect_command_changed_events(&rx);
-    assert!(
-        cwd_events.is_empty() && cmd_events.is_empty(),
-        "poll after osc7 should skip terminal since flag was cleared"
+    assert_eq!(
+        cmd_events.len(),
+        1,
+        "the poll must still discover what the pane is running"
     );
 }
 

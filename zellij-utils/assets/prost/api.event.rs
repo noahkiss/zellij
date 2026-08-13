@@ -701,6 +701,8 @@ pub struct PaneInfo {
     pub pane_command: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, optional, tag="35")]
     pub last_output_at: ::core::option::Option<u64>,
+    #[prost(bool, tag="36")]
+    pub has_pending_bell: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

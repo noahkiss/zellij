@@ -7290,6 +7290,12 @@ impl Tab {
         let stack_list_membership = self.stack_list_membership();
         for info in pane_info.iter_mut() {
             Self::apply_stack_list_membership(&stack_list_membership, info);
+            let pane_id = if info.is_plugin {
+                PaneId::Plugin(info.id)
+            } else {
+                PaneId::Terminal(info.id)
+            };
+            info.has_pending_bell = self.panes_with_pending_bell.contains(&pane_id);
         }
         pane_info
     }

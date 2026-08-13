@@ -516,6 +516,7 @@ message PaneInfo {
     optional uint32 pane_pid = 33;
     optional string pane_command = 34;
     optional uint64 last_output_at = 35;
+    bool has_pending_bell = 36;
 }
 
 message IndexInPaneGroup {

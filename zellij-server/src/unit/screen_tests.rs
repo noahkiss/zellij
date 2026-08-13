@@ -12500,7 +12500,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
         .send(ScreenInstruction::UpdatePaneProcessInfo(process_info));
     // any state change makes screen rebuild the manifest and report it
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
-        PaneId::Terminal(2),
+        PaneId::Terminal(0),
         None,
         None,
         None,
@@ -12541,7 +12541,7 @@ pub fn a_pane_the_pty_said_nothing_about_reports_no_process_fields() {
     );
 
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
-        PaneId::Terminal(2),
+        PaneId::Terminal(0),
         None,
         None,
         None,
@@ -12586,7 +12586,7 @@ pub fn pane_info_reports_when_a_pane_last_emitted_output() {
         .to_screen
         .send(ScreenInstruction::PtyBytes(1, "hi".as_bytes().to_vec()));
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
-        PaneId::Terminal(2),
+        PaneId::Terminal(0),
         None,
         None,
         None,
@@ -12635,7 +12635,7 @@ pub fn a_silent_pane_reports_no_last_output_time() {
     );
 
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
-        PaneId::Terminal(2),
+        PaneId::Terminal(0),
         None,
         None,
         None,
@@ -12652,4 +12652,99 @@ pub fn a_silent_pane_reports_no_last_output_time() {
         .find(|pane| !pane.is_plugin && pane.id == 1)
         .expect("terminal pane 1 should be in the manifest");
     assert_eq!(silent.last_output_at, None);
+}
+
+#[test]
+pub fn a_bell_is_recorded_on_the_pane_that_rang() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // pane 1 is not the focused one, so its bell latches
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(1, "\u{7}".as_bytes().to_vec()));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RenderToClients);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let rang = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(
+        rang.has_pending_bell,
+        "the pane that rang should report a pending bell"
+    );
+    let quiet = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 0)
+        .expect("terminal pane 0 should be in the manifest");
+    assert!(
+        !quiet.has_pending_bell,
+        "a pane that did not ring should report no pending bell"
+    );
+}
+
+#[test]
+pub fn a_bell_is_recorded_with_no_clients_attached() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // detach the only client, then ring the bell in a pane nobody is watching
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let instructions_before_bell = received_plugin_instructions.lock().unwrap().len();
+
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(1, "\u{7}".as_bytes().to_vec()));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RenderToClients);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions[instructions_before_bell..], 99).expect(
+        "a bell with nobody attached should still report session state to a background plugin",
+    );
+    let rang = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert!(
+        rang.has_pending_bell,
+        "a detached session must still record that a pane rang"
+    );
 }

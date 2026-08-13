@@ -238,6 +238,28 @@ read is one the tick performs for any active pane anyway.
 
 Proto tag 35.
 
+### `has_pending_bell`, and bells that are processed while detached
+
+`PaneInfo.has_pending_bell` is `true` for a pane that rang the terminal bell while it was not
+focused and has not been looked at since. It is the same condition that puts a ` [!]` suffix on the
+pane's `title` — read the field, and leave the title to display, which is what it is for.
+
+The field alone would have shipped a lie. Bell processing sat inside the branch that renders for
+connected clients, so **a fully detached session processed no bells at all**: a pane rang, the grid
+latched the bit, and nothing looked at it until a human attached. Recording a bell is session state,
+not a client-side effect, so the sweep now runs before that gate. What genuinely needs a client —
+flashing the pane and the tab, forwarding an ANSI BEL to the terminal — stays inside it, and a bell
+that changes recorded state reports the session with or without a client.
+
+The field is always `false` when `visual_bell` is off in the configuration. That setting turns off
+per-pane bell notification entirely, and reporting state the rest of zellij does not keep would be
+inventing it.
+
+For a consumer, this turns "is that tool waiting for me" from a periodic scrape of pane contents into
+something the session pushes — as long as the tool in the pane rings the bell.
+
+Proto tag 36.
+
 ### The socket directory is visible, and `ls` warns about sessions outside it
 
 Every session operation is scoped to one socket directory, resolved from the environment
