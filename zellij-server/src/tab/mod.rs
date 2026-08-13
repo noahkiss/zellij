@@ -1808,6 +1808,19 @@ impl Tab {
     ) -> Result<()> {
         self.swap_layouts
             .set_base_layout((layout.clone(), floating_panes_layout.clone()));
+        // fork addition: the panes this layout is about to build, so they can be announced with
+        // `PaneOpened` once they exist - the applier consumes the id lists
+        let panes_this_layout_creates: Vec<PaneId> = new_terminal_ids
+            .iter()
+            .chain(new_floating_terminal_ids.iter())
+            .map(|(terminal_id, _hold_for_command)| PaneId::Terminal(*terminal_id))
+            .chain(
+                new_plugin_ids
+                    .values()
+                    .flatten()
+                    .map(|plugin_id| PaneId::Plugin(*plugin_id)),
+            )
+            .collect();
         match LayoutApplier::new(
             &self.viewport,
             &self.senders,
@@ -1872,6 +1885,9 @@ impl Tab {
             self.tiled_panes.update_pane_sixel_host_support(supported);
             self.floating_panes
                 .update_pane_sixel_host_support(supported);
+        }
+        for pane_id in panes_this_layout_creates {
+            self.notify_pane_opened(pane_id);
         }
         Ok(())
     }
@@ -2549,6 +2565,23 @@ impl Tab {
             invoked_with
         }
     }
+    /// fork addition: announce a pane that has just been created, the counterpart of `PaneClosed`
+    ///
+    /// It is broadcast `(None, None)` like `PaneClosed`, so it reaches every subscribed plugin
+    /// whether or not a client is attached, and it is sent from the creation paths only - a pane
+    /// moved between tabs or toggled between tiled and floating is not a new pane. The pane is
+    /// checked for before announcing it: a creation that found no room drops the pane, and
+    /// reporting one that does not exist would be worse than reporting nothing.
+    fn notify_pane_opened(&self, pane_id: PaneId) {
+        if !self.has_pane_with_pid(&pane_id) {
+            return;
+        }
+        let _ = self.senders.send_to_plugin(PluginInstruction::Update(vec![(
+            None,
+            None,
+            Event::PaneOpened(pane_id.into()),
+        )]));
+    }
     pub fn new_pane(
         &mut self,
         pid: PaneId,
@@ -2561,6 +2594,35 @@ impl Tab {
         blocking_notification: Option<NotificationEnd>,
     ) -> Result<()> {
         let invoked_with = self.normalize_invoked_with_for_default_shell(invoked_with);
+        // an in-place pane is announced by `suppress_pane_and_replace_with_pid`, which is also
+        // reached from `Screen::replace_pane` - announcing it here as well would double-report it
+        let announce_here = !matches!(new_pane_placement, NewPanePlacement::InPlace { .. });
+        let result = self.new_pane_in_placement(
+            pid,
+            initial_pane_title,
+            invoked_with,
+            start_suppressed,
+            should_focus_pane,
+            new_pane_placement,
+            client_id,
+            blocking_notification,
+        );
+        if result.is_ok() && announce_here {
+            self.notify_pane_opened(pid);
+        }
+        result
+    }
+    fn new_pane_in_placement(
+        &mut self,
+        pid: PaneId,
+        initial_pane_title: Option<String>,
+        invoked_with: Option<Run>,
+        start_suppressed: bool,
+        should_focus_pane: bool,
+        new_pane_placement: NewPanePlacement,
+        client_id: Option<ClientId>,
+        blocking_notification: Option<NotificationEnd>,
+    ) -> Result<()> {
         match new_pane_placement {
             NewPanePlacement::NoPreference { borderless } => self.new_no_preference_pane(
                 pid,
@@ -3209,6 +3271,7 @@ impl Tab {
                             PaneId::Terminal(pid),
                         );
                         self.insert_scrollback_editor_replaced_pane(replaced_pane, pid);
+                        self.notify_pane_opened(PaneId::Terminal(pid));
                         self.get_active_pane(client_id)
                             .with_context(|| format!("no active pane found for client {client_id}"))
                             .and_then(|current_active_pane| {
@@ -3281,6 +3344,7 @@ impl Tab {
                             PaneId::Terminal(pid),
                         );
                         self.insert_scrollback_editor_replaced_pane(replaced_pane, pid);
+                        self.notify_pane_opened(PaneId::Terminal(pid));
                     },
                     None => {
                         Err::<(), _>(anyhow!("Could not find editor pane to replace"))
@@ -3458,6 +3522,7 @@ impl Tab {
                 }
             },
         }
+        self.notify_pane_opened(new_pane_id);
         Ok(())
     }
     pub fn close_pane_and_replace_with_other_pane(
@@ -7290,6 +7355,12 @@ impl Tab {
         let stack_list_membership = self.stack_list_membership();
         for info in pane_info.iter_mut() {
             Self::apply_stack_list_membership(&stack_list_membership, info);
+            let pane_id = if info.is_plugin {
+                PaneId::Plugin(info.id)
+            } else {
+                PaneId::Terminal(info.id)
+            };
+            info.has_pending_bell = self.panes_with_pending_bell.contains(&pane_id);
         }
         pane_info
     }
@@ -8133,6 +8204,17 @@ pub fn pane_info_for_pane(
     let geom = pane.position_and_size();
     pane_info.stack_id = geom.stacked;
     pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();
+    // fork addition: state the `Pane` trait already answers for every pane, terminal and plugin
+    // alike, and which nothing outside the server could read
+    pane_info.is_pinned = geom.is_pinned;
+    pane_info.logical_position = geom.logical_position;
+    pane_info.is_alternate_screen = pane.is_alternate_mode_active();
+    let (scrollback_position, scrollback_length) = pane.scroll_position();
+    pane_info.scrollback_position = scrollback_position;
+    pane_info.scrollback_length = scrollback_length;
+    pane_info.is_borderless = pane.borderless();
+    pane_info.exclude_from_sync = pane.exclude_from_sync();
+    pane_info.has_explicit_title = pane.has_explicit_title();
     pane_info.exited = pane.exited();
     pane_info.exit_status = pane.exit_status();
     pane_info.is_held = pane.is_held();

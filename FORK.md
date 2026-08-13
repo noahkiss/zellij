@@ -178,20 +178,117 @@ This adds an `Action` and therefore a message to the client/server contract (tag
 bumping the contract version: a fork client talking to a stock server of the same contract simply
 gets nothing for this one action, and every other action keeps working.
 
-### `pane_pid` in `list-panes --json`
+### The process behind a pane: `pane_pid`, `pane_cwd` and `pane_command`
 
 ```
 zellij action list-panes --all --json
 ```
 
-Terminal panes carry `pane_pid`, the pid of the process zellij spawned for the pane. The field is
-omitted for plugin panes and for any pane the pty does not answer for, exactly like the neighbouring
-`pane_command` and `pane_cwd`. This only exposes what the pty thread already knew — the pid was
-reachable from plugins and nowhere else — so consumers no longer have to scan `/proc/*/environ` for
-`ZELLIJ_PANE_ID` to map a pane to a process.
+Terminal panes carry three fields describing what is running in them:
 
-`PaneListEntry` is a CLI-only struct, so this is JSON output only: no protobuf, no contract change,
-and plugins see nothing new.
+- `pane_pid` — the pid of the process zellij spawned for the pane. That is the pane's own child, the
+  shell, not whatever the shell is running; walk down from it to find a tool inside the pane.
+- `pane_cwd` — its working directory.
+- `pane_command` — the foreground command if there is one, otherwise the pane's shell.
+
+All three are omitted for plugin panes and for a pane the pty thread has not reported on yet.
+
+**They are on `PaneInfo`, so plugins get them too.** They were CLI-only for a reason: the CLI
+resolved each one with a blocking round trip to the pty thread per pane, three per pane at a 100ms
+timeout each, which is not something an event path can carry. The pty thread already refreshes a cwd
+and command cache once a second for panes that produced output, and already holds every pane's pid —
+so it now reports that warm cache to Screen on the same tick, and Screen stamps it onto every
+`PaneInfo` it builds. The CLI reads the same stamped fields, and its per-pane blocking round trips
+are gone: `list-panes --json` no longer re-probes the OS for what was measured moments earlier.
+
+The JSON keys and their meaning are unchanged; they simply now come from the manifest rather than
+from a separate enrichment pass, and appear on plugin `PaneUpdate`/`SessionUpdate` as well.
+
+Both fields have a push complement that already existed and still fires: `Event::CwdChanged` and
+`Event::CommandChanged`, both broadcast client-independently. Subscribe to those for changes; read
+these fields for the state of the world when a consumer starts, which is what an event stream cannot
+tell it. The stamped values follow the pty ticker, so they lag a `cd` by up to a second.
+
+The fields cross the plugin API, so `event.proto` and its generated Rust are regenerated
+(`cargo xtask proto`), taking tags 32-34. They also round-trip through `session-metadata.kdl`, so a
+plugin reading a peer session gets them too.
+
+### `last_output_at`: when a pane last produced output
+
+`PaneInfo.last_output_at` is the time a terminal pane last emitted bytes, in milliseconds since the
+Unix epoch. It is `null` for plugin panes and for a pane that has produced nothing since the server
+started.
+
+It means output, not attention: a human typing does not move it, nor does focusing the pane. That
+makes it the cheapest liveness signal in the tree — "is this pane still working" answered without
+reading a cell of its content, and without spawning a process per pane to scrape one.
+
+The server already recorded the instant on every read from a pty, for the mobile view, and threw the
+wall-clock meaning away. Reporting it costs one clock read per manifest.
+
+Nothing pushes on output alone, so a consumer sees the value move on the once-a-second session tick
+rather than the moment bytes land. That is still an order of magnitude better than sweeping panes
+with `dump-screen`.
+
+Related fix on the same path: a shell emitting OSC 7 (a cwd report) used to clear the pane's
+activity flag in the pty thread. That flag gates the whole once-a-second refresh for the pane,
+command discovery included, so a shell announcing its cwd at every prompt could starve its own
+`pane_command` of updates. The flag now stays set — the pane did produce output — and the extra cwd
+read is one the tick performs for any active pane anyway.
+
+Proto tag 35.
+
+### `has_pending_bell`, and bells that are processed while detached
+
+`PaneInfo.has_pending_bell` is `true` for a pane that rang the terminal bell while it was not
+focused and has not been looked at since. It is the same condition that puts a ` [!]` suffix on the
+pane's `title` — read the field, and leave the title to display, which is what it is for.
+
+The field alone would have shipped a lie. Bell processing sat inside the branch that renders for
+connected clients, so **a fully detached session processed no bells at all**: a pane rang, the grid
+latched the bit, and nothing looked at it until a human attached. Recording a bell is session state,
+not a client-side effect, so the sweep now runs before that gate. What genuinely needs a client —
+flashing the pane and the tab, forwarding an ANSI BEL to the terminal — stays inside it, and a bell
+that changes recorded state reports the session with or without a client.
+
+The field is always `false` when `visual_bell` is off in the configuration. That setting turns off
+per-pane bell notification entirely, and reporting state the rest of zellij does not keep would be
+inventing it.
+
+For a consumer, this turns "is that tool waiting for me" from a periodic scrape of pane contents into
+something the session pushes — as long as the tool in the pane rings the bell.
+
+Proto tag 36.
+
+### `report_pane_env`: named environment variables on every pane
+
+```kdl
+report_pane_env "CLAUDE_CODE_SESSION_ID" "MY_TOOL_ID"
+```
+
+`PaneInfo.pane_env` reports the variables this list names, found in the pane's processes. It answers
+the question a pid alone cannot: *which* instance of a tool is this pane — which agent session, which
+job — without a consumer having to read `/proc` itself or the pane having to announce anything.
+
+**It is an allowlist, and only an allowlist.** Unset means report nothing, there are no default
+entries, and the names are exact — no patterns, because a pattern is how a key nobody meant to
+publish gets published. An environment is full of secrets; the whole of one is never reported.
+
+The value is looked for on the pane's own child and then its descendants, nearest first, so a tool
+running inside the pane's shell answers for a name they both export. That walk is the one
+`resurrect_command_hints` already does, and it is the same code: `/proc/<pid>/environ` on Linux,
+`sysctl(KERN_PROCARGS2)` on macOS, nothing anywhere else. Both platforms are supported.
+
+Cost: nothing at all with the list unset, which is the default. With it set, the pty thread reads
+the process table once per second — once for the tick, not once per pane — and one environment per
+process it walks, stopping as soon as every named variable is found.
+
+`pane_env` is the one new field that does **not** round-trip through `session-metadata.kdl`. Putting
+it on the event path is something a configuration opted into; writing the values into a file every
+session on the box can read, and which outlives the server, is a different exposure and was not.
+A peer session therefore reports an empty `pane_env` — read it from the session that owns the pane.
+
+Proto tag 37.
 
 ### The socket directory is visible, and `ls` warns about sessions outside it
 
@@ -2196,6 +2293,116 @@ file is there, and `plugin_watch` then watches it like any `file:` plugin — ed
 The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) because the two places
 that need it — resolving a builtin's bytes and watching its file — sit on different threads and
 neither carries the config.
+
+### Eight more things a pane already knew about itself
+
+```
+zellij action list-panes --all --json
+```
+
+Every one of these was a method on the server's `Pane` trait, answered for terminal and plugin panes
+alike, and readable nowhere outside the server. They are now stamped onto `PaneInfo` beside the
+rest, so they reach the CLI, plugins and peer sessions on the same path:
+
+- `is_alternate_screen` — the program is drawing on the alternate screen, i.e. a full-screen editor,
+  pager or TUI owns the pane rather than a shell sitting at a prompt. The cheapest way to tell those
+  apart, and the reason a pane's scrollback stops growing.
+- `scrollback_position` / `scrollback_length` — how far the pane is scrolled back from the bottom,
+  and how many lines it can scroll through. `0`/`0` for a plugin pane.
+- `is_pinned` — a floating pane pinned above the tiled layer. Always `false` for a tiled pane.
+- `logical_position` — the pane's position in the layout that placed it, which survives resizing and
+  reordering. `null` for a pane no layout placed.
+- `is_borderless` — the pane is drawn with no frame, so it shows no title.
+- `exclude_from_sync` — the pane is left out when the tab syncs input to all its panes.
+- `has_explicit_title` — a human named this pane. `title` is the display title whatever its source
+  and `program_title` is what the program called itself; neither could answer "did someone type
+  this name", which is what a consumer needs before overwriting it.
+
+**`frame_color_override` was assessed and skipped.** The survey read it as "the server already marks
+panes it considers failed and nothing outside sees it", but the mark is a one-second flash: the
+background job that sets it clears it again after `LONG_FLASH_DURATION_MS`
+(`background_jobs.rs`), and the same field also carries the multi-select highlight. A field sampled
+by a once-a-second manifest would report it at random, and the error text that would make it
+meaningful is not on the trait at all. If a "this pane failed" signal is wanted it should be its own
+recorded state, not a render override read sideways.
+
+`session-metadata.kdl` carries six of the eight, so a peer session reports them too. It does not
+carry `scrollback_position` or `scrollback_length`: those describe where one session's own viewport
+sits in a buffer that grows with every line of output, which a reader of another session can neither
+act on nor keep up with, and writing them would rewrite the file for every pane that produced a line.
+
+Proto tags 38-45.
+
+### A crashed plugin says so (`Event::PluginDied`)
+
+When a plugin panics, zellij pushes a loading-error indication to the plugin's pane. A background
+plugin has no pane. So a background plugin - the kind that watches a session and forwards what it
+sees - died behind one `log::error!` and nothing else changed: no event, nothing to poll, and a feed
+that has gone quiet looks exactly like a session with nothing to say.
+
+`Event::PluginDied(plugin_id, message)` is broadcast to every subscribed plugin when a plugin
+crashes, carrying the error it died with. A supervisor plugin can therefore notice, and a consumer
+downstream of one can be told.
+
+- **Nothing restarts the plugin.** This is a signal, not a policy; reloading is the caller's
+  decision and belongs where the caller's configuration is.
+- **Each plugin id is announced once.** Announcing a crash sends an event, and delivering an event
+  is how a plugin crashes, so two plugins that die on `PluginDied` would otherwise keep each other
+  crashing forever. A reloaded plugin gets a new id and can be announced again.
+- The pane indicator is unchanged for plugins that have a pane.
+
+`SessionInfo.plugins` deliberately does **not** mark dead plugins, because it does not list live
+ones either: `Screen` builds every `SessionInfo` with an empty map, `populate_plugin_list` has no
+callers anywhere in the tree, and the KDL codec drops the field. Marking a list nobody fills would
+be a fiction; populating it is a separate piece of work.
+
+Proto: `EventType` 54, event payload 48.
+
+### `Event::PaneExited`, so a failed command pane tells someone
+
+A command pane that fails had exactly one way to say so, and it only worked for one kind of caller:
+`Event::CommandPaneExited` goes to the plugin that opened the pane. A pane started by a layout or by
+`zellij action new-pane -- <command>` has no such plugin, so its exit status was read in the pty
+thread and thrown away. `PaneClosed` fired, carrying no status. A build in a background tab could
+fail and nothing outside that tab ever knew.
+
+`Event::PaneExited(PaneId, Option<i32>)` is the same news told to everyone. It is broadcast like
+`PaneClosed`, from every path that spawns a terminal - the interactive one, the layout one and the
+re-run of a held command pane - so it works in a fully detached session. `CommandPaneExited` still
+goes to the originating plugin exactly as before.
+
+- The status is `None` when the process was killed by a signal or the status could not be read.
+  `None` is not zero, and a consumer deciding whether a job succeeded must not treat it as such.
+- It fires for a plain shell exiting too, which is the same event from zellij's point of view.
+- A pane that holds after exiting keeps reporting `exited` and `exit_status` on `PaneInfo`; a pane
+  configured to close is announced by `PaneClosed` immediately afterwards.
+
+Proto: `EventType` 53, event payload 47.
+
+### `Event::PaneOpened`, the counterpart of `PaneClosed`
+
+`PaneClosed` was the only structural lifecycle event zellij had. It fires from every close path and
+reaches every subscribed plugin whether or not a client is attached, so pane *removal* was already
+observable in a detached session — while pane *creation* could only be recovered by diffing a pane
+manifest against the last one a consumer happened to see.
+
+`Event::PaneOpened(PaneId)` closes the asymmetry. It carries the same payload as `PaneClosed`, is
+broadcast the same way, and fires from every creation path: tiled, floating, stacked and
+no-preference panes, in-place and editor panes, the panes a layout builds when a tab is created,
+terminals and plugins alike.
+
+What it deliberately does not fire for:
+
+- **A pane that moved.** Toggling a pane between tiled and floating, breaking it out to another tab
+  or restacking it is the same pane with the same id and uuid. Only creation is announced.
+- **A pane that was not created.** A creation that finds no room for the pane drops it; the event is
+  sent only after the pane is found in the tab, because announcing one that does not exist is worse
+  than announcing nothing.
+
+Pair it with `PaneClosed` for a complete pane lifecycle without polling, and with `PaneInfo.uuid`
+when a consumer needs to tell a restored pane from the one it continues.
+
+Proto: `EventType` 52, event payload 46.
 
 ## Assessed and deliberately not built
 

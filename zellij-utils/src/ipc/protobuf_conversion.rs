@@ -990,6 +990,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             terminal_title_template: None,
             session_aliases: None,
             session_restart_drop_env: None,
+            report_pane_env: None,
             session_service: None,
             resurrect_command_hints: None,
             default_floating_size: None,

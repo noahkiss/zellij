@@ -1008,6 +1008,36 @@ pub enum Event {
     CommandPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> -
     // exit_code
     PaneClosed(PaneId),
+    /// A pane was created in this session, whether or not a client is attached
+    ///
+    /// The counterpart of `PaneClosed`: it fires once per pane from every creation path - tiled,
+    /// floating, stacked, in-place, editor and layout-applied, terminal and plugin alike - and it
+    /// is broadcast to every subscribed plugin rather than to the client that asked for the pane.
+    /// A pane moved between tabs is not a new pane and does not fire it.
+    PaneOpened(PaneId),
+    /// The process in a terminal pane exited, with the status it exited with
+    ///
+    /// It fires for every terminal pane whatever started it - a layout, the CLI, a plugin or the
+    /// user - and it is broadcast to every subscribed plugin rather than to whoever asked for the
+    /// pane. `CommandPaneExited` reports the same thing to the one plugin that opened the pane;
+    /// this is the general signal, and until now a command pane started by a layout could fail
+    /// and tell nobody.
+    ///
+    /// The status is `None` when the process was killed by a signal or the exit status could not
+    /// be read. A pane that holds after exiting keeps reporting the status on `PaneInfo`; a pane
+    /// that closes is then announced by `PaneClosed`, which carries no status of its own.
+    PaneExited(PaneId, Option<i32>),
+    /// A plugin crashed and is no longer running
+    ///
+    /// The payload is the plugin's id and the error it died with. It is broadcast to every
+    /// subscribed plugin, so a supervisor hears about a background plugin whose death has no other
+    /// symptom: a background plugin has no pane, so the loading-error indicator zellij draws for a
+    /// crashed plugin has nowhere to go, and a consumer of its output cannot tell a quiet session
+    /// from a dead feed.
+    ///
+    /// Nothing restarts the plugin. Each crash is announced once per plugin id, so a plugin that
+    /// dies again on the next event cannot drive an announcement loop.
+    PluginDied(u32, String), // u32 - plugin_id, String - the error it died with
     EditPaneOpened(u32, Context),              // u32 - terminal_pane_id
     EditPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> - exit code
     CommandPaneReRun(u32, Context),            // u32 - terminal_pane_id, Option<i32> -
@@ -2407,6 +2437,109 @@ pub struct PaneInfo {
     /// incarnation directly before it, not the whole chain. Use it to carry state across a restart
     /// deliberately - the new uuid is what stops that happening by accident.
     pub restored_from: String,
+    /// The working directory of the process running in this pane, if known
+    ///
+    /// Terminal panes only. It comes from the cache the pty thread refreshes once a second for
+    /// panes that produced output, so it lags a `cd` by up to a second and is `None` until the
+    /// first refresh. `Event::CwdChanged` is the push complement; this is the snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_cwd: Option<String>,
+    /// The pid of the process zellij started in this pane, if known
+    ///
+    /// Terminal panes only, and it is the pane's own child - the shell, not whatever the shell is
+    /// running. Walk down from it (`/proc/<pid>/task/<pid>/children` or the process table) to find
+    /// a tool running inside the pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_pid: Option<u32>,
+    /// The command running in this pane, if known, as a snapshot
+    ///
+    /// The foreground command when there is one, otherwise the pane's shell. Refreshed on the same
+    /// once-a-second cache as `pane_cwd`. `Event::CommandChanged` is the push complement, and is
+    /// the one to subscribe to for changes - this field exists so a consumer that has just started
+    /// does not have to wait for a command to change before it knows what is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_command: Option<String>,
+    /// When this pane last emitted output, in milliseconds since the Unix epoch
+    ///
+    /// Terminal panes only, and it means bytes arriving from the pty - not a human typing, not the
+    /// pane being focused. `None` for a pane that has produced nothing since the server started.
+    ///
+    /// It is the cheapest liveness signal there is: "is this pane still working" answered without
+    /// reading a single cell of its content. Nothing pushes on output alone, so a consumer sees it
+    /// move on the once-a-second session tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
+    /// Whether this pane has a bell nobody has looked at yet
+    ///
+    /// A pane that rings the terminal bell while it is not focused latches this until a client
+    /// focuses it. It is recorded whether or not anyone is attached, so it is readable from a
+    /// detached session - which is where "this pane wants attention" is worth knowing.
+    ///
+    /// The `title` field carries a ` [!]` suffix for the same condition; read this instead, and
+    /// leave `title` to display. Always `false` when `visual_bell` is off in the configuration:
+    /// with no visual notification there is no per-pane bell state to report.
+    #[serde(default)]
+    pub has_pending_bell: bool,
+    /// Environment variables from this pane's processes, as `report_pane_env` allows
+    ///
+    /// Empty unless the configuration names variables to report, which it does not by default -
+    /// an environment holds secrets, so nothing is reported that was not asked for by exact name.
+    ///
+    /// A value is looked for on the pane's own child and then its descendants, nearest first, so a
+    /// tool running inside the pane's shell answers for a name they both export. Terminal panes
+    /// only, and refreshed on the same once-a-second tick as `pane_cwd`.
+    ///
+    /// Unlike every other field here it is not written to `session-metadata.kdl`, so it is empty
+    /// for a session other than the one reporting it - read it from the session that owns the pane.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pane_env: BTreeMap<String, String>,
+    /// Whether the program in this pane is drawing on the alternate screen
+    ///
+    /// True while a full-screen program (an editor, a pager, a TUI) owns the pane, false for a
+    /// shell sitting at a prompt. Always `false` for plugin panes. It is the cheapest way to tell
+    /// "something interactive is running here" from "this pane is waiting for a command", and it
+    /// is also the reason a pane's scrollback stops growing.
+    #[serde(default)]
+    pub is_alternate_screen: bool,
+    /// How far this pane is scrolled back from the bottom, in lines
+    ///
+    /// `0` means the pane is at the bottom, showing the newest output. Terminal panes only; plugin
+    /// panes report `0`.
+    #[serde(default)]
+    pub scrollback_position: usize,
+    /// How many lines this pane's scrollback holds
+    ///
+    /// The lines above the viewport plus the lines below it, i.e. what `scrollback_position` can
+    /// move through. Terminal panes only; plugin panes report `0`.
+    #[serde(default)]
+    pub scrollback_length: usize,
+    /// Whether this floating pane is pinned above the tiled layer ("always on top")
+    ///
+    /// Only floating panes can be pinned; a tiled pane always reports `false`.
+    #[serde(default)]
+    pub is_pinned: bool,
+    /// The pane's position in the layout that placed it, if it came from one
+    ///
+    /// It survives resizing and reordering, so it is how a pane is matched back to the layout node
+    /// that created it. `None` for a pane that was not placed by a layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_position: Option<usize>,
+    /// Whether this pane is drawn without a frame
+    ///
+    /// Set by a layout (`borderless true`) or by the pane being created borderless. A borderless
+    /// pane has no title bar, so a consumer rendering its own UI knows the pane shows no title.
+    #[serde(default)]
+    pub is_borderless: bool,
+    /// Whether this pane is left out when the tab syncs input to all its panes
+    #[serde(default)]
+    pub exclude_from_sync: bool,
+    /// Whether a human named this pane
+    ///
+    /// `title` is the pane's display title whatever its source - the program's own title, the
+    /// default `Pane #n`, or a name someone typed. This says the last of those is what `title`
+    /// holds, which `title` and `program_title` together cannot answer.
+    #[serde(default)]
+    pub has_explicit_title: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -2416,12 +2549,6 @@ pub struct PaneListEntry {
     pub tab_id: usize,
     pub tab_position: usize,
     pub tab_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_pid: Option<i32>,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;

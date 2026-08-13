@@ -10,7 +10,7 @@ pub struct EventNameList {
 pub struct Event {
     #[prost(enumeration="EventType", tag="1")]
     pub name: i32,
-    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43, 44, 45")]
+    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48")]
     pub payload: ::core::option::Option<event::Payload>,
 }
 /// Nested message and enum types in `Event`.
@@ -104,6 +104,12 @@ pub mod event {
         ListSnapshotsPayload(super::ListSnapshotsPayload),
         #[prost(message, tag="45")]
         SnapshotRestoreFailedPayload(super::SnapshotRestoreFailedPayload),
+        #[prost(message, tag="46")]
+        PaneOpenedPayload(super::PaneOpenedPayload),
+        #[prost(message, tag="47")]
+        PaneExitedPayload(super::PaneExitedPayload),
+        #[prost(message, tag="48")]
+        PluginDiedPayload(super::PluginDiedPayload),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -298,6 +304,28 @@ pub struct CommandPaneReRunPayload {
 pub struct PaneClosedPayload {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneOpenedPayload {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneExitedPayload {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+    #[prost(int32, optional, tag="2")]
+    pub exit_status: ::core::option::Option<i32>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PluginDiedPayload {
+    #[prost(uint32, tag="1")]
+    pub plugin_id: u32,
+    #[prost(string, tag="2")]
+    pub message: ::prost::alloc::string::String,
 }
 /// duplicate of plugin_command.PaneId because protobuffs don't like recursive imports
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -693,6 +721,42 @@ pub struct PaneInfo {
     pub uuid: ::prost::alloc::string::String,
     #[prost(string, tag="31")]
     pub restored_from: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="32")]
+    pub pane_cwd: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag="33")]
+    pub pane_pid: ::core::option::Option<u32>,
+    #[prost(string, optional, tag="34")]
+    pub pane_command: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag="35")]
+    pub last_output_at: ::core::option::Option<u64>,
+    #[prost(bool, tag="36")]
+    pub has_pending_bell: bool,
+    #[prost(message, repeated, tag="37")]
+    pub pane_env: ::prost::alloc::vec::Vec<PaneEnvVar>,
+    #[prost(bool, tag="38")]
+    pub is_alternate_screen: bool,
+    #[prost(uint32, tag="39")]
+    pub scrollback_position: u32,
+    #[prost(uint32, tag="40")]
+    pub scrollback_length: u32,
+    #[prost(bool, tag="41")]
+    pub is_pinned: bool,
+    #[prost(uint32, optional, tag="42")]
+    pub logical_position: ::core::option::Option<u32>,
+    #[prost(bool, tag="43")]
+    pub is_borderless: bool,
+    #[prost(bool, tag="44")]
+    pub exclude_from_sync: bool,
+    #[prost(bool, tag="45")]
+    pub has_explicit_title: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PaneEnvVar {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -975,6 +1039,9 @@ pub enum EventType {
     ActivePaneScroll = 49,
     ListSnapshots = 50,
     SnapshotRestoreFailed = 51,
+    PaneOpened = 52,
+    PaneExited = 53,
+    PluginDied = 54,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1033,6 +1100,9 @@ impl EventType {
             EventType::ActivePaneScroll => "ActivePaneScroll",
             EventType::ListSnapshots => "ListSnapshots",
             EventType::SnapshotRestoreFailed => "SnapshotRestoreFailed",
+            EventType::PaneOpened => "PaneOpened",
+            EventType::PaneExited => "PaneExited",
+            EventType::PluginDied => "PluginDied",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1088,6 +1158,9 @@ impl EventType {
             "ActivePaneScroll" => Some(Self::ActivePaneScroll),
             "ListSnapshots" => Some(Self::ListSnapshots),
             "SnapshotRestoreFailed" => Some(Self::SnapshotRestoreFailed),
+            "PaneOpened" => Some(Self::PaneOpened),
+            "PaneExited" => Some(Self::PaneExited),
+            "PluginDied" => Some(Self::PluginDied),
             _ => None,
         }
     }
