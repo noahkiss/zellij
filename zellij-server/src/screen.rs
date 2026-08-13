@@ -5057,9 +5057,9 @@ impl Screen {
             }
             plugin_tab_updates.sort_by(|a, b| a.position.cmp(&b.position));
             let target_plugin_ids = if tab_structure_changed {
-                self.all_tab_plugin_ids(*client_id, EventType::TabUpdate)
+                self.all_tab_plugin_ids()
             } else {
-                self.targeted_plugin_ids(*client_id, EventType::TabUpdate)
+                self.active_tab_plugin_ids(*client_id)
             };
             for plugin_id in target_plugin_ids {
                 plugin_updates.push((
@@ -5068,6 +5068,21 @@ impl Screen {
                     Event::TabUpdate(plugin_tab_updates.clone()),
                 ));
             }
+        }
+        // Background plugins get the client-independent tab state once per change, whether or not
+        // any client is attached. The per-client payload above is relative to a client's active
+        // tab and so cannot be reused here, and the tab-list-changed arm above never reaches them
+        // because they live in no tab - so this stays one delivery either way.
+        let background_tab_updates: Vec<TabInfo> =
+            tab_infos_for_screen_state.values().cloned().collect();
+        for (plugin_id, plugin_client_id) in
+            self.background_plugin_ids_subscribed_to(EventType::TabUpdate)
+        {
+            plugin_updates.push((
+                Some(plugin_id),
+                Some(plugin_client_id),
+                Event::TabUpdate(background_tab_updates.clone()),
+            ));
         }
 
         self.bus
@@ -5084,7 +5099,7 @@ impl Screen {
         let mut plugin_updates = vec![];
         let client_ids: Vec<ClientId> = self.active_tab_ids.keys().copied().collect();
         for client_id in client_ids {
-            let target_plugin_ids = self.targeted_plugin_ids(client_id, EventType::PaneUpdate);
+            let target_plugin_ids = self.active_tab_plugin_ids(client_id);
             for plugin_id in target_plugin_ids {
                 plugin_updates.push((
                     Some(plugin_id),
@@ -5092,6 +5107,17 @@ impl Screen {
                     Event::PaneUpdate(pane_manifest.clone()),
                 ));
             }
+        }
+        // Background plugins get the manifest once per change, whether or not any client is
+        // attached, rather than once per connected client.
+        for (plugin_id, plugin_client_id) in
+            self.background_plugin_ids_subscribed_to(EventType::PaneUpdate)
+        {
+            plugin_updates.push((
+                Some(plugin_id),
+                Some(plugin_client_id),
+                Event::PaneUpdate(pane_manifest.clone()),
+            ));
         }
         if !plugin_updates.is_empty() {
             self.bus
@@ -5883,9 +5909,6 @@ impl Screen {
         }
         Ok(())
     }
-    /// Collect plugin IDs that should receive a broadcast event for a given client.
-    /// Returns plugin IDs from the client's active tab plus background plugins
-    /// subscribed to the given event type.
     /// The tab list as a plugin drawing a tab bar sees it: one entry per tab, id, position, name.
     ///
     /// Deliberately excludes which tab is active and everything else that changes while the tabs
@@ -5897,12 +5920,11 @@ impl Screen {
             .map(|tab| (tab.id, tab.position, tab.name.clone()))
             .collect()
     }
-    /// Every tab's plugins, plus the background plugins `targeted_plugin_ids` would have picked.
-    ///
-    /// For the events where the tabs a user is NOT looking at have to be right the moment they
-    /// become visible - which is only the ones that change the tab list itself.
-    fn all_tab_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
-        let mut plugin_ids = self.targeted_plugin_ids(client_id, event_type);
+    /// Every tab's plugins, for the events where the tabs a user is NOT looking at have to be
+    /// right the moment they become visible - which is only the ones that change the tab list
+    /// itself. Holds no background plugins: those have no tab, and are served client-independently.
+    fn all_tab_plugin_ids(&self) -> Vec<PluginId> {
+        let mut plugin_ids = Vec::new();
         for tab in self.tabs.values() {
             for plugin_id in tab.get_plugin_ids() {
                 if !plugin_ids.contains(&plugin_id) {
@@ -5912,14 +5934,37 @@ impl Screen {
         }
         plugin_ids
     }
-    fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
+    /// Collect the plugin IDs living in a client's active tab.
+    fn active_tab_plugin_ids(&self, client_id: ClientId) -> Vec<PluginId> {
         let mut plugin_ids = Vec::new();
-        // Active-tab plugins
         if let Some(active_tab_id) = self.active_tab_ids.get(&client_id) {
             if let Some(tab) = self.tabs.get(active_tab_id) {
                 plugin_ids.extend(tab.get_plugin_ids());
             }
         }
+        plugin_ids
+    }
+    /// Collect the background plugins subscribed to an event type, client-independently.
+    ///
+    /// A background plugin has no client of its own: the ClientId in the key is the id it was
+    /// loaded with, which the plugin map needs in order to address the instance. That client may
+    /// have detached long ago, or the id may since have been recycled to an unrelated client, so
+    /// it must never be used to decide *whether* to deliver - only where to deliver to.
+    fn background_plugin_ids_subscribed_to(
+        &self,
+        event_type: EventType,
+    ) -> Vec<(PluginId, ClientId)> {
+        self.background_plugin_subscriptions
+            .iter()
+            .filter(|(_, subs)| subs.contains(&event_type))
+            .map(|((bg_pid, bg_cid), _)| (*bg_pid, *bg_cid))
+            .collect()
+    }
+    /// Collect plugin IDs that should receive a broadcast event for a given client.
+    /// Returns plugin IDs from the client's active tab plus background plugins
+    /// subscribed to the given event type.
+    fn targeted_plugin_ids(&self, client_id: ClientId, event_type: EventType) -> Vec<PluginId> {
+        let mut plugin_ids = self.active_tab_plugin_ids(client_id);
         // Background plugins subscribed to this event type
         for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
             if subs.contains(&event_type) && *bg_cid == client_id {
