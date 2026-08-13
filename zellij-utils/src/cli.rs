@@ -1355,13 +1355,17 @@ pub enum CliAction {
     },
     /// Go to tab with name [name]
     ///
-    /// Returns: When --create is used and tab is created, outputs the tab ID as a single number
+    /// Prints the tab's ID as a single number on stdout when the tab exists or --create makes it.
+    /// With --no-focus and without --create this is an existence probe: the exit code is 0 either
+    /// way, and stdout is the answer - a tab ID if the tab is there, nothing at all if it is not.
     GoToTabName {
         name: String,
         /// Create a tab if one does not exist.
         #[clap(short, long, value_parser)]
         create: bool,
-        /// Leave focus where it is, whether the tab already existed or was just created
+        /// Leave focus where it is, whether the tab already existed or was just created.
+        /// Without --create, read stdout for the answer: a tab ID means it exists, empty means it
+        /// does not. The exit code stays 0 for both.
         #[clap(long, value_parser)]
         no_focus: bool,
     },
@@ -1749,8 +1753,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Set whether a pane is fullscreen, rather than toggling it
     ///
-    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
-    /// exist prints the reason on stderr and exits non-zero.
+    /// Exits 0 if the state changed and 2 if it did not - both when the pane was already so and
+    /// when the pane does not exist. Only the failure prints a reason on stderr, so read stderr to
+    /// tell the two apart.
     SetFullscreen {
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
@@ -1761,8 +1766,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Set whether a floating pane is pinned on top, rather than toggling it
     ///
-    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
-    /// exist prints the reason on stderr and exits non-zero.
+    /// Exits 0 if the state changed and 2 if it did not - both when the pane was already so and
+    /// when the pane does not exist. Only the failure prints a reason on stderr, so read stderr to
+    /// tell the two apart.
     SetPanePinned {
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
@@ -1773,9 +1779,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Set whether a pane floats or is embedded, rather than toggling it
     ///
-    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
-    /// exist, or a move the layout refuses (the last tiled pane cannot float), prints the reason
-    /// on stderr and exits non-zero.
+    /// Exits 0 if the state changed and 2 if it did not - when the pane was already so, when the
+    /// pane does not exist, and when the layout refuses the move (the last tiled pane cannot
+    /// float). Only the failures print a reason on stderr, so read stderr to tell them apart.
     SetPaneFloating {
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
@@ -1786,8 +1792,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Set whether input is synchronised across a tab's panes, rather than toggling it
     ///
-    /// Returns exit code 0 if the state changed, 2 if it was already so. A tab that does not
-    /// exist prints the reason on stderr and exits non-zero.
+    /// Exits 0 if the state changed and 2 if it did not - both when the tab was already so and
+    /// when the tab does not exist. Only the failure prints a reason on stderr, so read stderr to
+    /// tell the two apart.
     SetSyncTab {
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]

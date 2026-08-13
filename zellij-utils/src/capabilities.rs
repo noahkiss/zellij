@@ -65,11 +65,14 @@ pub const CAPABILITIES: &[&str] = &[
     "go-to-tab-name-no-focus", // zellij action go-to-tab-name --create --no-focus
     "new-pane-stacked-error", // --stacked refuses instead of creating nothing
     "dump-screen-plugin-panes", // dump-screen works on plugin panes
+    "cli-error-reporting", // a missed target or a timed-out action exits non-zero and says why on stderr
     // plugin development loop
-    "plugin-watch",       // plugin_watch, hot-reload of file: plugins
-    "plugin-permissions", // plugin_permissions in config.kdl
-    "builtin-plugin-dir", // builtin_plugin_dir, a builtin loaded from disk
-    "builtin-slim-bars",  // zellij:slim-tab-bar, zellij:slim-keybinds
+    "plugin-watch",               // plugin_watch, hot-reload of file: plugins
+    "plugin-permissions",         // plugin_permissions in config.kdl
+    "builtin-plugin-dir",         // builtin_plugin_dir, a builtin loaded from disk
+    "builtin-slim-bars",          // zellij:slim-tab-bar, zellij:slim-keybinds
+    "background-plugin-dispatch", // a background plugin gets updates with no client attached
+    "web-request-timeout", // web_request times out, and reports the kind in x-zellij-error-kind
     // configuration this fork adds
     "config-path-expansion",   // ~ and $VAR in config paths
     "terminal-title-template", // terminal_title_template, session_aliases

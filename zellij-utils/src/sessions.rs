@@ -370,11 +370,13 @@ pub fn print_sessions(
     // (session_name, timestamp, is_dead)
     let curr_session = envs::get_session_name().unwrap_or_else(|_| "".into());
     sessions.sort_by(|a, b| {
+        // the age is truncated to whole seconds, so sessions made in the same second tie. Break
+        // the tie on the name, or the listing reorders itself between two runs
         if reverse {
             // sort by `Duration` ascending (newest would be first)
-            a.1.cmp(&b.1)
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
         } else {
-            b.1.cmp(&a.1)
+            b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
         }
     });
     sessions
@@ -770,10 +772,12 @@ pub fn session_list_entries(
 ) -> Vec<SessionListEntry> {
     let mut sessions = sessions;
     sessions.sort_by(|a, b| {
+        // same tie-break as the human listing: the age is whole seconds, and the names arrive out
+        // of a HashMap, so without this two same-second sessions swap places between runs
         if reverse {
-            a.1.cmp(&b.1)
+            a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
         } else {
-            b.1.cmp(&a.1)
+            b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
         }
     });
     sessions
@@ -1393,5 +1397,25 @@ mod tests {
         };
         assert_eq!(names(false), vec!["old", "new"]);
         assert_eq!(names(true), vec!["new", "old"]);
+    }
+
+    #[test]
+    fn sessions_of_the_same_age_are_ordered_by_name() {
+        // the age is whole seconds, so sessions made in the same second tie. The names arrive out
+        // of a HashMap, so without a tie-break the listing reorders itself between runs
+        let same_second = Duration::from_secs(42);
+        let sessions = vec![
+            ("charlie".to_string(), same_second, false),
+            ("alpha".to_string(), same_second, false),
+            ("bravo".to_string(), same_second, false),
+        ];
+        let names = |reverse| {
+            session_list_entries(sessions.clone(), "", &BTreeMap::new(), reverse)
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false), vec!["alpha", "bravo", "charlie"]);
+        assert_eq!(names(true), vec!["alpha", "bravo", "charlie"]);
     }
 }

@@ -5019,11 +5019,8 @@ pub fn breaking_panes_to_a_tab_index_reports_a_missing_pane() {
             client_id: 1,
             completion_tx: Some(crate::route::NotificationEnd::new(completion_tx)),
         });
-    let result = crate::route::wait_for_action_completion(
-        completion_rx,
-        "BreakPanesToTabWithIndex",
-        false,
-    );
+    let result =
+        crate::route::wait_for_action_completion(completion_rx, "BreakPanesToTabWithIndex", false);
     mock_screen.teardown(vec![screen_thread]);
     assert_eq!(result.exit_status, Some(1));
     assert!(
