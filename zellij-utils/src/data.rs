@@ -2458,6 +2458,9 @@ pub struct PaneInfo {
     /// A value is looked for on the pane's own child and then its descendants, nearest first, so a
     /// tool running inside the pane's shell answers for a name they both export. Terminal panes
     /// only, and refreshed on the same once-a-second tick as `pane_cwd`.
+    ///
+    /// Unlike every other field here it is not written to `session-metadata.kdl`, so it is empty
+    /// for a session other than the one reporting it - read it from the session that owns the pane.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pane_env: BTreeMap<String, String>,
 }

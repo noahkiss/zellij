@@ -210,8 +210,8 @@ these fields for the state of the world when a consumer starts, which is what an
 tell it. The stamped values follow the pty ticker, so they lag a `cd` by up to a second.
 
 The fields cross the plugin API, so `event.proto` and its generated Rust are regenerated
-(`cargo xtask proto`), taking tags 32-34. `session-metadata.kdl` does not carry them, so a peer
-session read through that codec reports them as absent — the same limit the identity fields have.
+(`cargo xtask proto`), taking tags 32-34. They also round-trip through `session-metadata.kdl`, so a
+plugin reading a peer session gets them too.
 
 ### `last_output_at`: when a pane last produced output
 
@@ -282,6 +282,11 @@ running inside the pane's shell answers for a name they both export. That walk i
 Cost: nothing at all with the list unset, which is the default. With it set, the pty thread reads
 the process table once per second — once for the tick, not once per pane — and one environment per
 process it walks, stopping as soon as every named variable is found.
+
+`pane_env` is the one new field that does **not** round-trip through `session-metadata.kdl`. Putting
+it on the event path is something a configuration opted into; writing the values into a file every
+session on the box can read, and which outlives the server, is a different exposure and was not.
+A peer session therefore reports an empty `pane_env` — read it from the session that owns the pane.
 
 Proto tag 37.
 

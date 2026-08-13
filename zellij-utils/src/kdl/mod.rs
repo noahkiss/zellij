@@ -7309,15 +7309,20 @@ impl PaneInfo {
         let stack_id = optional_int_node!("stack_id", usize);
         let index_in_stack = optional_int_node!("index_in_stack", usize);
         let is_expanded_in_stack = optional_bool_node!("is_expanded_in_stack").unwrap_or(false);
+        let pane_cwd = optional_string_node!("pane_cwd");
+        let pane_pid = optional_int_node!("pane_pid", u32);
+        let pane_command = optional_string_node!("pane_command");
+        let last_output_at = optional_int_node!("last_output_at", u64);
+        let has_pending_bell = optional_bool_node!("has_pending_bell").unwrap_or(false);
 
         let pane_info = PaneInfo {
             restored_from,
-            // not carried by `session-metadata.kdl` - see the note on `encode_to_kdl`
-            pane_cwd: None,
-            pane_pid: None,
-            pane_command: None,
-            last_output_at: None,
-            has_pending_bell: false,
+            pane_cwd,
+            pane_pid,
+            pane_command,
+            last_output_at,
+            has_pending_bell,
+            // deliberately not carried - see the note on `encode_to_kdl`
             pane_env: Default::default(),
             id,
             is_plugin,
@@ -7434,6 +7439,29 @@ impl PaneInfo {
         }
         if self.is_expanded_in_stack {
             bool_node!("is_expanded_in_stack", self.is_expanded_in_stack);
+        }
+        // what the pane is running, and when it last said anything - the same rule again, written
+        // only when there is something to write, so a saved layout's panes are unchanged
+        //
+        // `pane_env` is deliberately absent. Reporting it on the event path is something a
+        // configuration opted into; writing those values into a file on disk, which every session
+        // on the box can read and which outlives the server, is a different exposure and was not
+        // asked for. A peer session's `pane_env` is therefore always empty - read it from the
+        // session that owns the pane.
+        if let Some(pane_cwd) = &self.pane_cwd {
+            string_node!("pane_cwd", pane_cwd.to_string());
+        }
+        if let Some(pane_pid) = self.pane_pid {
+            int_node!("pane_pid", pane_pid);
+        }
+        if let Some(pane_command) = &self.pane_command {
+            string_node!("pane_command", pane_command.to_string());
+        }
+        if let Some(last_output_at) = self.last_output_at {
+            int_node!("last_output_at", last_output_at);
+        }
+        if self.has_pending_bell {
+            bool_node!("has_pending_bell", self.has_pending_bell);
         }
         kdl_doucment
     }
@@ -7689,6 +7717,68 @@ fn session_info_round_trip_keeps_pane_identity_and_stack_fields() {
     assert_eq!(round_tripped_pane.index_in_stack, pane.index_in_stack);
     assert!(round_tripped_pane.is_expanded_in_stack);
     assert!(deserialized.tabs[0].has_bell_notification);
+}
+
+#[test]
+fn session_info_round_trip_keeps_the_process_and_activity_fields() {
+    let pane = PaneInfo {
+        id: 3,
+        title: "a pane".to_owned(),
+        pane_cwd: Some("/home/user/develop/thing".to_owned()),
+        pane_pid: Some(90210),
+        pane_command: Some("claude --resume".to_owned()),
+        last_output_at: Some(1_760_000_000_000),
+        has_pending_bell: true,
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane.clone()]);
+    let session_info = SessionInfo {
+        name: "process session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+
+    let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
+    assert_eq!(round_tripped_pane.pane_cwd, pane.pane_cwd);
+    assert_eq!(round_tripped_pane.pane_pid, pane.pane_pid);
+    assert_eq!(round_tripped_pane.pane_command, pane.pane_command);
+    assert_eq!(round_tripped_pane.last_output_at, pane.last_output_at);
+    assert!(round_tripped_pane.has_pending_bell);
+}
+
+/// Reporting an environment variable on the event path was opted into. Writing it to a file every
+/// session on the box can read, and which outlives the server, was not.
+#[test]
+fn session_metadata_never_carries_the_pane_environment() {
+    let pane = PaneInfo {
+        id: 3,
+        pane_env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    let mut panes = HashMap::new();
+    panes.insert(0, vec![pane]);
+    let session_info = SessionInfo {
+        name: "env session".to_owned(),
+        panes: PaneManifest { panes },
+        ..Default::default()
+    };
+    let serialized = session_info.to_string();
+    assert!(
+        !serialized.contains("abc-123") && !serialized.contains("CLAUDE_CODE_SESSION_ID"),
+        "the environment must not reach session metadata: {}",
+        serialized
+    );
+
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert!(deserialized.panes.panes.get(&0).unwrap()[0]
+        .pane_env
+        .is_empty());
 }
 
 #[test]
