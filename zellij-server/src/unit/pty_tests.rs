@@ -22,6 +22,8 @@ struct MockOsApi {
     cmds_by_ppid: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// the callback the pty thread hands to a spawn, kept so a test can make the process exit
     quit_cb: Arc<Mutex<Option<QuitCb>>>,
+    /// Every signal this api was asked to deliver, as (pid, signal name).
+    signals: Arc<Mutex<Vec<(u32, &'static str)>>>,
 }
 
 impl MockOsApi {
@@ -31,6 +33,7 @@ impl MockOsApi {
             cmds: Arc::new(Mutex::new(HashMap::new())),
             cmds_by_ppid: Arc::new(Mutex::new(HashMap::new())),
             quit_cb: Arc::new(Mutex::new(None)),
+            signals: Arc::new(Mutex::new(Vec::new())),
         }
     }
     /// Make the process behind the last spawned pane exit with this status.
@@ -40,6 +43,9 @@ impl MockOsApi {
             .as_ref()
             .expect("the pty thread should have handed us a quit callback");
         quit_cb(pane_id, exit_status, RunCommand::default());
+    }
+    fn signals_sent(&self) -> Vec<(u32, &'static str)> {
+        self.signals.lock().unwrap().clone()
     }
     fn set_cwd(&self, pid: u32, path: PathBuf) {
         self.cwds.lock().unwrap().insert(pid, path);
@@ -88,13 +94,16 @@ impl ServerOsApi for MockOsApi {
     fn tcdrain(&self, _: u32) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill(&self, _: u32) -> anyhow::Result<()> {
+    fn kill(&self, pid: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push((pid, "HUP"));
         Ok(())
     }
-    fn force_kill(&self, _: u32) -> anyhow::Result<()> {
+    fn force_kill(&self, pid: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push((pid, "KILL"));
         Ok(())
     }
-    fn send_sigint(&self, _: u32) -> anyhow::Result<()> {
+    fn send_sigint(&self, pid: u32) -> anyhow::Result<()> {
+        self.signals.lock().unwrap().push((pid, "INT"));
         Ok(())
     }
     fn box_clone(&self) -> Box<dyn ServerOsApi> {
@@ -184,6 +193,46 @@ fn make_pty_with_plugin_receiver(
     bus.senders.to_plugin = Some(plugin_sender);
     let pty = Pty::new(bus, false, None, None, None, None);
     (pty, plugin_rx)
+}
+
+/// A pty whose own instruction channel a test can read, to see what a quit callback sent back.
+fn make_pty_with_pty_receiver(
+    mock: MockOsApi,
+) -> (Pty, channels::Receiver<(PtyInstruction, ErrorContext)>) {
+    let (plugin_tx, _plugin_rx) = channels::unbounded();
+    let (pty_tx, pty_rx) = channels::unbounded();
+    let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    bus.os_input = Some(Box::new(mock));
+    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
+    bus.senders.to_pty = Some(SenderWithContext::new(pty_tx));
+    let pty = Pty::new(bus, false, None, None, None, None);
+    (pty, pty_rx)
+}
+
+/// A pty whose screen channel a test can read, to see what each tick told Screen.
+fn make_pty_with_screen_receiver(
+    mock: MockOsApi,
+) -> (Pty, channels::Receiver<(ScreenInstruction, ErrorContext)>) {
+    let (plugin_tx, _plugin_rx) = channels::unbounded();
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    bus.os_input = Some(Box::new(mock));
+    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
+    bus.senders.to_screen = Some(SenderWithContext::new(screen_tx));
+    let pty = Pty::new(bus, false, None, None, None, None);
+    (pty, screen_rx)
+}
+
+fn collect_process_info_reports(
+    rx: &channels::Receiver<(ScreenInstruction, ErrorContext)>,
+) -> Vec<HashMap<u32, PaneProcessInfo>> {
+    let mut reports = Vec::new();
+    while let Ok((instruction, _)) = rx.try_recv() {
+        if let ScreenInstruction::UpdatePaneProcessInfo(process_info) = instruction {
+            reports.push(process_info);
+        }
+    }
+    reports
 }
 
 fn set_active_terminal(pty: &mut Pty, terminal_id: u32, child_pid: u32) {
@@ -608,4 +657,157 @@ fn a_pane_killed_by_a_signal_broadcasts_no_exit_status() {
 
     let events = collect_pane_exited_events(&rx);
     assert_eq!(events, vec![(PaneId::Terminal(1), None)]);
+}
+
+#[test]
+fn each_signal_reaches_the_pane_process() {
+    for (signal, expected) in [
+        (PaneSignal::Int, "INT"),
+        (PaneSignal::Hup, "HUP"),
+        (PaneSignal::Kill, "KILL"),
+    ] {
+        let mock = MockOsApi::new();
+        let recorder = mock.clone();
+        let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+        set_active_terminal(&mut pty, 1, 4242);
+
+        pty.signal_pane(PaneId::Terminal(1), signal).expect("TEST");
+        assert_eq!(recorder.signals_sent(), vec![(4242, expected)]);
+    }
+}
+
+/// The pid of a reaped child is the OS's to hand out again, so a pane that outlives its command
+/// must not keep it: signalling it would hit whatever process holds that number now.
+#[test]
+fn a_held_pane_forgets_the_pid_of_its_reaped_child() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, pty_rx) = make_pty_with_pty_receiver(mock.clone());
+    let held_command = RunCommand {
+        command: PathBuf::from("/bin/does-not-matter"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(held_command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .expect("the mock spawns a terminal");
+    assert_eq!(
+        pty.id_to_child_pid.get(&1).copied(),
+        Some(100),
+        "the running pane has a pid"
+    );
+
+    mock.exit_last_spawned_pane(PaneId::Terminal(1), Some(0));
+
+    // the reaping thread owns none of the pty thread's state, so it asks the pty thread to forget
+    let mut forgotten = vec![];
+    while let Ok((instruction, _)) = pty_rx.try_recv() {
+        if let PtyInstruction::ChildProcessExited(terminal_id) = instruction {
+            forgotten.push(terminal_id);
+        }
+    }
+    assert_eq!(
+        forgotten,
+        vec![1],
+        "a held pane's exit should tell the pty thread to forget the child pid"
+    );
+    for terminal_id in forgotten {
+        pty.forget_child_pid(terminal_id);
+    }
+
+    assert!(
+        pty.id_to_child_pid.get(&1).is_none(),
+        "a held pane holds no pid"
+    );
+    match pty.get_pane_pid(PaneId::Terminal(1)) {
+        GetPanePidResponse::Err(_) => {},
+        other => panic!("a held pane should report no pid, got {:?}", other),
+    }
+    let result = pty.signal_pane(PaneId::Terminal(1), PaneSignal::Kill);
+    assert!(
+        result.unwrap_err().contains("no running process"),
+        "signalling a held pane should say there is no process, not signal a recycled pid"
+    );
+    assert!(
+        recorder.signals_sent().is_empty(),
+        "nothing should have been signalled"
+    );
+}
+
+#[test]
+fn signalling_a_pane_that_does_not_exist_is_an_error() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, 4242);
+
+    let result = pty.signal_pane(PaneId::Terminal(7), PaneSignal::Int);
+    assert!(result.is_err(), "no pane 7");
+    assert!(
+        result.unwrap_err().contains("no running process"),
+        "the error names the miss"
+    );
+    assert!(
+        recorder.signals_sent().is_empty(),
+        "and nothing was signalled"
+    );
+}
+
+#[test]
+fn a_plugin_pane_has_no_process_to_signal() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    set_active_terminal(&mut pty, 1, 4242);
+
+    let result = pty.signal_pane(PaneId::Plugin(1), PaneSignal::Kill);
+    assert!(result.is_err(), "a plugin pane runs no process");
+    assert!(recorder.signals_sent().is_empty());
+}
+
+/// An idle session should not wake the screen thread once a second to tell it nothing.
+#[test]
+fn an_unchanged_process_info_map_is_not_reported_again() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cmd(child_pid, vec!["/bin/bash".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp"));
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    pty.update_and_report_cwds();
+    let first = collect_process_info_reports(&screen_rx);
+    assert_eq!(first.len(), 1, "the first tick tells Screen what it found");
+
+    // nothing changed, and the pane produced no output
+    pty.update_and_report_cwds();
+    pty.update_and_report_cwds();
+    assert!(
+        collect_process_info_reports(&screen_rx).is_empty(),
+        "an unchanged map should not be sent again"
+    );
+
+    // the pane runs something new
+    mock.set_foreground_cmd(child_pid, vec!["vim".into()]);
+    pty.pane_activity_flags
+        .get(&1)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    let after_change = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        after_change.len(),
+        1,
+        "a changed map should reach Screen: {:?}",
+        after_change
+    );
+    assert_eq!(
+        after_change[0]
+            .get(&1)
+            .and_then(|info| info.command.clone()),
+        Some(vec!["vim".to_owned()])
+    );
 }

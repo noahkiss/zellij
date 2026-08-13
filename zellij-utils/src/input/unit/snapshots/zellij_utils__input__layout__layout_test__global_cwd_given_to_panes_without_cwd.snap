@@ -1,7 +1,6 @@
 ---
 source: zellij-utils/src/input/./unit/layout_test.rs
-assertion_line: 1732
-expression: "format!(\"{:#?}\", layout)"
+expression: "normalize_layout_debug(format!(\"{:#?}\", layout))"
 ---
 Layout {
     tabs: [
@@ -32,6 +31,7 @@ Layout {
                         pane_initial_contents: None,
                         default_fg: None,
                         default_bg: None,
+                        restored_from: None,
                     },
                     TiledPaneLayout {
                         children_split_direction: Horizontal,
@@ -64,6 +64,7 @@ Layout {
                         pane_initial_contents: None,
                         default_fg: None,
                         default_bg: None,
+                        restored_from: None,
                     },
                 ],
                 split_size: None,
@@ -83,6 +84,7 @@ Layout {
                 pane_initial_contents: None,
                 default_fg: None,
                 default_bg: None,
+                restored_from: None,
             },
             [],
         ),
@@ -115,6 +117,7 @@ Layout {
                         pane_initial_contents: None,
                         default_fg: None,
                         default_bg: None,
+                        restored_from: None,
                     },
                     TiledPaneLayout {
                         children_split_direction: Horizontal,
@@ -147,6 +150,7 @@ Layout {
                         pane_initial_contents: None,
                         default_fg: None,
                         default_bg: None,
+                        restored_from: None,
                     },
                 ],
                 split_size: None,
@@ -166,6 +170,7 @@ Layout {
                 pane_initial_contents: None,
                 default_fg: None,
                 default_bg: None,
+                restored_from: None,
             },
             [],
         ),

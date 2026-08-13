@@ -37,6 +37,57 @@ use crate::screen::ScreenInstruction;
 use crate::thread_bus::Bus;
 use crate::{ClientId, ServerInstruction};
 
+/// A stable name for a transport failure, reported in the `x-zellij-error-kind` header beside a
+/// `WEB_REQUEST_TRANSPORT_ERROR_STATUS` status. A retry policy needs "the host is unreachable"
+/// and "the request was malformed" to be different answers; string-matching the message is not
+/// one.
+fn web_request_error_kind(error: &isahc::Error) -> &'static str {
+    use isahc::error::ErrorKind;
+    match error.kind() {
+        ErrorKind::BadClientCertificate => "bad_client_certificate",
+        ErrorKind::BadServerCertificate => "bad_server_certificate",
+        ErrorKind::ClientInitialization => "client_initialization",
+        ErrorKind::ConnectionFailed => "connection_failed",
+        ErrorKind::InvalidContentEncoding => "invalid_content_encoding",
+        ErrorKind::InvalidCredentials => "invalid_credentials",
+        ErrorKind::InvalidRequest => "invalid_request",
+        ErrorKind::Io => "io",
+        ErrorKind::NameResolution => "name_resolution",
+        ErrorKind::ProtocolViolation => "protocol_violation",
+        ErrorKind::RequestBodyNotRewindable => "request_body_not_rewindable",
+        ErrorKind::Timeout => "timeout",
+        ErrorKind::TlsEngine => "tls_engine",
+        ErrorKind::TooManyRedirects => "too_many_redirects",
+        _ => "unknown",
+    }
+}
+
+/// The `WebRequestResult` for a request that never got an HTTP response.
+fn web_request_transport_error(error: &isahc::Error, context: BTreeMap<String, String>) -> Event {
+    web_request_transport_failure(web_request_error_kind(error), error.to_string(), context)
+}
+
+/// The `WebRequestResult` for a request that never got an HTTP response, from a failure that has
+/// no `isahc::Error` behind it. A plugin waits on its correlation entry until an answer arrives,
+/// so every web request has to produce one, however it failed.
+fn web_request_transport_failure(
+    error_kind: &str,
+    message: String,
+    context: BTreeMap<String, String>,
+) -> Event {
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        WEB_REQUEST_ERROR_KIND_HEADER.to_owned(),
+        error_kind.to_owned(),
+    );
+    Event::WebRequestResult(
+        WEB_REQUEST_TRANSPORT_ERROR_STATUS,
+        headers,
+        message.into_bytes(),
+        context,
+    )
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum BackgroundJob {
     DisplayPaneError(Vec<PaneId>, String),
@@ -129,6 +180,22 @@ static UPDATE_AND_REPORT_CWDS_INTERVAL_MS: u64 = 1000;
 /// been superseded. Slow on purpose: neither changes often, and both cost a syscall.
 static STATUS_NOTICES_INTERVAL_MS: u64 = 30_000;
 static DEFAULT_SERIALIZATION_INTERVAL: u64 = 60000;
+/// How long a plugin's `web_request` may take in total before the client gives up. Without it an
+/// endpoint that accepts the connection and never answers holds the task - and the plugin's
+/// correlation entry - forever.
+static WEB_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// The connect phase gets a shorter budget of its own, so an unreachable host fails fast instead
+/// of spending the whole request budget.
+static WEB_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// The status a `WebRequestResult` carries when no HTTP response was received at all. Real
+/// statuses start at 100, so a plugin can tell "the transport failed" from "the server answered
+/// and refused". The failure kind is in the `x-zellij-error-kind` header.
+pub const WEB_REQUEST_TRANSPORT_ERROR_STATUS: u16 = 0;
+/// The header naming the transport failure on a `WEB_REQUEST_TRANSPORT_ERROR_STATUS` result.
+pub const WEB_REQUEST_ERROR_KIND_HEADER: &str = "x-zellij-error-kind";
+/// The failure kind for a request that was never sent because the http client could not be built.
+/// It is a property of the session, not of the request, so retrying it will not help.
+pub const WEB_REQUEST_CLIENT_UNAVAILABLE_ERROR_KIND: &str = "client_unavailable";
 static REPAINT_DELAY_MS: u64 = 10;
 static HELP_TEXT_DEBOUNCE_DURATION: u64 = 5000;
 static COMMAND_OUTPUT_FLASH_DURATION_MS: u64 = 400;
@@ -180,7 +247,8 @@ pub(crate) fn background_jobs_main(
     let mut nested_guest_pings: HashMap<PaneId, Arc<AtomicBool>> = HashMap::new();
 
     let http_client = HttpClient::builder()
-        // TODO: timeout?
+        .timeout(Duration::from_secs(WEB_REQUEST_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(WEB_REQUEST_CONNECT_TIMEOUT_SECS))
         .redirect_policy(RedirectPolicy::Follow)
         .build()
         .ok();
@@ -427,6 +495,17 @@ pub(crate) fn background_jobs_main(
                         }
                         let Some(http_client) = http_client else {
                             log::error!("Cannot perform http request, likely due to a misconfigured http client");
+                            // the client failed to build once, at startup, so returning here
+                            // would hang every web request this session ever makes
+                            let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
+                                Some(plugin_id),
+                                Some(client_id),
+                                web_request_transport_failure(
+                                    WEB_REQUEST_CLIENT_UNAVAILABLE_ERROR_KIND,
+                                    "the http client could not be built".to_owned(),
+                                    context,
+                                ),
+                            )]));
                             return;
                         };
 
@@ -440,16 +519,13 @@ pub(crate) fn background_jobs_main(
                             },
                             Err(e) => {
                                 log::error!("Failed to send web request: {}", e);
-                                let error_body = e.to_string().as_bytes().to_vec();
+                                // no HTTP response was received, so there is no status to
+                                // report - synthesizing one would make "the host refused the
+                                // connection" indistinguishable from "the server answered 400"
                                 let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
                                     Some(plugin_id),
                                     Some(client_id),
-                                    Event::WebRequestResult(
-                                        400,
-                                        BTreeMap::new(),
-                                        error_body,
-                                        context,
-                                    ),
+                                    web_request_transport_error(&e, context),
                                 )]));
                             },
                         }
@@ -1052,5 +1128,75 @@ mod tests {
         for name in ["live-a", "live-b", "live-c"] {
             assert!(!resurrectable.contains_key(name));
         }
+    }
+}
+
+#[cfg(test)]
+mod web_request_tests {
+    use super::*;
+    use isahc::error::ErrorKind;
+
+    #[test]
+    fn transport_failure_is_not_reported_as_an_http_status() {
+        let error: isahc::Error = ErrorKind::ConnectionFailed.into();
+        let mut context = BTreeMap::new();
+        context.insert("correlation".to_owned(), "1".to_owned());
+        match web_request_transport_error(&error, context) {
+            Event::WebRequestResult(status, headers, _body, context) => {
+                assert_eq!(
+                    status, WEB_REQUEST_TRANSPORT_ERROR_STATUS,
+                    "a request that got no response must not carry an HTTP status"
+                );
+                assert_eq!(
+                    headers
+                        .get(WEB_REQUEST_ERROR_KIND_HEADER)
+                        .map(|s| s.as_str()),
+                    Some("connection_failed")
+                );
+                assert_eq!(context.get("correlation").map(|s| s.as_str()), Some("1"));
+            },
+            other => panic!("Expected a WebRequestResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unbuildable_http_client_answers_the_request_instead_of_hanging_it() {
+        // the plugin holds a correlation entry until an answer arrives, so a request that was
+        // never sent still has to produce one
+        let mut context = BTreeMap::new();
+        context.insert("correlation".to_owned(), "1".to_owned());
+        match web_request_transport_failure(
+            WEB_REQUEST_CLIENT_UNAVAILABLE_ERROR_KIND,
+            "the http client could not be built".to_owned(),
+            context,
+        ) {
+            Event::WebRequestResult(status, headers, _body, context) => {
+                assert_eq!(status, WEB_REQUEST_TRANSPORT_ERROR_STATUS);
+                assert_eq!(
+                    headers
+                        .get(WEB_REQUEST_ERROR_KIND_HEADER)
+                        .map(|s| s.as_str()),
+                    Some("client_unavailable")
+                );
+                assert_eq!(
+                    context.get("correlation").map(|s| s.as_str()),
+                    Some("1"),
+                    "the correlation must come back so the plugin can close its entry"
+                );
+            },
+            other => panic!("Expected a WebRequestResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn transport_failures_are_distinguishable_from_each_other() {
+        let refused: isahc::Error = ErrorKind::ConnectionFailed.into();
+        let timed_out: isahc::Error = ErrorKind::Timeout.into();
+        assert_eq!(web_request_error_kind(&refused), "connection_failed");
+        assert_eq!(web_request_error_kind(&timed_out), "timeout");
+        assert_ne!(
+            web_request_error_kind(&refused),
+            web_request_error_kind(&timed_out)
+        );
     }
 }

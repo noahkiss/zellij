@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_utils::common_path::common_path_all;
 use zellij_utils::pane_size::{PaneGeom, Size};
 use zellij_utils::{
-    data::{LayoutMetadata, PaneMetadata, TabMetadata},
+    data::{ClientInfo, LayoutMetadata, PaneMetadata, TabMetadata},
     input::command::RunCommand,
     input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
     input::plugins::PluginAliases,
@@ -70,6 +70,31 @@ impl SessionLayoutMetadata {
     }
     pub fn list_clients_metadata(&self) -> String {
         ClientMetadata::render_many(self.all_clients_metadata(), &self.default_editor)
+    }
+    /// The same client list as `list_clients_metadata`, as the `ClientInfo` array plugins already
+    /// receive in `Event::ListClients`.
+    ///
+    /// `requesting_client_id` marks `is_current_client`. A `zellij action` client is its own
+    /// short-lived client that is focused on no pane, so a CLI query marks no row.
+    pub fn list_clients_metadata_json(&self, requesting_client_id: ClientId) -> String {
+        let clients = self.client_infos(requesting_client_id);
+        serde_json::to_string_pretty(&clients).unwrap_or_else(|_| "[]".to_string())
+    }
+    /// Every client this layout knows about, in the shape `Event::ListClients` uses.
+    pub fn client_infos(&self, requesting_client_id: ClientId) -> Vec<ClientInfo> {
+        self.all_clients_metadata()
+            .into_iter()
+            .map(|(client_id, client_metadata)| {
+                ClientInfo::new(
+                    client_id,
+                    client_metadata.get_pane_id().into(),
+                    client_metadata.stringify_command(&self.default_editor),
+                    client_id == requesting_client_id,
+                )
+                .with_terminal_size(client_metadata.terminal_size())
+                .with_tty(client_metadata.tty())
+            })
+            .collect()
     }
     /// Record the terminal size of every attached client, keyed by client id.
     pub fn set_client_sizes(&mut self, client_sizes: BTreeMap<ClientId, Size>) {
@@ -609,6 +634,7 @@ impl Into<PaneLayoutManifest> for PaneLayoutMetadata {
             pane_contents: self.pane_contents,
             default_fg: self.default_fg,
             default_bg: self.default_bg,
+            pane_uuid: self.pane_uuid,
         }
     }
 }
@@ -635,6 +661,8 @@ pub struct PaneLayoutMetadata {
     focused_clients: Vec<ClientId>,
     default_fg: Option<String>,
     default_bg: Option<String>,
+    /// This pane's uuid, so a pane restored from the serialized layout can name what it continues.
+    pane_uuid: Option<String>,
 }
 
 impl PaneLayoutMetadata {
@@ -649,6 +677,7 @@ impl PaneLayoutMetadata {
         focused_clients: Vec<ClientId>,
         default_fg: Option<String>,
         default_bg: Option<String>,
+        pane_uuid: Option<String>,
     ) -> Self {
         PaneLayoutMetadata {
             id,
@@ -662,6 +691,7 @@ impl PaneLayoutMetadata {
             focused_clients,
             default_fg,
             default_bg,
+            pane_uuid,
         }
     }
     fn to_pane_metadata(&self) -> PaneMetadata {
@@ -767,6 +797,7 @@ impl ClientMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zellij_utils::data::PaneId as ZellijPaneId;
     use zellij_utils::pane_size::PaneGeom;
 
     fn make_command_pane(terminal_id: u32, command: &str, args: Vec<&str>) -> PaneLayoutMetadata {
@@ -781,6 +812,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             None,
             None,
         )
@@ -800,6 +832,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             None,
             None,
         )
@@ -1172,6 +1205,7 @@ mod tests {
             focused_clients,
             None,
             None,
+            None,
         )
     }
 
@@ -1236,6 +1270,40 @@ mod tests {
     }
 
     #[test]
+    fn json_client_list_carries_every_client() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+
+        let clients = meta.client_infos(2);
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].client_id, 1);
+        assert_eq!(clients[0].pane_id, ZellijPaneId::Plugin(3));
+        assert!(!clients[0].is_current_client);
+        assert_eq!(clients[1].client_id, 2);
+        assert_eq!(clients[1].pane_id, ZellijPaneId::Terminal(1));
+        assert!(clients[1].is_current_client, "the requesting client");
+    }
+
+    #[test]
+    fn json_client_list_is_an_array_and_nothing_else() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![]);
+        let rendered = meta.list_clients_metadata_json(2);
+        let parsed: Vec<ClientInfo> = serde_json::from_str(&rendered).expect("valid JSON array");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].client_id, 2);
+    }
+
+    #[test]
+    fn json_client_list_is_empty_when_nobody_is_attached() {
+        let meta = SessionLayoutMetadata::default();
+        assert_eq!(meta.list_clients_metadata_json(1), "[]");
+    }
+
+    #[test]
     fn removing_a_plugin_takes_the_clients_focused_on_it() {
         // why the client list must not drop the plugin that asked for it: the pane it would drop
         // is the pane its clients are looking at
@@ -1257,6 +1325,7 @@ mod tests {
             !focused_clients.is_empty(),
             None,
             focused_clients,
+            None,
             None,
             None,
         )

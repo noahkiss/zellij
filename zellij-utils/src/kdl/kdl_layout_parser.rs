@@ -108,6 +108,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "contents_file"
             || property_name == "default_fg"
             || property_name == "default_bg"
+            || property_name == "pane_uuid"
     }
     fn is_a_valid_floating_pane_property(&self, property_name: &str) -> bool {
         property_name == "borderless"
@@ -128,6 +129,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "contents_file"
             || property_name == "default_fg"
             || property_name == "default_bg"
+            || property_name == "pane_uuid"
     }
     fn is_a_valid_tab_property(&self, property_name: &str) -> bool {
         property_name == "focus"
@@ -571,6 +573,11 @@ impl<'a> KdlLayoutParser<'a> {
             .map(|s| s.to_string());
         let default_bg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_bg")
             .map(|s| s.to_string());
+        // Written by session serialization, not by hand: the uuid the pane had when the session
+        // was saved. It becomes the restored pane's `restored_from`, never its own uuid.
+        let restored_from =
+            kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_uuid")
+                .map(|s| s.to_string());
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -595,6 +602,7 @@ impl<'a> KdlLayoutParser<'a> {
             pane_initial_contents,
             default_fg,
             default_bg,
+            restored_from,
             ..Default::default()
         })
     }
@@ -619,6 +627,11 @@ impl<'a> KdlLayoutParser<'a> {
             .map(|s| s.to_string());
         let default_bg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_bg")
             .map(|s| s.to_string());
+        // Written by session serialization, not by hand: the uuid the pane had when the session
+        // was saved. It becomes the restored pane's `restored_from`, never its own uuid.
+        let restored_from =
+            kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_uuid")
+                .map(|s| s.to_string());
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -641,6 +654,7 @@ impl<'a> KdlLayoutParser<'a> {
             pane_initial_contents,
             default_fg,
             default_bg,
+            restored_from,
             ..Default::default()
         })
     }

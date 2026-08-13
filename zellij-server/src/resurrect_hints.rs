@@ -408,6 +408,14 @@ mod tests {
         );
         assert!(found.contains_key("PATH"), "found: {:?}", found.keys());
         assert!(!found.contains_key("NOT_A_REAL_VARIABLE_ZELLIJ"));
+        // the allowlist is a secret boundary: a present-but-unlisted variable must not leak, and
+        // nothing beyond the asked-for names may come back
+        assert!(
+            !found.contains_key("HOME"),
+            "an unlisted variable leaked: {:?}",
+            found.keys()
+        );
+        assert_eq!(found.len(), 1, "found: {:?}", found.keys());
     }
 
     #[test]

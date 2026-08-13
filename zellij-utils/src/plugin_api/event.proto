@@ -72,6 +72,9 @@ enum EventType {
     SoftKeyboardVisibilityChanged = 47;
     HintText = 48;
     ActivePaneScroll = 49;
+    // upstream ends at 49. Fork tags start here, flush against that maximum with no gap, so an
+    // upstream event added at 50 collides on rebase: renumber the FORK side, never upstream's,
+    // and keep the fork tags contiguous after the new upstream maximum.
     ListSnapshots = 50;
     SnapshotRestoreFailed = 51;
     PaneOpened = 52;
@@ -128,6 +131,9 @@ message Event {
     SoftKeyboardVisibilityChangedPayload soft_keyboard_visibility_changed_payload = 41;
     HintTextPayload hint_text_payload = 42;
     ActivePaneScrollPayload active_pane_scroll_payload = 43;
+    // upstream ends at 43. Fork tags start here, flush against that maximum with no gap, so an
+    // upstream payload added at 44 collides on rebase: renumber the FORK side, never upstream's,
+    // and keep the fork tags contiguous after the new upstream maximum.
     ListSnapshotsPayload list_snapshots_payload = 44;
     SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 45;
     PaneOpenedPayload pane_opened_payload = 46;
@@ -526,6 +532,9 @@ message PaneInfo {
     repeated IndexInPaneGroup index_in_pane_group = 23;
     optional string default_fg = 24;
     optional string default_bg = 25;
+    // upstream ends at 25. Fork fields start here, flush against that maximum with no gap, so an
+    // upstream field added at 26 collides on rebase: renumber the FORK side, never upstream's,
+    // and keep the fork tags contiguous after the new upstream maximum.
     optional string program_title = 26;
     optional uint32 stack_id = 27;
     optional uint32 index_in_stack = 28;

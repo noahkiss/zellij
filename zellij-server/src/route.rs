@@ -35,7 +35,12 @@ use zellij_utils::{
 
 use crate::ClientId;
 
-const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a CLI action waits for the server to report that it finished.
+///
+/// The budget is for the answer, not for the work: an action that takes longer than this is not
+/// cancelled and usually still completes. It is generous because the slow cases are legitimate -
+/// a new tab from a heavy layout, or the first plugin load of a session, which compiles wasm.
+const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ActionCompletionResult {
@@ -57,6 +62,16 @@ impl ActionCompletionResult {
             error_message: Some(error_message),
             stdout_message: None,
         }
+    }
+    /// The wait for the action's result ran out. The exit stays non-zero, because the caller was
+    /// not told the action succeeded - but it is not told the action failed either, since nothing
+    /// cancelled it and it may well complete a moment later.
+    pub fn timed_out(action_name: &str) -> Self {
+        ActionCompletionResult::failed(format!(
+            "Timed out after {:?} waiting for action {} to report a result. \
+             The action was not cancelled and may still complete.",
+            ACTION_COMPLETION_TIMEOUT, action_name
+        ))
     }
 }
 
@@ -92,17 +107,15 @@ pub fn wait_for_action_completion(
                 ))
             },
             Err(_) => {
-                log::error!(
-                    "Action {} did not complete within {:?} timeout",
+                log::warn!(
+                    "Action {} did not report a result within {:?}",
                     action_name,
                     ACTION_COMPLETION_TIMEOUT
                 );
-                // a timeout is a failure, not a silent success: the action may still be in
-                // flight, so the caller must not read "exited 0" as "this happened"
-                ActionCompletionResult::failed(format!(
-                    "Action {} did not complete within {:?}, the session may be busy",
-                    action_name, ACTION_COMPLETION_TIMEOUT
-                ))
+                // the exit stays non-zero: the action may still be in flight, so the caller must
+                // not read "exited 0" as "this happened". It must not read it as "this failed"
+                // either - nothing was cancelled - so the message says which of the two it is
+                ActionCompletionResult::timed_out(action_name)
             },
         }
     }
@@ -1123,13 +1136,18 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::GoToTabName { name, create } => {
+        Action::GoToTabName {
+            name,
+            create,
+            no_focus,
+        } => {
             let shell = default_shell.clone();
             senders
                 .send_to_screen(ScreenInstruction::GoToTabName(
                     name,
                     shell,
                     create,
+                    no_focus,
                     Some(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                 ))
@@ -1761,7 +1779,7 @@ pub(crate) fn route_action(
                 log::error!("Message must have a name");
             }
         },
-        Action::ListClients => {
+        Action::ListClients { output_json } => {
             let default_shell = match default_shell {
                 Some(TerminalAction::RunCommand(run_command)) => Some(run_command.command),
                 _ => None,
@@ -1772,6 +1790,7 @@ pub(crate) fn route_action(
                     cli_client_id.unwrap_or(client_id), // we prefer the cli client here because
                     // this is a cli query and we want to print
                     // it there
+                    output_json,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
@@ -1858,6 +1877,90 @@ pub(crate) fn route_action(
                 },
             }
             drop(NotificationEnd::new(completion_tx));
+        },
+        Action::SetPaneFullscreen {
+            pane_id,
+            fullscreen,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPaneFullscreen(
+                    pane_id.map(|p| p.into()),
+                    fullscreen,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetPanePinned { pane_id, pinned } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPanePinned(
+                    pane_id.map(|p| p.into()),
+                    pinned,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetPaneFloating { pane_id, floating } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPaneFloating(
+                    pane_id.map(|p| p.into()),
+                    floating,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetSyncTab { tab_id, sync } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetSyncTab(
+                    tab_id.map(|id| id as usize),
+                    sync,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::BreakPanesToNewTab {
+            pane_ids,
+            name,
+            no_focus,
+        } => {
+            let default_shell = default_shell.clone();
+            senders
+                .send_to_screen(ScreenInstruction::BreakPanesToNewTab {
+                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
+                    default_shell,
+                    should_change_focus_to_new_tab: !no_focus,
+                    new_tab_name: name,
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::BreakPanesToTabWithId {
+            pane_ids,
+            tab_id,
+            no_focus,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::BreakPanesToTabWithId {
+                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
+                    tab_id: tab_id as usize,
+                    should_change_focus_to_target_tab: !no_focus,
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::SignalPane { pane_id, signal } => {
+            senders
+                .send_to_pty(PtyInstruction::SignalPaneId(
+                    pane_id.into(),
+                    signal,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
         },
         Action::TogglePanePinned => {
             senders
@@ -3387,19 +3490,28 @@ mod tests {
     }
 
     #[test]
-    fn test_action_completion_timeout_reports_an_error() {
+    fn test_action_completion_timeout_reports_a_timeout_not_a_failure() {
         let (tx, rx) = oneshot::channel();
         // the sender is held for longer than the timeout, so the wait must give up
         let result = wait_for_action_completion(rx, "TestAction", false);
         drop(tx);
 
-        assert_eq!(result.exit_status, Some(1));
+        assert_eq!(
+            result.exit_status,
+            Some(1),
+            "the caller was not told the action succeeded, so the exit stays non-zero"
+        );
         let error_message = result
             .error_message
             .expect("a timed out action must report an error");
         assert!(
-            error_message.contains("did not complete"),
-            "Expected a timeout error, got: {}",
+            error_message.contains("Timed out"),
+            "Expected the message to name the timeout, got: {}",
+            error_message
+        );
+        assert!(
+            error_message.contains("may still complete"),
+            "the action is not cancelled, and the message must not claim it failed, got: {}",
             error_message
         );
     }
