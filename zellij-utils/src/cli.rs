@@ -1,4 +1,4 @@
-use crate::data::{Direction, InputMode, Resize, UnblockCondition};
+use crate::data::{Direction, InputMode, PaneSignal, Resize, UnblockCondition};
 use crate::setup::Setup;
 use crate::{
     consts::{ZELLIJ_CONFIG_DIR_ENV, ZELLIJ_CONFIG_FILE_ENV},
@@ -319,6 +319,10 @@ pub enum Sessions {
         /// List the sessions in reverse order (default is ascending order)
         #[clap(short, long)]
         reverse: bool,
+
+        /// Output as JSON (overrides --short and --no-formatting)
+        #[clap(short, long)]
+        json: bool,
     },
     /// List existing plugin aliases
     #[clap(visible_alias = "la")]
@@ -1357,6 +1361,9 @@ pub enum CliAction {
         /// Create a tab if one does not exist.
         #[clap(short, long, value_parser)]
         create: bool,
+        /// Leave focus where it is, whether the tab already existed or was just created
+        #[clap(long, value_parser)]
+        no_focus: bool,
     },
     /// Renames the focused pane
     RenameTab {
@@ -1627,7 +1634,14 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short('t'), long, value_parser, display_order(10))]
         plugin_title: Option<String>,
     },
-    ListClients,
+    /// List the clients attached to this session
+    ///
+    /// Returns: One row per client in a table, or the ClientInfo array with --json
+    ListClients {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// List all panes in the current session
     ///
     /// Returns: Formatted list of panes (table or JSON) to stdout
@@ -1733,6 +1747,99 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
     },
+    /// Set whether a pane is fullscreen, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
+    /// exist prints the reason on stderr and exits non-zero.
+    SetFullscreen {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Set whether a floating pane is pinned on top, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
+    /// exist prints the reason on stderr and exits non-zero.
+    SetPanePinned {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Set whether a pane floats or is embedded, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A pane that does not
+    /// exist, or a move the layout refuses (the last tiled pane cannot float), prints the reason
+    /// on stderr and exits non-zero.
+    SetPaneFloating {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Set whether input is synchronised across a tab's panes, rather than toggling it
+    ///
+    /// Returns exit code 0 if the state changed, 2 if it was already so. A tab that does not
+    /// exist prints the reason on stderr and exits non-zero.
+    SetSyncTab {
+        /// on|off (also accepts true/false, yes/no, 1/0)
+        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+        /// Target a specific tab by ID
+        #[clap(short, long, value_parser)]
+        tab_id: Option<usize>,
+    },
+    /// Move panes out into a new tab
+    ///
+    /// Without --pane-id this moves the focused pane. Returns the new tab's ID.
+    BreakPane {
+        /// Move this pane (repeatable). Defaults to the focused pane.
+        #[clap(short, long, value_parser)]
+        pane_id: Vec<String>,
+        /// Name for the new tab
+        #[clap(short, long, value_parser)]
+        name: Option<String>,
+        /// Leave focus where it is instead of following the panes
+        #[clap(long, value_parser)]
+        no_focus: bool,
+    },
+    /// Move panes into an existing tab
+    ///
+    /// A tab or pane that does not exist prints the reason on stderr and exits non-zero.
+    BreakPaneToTab {
+        /// Move this pane (repeatable)
+        #[clap(short, long, value_parser, required(true))]
+        pane_id: Vec<String>,
+        /// The tab to move the panes into
+        #[clap(short, long, value_parser)]
+        tab_id: u32,
+        /// Leave focus where it is instead of following the panes
+        #[clap(long, value_parser)]
+        no_focus: bool,
+    },
+    /// Move the focused pane into a new tab to the right of the current one
+    BreakPaneRight,
+    /// Move the focused pane into a new tab to the left of the current one
+    BreakPaneLeft,
+    /// Send a signal to the process running in a pane
+    ///
+    /// A pane that does not exist, or a plugin pane, which runs no process, prints the reason on
+    /// stderr and exits non-zero.
+    SignalPane {
+        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        #[clap(short, long, value_parser)]
+        pane_id: String,
+        /// The signal to send [int|hup|kill]
+        #[clap(short, long, value_enum, value_parser, default_value = "int")]
+        signal: PaneSignal,
+    },
     TogglePaneBorderless {
         /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
         #[clap(short, long, value_parser)]
@@ -1800,10 +1907,40 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// Parse a command line on a thread with a real stack.
+    ///
+    /// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
+    /// which overflows the 2MB stack the test harness gives a spawned test in a debug build. The
+    /// binary itself parses on the main thread and never sees this.
+    fn parse_cli(args: Vec<String>) -> Result<CliArgs, clap::Error> {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || CliArgs::try_parse_from(args))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn parse_action(args: &[&str]) -> CliAction {
+        let mut full_args = vec!["zellij".to_string(), "action".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        let cli = parse_cli(full_args).unwrap();
+        match cli.command {
+            Some(Command::Action(action)) => *action,
+            other => panic!("Expected Action, got {:?}", other),
+        }
+    }
+
+    fn action_parse_fails(args: &[&str]) -> bool {
+        let mut full_args = vec!["zellij".to_string(), "action".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        parse_cli(full_args).is_err()
+    }
+
     fn parse_subscribe(args: &[&str]) -> SubscribeCli {
-        let mut full_args = vec!["zellij"];
-        full_args.extend_from_slice(args);
-        let cli = CliArgs::try_parse_from(full_args).unwrap();
+        let mut full_args = vec!["zellij".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        let cli = parse_cli(full_args).unwrap();
         match cli.command {
             Some(Command::Subscribe(s)) => s,
             other => panic!("Expected Subscribe, got {:?}", other),
@@ -1863,7 +2000,172 @@ mod tests {
 
     #[test]
     fn subscribe_requires_pane_id() {
-        let result = CliArgs::try_parse_from(["zellij", "subscribe"]);
+        let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_setter_takes_a_boolish_value_and_an_optional_target() {
+        match parse_action(&["set-fullscreen", "on", "--pane-id", "terminal_1"]) {
+            CliAction::SetFullscreen { enabled, pane_id } => {
+                assert!(enabled);
+                assert_eq!(pane_id.as_deref(), Some("terminal_1"));
+            },
+            other => panic!("Expected SetFullscreen, got {:?}", other),
+        }
+        match parse_action(&["set-pane-pinned", "false"]) {
+            CliAction::SetPanePinned { enabled, pane_id } => {
+                assert!(!enabled);
+                assert_eq!(pane_id, None, "no target means the focused pane");
+            },
+            other => panic!("Expected SetPanePinned, got {:?}", other),
+        }
+        match parse_action(&["set-pane-floating", "1", "--pane-id", "3"]) {
+            CliAction::SetPaneFloating { enabled, .. } => assert!(enabled),
+            other => panic!("Expected SetPaneFloating, got {:?}", other),
+        }
+        match parse_action(&["set-sync-tab", "off", "--tab-id", "2"]) {
+            CliAction::SetSyncTab { enabled, tab_id } => {
+                assert!(!enabled);
+                assert_eq!(tab_id, Some(2));
+            },
+            other => panic!("Expected SetSyncTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_setter_refuses_a_missing_or_unreadable_value() {
+        assert!(action_parse_fails(&["set-fullscreen"]));
+        assert!(action_parse_fails(&["set-fullscreen", "maybe"]));
+        assert!(action_parse_fails(&["set-sync-tab"]));
+    }
+
+    #[test]
+    fn break_pane_takes_several_panes_and_a_name() {
+        let action = parse_action(&[
+            "break-pane",
+            "--pane-id",
+            "terminal_1",
+            "--pane-id",
+            "plugin_2",
+            "--name",
+            "build",
+            "--no-focus",
+        ]);
+        match action {
+            CliAction::BreakPane {
+                pane_id,
+                name,
+                no_focus,
+            } => {
+                assert_eq!(pane_id, vec!["terminal_1", "plugin_2"]);
+                assert_eq!(name.as_deref(), Some("build"));
+                assert!(no_focus);
+            },
+            other => panic!("Expected BreakPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_pane_with_no_target_means_the_focused_pane() {
+        let action = parse_action(&["break-pane"]);
+        match action {
+            CliAction::BreakPane {
+                pane_id, no_focus, ..
+            } => {
+                assert!(pane_id.is_empty());
+                assert!(!no_focus);
+            },
+            other => panic!("Expected BreakPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn break_pane_to_tab_needs_both_ends() {
+        let action = parse_action(&["break-pane-to-tab", "--pane-id", "3", "--tab-id", "2"]);
+        match action {
+            CliAction::BreakPaneToTab {
+                pane_id,
+                tab_id,
+                no_focus,
+            } => {
+                assert_eq!(pane_id, vec!["3"]);
+                assert_eq!(tab_id, 2);
+                assert!(!no_focus);
+            },
+            other => panic!("Expected BreakPaneToTab, got {:?}", other),
+        }
+        assert!(action_parse_fails(&["break-pane-to-tab", "--tab-id", "2"]));
+        assert!(action_parse_fails(&["break-pane-to-tab", "--pane-id", "3"]));
+    }
+
+    #[test]
+    fn signal_pane_defaults_to_sigint() {
+        let action = parse_action(&["signal-pane", "--pane-id", "terminal_1"]);
+        match action {
+            CliAction::SignalPane { pane_id, signal } => {
+                assert_eq!(pane_id, "terminal_1");
+                assert_eq!(signal, PaneSignal::Int);
+            },
+            other => panic!("Expected SignalPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn signal_pane_takes_the_named_signal() {
+        for (name, expected) in [
+            ("int", PaneSignal::Int),
+            ("hup", PaneSignal::Hup),
+            ("kill", PaneSignal::Kill),
+        ] {
+            let action = parse_action(&["signal-pane", "--pane-id", "3", "--signal", name]);
+            match action {
+                CliAction::SignalPane { signal, .. } => assert_eq!(signal, expected),
+                other => panic!("Expected SignalPane, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn signal_pane_needs_a_pane_and_rejects_an_unknown_signal() {
+        assert!(action_parse_fails(&["signal-pane"]));
+        assert!(action_parse_fails(&[
+            "signal-pane",
+            "--pane-id",
+            "1",
+            "--signal",
+            "term"
+        ]));
+    }
+
+    #[test]
+    fn go_to_tab_name_no_focus() {
+        let action = parse_action(&["go-to-tab-name", "build", "--create", "--no-focus"]);
+        match action {
+            CliAction::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => {
+                assert_eq!(name, "build");
+                assert!(create);
+                assert!(no_focus);
+            },
+            other => panic!("Expected GoToTabName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn go_to_tab_name_focuses_by_default() {
+        let action = parse_action(&["go-to-tab-name", "build"]);
+        match action {
+            CliAction::GoToTabName {
+                create, no_focus, ..
+            } => {
+                assert!(!create);
+                assert!(!no_focus);
+            },
+            other => panic!("Expected GoToTabName, got {:?}", other),
+        }
     }
 }

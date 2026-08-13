@@ -733,14 +733,14 @@ pub(crate) fn send_action_to_session(
                         "Session '{}' not found. The following sessions are active:",
                         session_name
                     );
-                    list_sessions(false, false, true);
+                    list_sessions(false, false, true, false);
                     std::process::exit(1);
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
                 attach_with_cli_client(cli_action, &session_name, config);
             } else {
                 eprintln!("Please specify the session name to send actions to. The following sessions are active:");
-                list_sessions(false, false, true);
+                list_sessions(false, false, true, false);
                 std::process::exit(1);
             }
         },
@@ -783,14 +783,14 @@ pub(crate) fn subscribe_to_session(
                         "Session '{}' not found. The following sessions are active:",
                         session_name
                     );
-                    list_sessions(false, false, true);
+                    list_sessions(false, false, true, false);
                     std::process::exit(1);
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
                 session_name
             } else {
                 eprintln!("Please specify the session name to subscribe to. The following sessions are active:");
-                list_sessions(false, false, true);
+                list_sessions(false, false, true, false);
                 std::process::exit(1);
             }
         },
@@ -922,7 +922,7 @@ fn attach_with_session_name(
             ActiveSession::One(session_name) => ClientInfo::Attach(session_name, config_options),
             ActiveSession::Many => {
                 println!("Please specify the session to attach to, either by using the full name or a unique prefix.\nThe following sessions are active:");
-                list_sessions(false, false, true);
+                list_sessions(false, false, true, false);
                 process::exit(1);
             },
         },

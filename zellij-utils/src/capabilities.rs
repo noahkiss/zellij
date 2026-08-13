@@ -31,6 +31,7 @@ pub const CAPABILITIES: &[&str] = &[
     "session-kill-wait",      // kill-session/delete-session wait, --wait-timeout, --no-wait
     "attach-no-resurrect",    // zellij attach --no-resurrect
     "ls-exited-marker",       // zellij ls -s marks dead sessions (EXITED)
+    "ls-json",                // zellij ls --json
     "setup-socket-dir",       // setup --check prints [SOCKET DIR]; ls warns about other socket dirs
     "build-mismatch-warning", // a client warns when the running server is another build
     // the snapshot archive
@@ -56,7 +57,12 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-opened-event",  // Event::PaneOpened, broadcast from every creation path
     "client-tty",         // ClientInfo.tty
     "list-clients-fixed", // the session manager's client list actually lists clients
+    "list-clients-json",  // zellij action list-clients --json
     "move-tab-to-index",  // zellij action move-tab --to-index
+    "signal-pane",        // zellij action signal-pane --pane-id X --signal int|hup|kill
+    "break-pane-cli",     // zellij action break-pane / break-pane-to-tab / -right / -left
+    "idempotent-setters", // set-fullscreen, set-pane-pinned, set-pane-floating, set-sync-tab
+    "go-to-tab-name-no-focus", // zellij action go-to-tab-name --create --no-focus
     "new-pane-stacked-error", // --stacked refuses instead of creating nothing
     "dump-screen-plugin-panes", // dump-screen works on plugin panes
     // plugin development loop

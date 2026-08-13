@@ -1089,13 +1089,18 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::GoToTabName { name, create } => {
+        Action::GoToTabName {
+            name,
+            create,
+            no_focus,
+        } => {
             let shell = default_shell.clone();
             senders
                 .send_to_screen(ScreenInstruction::GoToTabName(
                     name,
                     shell,
                     create,
+                    no_focus,
                     Some(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                 ))
@@ -1727,7 +1732,7 @@ pub(crate) fn route_action(
                 log::error!("Message must have a name");
             }
         },
-        Action::ListClients => {
+        Action::ListClients { output_json } => {
             let default_shell = match default_shell {
                 Some(TerminalAction::RunCommand(run_command)) => Some(run_command.command),
                 _ => None,
@@ -1738,6 +1743,7 @@ pub(crate) fn route_action(
                     cli_client_id.unwrap_or(client_id), // we prefer the cli client here because
                     // this is a cli query and we want to print
                     // it there
+                    output_json,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
@@ -1824,6 +1830,90 @@ pub(crate) fn route_action(
                 },
             }
             drop(NotificationEnd::new(completion_tx));
+        },
+        Action::SetPaneFullscreen {
+            pane_id,
+            fullscreen,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPaneFullscreen(
+                    pane_id.map(|p| p.into()),
+                    fullscreen,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetPanePinned { pane_id, pinned } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPanePinned(
+                    pane_id.map(|p| p.into()),
+                    pinned,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetPaneFloating { pane_id, floating } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetPaneFloating(
+                    pane_id.map(|p| p.into()),
+                    floating,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::SetSyncTab { tab_id, sync } => {
+            senders
+                .send_to_screen(ScreenInstruction::SetSyncTab(
+                    tab_id.map(|id| id as usize),
+                    sync,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::BreakPanesToNewTab {
+            pane_ids,
+            name,
+            no_focus,
+        } => {
+            let default_shell = default_shell.clone();
+            senders
+                .send_to_screen(ScreenInstruction::BreakPanesToNewTab {
+                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
+                    default_shell,
+                    should_change_focus_to_new_tab: !no_focus,
+                    new_tab_name: name,
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::BreakPanesToTabWithId {
+            pane_ids,
+            tab_id,
+            no_focus,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::BreakPanesToTabWithId {
+                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
+                    tab_id: tab_id as usize,
+                    should_change_focus_to_target_tab: !no_focus,
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::SignalPane { pane_id, signal } => {
+            senders
+                .send_to_pty(PtyInstruction::SignalPaneId(
+                    pane_id.into(),
+                    signal,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
         },
         Action::TogglePanePinned => {
             senders

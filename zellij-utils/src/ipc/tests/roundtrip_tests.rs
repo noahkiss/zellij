@@ -2,7 +2,7 @@ use super::test_framework::*;
 use crate::data::{
     BareKey, CommandOrPlugin, ConnectToSession, Direction, FloatingPaneCoordinates,
     HostTerminalThemeMode, InputMode, KeyModifier, KeyWithModifier, LayoutInfo, LayoutMetadata,
-    NewPanePlacement, OriginatingPlugin, PaneId, PluginTag, Resize, WebSharing,
+    NewPanePlacement, OriginatingPlugin, PaneId, PaneSignal, PluginTag, Resize, WebSharing,
 };
 use crate::input::actions::{Action, SearchDirection, SearchOption};
 use crate::input::cli_assets::CliAssets;
@@ -2301,6 +2301,7 @@ fn test_client_messages() {
         action: Action::GoToTabName {
             name: "tab_name".to_owned(),
             create: false,
+            no_focus: false,
         },
         terminal_id: Some(1),
         client_id: Some(100),
@@ -2310,6 +2311,17 @@ fn test_client_messages() {
         action: Action::GoToTabName {
             name: "tab_name".to_owned(),
             create: true,
+            no_focus: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::GoToTabName {
+            name: "tab_name".to_owned(),
+            create: true,
+            no_focus: true,
         },
         terminal_id: Some(1),
         client_id: Some(100),
@@ -3017,7 +3029,106 @@ fn test_client_messages() {
         is_cli_client: true,
     });
     test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::ListClients,
+        action: Action::SetPaneFullscreen {
+            pane_id: Some(PaneId::Terminal(1)),
+            fullscreen: true,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SetPanePinned {
+            pane_id: None,
+            pinned: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SetPaneFloating {
+            pane_id: Some(PaneId::Plugin(2)),
+            floating: true,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SetSyncTab {
+            tab_id: Some(3),
+            sync: true,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SetSyncTab {
+            tab_id: None,
+            sync: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::BreakPanesToNewTab {
+            pane_ids: vec![PaneId::Terminal(1), PaneId::Plugin(2)],
+            name: Some("build".to_owned()),
+            no_focus: true,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::BreakPanesToNewTab {
+            pane_ids: vec![],
+            name: None,
+            no_focus: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::BreakPanesToTabWithId {
+            pane_ids: vec![PaneId::Terminal(1)],
+            tab_id: 3,
+            no_focus: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SignalPane {
+            pane_id: PaneId::Terminal(1),
+            signal: PaneSignal::Int,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SignalPane {
+            pane_id: PaneId::Plugin(2),
+            signal: PaneSignal::Kill,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::ListClients { output_json: false },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::ListClients { output_json: true },
         terminal_id: Some(1),
         client_id: Some(100),
         is_cli_client: true,

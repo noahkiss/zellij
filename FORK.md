@@ -2404,6 +2404,144 @@ when a consumer needs to tell a restored pane from the one it continues.
 
 Proto: `EventType` 52, event payload 46.
 
+### Idempotent setters for the four remaining toggles
+
+```
+zellij action set-fullscreen on --pane-id terminal_3
+zellij action set-pane-pinned off --pane-id terminal_3
+zellij action set-pane-floating on
+zellij action set-sync-tab off --tab-id 2
+```
+
+Fullscreen, pinned, embed/float and tab sync could only be toggled. A controller that lost track of
+the state could not converge on it without reading first, and the read races anything else touching
+the session. Each now has a set-form, the shape the fork already gave floating-panes, borderless and
+the theme.
+
+The value is positional and boolish: `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0`. `--pane-id` and
+`--tab-id` are optional and default to what the calling client is focused on, so the interactive use
+stays short; naming the target explicitly is what makes the call work in a detached session. The
+toggles are untouched.
+
+Exit status follows `show-floating-panes`: **0** the state changed, **2** it was already so. A target
+that does not exist prints the reason on stderr and exits non-zero — every failing `zellij action`
+exits 2, because the client turns any error message into that one code, so **the message on stderr,
+not the exit status, is what separates a miss from a no-op**. `set-pane-floating` reports a refused
+move — the last tiled pane may not float, and an embed needs room — the same way, because reporting
+"already so" for a move that did not happen would be a lie. `set-fullscreen on` differs from the
+toggle in one more way: when another pane holds fullscreen, it hands fullscreen to the named pane
+instead of merely clearing it.
+
+Four `Action`s, contract tags 163-166.
+
+### Move a pane between tabs from the CLI (`break-pane`)
+
+```
+zellij action break-pane                                          # the focused pane, new tab
+zellij action break-pane --pane-id terminal_3 --name build --no-focus
+zellij action break-pane-to-tab --pane-id terminal_3 --tab-id 2
+zellij action break-pane-right                                    # focused pane, new tab to the right
+zellij action break-pane-left
+```
+
+`Action::BreakPane*` existed and plugins had all three `break_panes_to_*` calls, but the word `break`
+appeared nowhere in `cli.rs`, so reorganising a session across tabs was the one structural edit the
+CLI could not make. All of it is exposed now.
+
+`break-pane` moves panes into a new tab. Without `--pane-id` it moves the focused pane, which is what
+the keybinding does. With one or more `--pane-id` it moves exactly those, which is what makes it work
+in a detached session. `--name` names the new tab and `--no-focus` leaves focus where it is.
+`break-pane-to-tab` moves them into an existing tab and requires both `--pane-id` and `--tab-id`.
+Both print the affected tab's id.
+
+**A pane that no tab owns is now an error rather than a silent skip.** `break_multiple_panes_*`
+drops a pane id it cannot find, so a request naming only stale ids used to move nothing, report
+success, and — for a new tab — leave an empty tab behind. Both instructions now check every pane
+first and fail naming the first miss, changing nothing. A missing `--tab-id` fails the same way.
+This applies to the plugin calls that share these instructions too: a plugin passing a stale pane id
+now gets an error instead of a partial move.
+
+Two `Action`s, contract tags 161 and 162.
+
+### `signal-pane` — signal the process in a pane
+
+```
+zellij action signal-pane --pane-id terminal_3               # SIGINT
+zellij action signal-pane --pane-id terminal_3 --signal kill
+```
+
+Plugins could send SIGINT and SIGKILL to a pane; the CLI could not, and `write-chars $'\003'` is not
+the same thing — it asks whatever is reading the pty to interpret a keystroke, which a program that
+has turned off canonical input, or a pane whose reader has wedged, will not do. `--signal` takes
+`int`, `hup` or `kill`, the three the server can already deliver, and defaults to `int`.
+
+`--pane-id` is required: a signal is destructive enough that it should never fall back to whatever
+happens to be focused, and requiring it makes the command safe in a detached session. Naming a pane
+that does not exist, or a plugin pane, which runs no process, fails with the reason on stderr rather
+than warning into the log.
+
+The signal goes to the process zellij spawned for the pane — the pane's shell — which is what the
+plugin API has always done. A shell without job control runs its command in that same process, so
+this reaches the command; a shell with job control will handle the signal itself.
+
+This adds an `Action` and therefore a message to the client/server contract. Fork action messages
+start at **tag 160**, leaving 149-159 for upstream, so an upstream bump does not have to renumber
+anything the fork added.
+
+### `zellij ls --json`
+
+```
+zellij ls --json
+```
+
+The session listing was three prose formats — coloured, `--no-formatting`, `--short` — and a consumer
+had to parse one of them. `--json` prints an array instead, and it also reports what the human
+listing never did: `ls` reads the socket directory alone, while each live session writes a
+`session-metadata.kdl` the listing ignored.
+
+Each entry carries `name`, `created_seconds_ago` (the number the human listing formats as "x ago"),
+`is_current` and `is_dead`, plus `connected_clients`, `web_client_count`, `web_clients_allowed`,
+`tab_count` and `pane_count` from that metadata. The metadata fields are omitted, not null, for a
+dead session — it has no server to have written any — and for a live session whose metadata does not
+parse.
+
+`--json` overrides `--short` and `--no-formatting`; `--reverse` still orders the array. No sessions
+prints `[]` on stdout and keeps the existing exit status 1 and the existing note on stderr, so
+nothing but the array ever reaches stdout.
+
+### `list-clients --json`
+
+```
+zellij action list-clients --json
+```
+
+The client list was a human table only, so a controller had to parse fixed-width columns to learn
+who is attached and whose terminal is shrinking the grid. `--json` prints the `ClientInfo` array
+plugins already receive in `Event::ListClients` — `client_id`, `pane_id`, `running_command`,
+`is_current_client`, and the fork's `terminal_size` and `tty` where the server knows them. Nothing
+else goes to stdout, and no clients prints `[]`.
+
+`pane_id` is the serde form of the enum, `{"Terminal": 3}`, because this is the plugin-facing struct
+verbatim rather than a second shape to keep in step. `is_current_client` marks the client that asked;
+`zellij action` is its own short-lived client focused on no pane, so a CLI query marks no row. The
+flag rides on the existing `ListClientsAction` message (field 1) and adds nothing to the contract.
+
+### `go-to-tab-name --no-focus`
+
+```
+zellij action go-to-tab-name build --create --no-focus
+```
+
+"Make sure a tab named X exists" used to be impossible without stealing focus: `--create` focused the
+tab it made, and naming a tab that already existed focused that one. `--no-focus` makes the call
+idempotent in the way a controller wants — the tab is there afterwards, and whoever was looking at
+something else still is. `--create` still prints the new tab's id, so a script can create the tab and
+then address it.
+
+Without `--create` the flag reduces the command to an existence probe. The flag rides on the existing
+`GoToTabNameAction` message (field 3), so it adds no message to the client/server contract; the
+plugin API's `focus_or_create_tab` is unchanged and always focuses.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

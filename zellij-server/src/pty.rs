@@ -22,7 +22,8 @@ use tokio::task::JoinHandle;
 use zellij_utils::{
     data::{
         CommandOrPlugin, Event, FloatingPaneCoordinates, GetPaneCwdResponse, GetPanePidResponse,
-        GetPaneRunningCommandResponse, NewPanePlacement, OriginatingPlugin, SessionInfo,
+        GetPaneRunningCommandResponse, NewPanePlacement, OriginatingPlugin, PaneSignal,
+        SessionInfo,
     },
     errors::prelude::*,
     errors::{ContextType, PtyContext},
@@ -138,7 +139,12 @@ pub enum PtyInstruction {
         Option<FloatingPaneCoordinates>,
         Option<NotificationEnd>,
     ),
-    ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
+    ListClientsMetadata(
+        SessionLayoutMetadata,
+        ClientId,
+        bool,
+        Option<NotificationEnd>,
+    ),
     Reconfigure {
         client_id: ClientId,
         default_editor: Option<PathBuf>,
@@ -149,6 +155,9 @@ pub enum PtyInstruction {
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
     SendSigintToPaneId(PaneId),
+    /// The CLI's signal-to-pane. Unlike the two plugin instructions above it answers the caller:
+    /// naming a pane that does not exist, or one with no process, has to fail rather than warn.
+    SignalPaneId(PaneId, PaneSignal, Option<NotificationEnd>),
     SendSigkillToPaneId(PaneId),
     GetPanePid {
         pane_id: PaneId,
@@ -191,6 +200,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::ListClientsToPlugin(..) => PtyContext::ListClientsToPlugin,
             PtyInstruction::ReportPluginCwd(..) => PtyContext::ReportPluginCwd,
             PtyInstruction::SendSigintToPaneId(..) => PtyContext::SendSigintToPaneId,
+            PtyInstruction::SignalPaneId(..) => PtyContext::SignalPaneId,
             PtyInstruction::SendSigkillToPaneId(..) => PtyContext::SendSigkillToPaneId,
             PtyInstruction::GetPanePid { .. } => PtyContext::GetPanePid,
             PtyInstruction::GetPaneRunningCommand { .. } => PtyContext::GetPaneRunningCommand,
@@ -747,17 +757,20 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::ListClientsMetadata(
                 mut session_layout_metadata,
                 client_id,
+                output_json,
                 completion_tx,
             ) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
+                let rendered = if output_json {
+                    session_layout_metadata.list_clients_metadata_json(client_id)
+                } else {
+                    session_layout_metadata.list_clients_metadata()
+                };
                 pty.bus
                     .senders
                     .send_to_server(ServerInstruction::Log(
-                        vec![format!(
-                            "{}",
-                            session_layout_metadata.list_clients_metadata(),
-                        )],
+                        vec![rendered],
                         client_id,
                         completion_tx,
                     ))
@@ -906,6 +919,16 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             },
             PtyInstruction::SendSigintToPaneId(pane_id) => {
                 pty.send_sigint_to_pane(pane_id);
+            },
+            PtyInstruction::SignalPaneId(pane_id, signal, mut completion_tx) => {
+                if let Err(e) = pty.signal_pane(pane_id, signal) {
+                    log::error!("{}", e);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(e);
+                    }
+                }
+                drop(completion_tx);
             },
             PtyInstruction::SendSigkillToPaneId(pane_id) => {
                 pty.send_sigkill_to_pane(pane_id);
@@ -2403,6 +2426,37 @@ impl Pty {
                 )]));
             self.terminal_cwds.insert(terminal_id, path);
         }
+    }
+
+    /// Send `signal` to the process zellij spawned for `pane_id`.
+    ///
+    /// The error names which of the two ways this can miss happened: no such terminal pane, or a
+    /// plugin pane, which has no process to signal.
+    pub fn signal_pane(&self, pane_id: PaneId, signal: PaneSignal) -> Result<(), String> {
+        let terminal_id = match pane_id {
+            PaneId::Terminal(terminal_id) => terminal_id,
+            PaneId::Plugin(plugin_id) => {
+                return Err(format!(
+                    "Cannot signal plugin pane {}: it runs no process",
+                    plugin_id
+                ))
+            },
+        };
+        let child_pid = *self
+            .id_to_child_pid
+            .get(&terminal_id)
+            .ok_or_else(|| format!("Pane with id {:?} not found", pane_id))?;
+        let os_input = self
+            .bus
+            .os_input
+            .as_ref()
+            .ok_or_else(|| "no OS I/O interface found".to_owned())?;
+        let sent = match signal {
+            PaneSignal::Int => os_input.send_sigint(child_pid),
+            PaneSignal::Hup => os_input.kill(child_pid),
+            PaneSignal::Kill => os_input.force_kill(child_pid),
+        };
+        sent.map_err(|e| format!("failed to signal pane {:?}: {}", pane_id, e))
     }
 
     pub fn send_sigint_to_pane(&self, pane_id: PaneId) {
