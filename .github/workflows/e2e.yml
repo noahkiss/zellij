@@ -1,13 +1,31 @@
 name: End to End tests
 
+# Documentation-only pushes are skipped - see the note in rust.yml. No crate pulls a
+# `.md` into the build, so markdown cannot affect what these tests exercise.
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.md'
+      - 'docs/**'
+      - 'assets/**.md'
   pull_request:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.md'
+      - 'docs/**'
+      - 'assets/**.md'
 
 env:
   CARGO_TERM_COLOR: always
+
+# A superseded push cancels its stale run; without this, manual cancellations
+# accumulate and read as failures in `gh run list`.
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-e2e:
