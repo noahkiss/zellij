@@ -74,6 +74,7 @@ enum EventType {
     ActivePaneScroll = 49;
     ListSnapshots = 50;
     SnapshotRestoreFailed = 51;
+    PaneOpened = 52;
 }
 
 message EventNameList {
@@ -127,6 +128,7 @@ message Event {
     ActivePaneScrollPayload active_pane_scroll_payload = 43;
     ListSnapshotsPayload list_snapshots_payload = 44;
     SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 45;
+    PaneOpenedPayload pane_opened_payload = 46;
   }
 }
 
@@ -259,6 +261,10 @@ message CommandPaneReRunPayload {
 }
 
 message PaneClosedPayload {
+  PaneId pane_id = 1;
+}
+
+message PaneOpenedPayload {
   PaneId pane_id = 1;
 }
 

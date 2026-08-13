@@ -2294,6 +2294,31 @@ The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) b
 that need it — resolving a builtin's bytes and watching its file — sit on different threads and
 neither carries the config.
 
+### `Event::PaneOpened`, the counterpart of `PaneClosed`
+
+`PaneClosed` was the only structural lifecycle event zellij had. It fires from every close path and
+reaches every subscribed plugin whether or not a client is attached, so pane *removal* was already
+observable in a detached session — while pane *creation* could only be recovered by diffing a pane
+manifest against the last one a consumer happened to see.
+
+`Event::PaneOpened(PaneId)` closes the asymmetry. It carries the same payload as `PaneClosed`, is
+broadcast the same way, and fires from every creation path: tiled, floating, stacked and
+no-preference panes, in-place and editor panes, the panes a layout builds when a tab is created,
+terminals and plugins alike.
+
+What it deliberately does not fire for:
+
+- **A pane that moved.** Toggling a pane between tiled and floating, breaking it out to another tab
+  or restacking it is the same pane with the same id and uuid. Only creation is announced.
+- **A pane that was not created.** A creation that finds no room for the pane drops it; the event is
+  sent only after the pane is found in the tab, because announcing one that does not exist is worse
+  than announcing nothing.
+
+Pair it with `PaneClosed` for a complete pane lifecycle without polling, and with `PaneInfo.uuid`
+when a consumer needs to tell a restored pane from the one it continues.
+
+Proto: `EventType` 52, event payload 46.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

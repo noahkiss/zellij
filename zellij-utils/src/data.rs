@@ -1008,6 +1008,13 @@ pub enum Event {
     CommandPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> -
     // exit_code
     PaneClosed(PaneId),
+    /// A pane was created in this session, whether or not a client is attached
+    ///
+    /// The counterpart of `PaneClosed`: it fires once per pane from every creation path - tiled,
+    /// floating, stacked, in-place, editor and layout-applied, terminal and plugin alike - and it
+    /// is broadcast to every subscribed plugin rather than to the client that asked for the pane.
+    /// A pane moved between tabs is not a new pane and does not fire it.
+    PaneOpened(PaneId),
     EditPaneOpened(u32, Context),              // u32 - terminal_pane_id
     EditPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> - exit code
     CommandPaneReRun(u32, Context),            // u32 - terminal_pane_id, Option<i32> -
