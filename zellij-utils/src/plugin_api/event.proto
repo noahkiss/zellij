@@ -74,6 +74,9 @@ enum EventType {
     ActivePaneScroll = 49;
     ListSnapshots = 50;
     SnapshotRestoreFailed = 51;
+    PaneOpened = 52;
+    PaneExited = 53;
+    PluginDied = 54;
 }
 
 message EventNameList {
@@ -127,6 +130,9 @@ message Event {
     ActivePaneScrollPayload active_pane_scroll_payload = 43;
     ListSnapshotsPayload list_snapshots_payload = 44;
     SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 45;
+    PaneOpenedPayload pane_opened_payload = 46;
+    PaneExitedPayload pane_exited_payload = 47;
+    PluginDiedPayload plugin_died_payload = 48;
   }
 }
 
@@ -241,6 +247,12 @@ message ClientInfo {
   PaneId pane_id = 2;
   string running_command = 3;
   bool is_current_client = 4;
+  // fork-only fields start at 100, leaving 5.. free for upstream
+  // the client's terminal size, absent when the server has not recorded one yet
+  optional uint32 terminal_rows = 100;
+  optional uint32 terminal_cols = 101;
+  // the terminal device the client is attached to, absent when it has none
+  optional string tty = 102;
 }
 
 message FailedToWriteConfigToDiskPayload {
@@ -254,6 +266,20 @@ message CommandPaneReRunPayload {
 
 message PaneClosedPayload {
   PaneId pane_id = 1;
+}
+
+message PaneOpenedPayload {
+  PaneId pane_id = 1;
+}
+
+message PaneExitedPayload {
+  PaneId pane_id = 1;
+  optional int32 exit_status = 2;
+}
+
+message PluginDiedPayload {
+  uint32 plugin_id = 1;
+  string message = 2;
 }
 
 // duplicate of plugin_command.PaneId because protobuffs don't like recursive imports
@@ -505,6 +531,26 @@ message PaneInfo {
     optional uint32 index_in_stack = 28;
     bool is_expanded_in_stack = 29;
     string uuid = 30;
+    string restored_from = 31;
+    optional string pane_cwd = 32;
+    optional uint32 pane_pid = 33;
+    optional string pane_command = 34;
+    optional uint64 last_output_at = 35;
+    bool has_pending_bell = 36;
+    repeated PaneEnvVar pane_env = 37;
+    bool is_alternate_screen = 38;
+    uint32 scrollback_position = 39;
+    uint32 scrollback_length = 40;
+    bool is_pinned = 41;
+    optional uint32 logical_position = 42;
+    bool is_borderless = 43;
+    bool exclude_from_sync = 44;
+    bool has_explicit_title = 45;
+}
+
+message PaneEnvVar {
+  string name = 1;
+  string value = 2;
 }
 
 message IndexInPaneGroup {

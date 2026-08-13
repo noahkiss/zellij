@@ -92,6 +92,8 @@ pub fn zellij_server_listener(
                         .theme_config(config_options.theme.as_ref())
                         .unwrap_or_else(|| os_input.load_palette().into());
                     let client_attributes = zellij_utils::ipc::ClientAttributes {
+                        // a browser has no controlling terminal
+                        tty: None,
                         size: full_screen_ws,
                         style: Style {
                             colors: palette,
