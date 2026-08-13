@@ -2274,10 +2274,13 @@ pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: Thread
     // fork addition: a background plugin has no pane, so the loading error above has nowhere to go
     // and its death has no symptom at all - the feed simply goes quiet. Tell every subscribed
     // plugin instead, client-independently. Nothing here restarts anything.
+    // fail open on a poisoned lock: a duplicate announcement is noise, while a lost one leaves a
+    // dead background plugin with no symptom at all, and the poison would silence every crash for
+    // the life of the session
     let is_first_crash = ANNOUNCED_PLUGIN_CRASHES
         .lock()
         .map(|mut announced| announced.insert(plugin_id))
-        .unwrap_or(false);
+        .unwrap_or(true);
     if is_first_crash {
         let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
             None,
@@ -2362,6 +2365,11 @@ mod plugin_crash_tests {
         events
     }
 
+    /// `ANNOUNCED_PLUGIN_CRASHES` is a process-global set, shared by every test in this binary and
+    /// never reset. The tests below stay independent only because each uses a plugin id of its own
+    /// (9001, 9002) that nothing else in the binary touches. A new test here MUST pick another
+    /// unused id, or it will see an announcement another test already consumed.
+    ///
     /// A background plugin has no pane, so the loading-error indicator has nowhere to go and its
     /// death is silent - which is indistinguishable from a session with nothing to say.
     #[test]
@@ -2374,7 +2382,8 @@ mod plugin_crash_tests {
     }
 
     /// Announcing a crash sends an event, and delivering an event is how a plugin crashes. One
-    /// announcement per plugin id is what stops that being a loop.
+    /// announcement per plugin id is what stops that being a loop. Uses id 9002, distinct from the
+    /// test above - see the note there about the process-global set.
     #[test]
     fn a_plugin_that_keeps_crashing_is_announced_once() {
         let (senders, rx) = senders_with_plugin_receiver();
