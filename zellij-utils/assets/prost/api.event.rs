@@ -100,6 +100,9 @@ pub mod event {
         HintTextPayload(super::HintTextPayload),
         #[prost(message, tag="43")]
         ActivePaneScrollPayload(super::ActivePaneScrollPayload),
+        /// upstream ends at 43. Fork tags start here, flush against that maximum with no gap, so an
+        /// upstream payload added at 44 collides on rebase: renumber the FORK side, never upstream's,
+        /// and keep the fork tags contiguous after the new upstream maximum.
         #[prost(message, tag="44")]
         ListSnapshotsPayload(super::ListSnapshotsPayload),
         #[prost(message, tag="45")]
@@ -709,6 +712,9 @@ pub struct PaneInfo {
     pub default_fg: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="25")]
     pub default_bg: ::core::option::Option<::prost::alloc::string::String>,
+    /// upstream ends at 25. Fork fields start here, flush against that maximum with no gap, so an
+    /// upstream field added at 26 collides on rebase: renumber the FORK side, never upstream's,
+    /// and keep the fork tags contiguous after the new upstream maximum.
     #[prost(string, optional, tag="26")]
     pub program_title: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint32, optional, tag="27")]
@@ -1037,6 +1043,9 @@ pub enum EventType {
     SoftKeyboardVisibilityChanged = 47,
     HintText = 48,
     ActivePaneScroll = 49,
+    /// upstream ends at 49. Fork tags start here, flush against that maximum with no gap, so an
+    /// upstream event added at 50 collides on rebase: renumber the FORK side, never upstream's,
+    /// and keep the fork tags contiguous after the new upstream maximum.
     ListSnapshots = 50,
     SnapshotRestoreFailed = 51,
     PaneOpened = 52,
