@@ -178,20 +178,40 @@ This adds an `Action` and therefore a message to the client/server contract (tag
 bumping the contract version: a fork client talking to a stock server of the same contract simply
 gets nothing for this one action, and every other action keeps working.
 
-### `pane_pid` in `list-panes --json`
+### The process behind a pane: `pane_pid`, `pane_cwd` and `pane_command`
 
 ```
 zellij action list-panes --all --json
 ```
 
-Terminal panes carry `pane_pid`, the pid of the process zellij spawned for the pane. The field is
-omitted for plugin panes and for any pane the pty does not answer for, exactly like the neighbouring
-`pane_command` and `pane_cwd`. This only exposes what the pty thread already knew — the pid was
-reachable from plugins and nowhere else — so consumers no longer have to scan `/proc/*/environ` for
-`ZELLIJ_PANE_ID` to map a pane to a process.
+Terminal panes carry three fields describing what is running in them:
 
-`PaneListEntry` is a CLI-only struct, so this is JSON output only: no protobuf, no contract change,
-and plugins see nothing new.
+- `pane_pid` — the pid of the process zellij spawned for the pane. That is the pane's own child, the
+  shell, not whatever the shell is running; walk down from it to find a tool inside the pane.
+- `pane_cwd` — its working directory.
+- `pane_command` — the foreground command if there is one, otherwise the pane's shell.
+
+All three are omitted for plugin panes and for a pane the pty thread has not reported on yet.
+
+**They are on `PaneInfo`, so plugins get them too.** They were CLI-only for a reason: the CLI
+resolved each one with a blocking round trip to the pty thread per pane, three per pane at a 100ms
+timeout each, which is not something an event path can carry. The pty thread already refreshes a cwd
+and command cache once a second for panes that produced output, and already holds every pane's pid —
+so it now reports that warm cache to Screen on the same tick, and Screen stamps it onto every
+`PaneInfo` it builds. The CLI reads the same stamped fields, and its per-pane blocking round trips
+are gone: `list-panes --json` no longer re-probes the OS for what was measured moments earlier.
+
+The JSON keys and their meaning are unchanged; they simply now come from the manifest rather than
+from a separate enrichment pass, and appear on plugin `PaneUpdate`/`SessionUpdate` as well.
+
+Both fields have a push complement that already existed and still fires: `Event::CwdChanged` and
+`Event::CommandChanged`, both broadcast client-independently. Subscribe to those for changes; read
+these fields for the state of the world when a consumer starts, which is what an event stream cannot
+tell it. The stamped values follow the pty ticker, so they lag a `cd` by up to a second.
+
+The fields cross the plugin API, so `event.proto` and its generated Rust are regenerated
+(`cargo xtask proto`), taking tags 32-34. `session-metadata.kdl` does not carry them, so a peer
+session read through that codec reports them as absent — the same limit the identity fields have.
 
 ### The socket directory is visible, and `ls` warns about sessions outside it
 

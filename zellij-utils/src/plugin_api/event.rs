@@ -1972,6 +1972,9 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             is_expanded_in_stack: protobuf_pane_info.is_expanded_in_stack,
             uuid: protobuf_pane_info.uuid,
             restored_from: protobuf_pane_info.restored_from,
+            pane_cwd: protobuf_pane_info.pane_cwd,
+            pane_pid: protobuf_pane_info.pane_pid,
+            pane_command: protobuf_pane_info.pane_command,
         })
     }
 }
@@ -2023,6 +2026,9 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             is_expanded_in_stack: pane_info.is_expanded_in_stack,
             uuid: pane_info.uuid,
             restored_from: pane_info.restored_from,
+            pane_cwd: pane_info.pane_cwd,
+            pane_pid: pane_info.pane_pid,
+            pane_command: pane_info.pane_command,
         })
     }
 }
@@ -3126,6 +3132,9 @@ fn serialize_session_update_event_with_non_default_values() {
             is_expanded_in_stack: true,
             uuid: String::new(),
             restored_from: String::new(),
+            pane_cwd: Some("/home/user/develop/thing".to_owned()),
+            pane_pid: Some(90210),
+            pane_command: Some("claude --resume".to_owned()),
         },
         PaneInfo {
             id: 1,
@@ -3159,6 +3168,10 @@ fn serialize_session_update_event_with_non_default_values() {
             is_expanded_in_stack: false,
             uuid: String::new(),
             restored_from: String::new(),
+            // a plugin pane has no process of its own
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
         },
     ];
     panes.insert(0, panes_list);

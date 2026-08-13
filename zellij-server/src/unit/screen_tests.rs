@@ -12448,3 +12448,116 @@ fn switching_tabs_is_not_a_change_to_the_tab_list() {
         "moving a tab changes it, so every tab's plugins hear about it"
     );
 }
+
+/// The last `PaneUpdate` manifest delivered to `plugin_id`, flattened into one list of panes.
+fn last_pane_update_for_plugin(
+    instructions: &[PluginInstruction],
+    plugin_id: u32,
+) -> Option<Vec<zellij_utils::data::PaneInfo>> {
+    let mut last = None;
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if pid != &Some(plugin_id) {
+                    continue;
+                }
+                if let Event::PaneUpdate(manifest) = event {
+                    last = Some(manifest.panes.values().flatten().cloned().collect());
+                }
+            }
+        }
+    }
+    last
+}
+
+#[test]
+pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let mut process_info = HashMap::new();
+    process_info.insert(
+        1,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: Some(std::path::PathBuf::from("/home/user/develop/thing")),
+            command: Some(vec!["claude".to_owned(), "--resume".to_owned()]),
+        },
+    );
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+    // any state change makes screen rebuild the manifest and report it
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let reported = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(reported.pane_pid, Some(90210));
+    assert_eq!(
+        reported.pane_cwd.as_deref(),
+        Some("/home/user/develop/thing")
+    );
+    assert_eq!(reported.pane_command.as_deref(), Some("claude --resume"));
+}
+
+#[test]
+pub fn a_pane_the_pty_said_nothing_about_reports_no_process_fields() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let reported = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(reported.pane_pid, None);
+    assert_eq!(reported.pane_cwd, None);
+    assert_eq!(reported.pane_command, None);
+}

@@ -2407,6 +2407,28 @@ pub struct PaneInfo {
     /// incarnation directly before it, not the whole chain. Use it to carry state across a restart
     /// deliberately - the new uuid is what stops that happening by accident.
     pub restored_from: String,
+    /// The working directory of the process running in this pane, if known
+    ///
+    /// Terminal panes only. It comes from the cache the pty thread refreshes once a second for
+    /// panes that produced output, so it lags a `cd` by up to a second and is `None` until the
+    /// first refresh. `Event::CwdChanged` is the push complement; this is the snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_cwd: Option<String>,
+    /// The pid of the process zellij started in this pane, if known
+    ///
+    /// Terminal panes only, and it is the pane's own child - the shell, not whatever the shell is
+    /// running. Walk down from it (`/proc/<pid>/task/<pid>/children` or the process table) to find
+    /// a tool running inside the pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_pid: Option<u32>,
+    /// The command running in this pane, if known, as a snapshot
+    ///
+    /// The foreground command when there is one, otherwise the pane's shell. Refreshed on the same
+    /// once-a-second cache as `pane_cwd`. `Event::CommandChanged` is the push complement, and is
+    /// the one to subscribe to for changes - this field exists so a consumer that has just started
+    /// does not have to wait for a command to change before it knows what is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_command: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -2416,12 +2438,6 @@ pub struct PaneListEntry {
     pub tab_id: usize,
     pub tab_position: usize,
     pub tab_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_pid: Option<i32>,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;

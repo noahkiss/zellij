@@ -198,6 +198,20 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+/// What the pty thread knows about the process it started in a terminal pane.
+///
+/// Everything here comes out of the caches `update_and_report_cwds` refreshes once a second for
+/// panes that produced output - reporting it to Screen costs a message, not a probe. This is the
+/// snapshot half of the pair whose push half is `Event::CwdChanged` / `Event::CommandChanged`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PaneProcessInfo {
+    /// The pid of the pane's own child - the shell, not what the shell is running.
+    pub pid: Option<u32>,
+    pub cwd: Option<PathBuf>,
+    /// The foreground command if there is one, otherwise the pane's shell.
+    pub command: Option<Vec<String>>,
+}
+
 pub(crate) struct Pty {
     pub active_panes: HashMap<ClientId, PaneId>,
     pub bus: Bus<PtyInstruction>,
@@ -2109,7 +2123,48 @@ impl Pty {
         }
     }
 
+    /// The once-a-second tick: refresh what the active panes are doing, then tell Screen.
     pub fn update_and_report_cwds(&mut self) {
+        self.refresh_cwds_and_commands();
+        self.report_pane_process_info();
+    }
+
+    /// Screen holds no pid, cwd or command of its own - it is told, from these caches, every tick.
+    ///
+    /// The whole map goes every time rather than only the panes that were active, because Screen
+    /// stamps every `PaneInfo` it builds and a pane that has been quiet for an hour still has a
+    /// pid. Building it touches no OS: it is a walk of three `HashMap`s the tick above just filled.
+    fn report_pane_process_info(&self) {
+        let process_info: HashMap<u32, PaneProcessInfo> = self
+            .id_to_child_pid
+            .keys()
+            .copied()
+            .map(|terminal_id| {
+                let foreground = self
+                    .terminal_foreground_cmds
+                    .get(&terminal_id)
+                    .filter(|cmd| !cmd.is_empty());
+                let command = foreground
+                    .or_else(|| self.terminal_cmds.get(&terminal_id))
+                    .filter(|cmd| !cmd.is_empty())
+                    .cloned();
+                (
+                    terminal_id,
+                    PaneProcessInfo {
+                        pid: self.id_to_child_pid.get(&terminal_id).copied(),
+                        cwd: self.terminal_cwds.get(&terminal_id).cloned(),
+                        command,
+                    },
+                )
+            })
+            .collect();
+        let _ = self
+            .bus
+            .senders
+            .send_to_screen(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+    }
+
+    fn refresh_cwds_and_commands(&mut self) {
         use std::sync::atomic::Ordering;
 
         let active_terminal_ids: Vec<u32> = self

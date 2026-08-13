@@ -512,6 +512,9 @@ message PaneInfo {
     bool is_expanded_in_stack = 29;
     string uuid = 30;
     string restored_from = 31;
+    optional string pane_cwd = 32;
+    optional uint32 pane_pid = 33;
+    optional string pane_command = 34;
 }
 
 message IndexInPaneGroup {

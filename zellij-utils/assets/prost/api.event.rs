@@ -693,6 +693,12 @@ pub struct PaneInfo {
     pub uuid: ::prost::alloc::string::String,
     #[prost(string, tag="31")]
     pub restored_from: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="32")]
+    pub pane_cwd: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag="33")]
+    pub pane_pid: ::core::option::Option<u32>,
+    #[prost(string, optional, tag="34")]
+    pub pane_command: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -90,7 +90,7 @@ use crate::{
     panes::sixel::SixelImageStore,
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction, PluginRenderAsset},
-    pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
+    pty::{get_default_shell, ClientTabIndexOrPaneId, PaneProcessInfo, PtyInstruction, VteBytes},
     pty_writer::PtyWriteInstruction,
     tab::{GuestChoiceIndicator, SuppressedPanes, Tab, CANNOT_STACK_WITHOUT_ANCHOR},
     thread_bus::Bus,
@@ -333,6 +333,9 @@ pub struct TabOverrideResult {
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
     PtyBytes(u32, VteBytes),
+    /// The pty thread's once-a-second report of what each terminal pane is running, keyed by
+    /// terminal id. Screen keeps it only to stamp `PaneInfo`.
+    UpdatePaneProcessInfo(HashMap<u32, PaneProcessInfo>),
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -949,6 +952,7 @@ impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
             ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::UpdatePaneProcessInfo(..) => ScreenContext::UpdatePaneProcessInfo,
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
             ScreenInstruction::RenderToClients => ScreenContext::RenderToClients,
@@ -1599,6 +1603,9 @@ pub(crate) struct Screen {
     nested_session_handling: NestedSessionHandling,
     last_mobile_state_sent: HashMap<ClientId, MobileStatePayload>,
     pane_output_activity: HashMap<PaneId, Instant>,
+    /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
+    /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
+    pane_process_info: HashMap<u32, PaneProcessInfo>,
     mobile_web_prefs: HashMap<ClientId, MobileWebPrefs>,
     bell_dwell: BellDwellTracker,
 }
@@ -1792,6 +1799,7 @@ impl Screen {
             nested_session_handling,
             last_mobile_state_sent: HashMap::new(),
             pane_output_activity: HashMap::new(),
+            pane_process_info: HashMap::new(),
             mobile_web_prefs: HashMap::new(),
             bell_dwell: {
                 let mut bell_dwell = BellDwellTracker::default();
@@ -5091,10 +5099,37 @@ impl Screen {
             .context("failed to update tabs")?;
         Ok(tab_infos_for_screen_state.values().cloned().collect())
     }
+    /// A tab's panes, with the fields only Screen can fill stamped onto them.
+    ///
+    /// `Tab` knows a pane's geometry and title; it does not know the pid, the cwd or the command,
+    /// which arrive from the pty thread on a tick. Every consumer of `PaneInfo` goes through here
+    /// so that none of them has to know that.
+    fn pane_infos_for_tab(&self, tab: &Tab) -> Vec<PaneInfo> {
+        let mut pane_infos = tab.pane_infos();
+        for pane_info in pane_infos.iter_mut() {
+            if pane_info.is_plugin {
+                continue;
+            }
+            if let Some(process_info) = self.pane_process_info.get(&pane_info.id) {
+                pane_info.pane_pid = process_info.pid;
+                pane_info.pane_cwd = process_info
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| cwd.display().to_string());
+                pane_info.pane_command = process_info
+                    .command
+                    .as_ref()
+                    .map(|command| command.join(" "));
+            }
+        }
+        pane_infos
+    }
     fn generate_and_report_pane_state(&mut self) -> Result<PaneManifest> {
         let mut pane_manifest = PaneManifest::default();
         for tab in self.tabs.values() {
-            pane_manifest.panes.insert(tab.position, tab.pane_infos());
+            pane_manifest
+                .panes
+                .insert(tab.position, self.pane_infos_for_tab(tab));
         }
         let mut plugin_updates = vec![];
         let client_ids: Vec<ClientId> = self.active_tab_ids.keys().copied().collect();
@@ -5140,9 +5175,6 @@ impl Screen {
                 tab_id: tab.id,
                 tab_position: tab.position,
                 tab_name: tab.name.clone(),
-                pane_command: None,
-                pane_cwd: None,
-                pane_pid: None,
             }
         }
 
@@ -5153,7 +5185,7 @@ impl Screen {
         let mut pane_entries = Vec::new();
 
         for tab in self.tabs.values() {
-            let pane_infos = tab.pane_infos();
+            let pane_infos = self.pane_infos_for_tab(tab);
 
             for pane_info in pane_infos {
                 if should_include_pane(&pane_info, show_all) {
@@ -8031,6 +8063,9 @@ pub(crate) fn screen_thread_main(
         let _resize_cache = ResizeCache::new(thread_senders.clone());
 
         match event {
+            ScreenInstruction::UpdatePaneProcessInfo(process_info) => {
+                screen.pane_process_info = process_info;
+            },
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
                 screen
                     .pane_output_activity

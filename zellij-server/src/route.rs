@@ -1753,12 +1753,7 @@ pub(crate) fn route_action(
             let maybe_panes =
                 request_panes_from_screen(&senders, show_all).with_context(err_context)?;
 
-            if let Some(mut pane_entries) = maybe_panes {
-                if show_command || show_all || output_json {
-                    enrich_panes_with_pty_data(&mut pane_entries, &senders)
-                        .with_context(err_context)?;
-                }
-
+            if let Some(pane_entries) = maybe_panes {
                 let output_lines = if output_json {
                     format_panes_as_json(&pane_entries)
                 } else {
@@ -3012,89 +3007,6 @@ fn request_current_tab_info_from_screen(
     }
 }
 
-fn enrich_panes_with_pty_data(
-    pane_entries: &mut [PaneListEntry],
-    senders: &ThreadSenders,
-) -> Result<()> {
-    for entry in pane_entries.iter_mut() {
-        if !entry.pane_info.is_plugin {
-            let pane_id = PaneId::Terminal(entry.pane_info.id);
-            enrich_pane_with_running_command(entry, pane_id, senders)?;
-            enrich_pane_with_cwd(entry, pane_id, senders)?;
-            enrich_pane_with_pid(entry, pane_id, senders)?;
-        }
-    }
-    Ok(())
-}
-
-fn enrich_pane_with_running_command(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPaneRunningCommandResponse;
-
-    let (cmd_sender, cmd_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPaneRunningCommand {
-        pane_id,
-        response_channel: cmd_sender,
-    })?;
-
-    if let Ok(GetPaneRunningCommandResponse::Ok(command_vec)) =
-        cmd_receiver.recv_timeout(Duration::from_millis(100))
-    {
-        entry.pane_command = Some(command_vec.join(" "));
-    }
-
-    Ok(())
-}
-
-fn enrich_pane_with_cwd(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPaneCwdResponse;
-
-    let (cwd_sender, cwd_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPaneCwd {
-        pane_id,
-        response_channel: cwd_sender,
-    })?;
-
-    if let Ok(GetPaneCwdResponse::Ok(cwd)) = cwd_receiver.recv_timeout(Duration::from_millis(100)) {
-        entry.pane_cwd = Some(cwd.to_string_lossy().to_string());
-    }
-
-    Ok(())
-}
-
-fn enrich_pane_with_pid(
-    entry: &mut PaneListEntry,
-    pane_id: PaneId,
-    senders: &ThreadSenders,
-) -> Result<()> {
-    use crossbeam::channel::unbounded;
-    use std::time::Duration;
-    use zellij_utils::data::GetPanePidResponse;
-
-    let (pid_sender, pid_receiver) = unbounded();
-    senders.send_to_pty(PtyInstruction::GetPanePid {
-        pane_id,
-        response_channel: pid_sender,
-    })?;
-
-    if let Ok(GetPanePidResponse::Ok(pid)) = pid_receiver.recv_timeout(Duration::from_millis(100)) {
-        entry.pane_pid = Some(pid);
-    }
-
-    Ok(())
-}
-
 fn format_panes_as_json(pane_entries: &[PaneListEntry]) -> Vec<String> {
     vec![serde_json::to_string_pretty(pane_entries).unwrap_or_else(|_| "[]".to_string())]
 }
@@ -3224,6 +3136,7 @@ fn format_pane_type(pane_info: &zellij_utils::data::PaneInfo) -> String {
 
 fn extract_command(entry: &PaneListEntry) -> String {
     entry
+        .pane_info
         .pane_command
         .as_ref()
         .or(entry.pane_info.terminal_command.as_ref())
@@ -3235,6 +3148,7 @@ fn extract_command(entry: &PaneListEntry) -> String {
 
 fn extract_cwd(entry: &PaneListEntry) -> String {
     entry
+        .pane_info
         .pane_cwd
         .as_ref()
         .map(|s| s.as_str())

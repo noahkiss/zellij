@@ -7287,6 +7287,10 @@ impl PaneInfo {
 
         let pane_info = PaneInfo {
             restored_from,
+            // not carried by `session-metadata.kdl` - see the note on `encode_to_kdl`
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
             id,
             is_plugin,
             is_focused,
@@ -7469,6 +7473,9 @@ fn serialize_and_deserialize_session_info_with_data() {
     let panes_list = vec![
         PaneInfo {
             restored_from: String::new(),
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -7502,6 +7509,9 @@ fn serialize_and_deserialize_session_info_with_data() {
         },
         PaneInfo {
             restored_from: String::new(),
+            pane_cwd: None,
+            pane_pid: None,
+            pane_command: None,
             id: 1,
             is_plugin: true,
             is_focused: true,
