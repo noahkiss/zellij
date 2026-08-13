@@ -18,8 +18,12 @@ permissions:
   contents: write
 
 jobs:
-  # Created up front so the three build jobs only ever upload to it — creating
-  # it from the matrix races and one of the jobs loses.
+  # Created up front so the build jobs only ever upload to it — creating it from
+  # the matrix races and one of the jobs loses. It is created as a DRAFT and
+  # published by `finalize` once every build has uploaded: a draft is invisible
+  # to anonymous readers, so nothing downstream (brew, the tap's bump workflow)
+  # can consume a release that is missing a platform. A leg that fails leaves the
+  # release unpublished rather than permanently half-built.
   create-release:
     runs-on: ubuntu-latest
     steps:
@@ -33,7 +37,7 @@ jobs:
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes ""
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "" --draft
 
   build:
     needs: create-release
@@ -93,11 +97,33 @@ jobs:
           tar czf "${asset}" -C "target/${{ matrix.target }}/release" zellij
           shasum -a 256 "${asset}" > "${asset}.sha256"
 
-      - name: Publish
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TAG }}
-          files: |
-            zellij-nkmk-${{ env.RELEASE_VERSION }}-${{ matrix.target }}.tar.gz
-            zellij-nkmk-${{ env.RELEASE_VERSION }}-${{ matrix.target }}.tar.gz.sha256
+      # `gh release upload` attaches assets without touching the release's draft
+      # state. The action this replaced PATCHed the release on every upload with
+      # a `draft` input defaulting to false, so the first leg to finish would
+      # publish the draft out from under the one still building.
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          asset="zellij-nkmk-${RELEASE_VERSION}-${{ matrix.target }}.tar.gz"
+          gh release upload "$RELEASE_TAG" "$asset" "${asset}.sha256" --clobber
+
+  # Every leg uploaded, so the release is complete and safe to expose. `needs`
+  # requires all matrix legs to have succeeded, and `fail-fast: false` means a
+  # failed leg still gets here as a skip, leaving the draft unpublished.
+  finalize:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ]; then
+            tag='${{ inputs.tag }}'
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          gh release edit "$tag" --draft=false

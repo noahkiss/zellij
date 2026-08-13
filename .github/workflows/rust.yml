@@ -7,11 +7,29 @@ name: Rust
 # the wall-clock floor for the whole workflow while testing a platform that is
 # never shipped. If a rebase brings them back, delete them again.
 
+# Documentation-only pushes are skipped. Verified before adding this: no crate pulls a
+# `.md` into the build (`include_str!`/`#![doc = include_str!]` appear nowhere), so a
+# markdown change cannot affect compilation or tests. Keep this list narrow - anything
+# that can reach the build must NOT be listed here.
+#
+# Consequence for the release pipeline: a docs-only push produces NO run, so
+# "push, wait for Rust green, then tag" has nothing to wait for. The version bump
+# touches Cargo.toml and always runs, so gate the tag on that push's run.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.md'
+      - 'docs/**'
+      - 'assets/**.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.md'
+      - 'docs/**'
+      - 'assets/**.md'
   workflow_dispatch:
 
 env:
