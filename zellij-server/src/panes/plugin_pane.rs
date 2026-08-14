@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 use crate::output::{CharacterChunk, KittyImageChunk, SixelImageChunk};
+use crate::pane_handles::HeldHandle;
 use crate::panes::{
     grid::Grid,
     kitty_graphics::KittyImageStore,
@@ -82,6 +83,8 @@ pub(crate) struct PluginPane {
     uuid: Uuid,
     /// Set when this pane was built from a serialized session - see `Pane::restored_from`
     restored_from: Option<String>,
+    /// Given at creation and kept across a snapshot restore - see `Pane::pane_handle`
+    handle: HeldHandle,
     pub should_render: HashMap<ClientId, bool>,
     pub selectable: bool,
     pub geom: PaneGeom,
@@ -143,6 +146,7 @@ impl PluginPane {
             pid,
             uuid: Uuid::new_v4(),
             restored_from: None,
+            handle: HeldHandle::claim_new(),
             should_render: HashMap::new(),
             selectable: true,
             geom: position_and_size,
@@ -552,6 +556,12 @@ impl Pane for PluginPane {
     }
     fn set_restored_from(&mut self, restored_from: Option<String>) {
         self.restored_from = restored_from;
+    }
+    fn pane_handle(&self) -> String {
+        self.handle.as_str().to_owned()
+    }
+    fn set_pane_handle(&mut self, handle: &str) {
+        self.handle = HeldHandle::claim(handle);
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {

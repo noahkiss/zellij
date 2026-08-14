@@ -1,0 +1,286 @@
+//! The session's live pane handles.
+//!
+//! A handle is unique among the panes alive in one session. A zellij server process serves exactly
+//! one session, so a process-global set IS the session's set - which is why this is a static
+//! rather than something threaded through the three dozen places a pane gets built.
+//!
+//! Claims are RAII: a pane owns a [`HeldHandle`], and closing the pane frees the name for reuse.
+//! Uniqueness is over LIVE panes only, deliberately. A handle is an address, and an address that
+//! could never be reissued would drain the word lists over a long-lived session.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use zellij_utils::pane_handle::generate_handle;
+
+/// Draws a handle nothing has spoken for.
+#[cfg(not(test))]
+fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
+    generate_handle(is_taken)
+}
+
+/// Under `cargo test` the draw walks the handle space in order instead of shuffling it.
+///
+/// A pane frame shows its handle, and a great many tests snapshot a rendered frame. A random
+/// address would make every one of those a coin toss, so a test session's panes are named in the
+/// order they are built. The counter is per thread because that is the unit a test runs on - one
+/// test's panes are numbered from zero whatever its siblings are doing in parallel.
+///
+/// The randomness this stands in for is tested where it lives, in
+/// `zellij_utils::pane_handle`; what this module is responsible for - uniqueness among live panes,
+/// reservation, release on close - is the same either way.
+#[cfg(test)]
+fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
+    use std::cell::Cell;
+    use zellij_utils::pane_handle::{handle_space_size, nth_handle};
+    thread_local! {
+        static NEXT: Cell<usize> = const { Cell::new(0) };
+    }
+    NEXT.with(|next| {
+        for _ in 0..handle_space_size() {
+            let candidate = nth_handle(next.get());
+            next.set(next.get() + 1);
+            if !is_taken(&candidate) {
+                return candidate;
+            }
+        }
+        generate_handle(is_taken)
+    })
+}
+
+/// What a name in the registry is spoken for by.
+#[derive(Debug, PartialEq, Eq)]
+enum Claim {
+    /// A live pane answers to it.
+    Held,
+    /// A layout about to be applied carries it, and the pane that will hold it does not exist yet.
+    ///
+    /// Reserved names are invisible to a snapshot's own panes and opaque to everyone else: a
+    /// freshly generated handle rerolls around them, a restoring pane walks in and takes the one
+    /// meant for it. This is what "snapshot handles win" is made of.
+    Reserved,
+}
+
+#[cfg(not(test))]
+fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Claim>>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Under `cargo test` the registry is per thread, so each test gets a session of its own.
+///
+/// A test thread IS a session here: one test builds its panes, names them, and drops them without
+/// any other test's panes existing as far as it is concerned. Sharing one registry across a test
+/// binary would make the handles a pane is given depend on what its siblings happen to be doing in
+/// parallel - which a test that snapshots a rendered frame cannot live with, since the frame shows
+/// the handle. Everything this module promises is per session anyway, so scoping it to the thread
+/// weakens nothing the tests are checking.
+#[cfg(test)]
+fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
+    thread_local! {
+        static REGISTRY: &'static Mutex<HashMap<String, Claim>> =
+            Box::leak(Box::new(Mutex::new(HashMap::new())));
+    }
+    REGISTRY.with(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    })
+}
+
+/// Whether a name is out of the generator's reach: held by a live pane, or reserved for one.
+///
+/// Reserved counts, and that is the whole reservation mechanism - a name a layout is about to
+/// restore a pane under must not be handed to a pane built in the meantime.
+fn is_spoken_for(registry: &HashMap<String, Claim>, candidate: &str) -> bool {
+    registry.contains_key(candidate)
+}
+
+/// A handle held by a live pane, freed when that pane drops.
+#[derive(Debug)]
+pub struct HeldHandle(String);
+
+impl HeldHandle {
+    /// Takes a handle no live pane answers to and no pending layout has reserved.
+    pub fn claim_new() -> Self {
+        let mut registry = registry();
+        let handle = draw_handle(|candidate| is_spoken_for(&registry, candidate));
+        registry.insert(handle.clone(), Claim::Held);
+        HeldHandle(handle)
+    }
+
+    /// Takes `wanted` if it is free or reserved for this pane, and a fresh handle if it is not.
+    ///
+    /// The fallback is what keeps the invariant "every pane has a handle, and no two live panes
+    /// share one" true even for a snapshot that somehow names the same handle twice. Restoring a
+    /// session must not fail because two panes want the same name; one of them just gets a new one.
+    pub fn claim(wanted: &str) -> Self {
+        let mut registry = registry();
+        if registry.get(wanted) != Some(&Claim::Held) {
+            registry.insert(wanted.to_owned(), Claim::Held);
+            return HeldHandle(wanted.to_owned());
+        }
+        drop(registry);
+        HeldHandle::claim_new()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for HeldHandle {
+    fn drop(&mut self) {
+        registry().remove(&self.0);
+    }
+}
+
+/// Names a layout carries, held out of the generator's reach until its panes are built.
+///
+/// Without this, a handle-less pane earlier in the same layout could be handed a name that a later
+/// pane is about to restore under, and the restoring pane - the one with the prior claim - would be
+/// the one to reroll. Reserving first inverts that: the snapshot's names are spoken for before the
+/// first pane is built.
+///
+/// A restore is a session-wide event, not a tab-wide one: it announces every tab before the first
+/// tab's panes exist. So one reservation grows across all of them ([`Reservation::extend`]) and is
+/// released once, when the last tab has been applied. A per-tab reservation would leave a
+/// handle-less pane in tab 1 free to take a name tab 3 is coming back under.
+#[derive(Debug, Default)]
+pub struct Reservation(Vec<String>);
+
+impl Reservation {
+    /// Reserves each handle that is not already held by a live pane.
+    pub fn hold(handles: impl IntoIterator<Item = String>) -> Self {
+        let mut reservation = Reservation::default();
+        reservation.extend(handles);
+        reservation
+    }
+
+    /// Adds more names to this reservation, on the same terms.
+    pub fn extend(&mut self, handles: impl IntoIterator<Item = String>) {
+        let mut registry = registry();
+        for handle in handles {
+            if !registry.contains_key(handle.as_str()) {
+                registry.insert(handle.clone(), Claim::Reserved);
+                self.0.push(handle);
+            }
+        }
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // Releases only what is still merely reserved. A name a pane has since claimed is that
+        // pane's to free, so a layout that fails halfway leaves nothing stranded either way.
+        let mut registry = registry();
+        for handle in &self.0 {
+            if registry.get(handle.as_str()) == Some(&Claim::Reserved) {
+                registry.remove(handle.as_str());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name for a test to claim that no drawn handle can ever collide with.
+    ///
+    /// The registry is per thread under `cargo test`, so a sibling test cannot reach it - but a
+    /// draw made *within* one of these tests still can, and `claim` takes any string. A name the
+    /// generator cannot produce keeps each test about the one thing it is testing.
+    fn reserved_for_tests(name: &str) -> String {
+        format!("test~{}", name)
+    }
+
+    #[test]
+    fn two_live_panes_never_share_a_handle() {
+        let held: Vec<HeldHandle> = (0..200).map(|_| HeldHandle::claim_new()).collect();
+        let mut names: Vec<&str> = held.iter().map(|h| h.as_str()).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "a handle was handed out twice");
+    }
+
+    #[test]
+    fn a_closed_panes_handle_comes_back_into_circulation() {
+        let name = {
+            let handle = HeldHandle::claim_new();
+            handle.as_str().to_owned()
+        };
+        // the pane is gone, so the name is free for the taking - uniqueness is over LIVE panes
+        let reclaimed = HeldHandle::claim(&name);
+        assert_eq!(reclaimed.as_str(), name);
+    }
+
+    #[test]
+    fn a_snapshot_handle_is_taken_verbatim() {
+        let wanted = reserved_for_tests("verbatim");
+        let restored = HeldHandle::claim(&wanted);
+        assert_eq!(restored.as_str(), wanted);
+    }
+
+    #[test]
+    fn a_snapshot_handle_a_live_pane_already_holds_falls_back() {
+        let wanted = reserved_for_tests("contended");
+        let _live = HeldHandle::claim(&wanted);
+        let second = HeldHandle::claim(&wanted);
+        assert_ne!(
+            second.as_str(),
+            wanted,
+            "two live panes answered to the same handle"
+        );
+    }
+
+    #[test]
+    fn a_reserved_handle_is_kept_for_the_pane_restoring_under_it() {
+        // the ordering this exists for: a handle-less pane is built first, and must not be given
+        // the name a later pane in the same layout is coming back under
+        let wanted = reserved_for_tests("reserved");
+        let reservation = Reservation::hold([wanted.clone()]);
+        assert!(
+            is_spoken_for(&registry(), &wanted),
+            "the generator would hand out a reserved handle"
+        );
+        let restored = HeldHandle::claim(&wanted);
+        assert_eq!(restored.as_str(), wanted);
+        drop(reservation);
+        // the reservation must not have freed the name the restored pane went on to claim
+        assert_eq!(registry().get(&wanted), Some(&Claim::Held));
+    }
+
+    #[test]
+    fn one_reservation_covers_every_tab_of_a_restore() {
+        // the cross-tab ordering: a restore announces all its tabs before any tab's panes exist,
+        // so the later tab's names must already be out of the generator's reach
+        let first_tab = reserved_for_tests("tab-one");
+        let last_tab = reserved_for_tests("tab-three");
+        let mut reservation = Reservation::hold([first_tab.clone()]);
+        reservation.extend([last_tab.clone()]);
+        assert!(is_spoken_for(&registry(), &last_tab));
+        // the pane built for tab 1 cannot be handed tab 3's name, so tab 3 gets it verbatim
+        let restored = HeldHandle::claim(&last_tab);
+        assert_eq!(restored.as_str(), last_tab);
+        drop(reservation);
+        assert_eq!(registry().get(&last_tab), Some(&Claim::Held));
+        assert_eq!(
+            registry().get(&first_tab),
+            None,
+            "never claimed, so released"
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_reservation_is_released() {
+        // a layout that never builds the pane must not leave the name spoken for forever
+        let wanted = reserved_for_tests("unclaimed");
+        drop(Reservation::hold([wanted.clone()]));
+        assert_eq!(registry().get(&wanted), None);
+    }
+}

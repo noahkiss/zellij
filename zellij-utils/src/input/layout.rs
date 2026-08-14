@@ -803,6 +803,13 @@ pub struct FloatingPaneLayout {
     /// other half of that: it says WHICH pane it continues, so a consumer that wants the link can
     /// make it deliberately. Empty for a pane that was never restored.
     pub restored_from: Option<String>,
+    /// The handle this pane answers to, when it was built from a serialized session.
+    ///
+    /// Unlike `restored_from`, this one CARRIES: the restored pane keeps the handle, because a
+    /// handle is an address and an address that changed when the session came back would not be
+    /// one. `None` for a hand-written layout and for a snapshot saved before handles existed - the
+    /// pane then gets a fresh handle at restore, never an empty one.
+    pub pane_handle: Option<String>,
 }
 
 impl FloatingPaneLayout {
@@ -823,6 +830,7 @@ impl FloatingPaneLayout {
             default_fg: None,
             default_bg: None,
             restored_from: None,
+            pane_handle: None,
         }
     }
     pub fn add_cwd_to_layout(&mut self, cwd: &PathBuf) {
@@ -876,9 +884,27 @@ pub struct TiledPaneLayout {
     /// other half of that: it says WHICH pane it continues, so a consumer that wants the link can
     /// make it deliberately. Empty for a pane that was never restored.
     pub restored_from: Option<String>,
+    /// The handle this pane answers to, when it was built from a serialized session.
+    ///
+    /// Unlike `restored_from`, this one CARRIES: the restored pane keeps the handle, because a
+    /// handle is an address and an address that changed when the session came back would not be
+    /// one. `None` for a hand-written layout and for a snapshot saved before handles existed - the
+    /// pane then gets a fresh handle at restore, never an empty one.
+    pub pane_handle: Option<String>,
 }
 
 impl TiledPaneLayout {
+    /// Every handle this layout and its descendants carry.
+    ///
+    /// The applier reserves these before it builds the first pane, so a handle-less pane in the
+    /// same layout cannot be handed a name a later pane is restoring under.
+    pub fn pane_handles(&self) -> Vec<String> {
+        let mut handles: Vec<String> = self.pane_handle.iter().cloned().collect();
+        for child in &self.children {
+            handles.extend(child.pane_handles());
+        }
+        handles
+    }
     pub fn insert_children_layout(
         &mut self,
         children_layout: &mut TiledPaneLayout,

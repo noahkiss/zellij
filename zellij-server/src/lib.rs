@@ -8,6 +8,7 @@ mod os_input_output_windows;
 pub mod host_query;
 pub mod os_input_output;
 pub mod output;
+mod pane_handles;
 pub mod panes;
 pub mod tab;
 
