@@ -534,16 +534,21 @@ impl SessionLayoutMetadata {
             }
         }
     }
-    /// Rewrites the recorded command of any pane a `resurrect_command_hints` entry applies to, so
-    /// that the resurrected pane offers to resume the tool's session instead of starting a new one.
+    /// Appends resume arguments to the recorded command of any pane a `resurrect_command_hints`
+    /// entry applies to, so that the resurrected pane offers to resume the tool's session instead
+    /// of starting a new one.
+    ///
+    /// The observed command line is kept whole - path, arguments and all. A hint only adds, so a
+    /// resurrected pane always offers a command the pane really ran.
     ///
     /// `read_env` is the seam over the platform: it is handed a terminal id and a variable name and
     /// returns the value found in that pane's processes. Everything the hints decide is here;
     /// everything about processes is on the other side of that closure.
     ///
     /// A pane is left exactly as it was whenever anything does not line up - no hint matches, the
-    /// variable is not set, the template holds no command. There is no failure mode: a hint that
-    /// does not resolve gives the same snapshot the feature would have produced by not existing.
+    /// variable is not set, the observed arguments already resume. There is no failure mode: a hint
+    /// that does not resolve gives the same snapshot the feature would have produced by not
+    /// existing.
     pub fn apply_resurrect_command_hints<F>(
         &mut self,
         hints: &ResurrectCommandHints,
@@ -572,23 +577,23 @@ impl SessionLayoutMetadata {
                 let Some(env_value) = read_env(terminal_id, &hint.env) else {
                     continue;
                 };
-                let Some((command, args)) = hint.expand(&env_value) else {
+                let Some(extra_args) = hint.resume_args_for(&run_command.args, &env_value) else {
                     log::debug!(
-                        "resurrect_command_hints {:?}: rewrite {:?} holds no command",
+                        "resurrect_command_hints {:?}: resume_args {:?} add nothing to the observed \
+                         command of terminal {}",
                         hint.name,
-                        hint.rewrite
+                        hint.resume_args,
+                        terminal_id
                     );
                     continue;
                 };
-                let mut rewritten = RunCommand::new(PathBuf::from(command));
-                rewritten.args = args;
-                rewritten.cwd = run_command.cwd.clone();
-                rewritten.hold_on_close = run_command.hold_on_close;
-                rewritten.hold_on_start = run_command.hold_on_start;
+                let mut rewritten = run_command.clone();
+                rewritten.args.extend(extra_args);
                 log::debug!(
-                    "resurrect_command_hints {:?}: recording {:?} for terminal {}",
+                    "resurrect_command_hints {:?}: recording {:?} {:?} for terminal {}",
                     hint.name,
                     rewritten.command,
+                    rewritten.args,
                     terminal_id
                 );
                 pane.run = Some(Run::Command(rewritten));
@@ -1087,13 +1092,13 @@ mod tests {
 
     fn hints(entries: &[(&str, &str, &str)]) -> ResurrectCommandHints {
         let mut hints = ResurrectCommandHints::default();
-        for (match_command, env, rewrite) in entries {
+        for (match_command, env, resume_args) in entries {
             hints.push(
                 zellij_utils::resurrect_command_hints::ResurrectCommandHint {
                     name: match_command.to_string(),
                     match_command: match_command.to_string(),
                     env: env.to_string(),
-                    rewrite: rewrite.to_string(),
+                    resume_args: resume_args.to_string(),
                 },
             );
         }
@@ -1114,38 +1119,73 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_a_matching_command_when_the_variable_is_found() {
+    fn appends_resume_args_when_the_variable_is_found() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec![])]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         match get_first_tiled_run(&meta) {
             Some(Run::Command(rc)) => {
                 assert_eq!(rc.command, PathBuf::from("claude"));
-                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()]);
+                assert_eq!(rc.args, vec!["--continue".to_owned()]);
             },
             other => panic!("expected Command, got {:?}", other),
         }
     }
 
+    /// The regression: a hint used to REPLACE the command line, so the recorded command lost the
+    /// path and every flag the pane really ran. What comes back must be the observed argv plus the
+    /// resume flag, and nothing else.
     #[test]
-    fn matches_a_command_by_its_basename() {
+    fn keeps_the_observed_path_and_arguments() {
         let mut meta = session_with_panes(vec![make_command_pane(
             1,
             "/opt/homebrew/bin/claude",
-            vec!["--verbose"],
+            vec!["--dangerously-skip-permissions"],
         )]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         match get_first_tiled_run(&meta) {
             Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("/opt/homebrew/bin/claude"));
+                assert_eq!(
+                    rc.args,
+                    vec![
+                        "--dangerously-skip-permissions".to_owned(),
+                        "--continue".to_owned()
+                    ]
+                );
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    /// A pane that already ran a resume flag is recorded exactly as it ran. The environment value
+    /// is a detector here, and must not become a second, contradictory resume argument.
+    #[test]
+    fn observed_arguments_that_already_resume_are_left_alone() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "claude",
+            vec!["--dangerously-skip-permissions", "--continue"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(Some("an-internal-session-id")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
                 assert_eq!(rc.command, PathBuf::from("claude"));
-                // the recorded arguments are replaced, not appended to - the rewrite is the whole
-                // command line the resurrected pane offers
-                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()]);
+                assert_eq!(
+                    rc.args,
+                    vec![
+                        "--dangerously-skip-permissions".to_owned(),
+                        "--continue".to_owned()
+                    ]
+                );
             },
             other => panic!("expected Command, got {:?}", other),
         }
@@ -1155,7 +1195,7 @@ mod tests {
     fn leaves_the_command_alone_when_the_variable_is_missing() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["--verbose"])]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(None),
         );
         match get_first_tiled_run(&meta) {
@@ -1172,7 +1212,7 @@ mod tests {
         let mut meta = session_with_panes(vec![make_command_pane(1, "htop", vec![])]);
         let mut reads = 0;
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             |_terminal_id, _var| {
                 reads += 1;
                 Some("abc-123".to_owned())
@@ -1189,11 +1229,7 @@ mod tests {
     fn expands_a_placeholder_that_sits_in_an_argument() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "opencode", vec![])]);
         meta.apply_resurrect_command_hints(
-            &hints(&[(
-                "opencode",
-                "OPENCODE_SESSION_ID",
-                "opencode --session={} --continue",
-            )]),
+            &hints(&[("opencode", "OPENCODE_SESSION_ID", "--session={} --continue")]),
             env_always(Some("xyz")),
         );
         match get_first_tiled_run(&meta) {
@@ -1230,14 +1266,14 @@ mod tests {
         pane.run = None;
         let mut meta = session_with_panes(vec![pane]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         assert_eq!(get_first_tiled_run(&meta), None);
     }
 
     #[test]
-    fn floating_panes_are_rewritten_too() {
+    fn floating_panes_get_resume_args_too() {
         let mut meta = SessionLayoutMetadata::default();
         meta.add_tab(
             "tab1".to_string(),
@@ -1247,12 +1283,12 @@ mod tests {
             vec![make_command_pane(1, "claude", vec![])],
         );
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         match meta.tabs[0].floating_panes[0].run.as_ref() {
             Some(Run::Command(rc)) => {
-                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()])
+                assert_eq!(rc.args, vec!["--continue".to_owned()])
             },
             other => panic!("expected Command, got {:?}", other),
         }
