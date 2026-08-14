@@ -333,8 +333,10 @@ pub struct SigningRun {
 /// 4. Verify the copy twice before it is allowed near the pinned path. A signature that did not
 ///    take leaves the working pin untouched instead of replacing it with a broken one.
 /// 5. `rename(2)` last, which is atomic and cannot fail against a running server.
-/// 6. Re-stamp the source hash, or the next `session up` calls the signed pin stale and copies
-///    over the signature within the minute.
+/// 6. Nothing re-stamps, and nothing has to. The stamp beside the pin names the hash of the
+///    SOURCE binary, which signing does not touch - so the next `session up` still finds the pin
+///    current and does not copy over the signature. Writing the pin's own hash there instead is
+///    the mistake that undoes this whole file within a minute.
 ///
 /// A failure anywhere is a `Needs you` naming the recovery, never a fatal error: doctor has other
 /// checks to make and a machine that cannot sign is still a machine worth reporting on.
