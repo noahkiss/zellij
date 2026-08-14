@@ -1,17 +1,19 @@
-//! The CLI described to itself: the grouped, convention-first `zellij action --help`.
+//! The CLI described to itself: the grouped `zellij action --help`, and `--dump-surface`.
 //!
 //! Both readers here are agents rather than people. An agent that has to discover the surface one
 //! `--help` at a time reads a subcommand's name, guesses the rest, and gets it wrong - that is the
 //! failure this module exists to answer. So the command tree is walked rather than transcribed:
-//! the one-liner beside each name is read out of the parser that will handle the call, and only
-//! what clap cannot know - which verbs belong together - is written down here.
+//! everything clap knows (names, arguments, types, defaults, help) is read out of the parser that
+//! will handle the call, and only what clap cannot know (which verbs belong together, what a
+//! command prints) is written down here.
 //!
 //! What is written down is guarded by the tests at the bottom: a new `CliAction` variant that
 //! nobody grouped fails the build, rather than quietly going missing from the map.
 
-use clap::{Command as ClapCommand, CommandFactory, FromArgMatches};
+use clap::{ArgAction, Command as ClapCommand, CommandFactory, FromArgMatches};
 
 use crate::cli::CliArgs;
+use crate::consts::VERSION;
 
 /// A band of `zellij action` verbs that answer the same kind of question.
 pub struct ActionGroup {
@@ -144,6 +146,138 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
     },
 ];
 
+/// What a command puts on stdout, for the commands that put anything there.
+///
+/// The one thing clap cannot introspect. A command absent from this table prints nothing when it
+/// succeeds - that is the fork's default, not an omission - so the dump says so rather than
+/// leaving the reader to guess.
+struct OutputSpec {
+    /// The command path, without the leading `zellij `.
+    command: &'static str,
+    /// `record`, `table`, `outline` or `payload` - the shapes of the output convention.
+    shape: &'static str,
+    /// The keys of a record, or the columns of a table, in the order they are printed.
+    keys: &'static str,
+}
+
+const OUTPUTS: &[OutputSpec] = &[
+    OutputSpec {
+        command: "action current-tab-info",
+        shape: "record",
+        keys: "name id position",
+    },
+    OutputSpec {
+        command: "action dump-layout",
+        shape: "payload",
+        keys: "",
+    },
+    OutputSpec {
+        command: "action dump-screen",
+        shape: "payload",
+        keys: "",
+    },
+    OutputSpec {
+        command: "action list-clients",
+        shape: "table",
+        keys: "CLIENT_ID PANE_ID COMMAND TTY SIZE CURRENT",
+    },
+    OutputSpec {
+        command: "action list-panes",
+        shape: "table",
+        keys: "TAB_ID TAB_POS TAB_NAME PANE_ID HANDLE TYPE TITLE COMMAND",
+    },
+    OutputSpec {
+        command: "action list-tabs",
+        shape: "table",
+        keys: "TAB_ID POSITION NAME",
+    },
+    OutputSpec {
+        command: "action list-tree",
+        shape: "outline",
+        keys: "tab_id position name active / handle pane_id title command focused",
+    },
+    OutputSpec {
+        command: "action new-pane",
+        shape: "record",
+        keys: "pane_id handle",
+    },
+    OutputSpec {
+        command: "action edit",
+        shape: "record",
+        keys: "pane_id handle",
+    },
+    OutputSpec {
+        command: "action launch-plugin",
+        shape: "record",
+        keys: "pane_id handle",
+    },
+    OutputSpec {
+        command: "action launch-or-focus-plugin",
+        shape: "record",
+        keys: "pane_id handle",
+    },
+    OutputSpec {
+        command: "action new-tab",
+        shape: "record",
+        keys: "tab_id",
+    },
+    OutputSpec {
+        command: "action break-pane",
+        shape: "record",
+        keys: "tab_id",
+    },
+    OutputSpec {
+        command: "action close-pane",
+        shape: "record",
+        keys: "closed",
+    },
+    OutputSpec {
+        command: "action close-tab",
+        shape: "record",
+        keys: "closed",
+    },
+    OutputSpec {
+        command: "action close-tab-by-id",
+        shape: "record",
+        keys: "closed",
+    },
+    OutputSpec {
+        command: "action go-to-tab",
+        shape: "record",
+        keys: "from to",
+    },
+    OutputSpec {
+        command: "action go-to-tab-by-id",
+        shape: "record",
+        keys: "from to",
+    },
+    OutputSpec {
+        command: "action go-to-tab-name",
+        shape: "record",
+        keys: "from to id",
+    },
+    OutputSpec {
+        command: "action focus-pane-id",
+        shape: "record",
+        keys: "from to",
+    },
+    OutputSpec {
+        command: "action move-tab",
+        shape: "record",
+        keys: "from to",
+    },
+    OutputSpec {
+        command: "action are-floating-panes-visible",
+        shape: "payload",
+        keys: "",
+    },
+    OutputSpec {
+        command: "ls",
+        shape: "table",
+        keys: "NAME STATUS CURRENT CLIENTS CREATED",
+    },
+];
+
 /// The conventions, said once, at the top of `zellij action --help`.
 pub const ACTION_PREAMBLE: &str = "\
 Send an action to a session: the one you are in, or the one `--session` names.
@@ -168,7 +302,10 @@ A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means 
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
 assigned when the pane is created, it survives a session restore, and `list-panes` prints it.
 
-  zellij action dump-screen --pane-id sunny-otter";
+  zellij action dump-screen --pane-id sunny-otter
+
+`zellij setup --dump-surface` prints this whole command tree - every command, flag and output
+shape - in one call.";
 
 /// One line per command, grouped, for the body of `zellij action --help`.
 ///
@@ -238,6 +375,225 @@ pub fn parse_cli_args() -> CliArgs {
     }
 }
 
+/// The whole command tree, in the fork's outline convention.
+///
+/// One record per command, deepest path spelled out in full, so a reader can grep for the command
+/// it wants and get the flags with it.
+pub fn dump_surface_text() -> String {
+    let cmd = CliArgs::command();
+    let mut out = String::new();
+    out.push_str(&format!("version: {}\n", VERSION));
+    out.push_str("convention: record is `key: value` lines, list is a table with an UPPER_SNAKE header, nesting is an indented outline\n");
+    out.push_str("exit: 0 acted or found  1 error  2 miss\n");
+    out.push_str("prints: a command with no `prints:` line prints nothing when it succeeds\n");
+    out.push_str("pane_target: terminal_1 | plugin_2 | 3 | sunny-otter (handle) | uuid\n");
+    out.push('\n');
+    for command in walk(&cmd) {
+        out.push_str(&command_record(&command));
+    }
+    out
+}
+
+/// The same map, structured, for a program rather than an agent reading a shell.
+pub fn dump_surface_json() -> String {
+    let cmd = CliArgs::command();
+    let commands: Vec<serde_json::Value> = walk(&cmd)
+        .iter()
+        .map(|c| {
+            let output = OUTPUTS.iter().find(|o| o.command == c.path);
+            serde_json::json!({
+                "command": c.path,
+                "group": c.group,
+                "about": c.about,
+                "aliases": c.aliases,
+                "json": c.args.iter().any(|a| a.name == "--json"),
+                "prints": output.map(|o| o.shape),
+                "keys": output.map(|o| o.keys).filter(|k| !k.is_empty()),
+                "args": c.args.iter().map(|a| serde_json::json!({
+                    "name": a.name,
+                    "positional": a.positional,
+                    "type": a.kind,
+                    "required": a.required,
+                    "repeatable": a.repeatable,
+                    "default": a.default,
+                    "about": a.about,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let document = serde_json::json!({
+        "version": VERSION,
+        "convention": {
+            "record": "key: value lines",
+            "list": "table with an UPPER_SNAKE header row",
+            "nesting": "indented outline",
+            "append_only": true,
+            "exit": {"0": "acted or found", "1": "error", "2": "miss"},
+            "silent_on_success": "a command with no `prints` prints nothing",
+            "pane_target": ["terminal_1", "plugin_2", "3", "sunny-otter (handle)", "uuid"],
+        },
+        "commands": commands,
+    });
+    serde_json::to_string_pretty(&document).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
+}
+
+struct SurfaceCommand {
+    path: String,
+    group: Option<&'static str>,
+    about: String,
+    aliases: Vec<String>,
+    args: Vec<SurfaceArg>,
+}
+
+struct SurfaceArg {
+    name: String,
+    positional: bool,
+    kind: String,
+    required: bool,
+    repeatable: bool,
+    default: Option<String>,
+    about: String,
+}
+
+/// Every command in the tree, leaves and branches alike, in the order clap declares them.
+fn walk(root: &ClapCommand) -> Vec<SurfaceCommand> {
+    let mut root = root.clone();
+    root.build();
+    let mut found = Vec::new();
+    for sub in root.get_subcommands() {
+        collect(sub, "", &mut found);
+    }
+    found
+}
+
+fn collect(cmd: &ClapCommand, prefix: &str, found: &mut Vec<SurfaceCommand>) {
+    if cmd.is_hide_set() || cmd.get_name() == "help" {
+        return;
+    }
+    let path = if prefix.is_empty() {
+        cmd.get_name().to_owned()
+    } else {
+        format!("{} {}", prefix, cmd.get_name())
+    };
+    found.push(SurfaceCommand {
+        group: group_of(&path),
+        about: cmd
+            .get_about()
+            .map(|a| one_line(&a.to_string()))
+            .unwrap_or_default(),
+        aliases: cmd
+            .get_visible_aliases()
+            .map(|a| a.to_owned())
+            .collect::<Vec<_>>(),
+        args: cmd.get_arguments().filter_map(surface_arg).collect(),
+        path,
+    });
+    let path = found.last().map(|c| c.path.clone()).unwrap_or_default();
+    for sub in cmd.get_subcommands() {
+        collect(sub, &path, found);
+    }
+}
+
+fn group_of(path: &str) -> Option<&'static str> {
+    let name = path.strip_prefix("action ")?;
+    ACTION_GROUPS
+        .iter()
+        .find(|g| g.commands.contains(&name))
+        .map(|g| g.name)
+}
+
+fn surface_arg(arg: &clap::Arg) -> Option<SurfaceArg> {
+    if arg.is_hide_set() || arg.get_id() == "help" || arg.get_id() == "version" {
+        return None;
+    }
+    let name = if arg.is_positional() {
+        arg.get_id().to_string()
+    } else if let Some(long) = arg.get_long() {
+        format!("--{}", long)
+    } else if let Some(short) = arg.get_short() {
+        format!("-{}", short)
+    } else {
+        arg.get_id().to_string()
+    };
+    let kind_is_flag = matches!(
+        arg.get_action(),
+        ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
+    );
+    let kind = match arg.get_action() {
+        ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count => "flag".to_owned(),
+        _ => match arg.get_possible_values() {
+            values if !values.is_empty() => values
+                .iter()
+                .map(|v| v.get_name().to_owned())
+                .collect::<Vec<_>>()
+                .join("|"),
+            _ => "value".to_owned(),
+        },
+    };
+    Some(SurfaceArg {
+        positional: arg.is_positional(),
+        kind,
+        required: arg.is_required_set(),
+        repeatable: matches!(arg.get_action(), ArgAction::Append),
+        // a flag's default is its absence, and printing `default: false` on ninety of them buries
+        // the handful of defaults that are worth knowing
+        default: if kind_is_flag {
+            None
+        } else {
+            arg.get_default_values()
+                .first()
+                .map(|v| v.to_string_lossy().into_owned())
+        },
+        about: arg
+            .get_help()
+            .map(|h| one_line(&h.to_string()))
+            .unwrap_or_default(),
+        name,
+    })
+}
+
+fn command_record(command: &SurfaceCommand) -> String {
+    let mut out = format!("command: zellij {}", command.path);
+    if let Some(group) = command.group {
+        out.push_str(&format!("  group: {}", group));
+    }
+    if !command.aliases.is_empty() {
+        out.push_str(&format!("  aliases: {}", command.aliases.join(" ")));
+    }
+    out.push('\n');
+    if !command.about.is_empty() {
+        out.push_str(&format!("  about: {}\n", command.about));
+    }
+    if let Some(output) = OUTPUTS.iter().find(|o| o.command == command.path) {
+        out.push_str(&format!("  prints: {}", output.shape));
+        if !output.keys.is_empty() {
+            out.push_str(&format!("  keys: {}", output.keys));
+        }
+        out.push('\n');
+    }
+    for arg in &command.args {
+        out.push_str(&format!("  arg: {}  type: {}", arg.name, arg.kind));
+        if arg.positional {
+            out.push_str("  positional: true");
+        }
+        if arg.required {
+            out.push_str("  required: true");
+        }
+        if arg.repeatable {
+            out.push_str("  repeatable: true");
+        }
+        if let Some(default) = &arg.default {
+            out.push_str(&format!("  default: {}", default));
+        }
+        if !arg.about.is_empty() {
+            out.push_str(&format!("  about: {}", arg.about));
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
 /// Help text is written over several lines; a record line holds one.
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -256,6 +612,15 @@ fn indent(text: &str, by: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// One record of the dump, spelled out: the snapshot half of `the_dump_is_the_shape_it_says_it_is`.
+#[cfg(test)]
+const EXPECTED_LIST_TREE_RECORD: &str = concat!(
+    "command: zellij action list-tree  group: read\n",
+    "  about: List every tab with its panes nested beneath it\n",
+    "  prints: outline  keys: tab_id position name active / handle pane_id title command focused\n",
+    "  arg: --json  type: flag  about: Output as JSON",
+);
 
 #[cfg(test)]
 mod tests {
@@ -328,6 +693,120 @@ mod tests {
     }
 
     #[test]
+    fn the_dump_carries_every_command_and_its_flags() {
+        let dump = on_big_stack(dump_surface_text);
+        for name in action_subcommand_names() {
+            assert!(
+                dump.contains(&format!("command: zellij action {}  group:", name)),
+                "`{}` is missing from the dump",
+                name
+            );
+        }
+        // the generated half tracks clap: a flag nobody dumped cannot hide
+        assert!(dump.contains("command: zellij action list-panes  group: read"));
+        assert!(dump.contains("  arg: --json  type: flag"));
+        assert!(dump.contains("  prints: table  keys: TAB_ID TAB_POS"));
+        assert!(dump.contains("command: zellij setup"));
+        assert!(dump.contains("command: zellij session up"));
+    }
+
+    #[test]
+    fn every_flag_of_a_command_reaches_the_dump() {
+        // the shape is a contract, and the contract is "all of it": walk one busy command's
+        // arguments out of clap and require each one by name
+        let dump = on_big_stack(dump_surface_text);
+        let names = on_big_stack(|| {
+            let mut cmd = CliArgs::command();
+            cmd.build();
+            let names = cmd
+                .get_subcommands()
+                .find(|s| s.get_name() == "action")
+                .unwrap()
+                .get_subcommands()
+                .find(|s| s.get_name() == "new-pane")
+                .unwrap()
+                .get_arguments()
+                .filter(|a| !a.is_hide_set() && a.get_id() != "help")
+                .map(|a| {
+                    a.get_long()
+                        .map(|l| format!("--{}", l))
+                        .unwrap_or_else(|| a.get_id().to_string())
+                })
+                .collect::<Vec<_>>();
+            names
+        });
+        assert!(names.len() > 20, "new-pane should have a lot of flags");
+        let record = dump
+            .split("\n\n")
+            .find(|r| r.starts_with("command: zellij action new-pane"))
+            .expect("new-pane is in the dump");
+        for name in names {
+            assert!(
+                record.contains(&format!("  arg: {}  type:", name)),
+                "`{}` is missing from new-pane's record",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn the_dump_is_the_shape_it_says_it_is() {
+        // the snapshot: the grammar of the whole document, and one record spelled out. Snapshotting
+        // all eight hundred lines would make every help edit a snapshot update, which is how a
+        // snapshot stops being read - so what is pinned here is the shape a parser depends on
+        let dump = on_big_stack(dump_surface_text);
+        let (header, records) = dump.split_once("\n\n").expect("a header, then the records");
+        assert_eq!(
+            header
+                .lines()
+                .map(|l| l.split_once(": ").unwrap().0)
+                .collect::<Vec<_>>(),
+            vec!["version", "convention", "exit", "prints", "pane_target"]
+        );
+        for line in records.lines().filter(|l| !l.is_empty()) {
+            let known = line.starts_with("command: zellij ")
+                || line.starts_with("  about: ")
+                || line.starts_with("  prints: ")
+                || line.starts_with("  arg: ");
+            assert!(
+                known,
+                "the dump grew a line shape nobody parses: {:?}",
+                line
+            );
+        }
+        let list_tree = records
+            .split("\n\n")
+            .find(|r| r.starts_with("command: zellij action list-tree"))
+            .expect("list-tree is in the dump");
+        assert_eq!(list_tree, EXPECTED_LIST_TREE_RECORD);
+    }
+
+    #[test]
+    fn the_json_dump_is_the_same_map_structured() {
+        let json: serde_json::Value =
+            serde_json::from_str(&on_big_stack(dump_surface_json)).expect("the dump is JSON");
+        let commands = json["commands"].as_array().expect("commands is an array");
+        let list_panes = commands
+            .iter()
+            .find(|c| c["command"] == "action list-panes")
+            .expect("list-panes is in the dump");
+        assert_eq!(list_panes["group"], "read");
+        assert_eq!(list_panes["json"], true);
+        assert_eq!(list_panes["prints"], "table");
+        let close_pane = commands
+            .iter()
+            .find(|c| c["command"] == "action close-pane")
+            .expect("close-pane is in the dump");
+        assert_eq!(close_pane["prints"], "record");
+        assert_eq!(close_pane["keys"], "closed");
+        let write = commands
+            .iter()
+            .find(|c| c["command"] == "action write")
+            .expect("write is in the dump");
+        assert!(write["prints"].is_null(), "write prints nothing");
+    }
+
+    #[test]
     fn the_grouped_help_names_the_conventions_once() {
         let listing = on_big_stack(|| {
             let mut cmd = CliArgs::command();
@@ -345,5 +824,6 @@ mod tests {
         assert!(listing.contains("list-panes"));
         assert!(ACTION_PREAMBLE.contains("Exit 0 acted or found, 1 error, 2 miss"));
         assert!(ACTION_PREAMBLE.contains("sunny-otter"));
+        assert!(ACTION_PREAMBLE.contains("--dump-surface"));
     }
 }
