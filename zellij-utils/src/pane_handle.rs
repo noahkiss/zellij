@@ -104,13 +104,29 @@ mod tests {
 
     #[test]
     fn a_taken_handle_is_rerolled_around() {
-        // the collision rule in one test: whatever the first draw was, the generator must not
-        // return it while the predicate says it is spoken for
-        let first = generate_handle(|_| false);
-        let taken = first.clone();
-        let second = generate_handle(|candidate| candidate == taken);
-        assert_ne!(second, first);
-        assert!(is_handle_shaped(&second));
+        // refuse the first three distinct draws and accept the fourth: a generator that ignored
+        // the predicate would hand back a name it was just told is spoken for
+        let refused = std::cell::RefCell::new(HashSet::new());
+        let handle = generate_handle(|candidate| {
+            let mut refused = refused.borrow_mut();
+            if refused.len() < 3 {
+                refused.insert(candidate.to_owned());
+                return true;
+            }
+            false
+        });
+        let refused = refused.into_inner();
+        assert_eq!(
+            refused.len(),
+            3,
+            "the predicate was not consulted three times"
+        );
+        assert!(
+            !refused.contains(&handle),
+            "handed out a handle the predicate refused: {}",
+            handle
+        );
+        assert!(is_handle_shaped(&handle));
     }
 
     #[test]

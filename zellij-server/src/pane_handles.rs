@@ -34,6 +34,14 @@ fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether a name is out of the generator's reach: held by a live pane, or reserved for one.
+///
+/// Reserved counts, and that is the whole reservation mechanism - a name a layout is about to
+/// restore a pane under must not be handed to a pane built in the meantime.
+fn is_spoken_for(registry: &HashMap<String, Claim>, candidate: &str) -> bool {
+    registry.contains_key(candidate)
+}
+
 /// A handle held by a live pane, freed when that pane drops.
 #[derive(Debug)]
 pub struct HeldHandle(String);
@@ -42,7 +50,7 @@ impl HeldHandle {
     /// Takes a handle no live pane answers to and no pending layout has reserved.
     pub fn claim_new() -> Self {
         let mut registry = registry();
-        let handle = generate_handle(|candidate| registry.contains_key(candidate));
+        let handle = generate_handle(|candidate| is_spoken_for(&registry, candidate));
         registry.insert(handle.clone(), Claim::Held);
         HeldHandle(handle)
     }
@@ -157,14 +165,10 @@ mod tests {
         // the ordering this exists for: a handle-less pane is built first, and must not be given
         // the name a later pane in the same layout is coming back under
         let reservation = Reservation::hold(["merry-narwhal".to_owned()]);
-        for _ in 0..200 {
-            let fresh = HeldHandle::claim_new();
-            assert_ne!(
-                fresh.as_str(),
-                "merry-narwhal",
-                "the generator handed out a reserved handle"
-            );
-        }
+        assert!(
+            is_spoken_for(&registry(), "merry-narwhal"),
+            "the generator would hand out a reserved handle"
+        );
         let restored = HeldHandle::claim("merry-narwhal");
         assert_eq!(restored.as_str(), "merry-narwhal");
         drop(reservation);

@@ -7433,6 +7433,7 @@ impl Screen {
                         default_fg,
                         default_bg,
                         Some(p.pane_uuid().to_string()),
+                        Some(p.pane_handle()),
                     )
                 })
                 .collect();
@@ -7475,6 +7476,7 @@ impl Screen {
                         default_fg,
                         default_bg,
                         Some(p.pane_uuid().to_string()),
+                        Some(p.pane_handle()),
                     )
                 })
                 .collect();
