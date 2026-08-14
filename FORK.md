@@ -153,6 +153,12 @@ commands. And a `new-pane --block-until-exit` prints no `pane_id:` at all: the e
 answer, only one message reaches the CLI, and a caller parsing for the id would wait for a line
 that never comes.
 
+The blocking flags are not one thing, and the difference matters to a script. `--block-until-exit`
+and its `-success`/`-failure` siblings wait for the **command**; bare `-b/--blocking` waits for the
+**pane**. A pane whose command has ended is held open by default, so `-b` — and a `-success` wait a
+failing command never satisfies — keeps waiting until something closes the pane. Add
+`--close-on-exit` when the script wants the status and not the pane.
+
 ## The patch queue
 
 ### Plugin hot-reload (`plugin_watch`, default **on**)
