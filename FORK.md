@@ -308,6 +308,31 @@ is trusted to mean it. And because that variable is written when a pane is spawn
 updated in a shell that is already running — so after `zellij action rename-session`, panes that
 predate the rename read as outside the session until they are replaced.
 
+### Text on stdin: `write-chars` and `paste`
+
+```
+cat prompt.txt | zellij action write-chars --pane-id sunny-otter
+zellij action paste --pane-id sunny-otter -    # `-` reads stdin even from a terminal
+```
+
+The text these two write is a positional argument, and both now do without it: given none, they
+read stdin to EOF. Text that reaches a pane through an argument is escaped twice — once for the
+shell that types the command, once for the shell in the pane — and a multi-line prompt or a here-doc
+does not survive that. A pipe carries it as it is, newlines and quotes included.
+
+- **No argument and a pipe** reads the pipe. **No argument and a terminal** is an error, exit 1,
+  rather than a command that appears to hang while it waits for a Ctrl-D nobody expected.
+- **`-` always reads stdin**, terminal or not. It is how you say you meant it.
+- **Empty stdin writes nothing and exits 2** — a well-formed request that changed nothing, which is
+  what a miss is everywhere else in the fork.
+- **The bound is 1 MiB**, and more than that is an error, exit 1. The text is delivered as
+  keystrokes, so the pane's program reads every byte of it: the bound is what keeps a mistyped
+  redirect from wedging a shell.
+- Not valid UTF-8 is an error, exit 1, naming `zellij action write` as the command that takes raw
+  bytes.
+- The read happens after the refusal above, so a `write-chars` with no `--pane-id` from outside a
+  pane is refused without draining the pipe.
+
 ### Pane handles
 
 Every pane carries a two-word handle — `sunny-otter` — assigned when the pane is created and unique

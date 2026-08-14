@@ -804,6 +804,42 @@ pub(crate) fn subscribe_to_session(
     );
 }
 
+/// The text for a `write-chars` or a `paste` that was not given any on the command line.
+///
+/// Piping is the way multi-line text gets into a pane without being escaped twice - once for this
+/// shell and once for the pane's. So no positional means stdin, and an explicit `-` means stdin
+/// even from a terminal, where reading it would otherwise be a hang nobody asked for.
+///
+/// Every exit here is the command's own: 1 for text that cannot be sent, 2 for a stdin that carried
+/// nothing, which is a request that would change nothing.
+fn text_for(chars: Option<String>, verb: &str) -> String {
+    use std::io::IsTerminal;
+    match chars {
+        Some(chars) if chars != "-" => chars,
+        given => {
+            if given.is_none() && std::io::stdin().is_terminal() {
+                eprintln!(
+                    "`{}` needs text: pass it as an argument, or pipe it in. \
+                     `{} -` reads this terminal.",
+                    verb, verb
+                );
+                std::process::exit(1);
+            }
+            match zellij_utils::cli::text_from_stdin(std::io::stdin().lock(), verb) {
+                Ok(text) if text.is_empty() => {
+                    eprintln!("Nothing arrived on stdin, so `{}` wrote nothing.", verb);
+                    std::process::exit(2);
+                },
+                Ok(text) => text,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(1);
+                },
+            }
+        },
+    }
+}
+
 fn attach_with_cli_client(
     cli_action: zellij_utils::cli::CliAction,
     session_name: &str,
@@ -862,6 +898,23 @@ fn attach_with_cli_client(
         eprintln!("{}", message);
         std::process::exit(1);
     }
+    // the text these two write can come from stdin. It is read here, after the refusals above, so a
+    // call that was never going to reach a pane does not drain the pipe on its way out
+    let cli_action = match cli_action {
+        zellij_utils::cli::CliAction::WriteChars { chars, pane_id } => {
+            zellij_utils::cli::CliAction::WriteChars {
+                chars: Some(text_for(chars, "write-chars")),
+                pane_id,
+            }
+        },
+        zellij_utils::cli::CliAction::Paste { chars, pane_id } => {
+            zellij_utils::cli::CliAction::Paste {
+                chars: Some(text_for(chars, "paste")),
+                pane_id,
+            }
+        },
+        other => other,
+    };
     match Action::actions_from_cli(
         cli_action,
         Box::new(get_current_dir),

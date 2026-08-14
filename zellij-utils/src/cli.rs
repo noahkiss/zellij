@@ -976,9 +976,12 @@ pub enum CliAction {
     /// Write text into a pane, as if it had been typed
     ///
     /// No newline is added: `send-keys Enter` is how you submit what you wrote.
+    ///
+    /// With no text and something piped in, the text is read from stdin to EOF - so a multi-line
+    /// prompt goes in without shell escaping. Exits 2 if what arrives is empty.
     WriteChars {
-        /// The text to write
-        chars: String,
+        /// The text to write. Leave it out, or pass `-`, to read it from stdin instead (1 MiB max)
+        chars: Option<String>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
         /// in its PANE_ID and HANDLE columns. Without this, the focused pane
@@ -989,9 +992,12 @@ pub enum CliAction {
     ///
     /// The pane's program is told the text was pasted rather than typed, which is what keeps an
     /// editor from auto-indenting it and a shell from running each line as it arrives.
+    ///
+    /// With no text and something piped in, the text is read from stdin to EOF - so a file goes in
+    /// without shell escaping. Exits 2 if what arrives is empty.
     Paste {
-        /// The text to paste
-        chars: String,
+        /// The text to paste. Leave it out, or pass `-`, to read it from stdin instead (1 MiB max)
+        chars: Option<String>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
         /// in its PANE_ID and HANDLE columns. Without this, the focused pane
@@ -2258,6 +2264,42 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
         .unwrap()
 }
 
+/// The most text `write-chars` and `paste` will take from stdin, in bytes.
+///
+/// A megabyte is far more than anyone types and far less than a file that was piped in by mistake.
+/// The text is delivered to the pane as keystrokes, so the pane's program reads all of it: a bound
+/// here is what keeps `zellij action paste < some.iso` from being a way to wedge a shell.
+pub const MAX_STDIN_TEXT_BYTES: usize = 1024 * 1024;
+
+/// The text a `write-chars` or a `paste` was given on stdin, bounded and checked.
+///
+/// `Ok("")` is not an error here - an empty stdin is a well-formed request that writes nothing, and
+/// the caller is what turns it into the miss it is. Both errors are the caller's exit 1: text that
+/// is not text, and text past the bound.
+pub fn text_from_stdin<R: std::io::Read>(reader: R, verb: &str) -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    // one byte past the bound, so a file exactly at it still passes and anything longer is caught
+    // without reading the rest of it
+    std::io::Read::take(reader, MAX_STDIN_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("`{}` could not read stdin: {}", verb, e))?;
+    if bytes.len() > MAX_STDIN_TEXT_BYTES {
+        return Err(format!(
+            "`{}` reads at most {} bytes from stdin, and this is more than that. \
+             Send it in pieces, or write the file into the pane's program another way.",
+            verb, MAX_STDIN_TEXT_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "`{}` writes text, and what arrived on stdin is not valid UTF-8. \
+             `zellij action write` takes raw bytes.",
+            verb
+        )
+    })
+}
+
 /// Whether a command that acts on "the focused thing" has been given something to act on.
 ///
 /// A `zellij action` client is not attached to anything. It has no focus of its own, so the server
@@ -2742,6 +2784,55 @@ mod tests {
             let action = parse_action(&args);
             assert_eq!(missing_target_from_outside_a_pane(&action, false), None);
         }
+    }
+
+    #[test]
+    fn write_chars_and_paste_take_their_text_or_leave_it_to_stdin() {
+        for verb in ["write-chars", "paste"] {
+            let with_text = parse_action(&[verb, "hello"]);
+            let from_stdin = parse_action(&[verb]);
+            let explicit = parse_action(&[verb, "-"]);
+            let text = |action: &CliAction| match action {
+                CliAction::WriteChars { chars, .. } | CliAction::Paste { chars, .. } => {
+                    chars.clone()
+                },
+                other => panic!("Expected {}, got {:?}", verb, other),
+            };
+            assert_eq!(text(&with_text), Some("hello".to_owned()));
+            assert_eq!(text(&from_stdin), None);
+            assert_eq!(text(&explicit), Some("-".to_owned()));
+        }
+    }
+
+    #[test]
+    fn stdin_text_arrives_whole() {
+        // multi-line, and nothing added or trimmed: what was piped is what the pane is typed
+        let piped = "first line\nsecond line\n";
+        assert_eq!(
+            text_from_stdin(piped.as_bytes(), "write-chars"),
+            Ok(piped.to_owned())
+        );
+        // the negative control: an empty pipe is not an error here, it is the caller's miss
+        assert_eq!(text_from_stdin(&b""[..], "write-chars"), Ok(String::new()));
+    }
+
+    #[test]
+    fn stdin_text_stops_at_the_bound() {
+        let at_the_bound = vec![b'x'; MAX_STDIN_TEXT_BYTES];
+        assert!(text_from_stdin(&at_the_bound[..], "paste").is_ok());
+        let one_past = vec![b'x'; MAX_STDIN_TEXT_BYTES + 1];
+        let message = text_from_stdin(&one_past[..], "paste").expect_err("past the bound");
+        assert!(
+            message.contains(&MAX_STDIN_TEXT_BYTES.to_string()),
+            "{}",
+            message
+        );
+    }
+
+    #[test]
+    fn stdin_that_is_not_text_says_which_command_takes_bytes() {
+        let message = text_from_stdin(&[0xff, 0xfe][..], "write-chars").expect_err("not utf-8");
+        assert!(message.contains("write"), "{}", message);
     }
 
     #[test]

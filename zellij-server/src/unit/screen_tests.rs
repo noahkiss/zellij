@@ -2601,7 +2601,7 @@ pub fn send_cli_write_chars_action_to_screen() {
         pty_writer_receiver
     );
     let cli_action = CliAction::WriteChars {
-        chars: "input from the cli".into(),
+        chars: Some("input from the cli".into()),
         pane_id: None,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);

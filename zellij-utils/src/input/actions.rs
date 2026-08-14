@@ -784,34 +784,42 @@ impl Action {
                     is_kitty_keyboard_protocol: false,
                 }]),
             },
-            CliAction::WriteChars { chars, pane_id } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
-                            chars,
-                            pane_id: parsed_pane_id,
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::WriteChars { chars }]),
+            // the text is optional on the command line because stdin can carry it; the CLI has
+            // already read it by the time the action is built, and an empty one never gets here
+            CliAction::WriteChars { chars, pane_id } => {
+                let chars = chars.unwrap_or_default();
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
+                                chars,
+                                pane_id: parsed_pane_id,
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::WriteChars { chars }]),
+                }
             },
-            CliAction::Paste { chars, pane_id } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::Paste {
-                            chars,
-                            pane_id: Some(parsed_pane_id),
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::Paste {
-                    chars,
-                    pane_id: None,
-                }]),
+            CliAction::Paste { chars, pane_id } => {
+                let chars = chars.unwrap_or_default();
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::Paste {
+                                chars,
+                                pane_id: Some(parsed_pane_id),
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::Paste {
+                        chars,
+                        pane_id: None,
+                    }]),
+                }
             },
             CliAction::SendKeys { keys, pane_id } => {
                 let mut actions = Vec::new();
