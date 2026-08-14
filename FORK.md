@@ -1484,6 +1484,12 @@ judges a terminal-launched process against the terminal's grants, while a pane i
 domain and is attributed to the server's executable. They are skipped when the session is down,
 where the answers would be this terminal's.
 
+Full Disk Access is asked by OPENING the user's `TCC.db` for one byte. `[ -r ]` calls `access(2)`,
+which reads the permission bits, while TCC refuses at `open(2)` — so a test on the bits answers
+"readable" on a machine holding no grant at all. A database that is not there is reported as
+unknown rather than as a refusal, and neither the pane nor the client that opens it can outlast the
+probe's five-second deadline: a client talking to a wedged server never returns on its own.
+
 #### Signing the pinned copy (macOS)
 
 macOS keys a grant for a non-bundled program to an absolute path plus a code requirement. An
@@ -1498,11 +1504,12 @@ Four rungs, first hit wins:
 2. **Apple Development** — the requirement is written by hand, anchored on `subject.OU`. Never on
    the CN: the CN carries an email that changes on reissue and differs between two of one person's
    machines, while the OU is the team id and is the same everywhere that Apple ID is. Timestamped.
-3. **One we mint**, kept in `~/Library/Application Support/zellij/signing/`, with a copy of `id.p12`
-   in zellij's resolved config directory. Minted **once**: its own hash is the requirement, so a
-   second certificate voids every grant recorded against the first — a keychain that lost it is
-   re-imported from the bundle rather than given a new one. Not timestamped; Apple's server needs a
-   real chain, so the attempt falls back and says which.
+3. **One we mint**, kept 0700/0600 in `~/Library/Application Support/zellij/signing/`, with a copy
+   of `id.p12` in zellij's resolved config directory — and a copy that could not be written is a
+   `Needs you`, because the bundle carries no passphrase and cannot be minted a second time. Minted
+   **once**: its own hash is the requirement, so a second certificate voids every grant recorded
+   against the first — a keychain that lost it is re-imported from the bundle rather than given a
+   new one. Never timestamped: Apple's server needs a real chain and would only refuse.
 4. **Nothing** — the Xcode steps, as a `Needs you`.
 
 Nothing is ever signed ad-hoc: that anchors on the code hash, which is the fault under a new name.
@@ -1514,6 +1521,10 @@ answer.
 The identifier is the constant `org.zellij.nkmk`. **Changing it voids every grant on every machine**,
 because it is part of the requirement macOS recorded — which is why it is a constant and not a
 setting.
+
+On the two timestamped rungs the attempt can still fail — an offline machine has no timestamp
+server — and the signature is then made without one and the report says so, quoting the refusal. A
+signature that silently carries no timestamp looks exactly like one that was never asked for.
 
 The round trip is a copy, a sign, two verifications and a rename. `codesign` writes in place and a
 running server holds the pin open, so an in-place sign fails `ETXTBSY` exactly when a session is up.
