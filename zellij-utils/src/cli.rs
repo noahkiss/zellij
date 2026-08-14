@@ -1034,12 +1034,21 @@ pub enum CliAction {
     ///
     /// Returns: `from:` and `to:` lines, each `<pane_id> <handle>`. A jump that landed where it
     /// started prints only `to:`. A target no live pane answers to exits 2
+    ///
+    /// With --no-focus this is an existence probe instead, the same one `go-to-tab-name` has: the
+    /// exit code is 0 either way, and stdout is the answer - `id:` and `handle:` if the pane is
+    /// there, nothing at all if it is not
     #[clap(visible_alias = "go-to-pane")]
     FocusPaneId {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
         /// in its PANE_ID and HANDLE columns
         pane_id: String,
+        /// Leave focus where it is and only report what the target names. Read stdout for the
+        /// answer: `id:` and `handle:` mean the pane is there, empty means it is not. The exit
+        /// code stays 0 for both
+        #[clap(long, value_parser)]
+        no_focus: bool,
     },
     /// Move focus back to the pane it was on before the current one
     FocusLastPane,
@@ -2539,6 +2548,24 @@ mod tests {
             "--signal",
             "term"
         ]));
+    }
+
+    #[test]
+    fn go_to_pane_takes_no_focus() {
+        // the same probe flag `go-to-tab-name` has, on the alias people reach for
+        let action = parse_action(&["go-to-pane", "sunny-otter", "--no-focus"]);
+        match action {
+            CliAction::FocusPaneId { pane_id, no_focus } => {
+                assert_eq!(pane_id, "sunny-otter");
+                assert!(no_focus);
+            },
+            other => panic!("Expected FocusPaneId, got {:?}", other),
+        }
+        // and the negative control: without the flag it is the jump it always was
+        match parse_action(&["go-to-pane", "sunny-otter"]) {
+            CliAction::FocusPaneId { no_focus, .. } => assert!(!no_focus),
+            other => panic!("Expected FocusPaneId, got {:?}", other),
+        }
     }
 
     #[test]

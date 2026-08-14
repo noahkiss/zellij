@@ -1297,7 +1297,11 @@ message CloseFocusByPaneIdAction { PaneId pane_id = 1; }
 message RenamePaneByPaneIdAction { PaneId pane_id = 1; bytes name = 2; }
 message UndoRenamePaneByPaneIdAction { PaneId pane_id = 1; }
 message TogglePanePinnedByPaneIdAction { PaneId pane_id = 1; }
-message FocusPaneByPaneIdAction { PaneId pane_id = 1; }
+message FocusPaneByPaneIdAction {
+  PaneId pane_id = 1;
+  // the existence probe: resolve the pane and report it, but leave focus where it is
+  bool no_focus = 2;
+}
 
 // Tab-targeting action messages
 message UndoRenameTabByTabIdAction { uint64 id = 1; }

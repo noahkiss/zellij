@@ -469,6 +469,8 @@ mod tests {
     fn an_ordinary_action_is_answered_by_the_unblock() {
         // the negative control: everything that is not a blocking pane is done when the server says
         // the input is free again, and must not be left waiting for a report that never comes
-        assert!(!action_answers_with_its_own_report(&Action::ToggleFloatingPanes));
+        assert!(!action_answers_with_its_own_report(
+            &Action::ToggleFloatingPanes
+        ));
     }
 }

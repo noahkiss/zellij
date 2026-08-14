@@ -428,16 +428,30 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::FocusPaneByPaneId { pane_id } => {
-            senders
-                .send_to_screen(ScreenInstruction::FocusPaneWithId(
-                    pane_id.into(),
-                    true,  // should_float_if_hidden
-                    false, // should_be_in_place_if_hidden
-                    client_id,
-                    Some(NotificationEnd::new(completion_tx)),
-                ))
-                .with_context(err_context)?;
+        Action::FocusPaneByPaneId { pane_id, no_focus } => {
+            if no_focus {
+                // the probe: nothing moves, and the answer is whether a live pane answers to this
+                // target and what it is called. A pane that is not there is not a miss here - the
+                // question was whether it exists, and an empty answer is the answer
+                let mut notification_end = NotificationEnd::new(completion_tx);
+                if let Some(handle) = handle_of_pane(&senders, pane_id.into()) {
+                    notification_end.set_stdout_lines(vec![
+                        format!("id: {}", pane_id),
+                        format!("handle: {}", handle),
+                    ]);
+                }
+                drop(notification_end);
+            } else {
+                senders
+                    .send_to_screen(ScreenInstruction::FocusPaneWithId(
+                        pane_id.into(),
+                        true,  // should_float_if_hidden
+                        false, // should_be_in_place_if_hidden
+                        client_id,
+                        Some(NotificationEnd::new(completion_tx)),
+                    ))
+                    .with_context(err_context)?;
+            }
         },
         Action::FocusLastPane => {
             senders

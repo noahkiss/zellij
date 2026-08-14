@@ -365,6 +365,19 @@ landed as `<pane_id> <handle>` — the pane mirror of what `go-to-tab` prints. A
 where it started prints only `to:` and exits 0. A target no live pane answers to exits 2 with the
 resolver's own sentence.
 
+`--no-focus` turns it into the existence probe `go-to-tab-name` already had, which is what a handle
+written down last week needs before anything is aimed at it:
+
+```
+$ zellij action go-to-pane sunny-otter --no-focus
+id: terminal_0
+handle: sunny-otter
+```
+
+Nothing moves, and the exit code is 0 whether or not the pane is there — stdout is the whole answer,
+and it is empty for a pane that is gone. A target that names no pane in any form is still malformed
+input and still exits 1.
+
 ### `attach --no-resurrect`
 
 ```

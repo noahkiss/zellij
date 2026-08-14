@@ -14166,6 +14166,7 @@ pub fn jumping_to_a_pane_reports_where_focus_came_from_and_where_it_landed() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(1),
+            no_focus: false,
         },
         client_id,
     );
@@ -14192,6 +14193,7 @@ pub fn jumping_to_the_pane_you_are_already_in_reports_only_where_you_are() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(0),
+            no_focus: false,
         },
         client_id,
     );
@@ -14227,6 +14229,7 @@ pub fn jumping_to_a_pane_that_is_not_there_is_a_miss() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(9),
+            no_focus: false,
         },
         client_id,
     );
