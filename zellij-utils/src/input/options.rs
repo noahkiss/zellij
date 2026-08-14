@@ -245,15 +245,15 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub builtin_plugin_dir: Option<PathBuf>,
-    /// Say so in the session when Full Disk Access is missing (macOS only, true or false).
+    /// Warn the session when Full Disk Access is missing (macOS only, true or false).
     ///
-    /// Opt-in, because the notice is only meaningful where the user has decided zellij should
+    /// Opt-in, because the warning is only meaningful where the user has decided zellij should
     /// have that permission - and on that machine the permission being absent IS the actionable
     /// fact, whether or not it was ever granted before.
     #[clap(skip)]
     #[serde(default)]
     pub expect_full_disk_access: Option<bool>,
-    /// Say so in the session when the server is running a superseded build (true or false,
+    /// Warn the session when the server is running a superseded build (true or false,
     /// default true).
     #[clap(skip)]
     #[serde(default)]

@@ -83,7 +83,7 @@ use crate::panes::nested_session_modal::GuestModalShortcuts;
 use crate::panes::terminal_character::AnsiCode;
 use crate::panes::terminal_pane::{BRACKETED_PASTE_BEGIN, BRACKETED_PASTE_END};
 use crate::session_layout_metadata::{PaneLayoutMetadata, SessionLayoutMetadata};
-use crate::status_notices::StatusNotices;
+use zellij_utils::data::SessionWarning;
 
 use crate::{
     nested_guest::NestedGuestTracker,
@@ -627,8 +627,8 @@ pub enum ScreenInstruction {
     /// attaching to one - reach `Screen` through different messages, and the tty is equally true
     /// of both. `None` is a client with no controlling terminal.
     SetClientTty(ClientId, Option<String>),
-    /// Re-ask the questions the status overlay answers - both can change under a running server.
-    RecheckStatusNotices,
+    /// Re-ask the session-wide warning questions - both can change under a running server.
+    RecheckSessionWarnings,
     RemoveClient(ClientId),
     UpdateSearch(Vec<u8>, ClientId, Option<NotificationEnd>),
     SearchDown(ClientId, Option<NotificationEnd>),
@@ -1162,7 +1162,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ToggleTab(..) => ScreenContext::ToggleTab,
             ScreenInstruction::AddClient(..) => ScreenContext::AddClient,
             ScreenInstruction::SetClientTty(..) => ScreenContext::SetClientTty,
-            ScreenInstruction::RecheckStatusNotices => ScreenContext::RecheckStatusNotices,
+            ScreenInstruction::RecheckSessionWarnings => ScreenContext::RecheckSessionWarnings,
             ScreenInstruction::RemoveClient(..) => ScreenContext::RemoveClient,
             ScreenInstruction::UpdateSearch(..) => ScreenContext::UpdateSearch,
             ScreenInstruction::SearchDown(..) => ScreenContext::SearchDown,
@@ -1574,11 +1574,9 @@ pub(crate) struct Screen {
     client_sizes: HashMap<ClientId, Size>,
     /// The terminal device each client is attached to, for the session's client list
     client_ttys: HashMap<ClientId, String>,
-    /// What the server is currently telling every client about the session, drawn over the
-    /// top-right of the viewport
-    status_notices: StatusNotices,
-    /// How many rows the last drawn notices covered, so they can be repainted when they go away
-    status_notice_rows_drawn: usize,
+    /// What the server is currently telling every client about the session, carried to the bars
+    /// on `ModeInfo`
+    session_warnings: Vec<SessionWarning>,
     global_last_active_tab_id: usize,
     tab_history: BTreeMap<ClientId, Vec<usize>>,
     pane_history: BTreeMap<ClientId, Vec<PaneId>>,
@@ -1878,8 +1876,7 @@ impl Screen {
             active_tab_ids: BTreeMap::new(),
             client_sizes: HashMap::new(),
             client_ttys: HashMap::new(),
-            status_notices: StatusNotices::default(),
-            status_notice_rows_drawn: 0,
+            session_warnings: vec![],
             global_last_active_tab_id: 0,
             tabs: BTreeMap::new(),
             last_single_pane_tab_names: HashMap::new(),
@@ -2449,53 +2446,49 @@ impl Screen {
         self.client_sizes.insert(client_id, size);
     }
 
-    /// Re-ask the questions the overlay answers. `true` when the answer changed and a frame is due.
+    /// Re-ask the session-wide questions and, when an answer changed, hand every bar the new set.
     ///
-    /// Both notices are session-global and the config decides whether each is wanted at all: the
-    /// FDA one is opt-in, because only the user knows whether they mean zellij to have that
-    /// permission, and the stale-build one is on unless it is turned off.
-    /// Composite the session's notices over the top-right, after the panes have drawn.
+    /// Both are session-global and the config decides whether each is wanted at all: the FDA one is
+    /// opt-in, because only the user knows whether they mean zellij to have that permission, and
+    /// the stale-build one is on unless it is turned off.
     ///
-    /// Last, so an alt-screen application repainting underneath cannot clobber them, and into the
-    /// output rather than into any pane's grid, so `dump-screen` and every transcript consumer see
-    /// what they saw before.
-    fn draw_status_notices(&mut self, output: &mut Output) {
-        let client_ids: Vec<ClientId> = self
-            .connected_clients
-            .borrow()
-            .keys()
-            .filter(|client_id| !self.watcher_clients.contains_key(client_id))
-            .copied()
-            .collect();
-        let mut rows_now = 0;
+    /// The answers ride `ModeInfo`, which is the only thing every bar already reads and which
+    /// already reaches every tab's plugins. Nothing else about the mode has changed, so the
+    /// broadcast is the same shape as `update_all_clients_nesting_mode_info` and costs the same.
+    ///
+    /// A live warning is re-sent on every tick, not only when it changes. The first tick fires as
+    /// the server starts, before any tab exists and before a bar has loaded, so a warning that is
+    /// already true then would otherwise reach nobody and - never changing - would never be sent
+    /// again. Measured: a session started on a superseded build showed nothing for as long as it
+    /// ran. Only the abnormal state repeats, the bars drop an update that matches what they hold,
+    /// and the interval is 30 seconds.
+    pub fn recheck_session_warnings(&mut self) {
+        let warnings = crate::session_warnings::current_warnings();
+        if warnings == self.session_warnings && warnings.is_empty() {
+            return;
+        }
+        self.session_warnings = warnings.clone();
+        self.default_mode_info.session_warnings = warnings.clone();
+        let mut client_ids: Vec<ClientId> = self.mode_info.keys().copied().collect();
+        for connected_client_id in self.connected_clients.borrow().keys() {
+            if !client_ids.contains(connected_client_id) {
+                client_ids.push(*connected_client_id);
+            }
+        }
         for client_id in client_ids {
-            let viewport = self.size_for_client(Some(client_id));
-            rows_now = rows_now.max(self.status_notices.rows_covered(viewport));
-            let chunks = self.status_notices.character_chunks(viewport, &self.style);
-            if chunks.is_empty() {
-                continue;
-            }
-            let _ = output.add_character_chunks_to_client(client_id, chunks, None);
-        }
-        self.status_notice_rows_drawn = rows_now;
-    }
-
-    pub fn recheck_status_notices(&mut self) -> bool {
-        let notices = crate::status_notices::current_notices(&self.session_name);
-        if notices == self.status_notices {
-            return false;
-        }
-        let was_covering = self.status_notice_rows_drawn > 0;
-        self.status_notices = notices;
-        if was_covering {
-            // output is diffed between frames, so a notice that simply stops being drawn leaves
-            // its glyphs on screen. The panes underneath have to redraw the cells it covered, and
-            // only a forced render makes them
+            let mode_info = self
+                .mode_info
+                .entry(client_id)
+                .or_insert_with(|| self.default_mode_info.clone());
+            mode_info.session_warnings = warnings.clone();
+            let mode_info = mode_info.clone();
             for tab in self.tabs.values_mut() {
-                tab.set_force_render();
+                tab.change_mode_info(mode_info.clone(), client_id);
             }
         }
-        true
+        for tab in self.tabs.values_mut() {
+            let _ = tab.update_input_modes();
+        }
     }
 
     pub fn set_client_tty(&mut self, client_id: ClientId, tty: Option<String>) {
@@ -4392,8 +4385,6 @@ impl Screen {
                     tabs_to_close.push(*tab_index);
                 }
             }
-
-            self.draw_status_notices(&mut output);
 
             let pane_render_report = output.drain_pane_render_report();
 
@@ -10857,10 +10848,8 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::SetClientTty(client_id, tty) => {
                 screen.set_client_tty(client_id, tty);
             },
-            ScreenInstruction::RecheckStatusNotices => {
-                if screen.recheck_status_notices() {
-                    screen.render(None)?;
-                }
+            ScreenInstruction::RecheckSessionWarnings => {
+                screen.recheck_session_warnings();
             },
             ScreenInstruction::AddClient(
                 client_id,
