@@ -555,6 +555,7 @@ message PaneInfo {
     bool is_borderless = 43;
     bool exclude_from_sync = 44;
     bool has_explicit_title = 45;
+    string handle = 46;
 }
 
 message PaneEnvVar {

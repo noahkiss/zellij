@@ -42,7 +42,7 @@ use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
     cli::{CliArgs, Command, SessionCommand, Sessions, SnapshotCli},
-    data::ConnectToSession,
+    data::{ConnectToSession, PaneId, PaneTarget},
     envs,
     input::{
         actions::Action,
@@ -822,7 +822,27 @@ fn attach_with_cli_client(
     );
     let snapshot_settings =
         SnapshotSettings::from_options(config.as_ref().map(|config| &config.options));
-    match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
+    // A handle or a uuid names a pane only against the session's live panes, so those forms are
+    // resolved by asking the running server before the action is built. An id form needs no
+    // lookup, and pays for nothing: the connection is only opened when there is a question.
+    let resolve_pane_target = |target: &str| -> Result<PaneId, String> {
+        match target.parse::<PaneTarget>()? {
+            PaneTarget::Id(pane_id) => Ok(pane_id),
+            _ => zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                target,
+            ),
+        }
+    };
+    match Action::actions_from_cli(
+        cli_action,
+        Box::new(get_current_dir),
+        config,
+        &resolve_pane_target,
+    ) {
         Ok(actions) => {
             let exit_status = zellij_client::cli_client::start_cli_client(
                 Box::new(os_input),

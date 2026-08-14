@@ -158,7 +158,7 @@ pub enum Command {
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]
 pub struct SubscribeCli {
-    /// Pane ID(s) to subscribe to (e.g. terminal_1, plugin_2, or bare number like 1)
+    /// Pane ID(s) to subscribe to (terminal_1, plugin_2, or a bare number like 1)
     #[clap(
         short,
         long,
@@ -936,21 +936,21 @@ pub enum CliAction {
     /// Write bytes to the terminal.
     Write {
         bytes: Vec<u8>,
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Write characters to the terminal.
     WriteChars {
         chars: String,
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Paste text to the terminal (using bracketed paste mode).
     Paste {
         chars: String,
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -960,7 +960,7 @@ pub enum CliAction {
         #[clap(value_parser, required = true)]
         keys: Vec<String>,
 
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -968,7 +968,7 @@ pub enum CliAction {
     Resize {
         resize: Resize,
         direction: Option<Direction>,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -978,7 +978,7 @@ pub enum CliAction {
     FocusPreviousPane,
     /// Focus a specific pane by its ID
     FocusPaneId {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3
+        /// The pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         pane_id: String,
     },
     /// Change focus to the last focused frame
@@ -996,19 +996,19 @@ pub enum CliAction {
     /// [right|left|up|down]
     MovePane {
         direction: Option<Direction>,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Rotate the location of the previous pane backwards
     MovePaneBackwards {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Clear all buffers for a focused pane
     Clear {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1022,7 +1022,7 @@ pub enum CliAction {
         #[clap(short, long)]
         full: bool,
 
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3). If not specified, dumps the focused pane.
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid. If not specified, dumps the focused pane.
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
 
@@ -1040,7 +1040,7 @@ pub enum CliAction {
     },
     /// Open the pane scrollback in your default editor
     EditScrollback {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
 
@@ -1050,55 +1050,55 @@ pub enum CliAction {
     },
     /// Scroll up in the focused pane
     ScrollUp {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll down in focus pane.
     ScrollDown {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll down to bottom in focus pane.
     ScrollToBottom {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll up to top in focus pane.
     ScrollToTop {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll up one page in focus pane.
     PageScrollUp {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll down one page in focus pane.
     PageScrollDown {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll up half page in focus pane.
     HalfPageScrollUp {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Scroll down half page in focus pane.
     HalfPageScrollDown {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Toggle between fullscreen focus pane and normal layout.
     ToggleFullscreen {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1110,7 +1110,7 @@ pub enum CliAction {
             short,
             long,
             value_parser,
-            help = "Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)"
+            help = "Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid"
         )]
         pane_id: Option<String>,
     },
@@ -1156,7 +1156,7 @@ pub enum CliAction {
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
 
-        /// The pane to replace when opening in place, eg. terminal_1, plugin_2 or 3 (only
+        /// The pane to replace when opening in place: terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid (only
         /// effective with --in-place; defaults to the focused pane)
         #[clap(
             long,
@@ -1323,7 +1323,7 @@ pub enum CliAction {
     },
     /// Embed focused pane if floating or float focused pane if embedded
     TogglePaneEmbedOrFloating {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1357,20 +1357,20 @@ pub enum CliAction {
     },
     /// Close the focused pane.
     ClosePane {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Renames the focused pane
     RenamePane {
         name: String,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
     /// Remove a previously set pane name
     UndoRenamePane {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1746,7 +1746,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         json: bool,
     },
     TogglePanePinned {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1795,7 +1795,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1808,7 +1808,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1821,7 +1821,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1875,7 +1875,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// A pane that does not exist, or a plugin pane, which runs no process, prints the reason on
     /// stderr and exits non-zero.
     SignalPane {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: String,
         /// The signal to send [int|hup|kill]
@@ -1883,12 +1883,12 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         signal: PaneSignal,
     },
     TogglePaneBorderless {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: String,
     },
     SetPaneBorderless {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: String,
         /// Whether the pane should be borderless (flag present) or bordered (flag absent)
@@ -1928,7 +1928,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Set the default foreground/background color of a pane
     SetPaneColor {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3).
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid.
         /// Defaults to $ZELLIJ_PANE_ID if not provided.
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
@@ -1964,7 +1964,7 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
 mod tests {
     use super::*;
     use crate::data::PaneId;
-    use crate::input::actions::Action;
+    use crate::input::actions::{pane_ids_only, Action};
     use clap::Parser;
 
     /// Parse a command line on a thread with a real stack. See [`on_big_stack`].
@@ -2063,6 +2063,7 @@ mod tests {
             parse_action(&["close-pane", "--pane-id", "terminal_9"]),
             Box::new(PathBuf::new),
             None,
+            &pane_ids_only,
         )
         .expect("TEST");
         assert_eq!(

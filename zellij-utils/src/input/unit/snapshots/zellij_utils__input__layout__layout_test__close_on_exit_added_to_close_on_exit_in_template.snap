@@ -41,6 +41,7 @@ Layout {
                         default_fg: None,
                         default_bg: None,
                         restored_from: None,
+                        pane_handle: None,
                     },
                     TiledPaneLayout {
                         children_split_direction: Horizontal,
@@ -72,6 +73,7 @@ Layout {
                         default_fg: None,
                         default_bg: None,
                         restored_from: None,
+                        pane_handle: None,
                     },
                 ],
                 split_size: None,
@@ -88,6 +90,7 @@ Layout {
                 default_fg: None,
                 default_bg: None,
                 restored_from: None,
+                pane_handle: None,
             },
             [],
         ),

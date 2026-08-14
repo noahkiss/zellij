@@ -294,6 +294,7 @@ message Action {
     SetPanePinnedAction set_pane_pinned = 164;
     SetPaneFloatingAction set_pane_floating = 165;
     SetSyncTabAction set_sync_tab = 166;
+    ResolvePaneTargetAction resolve_pane_target = 167;
   }
 }
 
@@ -380,6 +381,9 @@ message BreakPaneRightAction {}
 message BreakPaneLeftAction {}
 message ListClientsAction {
   bool output_json = 1;
+}
+message ResolvePaneTargetAction {
+  string target = 1;
 }
 message ListPanesAction {
   bool show_tab = 1;

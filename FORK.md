@@ -57,6 +57,37 @@ release-note caches with an upstream build of the same version.
 features OFF on an upgrade, silently. Ask the binary what it has instead:
 [`zellij setup --check --json`](#zellij-setup---check---json).
 
+## The CLI output convention
+
+Every command the fork touches answers in one of three shapes, so that reading one command teaches
+you how to read the next.
+
+- **A single record is `key: value` lines.** One key per line, the key in `snake_case`, a single
+  space after the colon. `zellij action new-pane` answers `pane_id: terminal_7` and `handle:
+  sunny-otter`, not a bare number.
+- **A list of like things is a table** with a header row of `UPPER_SNAKE` column names.
+- **Both are append-only.** A key or a column may be added in any release; none is ever renamed or
+  removed. A value that carries a given name means the same thing in every command that prints it,
+  which is why `pane_id` is `terminal_7` everywhere and never `7` in one place and `terminal_7` in
+  another.
+- **`--json` is available on every query and on every mutation that reports something**, and carries
+  the same information structured. JSON is the interface for programs; the default output is for a
+  human or an agent reading a shell. A program that parses the default output has picked the wrong
+  one of the two.
+- **Results go to stdout, diagnostics go to stderr.** A command whose output you are capturing never
+  mixes an explanation into it.
+- **Exit codes are `0` acted, `1` error, `2` miss.** A miss is a well-formed request about something
+  that is not there — a pane that no longer exists, a tab by a name nothing answers to. It is not a
+  failure, and it prints its sentence on stderr like one so that `set -e` scripts stop either way.
+- **A payload command prints the payload and nothing else.** `dump-screen` writes screen content to
+  stdout; it does not introduce it.
+
+A mutation reports what it changed rather than acknowledging that it ran: `close-pane` prints
+`closed: terminal_3`, `move-tab` prints the `from:` and `to:` positions, `go-to-tab` prints the tab
+it left and the tab it landed on. The point is that the answer is usable — a script that moved a tab
+knows where to move it back — and that a command which changed nothing says so with exit 2 instead
+of a silent success.
+
 ## The patch queue
 
 ### Plugin hot-reload (`plugin_watch`, default **on**)

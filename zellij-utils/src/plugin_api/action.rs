@@ -2024,6 +2024,7 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::CliPipe { .. }
             | Action::ListClients { .. }
             | Action::ListPanes { .. }
+            | Action::ResolvePaneTarget { .. }
             | Action::StackPanes { pane_ids: _ }
             | Action::ChangeFloatingPaneCoordinates {
                 pane_id: _,
@@ -3109,6 +3110,9 @@ impl TryFrom<ProtobufTiledPaneLayout> for TiledPaneLayout {
             // Not carried across this contract: `restored_from` is provenance the SERVER assigns
             // when it rebuilds a pane from a serialized session, never something a sender declares.
             restored_from: None,
+            // Not carried across this contract for the same reason as `restored_from`: a pane's
+            // handle is the server's to assign, never something a sender declares.
+            pane_handle: None,
             children_split_direction,
             name: protobuf.name,
             children,
@@ -3172,6 +3176,9 @@ impl TryFrom<ProtobufFloatingPaneLayout> for FloatingPaneLayout {
             // Not carried across this contract: `restored_from` is provenance the SERVER assigns
             // when it rebuilds a pane from a serialized session, never something a sender declares.
             restored_from: None,
+            // Not carried across this contract for the same reason as `restored_from`: a pane's
+            // handle is the server's to assign, never something a sender declares.
+            pane_handle: None,
             name: protobuf.name,
             height,
             width,

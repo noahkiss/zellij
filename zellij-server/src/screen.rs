@@ -43,7 +43,7 @@ use zellij_utils::data::{
     CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
     HostTerminalThemeMode, KeyWithModifier, LayoutInfo, LayoutWithError, ListPanesResponse,
     ListTabsResponse, NewPanePlacement, PaneContents, PaneInfo, PaneListEntry, PaneManifest,
-    PaneRenderReport, PaneScrollbackResponse, PluginPermission, RegexHighlight, Resize,
+    PaneRenderReport, PaneScrollbackResponse, PaneTarget, PluginPermission, RegexHighlight, Resize,
     ResizeStrategy, SessionInfo, Styling, TabInfo, ThemeHue, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
@@ -764,6 +764,10 @@ pub enum ScreenInstruction {
         show_all: bool,
         response_channel: crossbeam::channel::Sender<ListPanesResponse>,
     },
+    ResolvePaneTarget {
+        target: PaneTarget,
+        response_channel: crossbeam::channel::Sender<Option<PaneId>>,
+    },
     ListTabs {
         client_id: ClientId,
         response_channel: crossbeam::channel::Sender<ListTabsResponse>,
@@ -1182,6 +1186,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::RenameSession(..) => ScreenContext::RenameSession,
             ScreenInstruction::ListClientsMetadata(..) => ScreenContext::ListClientsMetadata,
             ScreenInstruction::ListPanes { .. } => ScreenContext::ListPanes,
+            ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
@@ -5263,6 +5268,41 @@ impl Screen {
         Ok(pane_entries)
     }
 
+    /// Which pane, if any, a CLI target names.
+    ///
+    /// The handle and uuid forms are resolved here because here is where the live panes are - the
+    /// CLI holds a string and no way to turn it into a pane. An id form needs no lookup and is
+    /// returned as given, which deliberately means an id for a pane that does not exist resolves:
+    /// "does this id name a live pane" is a different question, and the commands that care already
+    /// answer it themselves.
+    ///
+    /// Non-selectable panes are searched too. They have handles like any other pane, and a target
+    /// naming one should reach it rather than silently miss.
+    pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
+        let matches: Box<dyn Fn(&PaneInfo) -> bool> = match target {
+            PaneTarget::Id(pane_id) => return Some((*pane_id).into()),
+            PaneTarget::Handle(handle) => {
+                let handle = handle.clone();
+                Box::new(move |pane_info| pane_info.handle == handle)
+            },
+            PaneTarget::Uuid(uuid) => {
+                let uuid = uuid.clone();
+                Box::new(move |pane_info| pane_info.uuid == uuid)
+            },
+        };
+        self.tabs
+            .values()
+            .flat_map(|tab| self.pane_infos_for_tab(tab))
+            .find(|pane_info| matches(pane_info))
+            .map(|pane_info| {
+                if pane_info.is_plugin {
+                    PaneId::Plugin(pane_info.id)
+                } else {
+                    PaneId::Terminal(pane_info.id)
+                }
+            })
+    }
+
     fn collect_tab_list(&self, _client_id: ClientId) -> Result<ListTabsResponse> {
         let mut tab_infos = Vec::new();
 
@@ -7433,6 +7473,7 @@ impl Screen {
                         default_fg,
                         default_bg,
                         Some(p.pane_uuid().to_string()),
+                        Some(p.pane_handle()),
                     )
                 })
                 .collect();
@@ -7475,6 +7516,7 @@ impl Screen {
                         default_fg,
                         default_bg,
                         Some(p.pane_uuid().to_string()),
+                        Some(p.pane_handle()),
                     )
                 })
                 .collect();
@@ -9049,6 +9091,12 @@ pub(crate) fn screen_thread_main(
                     .collect_pane_list(show_all)
                     .with_context(err_context)?;
                 let _ = response_channel.send(pane_entries);
+            },
+            ScreenInstruction::ResolvePaneTarget {
+                target,
+                response_channel,
+            } => {
+                let _ = response_channel.send(screen.resolve_pane_target(&target));
             },
             ScreenInstruction::ListTabs {
                 client_id,

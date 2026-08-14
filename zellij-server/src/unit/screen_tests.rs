@@ -125,7 +125,13 @@ fn send_cli_action_to_server(
     client_id: ClientId,
 ) {
     let get_current_dir = || PathBuf::from(".");
-    let actions = Action::actions_from_cli(cli_action, Box::new(get_current_dir), None).unwrap();
+    let actions = Action::actions_from_cli(
+        cli_action,
+        Box::new(get_current_dir),
+        None,
+        &zellij_utils::input::actions::pane_ids_only,
+    )
+    .unwrap();
     let senders = session_metadata.senders.clone();
     let default_shell = None;
     let default_mode = session_metadata
@@ -933,6 +939,86 @@ fn new_tab(screen: &mut Screen, pid: u32, tab_index: usize) {
             None,
         )
         .expect("TEST");
+}
+
+use zellij_utils::data::{PaneId as ZellijUtilsPaneId, PaneTarget};
+
+/// Every pane the screen knows about, as `(handle, uuid, id)`.
+fn pane_identities(screen: &Screen) -> Vec<(String, String, u32)> {
+    screen
+        .tabs
+        .values()
+        .flat_map(|tab| screen.pane_infos_for_tab(tab))
+        .map(|pane_info| (pane_info.handle, pane_info.uuid, pane_info.id))
+        .collect()
+}
+
+#[test]
+fn a_handle_resolves_to_the_pane_that_answers_to_it() {
+    // the CLI holds a string and the server holds the panes, so this lookup is the only place a
+    // handle turns back into something an action can be pointed at
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    let identities = pane_identities(&screen);
+    assert!(identities.len() >= 2, "expected a pane per tab");
+    for (handle, uuid, id) in identities {
+        assert!(!handle.is_empty(), "a live pane had no handle");
+        assert_eq!(
+            screen.resolve_pane_target(&PaneTarget::Handle(handle.clone())),
+            Some(PaneId::Terminal(id)),
+            "handle {} did not reach its pane",
+            handle
+        );
+        assert_eq!(
+            screen.resolve_pane_target(&PaneTarget::Uuid(uuid.clone())),
+            Some(PaneId::Terminal(id)),
+            "uuid {} did not reach its pane",
+            uuid
+        );
+    }
+}
+
+#[test]
+fn a_handle_no_pane_answers_to_resolves_to_nothing() {
+    // a miss has to be a miss: the caller turns this into exit 2, and a wrong pane would be worse
+    // than no pane
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Handle("sunny-otter".to_owned())),
+        None
+    );
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Uuid(
+            "e9b82dbd-0000-4000-8000-0000000000aa".to_owned()
+        )),
+        None
+    );
+}
+
+#[test]
+fn an_id_target_needs_no_lookup() {
+    // "does this id name a live pane" is a different question, answered by the command that acts
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let screen = create_new_screen(size, true, true);
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Id(ZellijUtilsPaneId::Terminal(9))),
+        Some(PaneId::Terminal(9))
+    );
 }
 
 #[test]
