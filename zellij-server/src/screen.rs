@@ -4354,6 +4354,16 @@ impl Screen {
         }
     }
 
+    /// The tab a client is looking at, as the `<id> <name>` a switch report names it by.
+    ///
+    /// A client with no active tab - one that has not attached yet - has no answer, and a report
+    /// built from it says nothing rather than guessing.
+    pub fn tab_summary_for_client(&self, client_id: ClientId) -> Option<String> {
+        self.get_active_tab(client_id)
+            .ok()
+            .map(|tab| format!("{} {}", tab.id, tab.name))
+    }
+
     pub fn get_client_input_mode(&self, client_id: ClientId) -> Option<InputMode> {
         self.get_active_tab(client_id)
             .ok()
@@ -9835,12 +9845,7 @@ pub(crate) fn screen_thread_main(
 
                 screen.render(None)?;
             },
-            ScreenInstruction::GoToTab(
-                tab_index,
-                client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
-                                // waiting for it
-            ) => {
+            ScreenInstruction::GoToTab(tab_index, client_id, mut completion_tx) => {
                 let client_id_to_switch = if client_id.is_none() {
                     None
                 } else if screen
@@ -9858,8 +9863,22 @@ pub(crate) fn screen_thread_main(
                     // the client focus, which should have happened before this instruction and not
                     // after)
                     Some(client_id) if pending_tab_ids.is_empty() => {
+                        // a position nothing sits at is a miss, not a silent no-op: without this
+                        // the report below would name the tab the client never left
+                        if screen
+                            .get_tab_id_at_position(tab_index.saturating_sub(1) as usize)
+                            .is_none()
+                        {
+                            if let Some(c) = completion_tx.as_mut() {
+                                c.set_error_message(format!("No tab at position {}", tab_index));
+                            }
+                            continue;
+                        }
+                        let from = screen.tab_summary_for_client(client_id);
                         screen.go_to_tab(tab_index as usize, client_id)?;
                         screen.render(None)?;
+                        let to = screen.tab_summary_for_client(client_id);
+                        report_tab_switch(completion_tx.as_mut(), from, to);
                     },
                     _ => {
                         if let Some(client_id) = client_id {
@@ -9899,6 +9918,7 @@ pub(crate) fn screen_thread_main(
                         .unwrap_or(false);
                     // `no_focus` asks only whether the tab is there, so the existence check and
                     // the focus switch are two calls rather than one
+                    let from = screen.tab_summary_for_client(client_id);
                     let tab_lookup = if no_focus {
                         Ok(screen.tabs.values().any(|t| t.name == tab_name))
                     } else {
@@ -9907,13 +9927,26 @@ pub(crate) fn screen_thread_main(
                     if let Ok(tab_exists) = tab_lookup {
                         screen.render(None)?;
                         if tab_exists {
-                            // Tab already exists - find its ID and set in completion
-                            if let Some(existing_tab) =
-                                screen.tabs.values().find(|t| t.name == tab_name)
-                            {
-                                completion_tx
-                                    .as_mut()
-                                    .map(|c| c.set_affected_tab_id(existing_tab.id));
+                            if no_focus {
+                                // the probe: nothing moved, so the answer is the tab's id and
+                                // nothing about focus
+                                if let Some(existing_tab) =
+                                    screen.tabs.values().find(|t| t.name == tab_name)
+                                {
+                                    completion_tx
+                                        .as_mut()
+                                        .map(|c| c.set_affected_tab_id(existing_tab.id));
+                                }
+                            } else {
+                                let to = screen.tab_summary_for_client(client_id);
+                                report_tab_switch(completion_tx.as_mut(), from, to);
+                            }
+                        } else if !create && !no_focus {
+                            // asked to go somewhere that is not there: a miss, which the probe
+                            // form (`--no-focus`) deliberately does not make - it answers with an
+                            // empty stdout and exit 0 either way
+                            if let Some(c) = completion_tx.as_mut() {
+                                c.set_error_message(format!("No tab named '{}'", tab_name));
                             }
                         }
                         if create && !tab_exists {
@@ -11194,7 +11227,7 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.log_and_report_session_state()?;
             },
-            ScreenInstruction::GoToTabWithId(tab_id, client_id, _completion_tx) => {
+            ScreenInstruction::GoToTabWithId(tab_id, client_id, mut completion_tx) => {
                 let client_id_to_switch = client_id
                     .and_then(|cid| {
                         if screen.active_tab_ids.contains_key(&cid) {
@@ -11208,6 +11241,7 @@ pub(crate) fn screen_thread_main(
                 if let Some(client_id) = client_id_to_switch {
                     // Get the position from the ID
                     if let Some(tab_position) = screen.get_tab_position_by_id(tab_id) {
+                        let from = screen.tab_summary_for_client(client_id);
                         // switch_active_tab expects 0-based position
                         screen.switch_active_tab(tab_position, None, true, client_id)?;
                         screen.render(None)?;
@@ -11217,8 +11251,13 @@ pub(crate) fn screen_thread_main(
                             .entry(client_id)
                             .or_insert_with(Vec::new)
                             .push(tab_id);
+                        let to = screen.tab_summary_for_client(client_id);
+                        report_tab_switch(completion_tx.as_mut(), from, to);
                     } else {
                         log::error!("Tab with ID {} not found", tab_id);
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!("No tab with id {}", tab_id));
+                        }
                     }
                 }
             },
@@ -12972,6 +13011,30 @@ mod screen_tests;
 fn set_converged(completion_tx: &mut Option<NotificationEnd>, changed: bool) {
     if let Some(c) = completion_tx.as_mut() {
         c.set_exit_status(if changed { 0 } else { 2 });
+    }
+}
+
+/// Report a focus switch as the tab it left and the tab it landed on.
+///
+/// Each line is `<id> <name>`, id first so that a script reads it with one field split and a name
+/// with spaces in it stays whole. A switch that landed where it started reports only `to:` - there
+/// is no "from" to go back to, and printing the same tab twice would suggest there is.
+fn report_tab_switch(
+    completion_tx: Option<&mut NotificationEnd>,
+    from: Option<String>,
+    to: Option<String>,
+) {
+    let Some(completion_tx) = completion_tx else {
+        return;
+    };
+    let Some(to) = to else {
+        return;
+    };
+    match from {
+        Some(from) if from != to => {
+            completion_tx.set_stdout_lines(vec![format!("from: {}", from), format!("to: {}", to)]);
+        },
+        _ => completion_tx.set_stdout_lines(vec![format!("to: {}", to)]),
     }
 }
 

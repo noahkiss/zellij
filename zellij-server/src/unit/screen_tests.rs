@@ -13780,3 +13780,123 @@ pub fn a_setter_with_no_pane_id_resolves_the_focused_pane() {
         "no id means the focused pane"
     );
 }
+
+#[test]
+pub fn going_to_a_tab_reports_where_focus_came_from_and_where_it_landed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    // the session starts with one tab, so this switch lands where it started
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTab { index: 1 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.stdout_lines.len(),
+        1,
+        "a switch that did not move reports only where it is: {:?}",
+        result.stdout_lines
+    );
+    assert!(
+        result.stdout_lines[0].starts_with("to: "),
+        "{:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_position_nothing_sits_at_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTab { index: 9 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab at position 9"))
+            .unwrap_or(false),
+        "Expected a miss naming the position, got: {:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_name_nothing_answers_to_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTabName {
+            name: "no-such-tab".to_owned(),
+            create: false,
+            no_focus: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab named 'no-such-tab'"))
+            .unwrap_or(false),
+        "Expected a miss naming the tab, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn the_no_focus_probe_stays_silent_about_a_tab_that_is_not_there() {
+    // the negative control for the miss above: --no-focus is an existence question, and a "no"
+    // answer is not an error - it is an empty stdout and exit 0
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTabName {
+            name: "no-such-tab".to_owned(),
+            create: false,
+            no_focus: true,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert!(result.stdout_lines.is_empty(), "{:?}", result.stdout_lines);
+    assert_eq!(result.affected_tab_id, None);
+}

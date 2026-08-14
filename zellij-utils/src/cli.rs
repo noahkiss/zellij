@@ -1384,15 +1384,23 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Go to tab with index [index]
+    /// Go to tab at position [index] (1-based)
+    ///
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for the tab focus left and the
+    /// tab it landed on. A switch that did not move prints only `to:`. A position no tab sits at
+    /// is a miss: a message on stderr and exit 2.
     GoToTab {
         index: u32,
     },
     /// Go to tab with name [name]
     ///
-    /// Prints the tab's ID as a single number on stdout when the tab exists or --create makes it.
-    /// With --no-focus and without --create this is an existence probe: the exit code is 0 either
-    /// way, and stdout is the answer - a tab ID if the tab is there, nothing at all if it is not.
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch, and `id:
+    /// <tab id>` when --create makes the tab. A name no tab answers to is a miss: a message on
+    /// stderr and exit 2.
+    ///
+    /// With --no-focus and without --create this is an existence probe instead: the exit code is 0
+    /// either way, and stdout is the answer - `id: <tab id>` if the tab is there, nothing at all
+    /// if it is not.
     GoToTabName {
         name: String,
         /// Create a tab if one does not exist.
@@ -1418,6 +1426,9 @@ pub enum CliAction {
         tab_id: Option<usize>,
     },
     /// Go to tab with stable ID
+    ///
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`. An id no tab answers to is a
+    /// miss: a message on stderr and exit 2.
     GoToTabById {
         id: u64,
     },
