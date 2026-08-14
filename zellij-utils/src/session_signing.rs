@@ -333,8 +333,12 @@ pub struct SigningRun {
 /// 4. Verify the copy twice before it is allowed near the pinned path. A signature that did not
 ///    take leaves the working pin untouched instead of replacing it with a broken one.
 /// 5. `rename(2)` last, which is atomic and cannot fail against a running server.
-/// 6. Re-stamp the source hash, or the next `session up` calls the signed pin stale and copies
-///    over the signature within the minute.
+/// 6. Nothing re-stamps, and nothing may be made to. The stamp beside the pin records the hash of
+///    the SOURCE binary, which signing does not touch, so it still agrees and the next
+///    `session up` leaves the signature alone. A "re-stamp" written here would have to hash the
+///    signed pin, and a stamp naming the pin's own bytes is exactly the comparison
+///    [`pin_is_stale`](crate::session_lifecycle::install_pinned_exe) exists to avoid: it would
+///    call every signed pin stale and copy over the signature within the minute.
 ///
 /// A failure anywhere is a `Needs you` naming the recovery, never a fatal error: doctor has other
 /// checks to make and a machine that cannot sign is still a machine worth reporting on.
@@ -398,6 +402,25 @@ pub fn sign_pin(
 
     let mut rung = choose_rung(&find_identities(commander));
 
+    // A run that is not acting stops here and says which rung it would have taken - including the
+    // one that does not exist yet. Falling through to the Xcode steps would have a dry run report
+    // `Needs you` on the machine the real run repairs by itself, which is every machine with no
+    // Apple account: the commonest case, and the one where the dry run is read most carefully.
+    if rung.is_none() && !mode.fix {
+        findings.push(
+            Finding::changed(
+                "signing",
+                mode.describe(&format!(
+                    "mint a certificate of zellij's own and sign {} with it",
+                    pin_display
+                )),
+            )
+            .note("the keychain offers no Apple certificate, so this is the rung the run takes")
+            .note("it needs `openssl` and the login keychain, and mints once and never again"),
+        );
+        return SigningRun { findings };
+    }
+
     // The third rung is not one the keychain offers - it is one we make. Only when the first two
     // are absent, only when doctor is allowed to act, and only once in the life of the machine:
     // `ensure_self_signed` re-imports an existing bundle rather than minting a second certificate.
@@ -425,6 +448,24 @@ pub fn sign_pin(
     }
 
     let Some(rung) = rung else {
+        // with no rung and no acting, the ladder never reached its third step - so the honest
+        // report is what doctor WOULD do, not the "no certificate anywhere" the fix path reaches
+        if !mode.fix {
+            let bundle = context.signing_dir.identity_bundle();
+            findings.push(Finding::ok(
+                "signing",
+                mode.describe(&format!(
+                    "{} a certificate of our own and sign {} with it",
+                    if bundle.exists() {
+                        format!("re-import {} -", bundle.display())
+                    } else {
+                        String::from("mint")
+                    },
+                    pin_display
+                )),
+            ));
+            return SigningRun { findings };
+        }
         findings.push(xcode_steps(&pin_display));
         return SigningRun { findings };
     };
@@ -437,7 +478,11 @@ pub fn sign_pin(
         return SigningRun { findings };
     }
 
-    findings.extend(perform_signing(commander, pin, &rung));
+    // a machine that minted its own certificate recorded every grant against THAT one, so signing
+    // with an Apple certificate now is a change of requirement and not only a change of signature
+    let changed_certificate =
+        !matches!(rung, Rung::SelfSigned(_)) && context.signing_dir.identity_bundle().exists();
+    findings.extend(perform_signing(commander, pin, &rung, changed_certificate));
     SigningRun { findings }
 }
 
@@ -476,23 +521,66 @@ fn find_identities(commander: &dyn Commander) -> Vec<Identity> {
 /// directory it lives in is not somewhere anyone thinks to back up. Copied silently and reported
 /// as a note rather than announced: it is a private key, and the one thing worth saying about it
 /// is where it now is.
+///
+/// A copy that did not happen is a `Needs you` and never a silence. The certificate has just been
+/// minted and cannot be minted again, so "there is a second copy of it" is exactly the kind of
+/// thing a user must not be left believing wrongly.
 fn back_up_identity(context: &SigningContext) -> Option<Finding> {
     let backup_dir = context.backup_dir.as_ref()?;
     let source = context.signing_dir.identity_bundle();
     let target = backup_dir.join("zellij-signing-id.p12");
-    std::fs::create_dir_all(backup_dir).ok()?;
-    std::fs::copy(&source, &target).ok()?;
-    Some(
-        Finding::changed(
-            "signing",
-            format!("kept a copy of the identity at {}", target.display()),
-        )
-        .note("losing both copies means minting a second certificate, which voids every grant"),
-    )
+    let copied = std::fs::create_dir_all(backup_dir)
+        .and_then(|()| std::fs::copy(&source, &target))
+        .and_then(|_| restrict(&target, 0o600));
+    match copied {
+        Ok(()) => Some(
+            Finding::changed(
+                "signing",
+                format!("kept a copy of the identity at {}", target.display()),
+            )
+            .note("losing both copies means minting a second certificate, which voids every grant"),
+        ),
+        Err(error) => Some(
+            Finding::needs_you(
+                "signing",
+                format!(
+                    "could not copy the identity to {}: {}",
+                    target.display(),
+                    error
+                ),
+            )
+            .note(format!("it exists only at {}", source.display()))
+            .note("copy it somewhere safe by hand: losing it means minting a second")
+            .note("certificate, and that voids every grant recorded against the first"),
+        ),
+    }
+}
+
+/// Keep a private key out of every other account on the machine.
+///
+/// Anything that can read the key can sign as this machine's zellij, and the grants are recorded
+/// against that signature. Neither `create_dir_all` nor the file `openssl` writes asks for
+/// anything narrower than the umask allows, which on a stock account is world-readable - and the
+/// bundle carries no passphrase, deliberately, so the permissions are the whole of its protection.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Steps 3 through 6, once a certificate has been chosen.
-fn perform_signing(commander: &dyn Commander, pin: &Path, rung: &Rung) -> Vec<Finding> {
+fn perform_signing(
+    commander: &dyn Commander,
+    pin: &Path,
+    rung: &Rung,
+    changed_certificate: bool,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     let pin_display = pin.display().to_string();
     let directory = pin.parent().unwrap_or_else(|| Path::new("."));
@@ -529,10 +617,13 @@ fn perform_signing(commander: &dyn Commander, pin: &Path, rung: &Rung) -> Vec<Fi
         timestamped,
         &temporary_display,
     );
+    let mut refused_timestamp = None;
     if !signed.0 && timestamped {
-        // Apple's timestamp server needs a real chain, and refuses one we minted. Losing the
-        // timestamp costs a signature nothing it had: our certificate outlives the machine.
+        // Apple's timestamp server needs a real chain, and refuses one we minted - and it is not
+        // reachable at all on a machine that is offline. Losing the timestamp costs a signature
+        // nothing it had, so the fall-back is silent about failing and loud about which happened.
         timestamped = false;
+        refused_timestamp = Some(signed.1.clone());
         signed = run_codesign(
             commander,
             rung,
@@ -578,20 +669,29 @@ fn perform_signing(commander: &dyn Commander, pin: &Path, rung: &Rung) -> Vec<Fi
         return findings;
     }
 
-    findings.push(
-        Finding::changed(
-            "signing",
-            format!(
-                "signed {} with {}{}",
-                pin_display,
-                rung.description(),
-                if timestamped { ", timestamped" } else { "" }
-            ),
-        )
-        .note(format!("identifier {}", PIN_IDENTIFIER)),
-    );
-    findings.push(follow_up(&pin_display));
+    let mut done = Finding::changed(
+        "signing",
+        format!(
+            "signed {} with {}{}",
+            pin_display,
+            rung.description(),
+            if timestamped { ", timestamped" } else { "" }
+        ),
+    )
+    .note(format!("identifier {}", PIN_IDENTIFIER));
+    if let Some(refusal) = refused_timestamp {
+        done = done
+            .note("the timestamp was refused, so it was signed without one:")
+            .note(format!("  {}", first_line(&refusal)));
+    }
+    findings.push(done);
+    findings.push(follow_up(&pin_display, changed_certificate));
     findings
+}
+
+/// The first line of a tool's complaint, which is the part worth quoting in a report.
+fn first_line(message: &str) -> &str {
+    message.lines().next().unwrap_or("").trim()
 }
 
 /// Run `codesign`, reporting whether it worked and what it said if it did not.
@@ -643,8 +743,8 @@ fn verify_signature(commander: &dyn Commander, target: &str) -> Result<(), Strin
 /// Re-granting FIRST and restarting SECOND is the whole of the advice. The grants are recorded
 /// against the pin's path and the signature it now carries; a server started before they are
 /// re-granted comes up not holding them, and the user ends up restarting twice.
-fn follow_up(pin: &str) -> Finding {
-    Finding::needs_you(
+fn follow_up(pin: &str, changed_certificate: bool) -> Finding {
+    let mut finding = Finding::needs_you(
         "signing",
         "the signature is in place; two things left, in this order",
     )
@@ -653,7 +753,15 @@ fn follow_up(pin: &str) -> Finding {
         pin
     ))
     .note("   in System Settings > Privacy & Security - once, for the new signature")
-    .note("2. THEN `zellij session restart`, so the new server comes up already holding them")
+    .note("2. THEN `zellij session restart`, so the new server comes up already holding them");
+    if changed_certificate {
+        // the machine's own certificate is still on disk, and every grant made before today names
+        // it. Saying which certificate changed is the difference between one re-grant and a hunt.
+        finding = finding
+            .note("this machine had signed with a certificate of its own before now, so the")
+            .note("requirement changed with the certificate - that is why the re-grant is needed");
+    }
+    finding
 }
 
 /// The last rung: no certificate, and nothing doctor may do about it.
@@ -750,6 +858,8 @@ pub fn ensure_self_signed(
     let mut findings = Vec::new();
     std::fs::create_dir_all(&dir.root)
         .map_err(|e| format!("could not create {}: {}", dir.root.display(), e))?;
+    restrict(&dir.root, 0o700)
+        .map_err(|e| format!("could not lock down {}: {}", dir.root.display(), e))?;
 
     let bundle = dir.identity_bundle();
     if !bundle.exists() {
@@ -842,6 +952,10 @@ fn mint_self_signed(commander: &dyn Commander, dir: &SigningDir) -> Result<(), S
             "openssl could not bundle the certificate: {}",
             output.stderr.trim()
         ));
+    }
+    for private in [dir.private_key(), dir.identity_bundle()] {
+        restrict(&private, 0o600)
+            .map_err(|e| format!("could not lock down {}: {}", private.display(), e))?;
     }
     Ok(())
 }
@@ -1165,6 +1279,37 @@ Signature=adhoc
         assert!(!commander.called_with("-s -"), "{:?}", commander.calls());
     }
 
+    /// The case a dry run is read most carefully in, and the one it used to get backwards: with no
+    /// Apple certificate on the machine, the real run mints one and signs, so the dry run has to
+    /// say that rather than print the Xcode steps and exit non-zero over work doctor does itself.
+    #[test]
+    fn a_dry_run_with_no_certificate_names_the_one_it_would_mint() {
+        let commander = RecordedCommander::new(&[
+            ("codesign -d --verbose=2 -r- /tmp/pin", recorded(AD_HOC)),
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            Path::new("/tmp/pin"),
+            DoctorMode {
+                fix: false,
+                dry_run: true,
+                sign: true,
+            },
+            &context(scratch.path()),
+        );
+        assert_eq!(run.findings.len(), 1, "{:?}", run.findings);
+        assert_eq!(run.findings[0].status, Status::Changed);
+        assert!(
+            run.findings[0].message.starts_with("would mint"),
+            "{:?}",
+            run.findings[0]
+        );
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        assert!(!commander.called_with("-s "), "{:?}", commander.calls());
+    }
+
     #[test]
     fn no_sign_reports_the_fault_and_touches_nothing() {
         let commander =
@@ -1406,6 +1551,90 @@ Signature=adhoc
             "{:?}",
             commander.calls()
         );
+    }
+
+    /// The second copy is the whole of the machine's insurance, so it lands where the user's other
+    /// zellij files are - and it lands readable by nobody else. The bundle carries no passphrase.
+    #[test]
+    fn the_backup_copy_goes_to_the_config_directory_and_nobody_else_can_read_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        std::fs::create_dir_all(&context.signing_dir.root).unwrap();
+        std::fs::write(
+            context.signing_dir.identity_bundle(),
+            b"the one certificate",
+        )
+        .unwrap();
+        context.backup_dir = Some(scratch.path().join("config"));
+
+        let finding = back_up_identity(&context).unwrap();
+        assert_eq!(finding.status, Status::Changed);
+        let copy = scratch.path().join("config/zellij-signing-id.p12");
+        assert_eq!(
+            std::fs::read(&copy).unwrap(),
+            b"the one certificate".to_vec()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    /// A copy that did not happen has to be said out loud: the certificate cannot be minted again,
+    /// and a user who believes there is a second copy of it will not make one.
+    #[test]
+    fn a_backup_that_could_not_be_written_is_reported_rather_than_swallowed() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        std::fs::create_dir_all(&context.signing_dir.root).unwrap();
+        std::fs::write(context.signing_dir.identity_bundle(), b"x").unwrap();
+        // a FILE where the directory would go, so creating it cannot succeed
+        let blocked = scratch.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        context.backup_dir = Some(blocked.join("config"));
+
+        let finding = back_up_identity(&context).unwrap();
+        assert_eq!(finding.status, Status::NeedsYou);
+        assert!(
+            finding
+                .notes
+                .iter()
+                .any(|note| note.contains("voids every grant")),
+            "{:?}",
+            finding
+        );
+    }
+
+    /// A dry run must describe the run it is standing in for. Minting is what doctor does by
+    /// default on a machine with no Apple certificate, so "no signing certificate" would be a
+    /// report of a different command.
+    #[test]
+    fn a_dry_run_with_no_certificate_says_it_would_mint_one() {
+        let commander = RecordedCommander::new(&[
+            ("codesign -d --verbose=2 -r- /tmp/pin", recorded(AD_HOC)),
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            Path::new("/tmp/pin"),
+            DoctorMode {
+                fix: false,
+                dry_run: true,
+                sign: true,
+            },
+            &context(scratch.path()),
+        );
+        assert!(
+            run.findings[0].message.starts_with("would mint"),
+            "{:?}",
+            run.findings
+        );
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
     }
 
     /// Over SSH there is no dialog to answer, so the password has to come from somewhere or the

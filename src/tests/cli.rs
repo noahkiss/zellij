@@ -234,3 +234,31 @@ fn session_restart_cannot_be_both_fresh_and_restored() {
     ])
     .is_err());
 }
+
+/// The order the two halves of a switch are typed in decides it, which is what `overrides_with`
+/// buys and what a plain pair of booleans would not: with both spelled out, the last one wins in
+/// both directions, and neither flag can be silently ignored.
+#[test]
+fn the_last_of_fix_and_no_fix_wins_whichever_it_is() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--fix", "--no-fix"]) {
+        SessionLifecycleCli::Doctor { fix, no_fix, .. } => {
+            assert!(no_fix);
+            assert!(!fix);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--no-fix", "--fix"]) {
+        SessionLifecycleCli::Doctor { fix, no_fix, .. } => {
+            assert!(fix);
+            assert!(!no_fix);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--no-sign", "--sign"]) {
+        SessionLifecycleCli::Doctor { sign, no_sign, .. } => {
+            assert!(sign);
+            assert!(!no_sign);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}

@@ -41,13 +41,7 @@ pub(crate) fn session_doctor_command(
     opts: CliArgs,
 ) -> ! {
     let name = resolve_session_name(session_name, &opts, false);
-    // `--dry-run` is `--no-fix` plus a change of tense, and it is expressed that way rather than
-    // checked separately so that no fix site can ever act in a dry run by forgetting to ask.
-    let mode = DoctorMode {
-        fix: !no_fix && !dry_run,
-        sign: !no_sign,
-        dry_run,
-    };
+    let mode = DoctorMode::from_flags(dry_run, no_fix, no_sign);
     let report = examine(&name, exe, mode, &opts);
     print!("{}", report.render());
     std::process::exit(report.exit_code());
@@ -71,6 +65,7 @@ fn examine(name: &str, exe: Option<PathBuf>, mode: DoctorMode, opts: &CliArgs) -
     check_unit(&mut report, name, exe, extras.as_ref(), pinned.clone());
     let facts = SessionFacts::collect(name);
     check_session(&mut report, name, &facts);
+    check_dead_session(&mut report, name, &facts);
     check_build(&mut report, name, &facts);
     check_pin(&mut report, name, pinned.as_deref(), mode);
     platform_checks(&mut report, name, pinned.as_deref(), mode, opts, &facts);
@@ -217,28 +212,11 @@ fn check_artifacts(report: &mut Report) {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;
     };
+    let running = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok());
 
-    let mut wrappers: Vec<(PathBuf, &'static str)> = std::fs::read_dir(home.join("bin"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter_map(|path| {
-            let name = path.file_name().and_then(|name| name.to_str())?;
-            if name == "zellij" {
-                return Some((path, "shadows the zellij on PATH"));
-            }
-            if !name.contains("zellij") {
-                return None;
-            }
-            // a script, so a bounded read; nothing in `~/bin` that is 40 MB is a wrapper
-            let source = std::fs::read_to_string(&path).ok()?;
-            source
-                .contains("ZELLIJ_SOCK_DIR")
-                .then_some((path, "sets ZELLIJ_SOCK_DIR before zellij can resolve it"))
-        })
-        .collect();
-    wrappers.sort();
+    let wrappers = wrapper_faults(&home.join("bin"), running.as_deref());
     for (wrapper, why) in &wrappers {
         report.push(
             Finding::needs_you("artifact", format!("{} {}", wrapper.display(), why))
@@ -269,6 +247,48 @@ fn check_artifacts(report: &mut Report) {
             "no wrapper scripts and no stale session-env",
         ));
     }
+}
+
+/// The files in one directory that mislead a shell about zellij, and what is wrong with each.
+///
+/// Its own function so the two shapes can be tested, which matters more here than anywhere else in
+/// the report: this is the only check whose advice is `rm`, and a false positive costs somebody a
+/// file doctor did not write.
+///
+/// `running` is this binary's resolved path, and a `zellij` in the directory that resolves to it is
+/// not a leftover at all - it is where zellij is installed. `check_path` has already reported that
+/// same file as the one a shell runs, so flagging it here would have doctor contradict itself and
+/// tell the user to delete their installation.
+fn wrapper_faults(directory: &Path, running: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
+    let mut faults: Vec<(PathBuf, &'static str)> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter_map(|path| {
+            let name = path.file_name().and_then(|name| name.to_str())?;
+            if name == "zellij" {
+                // a path that will not resolve - a dangling symlink - is still a name a shell
+                // finds and fails to run, so it stays a fault
+                if let (Ok(resolved), Some(running)) = (path.canonicalize(), running) {
+                    if resolved == running {
+                        return None;
+                    }
+                }
+                return Some((path, "shadows the zellij on PATH"));
+            }
+            if !name.contains("zellij") {
+                return None;
+            }
+            // a script, so a bounded read; nothing in `~/bin` that is 40 MB is a wrapper
+            let source = std::fs::read_to_string(&path).ok()?;
+            source
+                .contains("ZELLIJ_SOCK_DIR")
+                .then_some((path, "sets ZELLIJ_SOCK_DIR before zellij can resolve it"))
+        })
+        .collect();
+    faults.sort();
+    faults
 }
 
 /// What is installed to keep the session up, whether the init system holds it, and whether the
@@ -447,6 +467,35 @@ fn check_session(report: &mut Report, name: &str, facts: &SessionFacts) {
     }
 }
 
+/// Whether a dead session is holding this name.
+///
+/// A session that exited leaves its layout behind, and the name keeps pointing at it: the next
+/// `session up` resurrects that layout rather than starting from the configured one, which is the
+/// answer to "why did my session come back with yesterday's panes in it". Only worth saying when no
+/// server is up - a live session has a snapshot too, and there it is the ordinary state.
+///
+/// Reported and never removed. The snapshot is the user's work, and `zellij delete-session` is the
+/// command that decides against keeping it.
+fn check_dead_session(report: &mut Report, name: &str, facts: &SessionFacts) {
+    if facts.assert_up().is_ok() {
+        return;
+    }
+    if !sessions::get_resurrectable_session_names()
+        .iter()
+        .any(|dead| dead == name)
+    {
+        return;
+    }
+    report.push(
+        Finding::ok("dead", format!("'{}' has a saved layout waiting", name))
+            .note("`zellij session up` resurrects those panes rather than starting fresh")
+            .note(format!(
+                "`zellij delete-session {}` drops it, and the next session starts clean",
+                name
+            )),
+    );
+}
+
 /// Whether the server serving this session is running the build this binary is.
 fn check_build(report: &mut Report, name: &str, facts: &SessionFacts) {
     if facts.our_servers().is_empty() {
@@ -527,14 +576,8 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
 /// signed pin stale forever.
 #[cfg(unix)]
 fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
-    use zellij_utils::session_lifecycle::{install_pinned_exe, pin_source_stamp, PinOutcome};
+    use zellij_utils::session_lifecycle::{install_pinned_exe, pin_needs_refresh, PinOutcome};
 
-    if !pinned.exists() {
-        report.push(
-            Finding::needs_you("pin", format!("{} does not exist", pinned.display()))
-                .note("`zellij session up` writes it, and so would this run with --fix"),
-        );
-    }
     let Ok(current_exe) = std::env::current_exe() else {
         report.push(Finding::needs_you(
             "pin",
@@ -542,16 +585,28 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
         ));
         return;
     };
+    // A missing pin is not a `Needs you` on either path. With `--fix` this run writes it, and a
+    // report that both wrote the file and exited non-zero would be telling a script that somebody
+    // still has to act; without `--fix` the line below already says the copy would be made.
     if !mode.fix {
-        let stamped = std::fs::read_to_string(pin_source_stamp(pinned)).is_ok();
-        report.push(Finding::ok(
-            "pin",
-            if stamped {
-                mode.describe("leave the pinned copy alone unless its source stamp disagrees")
-            } else {
-                mode.describe("refresh the pinned copy, which carries no source stamp")
-            },
-        ));
+        // asked of the same function the fix asks, so a dry run reports the decision the fix would
+        // make rather than a condition under which it might make one
+        if !pin_needs_refresh(&current_exe, pinned) {
+            report.push(Finding::ok(
+                "pin",
+                format!("{} was made from this build", pinned.display()),
+            ));
+        } else if pinned.exists() {
+            report.push(Finding::changed(
+                "pin",
+                mode.describe(&format!("refresh the pinned copy at {}", pinned.display())),
+            ));
+        } else {
+            report.push(Finding::changed(
+                "pin",
+                mode.describe(&format!("pin this build at {}", pinned.display())),
+            ));
+        }
         return;
     }
     match install_pinned_exe(&current_exe, pinned) {
@@ -640,4 +695,96 @@ fn platform_checks(
     _opts: &CliArgs,
     _facts: &SessionFacts,
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(directory: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_wrapper_that_sets_the_socket_directory_is_a_leftover() {
+        let scratch = tempfile::tempdir().unwrap();
+        let wrapper = write(
+            scratch.path(),
+            "zellij-attach",
+            "#!/bin/sh\nexport ZELLIJ_SOCK_DIR=/tmp/mine\nexec zellij \"$@\"\n",
+        );
+        let faults = wrapper_faults(scratch.path(), None);
+        assert_eq!(faults.len(), 1, "{:?}", faults);
+        assert_eq!(faults[0].0, wrapper);
+    }
+
+    /// The report's one `rm` has to be earned. A companion script that merely calls zellij - the
+    /// wrapper that runs doctor itself, most of all - is not a fault, and saying it is would have
+    /// doctor ask somebody to delete a working tool.
+    #[test]
+    fn a_script_that_only_calls_zellij_is_left_alone() {
+        let scratch = tempfile::tempdir().unwrap();
+        write(
+            scratch.path(),
+            "zellij-mac-setup",
+            "#!/bin/sh\nexec zellij session doctor \"$@\"\n",
+        );
+        assert!(wrapper_faults(scratch.path(), None).is_empty());
+    }
+
+    /// A `zellij` in the directory that IS this binary is where zellij is installed, and
+    /// `check_path` has already reported it as the one a shell runs. Two checks disagreeing about
+    /// one file, with `rm` as the advice, is the worst answer doctor can give.
+    #[test]
+    fn the_installed_zellij_is_not_called_a_shadow_of_itself() {
+        let scratch = tempfile::tempdir().unwrap();
+        let installed = write(scratch.path(), "zellij", "the real one");
+        let resolved = installed.canonicalize().unwrap();
+        assert!(wrapper_faults(scratch.path(), Some(&resolved)).is_empty());
+    }
+
+    /// A symlink to the running binary is an installation too - `~/bin` on PATH, pointing at the
+    /// versioned path a package manager owns.
+    #[test]
+    fn a_symlink_to_this_binary_is_an_installation_and_not_a_shadow() {
+        let scratch = tempfile::tempdir().unwrap();
+        let real = write(scratch.path(), "zellij-0.45.0", "the real one");
+        let link = scratch.path().join("zellij");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let faults = wrapper_faults(scratch.path(), Some(&real.canonicalize().unwrap()));
+        assert!(faults.is_empty(), "{:?}", faults);
+    }
+
+    /// The shape the check exists for: another zellij entirely, earlier on PATH.
+    #[test]
+    fn another_zellij_under_the_same_name_is_a_shadow() {
+        let scratch = tempfile::tempdir().unwrap();
+        let other = write(scratch.path(), "zellij", "a different build");
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ours = write(elsewhere.path(), "zellij", "this build");
+        let faults = wrapper_faults(scratch.path(), Some(&ours.canonicalize().unwrap()));
+        assert_eq!(faults.len(), 1, "{:?}", faults);
+        assert_eq!(faults[0].0, other);
+        assert!(faults[0].1.contains("shadows"));
+    }
+
+    /// A name that resolves to nothing is still a name a shell finds and fails to run.
+    #[test]
+    fn a_dangling_zellij_symlink_is_still_a_shadow() {
+        let scratch = tempfile::tempdir().unwrap();
+        let link = scratch.path().join("zellij");
+        std::os::unix::fs::symlink(scratch.path().join("gone"), &link).unwrap();
+        let ours = tempfile::tempdir().unwrap();
+        let ours = write(ours.path(), "zellij", "this build");
+        let faults = wrapper_faults(scratch.path(), Some(&ours.canonicalize().unwrap()));
+        assert_eq!(faults.len(), 1, "{:?}", faults);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_there_holds_no_leftovers() {
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(wrapper_faults(&scratch.path().join("no-such-bin"), None).is_empty());
+    }
 }

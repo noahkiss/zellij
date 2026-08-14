@@ -1125,9 +1125,10 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
     //
     // Taken after the daemonize, so the descriptor belongs to the process that does the work: a
     // restart that dies mid-hold has the flock released for it by the kernel. At the default
-    // `--wait-timeout` both steps together are bounded well inside the lock's own 30 seconds, so a
-    // waiting `up` waits rather than giving up and proceeding unlocked; a much larger
-    // `--wait-timeout` can outlast that, which `lock_up` records.
+    // `--wait-timeout` both steps together are bounded well inside the lock's own 90 seconds - 10
+    // for the down and 30 for the up - so a waiting `up` waits rather than giving up and proceeding
+    // unlocked; a `--wait-timeout` past about a minute can outlast that, which `lock_up` records and
+    // `a_slow_restart_still_fits_inside_the_up_lock` asserts.
     let _restart_lock = lock_up(name);
 
     if down(name, wait_timeout, opts).is_err() {
@@ -1160,14 +1161,34 @@ mod tests {
     use super::*;
     use zellij_utils::session_lifecycle::UP_LOCK_TIMEOUT;
 
+    /// The default `--wait-timeout` on `session restart`, read from the parser rather than copied,
+    /// because the invariant below is only guarded if a change to that default breaks this test.
+    ///
+    /// Parsed on a big stack, like every other test that builds the clap tree: a test thread's own
+    /// stack overflows on it. See [`on_big_stack`].
+    fn default_restart_wait_timeout() -> Duration {
+        use clap::Parser;
+        use zellij_utils::cli::on_big_stack;
+
+        let parsed =
+            on_big_stack(|| CliArgs::try_parse_from(["zellij", "session", "restart", "a-session"]))
+                .expect("`session restart` parses with no flags");
+        match parsed.command {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Restart {
+                wait_timeout,
+                ..
+            }))) => Duration::from_secs(wait_timeout),
+            other => panic!("expected a `session restart` command, got {:?}", other),
+        }
+    }
+
     /// `restart` holds the up-lock across its down and its up, so the longest hold a healthy
     /// machine produces is a `--wait-timeout` down plus this wait for the server. A waiting `up`
     /// that gives up first goes ahead without the lock, which is the two-servers-for-one-name race
-    /// the lock exists to prevent - so raising one of these without the other reintroduces it.
+    /// the lock exists to prevent - so raising ANY of the three without the others reintroduces it.
     #[test]
     fn a_slow_restart_still_fits_inside_the_up_lock() {
-        // the default of `--wait-timeout` on `session restart`
-        let longest_down = Duration::from_secs(10);
+        let longest_down = default_restart_wait_timeout();
         assert!(
             longest_down + SERVER_APPEARANCE_TIMEOUT < UP_LOCK_TIMEOUT,
             "a restart can hold the lock for {:?}, but a waiting `up` gives up after {:?}",
