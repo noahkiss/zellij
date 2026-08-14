@@ -291,8 +291,11 @@ impl Commander for SystemCommander {
             .spawn()
             .map_err(|e| format!("could not run {}: {}", program, e))?;
         if let Some(stdin) = stdin {
-            // a keychain password goes down this pipe rather than into argv, where every other
-            // process on the machine could read it out of `ps`
+            // Nothing writes here yet. It is the pipe a secret would go down instead of argv,
+            // where `ps` shows it to every other process on the machine - and the one secret
+            // doctor handles, the keychain password, cannot use it: `security
+            // set-key-partition-list` reads its password from `-k` and from nowhere else. See
+            // `session_signing::import_identity`, which says the same thing from the other end.
             let mut pipe = child
                 .stdin
                 .take()
