@@ -2001,6 +2001,53 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
         .unwrap()
 }
 
+/// Whether a command that acts on "the focused thing" has been given something to act on.
+///
+/// A `zellij action` client is not attached to anything. It has no focus of its own, so the server
+/// resolves "focused" against whichever client it can find - which, from a script, is a pane the
+/// caller has never seen. For a mutation that is not a wrong answer, it is a wrong tab getting
+/// closed or moved.
+///
+/// Run from inside a pane, `focused` means the pane the hands are on, and that is exactly what the
+/// caller meant, so nothing here applies. `inside_the_session` is that test: the ambient session is
+/// this session.
+///
+/// Returns the sentence to print, naming the flag that would have made the command unambiguous.
+pub fn missing_target_from_outside_a_pane(
+    action: &CliAction,
+    inside_the_session: bool,
+) -> Option<String> {
+    if inside_the_session {
+        return None;
+    }
+    let needs = |verb: &str, flag: &str, lister: &str| {
+        Some(format!(
+            "`{verb}` run from outside a pane has no focused {thing} to act on. \
+             Pass {flag}, or run it from inside the session. `zellij action {lister}` lists them.",
+            verb = verb,
+            thing = if flag == "--pane-id" { "pane" } else { "tab" },
+            flag = flag,
+            lister = lister,
+        ))
+    };
+    match action {
+        CliAction::ClosePane { pane_id: None } => needs("close-pane", "--pane-id", "list-panes"),
+        CliAction::CloseTab { tab_id: None } => needs("close-tab", "--tab-id", "list-tabs"),
+        CliAction::MoveTab { tab_id: None, .. } => needs("move-tab", "--tab-id", "list-tabs"),
+        CliAction::BreakPane { pane_id, .. } if pane_id.is_empty() => {
+            needs("break-pane", "--pane-id", "list-panes")
+        },
+        // these two name no pane at all, by design - they are keybindings that happen to be
+        // reachable from the CLI, so the way to aim them is to use the verb that can be aimed
+        CliAction::BreakPaneRight | CliAction::BreakPaneLeft => Some(
+            "`break-pane-right` and `break-pane-left` act on the focused pane and cannot name \
+             one, so they mean nothing from outside a pane. Use `break-pane --pane-id` instead."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2263,6 +2310,80 @@ mod tests {
                 assert!(no_focus);
             },
             other => panic!("Expected GoToTabName, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_targetless_close_from_outside_a_pane_is_refused() {
+        for args in [
+            vec!["close-pane"],
+            vec!["close-tab"],
+            vec!["move-tab", "left"],
+            vec!["break-pane"],
+            vec!["break-pane-right"],
+            vec!["break-pane-left"],
+        ] {
+            let action = parse_action(&args);
+            assert!(
+                missing_target_from_outside_a_pane(&action, false).is_some(),
+                "expected `{}` to need a target",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_commands_are_untouched_from_inside_a_pane() {
+        // the negative control: inside the session, "focused" is the pane the hands are on, which
+        // is what the caller meant
+        for args in [
+            vec!["close-pane"],
+            vec!["close-tab"],
+            vec!["move-tab", "left"],
+            vec!["break-pane"],
+            vec!["break-pane-right"],
+            vec!["break-pane-left"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                missing_target_from_outside_a_pane(&action, true),
+                None,
+                "`{}` should be untouched from inside a pane",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_names_its_target_is_never_refused() {
+        for args in [
+            vec!["close-pane", "--pane-id", "terminal_1"],
+            vec!["close-tab", "--tab-id", "2"],
+            vec!["move-tab", "left", "--tab-id", "2"],
+            vec!["break-pane", "--pane-id", "terminal_1"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                missing_target_from_outside_a_pane(&action, false),
+                None,
+                "`{}` names its target",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_that_mutates_nothing_is_never_refused() {
+        // reading and creating are not the footgun: a query has no target to get wrong, and a new
+        // pane in the wrong tab is visible and undoable in a way a closed one is not
+        for args in [
+            vec!["list-panes"],
+            vec!["list-tabs"],
+            vec!["new-pane"],
+            vec!["new-tab"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(missing_target_from_outside_a_pane(&action, false), None);
         }
     }
 

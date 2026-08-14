@@ -838,6 +838,17 @@ fn attach_with_cli_client(
             ),
         }
     };
+    // a command that acts on "the focused thing" is only meaningful from inside the session that
+    // has the focus. From a script it resolves to a pane the caller has never seen
+    let inside_the_session = envs::get_session_name()
+        .map(|ambient| ambient == session_name)
+        .unwrap_or(false);
+    if let Some(message) =
+        zellij_utils::cli::missing_target_from_outside_a_pane(&cli_action, inside_the_session)
+    {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
     match Action::actions_from_cli(
         cli_action,
         Box::new(get_current_dir),
