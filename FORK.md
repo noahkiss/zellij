@@ -74,10 +74,12 @@ you how to read the next.
   removed. A value that carries a given name means the same thing in every command that prints it,
   which is why `pane_id` is `terminal_7` everywhere and never `7` in one place and `terminal_7` in
   another.
-- **`--json` is available on every query and on every mutation that reports something**, and carries
-  the same information structured. JSON is the interface for programs; the default output is for a
-  human or an agent reading a shell. A program that parses the default output has picked the wrong
-  one of the two.
+- **Where `--json` exists it carries the same information, structured.** JSON is the interface for
+  programs; the default output is for a human or an agent reading a shell. The goal is `--json` on
+  every query and on every mutation that reports something. The queries have it — `ls`,
+  `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `current-tab-info`. The mutations do not
+  yet, so for those this bullet is a direction rather than a promise you can write a script
+  against.
 - **Results go to stdout, diagnostics go to stderr.** A command whose output you are capturing never
   mixes an explanation into it.
 - **Exit codes are `0` acted, `1` error, `2` miss.** A miss is a well-formed request about something
@@ -209,11 +211,11 @@ of what moved to get there.
 | `list-clients` | gains `TTY`, `SIZE` and `CURRENT` — the fields that were reachable only through `--json` |
 | `ls` | a table: `NAME STATUS CURRENT CLIENTS CREATED`. `-s` is untouched |
 | `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2. `--no-focus` stays the existence probe, answering `id: <n>` |
-| `close-pane` | `closed: terminal_3` |
+| `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'` |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
 | `new-pane`, `new-tab`, `break-pane`, `launch-or-focus-plugin` | `pane_id:` / `tab_id:` / `handle:` instead of a bare id |
-| `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2 |
+| `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
 | `query-tab-names` | gone. `list-tabs` answers it |
 
 Two of those are refusals rather than shapes, and they are the same refusal: a `zellij action`
@@ -222,7 +224,18 @@ can find. From inside a pane that is right and is the point. From a script it is
 has never seen — which is a wrong answer for `dump-screen` and a closed tab for `close-tab`. So
 `close-pane`, `close-tab`, `move-tab` and `break-pane` exit 1 from outside the session unless they
 name a target, and `break-pane-right`/`break-pane-left`, which cannot name one, are refused
-outright. Inside a pane, nothing changes.
+outright. For those, inside a pane nothing changes.
+
+`dump-screen` is stricter: it refuses a targetless dump from **any** `zellij action` client,
+inside a pane or out. The client that types the command is not the client that holds the focus
+either way, so there is no reading of "the focused pane" that a `zellij action dump-screen` could
+mean. A keybinding is unaffected.
+
+Two caveats on the refusal. "Outside" is read from the ambient `$ZELLIJ_SESSION_NAME`, which is a
+convenience and not a security boundary: it is an environment variable, and a caller that sets it
+is trusted to mean it. And because that variable is written when a pane is spawned, it cannot be
+updated in a shell that is already running — so after `zellij action rename-session`, panes that
+predate the rename read as outside the session until they are replaced.
 
 ### Pane handles
 
