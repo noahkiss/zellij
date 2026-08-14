@@ -471,7 +471,7 @@ pub enum Sessions {
     },
 
     /// Run a command in a new pane
-    /// Returns: Created pane ID (format: terminal_<id>)
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "r")]
     Run {
         /// Command to run
@@ -580,7 +580,7 @@ pub enum Sessions {
         tab_id: Option<usize>,
     },
     /// Load a plugin
-    /// Returns: Created pane ID (format: plugin_<id>)
+    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "p")]
     Plugin {
         /// Plugin URL, can either start with http(s), file: or zellij:
@@ -635,7 +635,7 @@ pub enum Sessions {
         tab_id: Option<usize>,
     },
     /// Edit file with default $EDITOR / $VISUAL
-    /// Returns: Created pane ID (format: terminal_<id>)
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "e")]
     Edit {
         file: PathBuf,
@@ -1128,7 +1128,7 @@ pub enum CliAction {
     },
     /// Open a new pane in the specified direction [right|down]
     /// If no direction is specified, will try to use the biggest available space.
-    /// Returns: Created pane ID (format: terminal_<id> or plugin_<id>)
+    /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word handle>`
     NewPane {
         /// Direction to open the new pane in
         #[clap(short, long, value_parser, conflicts_with("floating"))]
@@ -1254,7 +1254,7 @@ pub enum CliAction {
         tab_id: Option<usize>,
     },
     /// Open the specified file in a new zellij pane with your default EDITOR
-    /// Returns: Created pane ID (format: terminal_<id>)
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     Edit {
         file: PathBuf,
 
@@ -1454,7 +1454,7 @@ pub enum CliAction {
     },
     /// Create a new tab, optionally with a specified tab layout and name
     ///
-    /// Returns: The created tab's ID as a single number on stdout
+    /// Returns: `tab_id: <id>` on stdout
     NewTab {
         /// Layout to use for the new tab
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]
@@ -1593,7 +1593,7 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
     },
-    /// Returns: Plugin pane ID (format: plugin_<id>) when creating or focusing plugin
+    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>` for the plugin pane it made or focused
     LaunchOrFocusPlugin {
         #[clap(short, long, value_parser)]
         floating: bool,
@@ -1613,7 +1613,7 @@ pub enum CliAction {
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
-    /// Returns: Plugin pane ID (format: plugin_<id>)
+    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`
     LaunchPlugin {
         #[clap(short, long, value_parser)]
         floating: bool,
@@ -1769,7 +1769,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Get information about the currently active tab
     ///
-    /// Returns: Tab name and ID by default, or full info in JSON
+    /// Returns: `name:`, `id:` and `position:` lines, or the full TabInfo with --json
     CurrentTabInfo {
         /// Output as JSON with full TabInfo
         #[clap(short, long, value_parser)]
@@ -1870,7 +1870,7 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Move panes out into a new tab
     ///
-    /// Without --pane-id this moves the focused pane. Returns the new tab's ID.
+    /// Without --pane-id this moves the focused pane. Returns `tab_id: <id>` for the new tab.
     BreakPane {
         /// Move this pane (repeatable). Defaults to the focused pane.
         #[clap(short, long, value_parser)]
