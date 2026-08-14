@@ -688,6 +688,18 @@ and then reports the session already running. A lock that cannot be taken in 30 
 holder rather than a busy one, so it is named and the `up` goes ahead: no session at all is a worse
 outcome than the race.
 
+`restart` takes that lock **once, for its `down` and its `up` together**, and the inner `up`
+re-enters the hold rather than waiting for it. Scoped to `up` alone the lock left the window between
+the two steps open, and the watchdog's tick fitted in it: the tick's `up` took the lock first and
+built the session fresh from the layout, and the restart's `up` then found a healthy session — and
+either reported "already running" and exited 0, or refused to restore into it. Both discard the
+snapshot the restart existed to bring back, and the case it is wanted for most is restoring a shape
+after a reboot, which is exactly when a watchdog is ticking. Re-entrancy is per thread and held in
+memory only, so a restart that dies mid-hold leaves nothing to clean up: the kernel releases the
+`flock` when the process goes. At the default `--wait-timeout` the whole restart fits inside the
+lock's own 30 seconds with room to spare; raise that timeout past about twenty seconds and a waiting
+`up` can give up on a restart that is only slow, which is the race put back by hand.
+
 ### `zellij setup --generate-service <systemd|launchd>`
 
 Writes a user-level systemd unit or launchd plist whose only job is to call `zellij session up`.

@@ -1095,6 +1095,20 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
     }
     drop_configured_env(opts);
 
+    // Held across BOTH steps, and taken here rather than left to `up`. A restart is a `down`
+    // followed by an `up`, and the watchdog's minute tick fits between them: its `up` takes the
+    // lock first, finds nothing, and builds the session fresh from the layout. This `up` then
+    // waits, finds a healthy session, and either reports "already running" or refuses to restore
+    // into it - having thrown away the snapshot the restart existed to bring back. The inner `up`
+    // re-enters this hold rather than waiting for it; see `session_lifecycle::lock_up`.
+    //
+    // Taken after the daemonize, so the descriptor belongs to the process that does the work: a
+    // restart that dies mid-hold has the flock released for it by the kernel. At the default
+    // `--wait-timeout` both steps together are bounded well inside the lock's own 30 seconds, so a
+    // waiting `up` waits rather than giving up and proceeding unlocked; a much larger
+    // `--wait-timeout` can outlast that, which `lock_up` records.
+    let _restart_lock = lock_up(name);
+
     if down(name, wait_timeout, opts).is_err() {
         eprintln!("teardown failed; NOT recreating the session.");
         process::exit(1);
