@@ -239,15 +239,30 @@ impl PaneFrame {
         };
         match (indications, self.render_handle_indication(space_left)) {
             (Some((mut indications, indications_len)), Some((mut handle, handle_len))) => {
-                let mut characters: Vec<_> = indications.drain(..).collect();
+                // the pin checkbox is a click target, and `clicked_on_pinned` finds it by counting
+                // back from the right edge of the pane. So on a pane that draws one, the pin keeps
+                // the right edge and the handle goes to its left - otherwise the handle pushes the
+                // checkbox out from under the place a click looks for it, and the button a user can
+                // see stops working
+                let (mut first, mut second) = if self.draws_pin_indication() {
+                    (handle, indications)
+                } else {
+                    (indications, handle)
+                };
+                let mut characters: Vec<_> = first.drain(..).collect();
                 characters.append(&mut foreground_color("|", self.color));
-                characters.append(&mut handle);
+                characters.append(&mut second);
                 Some((characters, indications_len + handle_len + 1))
             },
             (Some(indications), None) => Some(indications),
             (None, Some(handle)) => Some(handle),
             _ => None,
         }
+    }
+    /// Whether this frame draws the pin checkbox, which is a click target and so owns the right
+    /// edge of the title row - see `clicked_on_pinned`.
+    fn draws_pin_indication(&self) -> bool {
+        self.is_floating && self.is_selectable
     }
     /// The pane's handle, whole or not at all.
     ///
@@ -278,7 +293,7 @@ impl PaneFrame {
         let has_scroll = self.scroll_position.0 > 0 || self.scroll_position.1 > 0;
         if has_scroll && self.is_selectable {
             // TODO: don't show SCROLL at all for plugins
-            let pin_indication = if self.is_floating && self.is_selectable {
+            let pin_indication = if self.draws_pin_indication() {
                 self.render_pinned_indication(max_length)
             } else {
                 None
@@ -303,7 +318,7 @@ impl PaneFrame {
                 (None, Some(scroll_indication)) => Some(scroll_indication),
                 _ => None,
             }
-        } else if self.is_floating && self.is_selectable {
+        } else if self.draws_pin_indication() {
             self.render_pinned_indication(max_length)
         } else {
             None
@@ -1707,6 +1722,47 @@ mod tests {
         );
         assert!(title_row.contains("1/2"), "got: {}", title_row);
         assert!(!title_row.contains("sunny"), "got: {}", title_row);
+    }
+
+    /// A floating frame, which is the only kind that draws the pin checkbox.
+    fn floating_frame_with_handle(cols: usize, title: &str, handle: &str) -> PaneFrame {
+        let mut frame = frame_with_handle(cols, title, handle, (0, 0), true);
+        frame.is_floating = true;
+        frame
+    }
+
+    #[test]
+    fn a_handle_does_not_move_the_pin_checkbox_out_from_under_a_click() {
+        // the pin is a click target and `clicked_on_pinned` finds it by counting back from the
+        // right edge, so the handle must not take that edge from it. Without this the button a
+        // user can see stops working and the handle text toggles the pin instead
+        let cols = 60;
+        let mut frame = floating_frame_with_handle(cols, "Pane #1", "sunny-otter");
+        let title_row = characters_to_string(&frame.render_title().unwrap());
+        // every character on a frame row is one column wide, so a char index is a column
+        let drawn_checkbox = title_row
+            .chars()
+            .position(|character| character == '[')
+            .map(|index| index + 1)
+            .unwrap_or_else(|| panic!("no checkbox drawn: {}", title_row));
+        assert!(
+            title_row.contains("sunny-otter"),
+            "the handle is still drawn: {}",
+            title_row
+        );
+        assert!(
+            frame.clicked_on_pinned(Position::new(-1, drawn_checkbox as u16)),
+            "a click on the drawn checkbox at column {} did not toggle the pin: {}",
+            drawn_checkbox,
+            title_row
+        );
+    }
+
+    #[test]
+    fn a_pane_with_no_pin_still_draws_its_handle_last() {
+        // the negative control: only a pin moves the handle off the right edge
+        let title_row = full_frame_title(40, "Pane #1", "sunny-otter");
+        assert!(title_row.ends_with(" sunny-otter \u{2510}"), "got: {}", title_row);
     }
 
     #[test]
