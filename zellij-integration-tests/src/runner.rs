@@ -8,7 +8,7 @@ use zellij_client::os_input_output::SignalEvent;
 use zellij_client::ClientInfo;
 use zellij_utils::cli::{CliAction, CliArgs};
 use zellij_utils::data::{ConnectToSession, LayoutInfo};
-use zellij_utils::input::actions::Action;
+use zellij_utils::input::actions::{pane_ids_only, Action};
 use zellij_utils::input::options::Options;
 use zellij_utils::pane_size::Size;
 use zellij_utils::setup::Setup;
@@ -460,10 +460,13 @@ impl TestSession {
     }
 
     fn spawn_cli_client(&self, cli_action: CliAction) -> JoinHandle<i32> {
+        // The id forms only: resolving a handle or a uuid needs a real cli connection to ask the
+        // server on, and this harness builds its actions before it has one.
         let actions = Action::actions_from_cli(
             cli_action,
             Box::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
             Some(self.config.clone()),
+            &pane_ids_only,
         )
         .expect("failed to build cli actions");
         let (fake_client_os_api, _fake_client_handle) = FakeClientOsApi::new(self.size, None);
