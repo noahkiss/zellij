@@ -428,16 +428,30 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::FocusPaneByPaneId { pane_id } => {
-            senders
-                .send_to_screen(ScreenInstruction::FocusPaneWithId(
-                    pane_id.into(),
-                    true,  // should_float_if_hidden
-                    false, // should_be_in_place_if_hidden
-                    client_id,
-                    Some(NotificationEnd::new(completion_tx)),
-                ))
-                .with_context(err_context)?;
+        Action::FocusPaneByPaneId { pane_id, no_focus } => {
+            if no_focus {
+                // the probe: nothing moves, and the answer is whether a live pane answers to this
+                // target and what it is called. A pane that is not there is not a miss here - the
+                // question was whether it exists, and an empty answer is the answer
+                let mut notification_end = NotificationEnd::new(completion_tx);
+                if let Some(handle) = handle_of_pane(&senders, pane_id.into()) {
+                    notification_end.set_stdout_lines(vec![
+                        format!("id: {}", pane_id),
+                        format!("handle: {}", handle),
+                    ]);
+                }
+                drop(notification_end);
+            } else {
+                senders
+                    .send_to_screen(ScreenInstruction::FocusPaneWithId(
+                        pane_id.into(),
+                        true,  // should_float_if_hidden
+                        false, // should_be_in_place_if_hidden
+                        client_id,
+                        Some(NotificationEnd::new(completion_tx)),
+                    ))
+                    .with_context(err_context)?;
+            }
         },
         Action::FocusLastPane => {
             senders
@@ -3843,6 +3857,34 @@ mod tests {
             Some(0),
             "a tab with no panes carries an empty list, not a missing key"
         );
+    }
+
+    #[test]
+    fn the_surface_dump_promises_the_columns_these_tables_print() {
+        // `zellij setup --dump-surface` is the map an agent reads instead of running every
+        // `--help`, and its column lists are hand-written - the one thing clap cannot introspect.
+        // They have drifted from the printer before, so the printer is the authority: a column
+        // added here and not there fails the build rather than teaching an agent a short table.
+        for (command, header) in [
+            (
+                "action list-panes",
+                format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true)
+                    .remove(0),
+            ),
+            (
+                "action list-tabs",
+                format_tabs_table(&[TabInfo::default()], true, true, true, true).remove(0),
+            ),
+        ] {
+            let promised = zellij_utils::cli_surface::promised_output_keys(command)
+                .unwrap_or_else(|| panic!("`{}` promises columns in the dump", command));
+            assert_eq!(
+                promised.split_whitespace().collect::<Vec<_>>(),
+                header.split_whitespace().collect::<Vec<_>>(),
+                "`{}`: the dump and the table disagree",
+                command
+            );
+        }
     }
 
     #[test]

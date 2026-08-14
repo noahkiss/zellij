@@ -2154,9 +2154,10 @@ impl From<crate::input::actions::Action>
                     pane_id: Some(pane_id.into()),
                 })
             },
-            crate::input::actions::Action::FocusPaneByPaneId { pane_id } => {
+            crate::input::actions::Action::FocusPaneByPaneId { pane_id, no_focus } => {
                 ActionType::FocusPaneByPaneId(FocusPaneByPaneIdAction {
                     pane_id: Some(pane_id.into()),
+                    no_focus,
                 })
             },
             // Tab-targeting CLI-only variants
@@ -3180,6 +3181,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                         .pane_id
                         .ok_or_else(|| anyhow!("FocusPaneByPaneId missing pane_id"))?
                         .try_into()?,
+                    no_focus: a.no_focus,
                 })
             },
             // Tab-targeting CLI-only variants

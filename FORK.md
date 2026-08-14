@@ -153,6 +153,12 @@ commands. And a `new-pane --block-until-exit` prints no `pane_id:` at all: the e
 answer, only one message reaches the CLI, and a caller parsing for the id would wait for a line
 that never comes.
 
+The blocking flags are not one thing, and the difference matters to a script. `--block-until-exit`
+and its `-success`/`-failure` siblings wait for the **command**; bare `-b/--blocking` waits for the
+**pane**. A pane whose command has ended is held open by default, so `-b` — and a `-success` wait a
+failing command never satisfies — keeps waiting until something closes the pane. Add
+`--close-on-exit` when the script wants the status and not the pane.
+
 ## The patch queue
 
 ### Plugin hot-reload (`plugin_watch`, default **on**)
@@ -270,7 +276,7 @@ of what moved to get there.
 | `list-clients` | gains `TTY`, `SIZE` and `CURRENT` — the fields that were reachable only through `--json` |
 | `ls` | a table: `NAME STATUS CURRENT CLIENTS CREATED`. `-s` is untouched |
 | `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2. `--no-focus` stays the existence probe, answering `id: <n>` |
-| `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'` |
+| `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
 | `new-pane`, `new-tab`, `break-pane`, `launch-or-focus-plugin` | `pane_id:` / `tab_id:` / `handle:` instead of a bare id |
@@ -315,6 +321,12 @@ zellij action dump-screen --pane-id sunny-otter
   lineage answer different questions, which is why the fork keeps both.
 - **It is reused after the pane closes.** Uniqueness is over live panes only. A handle you wrote
   down last week names at most one pane today, and not necessarily the same one.
+- **It names a pane in one session.** `switch-session --pane-id` is the one flag that names a pane
+  in a *different* session, and it takes the id forms only. A handle or a uuid would be read against
+  the session you are leaving, and the number it resolved to would land on whatever pane happens to
+  wear it in the session you are joining — so it is refused, with a message and exit 1, rather than
+  answered wrongly. Reading it in the right session would need a cross-session query the protocol
+  does not carry.
 - **Where you see it**: the `HANDLE` column of `list-panes`, the `handle:` key of every creation
   command, the `list-tree` outline, both halves of a `go-to-pane` report, and the pane frame.
 
@@ -364,6 +376,19 @@ pane target, focuses the pane **and the tab it lives in**, and reports what it l
 landed as `<pane_id> <handle>` — the pane mirror of what `go-to-tab` prints. A jump that landed
 where it started prints only `to:` and exits 0. A target no live pane answers to exits 2 with the
 resolver's own sentence.
+
+`--no-focus` turns it into the existence probe `go-to-tab-name` already had, which is what a handle
+written down last week needs before anything is aimed at it:
+
+```
+$ zellij action go-to-pane sunny-otter --no-focus
+id: terminal_0
+handle: sunny-otter
+```
+
+Nothing moves, and the exit code is 0 whether or not the pane is there — stdout is the whole answer,
+and it is empty for a pane that is gone. A target that names no pane in any form is still malformed
+input and still exits 1.
 
 ### `attach --no-resurrect`
 

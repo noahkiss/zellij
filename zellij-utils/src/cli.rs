@@ -1034,12 +1034,21 @@ pub enum CliAction {
     ///
     /// Returns: `from:` and `to:` lines, each `<pane_id> <handle>`. A jump that landed where it
     /// started prints only `to:`. A target no live pane answers to exits 2
+    ///
+    /// With --no-focus this is an existence probe instead, the same one `go-to-tab-name` has: the
+    /// exit code is 0 either way, and stdout is the answer - `id:` and `handle:` if the pane is
+    /// there, nothing at all if it is not
     #[clap(visible_alias = "go-to-pane")]
     FocusPaneId {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
         /// in its PANE_ID and HANDLE columns
         pane_id: String,
+        /// Leave focus where it is and only report what the target names. Read stdout for the
+        /// answer: `id:` and `handle:` mean the pane is there, empty means it is not. The exit
+        /// code stays 0 for both
+        #[clap(long, value_parser)]
+        no_focus: bool,
     },
     /// Move focus back to the pane it was on before the current one
     FocusLastPane,
@@ -1558,9 +1567,10 @@ pub enum CliAction {
     },
     /// Focus the tab with a given name
     ///
-    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch, and `id:
-    /// <tab id>` when --create makes the tab. A name no tab answers to is a miss: a message on
-    /// stderr and exit 2.
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch. When
+    /// --create makes the tab it prints `id: <tab id>` instead, then `pane_id:` and `handle:` for
+    /// the pane the new tab opened on. A name no tab answers to is a miss: a message on stderr and
+    /// exit 2.
     ///
     /// With --no-focus and without --create this is an existence probe instead: the exit code is 0
     /// either way, and stdout is the answer - `id: <tab id>` if the tab is there, nothing at all
@@ -1618,8 +1628,9 @@ pub enum CliAction {
     },
     /// Create a tab, optionally from a layout
     ///
-    /// Returns: `tab_id: <id>`. A tab made from a layout gets whatever panes the layout names;
-    /// otherwise it opens one pane running your shell or --initial-command.
+    /// Returns: `tab_id: <id>`, then `pane_id:` and `handle:` for the pane the tab opened on. A
+    /// tab made from a layout gets whatever panes the layout names; otherwise it opens one pane
+    /// running your shell or --initial-command.
     NewTab {
         /// A layout to build the tab from: a name in the layout directory, or a path to a file
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]
@@ -2191,8 +2202,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// A 1-based tab position to focus in the session being switched to
         #[clap(long)]
         tab_position: Option<usize>,
-        /// A pane to focus in the session being switched to, as terminal_1 or plugin_2. Handles
-        /// and uuids are read against this session, not that one, so use the explicit forms
+        /// A pane to focus in the session being switched to: terminal_1, plugin_2, or a bare
+        /// integer. A handle or a uuid is refused here - it names a pane against this session, not
+        /// that one, and there is no way to ask that one
         #[clap(long)]
         pane_id: Option<String>,
         /// A layout to build the session from, if it is not already running: a name in the layout
@@ -2290,6 +2302,42 @@ pub fn missing_target_from_outside_a_pane(
                 .to_owned(),
         ),
         _ => None,
+    }
+}
+
+/// Whether `switch-session --pane-id` was handed a target only the other session could resolve.
+///
+/// A handle or a uuid names a pane against one session's live panes, and the only registry this
+/// process can reach is the session it is standing in. Resolving one here and sending the number on
+/// would land the switch on whichever pane happens to wear that id in the target session - a pane
+/// the caller never named. Asking the target session instead would need a query across sessions
+/// that the protocol does not carry.
+///
+/// So the id forms, which mean the same thing in every session, pass through untouched, and the
+/// rest are refused. A string that names a pane in no form at all is refused here too, in the
+/// parser's own words: it is malformed input like any other, and every other `--pane-id` reports it
+/// and exits 1, so this one does the same rather than turning it into a miss.
+///
+/// Returns the sentence to print, before exiting 1.
+pub fn cross_session_pane_target_needs_an_id(action: &CliAction) -> Option<String> {
+    let (name, pane_id) = match action {
+        CliAction::SwitchSession {
+            name,
+            pane_id: Some(pane_id),
+            ..
+        } => (name, pane_id),
+        _ => return None,
+    };
+    match pane_id.parse::<crate::data::PaneTarget>() {
+        Ok(crate::data::PaneTarget::Id(_)) => None,
+        Err(malformed) => Some(malformed),
+        Ok(_) => Some(format!(
+            "`switch-session --pane-id {pane_id}` reads '{pane_id}' against this session, not \
+             against '{name}', so it cannot mean a pane there. A --pane-id for another session \
+             must be an id form: terminal_1, plugin_2, or a bare integer.",
+            pane_id = pane_id,
+            name = name,
+        )),
     }
 }
 
@@ -2542,6 +2590,24 @@ mod tests {
     }
 
     #[test]
+    fn go_to_pane_takes_no_focus() {
+        // the same probe flag `go-to-tab-name` has, on the alias people reach for
+        let action = parse_action(&["go-to-pane", "sunny-otter", "--no-focus"]);
+        match action {
+            CliAction::FocusPaneId { pane_id, no_focus } => {
+                assert_eq!(pane_id, "sunny-otter");
+                assert!(no_focus);
+            },
+            other => panic!("Expected FocusPaneId, got {:?}", other),
+        }
+        // and the negative control: without the flag it is the jump it always was
+        match parse_action(&["go-to-pane", "sunny-otter"]) {
+            CliAction::FocusPaneId { no_focus, .. } => assert!(!no_focus),
+            other => panic!("Expected FocusPaneId, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn go_to_tab_name_no_focus() {
         let action = parse_action(&["go-to-tab-name", "build", "--create", "--no-focus"]);
         match action {
@@ -2630,6 +2696,92 @@ mod tests {
             let action = parse_action(&args);
             assert_eq!(missing_target_from_outside_a_pane(&action, false), None);
         }
+    }
+
+    #[test]
+    fn a_cross_session_pane_target_that_needs_a_registry_is_refused() {
+        // the registry a handle or a uuid would be read against is this session's, and the pane is
+        // in the other one - so the id it resolves to names a pane the caller never asked for
+        for target in ["sunny-otter", "e9b82dbd-0000-4000-8000-0000000000aa"] {
+            let action = parse_action(&["switch-session", "other", "--pane-id", target]);
+            let message = cross_session_pane_target_needs_an_id(&action)
+                .unwrap_or_else(|| panic!("expected `{}` to be refused", target));
+            assert!(message.contains(target), "got: {}", message);
+            assert!(message.contains("terminal_1"), "got: {}", message);
+        }
+    }
+
+    #[test]
+    fn a_cross_session_id_form_passes_through() {
+        // the negative control: an id means the same thing in every session, so nothing is resolved
+        // and nothing is refused
+        for target in ["terminal_7", "plugin_2", "3"] {
+            let action = parse_action(&["switch-session", "other", "--pane-id", target]);
+            assert_eq!(
+                cross_session_pane_target_needs_an_id(&action),
+                None,
+                "`{}` is an id form",
+                target
+            );
+        }
+        // and a switch that names no pane has nothing to refuse
+        let action = parse_action(&["switch-session", "other"]);
+        assert_eq!(cross_session_pane_target_needs_an_id(&action), None);
+    }
+
+    #[test]
+    fn a_malformed_cross_session_target_keeps_the_parsers_own_words() {
+        // malformed input exits 1 wherever it appears, and the sentence that names the four forms
+        // is more use than one about the session boundary, which is not what went wrong
+        let action = parse_action(&["switch-session", "other", "--pane-id", "not a pane"]);
+        let message = cross_session_pane_target_needs_an_id(&action)
+            .expect("a malformed target is refused, not passed on");
+        assert!(message.contains("does not name a pane"), "got: {}", message);
+        assert!(
+            !message.contains("switch-session"),
+            "the session boundary is not what went wrong: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn switch_session_never_reaches_the_local_registry() {
+        // the structural half: even handed a resolver that would answer, `switch-session` does not
+        // ask it - the answer would be about the wrong session's panes
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolver = |target: &str| -> Result<PaneId, String> {
+            asked.borrow_mut().push(target.to_owned());
+            Ok(PaneId::Terminal(99))
+        };
+        let action = parse_action(&["switch-session", "other", "--pane-id", "sunny-otter"]);
+        let built =
+            Action::actions_from_cli(action, Box::new(|| PathBuf::from("/")), None, &resolver);
+        assert!(
+            built.is_err(),
+            "a handle cannot be resolved for another session"
+        );
+        assert!(
+            asked.borrow().is_empty(),
+            "switch-session asked this session about {:?}",
+            asked.borrow()
+        );
+
+        // and an id form is carried across untouched, still without asking
+        let action = parse_action(&["switch-session", "other", "--pane-id", "terminal_7"]);
+        let built =
+            Action::actions_from_cli(action, Box::new(|| PathBuf::from("/")), None, &resolver)
+                .expect("an id form needs no registry");
+        assert_eq!(
+            built,
+            vec![Action::SwitchSession {
+                name: "other".to_owned(),
+                tab_position: None,
+                pane_id: Some((7, false)),
+                layout: None,
+                cwd: None,
+            }]
+        );
+        assert!(asked.borrow().is_empty(), "an id form needs no lookup");
     }
 
     #[test]

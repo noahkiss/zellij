@@ -238,7 +238,7 @@ impl PaneFrame {
             None => max_length,
         };
         match (indications, self.render_handle_indication(space_left)) {
-            (Some((mut indications, indications_len)), Some((mut handle, handle_len))) => {
+            (Some((indications, indications_len)), Some((handle, handle_len))) => {
                 // the pin checkbox is a click target, and `clicked_on_pinned` finds it by counting
                 // back from the right edge of the pane. So on a pane that draws one, the pin keeps
                 // the right edge and the handle goes to its left - otherwise the handle pushes the
@@ -1762,7 +1762,11 @@ mod tests {
     fn a_pane_with_no_pin_still_draws_its_handle_last() {
         // the negative control: only a pin moves the handle off the right edge
         let title_row = full_frame_title(40, "Pane #1", "sunny-otter");
-        assert!(title_row.ends_with(" sunny-otter \u{2510}"), "got: {}", title_row);
+        assert!(
+            title_row.ends_with(" sunny-otter \u{2510}"),
+            "got: {}",
+            title_row
+        );
     }
 
     #[test]

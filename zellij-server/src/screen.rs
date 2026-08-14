@@ -1688,6 +1688,17 @@ const STARTUP_SENTINEL_TOKEN: u32 = 0;
 /// network-pathological cases ever see this fire.
 const SERVER_FORWARD_TIMEOUT_MS: u64 = 1000;
 
+/// What `close-pane` answers when it is asked to close the focused pane and nothing is focused.
+///
+/// A detached session has no client holding the focus, so the request is well formed and its
+/// subject is not there - a miss, not an error, and certainly not a success. The CLI guard
+/// (`missing_target_from_outside_a_pane`) catches this from outside the session; from inside it,
+/// with `$ZELLIJ_SESSION_NAME` naming a session nobody is attached to, this is the only place that
+/// can tell.
+pub const NO_FOCUSED_PANE_TO_CLOSE: &str =
+    "`close-pane` has no focused pane to close: nothing is attached to this session. \
+     Pass --pane-id. `zellij action list-panes` lists them.";
+
 impl Screen {
     /// Creates and returns a new [`Screen`].
     pub fn new(
@@ -9533,17 +9544,25 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::CloseFocusedPane(client_id, mut completion_tx) => {
                 let old_pane_id = screen.get_active_pane_id(&client_id);
-                // the report is written before the close because the close consumes the channel.
-                // A close that refuses sets an error message, and an error outranks a report, so
-                // saying it early cannot make a failure look like a success
-                if let (Some(old_pane_id), Some(c)) = (old_pane_id, completion_tx.as_mut()) {
-                    c.set_stdout_message(format!("closed: {}", old_pane_id));
+                if let Some(old_pane_id) = old_pane_id {
+                    // the report is written before the close because the close consumes the
+                    // channel. A close that refuses sets an error message, and an error outranks a
+                    // report, so saying it early cannot make a failure look like a success
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_stdout_message(format!("closed: {}", old_pane_id));
+                    }
+                    active_tab_and_connected_client_id!(
+                        screen,
+                        client_id,
+                        |tab: &mut Tab, client_id: ClientId| tab.close_focused_pane(client_id, completion_tx), ?
+                    );
+                } else if let Some(c) = completion_tx.as_mut() {
+                    // nothing holds the focus, so there is nothing this command names. Saying so is
+                    // the whole job here: falling through would let the fallback close some other
+                    // client's pane, and saying nothing at all exits 0 on a session that still has
+                    // every pane it started with
+                    c.set_error_message(NO_FOCUSED_PANE_TO_CLOSE.to_owned());
                 }
-                active_tab_and_connected_client_id!(
-                    screen,
-                    client_id,
-                    |tab: &mut Tab, client_id: ClientId| tab.close_focused_pane(client_id, completion_tx), ?
-                );
                 let new_pane_id = screen.get_active_pane_id(&client_id);
                 if let (Some(old), Some(new)) = (old_pane_id, new_pane_id) {
                     screen.report_key_passthrough_state(client_id, old, new);

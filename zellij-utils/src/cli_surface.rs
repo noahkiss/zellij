@@ -179,17 +179,19 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action list-clients",
         shape: "table",
-        keys: "CLIENT_ID PANE_ID COMMAND TTY SIZE CURRENT",
+        keys: "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY SIZE CURRENT",
     },
     OutputSpec {
         command: "action list-panes",
         shape: "table",
-        keys: "TAB_ID TAB_POS TAB_NAME PANE_ID HANDLE TYPE TITLE COMMAND",
+        keys: "TAB_ID TAB_POS TAB_NAME PANE_ID HANDLE TYPE TITLE COMMAND CWD FOCUSED FLOATING \
+               EXITED X Y ROWS COLS",
     },
     OutputSpec {
         command: "action list-tabs",
         shape: "table",
-        keys: "TAB_ID POSITION NAME",
+        keys: "TAB_ID POSITION NAME ACTIVE FULLSCREEN SYNC_PANES FLOATING_VIS VP_ROWS VP_COLS \
+               DA_ROWS DA_COLS TILED_PANES FLOAT_PANES HIDDEN_PANES SWAP_LAYOUT LAYOUT_DIRTY",
     },
     OutputSpec {
         command: "action list-tree",
@@ -219,7 +221,7 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action new-tab",
         shape: "record",
-        keys: "tab_id",
+        keys: "tab_id pane_id handle",
     },
     OutputSpec {
         command: "action break-pane",
@@ -254,12 +256,14 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action go-to-tab-name",
         shape: "record",
-        keys: "from to id",
+        keys: "from to id pane_id handle",
     },
     OutputSpec {
         command: "action focus-pane-id",
         shape: "record",
-        keys: "from to",
+        // `id` and `handle` are the probe's answer (`--no-focus`), the way `id` is the tab probe's
+        // above; the jump itself prints `from` and `to`
+        keys: "from to id handle",
     },
     OutputSpec {
         command: "action move-tab",
@@ -277,6 +281,19 @@ const OUTPUTS: &[OutputSpec] = &[
         keys: "NAME STATUS CURRENT CLIENTS CREATED",
     },
 ];
+
+/// The keys or columns the dump promises for a command, or `None` if it promises nothing.
+///
+/// Exported so the code that does the printing can pin this table to what it actually prints. The
+/// table is hand-written - clap cannot see stdout - and it has drifted from the printer more than
+/// once, which is the whole reason a caller can reach it from outside this module.
+pub fn promised_output_keys(command: &str) -> Option<&'static str> {
+    OUTPUTS
+        .iter()
+        .find(|o| o.command == command)
+        .map(|o| o.keys)
+        .filter(|keys| !keys.is_empty())
+}
 
 /// The conventions, said once, at the top of `zellij action --help`.
 pub const ACTION_PREAMBLE: &str = "\
@@ -350,9 +367,11 @@ pub fn decorated_command() -> ClapCommand {
             .expect("the CLI has an `action` subcommand"),
     );
     // clap renders subcommands only as one flat list, so the grouping replaces `{all-args}` with a
-    // listing this module builds and leaves clap to print the options below it.
+    // listing this module builds and leaves clap to print the options below it. `{options}` is the
+    // option list alone - the `Options:` heading belongs to `{all-args}`, which is what was
+    // replaced - so the heading is written here, or the flags run on from the last command.
     let template = format!(
-        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\nCommands:\n{}{{options}}{{after-help}}",
+        "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\nCommands:\n{}\nOptions:\n{{options}}{{after-help}}",
         indent(&listing, 2)
     );
     cmd.mut_subcommand("action", move |action| {

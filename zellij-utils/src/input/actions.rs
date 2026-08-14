@@ -693,6 +693,8 @@ pub enum Action {
     },
     FocusPaneByPaneId {
         pane_id: PaneId,
+        /// The existence probe: report the pane and leave the focus where it is
+        no_focus: bool,
     },
     // Tab-targeting CLI-only variants
     UndoRenameTabByTabId {
@@ -872,9 +874,16 @@ impl Action {
             },
             CliAction::FocusNextPane => Ok(vec![Action::FocusNextPane]),
             CliAction::FocusPreviousPane => Ok(vec![Action::FocusPreviousPane]),
-            CliAction::FocusPaneId { pane_id } => {
-                let pane_id = resolve_pane_target(&pane_id)?;
-                Ok(vec![Action::FocusPaneByPaneId { pane_id }])
+            CliAction::FocusPaneId { pane_id, no_focus } => {
+                match resolve_pane_target(&pane_id) {
+                    Ok(pane_id) => Ok(vec![Action::FocusPaneByPaneId { pane_id, no_focus }]),
+                    // the probe answers "not there" with an empty stdout and exit 0, so a
+                    // well-formed target no pane answers to is not a miss for it - there is simply
+                    // nothing to report. A malformed one never gets here: the resolver exits 1 on
+                    // input that names no pane in any form
+                    Err(_) if no_focus => Ok(vec![]),
+                    Err(e) => Err(e),
+                }
             },
             CliAction::FocusLastPane => Ok(vec![Action::FocusLastPane]),
             CliAction::MoveFocus { direction } => Ok(vec![Action::MoveFocus { direction }]),
@@ -2144,8 +2153,12 @@ impl Action {
                 layout_dir,
                 cwd,
             } => {
+                // deliberately not `resolve_pane_target`: that resolver answers against the session
+                // this process is in, and this pane lives in `name`. See
+                // [`cli::cross_session_pane_target_needs_an_id`], which refuses the forms that
+                // would need the other session's registry before the call gets this far.
                 let pane_id = match pane_id {
-                    Some(stringified_pane_id) => match resolve_pane_target(&stringified_pane_id) {
+                    Some(stringified_pane_id) => match pane_ids_only(&stringified_pane_id) {
                         Ok(PaneId::Terminal(id)) => Some((id, false)),
                         Ok(PaneId::Plugin(id)) => Some((id, true)),
                         Err(e) => return Err(e),
@@ -3903,6 +3916,7 @@ mod tests {
     fn test_focus_pane_id() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "terminal_7".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3914,7 +3928,7 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::FocusPaneByPaneId { pane_id } => {
+            Action::FocusPaneByPaneId { pane_id, .. } => {
                 assert!(matches!(pane_id, PaneId::Terminal(7)));
             },
             _ => panic!("Expected FocusPaneByPaneId action"),
@@ -3922,9 +3936,71 @@ mod tests {
     }
 
     #[test]
+    fn go_to_pane_no_focus_is_a_probe() {
+        let cli_action = CliAction::FocusPaneId {
+            pane_id: "terminal_7".to_string(),
+            no_focus: true,
+        };
+        let actions = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::FocusPaneByPaneId { pane_id, no_focus } => {
+                assert!(matches!(pane_id, PaneId::Terminal(7)));
+                assert!(*no_focus, "the probe asked for the focus to move");
+            },
+            other => panic!("Expected FocusPaneByPaneId action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn go_to_pane_no_focus_says_nothing_about_a_pane_that_is_not_there() {
+        // the probe exits 0 either way, so a target no pane answers to leaves nothing to send
+        let cli_action = CliAction::FocusPaneId {
+            pane_id: "sunny-otter".to_string(),
+            no_focus: true,
+        };
+        let actions = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .unwrap();
+        assert!(
+            actions.is_empty(),
+            "the probe sent an action for a pane it could not resolve: {:?}",
+            actions
+        );
+    }
+
+    #[test]
+    fn go_to_pane_without_no_focus_still_refuses_a_pane_that_is_not_there() {
+        // the negative control: only the probe swallows an unresolvable target. The jump itself is
+        // still a miss, which is what exits 2
+        let cli_action = CliAction::FocusPaneId {
+            pane_id: "sunny-otter".to_string(),
+            no_focus: false,
+        };
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_focus_pane_id_bare_int() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "3".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3936,7 +4012,7 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::FocusPaneByPaneId { pane_id } => {
+            Action::FocusPaneByPaneId { pane_id, .. } => {
                 assert!(matches!(pane_id, PaneId::Terminal(3)));
             },
             _ => panic!("Expected FocusPaneByPaneId action"),
@@ -3947,6 +4023,7 @@ mod tests {
     fn test_focus_pane_id_plugin() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "plugin_2".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3958,7 +4035,7 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::FocusPaneByPaneId { pane_id } => {
+            Action::FocusPaneByPaneId { pane_id, .. } => {
                 assert!(matches!(pane_id, PaneId::Plugin(2)));
             },
             _ => panic!("Expected FocusPaneByPaneId action"),
@@ -3969,6 +4046,7 @@ mod tests {
     fn test_focus_pane_id_malformed() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "invalid_id".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,

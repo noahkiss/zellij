@@ -43,7 +43,10 @@ use zellij_utils::ipc::PixelDimensions;
 use interprocess::local_socket::Stream as LocalSocketStream;
 use zellij_utils::{
     channels::{self, ChannelWithContext, Receiver},
-    data::{Direction, FloatingPaneCoordinates, InputMode, ModeInfo, NewPanePlacement, Palette},
+    data::{
+        Direction, FloatingPaneCoordinates, InputMode, ModeInfo, NewPanePlacement, Palette,
+        UnblockCondition,
+    },
     ipc::{ClientAttributes, ClientToServerMsg, ServerToClientMsg},
 };
 
@@ -4301,7 +4304,11 @@ pub fn send_cli_toggle_floating_panes() {
 #[test]
 pub fn send_cli_close_pane_action() {
     let size = Size { cols: 80, rows: 10 };
-    let client_id = 10; // fake client id should not appear in the screen's state
+    // the client the session belongs to, so there is a focused pane for this to close. A client
+    // Screen has never heard of holds no focus, and `close-pane` now refuses that rather than
+    // closing whichever pane the fallback found - see
+    // `closing_the_focused_pane_with_nothing_focused_is_a_miss`
+    let client_id = 1;
     let mut initial_layout = TiledPaneLayout::default();
     initial_layout.children_split_direction = SplitDirection::Vertical;
     initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
@@ -14163,6 +14170,7 @@ pub fn jumping_to_a_pane_reports_where_focus_came_from_and_where_it_landed() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(1),
+            no_focus: false,
         },
         client_id,
     );
@@ -14189,6 +14197,7 @@ pub fn jumping_to_the_pane_you_are_already_in_reports_only_where_you_are() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(0),
+            no_focus: false,
         },
         client_id,
     );
@@ -14224,6 +14233,7 @@ pub fn jumping_to_a_pane_that_is_not_there_is_a_miss() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(9),
+            no_focus: false,
         },
         client_id,
     );
@@ -14425,5 +14435,226 @@ pub fn dumping_a_pane_that_is_there_still_dumps_it() {
             .contains("No pane answers to"),
         "the guard refused a pane that is there: {:?}",
         result.error_message
+    );
+}
+
+/// The screen-side half of `new-pane --block-until-exit`: the pane keeps the answer until the
+/// command it runs is done with it.
+///
+/// `set_blocking` is what hands the `NotificationEnd` to the pane instead of dropping it at the end
+/// of the `NewPane` handler, so this drives the same instruction the pty thread sends and asserts
+/// on the channel the CLI client is parked on.
+fn spawn_pane_and_take_its_completion_channel(
+    mock_screen: &MockScreen,
+    pane_id: u32,
+    client_id: ClientId,
+    unblock_condition: Option<UnblockCondition>,
+    set_blocking: bool,
+) -> tokio::sync::oneshot::Receiver<crate::route::ActionCompletionResult> {
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let notification_end = match unblock_condition {
+        Some(condition) => {
+            crate::route::NotificationEnd::new_with_condition(completion_tx, condition)
+        },
+        None => crate::route::NotificationEnd::new(completion_tx),
+    };
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(pane_id),
+        Some("sh".to_string()),
+        None, // hold_for_command
+        None, // invoked_with
+        NewPanePlacement::default(),
+        false, // start_suppressed
+        ClientTabIndexOrPaneId::ClientId(client_id),
+        Some(notification_end),
+        set_blocking,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    completion_rx
+}
+
+fn held_command() -> RunCommand {
+    RunCommand {
+        command: PathBuf::from("sh"),
+        args: vec!["-c".to_string(), "exit 7".to_string()],
+        hold_on_close: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+pub fn a_blocking_pane_answers_with_the_commands_exit_status() {
+    let size = Size { cols: 80, rows: 20 };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let mut completion_rx = spawn_pane_and_take_its_completion_channel(
+        &mock_screen,
+        new_pane_id,
+        client_id,
+        Some(UnblockCondition::OnAnyExit),
+        true,
+    );
+
+    // the pane exists and the command is still running: the CLI client is parked, so nothing may
+    // have been sent down this channel yet
+    assert!(
+        matches!(
+            completion_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the blocking pane answered before its command exited"
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::HoldPane(
+        PaneId::Terminal(new_pane_id),
+        Some(7),
+        held_command(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let result = completion_rx
+        .try_recv()
+        .expect("the blocking pane never answered after its command exited");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.exit_status,
+        Some(7),
+        "the command's exit status did not reach the answer"
+    );
+}
+
+#[test]
+pub fn a_non_blocking_pane_answers_as_soon_as_it_is_made() {
+    // the negative control for the test above: without `set_blocking` the same instruction answers
+    // at once, with the pane id and no exit status - which is what `new-pane` prints
+    let size = Size { cols: 80, rows: 20 };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let mut completion_rx = spawn_pane_and_take_its_completion_channel(
+        &mock_screen,
+        new_pane_id,
+        client_id,
+        None,
+        false,
+    );
+    let result = completion_rx
+        .try_recv()
+        .expect("a non-blocking pane did not answer once it was made");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.affected_pane_id,
+        Some(PaneId::Terminal(new_pane_id)),
+        "the answer did not name the pane that was made"
+    );
+    assert_eq!(
+        result.exit_status, None,
+        "a non-blocking pane answered with an exit status"
+    );
+}
+
+#[test]
+pub fn an_unmet_unblock_condition_waits_for_the_pane_to_close() {
+    // `--block-until-exit-success` on a command that fails: the condition is not met, so the wait
+    // runs on until the pane itself goes away - and the status it answers with is still the
+    // command's own
+    let size = Size { cols: 80, rows: 20 };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let mut completion_rx = spawn_pane_and_take_its_completion_channel(
+        &mock_screen,
+        new_pane_id,
+        client_id,
+        Some(UnblockCondition::OnExitSuccess),
+        true,
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::HoldPane(
+        PaneId::Terminal(new_pane_id),
+        Some(7),
+        held_command(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        matches!(
+            completion_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "a failing command released a wait that only ends on success"
+    );
+
+    // the pane-id form of `close-pane`, which finds the pane by scanning the tabs and needs no
+    // client of its own - the same one a detached session answers
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(new_pane_id),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let result = completion_rx
+        .try_recv()
+        .expect("closing the pane did not end the wait");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.exit_status,
+        Some(7),
+        "the wait ended without the command's exit status"
+    );
+}
+
+#[test]
+pub fn closing_the_focused_pane_with_nothing_focused_is_a_miss() {
+    // `close-pane` against a session nobody is attached to. It used to close nothing and exit 0,
+    // which reads as "the pane is gone" on a session that still has every pane it started with
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    // the client the mock session belongs to, and one that holds no focus in it - which is what a
+    // `zellij action` client is on a session with nothing attached
+    let client_holding_the_focus = 1;
+    let client_holding_no_focus = 99;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let missed = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocus,
+        client_holding_no_focus,
+    );
+    let acted = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocus,
+        client_holding_the_focus,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        missed.error_message.as_deref(),
+        Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
+        "{:?}",
+        missed.error_message
+    );
+    assert!(
+        missed.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        missed.stdout_lines
+    );
+    // the negative control: a client that does hold the focus is not refused. Its close is handed
+    // to the tab and finished by a pty this harness does not run, so what it answers here is the
+    // harness running out of patience - never the refusal above
+    assert_ne!(
+        acted.error_message.as_deref(),
+        Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
+        "a client with a focused pane was told it had none"
     );
 }

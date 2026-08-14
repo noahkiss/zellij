@@ -2209,6 +2209,9 @@ pub struct TogglePanePinnedByPaneIdAction {
 pub struct FocusPaneByPaneIdAction {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
+    /// the existence probe: resolve the pane and report it, but leave focus where it is
+    #[prost(bool, tag="2")]
+    pub no_focus: bool,
 }
 /// Tab-targeting action messages
 #[allow(clippy::derive_partial_eq_without_eq)]
