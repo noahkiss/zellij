@@ -105,6 +105,22 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             let name = resolve_session_name(session_name, &opts, false);
             process::exit(status(&name, exe, &opts));
         },
+        SessionLifecycleCli::Doctor {
+            session_name,
+            dry_run,
+            fix: _,
+            no_fix,
+            sign: _,
+            no_sign,
+            exe,
+        } => crate::session_doctor_command::session_doctor_command(
+            session_name,
+            dry_run,
+            no_fix,
+            no_sign,
+            exe,
+            opts,
+        ),
     }
 }
 
@@ -140,7 +156,7 @@ fn service_exe(explicit: Option<PathBuf>, pinned: Option<PathBuf>) -> PathBuf {
 /// against another service, a nice level - comes from here. The config is where it lives so that
 /// the tool can see it: a systemd drop-in would work and `zellij session status` could never
 /// report it.
-fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
+pub(crate) fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
     get_config_options_from_cli_args(opts)
         .ok()
         .and_then(|options| options.session_service)
@@ -695,7 +711,7 @@ fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOpti
 /// is the one command that means "this one"), else `--session`, else the `session_name` config
 /// option. There is no built-in default: a lifecycle command that guesses the name is a lifecycle
 /// command that eventually kills the wrong session.
-fn resolve_session_name(
+pub(crate) fn resolve_session_name(
     session_name: Option<String>,
     opts: &CliArgs,
     prefer_current_session: bool,

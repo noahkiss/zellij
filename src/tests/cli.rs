@@ -173,6 +173,45 @@ fn session_up_restore_defaults_to_the_newest_snapshot() {
     }
 }
 
+/// The three switches doctor is driven by, and the shape of each one's default.
+///
+/// `--fix` and `--sign` are the defaults, so the flags that matter are their negations - which is
+/// why the command reads `no_fix` and `no_sign` rather than a pair of booleans that could disagree
+/// with each other.
+#[test]
+fn session_doctor_fixes_and_signs_unless_told_otherwise() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "work"]) {
+        SessionLifecycleCli::Doctor {
+            session_name,
+            dry_run,
+            no_fix,
+            no_sign,
+            exe,
+            ..
+        } => {
+            assert_eq!(session_name.as_deref(), Some("work"));
+            assert!(!dry_run);
+            assert!(!no_fix);
+            assert!(!no_sign);
+            assert_eq!(exe, None);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_doctor_takes_its_negations_and_the_short_dry_run() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "-n", "--no-sign"]) {
+        SessionLifecycleCli::Doctor {
+            dry_run, no_sign, ..
+        } => {
+            assert!(dry_run);
+            assert!(no_sign);
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}
+
 #[test]
 fn a_session_name_is_optional_everywhere() {
     // it falls back to the config's session_name at run time
