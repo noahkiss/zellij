@@ -1567,9 +1567,10 @@ pub enum CliAction {
     },
     /// Focus the tab with a given name
     ///
-    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch, and `id:
-    /// <tab id>` when --create makes the tab. A name no tab answers to is a miss: a message on
-    /// stderr and exit 2.
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch. When
+    /// --create makes the tab it prints `id: <tab id>` instead, then `pane_id:` and `handle:` for
+    /// the pane the new tab opened on. A name no tab answers to is a miss: a message on stderr and
+    /// exit 2.
     ///
     /// With --no-focus and without --create this is an existence probe instead: the exit code is 0
     /// either way, and stdout is the answer - `id: <tab id>` if the tab is there, nothing at all
@@ -1627,8 +1628,9 @@ pub enum CliAction {
     },
     /// Create a tab, optionally from a layout
     ///
-    /// Returns: `tab_id: <id>`. A tab made from a layout gets whatever panes the layout names;
-    /// otherwise it opens one pane running your shell or --initial-command.
+    /// Returns: `tab_id: <id>`, then `pane_id:` and `handle:` for the pane the tab opened on. A
+    /// tab made from a layout gets whatever panes the layout names; otherwise it opens one pane
+    /// running your shell or --initial-command.
     NewTab {
         /// A layout to build the tab from: a name in the layout directory, or a path to a file
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]

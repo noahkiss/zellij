@@ -3860,6 +3860,34 @@ mod tests {
     }
 
     #[test]
+    fn the_surface_dump_promises_the_columns_these_tables_print() {
+        // `zellij setup --dump-surface` is the map an agent reads instead of running every
+        // `--help`, and its column lists are hand-written - the one thing clap cannot introspect.
+        // They have drifted from the printer before, so the printer is the authority: a column
+        // added here and not there fails the build rather than teaching an agent a short table.
+        for (command, header) in [
+            (
+                "action list-panes",
+                format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true)
+                    .remove(0),
+            ),
+            (
+                "action list-tabs",
+                format_tabs_table(&[TabInfo::default()], true, true, true, true).remove(0),
+            ),
+        ] {
+            let promised = zellij_utils::cli_surface::promised_output_keys(command)
+                .unwrap_or_else(|| panic!("`{}` promises columns in the dump", command));
+            assert_eq!(
+                promised.split_whitespace().collect::<Vec<_>>(),
+                header.split_whitespace().collect::<Vec<_>>(),
+                "`{}`: the dump and the table disagree",
+                command
+            );
+        }
+    }
+
+    #[test]
     fn the_pane_table_names_every_pane_by_its_handle() {
         let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
         let header = &table[0];
