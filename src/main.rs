@@ -1,5 +1,6 @@
 mod commands;
 mod session_commands;
+mod session_doctor_command;
 #[cfg(test)]
 mod tests;
 

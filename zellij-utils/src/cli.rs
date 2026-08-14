@@ -837,6 +837,41 @@ pub enum SessionLifecycleCli {
         #[clap(long, value_name = "PATH", value_parser)]
         exe: Option<PathBuf>,
     },
+
+    /// Check everything that has to hold for this session to come up and stay up, fix what a
+    /// program is allowed to fix, and name what only a person can. Reports in three sections -
+    /// what changed, what was already correct, and what needs you - and exits non-zero only when
+    /// something is waiting on you
+    Doctor {
+        /// Name of the session, defaults to the `session_name` config option
+        #[clap(value_parser)]
+        session_name: Option<String>,
+
+        /// Report every finding and change nothing. Each fix says what it would have done
+        #[clap(short('n'), long)]
+        dry_run: bool,
+
+        /// Whether to repair what can be repaired. `--dry-run` implies `--no-fix`
+        #[clap(long, overrides_with("no_fix"))]
+        fix: bool,
+
+        /// Only report; make no change
+        #[clap(long)]
+        no_fix: bool,
+
+        /// Whether the signing ladder may sign the pinned copy, minting a certificate of our own
+        /// if the machine has no Apple one. macOS only, and nothing on any other platform
+        #[clap(long, overrides_with("no_sign"))]
+        sign: bool,
+
+        /// Leave the pinned copy's signature alone, whatever state it is in
+        #[clap(long)]
+        no_sign: bool,
+
+        /// The binary path to compare the installed unit against, as `status` takes it
+        #[clap(long, value_name = "PATH", value_parser)]
+        exe: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
