@@ -201,7 +201,9 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action new-pane",
         shape: "record",
-        keys: "pane_id handle",
+        // `tab_id` is `--new-tab`'s line: the tab it made, above the pane it put in it. Every other
+        // new-pane prints the pane alone, into a tab that already existed
+        keys: "tab_id pane_id handle",
     },
     OutputSpec {
         command: "action edit",

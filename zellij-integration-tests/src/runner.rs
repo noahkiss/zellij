@@ -177,6 +177,7 @@ fn new_pane_cli_action(
         block_until_exit_failure: false,
         block_until_exit,
         unblock_condition: None,
+        new_tab: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,

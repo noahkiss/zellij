@@ -1273,9 +1273,8 @@ pub enum CliAction {
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
     /// handle>`. Without --direction the pane splits whichever side has the most room.
     ///
-    /// Where it lands: beside the focused pane by default, beside a pane you name with --near, in
-    /// the tab --in-tab or --tab-id names, or in a tab of its own with --new-tab, which reports
-    /// `tab_id:` too.
+    /// Where it lands: beside the focused pane by default, in the tab --tab-id names, or in a tab
+    /// of its own with --new-tab, which reports `tab_id:` too.
     NewPane {
         /// Split the pane it opens beside towards right or down. Without it, zellij splits
         /// whichever side has the most room
@@ -2836,6 +2835,129 @@ mod tests {
         ] {
             let action = parse_action(&args);
             assert_eq!(missing_target_from_outside_a_pane(&action, false), None);
+        }
+    }
+
+    /// The actions a `zellij action` command line turns into, with no session to ask.
+    fn actions_of(args: &[&str]) -> Result<Vec<Action>, String> {
+        Action::actions_from_cli(
+            parse_action(args),
+            Box::new(|| std::path::PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+    }
+
+    #[test]
+    fn new_tab_takes_a_name_or_none_at_all() {
+        let named = parse_action(&["new-pane", "--new-tab", "build"]);
+        let bare = parse_action(&["new-pane", "--new-tab"]);
+        let without = parse_action(&["new-pane"]);
+        let new_tab = |action: &CliAction| match action {
+            CliAction::NewPane { new_tab, .. } => new_tab.clone(),
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+        assert_eq!(new_tab(&named), Some(Some("build".to_owned())));
+        assert_eq!(new_tab(&bare), Some(None));
+        assert_eq!(new_tab(&without), None);
+    }
+
+    #[test]
+    fn a_pane_in_a_new_tab_is_one_tab_carrying_one_pane() {
+        // the point of the flag: one action, so the tab and the pane it holds are made together
+        // and reported together, rather than a tab that opens a shell and a pane beside it
+        let actions = actions_of(&["new-pane", "--new-tab", "build", "--", "cargo", "test"])
+            .expect("a new tab with a command in it");
+        assert_eq!(actions.len(), 1, "got: {:?}", actions);
+        match &actions[0] {
+            Action::NewTab {
+                tiled_layout,
+                tab_name,
+                initial_panes,
+                should_change_focus_to_new_tab,
+                ..
+            } => {
+                assert_eq!(tab_name.as_deref(), Some("build"));
+                assert!(should_change_focus_to_new_tab);
+                assert!(initial_panes.is_none(), "the layout carries the command");
+                let layout = tiled_layout.as_ref().expect("a layout for the one pane");
+                assert!(layout.children.is_empty(), "one pane, not a tree of them");
+                match layout.run.as_ref().expect("the command") {
+                    crate::input::layout::Run::Command(command) => {
+                        assert_eq!(command.command, std::path::PathBuf::from("cargo"));
+                        assert_eq!(command.args, vec!["test".to_owned()]);
+                    },
+                    other => panic!("Expected a command, got {:?}", other),
+                }
+            },
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_that_names_nothing_still_makes_the_tab() {
+        let actions = actions_of(&["new-pane", "--new-tab"]).expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                tab_name,
+                tiled_layout,
+                ..
+            } => {
+                assert_eq!(tab_name, &None, "zellij names it");
+                // a pane with no command is the shell, which is what a bare `new-pane` opens
+                assert!(tiled_layout.as_ref().expect("a layout").run.is_none());
+            },
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_keeps_the_focus_where_it_is_when_asked() {
+        let actions = actions_of(&["new-pane", "--new-tab", "--no-focus"]).expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                should_change_focus_to_new_tab,
+                ..
+            } => assert!(!should_change_focus_to_new_tab),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_refuses_the_flags_that_place_a_pane_in_an_existing_one() {
+        // each of these says where the pane goes, and `--new-tab` has already answered that
+        for args in [
+            vec!["new-pane", "--new-tab", "--stacked"],
+            vec!["new-pane", "--new-tab", "-d", "right"],
+            vec!["new-pane", "--new-tab", "--floating"],
+            vec!["new-pane", "--new-tab", "--in-place"],
+            vec!["new-pane", "--new-tab", "--tab-id", "2"],
+            vec!["new-pane", "--new-tab", "--near-current-pane"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_tab_says_which_waiting_flag_it_can_honour() {
+        // `--blocking` waits for a pane to close and has no pane to name in a tab that does not
+        // exist yet; the conditional ones ride on the tab's first pane
+        assert!(action_parse_fails(&["new-pane", "--new-tab", "--blocking"]));
+        let actions = actions_of(&["new-pane", "--new-tab", "--block-until-exit", "--", "true"])
+            .expect("a new tab that waits for its command");
+        match &actions[0] {
+            Action::NewTab {
+                first_pane_unblock_condition,
+                ..
+            } => assert_eq!(
+                first_pane_unblock_condition,
+                &Some(UnblockCondition::OnAnyExit)
+            ),
+            other => panic!("Expected NewTab, got {:?}", other),
         }
     }
 

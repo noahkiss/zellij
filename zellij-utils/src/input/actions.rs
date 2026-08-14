@@ -2,8 +2,9 @@
 
 pub use super::command::{OpenFilePayload, RunCommandAction};
 use super::layout::{
-    FloatingPaneLayout, Layout, PluginAlias, RunPlugin, RunPluginLocation, RunPluginOrAlias,
-    SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
+    FloatingPaneLayout, Layout, PluginAlias, PluginUserConfiguration, Run, RunPlugin,
+    RunPluginLocation, RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo,
+    TiledPaneLayout,
 };
 use crate::cli::CliAction;
 use crate::data::{
@@ -753,6 +754,36 @@ impl Action {
         }
     }
 
+    /// The plugin a `--plugin` names: a url this build can resolve, or an alias the config names.
+    ///
+    /// Shared by the two paths that open a plugin pane - one into the current tab, one into a tab
+    /// `--new-tab` is making - so a url that works for one works for the other.
+    fn run_plugin_or_alias(
+        plugin: String,
+        configuration: Option<PluginUserConfiguration>,
+        cwd: Option<PathBuf>,
+        alias_cwd: Option<PathBuf>,
+        current_dir: PathBuf,
+    ) -> RunPluginOrAlias {
+        match RunPluginLocation::parse(&plugin, cwd.clone()) {
+            Ok(location) => RunPluginOrAlias::RunPlugin(RunPlugin {
+                _allow_exec_host_cmd: false,
+                location,
+                configuration: configuration.unwrap_or_default(),
+                initial_cwd: cwd,
+            }),
+            Err(_) => {
+                let mut plugin_alias = PluginAlias::new(
+                    &plugin,
+                    &configuration.map(|c| c.inner().clone()),
+                    alias_cwd,
+                );
+                plugin_alias.set_caller_cwd_if_not_set(Some(current_dir));
+                RunPluginOrAlias::Alias(plugin_alias)
+            },
+        }
+    }
+
     /// Turns one CLI invocation into the actions that carry it out.
     ///
     /// `resolve_pane_target` turns a `--pane-id` string into a pane id. A handle or a uuid only
@@ -1115,13 +1146,15 @@ impl Action {
                     // action rather than two: the tab is described by a one-pane layout carrying
                     // the command, and what comes back is `tab_id:` with the pane it made.
                     if blocking {
-                        return Err("`--blocking` waits for a pane to close and cannot say which \
+                        return Err(
+                            "`--blocking` waits for a pane to close and cannot say which \
                                     pane in a new tab that is. Use --block-until-exit, or open \
                                     the tab first."
-                            .to_owned());
+                                .to_owned(),
+                        );
                     }
                     let run = if let Some(plugin) = plugin {
-                        Some(Run::Plugin(run_plugin_or_alias(
+                        Some(Run::Plugin(Self::run_plugin_or_alias(
                             plugin,
                             configuration,
                             cwd.clone(),
@@ -1219,8 +1252,13 @@ impl Action {
                         tab_id,
                     }])
                 } else if let Some(plugin) = plugin {
-                    let plugin =
-                        run_plugin_or_alias(plugin, configuration, cwd.clone(), alias_cwd, current_dir);
+                    let plugin = Self::run_plugin_or_alias(
+                        plugin,
+                        configuration,
+                        cwd.clone(),
+                        alias_cwd,
+                        current_dir,
+                    );
                     if floating {
                         Ok(vec![Action::NewFloatingPluginPane {
                             plugin,
@@ -4276,6 +4314,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4325,6 +4364,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4374,6 +4414,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4425,6 +4466,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4468,6 +4510,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4517,6 +4560,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4566,6 +4610,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4689,6 +4734,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4738,6 +4784,7 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,

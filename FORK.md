@@ -308,6 +308,29 @@ is trusted to mean it. And because that variable is written when a pane is spawn
 updated in a shell that is already running — so after `zellij action rename-session`, panes that
 predate the rename read as outside the session until they are replaced.
 
+### Where a new pane goes: `--new-tab`
+
+`new-pane` placed a pane beside the focused one, or in the tab `--tab-id` named. `--new-tab` says it
+without needing the focus to be anywhere in particular, which is what a script has: it makes the tab
+and puts the pane in it, and reports both.
+
+```
+$ zellij action new-pane --new-tab build -- cargo test
+tab_id: 4
+pane_id: terminal_9
+handle: sunny-otter
+```
+
+A tab arrives with a pane in it, so this is one action and not two: the tab is described by a
+one-pane layout carrying the command, which is why the tab holds the command's pane rather than a
+shell with the command's pane beside it. Bare, zellij names the tab as it names any new tab.
+`--cwd`, `--name`, `--close-on-exit`, `--start-suspended`, `--plugin` and `--no-focus` all mean what
+they mean elsewhere. The flags that say where a pane goes in an existing tab - `--direction`,
+`--stacked`, `--floating`, `--in-place`, `--tab-id`, `--near-current-pane` - are refused, because
+`--new-tab` has already answered that question. So is bare `--blocking`: it waits for a pane to
+close and cannot name a pane in a tab that does not exist yet. `--block-until-exit` and its two
+siblings do work - they wait on the tab's first pane, which is this one.
+
 ### Text on stdin: `write-chars` and `paste`
 
 ```
