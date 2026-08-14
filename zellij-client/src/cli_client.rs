@@ -217,7 +217,7 @@ fn pipe_client(
 ///
 /// `Err` carries the server's own message, which is what the caller prints before exiting 2.
 pub fn resolve_pane_target(
-    mut os_input: Box<dyn ClientOsApi>,
+    os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     target: &str,
 ) -> Result<PaneId, String> {

@@ -16,7 +16,7 @@ pub const HANDLE_SEPARATOR: char = '-';
 
 /// How many rerolls a collision is worth before the generator falls back to a numeric suffix.
 ///
-/// With 55391 combinations and a session's worth of panes taken, a collision is rare and two in a
+/// With 55104 combinations and a session's worth of panes taken, a collision is rare and two in a
 /// row is rarer still; the cap is here so a caller with a pathological predicate terminates, not
 /// because it is expected to be reached.
 const MAX_REROLLS: usize = 32;
@@ -50,6 +50,23 @@ pub fn generate_handle(is_taken: impl Fn(&str) -> bool) -> String {
     candidate
 }
 
+/// The handle at position `n` of the handle space, in a fixed order.
+///
+/// Every `n` below `ADJECTIVES.len() * NOUNS.len()` names a different handle, and the same `n`
+/// always names the same handle. Production draws at random ([`generate_handle`]); this exists for
+/// a test that renders a pane frame, where a random address would make a golden snapshot a
+/// coin toss.
+pub fn nth_handle(n: usize) -> String {
+    let adjective = ADJECTIVES[n % ADJECTIVES.len()];
+    let noun = NOUNS[(n / ADJECTIVES.len()) % NOUNS.len()];
+    format!("{}{}{}", adjective, HANDLE_SEPARATOR, noun)
+}
+
+/// How many handles [`nth_handle`] can name before it repeats itself.
+pub fn handle_space_size() -> usize {
+    ADJECTIVES.len() * NOUNS.len()
+}
+
 fn random_handle() -> String {
     let adjective = ADJECTIVES[random_index(ADJECTIVES.len())];
     let noun = NOUNS[random_index(NOUNS.len())];
@@ -59,8 +76,10 @@ fn random_handle() -> String {
 /// A random index below `len`, entropy borrowed from the same source pane uuids come from.
 ///
 /// `uuid` is already a dependency and its v4 constructor is already how this crate gets randomness
-/// for panes, so a handle costs no new dependency. The modulo bias over a 128-bit draw into a list
-/// of a few hundred words is far below anything a name generator cares about.
+/// for panes, so a handle costs no new dependency. Eight of its bytes make the draw, skipping the
+/// variant byte; the version nibble in byte 6 is fixed, so the draw carries about 60 random bits.
+/// The modulo bias that leaves over a list of a few hundred words is far below anything a name
+/// generator cares about.
 fn random_index(len: usize) -> usize {
     let bytes = *uuid::Uuid::new_v4().as_bytes();
     let draw = u64::from_le_bytes([
@@ -165,6 +184,39 @@ mod tests {
         // a generator that always drew the same words would pass every test above
         let drawn: HashSet<String> = (0..50).map(|_| generate_handle(|_| false)).collect();
         assert!(drawn.len() > 40, "too few distinct handles: {:?}", drawn);
+    }
+
+    #[test]
+    fn both_words_are_drawn_and_not_just_one() {
+        // whole-handle variety hides a stuck list: a fixed adjective with a random noun still
+        // yields 50 distinct handles, so each position is counted on its own. 100 draws over the
+        // shorter list leaves the odds of a false alarm below any number worth writing down.
+        let mut adjectives = HashSet::new();
+        let mut nouns = HashSet::new();
+        for _ in 0..100 {
+            let handle = generate_handle(|_| false);
+            let (adjective, noun) = handle.split_once(HANDLE_SEPARATOR).expect("two words");
+            adjectives.insert(adjective.to_owned());
+            nouns.insert(noun.to_owned());
+        }
+        assert!(
+            adjectives.len() > 20,
+            "adjectives barely move: {:?}",
+            adjectives
+        );
+        assert!(nouns.len() > 20, "nouns barely move: {:?}", nouns);
+    }
+
+    #[test]
+    fn the_ordered_draw_names_a_different_handle_every_time() {
+        // what a rendering test leans on: same n, same handle, and no two n share one
+        assert_eq!(nth_handle(7), nth_handle(7));
+        let space = handle_space_size();
+        let drawn: HashSet<String> = (0..500).map(nth_handle).collect();
+        assert_eq!(drawn.len(), 500, "the ordered draw repeated itself early");
+        assert!(drawn.iter().all(|handle| is_handle_shaped(handle)));
+        // it wraps rather than panicking, which is what makes it safe past the end of the space
+        assert_eq!(nth_handle(0), nth_handle(space));
     }
 
     #[test]

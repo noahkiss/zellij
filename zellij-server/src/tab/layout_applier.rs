@@ -126,6 +126,11 @@ impl<'a> LayoutApplier<'a> {
         // Reserve the layout's handles before building anything, so the panes coming back under
         // them win over any handle generated for a pane in the same pass. Dropped at the end of
         // this call: whatever a pane claimed stays claimed, the rest is released.
+        //
+        // This reservation covers THIS tab's layout, which is all a tab knows about. A multi-tab
+        // restore is covered by the session-scoped reservation `Screen` holds from the moment it
+        // is told about a tab until the last one has been applied; reserving the same names twice
+        // is free, and this one still stands alone for a layout applied to a single tab.
         let _reserved_handles = Reservation::hold(
             layout.pane_handles().into_iter().chain(
                 floating_panes_layout
@@ -158,6 +163,11 @@ impl<'a> LayoutApplier<'a> {
         // Reserve the layout's handles before building anything, so the panes coming back under
         // them win over any handle generated for a pane in the same pass. Dropped at the end of
         // this call: whatever a pane claimed stays claimed, the rest is released.
+        //
+        // This reservation covers THIS tab's layout, which is all a tab knows about. A multi-tab
+        // restore is covered by the session-scoped reservation `Screen` holds from the moment it
+        // is told about a tab until the last one has been applied; reserving the same names twice
+        // is free, and this one still stands alone for a layout applied to a single tab.
         let _reserved_handles = Reservation::hold(
             tiled_panes_layout.pane_handles().into_iter().chain(
                 floating_panes_layout

@@ -14,7 +14,7 @@
 
 /// The first word of a pane handle.
 
-pub const ADJECTIVES: [&str; 193] = [
+pub const ADJECTIVES: [&str; 192] = [
     "able", "active", "alert", "alive", "amused", "ample", "artistic", "awake", "aware", "bold",
     "brave", "bright", "busy", "calm", "careful", "caring", "casual", "central", "certain",
     "cheerful", "chief", "civil", "classic", "clean", "clear", "clever", "comic", "concise",
@@ -25,17 +25,17 @@ pub const ADJECTIVES: [&str; 193] = [
     "golden", "grand", "great", "handy", "happy", "hardy", "healthy", "helpful", "heroic",
     "honest", "hopeful", "humble", "ideal", "immense", "intense", "keen", "kind", "large",
     "lasting", "leading", "light", "living", "logical", "loyal", "lucky", "magical", "magnetic",
-    "main", "major", "master", "mature", "merry", "mighty", "mint", "modern", "modest", "moving",
-    "musical", "native", "natural", "neat", "neutral", "noble", "normal", "novel", "open",
-    "organic", "patient", "peaceful", "perfect", "pleasant", "polished", "polite", "popular",
-    "precious", "precise", "premium", "pretty", "prime", "prompt", "proper", "proud", "pure",
-    "quick", "quiet", "rapid", "rare", "ready", "refined", "regular", "relaxed", "resolved",
-    "rested", "rich", "robust", "romantic", "sacred", "safe", "secure", "sensible", "sharp",
-    "shining", "simple", "sincere", "skilled", "smart", "smiling", "smooth", "social", "solid",
-    "sound", "special", "splendid", "square", "stable", "steady", "sterling", "striking", "strong",
-    "stunning", "subtle", "sunny", "super", "superb", "supreme", "sweet", "talented", "tender",
-    "thorough", "tidy", "tough", "true", "trusty", "unique", "useful", "valid", "vast", "vital",
-    "vocal", "warm", "welcome", "willing", "winning", "wise", "witty", "worthy",
+    "main", "major", "mature", "merry", "mighty", "mint", "modern", "modest", "moving", "musical",
+    "native", "natural", "neat", "neutral", "noble", "normal", "novel", "open", "organic",
+    "patient", "peaceful", "perfect", "pleasant", "polished", "polite", "popular", "precious",
+    "precise", "premium", "pretty", "prime", "prompt", "proper", "proud", "pure", "quick", "quiet",
+    "rapid", "rare", "ready", "refined", "regular", "relaxed", "resolved", "rested", "rich",
+    "robust", "romantic", "sacred", "safe", "secure", "sensible", "sharp", "shining", "simple",
+    "sincere", "skilled", "smart", "smiling", "smooth", "social", "solid", "sound", "special",
+    "splendid", "square", "stable", "steady", "sterling", "striking", "strong", "stunning",
+    "subtle", "sunny", "super", "superb", "supreme", "sweet", "talented", "tender", "thorough",
+    "tidy", "tough", "true", "trusty", "unique", "useful", "valid", "vast", "vital", "vocal",
+    "warm", "welcome", "willing", "winning", "wise", "witty", "worthy",
 ];
 
 /// The second word of a pane handle.
