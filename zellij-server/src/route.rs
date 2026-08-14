@@ -1805,10 +1805,10 @@ pub(crate) fn route_action(
             drop(NotificationEnd::new(completion_tx));
         },
         Action::ListPanes {
-            show_tab,
-            show_command,
-            show_state,
-            show_geometry,
+            show_tab: _,
+            show_command: _,
+            show_state: _,
+            show_geometry: _,
             show_all,
             output_json,
         } => {
@@ -1819,13 +1819,11 @@ pub(crate) fn route_action(
                 let output_lines = if output_json {
                     format_panes_as_json(&pane_entries)
                 } else {
-                    format_panes_table(
-                        &pane_entries,
-                        show_tab || show_all,
-                        show_command || show_all,
-                        show_state || show_all,
-                        show_geometry || show_all,
-                    )
+                    // every column, every time: the flags that used to gate them stay accepted so
+                    // that a script asking for one is not an error, but asking is now a no-op.
+                    // `--all` keeps the one meaning the columns never shared with it - which ROWS
+                    // the table has, non-selectable panes included
+                    format_panes_table(&pane_entries, true, true, true, true)
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -1835,11 +1833,11 @@ pub(crate) fn route_action(
             drop(NotificationEnd::new(completion_tx));
         },
         Action::ListTabs {
-            show_state,
-            show_dimensions,
-            show_panes,
-            show_layout,
-            show_all,
+            show_state: _,
+            show_dimensions: _,
+            show_panes: _,
+            show_layout: _,
+            show_all: _,
             output_json,
         } => {
             let maybe_tabs =
@@ -1849,13 +1847,9 @@ pub(crate) fn route_action(
                 let output_lines = if output_json {
                     format_tabs_as_json(&tab_infos)
                 } else {
-                    format_tabs_table(
-                        &tab_infos,
-                        show_state || show_all,
-                        show_dimensions || show_all,
-                        show_panes || show_all,
-                        show_layout || show_all,
-                    )
+                    // every column, every time - see `list-panes` above. A tab has no row-set
+                    // question, so `--all` here means nothing at all beyond staying accepted
+                    format_tabs_table(&tab_infos, true, true, true, true)
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -3277,6 +3271,7 @@ fn build_table_header(
     }
 
     header.push("PANE_ID");
+    header.push("HANDLE");
     header.push("TYPE");
     header.push("TITLE");
 
@@ -3317,6 +3312,7 @@ fn build_table_row(
     }
 
     row.push(format_pane_id(&entry.pane_info));
+    row.push(entry.pane_info.handle.clone());
     row.push(format_pane_type(&entry.pane_info));
     row.push(entry.pane_info.title.clone());
 
@@ -3612,6 +3608,65 @@ mod tests {
         };
 
         assert_eq!(result.affected_tab_id, Some(123));
+    }
+
+    fn pane_entry(id: u32, handle: &str) -> PaneListEntry {
+        let mut pane_info = zellij_utils::data::PaneInfo::default();
+        pane_info.id = id;
+        pane_info.title = format!("pane {}", id);
+        pane_info.handle = handle.to_string();
+        PaneListEntry {
+            pane_info,
+            tab_id: 1,
+            tab_position: 0,
+            tab_name: "tab1".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_pane_table_names_every_pane_by_its_handle() {
+        let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
+        let header = &table[0];
+        assert!(header.contains("HANDLE"), "{}", header);
+        assert!(table[1].contains("sunny-otter"), "{}", table[1]);
+    }
+
+    #[test]
+    fn the_pane_table_prints_all_four_column_groups() {
+        let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
+        let header = &table[0];
+        for column in [
+            "TAB_ID", "TAB_POS", "TAB_NAME", "PANE_ID", "HANDLE", "TYPE", "TITLE", "COMMAND",
+            "CWD", "FOCUSED", "FLOATING", "EXITED", "X", "Y", "ROWS", "COLS",
+        ] {
+            assert!(header.contains(column), "missing {}: {}", column, header);
+        }
+    }
+
+    #[test]
+    fn the_tab_table_prints_all_four_column_groups() {
+        let table = format_tabs_table(&[TabInfo::default()], true, true, true, true);
+        let header = &table[0];
+        for column in [
+            "TAB_ID",
+            "POSITION",
+            "NAME",
+            "ACTIVE",
+            "FULLSCREEN",
+            "SYNC_PANES",
+            "FLOATING_VIS",
+            "VP_ROWS",
+            "VP_COLS",
+            "DA_ROWS",
+            "DA_COLS",
+            "TILED_PANES",
+            "FLOAT_PANES",
+            "HIDDEN_PANES",
+            "SWAP_LAYOUT",
+            "LAYOUT_DIRTY",
+        ] {
+            assert!(header.contains(column), "missing {}: {}", column, header);
+        }
     }
 
     fn completion_with(

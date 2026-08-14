@@ -1675,7 +1675,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// List the clients attached to this session
     ///
-    /// Returns: One row per client in a table, or the ClientInfo array with --json
+    /// Returns: one row per client - id, focused pane, running command, tty, terminal size, and
+    /// whether the row is the client asking - or the ClientInfo array with --json
     ListClients {
         /// Output as JSON
         #[clap(short, long, value_parser)]
@@ -1683,25 +1684,26 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// List all panes in the current session
     ///
-    /// Returns: Formatted list of panes (table or JSON) to stdout
+    /// Returns: one row per pane, every column - tab, handle, command, state, geometry - or the
+    /// same information as JSON with --json
     ListPanes {
-        /// Include tab information (name, position, ID)
+        /// Accepted and ignored: tab columns are always printed
         #[clap(short, long, value_parser)]
         tab: bool,
 
-        /// Include running command information
+        /// Accepted and ignored: command columns are always printed
         #[clap(short, long, value_parser)]
         command: bool,
 
-        /// Include pane state (focused, floating, exited, etc.)
+        /// Accepted and ignored: state columns are always printed
         #[clap(short, long, value_parser)]
         state: bool,
 
-        /// Include geometry (position, size)
+        /// Accepted and ignored: geometry columns are always printed
         #[clap(short, long, value_parser)]
         geometry: bool,
 
-        /// Include all available fields
+        /// Also list the panes you cannot select - plugin panes the UI hides, suppressed panes
         #[clap(short, long, value_parser)]
         all: bool,
 
@@ -1711,25 +1713,26 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// List all tabs with their information
     ///
-    /// Returns: Tab information in table or JSON format
+    /// Returns: one row per tab, every column - state, dimensions, pane counts, layout - or the
+    /// same information as JSON with --json
     ListTabs {
-        /// Include state information (active, fullscreen, sync, floating visibility)
+        /// Accepted and ignored: state columns are always printed
         #[clap(short, long, value_parser)]
         state: bool,
 
-        /// Include dimension information (viewport, display area)
+        /// Accepted and ignored: dimension columns are always printed
         #[clap(short, long, value_parser)]
         dimensions: bool,
 
-        /// Include pane counts
+        /// Accepted and ignored: pane-count columns are always printed
         #[clap(short, long, value_parser)]
         panes: bool,
 
-        /// Include layout information (swap layout name and dirty state)
+        /// Accepted and ignored: layout columns are always printed
         #[clap(short, long, value_parser)]
         layout: bool,
 
-        /// Include all available fields
+        /// Accepted and ignored: every column is always printed
         #[clap(short, long, value_parser)]
         all: bool,
 

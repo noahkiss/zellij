@@ -68,8 +68,14 @@ impl SessionLayoutMetadata {
             }
         }
     }
-    pub fn list_clients_metadata(&self) -> String {
-        ClientMetadata::render_many(self.all_clients_metadata(), &self.default_editor)
+    /// The client table. `requesting_client_id` is the client the `CURRENT` column marks - a
+    /// `zellij action` client is its own short-lived client, so a CLI query marks no row.
+    pub fn list_clients_metadata(&self, requesting_client_id: ClientId) -> String {
+        ClientMetadata::render_many(
+            self.all_clients_metadata(),
+            &self.default_editor,
+            requesting_client_id,
+        )
     }
     /// The same client list as `list_clients_metadata`, as the `ClientInfo` array plugins already
     /// receive in `Event::ListClients`.
@@ -823,23 +829,41 @@ impl ClientMetadata {
     pub fn get_pane_id(&self) -> PaneId {
         self.pane_id
     }
+    /// The terminal this client is attached through, or `-` for one that reports none.
+    pub fn stringify_tty(&self) -> String {
+        self.tty.clone().unwrap_or_else(|| "-".to_owned())
+    }
+    /// The client's terminal size as `COLSxROWS`, or `-` for one that reports none.
+    pub fn stringify_size(&self) -> String {
+        self.terminal_size
+            .map(|size| format!("{}x{}", size.cols, size.rows))
+            .unwrap_or_else(|| "-".to_owned())
+    }
     pub fn render_many(
         clients_metadata: BTreeMap<ClientId, ClientMetadata>,
         default_editor: &Option<PathBuf>,
+        requesting_client_id: ClientId,
     ) -> String {
         let mut lines = vec![];
-        lines.push(String::from("CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND"));
+        // the first three columns are what this table has always printed, in the order it printed
+        // them; the rest are the fields that used to be reachable only through --json
+        lines.push(String::from(
+            "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY             SIZE      CURRENT",
+        ));
 
         for (client_id, client_metadata) in clients_metadata.iter() {
-            // 9 - CLIENT_ID, 14 - ZELLIJ_PANE_ID, 15 - RUNNING_COMMAND
+            // 9 - CLIENT_ID, 14 - ZELLIJ_PANE_ID, 15 - RUNNING_COMMAND, 15 - TTY, 9 - SIZE
             lines.push(format!(
-                "{} {} {}",
+                "{} {} {} {} {} {}",
                 format!("{0: <9}", client_id),
                 format!("{0: <14}", client_metadata.stringify_pane_id()),
                 format!(
                     "{0: <15}",
                     client_metadata.stringify_command(default_editor)
-                )
+                ),
+                format!("{0: <15}", client_metadata.stringify_tty()),
+                format!("{0: <9}", client_metadata.stringify_size()),
+                *client_id == requesting_client_id,
             ));
         }
         lines.join("\n")
@@ -1410,10 +1434,50 @@ mod tests {
         let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
         let mut meta = SessionLayoutMetadata::default();
         meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
-        let rendered = meta.list_clients_metadata();
+        let rendered = meta.list_clients_metadata(2);
         assert_eq!(rendered.lines().count(), 3, "a header and two clients");
         assert!(rendered.contains("plugin_3"), "{}", rendered);
         assert!(rendered.contains("terminal_1"), "{}", rendered);
+    }
+
+    #[test]
+    fn rendered_client_list_carries_the_columns_json_used_to_keep() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+
+        let rendered = meta.list_clients_metadata(2);
+        let header = rendered.lines().next().unwrap();
+        for column in ["CLIENT_ID", "ZELLIJ_PANE_ID", "RUNNING_COMMAND"] {
+            assert!(header.contains(column), "{}", header);
+        }
+        for column in ["TTY", "SIZE", "CURRENT"] {
+            assert!(header.contains(column), "{}", header);
+        }
+        // the requesting client is the one marked, and only it
+        let marked: Vec<&str> = rendered
+            .lines()
+            .skip(1)
+            .filter(|line| line.ends_with("true"))
+            .collect();
+        assert_eq!(marked.len(), 1, "{}", rendered);
+        assert!(marked[0].starts_with('2'), "{}", marked[0]);
+    }
+
+    #[test]
+    fn a_cli_query_marks_no_client_as_current() {
+        // `zellij action list-clients` runs as its own short-lived client, which is in no row
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![]);
+
+        let rendered = meta.list_clients_metadata(99);
+        assert!(
+            !rendered.lines().skip(1).any(|line| line.ends_with("true")),
+            "{}",
+            rendered
+        );
     }
 
     #[test]

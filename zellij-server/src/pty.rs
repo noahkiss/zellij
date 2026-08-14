@@ -773,7 +773,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 let rendered = if output_json {
                     session_layout_metadata.list_clients_metadata_json(client_id)
                 } else {
-                    session_layout_metadata.list_clients_metadata()
+                    session_layout_metadata.list_clients_metadata(client_id)
                 };
                 pty.bus
                     .senders
