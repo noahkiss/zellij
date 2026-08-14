@@ -272,7 +272,10 @@ fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         if let Ok(written) = std::fs::read_to_string(&answer_file) {
-            if written.contains("fda=") {
+            // the trailing newline is what says the line is finished. The pane writes its two
+            // answers with two calls, so a read can land between them - and half of "fda=yes" is
+            // an answer that parses to "could not tell" on a machine that could have told.
+            if written.contains("fda=") && written.ends_with('\n') {
                 let _ = std::fs::remove_file(&answer_file);
                 reap(&mut client);
                 return Some(parse_pane_answer(&written));
