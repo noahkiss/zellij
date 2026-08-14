@@ -1426,6 +1426,106 @@ the copy is the command that unit runs.
 The explicit-path form is for a launcher written by hand: the launcher names a path, and the pin has
 to be that same one or the two disagree. `--exe` still beats it, being typed for the one command.
 
+### `zellij session doctor`
+
+```
+zellij session doctor [NAME] [-n|--dry-run] [--fix|--no-fix] [--sign|--no-sign] [--exe PATH]
+```
+
+Everything that has to hold for one session to come up and stay up, checked in one pass. It repairs
+what a program is allowed to repair and names what only a person can:
+
+```
+Changed
+  pin       refreshed the pinned copy at ~/.local/share/zellij/bin/zellij
+            the running session keeps the old copy until it is restarted
+Already correct
+  path      /opt/homebrew/bin/zellij leads to this binary
+  config    ~/.config/zellij/config.kdl parses
+  socket    /var/folders/xy/.../T/zellij-501/contract_version_1
+  agent     org.zellij.session.work is loaded in gui/501
+  domain    the server is in the graphical session, so its panes can reach TCC
+Needs you
+  fda       the server does NOT have Full Disk Access
+            every pane sees "Operation not permitted" in a protected directory,
+            whatever it runs. No program can grant this — Apple offers no API for it.
+```
+
+Exit 0 when `Needs you` is empty, 1 otherwise. That is the whole of the contract, so a script can
+call doctor and read the answer without parsing it. There is no `--json`; no `session` verb has one.
+
+**It never takes the session down.** A pin refresh, a signature and a rewritten plist all take
+effect at the next start, so doctor makes the change and *says* a restart is needed. `zellij session
+restart` is that command and it belongs to the person whose panes are in there. For the same reason
+a drifted unit is reported rather than rewritten: on launchd a rewrite means `bootout` then
+`bootstrap`, which stops the job.
+
+Nothing is re-implemented. The unit, its load state and its drift come from the same calls `session
+status` makes; the session from the same `SessionFacts`; the pin from the same `install_pinned_exe`.
+The two commands cannot describe one machine differently.
+
+**Everywhere**: which `zellij` a shell runs and whether it is this one; whether the config loads;
+the socket directory, and any server serving this name from another one or under another contract
+version; leftover wrapper scripts; the unit, its load state and its drift; one server and only one;
+whether the running server is this build; the pin.
+
+**Linux** adds what only systemd knows: whether the timer is armed — loaded and armed are different
+states, and a disarmed timer beside a healthy install is how a session stops coming back — and how
+the last run ended, read from `Result=` rather than `ActiveState=`, which cannot tell a failed run
+from one that has not happened. Twenty journal lines are quoted under a failure and none under a
+success. Signing and TCC report `n/a on Linux` rather than being left out: an absent line reads as
+"checked and fine".
+
+**macOS** adds `TMPDIR` against `getconf DARWIN_USER_TEMP_DIR` — reported, never fixed, because the
+value came from whatever started this shell — the launch agent's label, and two questions asked from
+inside a floating pane that closes itself: which session domain the server is in, and whether it has
+Full Disk Access. Both are asked in a pane because neither is about doctor's own process: macOS
+judges a terminal-launched process against the terminal's grants, while a pane inherits the server's
+domain and is attributed to the server's executable. They are skipped when the session is down,
+where the answers would be this terminal's.
+
+#### Signing the pinned copy (macOS)
+
+macOS keys a grant for a non-bundled program to an absolute path plus a code requirement. An
+unsigned or ad-hoc-signed binary has no identity to name, so the requirement is a hash of the
+*code* — and the next build voids every grant, silently, until a pane fails in a directory that
+worked yesterday. A signature anchored on a certificate ends that, and it runs by default;
+`--no-sign` opts out.
+
+Four rungs, first hit wins:
+
+1. **Developer ID Application** — `codesign` already anchors it on the team id. Timestamped.
+2. **Apple Development** — the requirement is written by hand, anchored on `subject.OU`. Never on
+   the CN: the CN carries an email that changes on reissue and differs between two of one person's
+   machines, while the OU is the team id and is the same everywhere that Apple ID is. Timestamped.
+3. **One we mint**, kept in `~/Library/Application Support/zellij/signing/`, with a copy of `id.p12`
+   in zellij's resolved config directory. Minted **once**: its own hash is the requirement, so a
+   second certificate voids every grant recorded against the first — a keychain that lost it is
+   re-imported from the bundle rather than given a new one. Not timestamped; Apple's server needs a
+   real chain, so the attempt falls back and says which.
+4. **Nothing** — the Xcode steps, as a `Needs you`.
+
+Nothing is ever signed ad-hoc: that anchors on the code hash, which is the fault under a new name.
+No trusted root is ever added — requirement evaluation does not consult trust unless the requirement
+says `trusted`, and ours never does. What signing needs is keychain ACL access, and
+`ZELLIJ_KEYCHAIN_PASSWORD` is the escape hatch for a run over SSH, where there is no dialog to
+answer.
+
+The identifier is the constant `org.zellij.nkmk`. **Changing it voids every grant on every machine**,
+because it is part of the requirement macOS recorded — which is why it is a constant and not a
+setting.
+
+The round trip is a copy, a sign, two verifications and a rename. `codesign` writes in place and a
+running server holds the pin open, so an in-place sign fails `ETXTBSY` exactly when a session is up.
+The two verifications are two questions because they fail apart: a signature can verify while its
+requirement still names the code hash, which is a run that reported success and fixed nothing.
+Anything that goes wrong leaves the working pin untouched and reports a `Needs you` — a machine that
+cannot sign is still a machine worth reporting on.
+
+After a signing, the follow-up is given in the order that makes it one pass: re-grant Full Disk
+Access, Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
+restart`, so the new server comes up already holding them.
+
 ### A missing `TMPDIR` is an error, not a panic
 
 ```
