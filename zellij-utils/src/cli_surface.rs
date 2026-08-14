@@ -261,7 +261,9 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action focus-pane-id",
         shape: "record",
-        keys: "from to",
+        // `id` and `handle` are the probe's answer (`--no-focus`), the way `id` is the tab probe's
+        // above; the jump itself prints `from` and `to`
+        keys: "from to id handle",
     },
     OutputSpec {
         command: "action move-tab",
