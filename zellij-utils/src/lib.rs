@@ -37,8 +37,12 @@ pub mod nested_session;
 pub mod remote_session_tokens;
 pub mod resurrect_command_hints;
 #[cfg(not(target_family = "wasm"))]
+pub mod session_doctor;
+#[cfg(not(target_family = "wasm"))]
 pub mod session_lifecycle;
 pub mod session_service;
+#[cfg(not(target_family = "wasm"))]
+pub mod session_signing;
 #[cfg(not(target_family = "wasm"))]
 pub mod session_snapshot;
 #[cfg(not(target_family = "wasm"))]
