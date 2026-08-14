@@ -321,6 +321,12 @@ zellij action dump-screen --pane-id sunny-otter
   lineage answer different questions, which is why the fork keeps both.
 - **It is reused after the pane closes.** Uniqueness is over live panes only. A handle you wrote
   down last week names at most one pane today, and not necessarily the same one.
+- **It names a pane in one session.** `switch-session --pane-id` is the one flag that names a pane
+  in a *different* session, and it takes the id forms only. A handle or a uuid would be read against
+  the session you are leaving, and the number it resolved to would land on whatever pane happens to
+  wear it in the session you are joining — so it is refused, with a message and exit 1, rather than
+  answered wrongly. Reading it in the right session would need a cross-session query the protocol
+  does not carry.
 - **Where you see it**: the `HANDLE` column of `list-panes`, the `handle:` key of every creation
   command, the `list-tree` outline, both halves of a `go-to-pane` report, and the pane frame.
 

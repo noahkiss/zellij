@@ -2153,8 +2153,12 @@ impl Action {
                 layout_dir,
                 cwd,
             } => {
+                // deliberately not `resolve_pane_target`: that resolver answers against the session
+                // this process is in, and this pane lives in `name`. See
+                // [`cli::cross_session_pane_target_needs_an_id`], which refuses the forms that
+                // would need the other session's registry before the call gets this far.
                 let pane_id = match pane_id {
-                    Some(stringified_pane_id) => match resolve_pane_target(&stringified_pane_id) {
+                    Some(stringified_pane_id) => match pane_ids_only(&stringified_pane_id) {
                         Ok(PaneId::Terminal(id)) => Some((id, false)),
                         Ok(PaneId::Plugin(id)) => Some((id, true)),
                         Err(e) => return Err(e),

@@ -856,6 +856,12 @@ fn attach_with_cli_client(
         eprintln!("{}", message);
         std::process::exit(1);
     }
+    // a pane in another session cannot be named by a handle or a uuid from here, and guessing is
+    // worse than refusing: the id it would resolve to belongs to a pane in this session
+    if let Some(message) = zellij_utils::cli::cross_session_pane_target_needs_an_id(&cli_action) {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
     match Action::actions_from_cli(
         cli_action,
         Box::new(get_current_dir),
