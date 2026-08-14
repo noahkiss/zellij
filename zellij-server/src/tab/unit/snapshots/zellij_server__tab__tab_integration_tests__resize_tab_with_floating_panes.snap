@@ -2,7 +2,7 @@
 source: zellij-server/src/tab/./unit/tab_integration_tests.rs
 expression: snapshot
 ---
-00 (C): ┌ Pane #1 ────────────────────┌ ┌ ┌ Pane #4 ───────────── SCROLL:  0/1 | PIN [ ] | alive-ant ┐-ant ┐                     
+00 (C): ┌ Pane #1 ────────────────────┌ ┌ ┌ Pane #4 ───────────── alive-ant | SCROLL:  0/1 | PIN [ ] ┐-ant ┐                     
 01 (C): │                             │ │E│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│     │                     
 02 (C): │ ┌ Pane #5 ───── SCROLL:  0/1 | PIN [ ] ┐EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│     │                     
 03 (C): │ │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│     │                     

@@ -94,6 +94,65 @@ it left and the tab it landed on. The point is that the answer is usable — a s
 knows where to move it back — and that a command which changed nothing says so with exit 2 instead
 of a silent success.
 
+## Reading the surface in one call
+
+```
+zellij setup --dump-surface          # the outline convention
+zellij setup --dump-surface --json   # the same map, structured
+```
+
+Every command in the tree — the `action` verbs, the session lifecycle, `setup` itself — with its
+band, its one-liner, its aliases, and each flag's type, whether it is required, repeatable or
+positional, its default and its help. Then what clap cannot know: what the command prints, in the
+shape [the convention](#the-cli-output-convention) names, and the keys or columns it prints under.
+
+```
+command: zellij action list-tree  group: read
+  about: List every tab with its panes nested beneath it
+  prints: outline  keys: tab_id position name active / handle pane_id title command focused
+  arg: --json  type: flag  about: Output as JSON
+```
+
+**A command with no `prints:` line prints nothing when it succeeds.** That is the fork's default
+rather than a gap in the map, and the dump's header says so, so the absence can be read.
+
+Only the bands and the `prints:` table are written down; everything else is read out of the same
+clap tree that parses the call, and a test walks a command's arguments out of clap and requires
+each one by name. A flag added tomorrow is in the map tomorrow, and cannot quietly miss it.
+
+The dump runs before the configuration is read, like `--dump-config` and `--dump-layout` beside it:
+what the CLI accepts does not depend on a config file, and a broken one must not take the map away.
+`zellij setup --json` now answers to `--check` or to `--dump-surface`; with neither it says which
+ones it takes, on stderr, and exits 1.
+
+### `zellij action --help`
+
+The same information, for a reader rather than a parser. The page opens with the conventions above
+— the shapes, `--json`, stdout against stderr, the exit codes, the refusal, and what a handle is —
+and then lists the verbs in five bands rather than one alphabetical column of eighty-seven:
+
+| Band | What is in it |
+|---|---|
+| `read` | asks the session something and changes nothing |
+| `navigate` | moves focus or the view; changes no content |
+| `create` | makes a pane or a tab, and reports the id and handle of what it made |
+| `mutate` | changes a pane or a tab, or what runs in one |
+| `session` | acts on the whole session, or on every client attached to it |
+
+clap renders subcommands as one flat list and has no heading to split them by, so the listing is
+built from the command tree and slotted into the help template. The names, one-liners and aliases
+come out of that tree, so a command cannot appear in the listing saying something its own `--help`
+does not; only the band membership is written down, and a command that nobody put in a band fails
+the build.
+
+Every subcommand's `--help` was swept against one test: an agent reading only this text uses the
+command correctly. Two things that failed it are worth naming, because both are load-bearing.
+`--tab-id` is the **stable** tab id — the `TAB_ID` column of `list-tabs` — while `go-to-tab` takes
+the 1-based display position, and the help said only "Target a specific tab by ID" on sixteen
+commands. And a `new-pane --block-until-exit` prints no `pane_id:` at all: the exit status is the
+answer, only one message reaches the CLI, and a caller parsing for the id would wait for a line
+that never comes.
+
 ## The patch queue
 
 ### Plugin hot-reload (`plugin_watch`, default **on**)
@@ -271,6 +330,8 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
   the same `|` separator they already use.
 - It is never truncated. Half an address reaches no pane, so a row too narrow for the whole handle
   shows none of it — there is no short form.
+- A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
+  counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
 
 ### `list-tree`
 
