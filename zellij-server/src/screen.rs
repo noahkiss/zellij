@@ -768,6 +768,12 @@ pub enum ScreenInstruction {
         target: PaneTarget,
         response_channel: crossbeam::channel::Sender<Option<PaneId>>,
     },
+    /// Gives a live pane the handle its creator chose. `Err` carries the sentence to print.
+    SetPaneHandle {
+        pane_id: PaneId,
+        handle: String,
+        response_channel: crossbeam::channel::Sender<Result<(), String>>,
+    },
     ListTabs {
         client_id: ClientId,
         response_channel: crossbeam::channel::Sender<ListTabsResponse>,
@@ -1187,6 +1193,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ListClientsMetadata(..) => ScreenContext::ListClientsMetadata,
             ScreenInstruction::ListPanes { .. } => ScreenContext::ListPanes,
             ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
+            ScreenInstruction::SetPaneHandle { .. } => ScreenContext::SetPaneHandle,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
@@ -5337,6 +5344,35 @@ impl Screen {
     ///
     /// Non-selectable panes are searched too. They have handles like any other pane, and a target
     /// naming one should reach it rather than silently miss.
+    /// Gives a live pane the handle its creator chose for it.
+    ///
+    /// The name has to be free among the session's live panes: a handle is an address, and an
+    /// address that reached two panes would be no address at all. A taken one is refused here
+    /// rather than rerolled the way a generated handle is - the caller asked for this name, and a
+    /// different one would answer a question nobody put.
+    ///
+    /// The pane's own handle counts as free for it: setting the name a pane already answers to
+    /// changes nothing and says so, rather than pushing the pane off its own address.
+    pub fn set_pane_handle(&mut self, pane_id: PaneId, handle: &str) -> Result<(), String> {
+        let pane = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(pane_id))
+            .ok_or_else(|| format!("No pane answers to '{}'", pane_id))?;
+        if pane.pane_handle() == handle {
+            return Ok(());
+        }
+        if crate::pane_handles::is_live(handle) {
+            return Err(format!(
+                "The handle '{}' is taken by another pane in this session. \
+                 Handles name one pane at a time; `zellij action list-panes` prints them.",
+                handle
+            ));
+        }
+        pane.set_pane_handle(handle);
+        Ok(())
+    }
+
     pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
         let matches: Box<dyn Fn(&PaneInfo) -> bool> = match target {
             PaneTarget::Id(pane_id) => return Some((*pane_id).into()),
@@ -9185,6 +9221,14 @@ pub(crate) fn screen_thread_main(
                 response_channel,
             } => {
                 let _ = response_channel.send(screen.resolve_pane_target(&target));
+            },
+            ScreenInstruction::SetPaneHandle {
+                pane_id,
+                handle,
+                response_channel,
+            } => {
+                let _ = response_channel.send(screen.set_pane_handle(pane_id, &handle));
+                screen.render(None)?;
             },
             ScreenInstruction::ListTabs {
                 client_id,

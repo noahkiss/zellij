@@ -28,6 +28,7 @@ pub fn start_cli_client(
     session_name: &str,
     actions: Vec<Action>,
     anchor_pane: Option<u32>,
+    mut chosen_handle: Option<String>,
 ) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
@@ -78,11 +79,37 @@ pub fn start_cli_client(
                 );
             },
             action => {
-                if let Some(exit_status) =
-                    individual_messages_client(&mut os_input, action, pane_id)
-                {
-                    return exit_status;
-                }
+                let lines = match individual_messages_client(&mut os_input, action, pane_id) {
+                    ActionOutcome::Done(exit_status) => return exit_status,
+                    ActionOutcome::Reported(lines) => lines,
+                };
+                // the pane named itself when it was born; this is the name its creator asked for,
+                // applied before the report is printed so the report says the one the caller has
+                let lines = match chosen_handle.take() {
+                    None => lines,
+                    Some(handle) => {
+                        let Some(made) = reported_pane(&lines) else {
+                            eprintln!(
+                                "The pane was made but reported no id, so it could not be given \
+                                 the handle '{}'.",
+                                handle
+                            );
+                            return 1;
+                        };
+                        match individual_messages_client(
+                            &mut os_input,
+                            Action::SetPaneHandle {
+                                pane_id: made,
+                                handle: handle.clone(),
+                            },
+                            pane_id,
+                        ) {
+                            ActionOutcome::Done(exit_status) => return exit_status,
+                            ActionOutcome::Reported(_) => with_handle(lines, &handle),
+                        }
+                    },
+                };
+                lines.iter().for_each(|line| println!("{line}"));
             },
         }
     }
@@ -353,11 +380,20 @@ fn action_answers_with_its_own_report(action: &Action) -> bool {
     matches!(action, Action::NewBlockingPane { .. })
 }
 
+/// What came back from one action: the lines it wants printed, or the status the command ends on.
+enum ActionOutcome {
+    /// The action's report. It is returned rather than printed because a `--handle` still has a
+    /// line of it to correct, and a report is printed once or not at all.
+    Reported(Vec<String>),
+    /// Nothing more will come: this is the exit status. Anything to say has been said on stderr.
+    Done(i32),
+}
+
 fn individual_messages_client(
     os_input: &mut Box<dyn ClientOsApi>,
     action: Action,
     pane_id: Option<u32>,
-) -> Option<i32> {
+) -> ActionOutcome {
     let is_blocking = action_answers_with_its_own_report(&action);
     let msg = ClientToServerMsg::Action {
         action,
@@ -369,31 +405,64 @@ fn individual_messages_client(
     loop {
         match os_input.recv_from_server() {
             Some((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
-                return None;
+                return ActionOutcome::Reported(Vec::new());
             },
             Some((ServerToClientMsg::Log { lines: log_lines }, _)) => {
-                log_lines.iter().for_each(|line| println!("{line}"));
-                return None;
+                return ActionOutcome::Reported(log_lines);
             },
             Some((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
                 log_lines.iter().for_each(|line| eprintln!("{line}"));
-                return Some(2);
+                return ActionOutcome::Done(2);
             },
             Some((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
                 ExitReason::Error(e) => {
                     eprintln!("{}", e);
-                    return Some(2);
+                    return ActionOutcome::Done(2);
                 },
                 ExitReason::CustomExitStatus(exit_status) => {
-                    return Some(exit_status);
+                    return ActionOutcome::Done(exit_status);
                 },
                 _ => {
-                    return None;
+                    return ActionOutcome::Reported(Vec::new());
                 },
             },
             _ => {},
         }
     }
+}
+
+/// The report a creating command printed, with the handle the caller chose in place of the one the
+/// pane gave itself.
+///
+/// The `handle:` line is replaced rather than added, so the report still says one thing about the
+/// pane's address. A report with no handle line at all gains one, because the caller asked about
+/// the handle and the answer belongs in the report.
+fn with_handle(lines: Vec<String>, handle: &str) -> Vec<String> {
+    let named = format!("handle: {}", handle);
+    let mut replaced = false;
+    let mut lines: Vec<String> = lines
+        .into_iter()
+        .map(|line| {
+            if line.starts_with("handle: ") {
+                replaced = true;
+                named.clone()
+            } else {
+                line
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(named);
+    }
+    lines
+}
+
+/// The pane a creating command's report says it made.
+fn reported_pane(lines: &[String]) -> Option<PaneId> {
+    lines
+        .iter()
+        .find_map(|line| line.strip_prefix("pane_id: "))
+        .and_then(|id| PaneId::from_str(id).ok())
 }
 
 /// The prefix each raw `subscribe` line carries, and the empty string when it carries none.
@@ -551,6 +620,36 @@ mod tests {
             no_focus: false,
             tab_id: None,
         }
+    }
+
+    #[test]
+    fn a_chosen_handle_replaces_the_one_the_pane_gave_itself() {
+        let reported = vec![
+            "pane_id: terminal_9".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(
+            with_handle(reported, "build"),
+            vec!["pane_id: terminal_9".to_owned(), "handle: build".to_owned()],
+            "the report says one thing about the pane's address"
+        );
+        // a report that never had a handle line gains one: the caller asked about the handle
+        assert_eq!(
+            with_handle(vec!["tab_id: 4".to_owned()], "build"),
+            vec!["tab_id: 4".to_owned(), "handle: build".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_pane_a_report_names_is_the_one_that_gets_the_handle() {
+        let reported = vec![
+            "tab_id: 4".to_owned(),
+            "pane_id: plugin_2".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(reported_pane(&reported), Some(PaneId::Plugin(2)));
+        // the negative control: a report with no pane in it names none
+        assert_eq!(reported_pane(&["tab_id: 4".to_owned()]), None);
     }
 
     #[test]

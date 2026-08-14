@@ -898,11 +898,25 @@ fn attach_with_cli_client(
         eprintln!("{}", message);
         std::process::exit(1);
     }
+    // `--handle` is applied to the pane once it exists, by the client that gets the report. It is
+    // checked against the live panes first, so a name that is already taken is an error before
+    // anything is created rather than a pane that came out under a name nobody asked for
+    let mut cli_action = cli_action;
+    let chosen_handle = cli_action.take_chosen_handle();
+    if let Some(handle) = &chosen_handle {
+        if let Ok(taken_by) = resolve_pane_target(handle) {
+            eprintln!(
+                "The handle '{}' is taken by {} in this session. Handles name one pane at a time, \
+                 and this one is not rerolled: pick another, or close that pane.",
+                handle, taken_by
+            );
+            std::process::exit(1);
+        }
+    }
     // `--near` names the pane the new one opens beside. It is resolved here, like every other pane
     // target, and travels as the pane this command came from - the channel `--near-current-pane`
     // reads out of the environment
     let mut anchor_pane: Option<u32> = None;
-    let mut cli_action = cli_action;
     if let Some(wanted) = cli_action.near_target().map(|t| t.to_owned()) {
         match resolve_pane_target(&wanted) {
             Ok(PaneId::Terminal(id)) => {
@@ -979,6 +993,7 @@ fn attach_with_cli_client(
                 session_name,
                 actions,
                 anchor_pane,
+                chosen_handle,
             );
             if should_archive {
                 match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)

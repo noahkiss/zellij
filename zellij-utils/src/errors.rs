@@ -390,6 +390,7 @@ pub enum ScreenContext {
     ListClientsMetadata,
     ListPanes,
     ResolvePaneTarget,
+    SetPaneHandle,
     ListTabs,
     GetCurrentTabInfo,
     Reconfigure,

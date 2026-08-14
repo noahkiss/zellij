@@ -2026,6 +2026,7 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::ListPanes { .. }
             | Action::ListTree { .. }
             | Action::ResolvePaneTarget { .. }
+            | Action::SetPaneHandle { .. }
             | Action::StackPanes { pane_ids: _ }
             | Action::ChangeFloatingPaneCoordinates {
                 pane_id: _,

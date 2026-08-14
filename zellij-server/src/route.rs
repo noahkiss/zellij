@@ -1826,6 +1826,30 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::SetPaneHandle { pane_id, handle } => {
+            // the pane was made a moment ago and named itself; this is the caller's name for it,
+            // and the one thing it may not do is reach a pane that is already answering to it
+            match request_pane_handle(&senders, pane_id.into(), handle.clone())
+                .with_context(err_context)?
+            {
+                Some(Ok(())) => {
+                    send_output_to_client(
+                        cli_client_id,
+                        os_input.as_ref(),
+                        vec![format!("handle: {}", handle)],
+                    );
+                },
+                Some(Err(message)) => {
+                    send_error_to_client(cli_client_id, os_input.as_ref(), &message)
+                },
+                None => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout setting the pane handle",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::ListPanes {
             show_tab: _,
             show_command: _,
@@ -3225,6 +3249,35 @@ fn request_pane_target_resolution(
         },
         Err(RecvTimeoutError::Disconnected) => {
             log::error!("ResolvePaneTarget channel disconnected");
+            Ok(None)
+        },
+    }
+}
+
+/// Asks Screen to give a pane a chosen handle. `None` when Screen did not answer in time.
+fn request_pane_handle(
+    senders: &ThreadSenders,
+    pane_id: PaneId,
+    handle: String,
+) -> Result<Option<std::result::Result<(), String>>> {
+    use crossbeam::channel::{unbounded, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (response_sender, response_receiver) = unbounded();
+    senders.send_to_screen(ScreenInstruction::SetPaneHandle {
+        pane_id,
+        handle,
+        response_channel: response_sender,
+    })?;
+
+    match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(answer) => Ok(Some(answer)),
+        Err(RecvTimeoutError::Timeout) => {
+            log::error!("SetPaneHandle timed out waiting for Screen response");
+            Ok(None)
+        },
+        Err(RecvTimeoutError::Disconnected) => {
+            log::error!("SetPaneHandle channel disconnected");
             Ok(None)
         },
     }

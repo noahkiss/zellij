@@ -415,6 +415,8 @@ zellij action dump-screen --pane-id sunny-otter
 
 - **Every `--pane-id` takes one**, alongside `terminal_1`, `plugin_2`, a bare integer and a pane
   uuid. One parser serves all four forms, so a handle works anywhere an id does.
+- **It can be chosen** — `zellij action new-pane --handle build`, or `handle "build"` on a pane in a
+  layout — and otherwise the pane names itself. See [choosing one](#choosing-a-handle) below.
 - **It survives a restore, and the uuid does not.** The handle is serialized into the session
   snapshot and the restored pane comes back under it. The uuid is the pane's *lineage* and rotates,
   because a restored pane is a new process (`restored_from` links it to the old one). Address and
@@ -429,6 +431,42 @@ zellij action dump-screen --pane-id sunny-otter
   does not carry.
 - **Where you see it**: the `HANDLE` column of `list-panes`, the `handle:` key of every creation
   command, the `list-tree` outline, both halves of a `go-to-pane` report, and the pane frame.
+
+#### Choosing a handle
+
+```
+zellij action new-pane --handle build -- cargo watch
+```
+```kdl
+layout {
+    pane handle="build" command="cargo" { args "watch" }
+}
+```
+
+A generated handle is memorable but not predictable, and a script that wants to reach the pane it
+just made has to read the id out of the report and carry it. A chosen handle is the other way round:
+the caller decides the address before the pane exists, and every later command already knows it.
+
+- **The grammar** is up to four lowercase words joined by dashes, each at most 16 characters, at
+  most 40 in all, at least one letter somewhere. That is what keeps one `--pane-id` able to take
+  four forms: `terminal_1` has an underscore, `7` is all digits, a uuid is five groups. A name that
+  reads like one of those is refused when it is typed, not when it is used. So is a name whose first
+  word is `terminal` or `plugin` — `terminal-1` beside `terminal_1` is a name that gets typed wrong
+  on the day it matters.
+- **A handle a live pane already holds is an error**, exit 1, and nothing is created. A generated
+  handle rerolls around a collision; a chosen one must not, because the caller asked for *this*
+  name and a different one would answer a question nobody put. The check happens before the pane is
+  made, so the refusal costs nothing.
+- **The pane names itself first.** A pane is born with a generated handle and the chosen one is
+  given to it immediately after, by the client that holds the report — so `handle:` in the report is
+  always the name the caller asked for. This is also why `--handle` cannot ride with the blocking
+  family: those answer with an exit status instead of a report naming a pane.
+- **It is stored like any other handle**, which means it survives a restore: the snapshot carries
+  `pane_handle="build"` and the pane comes back at that address.
+- **In a layout**, `handle` is the spelling a person writes and `pane_handle` is what serialization
+  writes; both reach the same field, and a saved layout keeps working. A layout that names a handle
+  another pane in the same layout already took loses the tie rather than failing the restore — a
+  session coming back is not a place to refuse work — so the last pane to ask gets a generated name.
 
 #### On the frame
 

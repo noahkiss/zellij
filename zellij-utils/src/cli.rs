@@ -1320,6 +1320,18 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         name: Option<String>,
 
+        /// The handle to give the pane, instead of the two-word one it would name itself: lowercase
+        /// words joined by dashes, eg. build. A handle another live pane holds is an error
+        #[clap(
+            long,
+            value_parser = chosen_handle,
+            conflicts_with("blocking"),
+            conflicts_with("block_until_exit"),
+            conflicts_with("block_until_exit_success"),
+            conflicts_with("block_until_exit_failure")
+        )]
+        handle: Option<String>,
+
         /// Close the pane immediately when its command exits
         #[clap(short, long, requires("command"))]
         close_on_exit: bool,
@@ -2325,7 +2337,31 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
         .unwrap()
 }
 
+/// A `--handle` value, refused at the parser when it is not a handle anyone could choose.
+///
+/// The reasons live in `pane_handle` with the grammar they come from; this is the clap end of it,
+/// so a bad name is caught before a pane is made rather than after.
+fn chosen_handle(value: &str) -> Result<String, String> {
+    match crate::pane_handle::chosen_handle_error(value) {
+        Some(reason) => Err(reason),
+        None => Ok(value.to_owned()),
+    }
+}
+
 impl CliAction {
+    /// The handle `--handle` chose, taken out of the request for the client to apply.
+    ///
+    /// A pane names itself when it is born and the CLI has no say in that moment, so a chosen
+    /// handle is given to the pane just after, by the client that is holding the report and knows
+    /// which pane was made. Taking it here is what keeps a handle from also travelling as part of
+    /// the creation action, where nothing would look at it.
+    pub fn take_chosen_handle(&mut self) -> Option<String> {
+        match self {
+            CliAction::NewPane { handle, .. } => handle.take(),
+            _ => None,
+        }
+    }
+
     /// The tab `--in-tab` named, for the caller that can ask the session which tab that is.
     ///
     /// The flag takes a name or a stable id, and neither can be turned into the `--tab-id` the
@@ -3048,6 +3084,55 @@ mod tests {
             ),
             other => panic!("Expected NewTab, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn a_chosen_handle_is_taken_out_of_the_request() {
+        let mut action = parse_action(&["new-pane", "--handle", "build"]);
+        assert_eq!(action.take_chosen_handle().as_deref(), Some("build"));
+        // taken once: the client applies it, and it must not also travel with the action
+        assert_eq!(action.take_chosen_handle(), None);
+    }
+
+    #[test]
+    fn a_handle_that_could_be_read_as_an_id_is_refused_at_the_parser() {
+        for rejected in ["terminal_1", "7", "Build", "my handle", "terminal-1"] {
+            assert!(
+                action_parse_fails(&["new-pane", "--handle", rejected]),
+                "expected `--handle {}` to be refused",
+                rejected
+            );
+        }
+        // the negative control: a name a person would pick goes through
+        assert_eq!(
+            parse_action(&["new-pane", "--handle", "my-build"]).take_chosen_handle(),
+            Some("my-build".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_handle_cannot_ride_with_a_command_that_prints_no_pane() {
+        // the blocking family answers with an exit status instead of a `pane_id:`, and the handle
+        // is applied to the pane the report names
+        for waiting in [
+            "--blocking",
+            "--block-until-exit",
+            "--block-until-exit-success",
+            "--block-until-exit-failure",
+        ] {
+            assert!(
+                action_parse_fails(&["new-pane", "--handle", "build", waiting]),
+                "expected `--handle` with `{}` to be refused",
+                waiting
+            );
+        }
+    }
+
+    #[test]
+    fn an_unapplied_handle_never_reaches_the_session() {
+        let error = actions_of(&["new-pane", "--handle", "build"])
+            .expect_err("a handle still on the request is not an action");
+        assert!(error.contains("--handle"), "got: {}", error);
     }
 
     #[test]

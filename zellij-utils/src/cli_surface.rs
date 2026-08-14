@@ -327,7 +327,8 @@ How every one of these answers:
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
-assigned when the pane is created, it survives a session restore, and `list-panes` prints it.
+assigned when the pane is created - or chosen then, with `new-pane --handle` - it survives a session
+restore, and `list-panes` prints it.
 
   zellij action dump-screen --pane-id sunny-otter
 

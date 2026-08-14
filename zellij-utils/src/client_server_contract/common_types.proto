@@ -299,6 +299,7 @@ message Action {
     SetSyncTabAction set_sync_tab = 166;
     ResolvePaneTargetAction resolve_pane_target = 167;
     ListTreeAction list_tree = 168;
+    SetPaneHandleAction set_pane_handle = 169;
   }
 }
 
@@ -388,6 +389,10 @@ message ListClientsAction {
 }
 message ResolvePaneTargetAction {
   string target = 1;
+}
+message SetPaneHandleAction {
+  PaneId pane_id = 1;
+  string handle = 2;
 }
 message ListTreeAction {
   bool output_json = 1;

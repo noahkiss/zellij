@@ -3185,8 +3185,9 @@ impl std::fmt::Display for PaneId {
 ///
 /// The forms cannot be confused for one another, which is what makes one flag able to take all
 /// four: `terminal_`/`plugin_` are prefixes nothing else starts with, a bare integer is digits, and
-/// a handle is two words from a fixed list joined by a dash - a shape no uuid can take, because a
-/// uuid is hex in five dash-separated groups and no word in the list is hex.
+/// a handle is up to four lowercase words joined by dashes, at least one of them holding a letter -
+/// a shape no uuid can take, because a uuid is hex in five dash-separated groups, or one group far
+/// longer than a word.
 ///
 /// Parsing says only which form a string IS. Whether a pane answers to it is the server's to
 /// decide, since the server is where the live panes are.
@@ -3292,14 +3293,12 @@ mod pane_target_tests {
 
     #[test]
     fn what_names_no_pane_is_refused_rather_than_guessed() {
-        // the ambiguity cases: two dash-joined words that are not BOTH from the list are not a
-        // handle, and must not be silently treated as one - the miss belongs at the parser, where
-        // the message can name every accepted form
+        // what is refused here is a string that is no target in any session: a handle only has to
+        // be handle-SHAPED, because a chosen handle can be any word and the parser cannot know
+        // which words a session's panes were given. A well-formed name nothing answers to is the
+        // resolver's miss, not the parser's error
         for input in [
             "",
-            "otter",
-            "purple-otter",
-            "sunny-teapot",
             "Sunny-Otter",
             "sunny_otter",
             "terminal_",
@@ -3307,12 +3306,24 @@ mod pane_target_tests {
             "plugin_-1",
             "-1",
             "1.5",
-            "e9b82dbd",
         ] {
             assert!(
                 PaneTarget::from_str(input).is_err(),
                 "should not name a pane: {:?}",
                 input
+            );
+        }
+    }
+
+    #[test]
+    fn a_chosen_handle_names_a_pane_like_a_generated_one() {
+        // `--handle build` is a name a caller picked, and every `--pane-id` has to take it back
+        for chosen in ["build", "my-build", "web-2"] {
+            assert_eq!(
+                PaneTarget::from_str(chosen),
+                Ok(PaneTarget::Handle(chosen.to_owned())),
+                "{} should read as a handle",
+                chosen
             );
         }
     }
