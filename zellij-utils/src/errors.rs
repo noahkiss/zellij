@@ -345,7 +345,7 @@ pub enum ScreenContext {
     ToggleTab,
     AddClient,
     SetClientTty,
-    RecheckStatusNotices,
+    RecheckSessionWarnings,
     RemoveClient,
     UpdateSearch,
     SearchDown,

@@ -27,7 +27,7 @@ mod resurrect_hints;
 mod route;
 mod screen;
 mod session_layout_metadata;
-mod status_notices;
+mod session_warnings;
 mod terminal_bytes;
 mod thread_bus;
 mod ui;
@@ -2459,9 +2459,9 @@ fn init_session(
             // is the config saying where that binary is kept - read here, where the config is
             let pinned_exe = configured_pinned_exe(config_options.session_service.as_ref());
             crate::plugins::plugin_loader::record_configured_pinned_exe(pinned_exe.clone());
-            // the same reason for the status overlay: it asks its questions from Screen, whose
+            // the same reason for the session warnings: they are asked from Screen, whose
             // constructor takes thirty arguments already
-            crate::status_notices::record_settings(crate::status_notices::NoticeSettings {
+            crate::session_warnings::record_settings(crate::session_warnings::WarningSettings {
                 expect_full_disk_access: config_options.expect_full_disk_access.unwrap_or(false),
                 stale_build_notice: config_options.stale_build_notice.unwrap_or(true),
                 pinned_exe,
