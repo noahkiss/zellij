@@ -50,6 +50,23 @@ pub fn generate_handle(is_taken: impl Fn(&str) -> bool) -> String {
     candidate
 }
 
+/// The handle at position `n` of the handle space, in a fixed order.
+///
+/// Every `n` below `ADJECTIVES.len() * NOUNS.len()` names a different handle, and the same `n`
+/// always names the same handle. Production draws at random ([`generate_handle`]); this exists for
+/// a test that renders a pane frame, where a random address would make a golden snapshot a
+/// coin toss.
+pub fn nth_handle(n: usize) -> String {
+    let adjective = ADJECTIVES[n % ADJECTIVES.len()];
+    let noun = NOUNS[(n / ADJECTIVES.len()) % NOUNS.len()];
+    format!("{}{}{}", adjective, HANDLE_SEPARATOR, noun)
+}
+
+/// How many handles [`nth_handle`] can name before it repeats itself.
+pub fn handle_space_size() -> usize {
+    ADJECTIVES.len() * NOUNS.len()
+}
+
 fn random_handle() -> String {
     let adjective = ADJECTIVES[random_index(ADJECTIVES.len())];
     let noun = NOUNS[random_index(NOUNS.len())];
@@ -188,6 +205,18 @@ mod tests {
             adjectives
         );
         assert!(nouns.len() > 20, "nouns barely move: {:?}", nouns);
+    }
+
+    #[test]
+    fn the_ordered_draw_names_a_different_handle_every_time() {
+        // what a rendering test leans on: same n, same handle, and no two n share one
+        assert_eq!(nth_handle(7), nth_handle(7));
+        let space = handle_space_size();
+        let drawn: HashSet<String> = (0..500).map(nth_handle).collect();
+        assert_eq!(drawn.len(), 500, "the ordered draw repeated itself early");
+        assert!(drawn.iter().all(|handle| is_handle_shaped(handle)));
+        // it wraps rather than panicking, which is what makes it safe past the end of the space
+        assert_eq!(nth_handle(0), nth_handle(space));
     }
 
     #[test]

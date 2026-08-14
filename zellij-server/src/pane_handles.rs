@@ -13,6 +13,41 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use zellij_utils::pane_handle::generate_handle;
 
+/// Draws a handle nothing has spoken for.
+#[cfg(not(test))]
+fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
+    generate_handle(is_taken)
+}
+
+/// Under `cargo test` the draw walks the handle space in order instead of shuffling it.
+///
+/// A pane frame shows its handle, and a great many tests snapshot a rendered frame. A random
+/// address would make every one of those a coin toss, so a test session's panes are named in the
+/// order they are built. The counter is per thread because that is the unit a test runs on - one
+/// test's panes are numbered from zero whatever its siblings are doing in parallel.
+///
+/// The randomness this stands in for is tested where it lives, in
+/// `zellij_utils::pane_handle`; what this module is responsible for - uniqueness among live panes,
+/// reservation, release on close - is the same either way.
+#[cfg(test)]
+fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
+    use std::cell::Cell;
+    use zellij_utils::pane_handle::{handle_space_size, nth_handle};
+    thread_local! {
+        static NEXT: Cell<usize> = const { Cell::new(0) };
+    }
+    NEXT.with(|next| {
+        for _ in 0..handle_space_size() {
+            let candidate = nth_handle(next.get());
+            next.set(next.get() + 1);
+            if !is_taken(&candidate) {
+                return candidate;
+            }
+        }
+        generate_handle(is_taken)
+    })
+}
+
 /// What a name in the registry is spoken for by.
 #[derive(Debug, PartialEq, Eq)]
 enum Claim {
@@ -26,12 +61,34 @@ enum Claim {
     Reserved,
 }
 
+#[cfg(not(test))]
 fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Claim>>> = OnceLock::new();
     REGISTRY
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Under `cargo test` the registry is per thread, so each test gets a session of its own.
+///
+/// A test thread IS a session here: one test builds its panes, names them, and drops them without
+/// any other test's panes existing as far as it is concerned. Sharing one registry across a test
+/// binary would make the handles a pane is given depend on what its siblings happen to be doing in
+/// parallel - which a test that snapshots a rendered frame cannot live with, since the frame shows
+/// the handle. Everything this module promises is per session anyway, so scoping it to the thread
+/// weakens nothing the tests are checking.
+#[cfg(test)]
+fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
+    thread_local! {
+        static REGISTRY: &'static Mutex<HashMap<String, Claim>> =
+            Box::leak(Box::new(Mutex::new(HashMap::new())));
+    }
+    REGISTRY.with(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    })
 }
 
 /// Whether a name is out of the generator's reach: held by a live pane, or reserved for one.
@@ -50,7 +107,7 @@ impl HeldHandle {
     /// Takes a handle no live pane answers to and no pending layout has reserved.
     pub fn claim_new() -> Self {
         let mut registry = registry();
-        let handle = generate_handle(|candidate| is_spoken_for(&registry, candidate));
+        let handle = draw_handle(|candidate| is_spoken_for(&registry, candidate));
         registry.insert(handle.clone(), Claim::Held);
         HeldHandle(handle)
     }
@@ -132,12 +189,11 @@ impl Drop for Reservation {
 mod tests {
     use super::*;
 
-    /// A name for a test to claim that no generated handle can ever collide with.
+    /// A name for a test to claim that no drawn handle can ever collide with.
     ///
-    /// The registry is process-global on purpose, so under `cargo test` every test in this module
-    /// shares it with siblings that draw hundreds of random handles. A name from the word lists
-    /// would be a rare-but-real flake; `claim` takes any string, so the tests use names the
-    /// generator cannot produce.
+    /// The registry is per thread under `cargo test`, so a sibling test cannot reach it - but a
+    /// draw made *within* one of these tests still can, and `claim` takes any string. A name the
+    /// generator cannot produce keeps each test about the one thing it is testing.
     fn reserved_for_tests(name: &str) -> String {
         format!("test~{}", name)
     }
