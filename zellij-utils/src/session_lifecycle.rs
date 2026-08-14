@@ -263,32 +263,104 @@ pub fn up_lock_path(name: &str) -> PathBuf {
 ///
 /// With the lock the second one waits, then finds the session healthy and says "already running",
 /// which is what it should have said in the first place.
+///
+/// `restart` needs it over a longer stretch than that. It is a `down` followed by an `up`, and the
+/// watchdog's tick fits between them: the tick's `up` takes the lock first, builds the session
+/// fresh from the layout, and the restart's `up` then finds it healthy and reports success without
+/// ever restoring the snapshot the user asked for. So the lock is taken once for the whole restart
+/// and the inner `up` re-enters it - see [`lock_up`].
 #[cfg(unix)]
 pub struct UpLock {
-    file: std::fs::File,
+    /// `None` on a re-entrant handle: this thread holds the `flock` further up the stack, and
+    /// taking it again on a second descriptor would block against itself.
+    file: Option<std::fs::File>,
+    path: PathBuf,
+    /// Not `Send`: the hold is recorded per thread, so it has to be given up on the thread that
+    /// took it or the count it decrements is somebody else's.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+thread_local! {
+    /// The lock files this THREAD holds, and how many nested holders each has.
+    ///
+    /// Per thread rather than per process, because re-entrancy is a property of one call stack:
+    /// `restart` calling `up` is the same work continuing, while two threads racing for one name
+    /// are two `up`s and must contend at the `flock` like two processes would.
+    ///
+    /// Nothing is persisted, which is the point - a `restart` that dies mid-hold takes the table
+    /// with it, and the kernel releases the `flock` on the way out. Staleness is therefore not a
+    /// state anyone has to clean up.
+    #[cfg(unix)]
+    static HELD_UP_LOCKS: std::cell::RefCell<std::collections::HashMap<PathBuf, usize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 #[cfg(unix)]
 impl Drop for UpLock {
     fn drop(&mut self) {
+        HELD_UP_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            match held.get_mut(&self.path) {
+                // an inner holder went away; the outermost one still holds the flock
+                Some(holders) if *holders > 1 => *holders -= 1,
+                _ => {
+                    held.remove(&self.path);
+                },
+            }
+        });
+        // The descriptor decides, not the count: a re-entrant handle never took an `flock` and so
+        // has nothing to give back. The one handle that did is the one that releases it.
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
         use std::os::unix::io::AsRawFd;
         // closing the descriptor would release it anyway; releasing it deliberately is cheaper
         // than leaving the next reader to know that
         // SAFETY: the descriptor is owned by this struct and is open for as long as it is
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
 /// Take the lock for `name`, waiting for a holder to finish.
 ///
+/// Re-entrant WITHIN one thread: a caller that already holds this lock - `restart`, over its
+/// `down` and its `up` - gets a handle that keeps the hold rather than a second `flock` that would
+/// wait for the first until the timeout ran out. Only the outermost handle releases.
+///
 /// `None` means the caller proceeds unlocked, and both ways of getting it are deliberate. A lock
 /// file that cannot be created (an unwritable socket directory) and a holder that never lets go are
 /// both worse reasons to leave a machine with no session than the race is to run.
+///
+/// The longest legitimate hold is a `restart`: its `down` waits `--wait-timeout` seconds (10 by
+/// default) and its `up` up to ten more, so the default fits inside this timeout with room. A
+/// `--wait-timeout` raised past about twenty seconds does not, and a waiting `up` then gives up on
+/// a holder that is merely slow and proceeds unlocked - the race this closes, reopened by hand.
+/// Raise the timeout here with it if that combination is ever wanted.
 #[cfg(unix)]
 pub fn lock_up(name: &str) -> Option<UpLock> {
+    lock_up_at(up_lock_path(name), name)
+}
+
+/// [`lock_up`], with the lock file named rather than derived, so it can be exercised off a real
+/// socket directory.
+#[cfg(unix)]
+fn lock_up_at(path: PathBuf, name: &str) -> Option<UpLock> {
     use std::os::unix::io::AsRawFd;
 
-    let path = up_lock_path(name);
+    let already_held = HELD_UP_LOCKS.with(|held| match held.borrow_mut().get_mut(&path) {
+        Some(holders) => {
+            *holders += 1;
+            true
+        },
+        None => false,
+    });
+    if already_held {
+        return Some(UpLock {
+            file: None,
+            path,
+            _not_send: std::marker::PhantomData,
+        });
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -310,12 +382,18 @@ pub fn lock_up(name: &str) -> Option<UpLock> {
     loop {
         // SAFETY: the descriptor is owned by `file`, which outlives this call
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Some(UpLock { file });
+            // recorded before the caller can nest: the entry is what makes the next one re-enter
+            HELD_UP_LOCKS.with(|held| held.borrow_mut().insert(path.clone(), 1));
+            return Some(UpLock {
+                file: Some(file),
+                path,
+                _not_send: std::marker::PhantomData,
+            });
         }
         if std::time::Instant::now() >= deadline {
             eprintln!(
-                "warning: another `zellij session up {}` has held {} for {}s. Going ahead \
-                 without the lock, so two servers for this name are possible.",
+                "warning: another `zellij session up` or `session restart` for '{}' has held {} \
+                 for {}s. Going ahead without the lock, so two servers for this name are possible.",
                 name,
                 path.display(),
                 UP_LOCK_TIMEOUT.as_secs()
@@ -2262,5 +2340,172 @@ mod tests {
         let scratch = ScratchDir::new("not-elf");
         let path = scratch.write("zellij", b"#!/bin/sh\nexec zellij \"$@\"\n");
         assert_eq!(identify_executable(path).build_id, None);
+    }
+
+    /// A directory of this test's own, so the lock tests never touch a real socket directory.
+    #[cfg(unix)]
+    fn lock_scratch(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("zellij-up-lock-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("a writable temp dir");
+        path
+    }
+
+    /// Whether the lock file is free, asked the way another PROCESS would ask: a descriptor of its
+    /// own. `flock` is per open file description, so this contends with a held lock even here.
+    #[cfg(unix)]
+    fn lock_is_free(path: &Path) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .expect("a writable lock file");
+        let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if free {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        free
+    }
+
+    /// `restart` holds the lock and then calls `up`, which takes it again. Without re-entrancy that
+    /// inner take waits for the outer one until the timeout runs out and then proceeds unlocked -
+    /// the deadlock dressed up as a 30-second pause.
+    #[test]
+    #[cfg(unix)]
+    fn a_nested_lock_re_enters_the_one_this_thread_already_holds() {
+        let dir = lock_scratch("nested");
+        let path = dir.join(".work.up.lock");
+
+        let outer = lock_up_at(path.clone(), "work").expect("the lock is free");
+        assert!(outer.file.is_some(), "the outer holder owns the flock");
+        assert!(!lock_is_free(&path));
+
+        let inner = lock_up_at(path.clone(), "work").expect("re-entered rather than waited");
+        assert!(inner.file.is_none(), "the inner holder took a second flock");
+
+        // the inner `up` finishing must not open the window the outer hold exists to close
+        drop(inner);
+        assert!(
+            !lock_is_free(&path),
+            "the inner drop released the outer hold"
+        );
+
+        drop(outer);
+        assert!(lock_is_free(&path), "the outermost drop left the lock held");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart that dies between its two steps must not leave the count claiming a hold nobody
+    /// has. The unwind drops both handles, so the next take on this thread is a real `flock`
+    /// again - a count left high would hand out a pass-through handle over an unheld lock.
+    #[test]
+    #[cfg(unix)]
+    fn an_unwind_gives_back_every_nested_hold() {
+        let dir = lock_scratch("unwind");
+        let path = dir.join(".work.up.lock");
+
+        let died = std::panic::catch_unwind({
+            let path = path.clone();
+            move || {
+                let _outer = lock_up_at(path.clone(), "work").expect("the lock is free");
+                let _inner = lock_up_at(path, "work").expect("re-entered rather than waited");
+                panic!("the `down` failed");
+            }
+        });
+        assert!(died.is_err(), "the panic never happened");
+
+        assert!(lock_is_free(&path), "the unwind left the flock held");
+        let after = lock_up_at(path.clone(), "work").expect("the lock is free again");
+        assert!(
+            after.file.is_some(),
+            "re-entered a hold the unwind had given up"
+        );
+        drop(after);
+        assert!(lock_is_free(&path));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fault this is all for. `restart` is a `down` and then an `up`, and the watchdog's minute
+    /// tick used to fit between them: its `up` rebuilt the session fresh from the layout, and the
+    /// restart's `up` then found a healthy session and reported success - having dropped the
+    /// snapshot the restart existed to restore.
+    #[test]
+    #[cfg(unix)]
+    fn the_watchdog_cannot_slip_between_a_restarts_down_and_its_up() {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Session {
+            alive: bool,
+            built_from: Option<&'static str>,
+            builds: usize,
+        }
+
+        /// `up`, reduced to the part that races: take the lock, and build only what is not there.
+        fn up(path: &Path, session: &Mutex<Session>, from: &'static str) {
+            let _guard = lock_up_at(path.to_path_buf(), "work");
+            let mut session = session.lock().unwrap();
+            if !session.alive {
+                session.alive = true;
+                session.built_from = Some(from);
+                session.builds += 1;
+            }
+        }
+
+        let dir = lock_scratch("restart-window");
+        let path = dir.join(".work.up.lock");
+        let session = Arc::new(Mutex::new(Session {
+            alive: true,
+            ..Session::default()
+        }));
+
+        // the restart takes the lock ONCE, for both of its steps
+        let restart_lock = lock_up_at(path.clone(), "work");
+        assert!(restart_lock.is_some(), "the lock is free");
+        // ... `down`
+        session.lock().unwrap().alive = false;
+
+        // and the watchdog's tick lands here, in the window
+        let (tx, rx) = mpsc::channel();
+        let watchdog = std::thread::spawn({
+            let path = path.clone();
+            let session = Arc::clone(&session);
+            move || {
+                up(&path, &session, "layout");
+                let _ = tx.send(());
+            }
+        });
+        // Blocks until the watchdog HAS rebuilt the session, so the failing case is decided by the
+        // event rather than by the clock. The timeout only bounds the case where the lock held it
+        // off, which is the case that has nothing to wait for.
+        let slipped_in = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+
+        // ... and `up`, which re-enters the hold rather than waiting for it
+        up(&path, &session, "restore");
+        drop(restart_lock);
+        watchdog.join().unwrap();
+
+        let built_from = { session.lock().unwrap().built_from };
+        assert_eq!(
+            built_from,
+            Some("restore"),
+            "the session came back from the layout, so the restore was discarded"
+        );
+        assert!(
+            !slipped_in,
+            "the watchdog's `up` ran between the restart's `down` and its `up`"
+        );
+        assert_eq!(
+            session.lock().unwrap().builds,
+            1,
+            "the session was built more than once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
