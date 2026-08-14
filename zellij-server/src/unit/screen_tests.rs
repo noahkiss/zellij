@@ -13900,3 +13900,143 @@ pub fn the_no_focus_probe_stays_silent_about_a_tab_that_is_not_there() {
     assert!(result.stdout_lines.is_empty(), "{:?}", result.stdout_lines);
     assert_eq!(result.affected_tab_id, None);
 }
+
+#[test]
+pub fn closing_a_pane_names_the_pane_it_closed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 1 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.stdout_lines, vec!["closed: terminal_1".to_string()]);
+}
+
+#[test]
+pub fn closing_a_pane_that_is_not_there_reports_a_miss_and_no_report() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' miss, got: {:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "nothing was closed, so nothing is reported closed: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn closing_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTabById { id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab with id 999"))
+            .unwrap_or(false),
+        "Expected a miss naming the id, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn moving_a_tab_reports_the_positions_it_went_between() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    // the client the mock screen attaches: a move is reported for the tab that client is on
+    let client_id = 1;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::MoveTab {
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.stdout_lines.len(), 2, "{:?}", result.stdout_lines);
+    assert!(
+        result.stdout_lines[0].starts_with("from: ") && result.stdout_lines[1].starts_with("to: "),
+        "{:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn moving_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::MoveTabByTabId {
+            id: 999,
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab with id 999"))
+            .unwrap_or(false),
+        "Expected a miss naming the id, got: {:?}",
+        result.error_message
+    );
+    assert!(result.stdout_lines.is_empty(), "{:?}", result.stdout_lines);
+}

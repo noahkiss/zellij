@@ -1355,7 +1355,11 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Close the focused pane.
+    /// Close a pane.
+    ///
+    /// Prints `closed: <pane id>`. A pane that is not there is a miss: a message on stderr and
+    /// exit 2. Without --pane-id this closes the focused pane, which is only meaningful from
+    /// inside a pane.
     ClosePane {
         /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
@@ -1378,7 +1382,11 @@ pub enum CliAction {
     GoToNextTab,
     /// Go to the previous tab.
     GoToPreviousTab,
-    /// Close the current tab.
+    /// Close a tab.
+    ///
+    /// Prints `closed: <tab id> <tab name>`. A tab that is not there is a miss: a message on
+    /// stderr and exit 2. Without --tab-id this closes the current tab, which is only meaningful
+    /// from inside a pane.
     CloseTab {
         /// Target a specific tab by ID
         #[clap(short, long, value_parser)]
@@ -1433,6 +1441,9 @@ pub enum CliAction {
         id: u64,
     },
     /// Close tab with stable ID
+    ///
+    /// Prints `closed: <tab id> <tab name>`. An id no tab answers to is a miss: a message on
+    /// stderr and exit 2.
     CloseTabById {
         id: u64,
     },
@@ -1514,7 +1525,12 @@ pub enum CliAction {
         )]
         no_focus: bool,
     },
-    /// Move the focused tab in the specified direction. [right|left]
+    /// Move a tab in the specified direction. [right|left]
+    ///
+    /// Prints `from:` and `to:` lines, each a 0-based display position - the same numbers
+    /// list-tabs prints in its POSITION column. A tab that is not there is a miss: a message on
+    /// stderr and exit 2. Without --tab-id this moves the current tab, which is only meaningful
+    /// from inside a pane.
     MoveTab {
         #[clap(
             value_parser,
