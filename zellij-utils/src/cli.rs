@@ -2289,6 +2289,19 @@ pub fn missing_target_from_outside_a_pane(
     };
     match action {
         CliAction::ClosePane { pane_id: None } => needs("close-pane", "--pane-id", "list-panes"),
+        // writing into a pane is the same footgun as closing one: the keystrokes land in whichever
+        // pane the server found, and a shell that received them has already run them
+        CliAction::Write { pane_id: None, .. } => needs("write", "--pane-id", "list-panes"),
+        CliAction::WriteChars { pane_id: None, .. } => {
+            needs("write-chars", "--pane-id", "list-panes")
+        },
+        CliAction::Clear { pane_id: None } => needs("clear", "--pane-id", "list-panes"),
+        CliAction::EditScrollback { pane_id: None, .. } => {
+            needs("edit-scrollback", "--pane-id", "list-panes")
+        },
+        CliAction::RenamePane { pane_id: None, .. } => {
+            needs("rename-pane", "--pane-id", "list-panes")
+        },
         CliAction::CloseTab { tab_id: None } => needs("close-tab", "--tab-id", "list-tabs"),
         CliAction::MoveTab { tab_id: None, .. } => needs("move-tab", "--tab-id", "list-tabs"),
         CliAction::BreakPane { pane_id, .. } if pane_id.is_empty() => {
@@ -2633,6 +2646,11 @@ mod tests {
             vec!["break-pane"],
             vec!["break-pane-right"],
             vec!["break-pane-left"],
+            vec!["write", "27"],
+            vec!["write-chars", "hello"],
+            vec!["clear"],
+            vec!["edit-scrollback"],
+            vec!["rename-pane", "build"],
         ] {
             let action = parse_action(&args);
             assert!(
@@ -2640,6 +2658,24 @@ mod tests {
                 "expected `{}` to need a target",
                 args.join(" ")
             );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_verb_and_the_flag_that_answers_it() {
+        for (args, verb) in [
+            (vec!["write", "27"], "write"),
+            (vec!["write-chars", "hello"], "write-chars"),
+            (vec!["clear"], "clear"),
+            (vec!["edit-scrollback"], "edit-scrollback"),
+            (vec!["rename-pane", "build"], "rename-pane"),
+        ] {
+            let action = parse_action(&args);
+            let message = missing_target_from_outside_a_pane(&action, false)
+                .unwrap_or_else(|| panic!("expected `{}` to be refused", args.join(" ")));
+            assert!(message.contains(verb), "got: {}", message);
+            assert!(message.contains("--pane-id"), "got: {}", message);
+            assert!(message.contains("list-panes"), "got: {}", message);
         }
     }
 
@@ -2654,6 +2690,11 @@ mod tests {
             vec!["break-pane"],
             vec!["break-pane-right"],
             vec!["break-pane-left"],
+            vec!["write", "27"],
+            vec!["write-chars", "hello"],
+            vec!["clear"],
+            vec!["edit-scrollback"],
+            vec!["rename-pane", "build"],
         ] {
             let action = parse_action(&args);
             assert_eq!(
@@ -2672,6 +2713,11 @@ mod tests {
             vec!["close-tab", "--tab-id", "2"],
             vec!["move-tab", "left", "--tab-id", "2"],
             vec!["break-pane", "--pane-id", "terminal_1"],
+            vec!["write", "27", "--pane-id", "terminal_1"],
+            vec!["write-chars", "hello", "--pane-id", "sunny-otter"],
+            vec!["clear", "--pane-id", "terminal_1"],
+            vec!["edit-scrollback", "--pane-id", "terminal_1"],
+            vec!["rename-pane", "build", "--pane-id", "terminal_1"],
         ] {
             let action = parse_action(&args);
             assert_eq!(

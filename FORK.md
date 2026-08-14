@@ -287,9 +287,15 @@ Two of those are refusals rather than shapes, and they are the same refusal: a `
 client is attached to nothing, so "the focused pane" resolves against whichever client the server
 can find. From inside a pane that is right and is the point. From a script it is a pane the caller
 has never seen — which is a wrong answer for `dump-screen` and a closed tab for `close-tab`. So
-`close-pane`, `close-tab`, `move-tab` and `break-pane` exit 1 from outside the session unless they
-name a target, and `break-pane-right`/`break-pane-left`, which cannot name one, are refused
-outright. For those, inside a pane nothing changes.
+`close-pane`, `close-tab`, `move-tab`, `break-pane`, `write`, `write-chars`, `clear`,
+`edit-scrollback` and `rename-pane` exit 1 from outside the session unless they name a target, and
+`break-pane-right`/`break-pane-left`, which cannot name one, are refused outright. For those,
+inside a pane nothing changes.
+
+The five verbs that write into a pane or wipe one are in that list for the same reason the closing
+ones are, and are the worse half of it: keystrokes that land in the wrong pane have already been
+run by the shell that received them, and there is no undo for a `clear`. Each refusal names its own
+verb and the `--pane-id` that answers it.
 
 `dump-screen` is stricter: it refuses a targetless dump from **any** `zellij action` client,
 inside a pane or out. The client that types the command is not the client that holds the focus

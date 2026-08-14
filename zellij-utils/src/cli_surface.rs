@@ -312,8 +312,9 @@ How every one of these answers:
     is not there - a closed pane, a tab by a name nothing answers to.
   * A command that only acts prints nothing. The ones that report say so in their own --help.
   * A mutation run from outside the session must name what it acts on. `close-pane`, `close-tab`,
-    `move-tab` and `break-pane` refuse a targetless call from a script, because \"the focused pane\"
-    there is a pane you have never seen.
+    `move-tab`, `break-pane`, `write`, `write-chars`, `clear`, `edit-scrollback` and `rename-pane`
+    refuse a targetless call from a script, because \"the focused pane\" there is a pane you have
+    never seen.
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
