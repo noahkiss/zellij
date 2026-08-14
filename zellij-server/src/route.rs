@@ -2403,7 +2403,7 @@ fn cli_report(
 ) -> Vec<String> {
     let mut lines = id_report_lines(result, id_keys);
     if let Some(pane_id) = result.affected_pane_id {
-        if result.stdout_lines.is_empty() {
+        if result.stdout_lines.is_empty() && !lines.is_empty() {
             // the handle is how a human addresses the pane that was just made, so it is printed
             // with the id rather than left to be looked up
             if let Some(handle) = handle_of_pane(senders, pane_id) {
@@ -2418,6 +2418,14 @@ fn cli_report(
 fn id_report_lines(result: &ActionCompletionResult, id_keys: &IdReportKeys) -> Vec<String> {
     if !result.stdout_lines.is_empty() {
         return result.stdout_lines.clone();
+    }
+    if result.exit_status.is_some() {
+        // The action was asked to wait for an exit status - `new-pane --block-until-exit` and its
+        // kin - and that status is the answer it was run for. The CLI stops reading at the first
+        // message it gets, so a `pane_id:` line sent here is the exit status thrown away: the
+        // caller waits for a command's status and is told 0 no matter what the command did. The
+        // ids are the fallback for a command that said nothing else, and this said something.
+        return Vec::new();
     }
     let mut lines = Vec::new();
     if let Some(tab_id) = result.affected_tab_id {
@@ -3935,6 +3943,29 @@ mod tests {
         let result = completion_with(None, None, vec![]);
         let keys = IdReportKeys::for_action(&Action::CloseFocus);
         assert!(id_report_lines(&result, &keys).is_empty());
+    }
+
+    #[test]
+    fn an_exit_status_is_not_displaced_by_the_id_report() {
+        // `new-pane --block-until-exit -- sh -c 'exit 7'` carries both a pane id, set when the
+        // pane was built, and the status the caller asked to wait for. Only one message reaches
+        // the CLI, so reporting the id here would answer 0 for every command
+        let mut result = completion_with(None, Some(PaneId::Terminal(7)), vec![]);
+        result.exit_status = Some(7);
+        let keys = IdReportKeys::for_action(&Action::CloseFocus);
+        assert!(id_report_lines(&result, &keys).is_empty());
+    }
+
+    #[test]
+    fn a_report_the_action_wrote_still_outranks_an_exit_status() {
+        // the negative control for the rule above: an action that said something meant to say it
+        let mut result = completion_with(None, None, vec!["closed: terminal_7".to_string()]);
+        result.exit_status = Some(1);
+        let keys = IdReportKeys::for_action(&Action::CloseFocus);
+        assert_eq!(
+            id_report_lines(&result, &keys),
+            vec!["closed: terminal_7".to_string()]
+        );
     }
 
     #[test]
