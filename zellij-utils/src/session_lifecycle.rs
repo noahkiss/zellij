@@ -1334,6 +1334,17 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     })
 }
 
+/// Whether [`install_pinned_exe`] would write, asked without writing.
+///
+/// The same two questions that function asks, in the same order, so that a dry run reports the
+/// decision the real run makes rather than a guess at it. A dry run whose answer is derived some
+/// other way is a dry run that eventually disagrees with the fix, and then it is worse than no dry
+/// run at all.
+#[cfg(unix)]
+pub fn pin_needs_refresh(source: &Path, target: &Path) -> bool {
+    !target.exists() || pin_is_stale(source, target, sha256_of_file(source).as_deref())
+}
+
 /// The file recording which source build the pinned copy was made from.
 ///
 /// Beside the pin rather than inside it: the pin has to stay a plain executable a launcher can run,
@@ -2463,6 +2474,37 @@ mod tests {
             std::fs::read(&target).unwrap(),
             signed,
             "the signature was copied over by the next `session up`"
+        );
+    }
+
+    /// What `zellij session doctor --dry-run` reports, asked without writing.
+    ///
+    /// It has to answer the same three ways the fix acts - no pin, stale pin, current pin - or a
+    /// dry run says one thing and the run after it does another, which is the one failure a dry run
+    /// cannot survive.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn what_the_pin_would_do_is_answered_without_writing_anything() {
+        let scratch = ScratchDir::new("pin-dry");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+
+        assert!(
+            pin_needs_refresh(&source, &target),
+            "a pin that is not there has to be written"
+        );
+        assert!(!target.exists(), "asking must not write the pin");
+
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        assert!(
+            !pin_needs_refresh(&source, &target),
+            "a pin made from this source is current"
+        );
+
+        std::fs::write(pin_source_stamp(&target), "a hash of some other build\n").unwrap();
+        assert!(
+            pin_needs_refresh(&source, &target),
+            "a stamp naming another source is a pin from another source"
         );
     }
 

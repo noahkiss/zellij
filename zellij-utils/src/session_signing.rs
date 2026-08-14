@@ -333,10 +333,12 @@ pub struct SigningRun {
 /// 4. Verify the copy twice before it is allowed near the pinned path. A signature that did not
 ///    take leaves the working pin untouched instead of replacing it with a broken one.
 /// 5. `rename(2)` last, which is atomic and cannot fail against a running server.
-/// 6. Nothing re-stamps, and nothing has to. The stamp beside the pin names the hash of the
-///    SOURCE binary, which signing does not touch - so the next `session up` still finds the pin
-///    current and does not copy over the signature. Writing the pin's own hash there instead is
-///    the mistake that undoes this whole file within a minute.
+/// 6. Nothing re-stamps, and nothing may be made to. The stamp beside the pin records the hash of
+///    the SOURCE binary, which signing does not touch, so it still agrees and the next
+///    `session up` leaves the signature alone. A "re-stamp" written here would have to hash the
+///    signed pin, and a stamp naming the pin's own bytes is exactly the comparison
+///    [`pin_is_stale`](crate::session_lifecycle::install_pinned_exe) exists to avoid: it would
+///    call every signed pin stale and copy over the signature within the minute.
 ///
 /// A failure anywhere is a `Needs you` naming the recovery, never a fatal error: doctor has other
 /// checks to make and a machine that cannot sign is still a machine worth reporting on.
@@ -399,6 +401,25 @@ pub fn sign_pin(
     }
 
     let mut rung = choose_rung(&find_identities(commander));
+
+    // A run that is not acting stops here and says which rung it would have taken - including the
+    // one that does not exist yet. Falling through to the Xcode steps would have a dry run report
+    // `Needs you` on the machine the real run repairs by itself, which is every machine with no
+    // Apple account: the commonest case, and the one where the dry run is read most carefully.
+    if rung.is_none() && !mode.fix {
+        findings.push(
+            Finding::changed(
+                "signing",
+                mode.describe(&format!(
+                    "mint a certificate of zellij's own and sign {} with it",
+                    pin_display
+                )),
+            )
+            .note("the keychain offers no Apple certificate, so this is the rung the run takes")
+            .note("it needs `openssl` and the login keychain, and mints once and never again"),
+        );
+        return SigningRun { findings };
+    }
 
     // The third rung is not one the keychain offers - it is one we make. Only when the first two
     // are absent, only when doctor is allowed to act, and only once in the life of the machine:
@@ -1256,6 +1277,37 @@ Signature=adhoc
         assert_eq!(last.status, Status::NeedsYou);
         assert!(last.notes.iter().any(|note| note.contains("Xcode")));
         assert!(!commander.called_with("-s -"), "{:?}", commander.calls());
+    }
+
+    /// The case a dry run is read most carefully in, and the one it used to get backwards: with no
+    /// Apple certificate on the machine, the real run mints one and signs, so the dry run has to
+    /// say that rather than print the Xcode steps and exit non-zero over work doctor does itself.
+    #[test]
+    fn a_dry_run_with_no_certificate_names_the_one_it_would_mint() {
+        let commander = RecordedCommander::new(&[
+            ("codesign -d --verbose=2 -r- /tmp/pin", recorded(AD_HOC)),
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            Path::new("/tmp/pin"),
+            DoctorMode {
+                fix: false,
+                dry_run: true,
+                sign: true,
+            },
+            &context(scratch.path()),
+        );
+        assert_eq!(run.findings.len(), 1, "{:?}", run.findings);
+        assert_eq!(run.findings[0].status, Status::Changed);
+        assert!(
+            run.findings[0].message.starts_with("would mint"),
+            "{:?}",
+            run.findings[0]
+        );
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        assert!(!commander.called_with("-s "), "{:?}", commander.calls());
     }
 
     #[test]
