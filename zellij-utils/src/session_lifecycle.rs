@@ -233,12 +233,14 @@ impl SessionFacts {
 
 /// How long to wait for another `session up` to finish before going ahead without the lock.
 ///
-/// Comfortably longer than an `up` takes: the creating path waits at most
-/// `SERVER_APPEARANCE_TIMEOUT` for the server to appear and does nothing slow after that. A wait
-/// that runs out therefore means the holder is wedged rather than busy, and refusing to bring the
-/// session up over a wedged neighbour would be a worse outcome than the race the lock prevents.
+/// Comfortably longer than an `up` takes, and it has to STAY that way: a `restart` holds this lock
+/// across both halves, so the longest legitimate hold is a `--wait-timeout` down plus a
+/// `SERVER_APPEARANCE_TIMEOUT` up - 10 plus 30 seconds at the defaults. A wait that runs out
+/// therefore means the holder is wedged rather than busy, and refusing to bring the session up over
+/// a wedged neighbour would be a worse outcome than the race the lock prevents. Set this below the
+/// sum and a waiting `up` gives up on a restart that is merely slow, which is that race put back.
 #[cfg(unix)]
-const UP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const UP_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 #[cfg(unix)]
 const UP_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 

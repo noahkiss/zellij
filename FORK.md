@@ -685,8 +685,10 @@ copy of.
 The wait for the created server **backs off**. Each poll forks `ps` to walk the whole process
 table, and a fixed 100 ms interval spent the same hundred forks on the session that came up in
 200 ms and on the one that never would — and the second is the case a launcher repeats every minute
-for as long as the fault lasts. The gap doubles from 50 ms to 1.5 s over the same ten seconds, which
-is about eight times fewer forks on the failing machine and no difference on the healthy one.
+for as long as the fault lasts. The gap doubles from 50 ms to 1.5 s over the same thirty seconds,
+which is about an order of magnitude fewer forks on the failing machine and no difference on the
+healthy one. Thirty, not ten: launchd was measured at 15 to 20 seconds on the fleet's Macs, and ten
+reported a post-condition failure on sessions that were up moments later.
 Nothing gives up early: what would escalate is the watchdog switching itself off, and that is the
 one state a person cannot recover from without a shell on the machine. The failure is already loud —
 the post-condition and its diagnostics go to the journal, or to the log the plist names.
@@ -696,7 +698,7 @@ and the creation. Without it the two are separate steps, so a `restart` typed by
 the watchdog's minute tick had both sides find no server and both create one — two servers for a
 name that allows one, reported by `assert_up` on both sides and cleaned up by neither, after which
 every later `up` refused until somebody killed a server by hand. With the lock the second one waits
-and then reports the session already running. A lock that cannot be taken in 30 seconds is a wedged
+and then reports the session already running. A lock that cannot be taken in 90 seconds is a wedged
 holder rather than a busy one, so it is named and the `up` goes ahead: no session at all is a worse
 outcome than the race.
 
@@ -709,8 +711,9 @@ snapshot the restart existed to bring back, and the case it is wanted for most i
 after a reboot, which is exactly when a watchdog is ticking. Re-entrancy is per thread and held in
 memory only, so a restart that dies mid-hold leaves nothing to clean up: the kernel releases the
 `flock` when the process goes. At the default `--wait-timeout` the whole restart fits inside the
-lock's own 30 seconds with room to spare; raise that timeout past about twenty seconds and a waiting
-`up` can give up on a restart that is only slow, which is the race put back by hand.
+lock's own 90 seconds with room to spare — the longest legitimate hold is a 10-second down plus a
+30-second wait for the server. Raise `--wait-timeout` past about a minute and a waiting `up` can
+give up on a restart that is only slow, which is the race put back by hand.
 
 ### `zellij setup --generate-service <systemd|launchd>`
 
