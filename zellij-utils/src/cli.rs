@@ -191,6 +191,22 @@ pub struct SubscribeCli {
     /// Preserve ANSI styling in the output
     #[clap(long)]
     pub ansi: bool,
+
+    /// Stamp every line with the UTC time it was printed: `2026-08-14T18:03:12.345Z ` before each
+    /// raw line, a `ts` key in each json object. It is when this client printed the line, not when
+    /// the pane produced it
+    #[clap(long)]
+    pub timestamps: bool,
+}
+
+/// The stamp `subscribe --timestamps` puts on a line: RFC3339, UTC, to the millisecond.
+///
+/// It is taken once per update, so every line of one render shares it - the lines were printed in
+/// one go and a stamp that drifted across them would say otherwise. It is a *print* time: the
+/// client's clock when the line left it, which is later than the pane's output by however long the
+/// render and the socket took, and is the only time this side of the connection can honestly claim.
+pub fn event_timestamp(at: std::time::SystemTime) -> String {
+    humantime::format_rfc3339_millis(at).to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ValueEnum)]
@@ -2468,6 +2484,23 @@ mod tests {
     fn subscribe_format_default_raw() {
         let s = parse_subscribe(&["subscribe", "--pane-id", "terminal_1"]);
         assert!(matches!(s.format, SubscribeFormat::Raw));
+    }
+
+    #[test]
+    fn subscribe_timestamps_are_off_until_asked_for() {
+        let bare = parse_subscribe(&["subscribe", "--pane-id", "terminal_1"]);
+        assert!(!bare.timestamps);
+        let stamped = parse_subscribe(&["subscribe", "--pane-id", "terminal_1", "--timestamps"]);
+        assert!(stamped.timestamps);
+    }
+
+    #[test]
+    fn an_event_timestamp_is_rfc3339_utc_to_the_millisecond() {
+        let epoch = event_timestamp(std::time::UNIX_EPOCH);
+        assert_eq!(epoch, "1970-01-01T00:00:00.000Z");
+        let later =
+            event_timestamp(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_234_567));
+        assert_eq!(later, "1970-01-01T00:20:34.567Z");
     }
 
     #[test]

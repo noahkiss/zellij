@@ -280,6 +280,13 @@ const OUTPUTS: &[OutputSpec] = &[
         shape: "table",
         keys: "NAME STATUS CURRENT CLIENTS CREATED",
     },
+    // a stream rather than an answer: the pane's own lines, until the pane closes. `--format json`
+    // wraps each update in a record instead, and `--timestamps` adds the time to either
+    OutputSpec {
+        command: "subscribe",
+        shape: "payload",
+        keys: "",
+    },
 ];
 
 /// The keys or columns the dump promises for a command, or `None` if it promises nothing.

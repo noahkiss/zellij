@@ -3027,6 +3027,33 @@ The flag rides on the existing
 `GoToTabNameAction` message (field 3), so it adds no message to the client/server contract; the
 plugin API's `focus_or_create_tab` is unchanged and always focuses.
 
+### `subscribe --timestamps`
+
+```
+$ zellij subscribe --pane-id sunny-otter --timestamps
+2026-08-14T18:03:12.345Z $ cargo test
+2026-08-14T18:03:12.345Z test result: ok. 37 passed
+$ zellij subscribe --pane-id sunny-otter --format json --timestamps
+{"event":"pane_update","pane_id":"terminal_3",...,"ts":"2026-08-14T18:03:12.345Z"}
+```
+
+A stream of pane renders with no times in it cannot answer "how long did that take" or "did this
+appear before or after that", and a watcher that has to stamp the lines itself has already lost the
+moment they arrived. The flag puts the time on each line: a prefix and a space in raw mode, a `ts`
+key in json.
+
+- **The format is RFC3339, UTC, to the millisecond** — `2026-08-14T18:03:12.345Z`. It sorts as text
+  and every log tool already reads it.
+- **It is a print time, not a server time.** The clock is read by this client as the line leaves it,
+  which is after the pane produced the output by however long the render and the socket took. The
+  server does not stamp the update, so there is no time here that could be compared against another
+  machine's.
+- **One stamp per update.** Every line of one render carries the same time, because they are printed
+  in one go; a stamp that crept forward between the lines of a frame would be describing something
+  that did not happen.
+- Without the flag the output is byte for byte what it was, and in json the `ts` key is simply
+  absent — added, like every key in the fork, never renamed or removed.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

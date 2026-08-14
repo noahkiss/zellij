@@ -326,6 +326,34 @@ fn individual_messages_client(
     }
 }
 
+/// The prefix each raw `subscribe` line carries, and the empty string when it carries none.
+fn now_stamp(timestamps: bool) -> String {
+    if timestamps {
+        format!(
+            "{} ",
+            zellij_utils::cli::event_timestamp(std::time::SystemTime::now())
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// The same stamp, as the `ts` key of a json event. A key is added, never renamed or removed, so a
+/// reader that does not know about it is unaffected.
+fn add_timestamp(event: &mut serde_json::Value, timestamps: bool) {
+    if !timestamps {
+        return;
+    }
+    if let Some(object) = event.as_object_mut() {
+        object.insert(
+            "ts".to_owned(),
+            serde_json::Value::String(zellij_utils::cli::event_timestamp(
+                std::time::SystemTime::now(),
+            )),
+        );
+    }
+}
+
 pub fn start_subscribe_client(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
@@ -379,24 +407,28 @@ pub fn start_subscribe_client(
                 _,
             )) => match subscribe_cli.format {
                 SubscribeFormat::Raw => {
+                    // one stamp for the whole update: these lines are printed in one go, and a
+                    // stamp that crept forward between them would be describing something else
+                    let stamp = now_stamp(subscribe_cli.timestamps);
                     if let Some(ref scrollback_lines) = scrollback {
                         for line in scrollback_lines {
-                            let _ = writeln!(stdout, "{}", line);
+                            let _ = writeln!(stdout, "{}{}", stamp, line);
                         }
                     }
                     for line in &viewport {
-                        let _ = writeln!(stdout, "{}", line);
+                        let _ = writeln!(stdout, "{}{}", stamp, line);
                     }
                     let _ = stdout.flush();
                 },
                 SubscribeFormat::Json => {
-                    let json = serde_json::json!({
+                    let mut json = serde_json::json!({
                         "event": "pane_update",
                         "pane_id": pane_id.to_string(),
                         "viewport": viewport,
                         "scrollback": scrollback,
                         "is_initial": is_initial,
                     });
+                    add_timestamp(&mut json, subscribe_cli.timestamps);
                     let _ = writeln!(stdout, "{}", json);
                     let _ = stdout.flush();
                 },
@@ -406,10 +438,11 @@ pub fn start_subscribe_client(
                 match subscribe_cli.format {
                     SubscribeFormat::Raw => {},
                     SubscribeFormat::Json => {
-                        let json = serde_json::json!({
+                        let mut json = serde_json::json!({
                             "event": "pane_closed",
                             "pane_id": pane_id.to_string(),
                         });
+                        add_timestamp(&mut json, subscribe_cli.timestamps);
                         let _ = writeln!(stdout, "{}", json);
                         let _ = stdout.flush();
                     },
@@ -448,6 +481,30 @@ mod tests {
             no_focus: false,
             tab_id: None,
         }
+    }
+
+    #[test]
+    fn a_stamped_line_carries_the_time_and_a_bare_one_carries_nothing() {
+        let stamp = now_stamp(true);
+        assert!(
+            stamp.ends_with(' '),
+            "the prefix separates itself: {stamp:?}"
+        );
+        assert!(stamp.trim_end().ends_with('Z'), "utc: {stamp:?}");
+        assert_eq!(stamp.trim_end().len(), "2026-08-14T18:03:12.345Z".len());
+        // the negative control: without the flag the line is exactly what it was before
+        assert_eq!(now_stamp(false), "");
+    }
+
+    #[test]
+    fn a_json_event_gains_a_ts_key_only_when_it_was_asked_for() {
+        let mut event = serde_json::json!({"event": "pane_closed"});
+        add_timestamp(&mut event, false);
+        assert!(event.get("ts").is_none());
+        add_timestamp(&mut event, true);
+        assert!(event["ts"].as_str().unwrap().ends_with('Z'), "{event}");
+        // the rest of the object is untouched
+        assert_eq!(event["event"], "pane_closed");
     }
 
     #[test]
