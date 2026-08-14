@@ -1208,6 +1208,7 @@ impl From<crate::input::actions::Action>
             RenameTerminalPaneAction,
             ResizeAction,
             ResizeByPaneIdAction,
+            ResolvePaneTargetAction,
             RunAction,
             SaveSessionAction,
             ScrollDownAction,
@@ -1957,6 +1958,9 @@ impl From<crate::input::actions::Action>
             }),
             crate::input::actions::Action::ListClients { output_json } => {
                 ActionType::ListClients(ListClientsAction { output_json })
+            },
+            crate::input::actions::Action::ResolvePaneTarget { target } => {
+                ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2906,6 +2910,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::ListClients(a) => Ok(crate::input::actions::Action::ListClients {
                 output_json: a.output_json,
             }),
+            ActionType::ResolvePaneTarget(a) => {
+                Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
+            },
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {
                     show_tab: list_panes_action.show_tab,

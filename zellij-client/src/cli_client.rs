@@ -209,6 +209,66 @@ fn pipe_client(
     }
 }
 
+/// Asks the running session which pane a handle or uuid names.
+///
+/// The CLI holds a string; only the server holds the panes. This is that one question, asked on its
+/// own short-lived connection before the real action is built - so by the time the action leaves,
+/// it names a pane id like it always did, and nothing downstream has to know a handle existed.
+///
+/// `Err` carries the server's own message, which is what the caller prints before exiting 2.
+pub fn resolve_pane_target(
+    mut os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    target: &str,
+) -> Result<PaneId, String> {
+    let zellij_ipc_pipe: PathBuf = {
+        let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+        fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
+        zellij_utils::shared::set_permissions(&sock_dir, 0o700).map_err(|e| e.to_string())?;
+        sock_dir.push(session_name);
+        sock_dir
+    };
+    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
+    os_input.connect_to_server(&*zellij_ipc_pipe);
+    os_input.send_to_server(ClientToServerMsg::Action {
+        action: Action::ResolvePaneTarget {
+            target: target.to_owned(),
+        },
+        terminal_id: None,
+        client_id: None,
+        is_cli_client: true,
+    });
+    let resolved = loop {
+        match os_input.recv_from_server() {
+            Some((ServerToClientMsg::Log { lines }, _)) => {
+                // `pane_id: terminal_7`, the key-value shape every reporting command answers in
+                break lines
+                    .first()
+                    .and_then(|line| line.strip_prefix("pane_id: "))
+                    .ok_or_else(|| format!("Could not read the resolved pane for '{}'", target))
+                    .and_then(|id| {
+                        PaneId::from_str(id).map_err(|e| {
+                            format!("Could not read the resolved pane for '{}': {}", target, e)
+                        })
+                    });
+            },
+            Some((ServerToClientMsg::LogError { lines }, _)) => {
+                break Err(lines.join("\n"));
+            },
+            Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                break Err(match exit_reason {
+                    ExitReason::Error(e) => e,
+                    _ => format!("The session exited while resolving '{}'", target),
+                });
+            },
+            Some(_) => {},
+            None => break Err(format!("The session did not answer for '{}'", target)),
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    resolved
+}
+
 fn individual_messages_client(
     os_input: &mut Box<dyn ClientOsApi>,
     action: Action,

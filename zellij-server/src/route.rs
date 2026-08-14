@@ -19,8 +19,8 @@ use zellij_utils::{
     channels::SenderWithContext,
     data::{
         BareKey, ConnectToSession, Direction, Event, InputMode, KeyModifier, ListPanesResponse,
-        ListTabsResponse, NewPanePlacement, PaneListEntry, ResizeStrategy, TabInfo,
-        UnblockCondition,
+        ListTabsResponse, NewPanePlacement, PaneId as ZellijUtilsPaneId, PaneListEntry, PaneTarget,
+        ResizeStrategy, TabInfo, UnblockCondition,
     },
     envs,
     errors::prelude::*,
@@ -1761,6 +1761,36 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::ResolvePaneTarget { target } => {
+            match target.parse::<PaneTarget>() {
+                Ok(parsed) => match request_pane_target_resolution(&senders, parsed)
+                    .with_context(err_context)?
+                {
+                    Some(Some(pane_id)) => {
+                        let pane_id: ZellijUtilsPaneId = pane_id.into();
+                        send_output_to_client(
+                            cli_client_id,
+                            os_input.as_ref(),
+                            vec![format!("pane_id: {}", pane_id)],
+                        );
+                    },
+                    // a target that names no live pane is a miss, not an error: exit 2, per the
+                    // convention the rest of the query surface already follows
+                    Some(None) => send_error_to_client(
+                        cli_client_id,
+                        os_input.as_ref(),
+                        &format!("No pane answers to '{}'", target),
+                    ),
+                    None => send_error_to_client(
+                        cli_client_id,
+                        os_input.as_ref(),
+                        "Timeout resolving pane target",
+                    ),
+                },
+                Err(e) => send_error_to_client(cli_client_id, os_input.as_ref(), &e),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::ListPanes {
             show_tab,
             show_command,
@@ -3030,6 +3060,33 @@ pub(crate) fn route_thread_main(
     // route thread exited, make sure we clean up
     let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
     Ok(())
+}
+
+/// Asks Screen which pane a target names. `None` when Screen did not answer in time.
+fn request_pane_target_resolution(
+    senders: &ThreadSenders,
+    target: PaneTarget,
+) -> Result<Option<Option<PaneId>>> {
+    use crossbeam::channel::{unbounded, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (response_sender, response_receiver) = unbounded();
+    senders.send_to_screen(ScreenInstruction::ResolvePaneTarget {
+        target,
+        response_channel: response_sender,
+    })?;
+
+    match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(pane_id) => Ok(Some(pane_id)),
+        Err(RecvTimeoutError::Timeout) => {
+            log::error!("ResolvePaneTarget timed out waiting for Screen response");
+            Ok(None)
+        },
+        Err(RecvTimeoutError::Disconnected) => {
+            log::error!("ResolvePaneTarget channel disconnected");
+            Ok(None)
+        },
+    }
 }
 
 fn request_panes_from_screen(
