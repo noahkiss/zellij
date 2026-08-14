@@ -1365,11 +1365,14 @@ rename is also atomic, and it does not fail `ETXTBSY` against a server that is e
 Linux gets the same treatment for the plainer half of the problem — a versioned path that
 disappears on upgrade.
 
-**What decides whether to copy.** [Build identity](#a-warning-when-the-running-session-is-a-different-build),
-not a timestamp. The pinned copy is a copy, so it is a different file from the binary it came from
-and only the id the linker stamped in can say whether it is the same build. Same build, nothing is
-written — which is every pass but the first after an upgrade, and the binary is around 40 MB while
-`session up` runs from a watchdog every minute. A refresh says so once:
+**What decides whether to copy.** The SOURCE the copy was made from, recorded beside it in
+`<pin>.source-sha256` — not a timestamp, and not a comparison of the two files. The pin is not
+required to stay byte-identical to its source: signing it on macOS changes it on purpose. A pin
+judged by its own contents would therefore read stale forever, and `session up` runs from a watchdog
+every minute, so the signature would last about that long. The pin is stale when the stamp is
+missing, unreadable, or names a different source; a source that cannot be hashed at all falls back
+to [build identity](#a-warning-when-the-running-session-is-a-different-build). Nothing is written on
+every pass but the first after an upgrade, and the binary is around 40 MB. A refresh says so once:
 
 ```
       refreshed the pinned copy at /home/<user>/.local/share/zellij/bin/zellij

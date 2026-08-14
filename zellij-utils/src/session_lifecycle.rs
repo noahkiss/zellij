@@ -1296,20 +1296,18 @@ impl PinOutcome {
 ///   cdhash for that vnode, and the next launch died with `OS_REASON_CODESIGNING` while
 ///   `codesign --verify` called the file valid on disk.
 ///
-/// Whether to write at all is decided by [`compare_builds`], not by a timestamp or a path: the
-/// pinned copy is a COPY, so it is a different file from the binary it came from and only the id
-/// the linker stamped in can say whether it is the same build.
+/// Whether to write at all is decided by [`pin_is_stale`], which asks what the pinned copy was made
+/// FROM rather than what it now contains. The pinned copy is not required to stay byte-identical to
+/// its source - signing it changes it deliberately - so a comparison of the two files would call a
+/// signed pin stale and copy over the signature on the next `session up`.
 ///
 /// A write that fails part-way leaves nothing behind: the temp file is removed and the pinned path
 /// still holds whatever it held before, which is a working binary rather than a short one.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
-    if target.exists() {
-        let ours = identify_executable(source.to_path_buf());
-        let theirs = identify_executable(target.to_path_buf());
-        if compare_builds(Some(&ours), Some(&theirs)) == BuildMatch::Same {
-            return Ok(PinOutcome::UpToDate(target.to_path_buf()));
-        }
+    let source_hash = sha256_of_file(source);
+    if target.exists() && !pin_is_stale(source, target, source_hash.as_deref()) {
+        return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let refreshing = target.exists();
     let directory = pin_directory(target);
@@ -1326,11 +1324,97 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         let _ = std::fs::remove_file(&temporary);
         return Err(pin_write_error(target, &error));
     }
+    record_pin_source(target, source_hash.as_deref());
     Ok(if refreshing {
         PinOutcome::Refreshed(target.to_path_buf())
     } else {
         PinOutcome::Installed(target.to_path_buf())
     })
+}
+
+/// The file recording which source build the pinned copy was made from.
+///
+/// Beside the pin rather than inside it: the pin has to stay a plain executable a launcher can run,
+/// and on macOS its bytes are the thing a signature covers.
+#[cfg(unix)]
+pub fn pin_source_stamp(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".source-sha256");
+    pin_directory(target).join(name)
+}
+
+/// Whether the pinned copy has to be written again.
+///
+/// The question is NOT whether the two files agree. Once the pin is signed it differs from its
+/// source by design, and every signature is a fresh certificate over a fresh cdhash - so an answer
+/// derived from the pin's own contents says "stale" forever and the next `session up`, a minute
+/// later on the watchdog, copies over the work. What settles it is the source this copy was made
+/// from, recorded when it was made.
+///
+/// A stamp that is missing or unreadable means stale. A pin nobody stamped is a pin from before
+/// this scheme, or one somebody put there by hand, and re-copying it once is cheap and correct.
+///
+/// [`compare_builds`] is the fallback for a source that cannot be hashed at all, which is the same
+/// judgement the pin used before there were stamps: worse, because it cannot see a signature, but
+/// better than refusing to answer.
+#[cfg(unix)]
+fn pin_is_stale(source: &Path, target: &Path, source_hash: Option<&str>) -> bool {
+    let Some(source_hash) = source_hash else {
+        let ours = identify_executable(source.to_path_buf());
+        let theirs = identify_executable(target.to_path_buf());
+        return compare_builds(Some(&ours), Some(&theirs)) != BuildMatch::Same;
+    };
+    match std::fs::read_to_string(pin_source_stamp(target)) {
+        Ok(recorded) => recorded.trim() != source_hash,
+        Err(_) => true,
+    }
+}
+
+/// Record what the pin was made from, so the next pass can tell a signed pin from a stale one.
+///
+/// Best effort, and deliberately not an error: the copy is in place and working, and a stamp that
+/// could not be written costs one needless 40 MB copy on the next pass rather than a failed
+/// `session up`. A partial write is self-correcting for the same reason - it cannot match, so the
+/// pin reads stale and is written again.
+#[cfg(unix)]
+fn record_pin_source(target: &Path, source_hash: Option<&str>) {
+    let stamp = pin_source_stamp(target);
+    match source_hash {
+        Some(hash) => {
+            let _ = std::fs::write(stamp, format!("{}\n", hash));
+        },
+        // a stamp left over from an earlier pin would name a source this copy did not come from
+        None => {
+            let _ = std::fs::remove_file(stamp);
+        },
+    }
+}
+
+/// The SHA-256 of a file, as lowercase hex, streamed rather than read whole - the binary is around
+/// 40 MB and this runs on every `session up`.
+#[cfg(unix)]
+fn sha256_of_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect(),
+    )
 }
 
 /// The directory the pinned copy lives in, for a target that may name no directory at all.
@@ -2321,7 +2405,7 @@ mod tests {
         let scratch = ScratchDir::new("pin-same");
         let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
         let target = scratch.0.join("pinned");
-        std::fs::copy(&source, &target).unwrap();
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
         let before = std::fs::metadata(&target).unwrap().modified().unwrap();
 
         assert_eq!(
@@ -2333,6 +2417,89 @@ mod tests {
             before,
             "a copy of the same build was written all the same"
         );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn installing_the_pin_records_the_source_it_came_from() {
+        let scratch = ScratchDir::new("pin-stamp");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let recorded = std::fs::read_to_string(pin_source_stamp(&target)).expect("a stamp");
+        assert_eq!(
+            recorded.trim(),
+            sha256_of_file(&source).unwrap(),
+            "the stamp has to name the SOURCE, not the copy"
+        );
+    }
+
+    /// The reason the stamp exists. A signed pin differs from its source by design, and the pass
+    /// `session up` takes every minute must not copy over the signature.
+    ///
+    /// The source carries no linker stamp, which is the case that makes this bite: with no id to
+    /// compare, [`compare_builds`] falls through to size, a signature changes the size, and the pin
+    /// reads as another build every minute forever.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pin_that_differs_from_its_source_is_left_alone_while_the_stamp_agrees() {
+        let scratch = ScratchDir::new("pin-signed");
+        let source = scratch.write("zellij", &vec![0x7f; 4096]);
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        // what signing does to the copy: same build, more bytes
+        let mut signed = std::fs::read(&target).unwrap();
+        signed.extend(std::iter::repeat(0xcd).take(900));
+        std::fs::write(&target, &signed).unwrap();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            signed,
+            "the signature was copied over by the next `session up`"
+        );
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pin_whose_stamp_is_missing_or_disagrees_is_written_again() {
+        let scratch = ScratchDir::new("pin-stale");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+
+        std::fs::write(pin_source_stamp(&target), "a hash of some other build\n").unwrap();
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "a stamp naming another source is a pin from another source"
+        );
+
+        std::fs::remove_file(pin_source_stamp(&target)).unwrap();
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "an unstamped pin is one nothing here put there, and is not trusted"
+        );
+    }
+
+    /// The stamp cannot answer for a source that will not read, and refusing to answer would leave
+    /// the pin unmanaged. The build comparison is the same judgement the pin used before stamps.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn without_a_source_hash_the_build_comparison_decides() {
+        let scratch = ScratchDir::new("pin-nohash");
+        let unreadable = scratch.0.join("a-directory");
+        std::fs::create_dir(&unreadable).expect("a writable temp dir");
+        let other = scratch.write("pinned", &elf_with_build_id(&[0xcd; 20], 4096));
+
+        assert_eq!(sha256_of_file(&unreadable), None);
+        assert!(!pin_is_stale(&unreadable, &unreadable, None), "one file");
+        assert!(pin_is_stale(&unreadable, &other, None), "two files");
     }
 
     /// The refresh renames a finished copy over the target rather than writing through the file a
