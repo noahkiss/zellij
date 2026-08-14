@@ -1467,7 +1467,14 @@ The two commands cannot describe one machine differently.
 **Everywhere**: which `zellij` a shell runs and whether it is this one; whether the config loads;
 the socket directory, and any server serving this name from another one or under another contract
 version; leftover wrapper scripts; the unit, its load state and its drift; one server and only one;
-whether the running server is this build; the pin.
+whether a dead session's saved layout is holding the name; whether the running server is this build;
+the pin.
+
+A leftover is narrow on purpose. A script in `~/bin` that merely calls zellij is a companion tool,
+not a fault, and a `zellij` there that resolves to this very binary is where zellij is installed —
+neither is reported. Two shapes are: a different build taking the name, and a script that sets
+`ZELLIJ_SOCK_DIR` before zellij can resolve it. Both are reported and never removed; the `rm` is
+printed for the user to run.
 
 **Linux** adds what only systemd knows: whether the timer is armed — loaded and armed are different
 states, and a disarmed timer beside a healthy install is how a session stops coming back — and how
@@ -1489,6 +1496,11 @@ which reads the permission bits, while TCC refuses at `open(2)` — so a test on
 "readable" on a machine holding no grant at all. A database that is not there is reported as
 unknown rather than as a refusal, and neither the pane nor the client that opens it can outlast the
 probe's five-second deadline: a client talking to a wedged server never returns on its own.
+
+`--dry-run` withholds every fix, and the pane probe is the one thing it still does: it is a
+question, not a repair, and the answer cannot be had any other way. Expect a floating pane to
+appear and close itself on a `-n` run against a live session. Nothing else on that path writes —
+the pin is compared and not copied, the keychain is not touched, and no certificate is minted.
 
 #### Signing the pinned copy (macOS)
 
