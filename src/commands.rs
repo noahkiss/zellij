@@ -1,4 +1,5 @@
 use dialoguer::Confirm;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::{path::PathBuf, process, time::Duration};
 
@@ -912,14 +913,17 @@ fn attach_with_session_name(
                     "Ambiguous selection: multiple sessions names start with '{}':",
                     prefix
                 );
+                // the names are the answer here, and the ages are not known - `--short` is the
+                // listing that says only what this caller has
                 print_sessions(
                     sessions
                         .iter()
                         .map(|s| (s.clone(), Duration::default(), false))
                         .collect(),
                     false,
-                    false,
                     true,
+                    true,
+                    &BTreeMap::new(),
                 );
                 process::exit(1);
             },
@@ -1369,14 +1373,17 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
                     "Ambiguous selection: multiple sessions names start with '{}':",
                     prefix
                 );
+                // the names are the answer here, and the ages are not known - `--short` is the
+                // listing that says only what this caller has
                 print_sessions(
                     sessions
                         .iter()
                         .map(|s| (s.clone(), Duration::default(), false))
                         .collect(),
                     false,
-                    false,
                     true,
+                    true,
+                    &BTreeMap::new(),
                 );
                 process::exit(1);
             },

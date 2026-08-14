@@ -306,13 +306,16 @@ pub enum SessionCommand {
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum Sessions {
     /// List active sessions
+    ///
+    /// Returns: one row per session - NAME, STATUS (live or exited), CURRENT, CLIENTS, CREATED.
+    /// CREATED is last because it is the only column that holds spaces.
     #[clap(visible_alias = "ls")]
     ListSessions {
-        /// Do not add colors and formatting to the list (useful for parsing)
+        /// Do not add colors to the table
         #[clap(short, long)]
         no_formatting: bool,
 
-        /// Print just the session name
+        /// Print just the session name, with ` (EXITED)` after a resurrectable one
         #[clap(short, long)]
         short: bool,
 
