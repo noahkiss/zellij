@@ -755,6 +755,8 @@ pub struct PaneInfo {
     pub exclude_from_sync: bool,
     #[prost(bool, tag="45")]
     pub has_explicit_title: bool,
+    #[prost(string, tag="46")]
+    pub handle: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

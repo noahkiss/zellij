@@ -1,4 +1,5 @@
 use crate::output::{CharacterChunk, KittyImageChunk, SixelImageChunk};
+use crate::pane_handles::HeldHandle;
 use crate::panes::kitty_graphics::{
     InterceptorResult, KittyApcInterceptor, KittyHostSupport, KittyImageStore,
 };
@@ -137,6 +138,8 @@ pub struct TerminalPane {
     uuid: Uuid,
     /// Set when this pane was built from a serialized session - see `Pane::restored_from`
     restored_from: Option<String>,
+    /// Given at creation and kept across a snapshot restore - see `Pane::pane_handle`
+    handle: HeldHandle,
     pub selectable: bool,
     pub geom: PaneGeom,
     pub geom_override: Option<PaneGeom>,
@@ -687,6 +690,12 @@ impl Pane for TerminalPane {
     }
     fn set_restored_from(&mut self, restored_from: Option<String>) {
         self.restored_from = restored_from;
+    }
+    fn pane_handle(&self) -> String {
+        self.handle.as_str().to_owned()
+    }
+    fn set_pane_handle(&mut self, handle: &str) {
+        self.handle = HeldHandle::claim(handle);
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
@@ -1393,6 +1402,7 @@ impl TerminalPane {
         TerminalPane {
             uuid: Uuid::new_v4(),
             restored_from: None,
+            handle: HeldHandle::claim_new(),
             frame: HashMap::new(),
             content_offset: Offset::default(),
             pid,

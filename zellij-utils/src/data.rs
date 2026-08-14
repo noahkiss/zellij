@@ -2540,6 +2540,18 @@ pub struct PaneInfo {
     /// holds, which `title` and `program_title` together cannot answer.
     #[serde(default)]
     pub has_explicit_title: bool,
+    /// The two-word name a human addresses this pane by, eg. `sunny-otter`
+    ///
+    /// The pane's ADDRESS, where the uuid is its LINEAGE. Unique among the session's live panes,
+    /// and it CARRIES across a snapshot restore while the uuid rotates - an address that changed
+    /// when the session came back would not be one. A closed pane's handle returns to circulation,
+    /// so a handle names at most one pane right now, not one pane forever.
+    ///
+    /// Two lowercase words joined by a dash, drawn from a fixed append-only word list, which is
+    /// what keeps it unambiguous against every other way of naming a pane: `terminal_1`, a bare
+    /// id, a uuid.
+    #[serde(default)]
+    pub handle: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

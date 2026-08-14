@@ -1096,3 +1096,73 @@ fn a_pane_uuid_does_not_change_under_the_pane() {
     pane.rename(b"renamed".to_vec());
     assert_eq!(pane.pane_uuid(), at_creation);
 }
+
+fn a_terminal_pane(pid: u32) -> TerminalPane {
+    TerminalPane::new(
+        pid,
+        PaneGeom::default(),
+        Style::default(),
+        0,
+        String::new(),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(SixelImageStore::default())),
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        Rc::new(RefCell::new(Palette::default())),
+        Rc::new(RefCell::new(HashMap::new())),
+        None,
+        None,
+        false,
+        true,
+        true,
+        true,
+        false,
+        None,
+    )
+}
+
+#[test]
+fn every_pane_has_a_handle_from_the_moment_it_is_built() {
+    // the invariant the rest of the addressing surface rests on: there is no window in which a
+    // pane exists without a name to reach it by
+    let pane = a_terminal_pane(1);
+    let handle = pane.pane_handle();
+    assert!(!handle.is_empty(), "a pane was built without a handle");
+    assert!(
+        zellij_utils::pane_handle::is_handle_shaped(&handle),
+        "not a handle: {}",
+        handle
+    );
+}
+
+#[test]
+fn two_live_panes_do_not_share_a_handle() {
+    let first = a_terminal_pane(1);
+    let second = a_terminal_pane(2);
+    assert_ne!(first.pane_handle(), second.pane_handle());
+}
+
+#[test]
+fn a_restored_pane_is_put_back_under_the_handle_it_had() {
+    // this is the whole point of the handle: the uuid rotates across a restore, the address does
+    // not, so `zellij action ... --pane-id sunny-otter` still reaches the same pane afterwards
+    let mut pane = a_terminal_pane(1);
+    let generated = pane.pane_handle();
+    pane.set_pane_handle("sunny-otter");
+    assert_eq!(pane.pane_handle(), "sunny-otter");
+    assert_ne!(pane.pane_handle(), generated);
+}
+
+#[test]
+fn a_restored_pane_never_ends_up_at_a_handle_a_live_pane_holds() {
+    let live = a_terminal_pane(1);
+    let taken = live.pane_handle();
+    let mut restoring = a_terminal_pane(2);
+    restoring.set_pane_handle(&taken);
+    assert_ne!(
+        restoring.pane_handle(),
+        taken,
+        "a restore put two live panes at one address"
+    );
+    assert!(!restoring.pane_handle().is_empty());
+}
