@@ -2443,9 +2443,16 @@ impl Screen {
     /// The answers ride `ModeInfo`, which is the only thing every bar already reads and which
     /// already reaches every tab's plugins. Nothing else about the mode has changed, so the
     /// broadcast is the same shape as `update_all_clients_nesting_mode_info` and costs the same.
+    ///
+    /// A live warning is re-sent on every tick, not only when it changes. The first tick fires as
+    /// the server starts, before any tab exists and before a bar has loaded, so a warning that is
+    /// already true then would otherwise reach nobody and - never changing - would never be sent
+    /// again. Measured: a session started on a superseded build showed nothing for as long as it
+    /// ran. Only the abnormal state repeats, the bars drop an update that matches what they hold,
+    /// and the interval is 30 seconds.
     pub fn recheck_session_warnings(&mut self) {
         let warnings = crate::session_warnings::current_warnings();
-        if warnings == self.session_warnings {
+        if warnings == self.session_warnings && warnings.is_empty() {
             return;
         }
         self.session_warnings = warnings.clone();
