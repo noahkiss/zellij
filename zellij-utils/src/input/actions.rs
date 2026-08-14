@@ -563,6 +563,10 @@ pub enum Action {
         show_all: bool,
         output_json: bool,
     },
+    /// Every tab with its panes nested beneath it - the shape of the session in one answer.
+    ListTree {
+        output_json: bool,
+    },
     ListTabs {
         show_state: bool,
         show_dimensions: bool,
@@ -1950,6 +1954,7 @@ impl Action {
                 show_all: all,
                 output_json: json,
             }]),
+            CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
             CliAction::ListTabs {
                 state,
                 dimensions,

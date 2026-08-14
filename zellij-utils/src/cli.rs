@@ -1782,6 +1782,15 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
     },
+    /// List every tab with its panes nested beneath it
+    ///
+    /// Returns: one line per tab, then its panes indented below it, each line `key: value` pairs
+    /// two spaces apart - or the same tree structured with --json
+    ListTree {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// Get information about the currently active tab
     ///
     /// Returns: `name:`, `id:` and `position:` lines, or the full TabInfo with --json

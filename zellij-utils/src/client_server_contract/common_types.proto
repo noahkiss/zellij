@@ -298,6 +298,7 @@ message Action {
     SetPaneFloatingAction set_pane_floating = 165;
     SetSyncTabAction set_sync_tab = 166;
     ResolvePaneTargetAction resolve_pane_target = 167;
+    ListTreeAction list_tree = 168;
   }
 }
 
@@ -387,6 +388,9 @@ message ListClientsAction {
 }
 message ResolvePaneTargetAction {
   string target = 1;
+}
+message ListTreeAction {
+  bool output_json = 1;
 }
 message ListPanesAction {
   bool show_tab = 1;

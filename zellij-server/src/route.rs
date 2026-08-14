@@ -1866,6 +1866,31 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::ListTree { output_json } => {
+            // the tree is the join of the two queries that already exist, asked in one command:
+            // the tabs give the nesting and which one is in view, the panes give what is in them
+            let maybe_tabs =
+                request_tabs_from_screen(&senders, client_id).with_context(err_context)?;
+            let maybe_panes =
+                request_panes_from_screen(&senders, false).with_context(err_context)?;
+
+            match (maybe_tabs, maybe_panes) {
+                (Some(tab_infos), Some(pane_entries)) => {
+                    let output_lines = if output_json {
+                        format_tree_as_json(&tab_infos, &pane_entries)
+                    } else {
+                        format_tree(&tab_infos, &pane_entries)
+                    };
+                    send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
+                },
+                _ => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout listing the session tree",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::CurrentTabInfo { output_json } => {
             let maybe_tab_info = request_current_tab_info_from_screen(&senders, client_id)
                 .with_context(err_context)?;
@@ -3412,6 +3437,67 @@ fn extract_cwd(entry: &PaneListEntry) -> String {
         .to_string()
 }
 
+/// The session as a tree: every tab, with the panes that live in it indented below it.
+///
+/// The third shape, alongside the record and the table, and the only one that can say "these panes
+/// are in that tab". A table cannot nest and a record cannot repeat, so the tree is an outline:
+/// indentation carries the nesting and every line names its own fields as `key: value` pairs two
+/// spaces apart, so a line read on its own still says what it is.
+///
+/// The keys are the ones `list-tabs` and `list-panes` already print under those names, and mean the
+/// same things. A tab with no panes of its own still gets its line - the answer to "what is in this
+/// session" includes the empty rooms.
+fn format_tree(tab_infos: &[TabInfo], pane_entries: &[PaneListEntry]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for tab in tab_infos {
+        lines.push(format!(
+            "tab_id: {}  position: {}  name: {}  active: {}",
+            tab.tab_id, tab.position, tab.name, tab.active
+        ));
+        for entry in pane_entries
+            .iter()
+            .filter(|entry| entry.tab_id == tab.tab_id)
+        {
+            lines.push(format!(
+                "  handle: {}  pane_id: {}  title: {}  command: {}  focused: {}",
+                entry.pane_info.handle,
+                format_pane_id(&entry.pane_info),
+                entry.pane_info.title,
+                extract_command(entry),
+                entry.pane_info.is_focused,
+            ));
+        }
+    }
+    lines
+}
+
+/// The tree structured: each tab as `list-tabs --json` reports it, with its `list-panes --json`
+/// entries under a `panes` key.
+///
+/// Nothing is summarised away. The two queries this joins carry more fields than the outline shows,
+/// and a program asking for the tree gets all of them rather than a smaller answer than it would
+/// have got by asking twice.
+fn format_tree_as_json(tab_infos: &[TabInfo], pane_entries: &[PaneListEntry]) -> Vec<String> {
+    let tree: Vec<serde_json::Value> = tab_infos
+        .iter()
+        .map(|tab| {
+            let mut value = serde_json::to_value(tab).unwrap_or(serde_json::Value::Null);
+            let tab_panes: Vec<&PaneListEntry> = pane_entries
+                .iter()
+                .filter(|entry| entry.tab_id == tab.tab_id)
+                .collect();
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "panes".to_string(),
+                    serde_json::to_value(&tab_panes).unwrap_or(serde_json::Value::Array(vec![])),
+                );
+            }
+            value
+        })
+        .collect();
+    vec![serde_json::to_string_pretty(&tree).unwrap_or_else(|_| "[]".to_string())]
+}
+
 fn format_tabs_as_json(tab_infos: &[TabInfo]) -> Vec<String> {
     vec![serde_json::to_string_pretty(tab_infos).unwrap_or_else(|_| "[]".to_string())]
 }
@@ -3658,6 +3744,97 @@ mod tests {
             tab_position: 0,
             tab_name: "tab1".to_string(),
         }
+    }
+
+    fn pane_entry_in_tab(id: u32, handle: &str, tab_id: usize) -> PaneListEntry {
+        let mut entry = pane_entry(id, handle);
+        entry.tab_id = tab_id;
+        entry
+    }
+
+    fn tab_info(tab_id: usize, name: &str, active: bool) -> TabInfo {
+        let mut tab = TabInfo::default();
+        tab.tab_id = tab_id;
+        tab.position = tab_id;
+        tab.name = name.to_string();
+        tab.active = active;
+        tab
+    }
+
+    #[test]
+    fn the_tree_puts_each_pane_under_the_tab_it_lives_in() {
+        let tree = format_tree(
+            &[tab_info(1, "first", true), tab_info(2, "second", false)],
+            &[
+                pane_entry_in_tab(7, "sunny-otter", 1),
+                pane_entry_in_tab(9, "brave-badger", 2),
+            ],
+        );
+        assert_eq!(tree.len(), 4, "{:?}", tree);
+        assert!(tree[0].starts_with("tab_id: 1  "), "{}", tree[0]);
+        assert!(tree[0].contains("name: first"), "{}", tree[0]);
+        assert!(tree[0].contains("active: true"), "{}", tree[0]);
+        assert!(
+            tree[1].starts_with("  handle: sunny-otter  "),
+            "{}",
+            tree[1]
+        );
+        assert!(tree[1].contains("pane_id: terminal_7"), "{}", tree[1]);
+        assert!(tree[2].starts_with("tab_id: 2  "), "{}", tree[2]);
+        assert!(
+            tree[3].starts_with("  handle: brave-badger  "),
+            "{}",
+            tree[3]
+        );
+    }
+
+    #[test]
+    fn a_tab_with_no_panes_still_gets_its_line() {
+        // the negative control: nesting nothing under a tab is not the same as leaving it out
+        let tree = format_tree(&[tab_info(1, "empty", true)], &[]);
+        assert_eq!(tree.len(), 1, "{:?}", tree);
+        assert!(tree[0].starts_with("tab_id: 1  "), "{}", tree[0]);
+    }
+
+    #[test]
+    fn a_pane_belonging_to_no_listed_tab_is_nested_under_none() {
+        // panes and tabs are asked for separately, so a tab closing between the two answers must
+        // not put its panes under some other tab
+        let tree = format_tree(
+            &[tab_info(1, "first", true)],
+            &[pane_entry_in_tab(9, "brave-badger", 2)],
+        );
+        assert_eq!(tree.len(), 1, "{:?}", tree);
+        assert!(!tree[0].contains("brave-badger"), "{}", tree[0]);
+    }
+
+    #[test]
+    fn the_tree_names_every_pane_field_the_pane_table_does() {
+        let tree = format_tree(
+            &[tab_info(1, "first", true)],
+            &[pane_entry_in_tab(7, "sunny-otter", 1)],
+        );
+        for key in ["handle: ", "pane_id: ", "title: ", "command: ", "focused: "] {
+            assert!(tree[1].contains(key), "missing {}: {}", key, tree[1]);
+        }
+    }
+
+    #[test]
+    fn the_tree_as_json_carries_the_panes_under_their_tab() {
+        let json = format_tree_as_json(
+            &[tab_info(1, "first", true), tab_info(2, "second", false)],
+            &[pane_entry_in_tab(7, "sunny-otter", 1)],
+        );
+        let tree: serde_json::Value = serde_json::from_str(&json[0]).expect("valid json");
+        let tabs = tree.as_array().expect("an array of tabs");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0]["name"], "first");
+        assert_eq!(tabs[0]["panes"][0]["handle"], "sunny-otter");
+        assert_eq!(
+            tabs[1]["panes"].as_array().map(|panes| panes.len()),
+            Some(0),
+            "a tab with no panes carries an empty list, not a missing key"
+        );
     }
 
     #[test]
