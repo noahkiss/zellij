@@ -141,9 +141,14 @@ impl SessionLayoutMetadata {
         // 1. The current number of panes is different than the number of panes in the base layout
         //    (meaning a pane was opened or closed)
         // 2. One or more terminal panes are running a command that is not the default shell
+        // 3. The tabs no longer match the base layout's tabs - one was renamed, added, closed or
+        //    MOVED
         let base_layout_pane_count = self.default_layout.pane_count();
         let current_pane_count = self.pane_count();
         if current_pane_count != base_layout_pane_count {
+            return true;
+        }
+        if self.tabs_diverge_from_base_layout() {
             return true;
         }
         for tab in &self.tabs {
@@ -179,6 +184,43 @@ impl SessionLayoutMetadata {
             }
         }
         false
+    }
+    /// Whether the tab list differs from the one the base layout describes - in count, in name, or
+    /// in ORDER.
+    ///
+    /// Moving a tab changes none of the things `is_dirty` used to look at: the pane count is the
+    /// same and so are the commands. A session that is otherwise clean therefore never writes its
+    /// layout again after a move, the copy on disk keeps the pre-move order, and the next restart
+    /// that resurrects from that copy hands the tab back where it started - silently, and every
+    /// time, since nothing ever marks it dirty.
+    ///
+    /// A base layout with no tabs of its own says nothing about the tabs a session grew, so it is
+    /// not compared. An unnamed base tab matches any name for the same reason: the layout did not
+    /// ask for one, so a session that named it itself has not diverged. The cost of that wildcard
+    /// is that a move between two tabs the layout left unnamed is not seen; the alternative -
+    /// comparing against the default `Tab #n` names - calls every such session dirty forever.
+    ///
+    /// Note the check is only reached today when the base layout defines no tabs of its own beyond
+    /// its template: `Layout::pane_count` adds the template's panes to the tabs' panes, so any
+    /// layout parsed from KDL with explicit tabs already fails the pane count comparison above and
+    /// `is_dirty` returns before this runs. This is the check the tab comparison would need, the
+    /// moment that count is made to mean what it says.
+    fn tabs_diverge_from_base_layout(&self) -> bool {
+        let base_tabs = &self.default_layout.tabs;
+        if base_tabs.is_empty() {
+            return false;
+        }
+        if base_tabs.len() != self.tabs.len() {
+            return true;
+        }
+        base_tabs
+            .iter()
+            .zip(self.tabs.iter())
+            .any(|((base_name, _, _), tab)| match (base_name, &tab.name) {
+                (Some(base_name), Some(name)) => base_name != name,
+                (Some(_), None) => true,
+                (None, _) => false,
+            })
     }
     fn pane_count(&self) -> usize {
         let mut pane_count = 0;
@@ -798,6 +840,7 @@ impl ClientMetadata {
 mod tests {
     use super::*;
     use zellij_utils::data::PaneId as ZellijPaneId;
+    use zellij_utils::input::layout::TiledPaneLayout;
     use zellij_utils::pane_size::PaneGeom;
 
     fn make_command_pane(terminal_id: u32, command: &str, args: Vec<&str>) -> PaneLayoutMetadata {
@@ -816,6 +859,43 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn make_plain_pane(terminal_id: u32) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            PaneId::Terminal(terminal_id),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            false,
+            None,
+            vec![],
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A session in exactly the shape of the layout it was built from: one plain pane per tab, the
+    /// tabs named and ordered as the layout names and orders them. Nothing about it is dirty.
+    fn session_matching_layout(tab_names: &[&str]) -> SessionLayoutMetadata {
+        let mut layout = Layout::default();
+        layout.tabs = tab_names
+            .iter()
+            .map(|name| (Some(name.to_string()), TiledPaneLayout::default(), vec![]))
+            .collect();
+        let mut session_layout_metadata = SessionLayoutMetadata::new(Box::new(layout));
+        for (i, name) in tab_names.iter().enumerate() {
+            session_layout_metadata.add_tab(
+                name.to_string(),
+                i == 0,
+                false,
+                vec![make_plain_pane(i as u32)],
+                vec![],
+            );
+        }
+        session_layout_metadata
     }
 
     fn make_edit_file_pane(
@@ -1378,5 +1458,105 @@ mod tests {
         );
         let clients = meta.all_clients_metadata();
         assert_eq!(clients.get(&1).and_then(|c| c.terminal_size()), None);
+    }
+
+    #[test]
+    fn a_session_in_the_shape_of_its_layout_is_not_dirty() {
+        let meta = session_matching_layout(&["one", "two", "three"]);
+        assert!(
+            !meta.is_dirty(),
+            "nothing has changed since the layout built it"
+        );
+    }
+
+    #[test]
+    fn a_moved_tab_makes_the_layout_dirty() {
+        // a move changes neither the pane count nor any command, so it is invisible to every other
+        // dirty check - and a layout that is never rewritten hands the tab back where it started
+        let mut meta = session_matching_layout(&["one", "two", "three"]);
+        meta.tabs.swap(1, 2);
+        assert_eq!(
+            meta.tab_names(),
+            vec!["one".to_string(), "three".to_string(), "two".to_string()],
+            "the tab really moved"
+        );
+        assert!(
+            meta.is_dirty(),
+            "the order on disk no longer matches the order the user sees"
+        );
+    }
+
+    #[test]
+    fn a_renamed_tab_makes_the_layout_dirty() {
+        let mut meta = session_matching_layout(&["one", "two"]);
+        meta.tabs[1].name = Some("renamed".to_string());
+        assert!(meta.is_dirty(), "the name on disk is the old one");
+    }
+
+    #[test]
+    fn a_layout_that_names_no_tabs_of_its_own_leaves_the_session_clean() {
+        // the base layout describes a template rather than tabs, so it says nothing about the tabs
+        // this session has - and a session that has diverged from nothing is not dirty
+        let mut layout = Layout::default();
+        layout.template = Some((TiledPaneLayout::default(), vec![]));
+        let mut meta = SessionLayoutMetadata::new(Box::new(layout));
+        meta.add_tab(
+            "Tab #1".to_string(),
+            true,
+            false,
+            vec![make_plain_pane(0)],
+            vec![],
+        );
+        assert!(
+            !meta.is_dirty(),
+            "a template-only layout must not make every session dirty"
+        );
+    }
+
+    #[test]
+    fn a_moved_tab_diverges_from_a_layout_parsed_from_kdl() {
+        // the shape a real session is built from: named tabs over a default_tab_template, parsed
+        // by the same parser that reads the layout file
+        let raw = "layout {\n \
+                   default_tab_template {\n \
+                   pane size=1 borderless=true {\n \
+                   plugin location=\"zellij:tab-bar\"\n \
+                   }\n \
+                   children\n \
+                   }\n \
+                   tab name=\"console\"\n \
+                   tab name=\"develop\"\n \
+                   }";
+        let layout = Layout::from_str(raw, "test".into(), None, None).unwrap();
+        let mut meta = SessionLayoutMetadata::new(Box::new(layout));
+        for (i, name) in ["console", "develop"].iter().enumerate() {
+            meta.add_tab(
+                name.to_string(),
+                i == 0,
+                false,
+                vec![
+                    make_plain_pane(i as u32 * 2),
+                    make_plain_pane(i as u32 * 2 + 1),
+                ],
+                vec![],
+            );
+        }
+        assert!(
+            !meta.tabs_diverge_from_base_layout(),
+            "the session is in the shape the layout describes"
+        );
+        // the reason the comparison is read directly rather than through `is_dirty`:
+        // `Layout::pane_count` counts the template's panes on top of the tabs it already expanded
+        // them into, so this session - in exactly the shape of the layout that built it - already
+        // fails the pane count comparison and is dirty before its tabs are ever looked at
+        assert!(
+            meta.is_dirty(),
+            "a parsed layout counts its template twice, so nothing here is ever clean"
+        );
+        meta.tabs.swap(0, 1);
+        assert!(
+            meta.tabs_diverge_from_base_layout(),
+            "the tabs are no longer in the order the layout lists them"
+        );
     }
 }
