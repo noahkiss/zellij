@@ -31,7 +31,12 @@ use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start
 
 /// How long to wait for a freshly requested server to appear before calling the creation a failure.
 /// `attach --create-background` returns as soon as the spawn is requested, not once it has happened.
-const SERVER_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Thirty seconds because launchd was measured at 15 to 20 on the fleet's Macs. The old ten
+/// reported a post-condition failure on both of them during an upgrade, on sessions that were up
+/// moments later - and a false failure on a healthy machine is worse than a slow true one, because
+/// it is the shape a real fault takes and it teaches everyone to ignore the line.
+const SERVER_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The first gap between polls. Short, because a server that is going to appear usually has.
 const SERVER_APPEARANCE_FIRST_POLL: Duration = Duration::from_millis(50);
 /// The longest gap. Each poll forks `ps` to walk the whole process table, and a fixed short
@@ -100,6 +105,22 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             let name = resolve_session_name(session_name, &opts, false);
             process::exit(status(&name, exe, &opts));
         },
+        SessionLifecycleCli::Doctor {
+            session_name,
+            dry_run,
+            fix: _,
+            no_fix,
+            sign: _,
+            no_sign,
+            exe,
+        } => crate::session_doctor_command::session_doctor_command(
+            session_name,
+            dry_run,
+            no_fix,
+            no_sign,
+            exe,
+            opts,
+        ),
     }
 }
 
@@ -135,7 +156,7 @@ fn service_exe(explicit: Option<PathBuf>, pinned: Option<PathBuf>) -> PathBuf {
 /// against another service, a nice level - comes from here. The config is where it lives so that
 /// the tool can see it: a systemd drop-in would work and `zellij session status` could never
 /// report it.
-fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
+pub(crate) fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions> {
     get_config_options_from_cli_args(opts)
         .ok()
         .and_then(|options| options.session_service)
@@ -690,7 +711,7 @@ fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOpti
 /// is the one command that means "this one"), else `--session`, else the `session_name` config
 /// option. There is no built-in default: a lifecycle command that guesses the name is a lifecycle
 /// command that eventually kills the wrong session.
-fn resolve_session_name(
+pub(crate) fn resolve_session_name(
     session_name: Option<String>,
     opts: &CliArgs,
     prefer_current_session: bool,
@@ -903,10 +924,10 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
 ///
 /// The gap doubles, because every poll costs a `ps` over the whole process table and the two cases
 /// want opposite things from it. A session that comes up does so in the first few hundred
-/// milliseconds and wants to be noticed at once; a session that is never coming up spends the rest
-/// of the ten seconds proving it, and that is the case a launcher REPEATS every minute for as long
-/// as the fault lasts. Backing off cuts the forks on the failing machine by about eight to one and
-/// costs the healthy one nothing.
+/// milliseconds and wants to be noticed at once; a session that is never coming up spends the whole
+/// of `SERVER_APPEARANCE_TIMEOUT` proving it, and that is the case a launcher REPEATS every minute
+/// for as long as the fault lasts. Backing off cuts the forks on the failing machine by about an
+/// order of magnitude and costs the healthy one nothing.
 ///
 /// Nothing here gives up early or escalates, deliberately. This function's whole answer is "the
 /// post-condition does not hold yet", and its caller already reports that loudly and with
@@ -1104,9 +1125,10 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
     //
     // Taken after the daemonize, so the descriptor belongs to the process that does the work: a
     // restart that dies mid-hold has the flock released for it by the kernel. At the default
-    // `--wait-timeout` both steps together are bounded well inside the lock's own 30 seconds, so a
-    // waiting `up` waits rather than giving up and proceeding unlocked; a much larger
-    // `--wait-timeout` can outlast that, which `lock_up` records.
+    // `--wait-timeout` both steps together are bounded well inside the lock's own 90 seconds - 10
+    // for the down and 30 for the up - so a waiting `up` waits rather than giving up and proceeding
+    // unlocked; a `--wait-timeout` past about a minute can outlast that, which `lock_up` records and
+    // `a_slow_restart_still_fits_inside_the_up_lock` asserts.
     let _restart_lock = lock_up(name);
 
     if down(name, wait_timeout, opts).is_err() {
@@ -1132,4 +1154,54 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
         Ok(()) => 0,
         Err(()) => 1,
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use zellij_utils::session_lifecycle::UP_LOCK_TIMEOUT;
+
+    /// The default `--wait-timeout` on `session restart`, read from the parser rather than copied,
+    /// because the invariant below is only guarded if a change to that default breaks this test.
+    ///
+    /// Parsed on a big stack, like every other test that builds the clap tree: a test thread's own
+    /// stack overflows on it. See [`on_big_stack`].
+    fn default_restart_wait_timeout() -> Duration {
+        use clap::Parser;
+        use zellij_utils::cli::on_big_stack;
+
+        let parsed =
+            on_big_stack(|| CliArgs::try_parse_from(["zellij", "session", "restart", "a-session"]))
+                .expect("`session restart` parses with no flags");
+        match parsed.command {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Restart {
+                wait_timeout,
+                ..
+            }))) => Duration::from_secs(wait_timeout),
+            other => panic!("expected a `session restart` command, got {:?}", other),
+        }
+    }
+
+    /// `restart` holds the up-lock across its down and its up, so the longest hold a healthy
+    /// machine produces is a `--wait-timeout` down plus this wait for the server. A waiting `up`
+    /// that gives up first goes ahead without the lock, which is the two-servers-for-one-name race
+    /// the lock exists to prevent - so raising ANY of the three without the others reintroduces it.
+    #[test]
+    fn a_slow_restart_still_fits_inside_the_up_lock() {
+        let longest_down = default_restart_wait_timeout();
+        assert!(
+            longest_down + SERVER_APPEARANCE_TIMEOUT < UP_LOCK_TIMEOUT,
+            "a restart can hold the lock for {:?}, but a waiting `up` gives up after {:?}",
+            longest_down + SERVER_APPEARANCE_TIMEOUT,
+            UP_LOCK_TIMEOUT
+        );
+    }
+
+    /// launchd was measured at 15 to 20 seconds on the fleet's Macs, and a `session up` that
+    /// reports a false post-condition failure on every slow start teaches everyone to ignore the
+    /// one line that reports a real one.
+    #[test]
+    fn the_wait_for_a_server_outlasts_a_measured_launchd_start() {
+        assert!(SERVER_APPEARANCE_TIMEOUT >= Duration::from_secs(30));
+    }
 }

@@ -5040,7 +5040,7 @@ dependencies = [
 
 [[package]]
 name = "zellij"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -5058,6 +5058,7 @@ dependencies = [
  "regex",
  "ssh2",
  "suggest",
+ "tempfile",
  "thiserror 2.0.19",
  "vte 0.15.0",
  "zellij-client",
@@ -5067,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-client"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5113,7 +5114,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-integration-tests"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5132,7 +5133,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-server"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "ansi_term",
  "anyhow",
@@ -5182,7 +5183,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "prost",
  "serde",
@@ -5194,14 +5195,14 @@ dependencies = [
 
 [[package]]
 name = "zellij-tile-utils"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "ansi_term",
 ]
 
 [[package]]
 name = "zellij-utils"
-version = "0.45.0-nkmk.4"
+version = "0.45.0-nkmk.5"
 dependencies = [
  "anyhow",
  "backtrace",
