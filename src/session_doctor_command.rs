@@ -73,7 +73,7 @@ fn examine(name: &str, exe: Option<PathBuf>, mode: DoctorMode, opts: &CliArgs) -
     check_session(&mut report, name, &facts);
     check_build(&mut report, name, &facts);
     check_pin(&mut report, name, pinned.as_deref(), mode);
-    platform_checks(&mut report, name, pinned.as_deref(), mode);
+    platform_checks(&mut report, name, pinned.as_deref(), mode, opts, &facts);
     report
 }
 
@@ -584,9 +584,46 @@ fn pin_state_of(_name: &str, pinned: &Path) -> PinState {
 /// back as `n/a` on Linux rather than being left out. Silence there would read as "checked and
 /// fine", which is the one answer that is never true.
 #[cfg(target_os = "linux")]
-fn platform_checks(report: &mut Report, name: &str, _pinned: Option<&Path>, _mode: DoctorMode) {
+fn platform_checks(
+    report: &mut Report,
+    name: &str,
+    _pinned: Option<&Path>,
+    _mode: DoctorMode,
+    _opts: &CliArgs,
+    _facts: &SessionFacts,
+) {
     crate::session_doctor_linux::checks(report, name);
 }
 
-#[cfg(not(target_os = "linux"))]
-fn platform_checks(_report: &mut Report, _name: &str, _pinned: Option<&Path>, _mode: DoctorMode) {}
+#[cfg(target_os = "macos")]
+fn platform_checks(
+    report: &mut Report,
+    name: &str,
+    pinned: Option<&Path>,
+    mode: DoctorMode,
+    opts: &CliArgs,
+    facts: &SessionFacts,
+) {
+    // the same resolution `setup` makes, so a machine with ZELLIJ_CONFIG_DIR or an unusual XDG
+    // layout gets its backup beside its own config rather than beside somebody's default
+    let config_dir = opts.config_dir.clone().or_else(find_default_config_dir);
+    crate::session_doctor_macos::checks(
+        report,
+        name,
+        pinned,
+        mode,
+        config_dir,
+        facts.assert_up().is_ok(),
+    );
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn platform_checks(
+    _report: &mut Report,
+    _name: &str,
+    _pinned: Option<&Path>,
+    _mode: DoctorMode,
+    _opts: &CliArgs,
+    _facts: &SessionFacts,
+) {
+}

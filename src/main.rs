@@ -3,6 +3,8 @@ mod session_commands;
 mod session_doctor_command;
 #[cfg(target_os = "linux")]
 mod session_doctor_linux;
+#[cfg(target_os = "macos")]
+mod session_doctor_macos;
 #[cfg(test)]
 mod tests;
 
