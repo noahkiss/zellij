@@ -682,6 +682,7 @@ impl Into<PaneLayoutManifest> for PaneLayoutMetadata {
             default_fg: self.default_fg,
             default_bg: self.default_bg,
             pane_uuid: self.pane_uuid,
+            pane_handle: self.pane_handle,
         }
     }
 }
@@ -710,6 +711,8 @@ pub struct PaneLayoutMetadata {
     default_bg: Option<String>,
     /// This pane's uuid, so a pane restored from the serialized layout can name what it continues.
     pane_uuid: Option<String>,
+    /// This pane's handle, so a pane restored from the serialized layout comes back at it.
+    pane_handle: Option<String>,
 }
 
 impl PaneLayoutMetadata {
@@ -725,6 +728,7 @@ impl PaneLayoutMetadata {
         default_fg: Option<String>,
         default_bg: Option<String>,
         pane_uuid: Option<String>,
+        pane_handle: Option<String>,
     ) -> Self {
         PaneLayoutMetadata {
             id,
@@ -739,6 +743,7 @@ impl PaneLayoutMetadata {
             default_fg,
             default_bg,
             pane_uuid,
+            pane_handle,
         }
     }
     fn to_pane_metadata(&self) -> PaneMetadata {
@@ -863,6 +868,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -876,6 +882,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             None,
             None,
             None,
@@ -917,6 +924,7 @@ mod tests {
             false,
             None,
             vec![],
+            None,
             None,
             None,
             None,
@@ -1322,6 +1330,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1330,6 +1339,28 @@ mod tests {
             .into_iter()
             .map(|(client_id, client_metadata)| (client_id, client_metadata.get_pane_id()))
             .collect()
+    }
+
+    #[test]
+    fn a_panes_handle_reaches_the_serialized_layout() {
+        // the wiring the snapshot rests on: what `Pane::pane_handle` reports at save time is what
+        // the pane comes back under, so a handle dropped anywhere along here is a broken address
+        let pane = PaneLayoutMetadata::new(
+            PaneId::Terminal(1),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            false,
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            Some("sunny-otter".to_owned()),
+        );
+        let manifest: PaneLayoutManifest = pane.into();
+        assert_eq!(manifest.pane_handle.as_deref(), Some("sunny-otter"));
     }
 
     #[test]
@@ -1441,6 +1472,7 @@ mod tests {
             !focused_clients.is_empty(),
             None,
             focused_clients,
+            None,
             None,
             None,
             None,

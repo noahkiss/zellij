@@ -28,6 +28,7 @@ Layout {
                         default_fg: None,
                         default_bg: None,
                         restored_from: None,
+                        pane_handle: None,
                     },
                 ],
                 split_size: None,
@@ -44,6 +45,7 @@ Layout {
                 default_fg: None,
                 default_bg: None,
                 restored_from: None,
+                pane_handle: None,
             },
             [
                 FloatingPaneLayout {
@@ -62,6 +64,7 @@ Layout {
                     default_fg: None,
                     default_bg: None,
                     restored_from: None,
+                    pane_handle: None,
                 },
             ],
         ),
@@ -89,6 +92,7 @@ Layout {
                         default_fg: None,
                         default_bg: None,
                         restored_from: None,
+                        pane_handle: None,
                     },
                 ],
                 split_size: None,
@@ -105,6 +109,7 @@ Layout {
                 default_fg: None,
                 default_bg: None,
                 restored_from: None,
+                pane_handle: None,
             },
             [
                 FloatingPaneLayout {
@@ -123,6 +128,7 @@ Layout {
                     default_fg: None,
                     default_bg: None,
                     restored_from: None,
+                    pane_handle: None,
                 },
                 FloatingPaneLayout {
                     name: None,
@@ -140,6 +146,7 @@ Layout {
                     default_fg: None,
                     default_bg: None,
                     restored_from: None,
+                    pane_handle: None,
                 },
             ],
         ),
@@ -165,6 +172,7 @@ Layout {
                 default_fg: None,
                 default_bg: None,
                 restored_from: None,
+                pane_handle: None,
             },
             [],
         ),

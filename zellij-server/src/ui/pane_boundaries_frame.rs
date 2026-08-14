@@ -96,6 +96,8 @@ pub struct FrameParams {
     pub frame_geom_override: Option<PaneGeom>,
     pub stack_list_entry: Option<StackListEntry>,
     pub blank_title: bool,
+    // fork addition: the handle this pane is addressed by, drawn at the right of the title row
+    pub pane_handle: String,
     // fork addition: `pane_frame_style top_only`
     pub top_only_frames: bool,
     pub mouse_scroll_resize: bool,
@@ -135,6 +137,8 @@ pub struct PaneFrame {
     mouse_hover_tips: bool,
     dimmed: bool,
     guest_choice_indicator: Option<GuestChoiceIndicator>,
+    // fork addition: the handle this pane is addressed by, drawn at the right of the title row
+    pane_handle: String,
     // fork addition: `pane_frame_style top_only`
     top_only_frames: bool,
 }
@@ -176,6 +180,7 @@ impl PaneFrame {
             mouse_hover_tips: frame_params.mouse_hover_tips,
             dimmed: frame_params.dimmed,
             guest_choice_indicator: frame_params.guest_choice_indicator,
+            pane_handle: frame_params.pane_handle,
             top_only_frames: frame_params.top_only_frames,
         }
     }
@@ -228,7 +233,45 @@ impl PaneFrame {
         &self,
         max_length: usize,
     ) -> Option<(Vec<TerminalCharacter>, usize)> {
-        self.render_title_right_side_inner(max_length)
+        // fork addition: the handle sits at the far right of the title row, the mirror of the
+        // title at the far left, and is the last element to be given room
+        let indications = self.render_title_right_side_inner(max_length);
+        let space_left = match &indications {
+            Some((_, length)) => max_length.saturating_sub(length + 1), // 1 for the separator
+            None => max_length,
+        };
+        match (indications, self.render_handle_indication(space_left)) {
+            (Some((mut indications, indications_len)), Some((mut handle, handle_len))) => {
+                let mut characters: Vec<_> = indications.drain(..).collect();
+                characters.append(&mut foreground_color("|", self.color));
+                characters.append(&mut handle);
+                Some((characters, indications_len + handle_len + 1))
+            },
+            (Some(indications), None) => Some(indications),
+            (None, Some(handle)) => Some(handle),
+            _ => None,
+        }
+    }
+    /// The pane's handle, whole or not at all.
+    ///
+    /// Unlike the title, a handle is never truncated: it is an address, and half an address reaches
+    /// no pane. A frame row too narrow to hold it simply does not show it, which is also why the
+    /// handle is the last thing offered room - the title, which a human reads, always wins.
+    fn render_handle_indication(
+        &self,
+        max_length: usize,
+    ) -> Option<(Vec<TerminalCharacter>, usize)> {
+        if self.pane_handle.is_empty() {
+            return None;
+        }
+        let full_indication = format!(" {} ", self.pane_handle);
+        let full_indication_len = full_indication.width();
+        (full_indication_len <= max_length).then(|| {
+            (
+                foreground_color(&full_indication, self.color),
+                full_indication_len,
+            )
+        })
     }
     fn render_title_right_side_inner(
         &self,
@@ -866,7 +909,7 @@ impl PaneFrame {
         let focus = self.bracketed_focus_indicator(side_budget);
         let focus_length = focus.as_ref().map(|(_, length)| *length).unwrap_or(0);
         let right_budget = width.saturating_sub(focus_length + title_length);
-        let right = self.bracketed_scroll_indicator(right_budget);
+        let right = self.bracketed_right_side(right_budget);
         Ok(self.compose_bracketed_title(focus, title, right))
     }
     fn bracketed_title_part(&self, content: &str) -> (Vec<TerminalCharacter>, usize) {
@@ -941,6 +984,37 @@ impl PaneFrame {
             return Some((short_part, short_length));
         }
         None
+    }
+    /// Everything the one-line title row puts at its right edge, the handle last.
+    ///
+    /// The same order and the same precedence as the full frame's right side: the scroll indicator
+    /// is offered room first and the handle takes what is left, so a narrow row loses the address
+    /// before it loses anything a human is reading.
+    fn bracketed_right_side(&self, max_length: usize) -> Option<(Vec<TerminalCharacter>, usize)> {
+        let scroll = self.bracketed_scroll_indicator(max_length);
+        let scroll_length = scroll.as_ref().map(|(_, length)| *length).unwrap_or(0);
+        let handle = self.bracketed_handle_indicator(max_length.saturating_sub(scroll_length));
+        match (scroll, handle) {
+            (Some((mut scroll, scroll_length)), Some((mut handle, handle_length))) => {
+                let mut characters: Vec<_> = scroll.drain(..).collect();
+                characters.append(&mut handle);
+                Some((characters, scroll_length + handle_length))
+            },
+            (Some(scroll), None) => Some(scroll),
+            (None, Some(handle)) => Some(handle),
+            _ => None,
+        }
+    }
+    /// The pane's handle in the one-line row, whole or not at all - see `render_handle_indication`.
+    fn bracketed_handle_indicator(
+        &self,
+        max_length: usize,
+    ) -> Option<(Vec<TerminalCharacter>, usize)> {
+        if self.pane_handle.is_empty() {
+            return None;
+        }
+        let (part, length) = self.bracketed_title_part(&self.pane_handle);
+        (length <= max_length).then_some((part, length))
     }
     fn bracketed_focus_indicator(
         &self,
@@ -1493,6 +1567,7 @@ mod tests {
                 frame_geom_override: None,
                 stack_list_entry: None,
                 blank_title: false,
+                pane_handle: String::new(),
                 top_only_frames: false,
                 mouse_scroll_resize,
                 mouse_hover_tips: true,
@@ -1504,6 +1579,142 @@ mod tests {
 
     fn characters_to_string(chars: &[TerminalCharacter]) -> String {
         chars.iter().map(|c| c.character).collect()
+    }
+
+    /// A frame with a title, a handle and an optional scroll position, in either frame style.
+    fn frame_with_handle(
+        cols: usize,
+        title: &str,
+        handle: &str,
+        scroll_position: (usize, usize),
+        draws_full_frame: bool,
+    ) -> PaneFrame {
+        PaneFrame::new(
+            Viewport {
+                x: 0,
+                y: 0,
+                cols,
+                rows: 10,
+            },
+            scroll_position,
+            title.to_owned(),
+            FrameParams {
+                focused_client: None,
+                is_main_client: true,
+                other_focused_clients: vec![],
+                style: Style::default(),
+                color: None,
+                other_cursors_exist_in_session: false,
+                pane_is_stacked_over: false,
+                pane_is_stacked_under: false,
+                pane_is_stacked: false,
+                should_draw_pane_frames: draws_full_frame,
+                pane_is_floating: false,
+                content_offset: Offset::default(),
+                mouse_is_hovering_over_pane: false,
+                pane_is_selectable: true,
+                show_help_text: true,
+                highlight_tooltip: None,
+                omit_title: false,
+                frame_geom_override: None,
+                stack_list_entry: None,
+                blank_title: false,
+                pane_handle: handle.to_owned(),
+                // `top_only` is the fork's frames-off style, so it renders the one-line row
+                top_only_frames: !draws_full_frame,
+                mouse_scroll_resize: false,
+                mouse_hover_tips: false,
+                dimmed: false,
+                guest_choice_indicator: None,
+            },
+        )
+    }
+
+    fn full_frame_title(cols: usize, title: &str, handle: &str) -> String {
+        characters_to_string(
+            &frame_with_handle(cols, title, handle, (0, 0), true)
+                .render_title()
+                .unwrap(),
+        )
+    }
+
+    fn one_line_title(cols: usize, title: &str, handle: &str) -> String {
+        characters_to_string(
+            &frame_with_handle(cols, title, handle, (0, 0), false)
+                .render_one_line_title()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_handle_sits_at_the_right_of_a_full_frame_title_row() {
+        // the mirror of the title: the title opens the row, the handle closes it
+        let title_row = full_frame_title(40, "Pane #1", "sunny-otter");
+        assert!(title_row.starts_with("┌ Pane #1 "), "got: {}", title_row);
+        assert!(title_row.ends_with(" sunny-otter ┐"), "got: {}", title_row);
+        assert_eq!(title_row.width(), 40);
+    }
+
+    #[test]
+    fn the_handle_sits_at_the_right_of_a_one_line_title_row() {
+        let title_row = one_line_title(40, "Pane #1", "sunny-otter");
+        assert!(
+            title_row.trim_end().ends_with("[ sunny-otter ]"),
+            "got: {}",
+            title_row
+        );
+        assert_eq!(title_row.width(), 40);
+    }
+
+    #[test]
+    fn the_title_wins_the_width_contest_against_the_handle() {
+        // a row with room for one of the two shows the title, in both frame styles. 24 columns is
+        // also the case where a TRUNCATED handle would have fit: it is dropped rather than cut,
+        // because half an address reaches no pane
+        for title_row in [
+            full_frame_title(24, "Pane #1", "sunny-otter"),
+            one_line_title(24, "Pane #1", "sunny-otter"),
+        ] {
+            assert!(title_row.contains("Pane #1"), "got: {}", title_row);
+            assert!(!title_row.contains("sunny"), "got: {}", title_row);
+            assert_eq!(title_row.width(), 24);
+        }
+    }
+
+    #[test]
+    fn a_handle_never_moves_what_the_frame_already_drew() {
+        // the negative control: a pane with no handle renders exactly what it rendered before
+        // handles existed, and a pane with one leaves the scroll indication where it was
+        let without = characters_to_string(
+            &frame_with_handle(50, "Pane #1", "", (1, 2), true)
+                .render_title()
+                .unwrap(),
+        );
+        assert!(without.ends_with(" SCROLL:  1/2 ┐"), "got: {}", without);
+        let with = characters_to_string(
+            &frame_with_handle(50, "Pane #1", "sunny-otter", (1, 2), true)
+                .render_title()
+                .unwrap(),
+        );
+        assert!(
+            with.contains(" SCROLL:  1/2 | sunny-otter ┐"),
+            "got: {}",
+            with
+        );
+        assert_eq!(without.width(), 50);
+        assert_eq!(with.width(), 50);
+    }
+
+    #[test]
+    fn the_scroll_indication_outranks_the_handle_when_only_one_fits() {
+        // the handle is the last element offered room, so it is the first to go without
+        let title_row = characters_to_string(
+            &frame_with_handle(30, "Pane #1", "sunny-otter", (1, 2), true)
+                .render_title()
+                .unwrap(),
+        );
+        assert!(title_row.contains("1/2"), "got: {}", title_row);
+        assert!(!title_row.contains("sunny"), "got: {}", title_row);
     }
 
     #[test]
