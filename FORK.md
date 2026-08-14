@@ -66,7 +66,11 @@ you how to read the next.
   space after the colon. `zellij action new-pane` answers `pane_id: terminal_7` and `handle:
   sunny-otter`, not a bare number.
 - **A list of like things is a table** with a header row of `UPPER_SNAKE` column names.
-- **Both are append-only.** A key or a column may be added in any release; none is ever renamed or
+- **A nesting of like things is an outline.** Indentation carries the nesting, and each line names
+  its own fields as `key: value` pairs two spaces apart, so a line read on its own still says what
+  it is. Only `list-tree` answers in this shape, because it is the only command with something to
+  nest — a table cannot nest and a record cannot repeat.
+- **All three are append-only.** A key or a column may be added in any release; none is ever renamed or
   removed. A value that carries a given name means the same thing in every command that prints it,
   which is why `pane_id` is `terminal_7` everywhere and never `7` in one place and `terminal_7` in
   another.
@@ -219,6 +223,73 @@ has never seen — which is a wrong answer for `dump-screen` and a closed tab fo
 `close-pane`, `close-tab`, `move-tab` and `break-pane` exit 1 from outside the session unless they
 name a target, and `break-pane-right`/`break-pane-left`, which cannot name one, are refused
 outright. Inside a pane, nothing changes.
+
+### Pane handles
+
+Every pane carries a two-word handle — `sunny-otter` — assigned when the pane is created and unique
+among the session's live panes. It is the pane's **address**: the word you type to reach it, and the
+word the fork shows you when it has to name a pane.
+
+```
+zellij action go-to-pane sunny-otter
+zellij action dump-screen --pane-id sunny-otter
+```
+
+- **Every `--pane-id` takes one**, alongside `terminal_1`, `plugin_2`, a bare integer and a pane
+  uuid. One parser serves all four forms, so a handle works anywhere an id does.
+- **It survives a restore, and the uuid does not.** The handle is serialized into the session
+  snapshot and the restored pane comes back under it. The uuid is the pane's *lineage* and rotates,
+  because a restored pane is a new process (`restored_from` links it to the old one). Address and
+  lineage answer different questions, which is why the fork keeps both.
+- **It is reused after the pane closes.** Uniqueness is over live panes only. A handle you wrote
+  down last week names at most one pane today, and not necessarily the same one.
+- **Where you see it**: the `HANDLE` column of `list-panes`, the `handle:` key of every creation
+  command, the `list-tree` outline, both halves of a `go-to-pane` report, and the pane frame.
+
+#### On the frame
+
+The handle is drawn at the right of the pane's title row, the mirror of the title at the left, in
+both frame styles — the full frame and the one-line row that `pane_frame_style "titles"` and
+`top_only` share. It is the rightmost element and the last one offered room:
+
+- The title is measured first and takes what it needs. A narrow frame loses the handle rather than
+  truncating the name a human is reading.
+- The scroll and pin indications are measured next; the handle takes what is left, joined to them by
+  the same `|` separator they already use.
+- It is never truncated. Half an address reaches no pane, so a row too narrow for the whole handle
+  shows none of it — there is no short form.
+
+### `list-tree`
+
+```
+$ zellij action list-tree
+tab_id: 0  position: 0  name: develop  active: true
+  handle: secure-wildcat  pane_id: terminal_0  title: zsh  command: /bin/zsh  focused: true
+  handle: rapid-bass  pane_id: plugin_0  title: zellij:link  command: zellij:link  focused: false
+tab_id: 1  position: 1  name: logs  active: false
+  handle: cunning-filly  pane_id: terminal_1  title: Pane #1  command: -  focused: false
+```
+
+Every tab with its panes nested beneath it — the join of `list-tabs` and `list-panes` that you
+otherwise had to do by tab id yourself. A tab with no panes still gets its line.
+
+`--json` is the same join rather than a summary of it: each tab exactly as `list-tabs --json`
+reports it, with its `list-panes --json` entries under a `panes` key. Asking for the tree never
+returns less than asking the two questions separately would.
+
+### `go-to-pane`
+
+```
+$ zellij action go-to-pane sunny-otter
+from: terminal_2 tender-orca
+to: terminal_0 sunny-otter
+```
+
+A visible alias for upstream's `focus-pane-id`, so the `go-to-*` family is complete. It takes any
+pane target, focuses the pane **and the tab it lives in**, and reports what it left and where it
+landed as `<pane_id> <handle>` — the pane mirror of what `go-to-tab` prints. A jump that landed
+where it started prints only `to:` and exits 0. A target no live pane answers to exits 2 with the
+resolver's own sentence.
 
 ### `attach --no-resurrect`
 

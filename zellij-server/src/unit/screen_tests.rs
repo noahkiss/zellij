@@ -23,6 +23,7 @@ use zellij_utils::input::options::{
     NestedSessionHandling, Options, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::IpcReceiverWithContext;
+use zellij_utils::pane_handle::is_handle_shaped;
 use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::position::Position;
 
@@ -14129,4 +14130,148 @@ pub fn dumping_a_screen_from_a_keybinding_still_takes_the_focused_pane() {
     );
     mock_screen.teardown(vec![screen_thread]);
     assert_eq!(result.error_message, None);
+}
+
+/// A session of two panes side by side, with focus on the first of them.
+fn two_pane_mock_screen(size: Size) -> (MockScreen, TiledPaneLayout) {
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    (MockScreen::new(size), initial_layout)
+}
+
+/// The handle half of a `from:`/`to:` line, once the key and the pane id are taken off it.
+fn handle_in_report_line(line: &str, expected_prefix: &str) -> String {
+    let rest = line.strip_prefix(expected_prefix).unwrap_or_else(|| {
+        panic!(
+            "expected a line starting {:?}, got: {:?}",
+            expected_prefix, line
+        )
+    });
+    rest.to_owned()
+}
+
+#[test]
+pub fn jumping_to_a_pane_reports_where_focus_came_from_and_where_it_landed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::FocusPaneByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(1),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.stdout_lines.len(), 2, "{:?}", result.stdout_lines);
+    let from = handle_in_report_line(&result.stdout_lines[0], "from: terminal_0 ");
+    let to = handle_in_report_line(&result.stdout_lines[1], "to: terminal_1 ");
+    assert!(is_handle_shaped(&from), "not a handle: {:?}", from);
+    assert!(is_handle_shaped(&to), "not a handle: {:?}", to);
+    assert_ne!(from, to, "two panes reported the same handle");
+}
+
+#[test]
+pub fn jumping_to_the_pane_you_are_already_in_reports_only_where_you_are() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::FocusPaneByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(0),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.stdout_lines.len(),
+        1,
+        "a jump that did not move reports only where it is: {:?}",
+        result.stdout_lines
+    );
+    assert!(
+        result.stdout_lines[0].starts_with("to: terminal_0 "),
+        "{:?}",
+        result.stdout_lines
+    );
+    assert_eq!(
+        result.error_message, None,
+        "landing where you are is not a miss"
+    );
+}
+
+#[test]
+pub fn jumping_to_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::FocusPaneByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No pane answers to"))
+            .unwrap_or(false),
+        "expected a miss naming the pane, got: {:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn jumping_to_a_pane_in_another_tab_brings_the_tab_with_it() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    assert_eq!(
+        screen.tab_position_for_client(client_id),
+        Some(1),
+        "the second tab is the one in view"
+    );
+    screen
+        .focus_pane_with_id(PaneId::Terminal(1), false, false, client_id)
+        .unwrap();
+    assert_eq!(
+        screen.tab_position_for_client(client_id),
+        Some(0),
+        "focusing a pane left its tab behind"
+    );
+    assert_eq!(
+        screen.pane_summary_for_client(client_id).as_deref(),
+        Some(screen.pane_summary(PaneId::Terminal(1)).as_str()),
+        "the client is looking at the pane it was sent to"
+    );
 }

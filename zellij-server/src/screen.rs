@@ -4369,6 +4369,39 @@ impl Screen {
             .map(|tab| format!("{} {}", tab.id, tab.name))
     }
 
+    /// A pane as the `<pane_id> <handle>` a jump report names it by.
+    ///
+    /// The id comes first for the same reason it does in a tab summary: one field split reads it.
+    /// The handle follows because that is the word a human types to come back here.
+    pub fn pane_summary(&self, pane_id: PaneId) -> String {
+        let printed_id = match pane_id {
+            PaneId::Terminal(id) => format!("terminal_{}", id),
+            PaneId::Plugin(id) => format!("plugin_{}", id),
+        };
+        match self.get_pane_info(pane_id) {
+            Some(pane_info) if !pane_info.handle.is_empty() => {
+                format!("{} {}", printed_id, pane_info.handle)
+            },
+            _ => printed_id,
+        }
+    }
+
+    /// The pane a client is focused on, in the tab it is looking at.
+    ///
+    /// A client that is looking at nothing - a transient CLI connection that never attached - is
+    /// answered for by an attached client instead, the same fallback a tab switch already makes.
+    /// The alternative is a `from:` that goes missing precisely when a script asked from outside a
+    /// pane, which is when it is most wanted.
+    pub fn pane_summary_for_client(&self, client_id: ClientId) -> Option<String> {
+        let client_id = if self.active_tab_ids.contains_key(&client_id) {
+            client_id
+        } else {
+            *self.active_tab_ids.keys().next()?
+        };
+        self.get_active_pane_id(&client_id)
+            .map(|pane_id| self.pane_summary(pane_id))
+    }
+
     pub fn get_client_input_mode(&self, client_id: ClientId) -> Option<InputMode> {
         self.get_active_tab(client_id)
             .ok()
@@ -9923,7 +9956,7 @@ pub(crate) fn screen_thread_main(
                         screen.go_to_tab(tab_index as usize, client_id)?;
                         screen.render(None)?;
                         let to = screen.tab_summary_for_client(client_id);
-                        report_tab_switch(completion_tx.as_mut(), from, to);
+                        report_focus_switch(completion_tx.as_mut(), from, to);
                     },
                     _ => {
                         if let Some(client_id) = client_id {
@@ -9984,7 +10017,7 @@ pub(crate) fn screen_thread_main(
                                 }
                             } else {
                                 let to = screen.tab_summary_for_client(client_id);
-                                report_tab_switch(completion_tx.as_mut(), from, to);
+                                report_focus_switch(completion_tx.as_mut(), from, to);
                             }
                         } else if !create && !no_focus {
                             // asked to go somewhere that is not there: a miss, which the probe
@@ -11203,21 +11236,22 @@ pub(crate) fn screen_thread_main(
                     .iter()
                     .any(|(_, tab)| tab.has_pane_with_pid(&pane_id));
                 if !pane_exists {
+                    // an id no live pane answers to is a miss, not a failure: the handle and uuid
+                    // forms are caught by the resolver before they get here, so what lands here is
+                    // an id form for a pane that has since closed
                     if let Some(c) = completion_tx.as_mut() {
-                        c.set_exit_status(1);
-                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
+                        c.set_error_message(format!(
+                            "No pane answers to '{}'",
+                            screen.pane_summary(pane_id)
+                        ));
                     }
                 } else {
+                    let from = screen.pane_summary_for_client(client_id);
                     let already_focused = screen
                         .get_active_pane_id(&client_id)
                         .map(|active| active == pane_id)
                         .unwrap_or(false);
-                    if already_focused {
-                        if let Some(c) = completion_tx.as_mut() {
-                            c.set_exit_status(1);
-                            c.set_error_message(format!("Pane {:?} is already focused", pane_id));
-                        }
-                    } else {
+                    if !already_focused {
                         screen.focus_pane_with_id(
                             pane_id,
                             should_float_if_hidden,
@@ -11228,6 +11262,17 @@ pub(crate) fn screen_thread_main(
                         screen.reconcile_single_pane_focus(client_id);
                         screen.log_and_report_session_state()?;
                     }
+                    // a jump that landed where it started reports only `to:`, exactly as a tab
+                    // switch does - it went where it was asked to go, and there is no "from" to
+                    // put focus back on
+                    // `to:` names the pane the command was given, not the one a client happens to
+                    // be looking at afterwards - that is the answer even for a caller with no
+                    // focus of its own
+                    report_focus_switch(
+                        completion_tx.as_mut(),
+                        from,
+                        Some(screen.pane_summary(pane_id)),
+                    );
                 }
             },
             ScreenInstruction::RenamePane(
@@ -11303,7 +11348,7 @@ pub(crate) fn screen_thread_main(
                             .or_insert_with(Vec::new)
                             .push(tab_id);
                         let to = screen.tab_summary_for_client(client_id);
-                        report_tab_switch(completion_tx.as_mut(), from, to);
+                        report_focus_switch(completion_tx.as_mut(), from, to);
                     } else {
                         log::error!("Tab with ID {} not found", tab_id);
                         if let Some(c) = completion_tx.as_mut() {
@@ -13087,12 +13132,13 @@ fn set_converged(completion_tx: &mut Option<NotificationEnd>, changed: bool) {
     }
 }
 
-/// Report a focus switch as the tab it left and the tab it landed on.
+/// Report a focus switch as what it left and what it landed on.
 ///
-/// Each line is `<id> <name>`, id first so that a script reads it with one field split and a name
-/// with spaces in it stays whole. A switch that landed where it started reports only `to:` - there
-/// is no "from" to go back to, and printing the same tab twice would suggest there is.
-fn report_tab_switch(
+/// Serves tabs (`<id> <name>`) and panes (`<pane_id> <handle>`) alike: id first, so that a script
+/// reads it with one field split and a name with spaces in it stays whole. A switch that landed
+/// where it started reports only `to:` - there is no "from" to go back to, and printing the same
+/// thing twice would suggest there is.
+fn report_focus_switch(
     completion_tx: Option<&mut NotificationEnd>,
     from: Option<String>,
     to: Option<String>,

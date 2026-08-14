@@ -1165,6 +1165,7 @@ impl From<crate::input::actions::Action>
             ListClientsAction,
             ListPanesAction,
             ListTabsAction,
+            ListTreeAction,
             MouseEventAction,
             MoveFocusAction,
             MoveFocusOrTabAction,
@@ -1961,6 +1962,9 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::ResolvePaneTarget { target } => {
                 ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
+            },
+            crate::input::actions::Action::ListTree { output_json } => {
+                ActionType::ListTree(ListTreeAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2913,6 +2917,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::ResolvePaneTarget(a) => {
                 Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
             },
+            ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
+                output_json: a.output_json,
+            }),
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {
                     show_tab: list_panes_action.show_tab,
