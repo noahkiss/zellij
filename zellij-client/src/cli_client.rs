@@ -269,18 +269,26 @@ pub fn resolve_pane_target(
     resolved
 }
 
+/// Whether this action's answer is a report of its own, rather than "the server is free again".
+///
+/// `UnblockInputThread` is addressed to whoever is holding the input, and every route thread sends
+/// one to its own client when it finishes handling a message. For most actions that is the answer.
+/// For a blocking one it is not: the answer is the command's exit status, which arrives later as
+/// `Exit`, `Log` or `LogError`. A client that took the unblock would print nothing and exit 0 while
+/// the command it was waiting for is still running.
+///
+/// Every `NewBlockingPane` counts, condition or none: bare `-b/--blocking` waits for the pane to
+/// close rather than for a status to match, and it is no less blocking for that.
+fn action_answers_with_its_own_report(action: &Action) -> bool {
+    matches!(action, Action::NewBlockingPane { .. })
+}
+
 fn individual_messages_client(
     os_input: &mut Box<dyn ClientOsApi>,
     action: Action,
     pane_id: Option<u32>,
 ) -> Option<i32> {
-    let is_blocking = matches!(
-        &action,
-        Action::NewBlockingPane {
-            unblock_condition: Some(_),
-            ..
-        }
-    );
+    let is_blocking = action_answers_with_its_own_report(&action);
     let msg = ClientToServerMsg::Action {
         action,
         terminal_id: pane_id,
@@ -423,4 +431,44 @@ pub fn start_subscribe_client(
     }
 
     os_input.send_to_server(ClientToServerMsg::ClientExited);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zellij_utils::data::{NewPanePlacement, UnblockCondition};
+
+    fn blocking_pane(unblock_condition: Option<UnblockCondition>) -> Action {
+        Action::NewBlockingPane {
+            placement: NewPanePlacement::default(),
+            pane_name: None,
+            command: None,
+            unblock_condition,
+            near_current_pane: false,
+            no_focus: false,
+            tab_id: None,
+        }
+    }
+
+    #[test]
+    fn a_bare_blocking_pane_still_waits_for_its_own_report() {
+        // `-b/--blocking` sets no unblock condition: it waits for the pane to close rather than for
+        // a status to match. Reading an `UnblockInputThread` as its answer would print nothing and
+        // exit 0 while the command is still running
+        assert!(action_answers_with_its_own_report(&blocking_pane(None)));
+    }
+
+    #[test]
+    fn a_conditional_blocking_pane_waits_for_its_own_report() {
+        assert!(action_answers_with_its_own_report(&blocking_pane(Some(
+            UnblockCondition::OnAnyExit
+        ))));
+    }
+
+    #[test]
+    fn an_ordinary_action_is_answered_by_the_unblock() {
+        // the negative control: everything that is not a blocking pane is done when the server says
+        // the input is free again, and must not be left waiting for a report that never comes
+        assert!(!action_answers_with_its_own_report(&Action::ToggleFloatingPanes));
+    }
 }
