@@ -30,7 +30,8 @@ pub use super::generated_api::api::{
         PluginInfo as ProtobufPluginInfo, ResurrectableSession as ProtobufResurrectableSession,
         SelectedText as ProtobufSelectedText, SessionManifest as ProtobufSessionManifest,
         SessionSnapshotInfo as ProtobufSessionSnapshotInfo,
-        SnapshotPaneInfo as ProtobufSnapshotPaneInfo, SnapshotTabInfo as ProtobufSnapshotTabInfo,
+        SessionWarning as ProtobufSessionWarning, SnapshotPaneInfo as ProtobufSnapshotPaneInfo,
+        SnapshotTabInfo as ProtobufSnapshotTabInfo,
         SoftKeyboardVisibilityChangedPayload as ProtobufSoftKeyboardVisibilityChangedPayload,
         StyledText as ProtobufStyledText, StyledTextIndices as ProtobufStyledTextIndices,
         SyntaxError as ProtobufSyntaxError, TabInfo as ProtobufTabInfo,
@@ -47,7 +48,7 @@ use crate::data::{
     ClientId, ClientInfo, CopyDestination, Event, EventType, FileMetadata, HostTerminalThemeMode,
     InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, ModeInfo, Mouse, PaneContents, PaneId,
     PaneInfo, PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus,
-    PluginCapabilities, PluginInfo, SelectedText, SessionInfo, SessionSnapshotInfo,
+    PluginCapabilities, PluginInfo, SelectedText, SessionInfo, SessionSnapshotInfo, SessionWarning,
     SnapshotPaneInfo, SnapshotTabInfo, Style, StyledText, TabInfo, TabMetadata, WebServerStatus,
     WebSharing,
 };
@@ -2278,6 +2279,15 @@ impl TryFrom<ProtobufModeUpdatePayload> for ModeInfo {
             .filter_map(|key| KeyWithModifier::from_str(key).ok())
             .collect();
 
+        // an unknown code is dropped rather than fatal: a bar built against an older contract
+        // should badge what it understands, not refuse the whole mode update
+        let session_warnings = protobuf_mode_update_payload
+            .session_warnings
+            .iter()
+            .filter_map(|warning| ProtobufSessionWarning::from_i32(*warning))
+            .map(|warning| warning.into())
+            .collect();
+
         let mode_info = ModeInfo {
             mode: current_mode,
             keybinds,
@@ -2301,6 +2311,7 @@ impl TryFrom<ProtobufModeUpdatePayload> for ModeInfo {
             nested_ascend_keys,
             session_ascended,
             nested_descend_keys,
+            session_warnings,
         };
         Ok(mode_info)
     }
@@ -2342,6 +2353,14 @@ impl TryFrom<ModeInfo> for ProtobufModeUpdatePayload {
             .nested_descend_keys
             .iter()
             .map(|key| key.to_kdl())
+            .collect();
+        let session_warnings = mode_info
+            .session_warnings
+            .iter()
+            .map(|warning| {
+                let protobuf_warning: ProtobufSessionWarning = (*warning).into();
+                protobuf_warning as i32
+            })
             .collect();
         let mut protobuf_input_mode_keybinds: Vec<ProtobufInputModeKeybinds> = vec![];
         for (input_mode, input_mode_keybinds) in mode_info.keybinds {
@@ -2390,7 +2409,26 @@ impl TryFrom<ModeInfo> for ProtobufModeUpdatePayload {
             nested_ascend_keys,
             session_ascended,
             nested_descend_keys,
+            session_warnings,
         })
+    }
+}
+
+impl Into<ProtobufSessionWarning> for SessionWarning {
+    fn into(self) -> ProtobufSessionWarning {
+        match self {
+            SessionWarning::SupersededBuild => ProtobufSessionWarning::SupersededBuild,
+            SessionWarning::MissingFullDiskAccess => ProtobufSessionWarning::MissingFullDiskAccess,
+        }
+    }
+}
+
+impl Into<SessionWarning> for ProtobufSessionWarning {
+    fn into(self) -> SessionWarning {
+        match self {
+            ProtobufSessionWarning::SupersededBuild => SessionWarning::SupersededBuild,
+            ProtobufSessionWarning::MissingFullDiskAccess => SessionWarning::MissingFullDiskAccess,
+        }
     }
 }
 
@@ -2763,6 +2801,11 @@ fn serialize_mode_update_event_with_non_default_values() {
         nested_descend_keys: vec![
             KeyWithModifier::new(BareKey::Char('o')).with_ctrl_modifier(),
             KeyWithModifier::new(BareKey::Down),
+        ],
+        // both, so the roundtrip covers the repeated field rather than an empty one
+        session_warnings: vec![
+            SessionWarning::SupersededBuild,
+            SessionWarning::MissingFullDiskAccess,
         ],
     });
     let protobuf_event: ProtobufEvent = mode_update_event.clone().try_into().unwrap();
