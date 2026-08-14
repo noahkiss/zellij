@@ -87,21 +87,31 @@ impl Drop for HeldHandle {
 /// pane is about to restore under, and the restoring pane - the one with the prior claim - would be
 /// the one to reroll. Reserving first inverts that: the snapshot's names are spoken for before the
 /// first pane is built.
+///
+/// A restore is a session-wide event, not a tab-wide one: it announces every tab before the first
+/// tab's panes exist. So one reservation grows across all of them ([`Reservation::extend`]) and is
+/// released once, when the last tab has been applied. A per-tab reservation would leave a
+/// handle-less pane in tab 1 free to take a name tab 3 is coming back under.
 #[derive(Debug, Default)]
 pub struct Reservation(Vec<String>);
 
 impl Reservation {
     /// Reserves each handle that is not already held by a live pane.
     pub fn hold(handles: impl IntoIterator<Item = String>) -> Self {
+        let mut reservation = Reservation::default();
+        reservation.extend(handles);
+        reservation
+    }
+
+    /// Adds more names to this reservation, on the same terms.
+    pub fn extend(&mut self, handles: impl IntoIterator<Item = String>) {
         let mut registry = registry();
-        let mut reserved = Vec::new();
         for handle in handles {
             if !registry.contains_key(handle.as_str()) {
                 registry.insert(handle.clone(), Claim::Reserved);
-                reserved.push(handle);
+                self.0.push(handle);
             }
         }
-        Reservation(reserved)
     }
 }
 
@@ -187,6 +197,27 @@ mod tests {
         drop(reservation);
         // the reservation must not have freed the name the restored pane went on to claim
         assert_eq!(registry().get(&wanted), Some(&Claim::Held));
+    }
+
+    #[test]
+    fn one_reservation_covers_every_tab_of_a_restore() {
+        // the cross-tab ordering: a restore announces all its tabs before any tab's panes exist,
+        // so the later tab's names must already be out of the generator's reach
+        let first_tab = reserved_for_tests("tab-one");
+        let last_tab = reserved_for_tests("tab-three");
+        let mut reservation = Reservation::hold([first_tab.clone()]);
+        reservation.extend([last_tab.clone()]);
+        assert!(is_spoken_for(&registry(), &last_tab));
+        // the pane built for tab 1 cannot be handed tab 3's name, so tab 3 gets it verbatim
+        let restored = HeldHandle::claim(&last_tab);
+        assert_eq!(restored.as_str(), last_tab);
+        drop(reservation);
+        assert_eq!(registry().get(&last_tab), Some(&Claim::Held));
+        assert_eq!(
+            registry().get(&first_tab),
+            None,
+            "never claimed, so released"
+        );
     }
 
     #[test]

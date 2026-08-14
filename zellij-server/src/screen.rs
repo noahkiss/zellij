@@ -7488,7 +7488,10 @@ impl Screen {
                         default_fg,
                         default_bg,
                         Some(p.pane_uuid().to_string()),
-                        Some(p.pane_handle()),
+                        // a pane that never got a handle - the trait default - has an empty one,
+                        // and serializing that would put a handle nothing can address into the
+                        // snapshot
+                        Some(p.pane_handle()).filter(|handle| !handle.is_empty()),
                     )
                 })
                 .collect();
@@ -7531,7 +7534,10 @@ impl Screen {
                         default_fg,
                         default_bg,
                         Some(p.pane_uuid().to_string()),
-                        Some(p.pane_handle()),
+                        // a pane that never got a handle - the trait default - has an empty one,
+                        // and serializing that would put a handle nothing can address into the
+                        // snapshot
+                        Some(p.pane_handle()).filter(|handle| !handle.is_empty()),
                     )
                 })
                 .collect();
@@ -8218,6 +8224,11 @@ pub(crate) fn screen_thread_main(
     screen.host_theme_light_styling = host_theme_light_styling;
 
     let mut pending_tab_ids: HashSet<usize> = HashSet::new();
+    // The handles every pending tab is coming back under, held out of the generator's reach for as
+    // long as any tab is still pending. A restore announces all of its tabs before the first tab's
+    // panes exist, so reserving per tab - at the moment that tab's panes are built - would leave a
+    // handle-less pane in an early tab free to take a name a later tab is restoring under.
+    let mut restore_reservation = crate::pane_handles::Reservation::default();
     let mut pending_tab_switches: HashSet<(usize, ClientId)> = HashSet::new(); // usize is the
                                                                                // tab_index
     let mut pending_events_waiting_for_tab: Vec<ScreenInstruction> = vec![];
@@ -9739,6 +9750,16 @@ pub(crate) fn screen_thread_main(
             ) => {
                 let tab_index = screen.get_new_tab_id();
                 pending_tab_ids.insert(tab_index);
+                restore_reservation.extend(
+                    layout
+                        .iter()
+                        .flat_map(|layout| layout.pane_handles())
+                        .chain(
+                            floating_panes_layout
+                                .iter()
+                                .filter_map(|pane| pane.pane_handle.clone()),
+                        ),
+                );
                 let client_id_for_new_tab = if should_change_focus_to_new_tab {
                     Some(client_id)
                 } else {
@@ -9821,6 +9842,9 @@ pub(crate) fn screen_thread_main(
                 )?;
                 pending_tab_ids.remove(&tab_id);
                 if pending_tab_ids.is_empty() {
+                    // every tab is built, so the names none of them claimed go back into
+                    // circulation
+                    restore_reservation = crate::pane_handles::Reservation::default();
                     for (tab_index, client_id) in pending_tab_switches.drain() {
                         screen.go_to_tab(tab_index as usize + 1, client_id)?;
                     }

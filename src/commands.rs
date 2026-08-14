@@ -827,9 +827,16 @@ fn attach_with_cli_client(
     // resolved by asking the running server before the action is built. An id form needs no
     // lookup, and pays for nothing: the connection is only opened when there is a question.
     let resolve_pane_target = |target: &str| -> Result<PaneId, String> {
-        match target.parse::<PaneTarget>()? {
-            PaneTarget::Id(pane_id) => Ok(pane_id),
-            _ => zellij_client::cli_client::resolve_pane_target(
+        match target.parse::<PaneTarget>() {
+            // a string that names no pane in any form is malformed input, which is an error and
+            // exits 1. Only a well-formed target that no live pane answers to is a miss, and the
+            // miss is what the caller below turns into exit 2
+            Err(malformed) => {
+                eprintln!("{}", malformed);
+                std::process::exit(1);
+            },
+            Ok(PaneTarget::Id(pane_id)) => Ok(pane_id),
+            Ok(_) => zellij_client::cli_client::resolve_pane_target(
                 Box::new(get_os_input(
                     zellij_client::os_input_output::get_cli_client_os_input,
                 )),

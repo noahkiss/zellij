@@ -127,11 +127,10 @@ impl<'a> LayoutApplier<'a> {
         // them win over any handle generated for a pane in the same pass. Dropped at the end of
         // this call: whatever a pane claimed stays claimed, the rest is released.
         //
-        // The reservation covers THIS tab's layout only, because a tab is the unit a layout is
-        // applied in. Restoring a multi-tab session applies one tab at a time, so a handle-less
-        // pane in an earlier tab can still be handed a name a later tab restores under, and that
-        // later pane rerolls. Within a tab "snapshot handles win" holds outright; across tabs it
-        // is a 1-in-55391 race per pane pair, not a guarantee.
+        // This reservation covers THIS tab's layout, which is all a tab knows about. A multi-tab
+        // restore is covered by the session-scoped reservation `Screen` holds from the moment it
+        // is told about a tab until the last one has been applied; reserving the same names twice
+        // is free, and this one still stands alone for a layout applied to a single tab.
         let _reserved_handles = Reservation::hold(
             layout.pane_handles().into_iter().chain(
                 floating_panes_layout
@@ -165,11 +164,10 @@ impl<'a> LayoutApplier<'a> {
         // them win over any handle generated for a pane in the same pass. Dropped at the end of
         // this call: whatever a pane claimed stays claimed, the rest is released.
         //
-        // The reservation covers THIS tab's layout only, because a tab is the unit a layout is
-        // applied in. Restoring a multi-tab session applies one tab at a time, so a handle-less
-        // pane in an earlier tab can still be handed a name a later tab restores under, and that
-        // later pane rerolls. Within a tab "snapshot handles win" holds outright; across tabs it
-        // is a 1-in-55391 race per pane pair, not a guarantee.
+        // This reservation covers THIS tab's layout, which is all a tab knows about. A multi-tab
+        // restore is covered by the session-scoped reservation `Screen` holds from the moment it
+        // is told about a tab until the last one has been applied; reserving the same names twice
+        // is free, and this one still stands alone for a layout applied to a single tab.
         let _reserved_handles = Reservation::hold(
             tiled_panes_layout.pane_handles().into_iter().chain(
                 floating_panes_layout

@@ -16,7 +16,7 @@ pub const HANDLE_SEPARATOR: char = '-';
 
 /// How many rerolls a collision is worth before the generator falls back to a numeric suffix.
 ///
-/// With 55391 combinations and a session's worth of panes taken, a collision is rare and two in a
+/// With 55104 combinations and a session's worth of panes taken, a collision is rare and two in a
 /// row is rarer still; the cap is here so a caller with a pathological predicate terminates, not
 /// because it is expected to be reached.
 const MAX_REROLLS: usize = 32;
@@ -59,8 +59,10 @@ fn random_handle() -> String {
 /// A random index below `len`, entropy borrowed from the same source pane uuids come from.
 ///
 /// `uuid` is already a dependency and its v4 constructor is already how this crate gets randomness
-/// for panes, so a handle costs no new dependency. The modulo bias over a 128-bit draw into a list
-/// of a few hundred words is far below anything a name generator cares about.
+/// for panes, so a handle costs no new dependency. Eight of its bytes make the draw, skipping the
+/// variant byte; the version nibble in byte 6 is fixed, so the draw carries about 60 random bits.
+/// The modulo bias that leaves over a list of a few hundred words is far below anything a name
+/// generator cares about.
 fn random_index(len: usize) -> usize {
     let bytes = *uuid::Uuid::new_v4().as_bytes();
     let draw = u64::from_le_bytes([
