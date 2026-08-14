@@ -168,6 +168,27 @@ mod tests {
     }
 
     #[test]
+    fn both_words_are_drawn_and_not_just_one() {
+        // whole-handle variety hides a stuck list: a fixed adjective with a random noun still
+        // yields 50 distinct handles, so each position is counted on its own. 100 draws over the
+        // shorter list leaves the odds of a false alarm below any number worth writing down.
+        let mut adjectives = HashSet::new();
+        let mut nouns = HashSet::new();
+        for _ in 0..100 {
+            let handle = generate_handle(|_| false);
+            let (adjective, noun) = handle.split_once(HANDLE_SEPARATOR).expect("two words");
+            adjectives.insert(adjective.to_owned());
+            nouns.insert(noun.to_owned());
+        }
+        assert!(
+            adjectives.len() > 20,
+            "adjectives barely move: {:?}",
+            adjectives
+        );
+        assert!(nouns.len() > 20, "nouns barely move: {:?}", nouns);
+    }
+
+    #[test]
     fn handle_shape_rejects_what_is_not_a_handle() {
         for not_a_handle in [
             "",
