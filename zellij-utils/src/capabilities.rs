@@ -83,7 +83,7 @@ pub const CAPABILITIES: &[&str] = &[
     "session-drop-env",        // session_restart_drop_env
     "snapshot-dir-config",     // snapshot_dir, session_snapshot_limit
     "session-service-config",  // session_service, pin_exe
-    "status-notices",          // Full Disk Access / superseded-build notices
+    "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
 ];
 
 /// The version, split into the parts that can actually be compared.

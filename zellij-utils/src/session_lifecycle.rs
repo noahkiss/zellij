@@ -1848,7 +1848,7 @@ pub fn build_mismatch_warning(name: &str) -> Option<String> {
     ))
 }
 
-/// The notice a running server should show about its own build being superseded, if any.
+/// Whether this running server's own build has been superseded.
 ///
 /// A server keeps the binary it started with for the whole life of the session, so an upgrade
 /// reaches nothing until the session is restarted - and nothing else says so, which is how a
@@ -1865,7 +1865,11 @@ pub fn build_mismatch_warning(name: &str) -> Option<String> {
 /// `PATH` is the intended source of that copy, so it is the right thing to compare against. Once
 /// the refresh does happen it renames over the pinned path, which unlinks the file this server
 /// started from - and rule one answers.
-pub fn stale_build_notice(session_name: &str, pinned_exe: Option<&Path>) -> Option<String> {
+pub fn build_is_superseded(pinned_exe: Option<&Path>) -> bool {
+    inner_build_is_superseded(pinned_exe).unwrap_or(false)
+}
+
+fn inner_build_is_superseded(pinned_exe: Option<&Path>) -> Option<bool> {
     let running_path = std::env::current_exe().ok()?;
     let running = own_executable()?;
 
@@ -1886,13 +1890,7 @@ pub fn stale_build_notice(session_name: &str, pinned_exe: Option<&Path>) -> Opti
         false
     };
 
-    if !superseded {
-        return None;
-    }
-    Some(format!(
-        "⚠ session '{}' runs a superseded build - `zellij session restart {}`",
-        session_name, session_name
-    ))
+    Some(superseded)
 }
 
 /// The build of the `PATH` entry that shares this binary's file name, if there is one.
@@ -1944,20 +1942,13 @@ pub fn full_disk_access_granted() -> Option<bool> {
     None
 }
 
-/// The notice a session should show about Full Disk Access, if any.
+/// Whether this binary was refused a Full Disk Access-gated open just now.
 ///
-/// Names the path, because the grant is keyed to that exact file and auto-registration was not
-/// observed to happen - the user may have to add it by hand, and a notice that does not name it
-/// sends them hunting through a versioned package directory.
-pub fn full_disk_access_notice() -> Option<String> {
-    if full_disk_access_granted()? {
-        return None;
-    }
-    let path = own_executable_path()?;
-    Some(format!(
-        "⚠ Full Disk Access not granted for {}",
-        path.display()
-    ))
+/// False on every platform without the permission, and false when the question was not answered:
+/// [`full_disk_access_granted`] returns `None` for a missing file or a non-permission failure, and
+/// neither is a denial.
+pub fn full_disk_access_missing() -> bool {
+    full_disk_access_granted() == Some(false)
 }
 
 /// Say it, at most once for the life of this process.

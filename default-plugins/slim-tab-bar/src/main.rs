@@ -103,6 +103,25 @@ struct SlimBar {
     session_gap: usize,
     /// Display substitutions for session names, e.g. `mysession` -> `GFF`.
     session_aliases: Vec<(String, String)>,
+    /// Session-wide conditions the server is reporting, as of the last `ModeUpdate`. Empty is the
+    /// normal case and draws nothing at all.
+    warnings: Vec<SessionWarning>,
+}
+
+/// The badge for a set of warnings, or an empty string when there are none.
+///
+/// One triangle however many conditions are live: two triangles side by side read as two separate
+/// widgets rather than one thing that is wrong. Codes are space-separated in the order given, which
+/// is the order the server produces and therefore stable between frames.
+///
+/// A free function rather than a method: it is the whole of the badge's logic and nothing about it
+/// depends on the bar's state.
+fn badge_text(warnings: &[SessionWarning]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let codes: Vec<&str> = warnings.iter().map(|warning| warning.code()).collect();
+    format!("⚠ {}", codes.join(" "))
 }
 
 /// `PaletteColor` as an SGR colour parameter. The enum has exactly two variants and both are
@@ -292,32 +311,66 @@ impl SlimBar {
         (60 - Utc::now().second()) as f64 + 0.5
     }
 
-    /// Right-hand element: date and clock, or the clock alone, or nothing.
+    /// Right-hand element: the warning badge, the date and the clock, in that order.
     ///
     /// This is the single place that decides what sits on the right. Everything else works in
-    /// terms of the returned segment's width. `with_date` is the wider of the two forms; the
-    /// render calls this twice, widest first, and takes the first one that fits.
+    /// terms of the returned segment's width. The render calls this several times, widest form
+    /// first, and takes the first one that fits.
+    ///
+    /// The badge sits to the LEFT of the clock rather than at the outer edge, so the clock keeps
+    /// its column when a warning appears or clears — the clock is what gets read at a glance, and
+    /// a badge that shoved it sideways twice a session would be worse than the badge is good.
+    /// It is drawn in the palette's error colour and bold, but never blinks: it reports a fact
+    /// that has been true for minutes and will stay true until someone acts on it.
     ///
     /// No padding spaces of its own: the flex spacer supplies the gap on the left and the
     /// line's edge pad supplies the single column on the right.
-    fn right_segment(&self, colors: &Styling, with_date: bool) -> Option<Segment> {
-        if self.clock.is_empty() {
+    fn right_segment(
+        &self,
+        colors: &Styling,
+        with_date: bool,
+        with_clock: bool,
+    ) -> Option<Segment> {
+        let badge = badge_text(&self.warnings);
+        let clock = if with_clock { self.clock.as_str() } else { "" };
+        let date = if with_date && with_clock {
+            self.date.as_str()
+        } else {
+            ""
+        };
+        if badge.is_empty() && clock.is_empty() {
             return None;
         }
-        let text = if with_date && !self.date.is_empty() {
-            format!("{} {}", self.date, self.clock)
-        } else {
-            self.clock.clone()
-        };
-        Some(Segment {
-            len: text.width(),
-            part: paint(
+        // painted in two runs, because the badge and the time are different colours; the widths
+        // add up because `paint` resets after each run
+        let time: String = [date, clock]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut part = String::new();
+        let mut len = 0;
+        if !badge.is_empty() {
+            part.push_str(&paint(
+                &badge,
+                colors.exit_code_error.base,
+                colors.text_unselected.background,
+                true,
+            ));
+            len += badge.width();
+        }
+        if !time.is_empty() {
+            let gap = if badge.is_empty() { "" } else { " " };
+            let text = format!("{}{}", gap, time);
+            part.push_str(&paint(
                 &text,
                 colors.text_unselected.base,
                 colors.text_unselected.background,
                 false,
-            ),
-        })
+            ));
+            len += text.width();
+        }
+        Some(Segment { part, len })
     }
 
     /// 1-based index of the active tab, which is what `switch_tab_to` wants.
@@ -470,9 +523,15 @@ impl ZellijPlugin for SlimBar {
             // Same reasoning: ModeUpdate fires far more often than any of this changes.
             Event::ModeUpdate(mode_info) => {
                 let colors = Some(mode_info.style.colors);
-                let changed = self.session_name != mode_info.session_name || self.colors != colors;
+                let changed = self.session_name != mode_info.session_name
+                    || self.colors != colors
+                    || self.warnings != mode_info.session_warnings;
                 self.session_name = mode_info.session_name;
                 self.colors = colors;
+                // the server re-asks its session-wide questions on a slow timer and sends a
+                // ModeUpdate when an answer moves, so the badge follows a live change — an FDA
+                // grant or a `session restart` — without the bar probing anything itself
+                self.warnings = mode_info.session_warnings;
                 changed
             },
             // Re-arm unconditionally, but only repaint when the displayed string actually
@@ -518,12 +577,18 @@ impl ZellijPlugin for SlimBar {
         // time is one row below in the claude bar anyway. Measured against the tabs at their
         // NATURAL width, so a narrow terminal hides the clock rather than mangling labels to
         // keep it — which is what makes this adapt to tab count instead of a fixed breakpoint.
+        //
+        // The warning badge is in every form, so it outlives the clock: it is a few columns, it
+        // is only ever there when something is wrong, and a bar too narrow to say so is exactly
+        // the bar that would hide it forever.
         let natural: Vec<String> = self.tabs.iter().map(|t| self.tab_label(t)).collect();
         let natural_width: usize = natural.iter().map(|l| self.tab_width(l)).sum();
-        let right = [true, false].into_iter().find_map(|with_date| {
-            self.right_segment(&colors, with_date)
-                .filter(|r| natural_width + r.len <= avail)
-        });
+        let right = [(true, true), (false, true), (false, false)]
+            .into_iter()
+            .find_map(|(with_date, with_clock)| {
+                self.right_segment(&colors, with_date, with_clock)
+                    .filter(|r| natural_width + r.len <= avail)
+            });
 
         let labels = self.fit(
             natural,
@@ -579,3 +644,127 @@ impl ZellijPlugin for SlimBar {
 }
 
 register_plugin!(SlimBar);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_warnings_draw_nothing_at_all() {
+        // zero width, not a space: the badge must cost the tab list nothing on a healthy session
+        assert_eq!(badge_text(&[]), "");
+    }
+
+    #[test]
+    fn a_superseded_build_is_one_code() {
+        assert_eq!(badge_text(&[SessionWarning::SupersededBuild]), "⚠ zj");
+    }
+
+    #[test]
+    fn missing_full_disk_access_is_one_code() {
+        assert_eq!(
+            badge_text(&[SessionWarning::MissingFullDiskAccess]),
+            "⚠ TCC"
+        );
+    }
+
+    #[test]
+    fn both_conditions_share_one_triangle() {
+        assert_eq!(
+            badge_text(&[
+                SessionWarning::SupersededBuild,
+                SessionWarning::MissingFullDiskAccess
+            ]),
+            "⚠ zj TCC"
+        );
+    }
+
+    #[test]
+    fn the_order_given_is_the_order_drawn() {
+        // the server always produces the same order, and the badge must not re-sort it into a
+        // different one - a badge whose codes swap between frames reads as a flicker
+        assert_eq!(
+            badge_text(&[
+                SessionWarning::MissingFullDiskAccess,
+                SessionWarning::SupersededBuild
+            ]),
+            "⚠ TCC zj"
+        );
+    }
+
+    #[test]
+    fn the_badge_stays_narrow() {
+        // it shares a line with the tab list, and the render only drops it after the clock
+        let both = badge_text(&[
+            SessionWarning::SupersededBuild,
+            SessionWarning::MissingFullDiskAccess,
+        ]);
+        assert!(
+            both.width() <= 10,
+            "the widest badge is still a badge: {} columns",
+            both.width()
+        );
+    }
+
+    fn bar_with(warnings: Vec<SessionWarning>, clock: &str, date: &str) -> SlimBar {
+        SlimBar {
+            warnings,
+            clock: clock.to_string(),
+            date: date.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The visible text of a drawn segment, with the SGR escapes stripped.
+    fn visible(segment: &Segment) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for character in segment.part.chars() {
+            match character {
+                '\u{1b}' => in_escape = true,
+                'm' if in_escape => in_escape = false,
+                _ if in_escape => {},
+                _ => out.push(character),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_badge_sits_immediately_left_of_the_clock() {
+        let colors = Styling::default();
+        let bar = bar_with(vec![SessionWarning::SupersededBuild], "3:47 PM", "7/30");
+        let segment = bar.right_segment(&colors, true, true).unwrap();
+        assert_eq!(visible(&segment), "⚠ zj 7/30 3:47 PM");
+        assert_eq!(segment.len, "⚠ zj 7/30 3:47 PM".width(), "width is tracked");
+    }
+
+    #[test]
+    fn a_healthy_session_draws_the_clock_exactly_as_before() {
+        let colors = Styling::default();
+        let bar = bar_with(vec![], "3:47 PM", "7/30");
+        let segment = bar.right_segment(&colors, true, true).unwrap();
+        assert_eq!(visible(&segment), "7/30 3:47 PM");
+        assert_eq!(segment.len, "7/30 3:47 PM".width());
+    }
+
+    #[test]
+    fn the_badge_survives_the_clock_being_dropped() {
+        // the narrowest right-hand form the render tries still says something is wrong
+        let colors = Styling::default();
+        let bar = bar_with(
+            vec![SessionWarning::MissingFullDiskAccess],
+            "3:47 PM",
+            "7/30",
+        );
+        let segment = bar.right_segment(&colors, false, false).unwrap();
+        assert_eq!(visible(&segment), "⚠ TCC");
+    }
+
+    #[test]
+    fn nothing_to_say_and_no_clock_is_no_segment() {
+        let colors = Styling::default();
+        let bar = bar_with(vec![], "3:47 PM", "7/30");
+        assert!(bar.right_segment(&colors, false, false).is_none());
+    }
+}
