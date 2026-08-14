@@ -122,6 +122,16 @@ impl Drop for Reservation {
 mod tests {
     use super::*;
 
+    /// A name for a test to claim that no generated handle can ever collide with.
+    ///
+    /// The registry is process-global on purpose, so under `cargo test` every test in this module
+    /// shares it with siblings that draw hundreds of random handles. A name from the word lists
+    /// would be a rare-but-real flake; `claim` takes any string, so the tests use names the
+    /// generator cannot produce.
+    fn reserved_for_tests(name: &str) -> String {
+        format!("test~{}", name)
+    }
+
     #[test]
     fn two_live_panes_never_share_a_handle() {
         let held: Vec<HeldHandle> = (0..200).map(|_| HeldHandle::claim_new()).collect();
@@ -145,17 +155,19 @@ mod tests {
 
     #[test]
     fn a_snapshot_handle_is_taken_verbatim() {
-        let restored = HeldHandle::claim("sunny-otter");
-        assert_eq!(restored.as_str(), "sunny-otter");
+        let wanted = reserved_for_tests("verbatim");
+        let restored = HeldHandle::claim(&wanted);
+        assert_eq!(restored.as_str(), wanted);
     }
 
     #[test]
     fn a_snapshot_handle_a_live_pane_already_holds_falls_back() {
-        let _live = HeldHandle::claim("golden-badger");
-        let second = HeldHandle::claim("golden-badger");
+        let wanted = reserved_for_tests("contended");
+        let _live = HeldHandle::claim(&wanted);
+        let second = HeldHandle::claim(&wanted);
         assert_ne!(
             second.as_str(),
-            "golden-badger",
+            wanted,
             "two live panes answered to the same handle"
         );
     }
@@ -164,22 +176,24 @@ mod tests {
     fn a_reserved_handle_is_kept_for_the_pane_restoring_under_it() {
         // the ordering this exists for: a handle-less pane is built first, and must not be given
         // the name a later pane in the same layout is coming back under
-        let reservation = Reservation::hold(["merry-narwhal".to_owned()]);
+        let wanted = reserved_for_tests("reserved");
+        let reservation = Reservation::hold([wanted.clone()]);
         assert!(
-            is_spoken_for(&registry(), "merry-narwhal"),
+            is_spoken_for(&registry(), &wanted),
             "the generator would hand out a reserved handle"
         );
-        let restored = HeldHandle::claim("merry-narwhal");
-        assert_eq!(restored.as_str(), "merry-narwhal");
+        let restored = HeldHandle::claim(&wanted);
+        assert_eq!(restored.as_str(), wanted);
         drop(reservation);
         // the reservation must not have freed the name the restored pane went on to claim
-        assert_eq!(registry().get("merry-narwhal"), Some(&Claim::Held));
+        assert_eq!(registry().get(&wanted), Some(&Claim::Held));
     }
 
     #[test]
     fn an_unclaimed_reservation_is_released() {
         // a layout that never builds the pane must not leave the name spoken for forever
-        drop(Reservation::hold(["quiet-pangolin".to_owned()]));
-        assert_eq!(registry().get("quiet-pangolin"), None);
+        let wanted = reserved_for_tests("unclaimed");
+        drop(Reservation::hold([wanted.clone()]));
+        assert_eq!(registry().get(&wanted), None);
     }
 }
