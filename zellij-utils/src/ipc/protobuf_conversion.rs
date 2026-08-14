@@ -1171,6 +1171,7 @@ impl From<crate::input::actions::Action>
             ListClientsAction,
             ListPanesAction,
             ListTabsAction,
+            ListTreeAction,
             MouseEventAction,
             MoveFocusAction,
             MoveFocusOrTabAction,
@@ -1214,6 +1215,7 @@ impl From<crate::input::actions::Action>
             RenameTerminalPaneAction,
             ResizeAction,
             ResizeByPaneIdAction,
+            ResolvePaneTargetAction,
             RunAction,
             SaveSessionAction,
             ScrollDownAction,
@@ -1963,6 +1965,12 @@ impl From<crate::input::actions::Action>
             }),
             crate::input::actions::Action::ListClients { output_json } => {
                 ActionType::ListClients(ListClientsAction { output_json })
+            },
+            crate::input::actions::Action::ResolvePaneTarget { target } => {
+                ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
+            },
+            crate::input::actions::Action::ListTree { output_json } => {
+                ActionType::ListTree(ListTreeAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2910,6 +2918,12 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 })
             },
             ActionType::ListClients(a) => Ok(crate::input::actions::Action::ListClients {
+                output_json: a.output_json,
+            }),
+            ActionType::ResolvePaneTarget(a) => {
+                Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
+            },
+            ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
                 output_json: a.output_json,
             }),
             ActionType::ListPanes(list_panes_action) => {
@@ -4742,6 +4756,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::TiledPaneLay
             // Not carried across this contract: `restored_from` is provenance the SERVER assigns
             // when it rebuilds a pane from a serialized session, never something a sender declares.
             restored_from: None,
+            // Not carried across this contract for the same reason as `restored_from`: a pane's
+            // handle is the server's to assign, never something a sender declares.
+            pane_handle: None,
             children_split_direction,
             name: layout.name,
             children: children?,
@@ -4781,6 +4798,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::FloatingPane
             // Not carried across this contract: `restored_from` is provenance the SERVER assigns
             // when it rebuilds a pane from a serialized session, never something a sender declares.
             restored_from: None,
+            // Not carried across this contract for the same reason as `restored_from`: a pane's
+            // handle is the server's to assign, never something a sender declares.
+            pane_handle: None,
             name: layout.name,
             height,
             width,

@@ -41,6 +41,9 @@ pub struct PaneLayoutManifest {
     /// The uuid this pane had when the session was serialized. A pane restored from this manifest
     /// gets a NEW uuid and reports this one as `restored_from`.
     pub pane_uuid: Option<String>,
+    /// The handle this pane answers to. A pane restored from this manifest comes back at the same
+    /// handle - that is the difference between an address and a lineage.
+    pub pane_handle: Option<String>,
 }
 
 pub fn serialize_session_layout(
@@ -194,6 +197,14 @@ fn serialize_tiled_pane(
         tiled_pane_node
             .entries_mut()
             .push(KdlEntry::new_prop("pane_uuid", uuid.to_owned()));
+    }
+    // The pane's handle, written so the pane restored from this layout comes back at the same
+    // address. Unlike the uuid above, this one is not provenance - it IS the restored pane's
+    // handle.
+    if let Some(ref handle) = layout.pane_handle {
+        tiled_pane_node
+            .entries_mut()
+            .push(KdlEntry::new_prop("pane_handle", handle.to_owned()));
     }
     if let Some(ref fg) = layout.default_fg {
         tiled_pane_node
@@ -690,6 +701,14 @@ fn serialize_floating_pane(
             .entries_mut()
             .push(KdlEntry::new_prop("pane_uuid", uuid.to_owned()));
     }
+    // The pane's handle, written so the pane restored from this layout comes back at the same
+    // address. Unlike the uuid above, this one is not provenance - it IS the restored pane's
+    // handle.
+    if let Some(ref handle) = layout.pane_handle {
+        floating_pane_node
+            .entries_mut()
+            .push(KdlEntry::new_prop("pane_handle", handle.to_owned()));
+    }
     if let Some(ref fg) = layout.default_fg {
         floating_pane_node
             .entries_mut()
@@ -793,6 +812,7 @@ fn tiled_pane_layout_from_manifest(
         default_fg,
         default_bg,
         restored_from: manifest.and_then(|m| m.pane_uuid.clone()),
+        pane_handle: manifest.and_then(|m| m.pane_handle.clone()),
         ..Default::default()
     }
 }
@@ -904,6 +924,7 @@ fn get_floating_panes_layout_from_panegeoms(
                 default_fg: m.default_fg.clone(),
                 default_bg: m.default_bg.clone(),
                 restored_from: m.pane_uuid.clone(),
+                pane_handle: m.pane_handle.clone(),
             }
         })
         .collect()
@@ -2263,7 +2284,14 @@ mod restored_from_tests {
     use super::*;
     use crate::input::layout::{Layout, TiledPaneLayout};
 
-    fn manifest_with_uuid(uuid: Option<&str>) -> PaneLayoutManifest {
+    pub(super) fn manifest_with_handle(handle: Option<&str>) -> PaneLayoutManifest {
+        PaneLayoutManifest {
+            pane_handle: handle.map(|h| h.to_owned()),
+            ..manifest_with_uuid(None)
+        }
+    }
+
+    pub(super) fn manifest_with_uuid(uuid: Option<&str>) -> PaneLayoutManifest {
         PaneLayoutManifest {
             geom: Default::default(),
             run: None,
@@ -2275,10 +2303,11 @@ mod restored_from_tests {
             default_fg: None,
             default_bg: None,
             pane_uuid: uuid.map(|u| u.to_owned()),
+            pane_handle: None,
         }
     }
 
-    fn parse_single_pane(kdl: &str) -> TiledPaneLayout {
+    pub(super) fn parse_single_pane(kdl: &str) -> TiledPaneLayout {
         let layout = Layout::from_kdl(kdl, None, None, None).expect("layout parses");
         layout
             .template
@@ -2331,5 +2360,79 @@ mod restored_from_tests {
         // `pane_uuid` is written by serialization, never by a user - its absence is the normal case
         let parsed = parse_single_pane("layout {\n    pane name=\"shell\"\n}");
         assert_eq!(parsed.restored_from, None);
+    }
+}
+
+#[cfg(test)]
+mod pane_handle_tests {
+    use super::restored_from_tests::{manifest_with_handle, parse_single_pane};
+    use super::*;
+
+    #[test]
+    fn a_serialized_pane_records_the_handle_it_answers_to() {
+        let layout =
+            tiled_pane_layout_from_manifest(Some(&manifest_with_handle(Some("sunny-otter"))), None);
+        assert_eq!(layout.pane_handle.as_deref(), Some("sunny-otter"));
+    }
+
+    #[test]
+    fn the_handle_survives_the_kdl_round_trip_unchanged() {
+        // the whole point: the uuid rotates across a restore and the handle does not, so an
+        // address written down before the restart still reaches the same pane after it
+        let manifest = manifest_with_handle(Some("sunny-otter"));
+        let layout = tiled_pane_layout_from_manifest(Some(&manifest), None);
+        let kdl = serialize_tiled_pane(&layout, false, &mut BTreeMap::new()).to_string();
+        assert!(
+            kdl.contains("pane_handle=\"sunny-otter\""),
+            "expected the handle in the serialized layout, got: {}",
+            kdl
+        );
+        let parsed = parse_single_pane(&format!("layout {{\n{}\n}}", kdl));
+        assert_eq!(parsed.pane_handle.as_deref(), Some("sunny-otter"));
+    }
+
+    #[test]
+    fn a_floating_panes_handle_round_trips_too() {
+        let mut layout = FloatingPaneLayout::new();
+        layout.pane_handle = Some("merry-narwhal".to_owned());
+        let kdl = serialize_floating_pane(&layout, &mut BTreeMap::new()).to_string();
+        assert!(
+            kdl.contains("pane_handle=\"merry-narwhal\""),
+            "got: {}",
+            kdl
+        );
+    }
+
+    #[test]
+    fn a_snapshot_saved_before_handles_existed_carries_none() {
+        // the old-snapshot case: the layout says nothing, and the restored pane must end up with
+        // the handle it generated for itself rather than an empty one
+        let layout = tiled_pane_layout_from_manifest(Some(&manifest_with_handle(None)), None);
+        assert_eq!(layout.pane_handle, None);
+        let kdl = serialize_tiled_pane(&layout, false, &mut BTreeMap::new()).to_string();
+        assert!(!kdl.contains("pane_handle"), "got: {}", kdl);
+        let parsed = parse_single_pane(&format!("layout {{\n{}\n}}", kdl));
+        assert_eq!(parsed.pane_handle, None);
+    }
+
+    #[test]
+    fn a_hand_written_layout_needs_no_handle() {
+        // `pane_handle` is written by serialization, never by a user
+        let parsed = parse_single_pane("layout {\n    pane name=\"shell\"\n}");
+        assert_eq!(parsed.pane_handle, None);
+    }
+
+    #[test]
+    fn a_layouts_handles_are_collected_for_reservation() {
+        // the applier reserves these before building anything, so nested panes must be reached
+        let mut child = TiledPaneLayout::default();
+        child.pane_handle = Some("quiet-pangolin".to_owned());
+        let mut parent = TiledPaneLayout::default();
+        parent.pane_handle = Some("sunny-otter".to_owned());
+        parent.children = vec![child, TiledPaneLayout::default()];
+        assert_eq!(
+            parent.pane_handles(),
+            vec!["sunny-otter".to_owned(), "quiet-pangolin".to_owned()]
+        );
     }
 }

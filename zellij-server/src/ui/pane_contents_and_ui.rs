@@ -362,6 +362,8 @@ impl<'a> PaneContentsAndUi<'a> {
         });
         let frame_is_dimmed = self.frame_is_dimmed_for_client(client_id);
         let guest_choice_indicator = self.pane.guest_choice_indicator(client_id);
+        // fork addition: the frame draws the handle the pane is addressed by
+        let pane_handle = self.pane.pane_handle();
         let frame_params = if session_is_mirrored {
             FrameParams {
                 focused_client,
@@ -386,6 +388,7 @@ impl<'a> PaneContentsAndUi<'a> {
                 frame_geom_override: self.frame_geom_override,
                 stack_list_entry: stack_list_entry.clone(),
                 blank_title: self.blank_title,
+                pane_handle: pane_handle.clone(),
                 top_only_frames: self.top_only_frames,
                 mouse_scroll_resize: self.mouse_scroll_resize,
                 dimmed: frame_is_dimmed,
@@ -415,6 +418,7 @@ impl<'a> PaneContentsAndUi<'a> {
                 frame_geom_override: self.frame_geom_override,
                 stack_list_entry,
                 blank_title: self.blank_title,
+                pane_handle,
                 top_only_frames: self.top_only_frames,
                 mouse_scroll_resize: self.mouse_scroll_resize,
                 dimmed: frame_is_dimmed,

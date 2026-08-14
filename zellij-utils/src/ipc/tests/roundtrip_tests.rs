@@ -2140,6 +2140,7 @@ fn test_client_messages() {
                 },
                 FloatingPaneLayout {
                     restored_from: None,
+                    pane_handle: None,
                     name: Some("third floating layout".to_owned()),
                     height: Some(PercentOrFixed::Percent(10)),
                     width: Some(PercentOrFixed::Fixed(20)),
