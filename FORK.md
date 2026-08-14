@@ -193,6 +193,33 @@ process **group**, and escalates to SIGKILL after 200ms. A caller that polls `ze
 Dead sessions get an `(EXITED)` suffix. The name is still the first whitespace-separated field, so
 `cut`/`awk` parsing is unaffected.
 
+### The commands the output convention changed
+
+Everything below follows [the CLI output convention](#the-cli-output-convention); this is the list
+of what moved to get there.
+
+| Command | Now |
+|---|---|
+| `list-panes` | every column, always, plus `HANDLE`. `--all` keeps only its row-set meaning: include the panes you cannot select |
+| `list-tabs` | every column, always. The gating flags stay accepted and do nothing |
+| `list-clients` | gains `TTY`, `SIZE` and `CURRENT` — the fields that were reachable only through `--json` |
+| `ls` | a table: `NAME STATUS CURRENT CLIENTS CREATED`. `-s` is untouched |
+| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2. `--no-focus` stays the existence probe, answering `id: <n>` |
+| `close-pane` | `closed: terminal_3` |
+| `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
+| `move-tab` | `from:` and `to:` display positions |
+| `new-pane`, `new-tab`, `break-pane`, `launch-or-focus-plugin` | `pane_id:` / `tab_id:` / `handle:` instead of a bare id |
+| `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2 |
+| `query-tab-names` | gone. `list-tabs` answers it |
+
+Two of those are refusals rather than shapes, and they are the same refusal: a `zellij action`
+client is attached to nothing, so "the focused pane" resolves against whichever client the server
+can find. From inside a pane that is right and is the point. From a script it is a pane the caller
+has never seen — which is a wrong answer for `dump-screen` and a closed tab for `close-tab`. So
+`close-pane`, `close-tab`, `move-tab` and `break-pane` exit 1 from outside the session unless they
+name a target, and `break-pane-right`/`break-pane-left`, which cannot name one, are refused
+outright. Inside a pane, nothing changes.
+
 ### `attach --no-resurrect`
 
 ```

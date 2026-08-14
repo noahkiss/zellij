@@ -1,4 +1,5 @@
 use dialoguer::Confirm;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::{path::PathBuf, process, time::Duration};
 
@@ -837,6 +838,17 @@ fn attach_with_cli_client(
             ),
         }
     };
+    // a command that acts on "the focused thing" is only meaningful from inside the session that
+    // has the focus. From a script it resolves to a pane the caller has never seen
+    let inside_the_session = envs::get_session_name()
+        .map(|ambient| ambient == session_name)
+        .unwrap_or(false);
+    if let Some(message) =
+        zellij_utils::cli::missing_target_from_outside_a_pane(&cli_action, inside_the_session)
+    {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
     match Action::actions_from_cli(
         cli_action,
         Box::new(get_current_dir),
@@ -912,14 +924,17 @@ fn attach_with_session_name(
                     "Ambiguous selection: multiple sessions names start with '{}':",
                     prefix
                 );
+                // the names are the answer here, and the ages are not known - `--short` is the
+                // listing that says only what this caller has
                 print_sessions(
                     sessions
                         .iter()
                         .map(|s| (s.clone(), Duration::default(), false))
                         .collect(),
                     false,
-                    false,
                     true,
+                    true,
+                    &BTreeMap::new(),
                 );
                 process::exit(1);
             },
@@ -1369,14 +1384,17 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
                     "Ambiguous selection: multiple sessions names start with '{}':",
                     prefix
                 );
+                // the names are the answer here, and the ages are not known - `--short` is the
+                // listing that says only what this caller has
                 print_sessions(
                     sessions
                         .iter()
                         .map(|s| (s.clone(), Duration::default(), false))
                         .collect(),
                     false,
-                    false,
                     true,
+                    true,
+                    &BTreeMap::new(),
                 );
                 process::exit(1);
             },

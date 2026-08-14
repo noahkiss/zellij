@@ -46,7 +46,10 @@ pub struct ActionCompletionResult {
     pub affected_pane_id: Option<PaneId>,
     pub affected_tab_id: Option<usize>,
     pub error_message: Option<String>,
-    pub stdout_message: Option<String>,
+    /// The report the CLI prints, already in its final shape and order. It leaves the server as one
+    /// message: the CLI client stops reading at the first one it gets, so a report split over two
+    /// sends loses whichever half arrives second.
+    pub stdout_lines: Vec<String>,
 }
 
 impl ActionCompletionResult {
@@ -58,7 +61,7 @@ impl ActionCompletionResult {
             affected_pane_id: None,
             affected_tab_id: None,
             error_message: Some(error_message),
-            stdout_message: None,
+            stdout_lines: Vec::new(),
         }
     }
     /// The wait for the action's result ran out. The exit stays non-zero, because the caller was
@@ -133,7 +136,7 @@ pub struct NotificationEnd {
     affected_pane_id: Option<PaneId>, // optional payload of the pane id affected by this action
     affected_tab_id: Option<usize>,   // optional payload of the tab id affected by this action
     error_message: Option<String>,
-    stdout_message: Option<String>,
+    stdout_lines: Vec<String>,
 }
 
 impl Clone for NotificationEnd {
@@ -146,7 +149,7 @@ impl Clone for NotificationEnd {
             affected_pane_id: self.affected_pane_id,
             affected_tab_id: self.affected_tab_id,
             error_message: self.error_message.clone(),
-            stdout_message: self.stdout_message.clone(),
+            stdout_lines: self.stdout_lines.clone(),
         }
     }
 }
@@ -160,7 +163,7 @@ impl NotificationEnd {
             affected_pane_id: None,
             affected_tab_id: None,
             error_message: None,
-            stdout_message: None,
+            stdout_lines: Vec::new(),
         }
     }
 
@@ -175,7 +178,7 @@ impl NotificationEnd {
             affected_pane_id: None,
             affected_tab_id: None,
             error_message: None,
-            stdout_message: None,
+            stdout_lines: Vec::new(),
         }
     }
 
@@ -195,8 +198,16 @@ impl NotificationEnd {
         self.error_message = Some(message);
     }
 
+    /// The one report this action prints. Calling it again replaces the report rather than adding
+    /// to it, because a command answers once.
     pub fn set_stdout_message(&mut self, message: String) {
-        self.stdout_message = Some(message);
+        self.stdout_lines = vec![message];
+    }
+
+    /// The same, for a report that takes more than one line - `from:` and `to:`, say. The lines are
+    /// printed in the order given.
+    pub fn set_stdout_lines(&mut self, lines: Vec<String>) {
+        self.stdout_lines = lines;
     }
 
     pub fn unblock_condition(&self) -> Option<UnblockCondition> {
@@ -212,7 +223,7 @@ impl Drop for NotificationEnd {
                 affected_pane_id: self.affected_pane_id,
                 affected_tab_id: self.affected_tab_id,
                 error_message: self.error_message.take(),
-                stdout_message: self.stdout_message.take(),
+                stdout_lines: std::mem::take(&mut self.stdout_lines),
             };
             let _ = tx.send(result);
         }
@@ -259,6 +270,8 @@ pub(crate) fn route_action(
     let mut should_break = false;
     let err_context = || format!("failed to route action for client {client_id}");
     let action_name = action.to_string();
+    // read off the action before the match below consumes it
+    let id_keys = IdReportKeys::for_action(&action);
 
     if !action.is_mouse_action() {
         // mouse actions should only send InputReceived to plugins
@@ -506,6 +519,14 @@ pub(crate) fn route_action(
             pane_id,
             ansi,
         } => {
+            if pane_id.is_none() && cli_client_id.is_some() {
+                // dumping "the focused pane" from outside a pane means dumping whichever pane the
+                // session happens to be on, which is nobody's intent. Answering with the panes
+                // that could have been asked for turns a wrong dump into a choice
+                let targets = available_pane_targets(&senders).with_context(err_context)?;
+                send_error_to_client(cli_client_id, os_input.as_ref(), &targets.join("\n"));
+                return Ok((should_break, None));
+            }
             senders
                 .send_to_screen(ScreenInstruction::DumpScreen(
                     file_path,
@@ -1792,10 +1813,10 @@ pub(crate) fn route_action(
             drop(NotificationEnd::new(completion_tx));
         },
         Action::ListPanes {
-            show_tab,
-            show_command,
-            show_state,
-            show_geometry,
+            show_tab: _,
+            show_command: _,
+            show_state: _,
+            show_geometry: _,
             show_all,
             output_json,
         } => {
@@ -1806,13 +1827,11 @@ pub(crate) fn route_action(
                 let output_lines = if output_json {
                     format_panes_as_json(&pane_entries)
                 } else {
-                    format_panes_table(
-                        &pane_entries,
-                        show_tab || show_all,
-                        show_command || show_all,
-                        show_state || show_all,
-                        show_geometry || show_all,
-                    )
+                    // every column, every time: the flags that used to gate them stay accepted so
+                    // that a script asking for one is not an error, but asking is now a no-op.
+                    // `--all` keeps the one meaning the columns never shared with it - which ROWS
+                    // the table has, non-selectable panes included
+                    format_panes_table(&pane_entries, true, true, true, true)
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -1822,11 +1841,11 @@ pub(crate) fn route_action(
             drop(NotificationEnd::new(completion_tx));
         },
         Action::ListTabs {
-            show_state,
-            show_dimensions,
-            show_panes,
-            show_layout,
-            show_all,
+            show_state: _,
+            show_dimensions: _,
+            show_panes: _,
+            show_layout: _,
+            show_all: _,
             output_json,
         } => {
             let maybe_tabs =
@@ -1836,13 +1855,9 @@ pub(crate) fn route_action(
                 let output_lines = if output_json {
                     format_tabs_as_json(&tab_infos)
                 } else {
-                    format_tabs_table(
-                        &tab_infos,
-                        show_state || show_all,
-                        show_dimensions || show_all,
-                        show_panes || show_all,
-                        show_layout || show_all,
-                    )
+                    // every column, every time - see `list-panes` above. A tab has no row-set
+                    // question, so `--all` here means nothing at all beyond staying accepted
+                    format_tabs_table(&tab_infos, true, true, true, true)
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -2303,20 +2318,15 @@ pub(crate) fn route_action(
                 );
             }
         }
-    } else if let Some(stdout_message) = &result.stdout_message {
-        if let Some(cli_client_id) = cli_client_id {
-            if let Some(ref os_input) = os_input {
-                let _ = os_input.send_to_client(
-                    cli_client_id,
-                    ServerToClientMsg::Log {
-                        lines: vec![stdout_message.clone()],
-                    },
-                );
-            }
-        }
-    } else if let Some(exit_status) = result.exit_status {
-        if let Some(cli_client_id) = cli_client_id {
-            if let Some(ref os_input) = os_input {
+    } else if let Some(cli_client_id) = cli_client_id {
+        // the report is only built for a CLI client: a plugin reads the ids off the result itself,
+        // and the handle lookup below is a question worth asking only when someone will read it
+        let report = cli_report(&result, &id_keys, &senders);
+        if let Some(ref os_input) = os_input {
+            if !report.is_empty() {
+                let _ = os_input
+                    .send_to_client(cli_client_id, ServerToClientMsg::Log { lines: report });
+            } else if let Some(exit_status) = result.exit_status {
                 let _ = os_input.send_to_client(
                     cli_client_id,
                     ServerToClientMsg::Exit {
@@ -2326,33 +2336,117 @@ pub(crate) fn route_action(
             }
         }
     }
-    // Return tab ID to CLI clients as plain text
-    if let Some(tab_id) = result.affected_tab_id {
-        if let Some(cli_client_id) = cli_client_id {
-            if let Some(ref os_input) = os_input {
-                let _ = os_input.send_to_client(
-                    cli_client_id,
-                    ServerToClientMsg::Log {
-                        lines: vec![tab_id.to_string()],
-                    },
-                );
-            }
-        }
-    }
-    // Return pane ID to CLI clients as plain text
-    if let Some(pane_id) = result.affected_pane_id {
-        if let Some(cli_client_id) = cli_client_id {
-            if let Some(ref os_input) = os_input {
-                let _ = os_input.send_to_client(
-                    cli_client_id,
-                    ServerToClientMsg::Log {
-                        lines: vec![pane_id.to_string()],
-                    },
-                );
-            }
-        }
-    }
     Ok((should_break, Some(result)))
+}
+
+/// The keys an action names its ids with.
+///
+/// The ids themselves are set deep in `Screen`, which knows what happened but not what the command
+/// that asked was called. The key is that missing half, so it is decided here, next to the action.
+struct IdReportKeys {
+    tab: &'static str,
+    pane: &'static str,
+}
+
+impl IdReportKeys {
+    fn for_action(action: &Action) -> Self {
+        match action {
+            // `go-to-tab*` reports a tab it is already talking about, so `id:` is the whole answer
+            // and `tab_id:` would only repeat the subject
+            Action::GoToTab { .. } | Action::GoToTabName { .. } | Action::GoToTabById { .. } => {
+                IdReportKeys {
+                    tab: "id",
+                    pane: "pane_id",
+                }
+            },
+            _ => IdReportKeys {
+                tab: "tab_id",
+                pane: "pane_id",
+            },
+        }
+    }
+}
+
+/// The lines the CLI prints for a completed action, as one report.
+///
+/// An action that wrote its own report has said everything it means to say; the ids are the
+/// fallback for the ones that only handed back what they made.
+fn cli_report(
+    result: &ActionCompletionResult,
+    id_keys: &IdReportKeys,
+    senders: &ThreadSenders,
+) -> Vec<String> {
+    let mut lines = id_report_lines(result, id_keys);
+    if let Some(pane_id) = result.affected_pane_id {
+        if result.stdout_lines.is_empty() {
+            // the handle is how a human addresses the pane that was just made, so it is printed
+            // with the id rather than left to be looked up
+            if let Some(handle) = handle_of_pane(senders, pane_id) {
+                lines.push(format!("handle: {}", handle));
+            }
+        }
+    }
+    lines
+}
+
+/// The id half of the report, without the handle lookup that needs a live `Screen`.
+fn id_report_lines(result: &ActionCompletionResult, id_keys: &IdReportKeys) -> Vec<String> {
+    if !result.stdout_lines.is_empty() {
+        return result.stdout_lines.clone();
+    }
+    let mut lines = Vec::new();
+    if let Some(tab_id) = result.affected_tab_id {
+        lines.push(format!("{}: {}", id_keys.tab, tab_id));
+    }
+    if let Some(pane_id) = result.affected_pane_id {
+        lines.push(format!("{}: {}", id_keys.pane, pane_id));
+    }
+    lines
+}
+
+/// The panes a command could have been given, grouped by the tab they are in.
+///
+/// This is what a pane-less pane command answers with. It is a list of choices, not a table: the
+/// reader is about to type one of these into `--pane-id`, and the handle is the form they want.
+fn available_pane_targets(senders: &ThreadSenders) -> Result<Vec<String>> {
+    let mut lines = vec!["No pane given. Pass --pane-id with one of:".to_string()];
+    let panes = match request_panes_from_screen(senders, false)? {
+        Some(panes) => panes,
+        None => {
+            lines.push("  (the session did not answer in time)".to_string());
+            return Ok(lines);
+        },
+    };
+    let mut current_tab: Option<usize> = None;
+    for entry in panes {
+        if current_tab != Some(entry.tab_id) {
+            lines.push(format!("  tab {} {}", entry.tab_id, entry.tab_name));
+            current_tab = Some(entry.tab_id);
+        }
+        lines.push(format!(
+            "    {}  {}  {}",
+            entry.pane_info.handle,
+            format_pane_id(&entry.pane_info),
+            entry.pane_info.title
+        ));
+    }
+    Ok(lines)
+}
+
+/// The handle of a live pane, asked of `Screen` because that is where the panes are.
+fn handle_of_pane(senders: &ThreadSenders, pane_id: PaneId) -> Option<String> {
+    let panes = request_panes_from_screen(senders, true).ok()??;
+    panes
+        .iter()
+        .find(|entry| {
+            let entry_id = if entry.pane_info.is_plugin {
+                PaneId::Plugin(entry.pane_info.id)
+            } else {
+                PaneId::Terminal(entry.pane_info.id)
+            };
+            entry_id == pane_id
+        })
+        .map(|entry| entry.pane_info.handle.clone())
 }
 
 // this should only be used for one-off startup instructions
@@ -3214,6 +3308,7 @@ fn build_table_header(
     }
 
     header.push("PANE_ID");
+    header.push("HANDLE");
     header.push("TYPE");
     header.push("TITLE");
 
@@ -3254,6 +3349,7 @@ fn build_table_row(
     }
 
     row.push(format_pane_id(&entry.pane_info));
+    row.push(entry.pane_info.handle.clone());
     row.push(format_pane_type(&entry.pane_info));
     row.push(entry.pane_info.title.clone());
 
@@ -3545,10 +3641,123 @@ mod tests {
             affected_pane_id: None,
             affected_tab_id: Some(123),
             error_message: None,
-            stdout_message: None,
+            stdout_lines: Vec::new(),
         };
 
         assert_eq!(result.affected_tab_id, Some(123));
+    }
+
+    fn pane_entry(id: u32, handle: &str) -> PaneListEntry {
+        let mut pane_info = zellij_utils::data::PaneInfo::default();
+        pane_info.id = id;
+        pane_info.title = format!("pane {}", id);
+        pane_info.handle = handle.to_string();
+        PaneListEntry {
+            pane_info,
+            tab_id: 1,
+            tab_position: 0,
+            tab_name: "tab1".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_pane_table_names_every_pane_by_its_handle() {
+        let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
+        let header = &table[0];
+        assert!(header.contains("HANDLE"), "{}", header);
+        assert!(table[1].contains("sunny-otter"), "{}", table[1]);
+    }
+
+    #[test]
+    fn the_pane_table_prints_all_four_column_groups() {
+        let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
+        let header = &table[0];
+        for column in [
+            "TAB_ID", "TAB_POS", "TAB_NAME", "PANE_ID", "HANDLE", "TYPE", "TITLE", "COMMAND",
+            "CWD", "FOCUSED", "FLOATING", "EXITED", "X", "Y", "ROWS", "COLS",
+        ] {
+            assert!(header.contains(column), "missing {}: {}", column, header);
+        }
+    }
+
+    #[test]
+    fn the_tab_table_prints_all_four_column_groups() {
+        let table = format_tabs_table(&[TabInfo::default()], true, true, true, true);
+        let header = &table[0];
+        for column in [
+            "TAB_ID",
+            "POSITION",
+            "NAME",
+            "ACTIVE",
+            "FULLSCREEN",
+            "SYNC_PANES",
+            "FLOATING_VIS",
+            "VP_ROWS",
+            "VP_COLS",
+            "DA_ROWS",
+            "DA_COLS",
+            "TILED_PANES",
+            "FLOAT_PANES",
+            "HIDDEN_PANES",
+            "SWAP_LAYOUT",
+            "LAYOUT_DIRTY",
+        ] {
+            assert!(header.contains(column), "missing {}: {}", column, header);
+        }
+    }
+
+    fn completion_with(
+        tab_id: Option<usize>,
+        pane_id: Option<PaneId>,
+        stdout_lines: Vec<String>,
+    ) -> ActionCompletionResult {
+        ActionCompletionResult {
+            exit_status: None,
+            affected_pane_id: pane_id,
+            affected_tab_id: tab_id,
+            error_message: None,
+            stdout_lines,
+        }
+    }
+
+    #[test]
+    fn a_created_tab_and_pane_are_reported_as_key_values() {
+        let result = completion_with(Some(3), Some(PaneId::Terminal(7)), vec![]);
+        let keys = IdReportKeys::for_action(&Action::CloseFocus);
+        assert_eq!(
+            id_report_lines(&result, &keys),
+            vec!["tab_id: 3".to_string(), "pane_id: terminal_7".to_string()]
+        );
+    }
+
+    #[test]
+    fn go_to_tab_names_its_tab_id() {
+        let result = completion_with(Some(3), None, vec![]);
+        let keys = IdReportKeys::for_action(&Action::GoToTab { index: 1 });
+        assert_eq!(id_report_lines(&result, &keys), vec!["id: 3".to_string()]);
+    }
+
+    #[test]
+    fn an_action_that_wrote_a_report_keeps_it_whole() {
+        // the ids are the fallback, not an addition: a command that said `from:`/`to:` has already
+        // named the tab, and appending `id:` to it would report the same switch twice
+        let result = completion_with(
+            Some(3),
+            None,
+            vec!["from: 1".to_string(), "to: 3".to_string()],
+        );
+        let keys = IdReportKeys::for_action(&Action::GoToTab { index: 1 });
+        assert_eq!(
+            id_report_lines(&result, &keys),
+            vec!["from: 1".to_string(), "to: 3".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_action_that_reported_nothing_prints_nothing() {
+        let result = completion_with(None, None, vec![]);
+        let keys = IdReportKeys::for_action(&Action::CloseFocus);
+        assert!(id_report_lines(&result, &keys).is_empty());
     }
 
     #[test]
