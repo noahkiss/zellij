@@ -12879,12 +12879,22 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::CloseFocusWithPaneId(pane_id, mut completion_tx) => {
+                let printed_id = screen.pane_summary(pane_id);
                 let all_tabs = screen.get_tabs_mut();
                 let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.close_pane_by_pane_id(pane_id, completion_tx.take())
-                            .non_fatal();
+                        // the report is written here and the channel is NOT handed on to the pane
+                        // being torn down. It used to ride along into the pty thread and drop
+                        // there, after that thread had already broadcast its unblock - so the
+                        // answer was assembled behind the message that ended the command
+                        if let Some(c) = completion_tx.as_mut() {
+                            // the id and not the handle: the pane is gone, and its handle is back
+                            // in circulation for the next pane to be given
+                            c.set_stdout_message(format!("closed: {}", pane_id));
+                        }
+                        drop(completion_tx.take());
+                        tab.close_pane_by_pane_id(pane_id, None).non_fatal();
                         found = true;
                         break;
                     }
@@ -12892,8 +12902,10 @@ pub(crate) fn screen_thread_main(
                 if !found {
                     log::error!("Pane with id {:?} not found", pane_id);
                     if let Some(c) = completion_tx.as_mut() {
-                        c.set_exit_status(1);
-                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
+                        // the miss sentence every pane target answers with, not a debug-formatted
+                        // id: `No pane answers to 'terminal_9'` is the same answer the resolver
+                        // gives for a handle nothing holds
+                        c.set_error_message(format!("No pane answers to '{}'", printed_id));
                     }
                 }
                 screen.render(None)?;

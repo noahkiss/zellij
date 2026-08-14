@@ -2767,14 +2767,12 @@ pub fn close_pane_by_pane_id_for_missing_pane_reports_an_error() {
         client_id,
     );
     mock_screen.teardown(vec![screen_thread]);
-    assert_eq!(result.exit_status, Some(1));
-    assert!(
-        result
-            .error_message
-            .as_ref()
-            .map(|m| m.contains("not found"))
-            .unwrap_or(false),
-        "Expected a 'not found' error, got: {:?}",
+    // a miss, not a failure: the sentence is the one every pane target answers with, and the
+    // exit status is left to the miss convention rather than claimed as an error here
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_999'"),
+        "{:?}",
         result.error_message
     );
 }
@@ -14273,5 +14271,90 @@ pub fn jumping_to_a_pane_in_another_tab_brings_the_tab_with_it() {
         screen.pane_summary_for_client(client_id).as_deref(),
         Some(screen.pane_summary(PaneId::Terminal(1)).as_str()),
         "the client is looking at the pane it was sent to"
+    );
+}
+
+#[test]
+pub fn closing_a_pane_by_id_says_what_it_closed() {
+    // the route the CLI actually takes: `close-pane --pane-id` becomes CloseFocusByPaneId, which
+    // reaches ScreenInstruction::CloseFocusWithPaneId - not the CloseTerminalPane that the older
+    // tests drove and that no CLI invocation sends
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocusByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(1),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.stdout_lines,
+        vec!["closed: terminal_1".to_string()],
+        "{:?}",
+        result.stdout_lines
+    );
+    assert_eq!(result.error_message, None);
+}
+
+#[test]
+pub fn closing_a_pane_id_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocusByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn closing_a_tab_by_id_says_what_it_closed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTabById { id: 0 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.stdout_lines.len(), 1, "{:?}", result.stdout_lines);
+    assert!(
+        result.stdout_lines[0].starts_with("closed: 0 "),
+        "{:?}",
+        result.stdout_lines
     );
 }
