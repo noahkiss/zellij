@@ -1280,23 +1280,30 @@ impl PinOutcome {
 
 /// Put this build at `target`, if it is not there already.
 ///
-/// WRITTEN OVER IN PLACE, never unlinked and replaced. Measured on one machine: macOS keeps a
-/// permission grant when a different build is written over the file the grant names, and the grant
-/// is keyed to that file rather than to its contents - the code signature it recorded is not
-/// enforced for an ad-hoc-signed client. A new inode at the same path is a new client with none of
-/// the grants, so `truncate` is load-bearing and a rename into place would undo the whole point.
+/// WRITTEN TO A TEMP FILE IN THE SAME DIRECTORY AND `rename(2)`d over the target, never in place.
+/// The comment that stood here said the opposite - that the refresh had to keep the inode, because
+/// macOS keys a permission grant to the file rather than the path. That model is refuted. TCC.db
+/// has no inode or device column: a non-bundled client is keyed by absolute PATH plus a recorded
+/// `csreq` requirement the running process has to satisfy. Mysk's 2026-07 write-up overwrites an
+/// executable in place, keeping the inode, and the grants are gone anyway. Path stability is what
+/// earns the pin its place, and a rename preserves the path.
+///
+/// Two reasons for the rename stand on their own, whatever TCC does:
+///
+/// - it is atomic, so no reader ever sees a half-written binary at the pinned path;
+/// - it does not fail `ETXTBSY` against a running server, which holds the pinned copy open for
+///   execution. An in-place refresh under a live session also left the kernel holding the OLD
+///   cdhash for that vnode, and the next launch died with `OS_REASON_CODESIGNING` while
+///   `codesign --verify` called the file valid on disk.
 ///
 /// Whether to write at all is decided by [`compare_builds`], not by a timestamp or a path: the
 /// pinned copy is a COPY, so it is a different file from the binary it came from and only the id
 /// the linker stamped in can say whether it is the same build.
 ///
-/// A write that fails part-way leaves a short file at the pinned path. That is not silent and it is
-/// not permanent: a truncated copy is a different size, so the next `session up` finds it different
-/// and writes it again.
+/// A write that fails part-way leaves nothing behind: the temp file is removed and the pinned path
+/// still holds whatever it held before, which is a working binary rather than a short one.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
-    use std::os::unix::fs::PermissionsExt;
-
     if target.exists() {
         let ours = identify_executable(source.to_path_buf());
         let theirs = identify_executable(target.to_path_buf());
@@ -1305,22 +1312,20 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         }
     }
     let refreshing = target.exists();
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
-    }
+    let directory = pin_directory(target);
+    std::fs::create_dir_all(&directory).map_err(|e| pin_write_error(&directory, &e))?;
     let mut input = std::fs::File::open(source)
         .map_err(|e| format!("could not read {}: {}", source.display(), e))?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(target)
-        .map_err(|e| pin_write_error(target, &e))?;
-    std::io::copy(&mut input, &mut output)
-        .map_err(|e| format!("could not write {}: {}", target.display(), e))?;
-    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not make {} executable: {}", target.display(), e))?;
+    // the same directory, or the rename would cross a filesystem and stop being a rename
+    let temporary = directory.join(format!(".zellij.pin.{}.tmp", std::process::id()));
+    if let Err(reason) = write_pin_temp(&mut input, &temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(reason);
+    }
+    if let Err(error) = std::fs::rename(&temporary, target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(pin_write_error(target, &error));
+    }
     Ok(if refreshing {
         PinOutcome::Refreshed(target.to_path_buf())
     } else {
@@ -1328,23 +1333,47 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     })
 }
 
-/// Why the pinned path could not be opened for writing, saying what to do about the one cause that
-/// is ordinary: the copy is running.
-///
-/// A server keeps the binary it started with, so the pinned copy of a session that is up is being
-/// executed, and no unix will let it be written to. Restarting the session releases it, and the
-/// restart is what the new build was wanted for anyway.
+/// The directory the pinned copy lives in, for a target that may name no directory at all.
 #[cfg(unix)]
-fn pin_write_error(target: &Path, error: &std::io::Error) -> String {
-    if error.raw_os_error() == Some(libc::ETXTBSY) {
+fn pin_directory(target: &Path) -> PathBuf {
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Fill the temp copy and make it executable BEFORE it takes the pinned path, so the file that
+/// appears there is complete and runnable from its first instant.
+#[cfg(unix)]
+fn write_pin_temp(source: &mut std::fs::File, temporary: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut output =
+        std::fs::File::create(temporary).map_err(|e| pin_write_error(temporary, &e))?;
+    std::io::copy(source, &mut output)
+        .map_err(|e| format!("could not write {}: {}", temporary.display(), e))?;
+    output
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("could not make {} executable: {}", temporary.display(), e))
+}
+
+/// Why the pinned copy could not be written, saying what to do about the cause that is ordinary:
+/// the directory is not ours to write in.
+///
+/// There is no `ETXTBSY` case here any more. The copy is written to a temp file and renamed over
+/// the target, and neither step opens a file that is being executed - which is the point of the
+/// rename. A server that is up no longer blocks the refresh of the copy it started from.
+#[cfg(unix)]
+fn pin_write_error(path: &Path, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
         return format!(
-            "the pinned copy at {} is being executed right now, so it cannot be written over. \
-             A server keeps the binary it started with, so restart the session to release it - \
-             `zellij session restart` - and the copy is refreshed on the way back up.",
-            target.display()
+            "could not write {}: {}. The pinned copy is zellij's own, so the directory holding it \
+             has to be writable by the user the session runs as.",
+            path.display(),
+            error
         );
     }
-    format!("could not write {}: {}", target.display(), error)
+    format!("could not write {}: {}", path.display(), error)
 }
 
 /// What to say about a session served by a build that is not this one, if it is.
@@ -1382,10 +1411,12 @@ pub fn build_mismatch_warning(name: &str) -> Option<String> {
 /// proof that what is installed there is no longer what is running. Comparing against whatever
 /// `zellij` happens to be on `PATH` would call a deliberately-mixed setup stale forever.
 ///
-/// The one addition is for [`pin_exe`](crate::session_service::configured_pinned_exe): a pinned
-/// copy cannot be written over while it is being executed, so an upgrade CANNOT change it under a
-/// running server and rule two can never fire. There the binary on `PATH` is the intended source
-/// of that copy, so it is the right thing to compare against.
+/// The one addition is for [`pin_exe`](crate::session_service::configured_pinned_exe): an upgrade
+/// reaches the pinned copy only when something runs `session up`, so between the two the pinned
+/// path still holds the build the server is running and rule two stays silent. There the binary on
+/// `PATH` is the intended source of that copy, so it is the right thing to compare against. Once
+/// the refresh does happen it renames over the pinned path, which unlinks the file this server
+/// started from - and rule one answers.
 pub fn stale_build_notice(session_name: &str, pinned_exe: Option<&Path>) -> Option<String> {
     let running_path = std::env::current_exe().ok()?;
     let running = own_executable()?;
@@ -2304,12 +2335,12 @@ mod tests {
         );
     }
 
-    /// The measured constraint the whole feature rests on: macOS keeps a permission grant when the
-    /// file the grant names is written over, and loses it when a new file takes the path. So the
-    /// refresh has to keep the inode.
+    /// The refresh renames a finished copy over the target rather than writing through the file a
+    /// running server is executing. What TCC keys on is the path, which the rename keeps; what an
+    /// in-place write cost was a live server killed with `OS_REASON_CODESIGNING`.
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn a_refresh_writes_over_the_same_file_rather_than_replacing_it() {
+    fn a_refresh_replaces_the_pinned_file_rather_than_writing_through_it() {
         use std::os::unix::fs::MetadataExt;
 
         let scratch = ScratchDir::new("pin-refresh");
@@ -2321,15 +2352,46 @@ mod tests {
             install_pinned_exe(&source, &target),
             Ok(PinOutcome::Refreshed(target.clone()))
         );
-        assert_eq!(
+        assert_ne!(
             std::fs::metadata(&target).unwrap().ino(),
             before,
-            "the pinned path holds a new file, so a macOS grant would not follow it"
+            "the old file was written through, so a running server keeps executing the new bytes"
         );
         assert_eq!(
             identify_executable(target).build_id,
             Some(vec![0xab; 20]),
             "and it is the new build"
+        );
+    }
+
+    /// The pinned copy is the binary a launcher execs, so a failed refresh must leave the working
+    /// one in place. A directory opens but does not read, which fails the copy after the temp file
+    /// exists - the one window where an in-place write would already have truncated the target.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_write_that_fails_leaves_the_pinned_copy_and_no_temp_behind() {
+        let scratch = ScratchDir::new("pin-fail");
+        let source = scratch.0.join("not-a-file");
+        std::fs::create_dir(&source).expect("a writable temp dir");
+        let target = scratch.write("pinned", &elf_with_build_id(&[0xcd; 20], 4096));
+        let before = std::fs::read(&target).unwrap();
+
+        assert!(install_pinned_exe(&source, &target).is_err());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "the pinned copy was damaged by a refresh that never completed"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed refresh left {:?} behind, and the binary is around 40 MB",
+            leftovers
         );
     }
 

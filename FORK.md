@@ -1352,14 +1352,18 @@ Measured on one machine, with a session at a fixed path and a grant given to it:
 
 - a **symlink never holds a grant** — macOS resolves it and records the versioned target, both when
   launchd runs it and when the path is added by hand in System Settings;
-- a **real file keeps its grant when a different build is written over it** — a changed code
-  signature did not revoke it, and the stored requirement is not enforced for an ad-hoc-signed
-  client;
 - it is **not cached state**: it survived `killall tccd`, a fresh server process, and a reboot.
 
-So the refresh writes **over the same file**, and never unlinks and replaces it: a new inode at the
-same path is a new client with none of the grants. Linux gets the same treatment for the plainer
-half of the problem — a versioned path that disappears on upgrade.
+**The refresh renames a finished copy over the pinned path.** It writes a temp file in the same
+directory, makes it executable, and `rename(2)`s it into place. An earlier version of this feature
+wrote through the existing file instead, on the belief that TCC keyed the grant to the inode. It
+does not: `TCC.db` has no inode column, and a non-bundled client is keyed by absolute path plus a
+recorded code requirement. What the in-place write did cost was real — the kernel kept the OLD
+cdhash for that vnode, so the next launch died with `OS_REASON_CODESIGNING` while
+`codesign --verify` called the file valid on disk, and the session simply never came back. The
+rename is also atomic, and it does not fail `ETXTBSY` against a server that is executing the copy.
+Linux gets the same treatment for the plainer half of the problem — a versioned path that
+disappears on upgrade.
 
 **What decides whether to copy.** [Build identity](#a-warning-when-the-running-session-is-a-different-build),
 not a timestamp. The pinned copy is a copy, so it is a different file from the binary it came from
@@ -1371,9 +1375,9 @@ written — which is every pass but the first after an upgrade, and the binary i
       refreshed the pinned copy at /home/<user>/.local/share/zellij/bin/zellij
 ```
 
-A copy that is **being executed** cannot be written over, which is the ordinary case of a session
-that is already up on the pinned build. That is reported, not swallowed: a server keeps the binary
-it started with anyway, so the restart the message asks for is what the new build was wanted for.
+A refresh under a **running session** is allowed and does not disturb it. The rename leaves the busy
+file in place under a name nobody holds, so the server keeps executing the build it started with
+until it is restarted, and the next start picks up the new copy.
 
 **The unit records the path, and the refresh uses the recorded one.** `up` reads the binary out of
 the installed unit rather than deriving the path again. The canonical directory honours
@@ -2208,10 +2212,11 @@ deletes the old versioned directory, and Linux reports a deleted binary's path w
 suffix, so the file "not existing" is exactly the case that matters. A binary that is merely
 RENAMED is followed, and correctly says nothing.
 
-The one addition is for `pin_exe`: a pinned copy cannot be written over while it is being executed,
-so an upgrade can never change it under a running server and the rule above can never fire. There -
-and only there - the binary on `PATH` is the intended source of that copy, so it is what gets
-compared.
+The one addition is for `pin_exe`: an upgrade reaches the pinned copy only when something runs
+`session up`, so until it does the pinned path still holds the build the server is running and the
+rule above stays silent. There — and only there — the binary on `PATH` is the intended source of
+that copy, so it is what gets compared. Once the refresh runs it renames over the pinned path, which
+unlinks the file the server started from, and the ` (deleted)` rule answers on its own.
 
 ### `pin_exe` covers a session you started by hand
 
@@ -2227,11 +2232,10 @@ the process the grant has to name, and the client is gone from TCC's point of vi
 spawned one. What the user typed keeps running as the client, and `zellij --version` still answers
 for the binary on `PATH`.
 
-The copy is brought up to date first, by the same `install_pinned_exe` `session up` uses — written
-over in place, because a new inode at that path is a new client with none of the grants. When it
-cannot be updated, the current binary is used and the reason is printed. The ordinary cause is
-another session's server already running the pinned copy, and the fallback is not politeness: a
-pinned copy of a different build is a server that would not speak to its client.
+The copy is brought up to date first, by the same `install_pinned_exe` `session up` uses — a temp
+file renamed over the pinned path. When it cannot be updated, the current binary is used and the
+reason is printed. The ordinary cause is a directory this user cannot write, and the fallback is not
+politeness: a pinned copy of a different build is a server that would not speak to its client.
 
 The path is decided once, in `start_client`, where the config is, and reaches `spawn_server` through
 a `OnceLock` rather than through the `ClientOsApi` trait and its test fake.
