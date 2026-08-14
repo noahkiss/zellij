@@ -898,6 +898,34 @@ fn attach_with_cli_client(
         eprintln!("{}", message);
         std::process::exit(1);
     }
+    // `--in-tab` names a tab the way a person does, and the action carries a stable id. The session
+    // is the only thing that knows which is which, so it is asked before the pane is made: a tab
+    // nothing answers to is a miss, and nothing is created
+    let mut cli_action = cli_action;
+    if let Some(wanted) = cli_action.in_tab_target().map(|t| t.to_owned()) {
+        let found = zellij_client::cli_client::resolve_tab_target(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            &wanted,
+        );
+        match found {
+            Ok(Some(tab_id)) => cli_action.place_in_tab(tab_id),
+            Ok(None) => {
+                eprintln!(
+                    "No tab answers to '{}'. `zellij action list-tabs` lists them by TAB_ID and \
+                     NAME.",
+                    wanted
+                );
+                std::process::exit(2);
+            },
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            },
+        }
+    }
     // the text these two write can come from stdin. It is read here, after the refusals above, so a
     // call that was never going to reach a pane does not drain the pipe on its way out
     let cli_action = match cli_action {

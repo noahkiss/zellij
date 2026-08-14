@@ -209,18 +209,21 @@ fn pipe_client(
     }
 }
 
-/// Asks the running session which pane a handle or uuid names.
+/// Asks the running session one question, on a connection opened for it and closed after it.
 ///
-/// The CLI holds a string; only the server holds the panes. This is that one question, asked on its
-/// own short-lived connection before the real action is built - so by the time the action leaves,
-/// it names a pane id like it always did, and nothing downstream has to know a handle existed.
+/// The CLI holds a string; only the server holds the panes and the tabs. So a question that has to
+/// be answered before the real action can be built is asked here, ahead of it, and what comes back
+/// is the report's own lines - `Ok(vec![])` when the command found nothing to report, which is how
+/// a probe says "not there".
 ///
-/// `Err` carries the server's own message, which is what the caller prints before exiting 2.
-pub fn resolve_pane_target(
+/// `subject` is what the question was about, and appears in the message if the session does not
+/// answer. `Err` carries the server's own words wherever it had any.
+fn ask(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
-    target: &str,
-) -> Result<PaneId, String> {
+    action: Action,
+    subject: &str,
+) -> Result<Vec<String>, String> {
     let zellij_ipc_pipe: PathBuf = {
         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
         fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
@@ -231,42 +234,99 @@ pub fn resolve_pane_target(
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
     os_input.connect_to_server(&*zellij_ipc_pipe);
     os_input.send_to_server(ClientToServerMsg::Action {
-        action: Action::ResolvePaneTarget {
-            target: target.to_owned(),
-        },
+        action,
         terminal_id: None,
         client_id: None,
         is_cli_client: true,
     });
-    let resolved = loop {
+    let answer = loop {
         match os_input.recv_from_server() {
-            Some((ServerToClientMsg::Log { lines }, _)) => {
-                // `pane_id: terminal_7`, the key-value shape every reporting command answers in
-                break lines
-                    .first()
-                    .and_then(|line| line.strip_prefix("pane_id: "))
-                    .ok_or_else(|| format!("Could not read the resolved pane for '{}'", target))
-                    .and_then(|id| {
-                        PaneId::from_str(id).map_err(|e| {
-                            format!("Could not read the resolved pane for '{}': {}", target, e)
-                        })
-                    });
-            },
-            Some((ServerToClientMsg::LogError { lines }, _)) => {
-                break Err(lines.join("\n"));
-            },
+            Some((ServerToClientMsg::Log { lines }, _)) => break Ok(lines),
+            // the server is free again and said nothing: the command reported nothing, which for a
+            // question means the thing it asked about is not there
+            Some((ServerToClientMsg::UnblockInputThread, _)) => break Ok(Vec::new()),
+            Some((ServerToClientMsg::LogError { lines }, _)) => break Err(lines.join("\n")),
             Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
                 break Err(match exit_reason {
                     ExitReason::Error(e) => e,
-                    _ => format!("The session exited while resolving '{}'", target),
+                    _ => format!("The session exited while asking about '{}'", subject),
                 });
             },
             Some(_) => {},
-            None => break Err(format!("The session did not answer for '{}'", target)),
+            None => break Err(format!("The session did not answer for '{}'", subject)),
         }
     };
     os_input.send_to_server(ClientToServerMsg::ClientExited);
-    resolved
+    answer
+}
+
+/// Asks the running session which pane a handle or uuid names.
+///
+/// Asked before the real action is built - so by the time the action leaves, it names a pane id like
+/// it always did, and nothing downstream has to know a handle existed.
+///
+/// `Err` carries the server's own message, which is what the caller prints before exiting 2.
+pub fn resolve_pane_target(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    target: &str,
+) -> Result<PaneId, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ResolvePaneTarget {
+            target: target.to_owned(),
+        },
+        target,
+    )?;
+    // `pane_id: terminal_7`, the key-value shape every reporting command answers in
+    lines
+        .first()
+        .and_then(|line| line.strip_prefix("pane_id: "))
+        .ok_or_else(|| format!("Could not read the resolved pane for '{}'", target))
+        .and_then(|id| {
+            PaneId::from_str(id)
+                .map_err(|e| format!("Could not read the resolved pane for '{}': {}", target, e))
+        })
+}
+
+/// Asks the running session which tab a name or a stable id names.
+///
+/// `Ok(None)` is the miss: the session answered, and no tab is that one. Both forms are read out of
+/// the same `list-tabs` answer, so an id that no tab holds is a miss like a name that no tab has,
+/// rather than a number that quietly reaches nothing.
+pub fn resolve_tab_target(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    wanted: &str,
+) -> Result<Option<usize>, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ListTabs {
+            show_state: false,
+            show_dimensions: false,
+            show_panes: false,
+            show_layout: false,
+            show_all: false,
+            output_json: true,
+        },
+        wanted,
+    )?;
+    let tabs: Vec<zellij_utils::data::TabInfo> = serde_json::from_str(&lines.join("\n"))
+        .map_err(|e| format!("Could not read the session's tabs: {}", e))?;
+    // an all-digits value is the stable id from the TAB_ID column; anything else is a name. A tab
+    // may be *named* "3", and the id is what wins - the names are the caller's to change
+    if let Ok(id) = wanted.parse::<usize>() {
+        if tabs.iter().any(|tab| tab.tab_id == id) {
+            return Ok(Some(id));
+        }
+        return Ok(None);
+    }
+    Ok(tabs
+        .iter()
+        .find(|tab| tab.name == wanted)
+        .map(|tab| tab.tab_id))
 }
 
 /// Whether this action's answer is a report of its own, rather than "the server is free again".

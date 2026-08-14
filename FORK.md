@@ -308,11 +308,17 @@ is trusted to mean it. And because that variable is written when a pane is spawn
 updated in a shell that is already running — so after `zellij action rename-session`, panes that
 predate the rename read as outside the session until they are replaced.
 
-### Where a new pane goes: `--new-tab`
+### Where a new pane goes: `--new-tab`, `--in-tab`
 
-`new-pane` placed a pane beside the focused one, or in the tab `--tab-id` named. `--new-tab` says it
-without needing the focus to be anywhere in particular, which is what a script has: it makes the tab
-and puts the pane in it, and reports both.
+`new-pane` placed a pane beside the focused one, or in the tab `--tab-id` named. Two flags say it
+without needing the focus to be anywhere in particular, which is what a script has:
+
+```
+zellij action new-pane --new-tab build -- cargo test    # a tab of its own, made now
+zellij action new-pane --in-tab logs -- tail -f app.log # into that tab, without going there
+```
+
+**`--new-tab [NAME]`** makes the tab and puts the pane in it, and reports both.
 
 ```
 $ zellij action new-pane --new-tab build -- cargo test
@@ -330,6 +336,25 @@ they mean elsewhere. The flags that say where a pane goes in an existing tab - `
 `--new-tab` has already answered that question. So is bare `--blocking`: it waits for a pane to
 close and cannot name a pane in a tab that does not exist yet. `--block-until-exit` and its two
 siblings do work - they wait on the tab's first pane, which is this one.
+
+**`--in-tab <name-or-id>`** puts the pane in a tab that already exists:
+
+```
+$ zellij action new-pane --in-tab logs -- tail -f app.log
+pane_id: terminal_11
+handle: merry-narwhal
+```
+
+A value that is all digits is read as the stable `TAB_ID`, and anything else as a tab name — both
+are looked up in the same `list-tabs` answer, so an id no tab holds is a miss exactly like a name no
+tab has: exit 2, nothing created. A tab *named* `3` is reachable by its own id rather than by that
+name, which is the one case the two forms disagree about; the names are the caller's to change.
+
+**Nothing moves the focus** — not the caller's, and not that of whoever is attached. `--in-tab` is
+`--tab-id` with a name lookup and `--no-focus` built in, because a script that puts a pane in
+another tab has not asked to be taken there, and a `zellij action` client that "focuses" something
+is moving a focus that belongs to somebody else. `--tab-id` is the spelling for a caller that does
+want the view to follow.
 
 ### Text on stdin: `write-chars` and `paste`
 

@@ -1273,8 +1273,8 @@ pub enum CliAction {
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
     /// handle>`. Without --direction the pane splits whichever side has the most room.
     ///
-    /// Where it lands: beside the focused pane by default, in the tab --tab-id names, or in a tab
-    /// of its own with --new-tab, which reports `tab_id:` too.
+    /// Where it lands: beside the focused pane by default, in the tab --in-tab or --tab-id names, or
+    /// in a tab of its own with --new-tab, which reports `tab_id:` too.
     NewPane {
         /// Split the pane it opens beside towards right or down. Without it, zellij splits
         /// whichever side has the most room
@@ -1426,6 +1426,18 @@ pub enum CliAction {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
+        /// A tab that already exists, by name or by stable id, without going there: nothing moves
+        /// the focus. A tab nothing answers to is a miss and nothing is created
+        #[clap(
+            long,
+            value_name = "NAME_OR_ID",
+            value_parser,
+            conflicts_with("tab_id"),
+            conflicts_with("new_tab"),
+            conflicts_with("near_current_pane"),
+            conflicts_with("in_place")
+        )]
+        in_tab: Option<String>,
     },
     /// Open a file in a new pane running your $EDITOR
     ///
@@ -2299,6 +2311,40 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
         .unwrap()
 }
 
+impl CliAction {
+    /// The tab `--in-tab` named, for the caller that can ask the session which tab that is.
+    ///
+    /// The flag takes a name or a stable id, and neither can be turned into the `--tab-id` the
+    /// action carries without the session's own list of tabs. So the CLI asks first and rewrites
+    /// the request with [`CliAction::place_in_tab`]; nothing downstream knows the flag existed.
+    pub fn in_tab_target(&self) -> Option<&str> {
+        match self {
+            CliAction::NewPane { in_tab, .. } => in_tab.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Puts the pane in the tab `--in-tab` turned out to name, and leaves every focus alone.
+    ///
+    /// `no_focus` is the flag's whole point rather than a default it happens to take: a script that
+    /// puts a pane in another tab has not asked to be taken there, and a `zellij action` client
+    /// that "focuses" something is moving a focus that belongs to whoever is attached. `--tab-id`
+    /// is the spelling for a caller that does want the view to follow.
+    pub fn place_in_tab(&mut self, tab: usize) {
+        if let CliAction::NewPane {
+            in_tab,
+            tab_id,
+            no_focus,
+            ..
+        } = self
+        {
+            *in_tab = None;
+            *tab_id = Some(tab);
+            *no_focus = true;
+        }
+    }
+}
+
 /// The most text `write-chars` and `paste` will take from stdin, in bytes.
 ///
 /// A megabyte is far more than anyone types and far less than a file that was piped in by mistake.
@@ -2959,6 +3005,57 @@ mod tests {
             ),
             other => panic!("Expected NewTab, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn in_tab_becomes_a_tab_id_and_takes_nobodys_focus() {
+        let mut action = parse_action(&["new-pane", "--in-tab", "logs"]);
+        assert_eq!(action.in_tab_target(), Some("logs"));
+        action.place_in_tab(4);
+        match &action {
+            CliAction::NewPane {
+                in_tab,
+                tab_id,
+                no_focus,
+                ..
+            } => {
+                assert_eq!(in_tab, &None, "the name is spent once it is resolved");
+                assert_eq!(tab_id, &Some(4));
+                assert!(no_focus, "putting a pane somewhere is not going there");
+            },
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_in_tab_never_reaches_the_session() {
+        // the guard: a caller that skipped the lookup would open the pane in the focused tab, which
+        // is the one tab `--in-tab` was passed to avoid
+        let error = actions_of(&["new-pane", "--in-tab", "logs"])
+            .expect_err("an unresolved --in-tab is not an action");
+        assert!(error.contains("--in-tab"), "got: {}", error);
+    }
+
+    #[test]
+    fn in_tab_refuses_the_other_ways_of_naming_a_tab() {
+        for args in [
+            vec!["new-pane", "--in-tab", "logs", "--tab-id", "2"],
+            vec!["new-pane", "--in-tab", "logs", "--new-tab"],
+            vec!["new-pane", "--in-tab", "logs", "--in-place"],
+            vec!["new-pane", "--in-tab", "logs", "--near-current-pane"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+        // the negative control: the flags that say how the pane is drawn, not where it goes, are
+        // still free to travel with it
+        assert_eq!(
+            parse_action(&["new-pane", "--in-tab", "logs", "-d", "right"]).in_tab_target(),
+            Some("logs")
+        );
     }
 
     #[test]

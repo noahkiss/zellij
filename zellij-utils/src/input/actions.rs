@@ -1115,7 +1115,19 @@ impl Action {
                 no_focus,
                 borderless,
                 tab_id,
+                in_tab,
             } => {
+                if in_tab.is_some() {
+                    // `--in-tab` is a name or an id that only the session can turn into the
+                    // `--tab-id` this action carries, so the CLI resolves it before building the
+                    // action. Reaching here means a caller skipped that, and the pane would
+                    // quietly open in the wrong tab.
+                    return Err(
+                        "`--in-tab` names a tab the session has to identify, and it was not \
+                         resolved before the action was built."
+                            .to_owned(),
+                    );
+                }
                 let pane_id_to_replace = match pane_id {
                     Some(pane_id_str) => match resolve_pane_target(&pane_id_str) {
                         Ok(parsed_pane_id) => Some(parsed_pane_id),
@@ -4315,6 +4327,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4365,6 +4378,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4415,6 +4429,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4467,6 +4482,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4511,6 +4527,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4561,6 +4578,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4611,6 +4629,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4735,6 +4754,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4785,6 +4805,7 @@ mod tests {
             block_until_exit: false,
             unblock_condition: None,
             new_tab: None,
+            in_tab: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
