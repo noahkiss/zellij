@@ -182,6 +182,37 @@ fn route_arbitrary_action_to_server(
     .unwrap();
 }
 
+/// Route an action as a CLI client would, and hand back whether it reached the app at all.
+///
+/// A command that refuses before dispatch - a pane command with no pane, run from outside a pane -
+/// returns no completion result, because nothing was asked of Screen.
+fn route_action_as_cli_client(
+    session_metadata: &SessionMetaData,
+    action: Action,
+    client_id: ClientId,
+) -> Option<crate::route::ActionCompletionResult> {
+    let senders = session_metadata.senders.clone();
+    let default_mode = session_metadata
+        .session_configuration
+        .get_client_configuration(&client_id)
+        .options
+        .default_mode
+        .unwrap_or(InputMode::Normal);
+    let (_should_break, result) = route_action(
+        action,
+        client_id,
+        Some(client_id),
+        None,
+        senders,
+        None,
+        None,
+        default_mode,
+        None,
+    )
+    .unwrap();
+    result
+}
+
 // same as the above, but hands back the completion result so a test can assert on the
 // error message and exit status an action reports
 fn route_arbitrary_action_and_get_result(
@@ -3158,6 +3189,7 @@ pub fn send_cli_dump_screen_action() {
         server_receiver
     );
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/foo")),
         full: true,
         pane_id: None,
@@ -8181,6 +8213,7 @@ pub fn send_cli_dump_screen_action_with_ansi() {
         server_receiver
     );
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/foo_ansi")),
         full: true,
         pane_id: None,
@@ -8221,6 +8254,7 @@ pub fn send_cli_dump_screen_action_without_ansi_strips_codes() {
         server_receiver
     );
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/foo_plain")),
         full: true,
         pane_id: None,
@@ -9836,6 +9870,7 @@ pub fn pty_bytes_and_hold_pane_buffered_before_new_pane() {
 
     // Use DumpScreen to verify the pane received the bytes
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/dump_early_bytes")),
         full: true,
         pane_id: None,
@@ -14041,4 +14076,57 @@ pub fn moving_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
         result.error_message
     );
     assert!(result.stdout_lines.is_empty(), "{:?}", result.stdout_lines);
+}
+
+#[test]
+pub fn dumping_a_screen_without_a_pane_never_reaches_the_app() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_action_as_cli_client(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: None,
+            include_scrollback: false,
+            pane_id: None,
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result.is_none(),
+        "the dump was refused before dispatch, so there is no completion to report"
+    );
+}
+
+#[test]
+pub fn dumping_a_screen_from_a_keybinding_still_takes_the_focused_pane() {
+    // the negative control: only a CLI client is refused a targetless dump. A keybinding is
+    // pressed inside a pane, where "focused" means the pane the hands are on
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: Some("/tmp/zellij-dump-screen-test".to_string()),
+            include_scrollback: false,
+            pane_id: None,
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
 }

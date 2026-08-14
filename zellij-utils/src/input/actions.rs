@@ -917,29 +917,36 @@ impl Action {
                 None => Ok(vec![Action::ClearScreen]),
             },
             CliAction::DumpScreen {
+                file,
                 path,
                 full,
                 pane_id,
                 ansi,
-            } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::DumpScreen {
-                            file_path: path.map(|p| p.as_os_str().to_string_lossy().into()),
-                            include_scrollback: full,
-                            pane_id: Some(parsed_pane_id),
-                            ansi,
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::DumpScreen {
-                    file_path: path.map(|p| p.as_os_str().to_string_lossy().into()),
-                    include_scrollback: full,
-                    pane_id: None,
-                    ansi,
-                }]),
+            } => {
+                // the two spellings of the same argument; clap has already refused both at once
+                let file_path = path
+                    .or(file)
+                    .map(|p| p.as_os_str().to_string_lossy().into());
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::DumpScreen {
+                                file_path,
+                                include_scrollback: full,
+                                pane_id: Some(parsed_pane_id),
+                                ansi,
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::DumpScreen {
+                        file_path,
+                        include_scrollback: full,
+                        pane_id: None,
+                        ansi,
+                    }]),
+                }
             },
             CliAction::DumpLayout => Ok(vec![Action::DumpLayout]),
             CliAction::SaveSession { .. } => Ok(vec![Action::SaveSession]),
@@ -3832,6 +3839,7 @@ mod tests {
     #[test]
     fn test_dump_screen_with_ansi_flag() {
         let cli_action = CliAction::DumpScreen {
+            file: None,
             path: Some(PathBuf::from("/tmp/test")),
             full: true,
             pane_id: None,
@@ -3862,6 +3870,7 @@ mod tests {
     #[test]
     fn test_dump_screen_with_pane_id_and_ansi() {
         let cli_action = CliAction::DumpScreen {
+            file: None,
             path: None,
             full: false,
             pane_id: Some("terminal_5".to_string()),

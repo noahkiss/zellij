@@ -1013,8 +1013,18 @@ pub enum CliAction {
         pane_id: Option<String>,
     },
     /// Dumps the viewport and optionally scrollback of a pane to a file or STDOUT
+    ///
+    /// The pane is not optional: without --pane-id this prints the panes you could have asked for,
+    /// grouped by tab, on stderr and exits 2. "The focused pane" is not a thing a command run from
+    /// outside a pane can mean.
+    ///
+    /// Prints the pane content and nothing else - no header, no trailing summary.
     DumpScreen {
         /// File path to dump the pane content to. If omitted, prints to STDOUT.
+        #[clap(value_parser, conflicts_with = "path")]
+        file: Option<PathBuf>,
+
+        /// File path to dump the pane content to. The same as giving the path as an argument.
         #[clap(long, value_parser)]
         path: Option<PathBuf>,
 
@@ -1022,7 +1032,7 @@ pub enum CliAction {
         #[clap(short, long)]
         full: bool,
 
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid. If not specified, dumps the focused pane.
+        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
 
@@ -2251,6 +2261,44 @@ mod tests {
             },
             other => panic!("Expected GoToTabName, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn dump_screen_takes_its_path_as_an_argument() {
+        match parse_action(&["dump-screen", "--pane-id", "terminal_1", "/tmp/dump"]) {
+            CliAction::DumpScreen { file, path, .. } => {
+                assert_eq!(file, Some(PathBuf::from("/tmp/dump")));
+                assert_eq!(path, None);
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_still_takes_its_path_as_a_flag() {
+        match parse_action(&[
+            "dump-screen",
+            "--pane-id",
+            "terminal_1",
+            "--path",
+            "/tmp/dump",
+        ]) {
+            CliAction::DumpScreen { file, path, .. } => {
+                assert_eq!(file, None);
+                assert_eq!(path, Some(PathBuf::from("/tmp/dump")));
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_refuses_both_spellings_of_the_path() {
+        assert!(action_parse_fails(&[
+            "dump-screen",
+            "/tmp/dump",
+            "--path",
+            "/tmp/other"
+        ]));
     }
 
     #[test]

@@ -519,6 +519,14 @@ pub(crate) fn route_action(
             pane_id,
             ansi,
         } => {
+            if pane_id.is_none() && cli_client_id.is_some() {
+                // dumping "the focused pane" from outside a pane means dumping whichever pane the
+                // session happens to be on, which is nobody's intent. Answering with the panes
+                // that could have been asked for turns a wrong dump into a choice
+                let targets = available_pane_targets(&senders).with_context(err_context)?;
+                send_error_to_client(cli_client_id, os_input.as_ref(), &targets.join("\n"));
+                return Ok((should_break, None));
+            }
             senders
                 .send_to_screen(ScreenInstruction::DumpScreen(
                     file_path,
@@ -2394,6 +2402,35 @@ fn id_report_lines(result: &ActionCompletionResult, id_keys: &IdReportKeys) -> V
         lines.push(format!("{}: {}", id_keys.pane, pane_id));
     }
     lines
+}
+
+/// The panes a command could have been given, grouped by the tab they are in.
+///
+/// This is what a pane-less pane command answers with. It is a list of choices, not a table: the
+/// reader is about to type one of these into `--pane-id`, and the handle is the form they want.
+fn available_pane_targets(senders: &ThreadSenders) -> Result<Vec<String>> {
+    let mut lines = vec!["No pane given. Pass --pane-id with one of:".to_string()];
+    let panes = match request_panes_from_screen(senders, false)? {
+        Some(panes) => panes,
+        None => {
+            lines.push("  (the session did not answer in time)".to_string());
+            return Ok(lines);
+        },
+    };
+    let mut current_tab: Option<usize> = None;
+    for entry in panes {
+        if current_tab != Some(entry.tab_id) {
+            lines.push(format!("  tab {} {}", entry.tab_id, entry.tab_name));
+            current_tab = Some(entry.tab_id);
+        }
+        lines.push(format!(
+            "    {}  {}  {}",
+            entry.pane_info.handle,
+            format_pane_id(&entry.pane_info),
+            entry.pane_info.title
+        ));
+    }
+    Ok(lines)
 }
 
 /// The handle of a live pane, asked of `Screen` because that is where the panes are.
