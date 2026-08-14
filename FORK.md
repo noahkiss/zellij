@@ -330,6 +330,8 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
   the same `|` separator they already use.
 - It is never truncated. Half an address reaches no pane, so a row too narrow for the whole handle
   shows none of it — there is no short form.
+- A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
+  counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
 
 ### `list-tree`
 
