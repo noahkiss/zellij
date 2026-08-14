@@ -395,7 +395,7 @@ pub enum Sessions {
         insecure: bool,
     },
 
-    /// Watch a session (read-only)
+    /// Attach to a session read-only, seeing what it shows without being able to type into it
     #[clap(visible_alias = "w")]
     Watch {
         /// Name of the session to watch
@@ -403,7 +403,10 @@ pub enum Sessions {
         session_name: Option<String>,
     },
 
-    /// Kill a specific session
+    /// Stop a session's server, keeping the session resurrectable
+    ///
+    /// Returns once the server process is gone, so a caller that rebuilds the session next gets a
+    /// true answer. `delete-session` is what removes it for good.
     #[clap(visible_alias = "k")]
     KillSession {
         /// Name of target session
@@ -417,7 +420,9 @@ pub enum Sessions {
         wait_timeout: u64,
     },
 
-    /// Delete a specific session
+    /// Delete a session's saved state, so it can no longer be resurrected
+    ///
+    /// A running session has to be killed first; --force does both.
     #[clap(visible_alias = "d")]
     DeleteSession {
         /// Name of target session
@@ -442,7 +447,9 @@ pub enum Sessions {
     #[clap(subcommand)]
     Session(SessionLifecycleCli),
 
-    /// Kill all sessions
+    /// Stop every session's server, keeping the sessions resurrectable
+    ///
+    /// Attempts every session and exits non-zero if any server did not go.
     #[clap(visible_alias = "ka")]
     KillAllSessions {
         /// Automatic yes to prompts
@@ -456,7 +463,9 @@ pub enum Sessions {
         wait_timeout: u64,
     },
 
-    /// Delete all sessions
+    /// Delete every session's saved state, so none of them can be resurrected
+    ///
+    /// Attempts every session and exits non-zero if any of them did not go.
     #[clap(visible_alias = "da")]
     DeleteAllSessions {
         /// Automatic yes to prompts
@@ -528,13 +537,17 @@ pub enum Sessions {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
+        /// Open the pane into a stack with the pane it opens beside. Fails if that pane cannot be
+        /// stacked, rather than opening the pane somewhere else
         #[clap(long, conflicts_with("floating"), conflicts_with("direction"))]
         stacked: bool,
-        /// Block until the command has finished and its pane has been closed
+        /// Wait until the pane closes, then exit with the command's exit status. Waiting replaces
+        /// the report: a blocking run prints no `pane_id:`, because the status is the answer
         #[clap(long)]
         blocking: bool,
 
-        /// Block until the command exits successfully (exit status 0) OR its pane has been closed
+        /// Wait until the command exits 0 or its pane closes, then exit with its status. Prints no
+        /// `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -543,8 +556,8 @@ pub enum Sessions {
         )]
         block_until_exit_success: bool,
 
-        /// Block until the command exits with failure (non-zero exit status) OR its pane has been
-        /// closed
+        /// Wait until the command exits non-zero or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -553,7 +566,8 @@ pub enum Sessions {
         )]
         block_until_exit_failure: bool,
 
-        /// Block until the command exits (regardless of exit status) OR its pane has been closed
+        /// Wait until the command exits either way or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -561,19 +575,20 @@ pub enum Sessions {
             conflicts_with("block_until_exit_failure")
         )]
         block_until_exit: bool,
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -629,11 +644,12 @@ pub enum Sessions {
             help = "if set, will open the plugin pane without changing the focus of any client, placing it relative to the pane the command was issued from"
         )]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
@@ -681,19 +697,20 @@ pub enum Sessions {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -936,48 +953,72 @@ pub enum SnapshotCli {
 
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum CliAction {
-    /// Write bytes to the terminal.
+    /// Write raw bytes into a pane, as if they had been typed
     Write {
+        /// The bytes, as space-separated decimal values (27 91 65 is Escape [ A)
         bytes: Vec<u8>,
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Write characters to the terminal.
+    /// Write text into a pane, as if it had been typed
+    ///
+    /// No newline is added: `send-keys Enter` is how you submit what you wrote.
     WriteChars {
+        /// The text to write
         chars: String,
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Paste text to the terminal (using bracketed paste mode).
+    /// Paste text into a pane in bracketed paste mode
+    ///
+    /// The pane's program is told the text was pasted rather than typed, which is what keeps an
+    /// editor from auto-indenting it and a shell from running each line as it arrives.
     Paste {
+        /// The text to paste
         chars: String,
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Send one or more keys to the terminal (e.g., "Ctrl a", "F1", "Alt Shift b")
+    /// Send named keys to a pane
+    ///
+    /// Keys by name, not by character: `Enter`, `Esc`, `Tab`, `F1`, `Ctrl a`, `Alt Shift b`. Use
+    /// `write-chars` for literal text.
     SendKeys {
-        /// Keys to send as space-separated strings
+        /// One key per argument, each a space-separated modifier chain ("Ctrl a", "F1")
         #[clap(value_parser, required = true)]
         keys: Vec<String>,
 
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// [increase|decrease] the focused panes area at the [left|down|up|right] border.
+    /// Grow or shrink a pane at one of its borders
     Resize {
+        /// increase or decrease
         resize: Resize,
+        /// The border to move: left, down, up or right. Without it, the pane grows or shrinks on
+        /// every side that can move
         direction: Option<Direction>,
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Change focus to the next pane
+    /// Move focus to the next pane in the tab, wrapping at the end
     FocusNextPane,
-    /// Change focus to the previous pane
+    /// Move focus to the previous pane in the tab, wrapping at the start
     FocusPreviousPane,
     /// Focus a pane, and the tab it lives in
     ///
@@ -985,41 +1026,50 @@ pub enum CliAction {
     /// started prints only `to:`. A target no live pane answers to exits 2
     #[clap(visible_alias = "go-to-pane")]
     FocusPaneId {
-        /// The pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
         pane_id: String,
     },
-    /// Change focus to the last focused frame
+    /// Move focus back to the pane it was on before the current one
     FocusLastPane,
-    /// Move the focused pane in the specified direction. [right|left|up|down]
+    /// Move focus to the neighbouring pane in a direction, stopping at the edge of the tab
     MoveFocus {
+        /// right, left, up or down
         direction: Direction,
     },
-    /// Move focus to the pane or tab (if on screen edge) in the specified direction
-    /// [right|left|up|down]
+    /// Move focus to the neighbouring pane in a direction, or to the neighbouring tab at the edge
     MoveFocusOrTab {
+        /// right, left, up or down
         direction: Direction,
     },
-    /// Change the location of the focused pane in the specified direction or rotate forwrads
-    /// [right|left|up|down]
+    /// Move a pane to a different place in its tab's layout
     MovePane {
+        /// right, left, up or down. Without it, the pane rotates forwards through the layout
         direction: Option<Direction>,
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Rotate the location of the previous pane backwards
+    /// Rotate a pane backwards through its tab's layout
     MovePaneBackwards {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Clear all buffers for a focused pane
+    /// Clear a pane's screen and its scrollback
     Clear {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Dumps the viewport and optionally scrollback of a pane to a file or STDOUT
+    /// Print what a pane is showing
     ///
     /// The pane is not optional: without --pane-id this prints the panes you could have asked for,
     /// grouped by tab, on stderr and exits 2. "The focused pane" is not a thing a command run from
@@ -1027,37 +1077,44 @@ pub enum CliAction {
     ///
     /// Prints the pane content and nothing else - no header, no trailing summary.
     DumpScreen {
-        /// File path to dump the pane content to. If omitted, prints to STDOUT.
+        /// Write the content to this file instead of stdout
         #[clap(value_parser, conflicts_with = "path")]
         file: Option<PathBuf>,
 
-        /// File path to dump the pane content to. The same as giving the path as an argument.
+        /// The same file, spelled as a flag. Give it one way or the other, not both
         #[clap(long, value_parser)]
         path: Option<PathBuf>,
 
-        /// Dump the pane with full scrollback
+        /// Include the whole scrollback, not just the visible screen. A long-lived pane's
+        /// scrollback can be megabytes
         #[clap(short, long)]
         full: bool,
 
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: see above
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
 
-        /// Preserve ANSI styling in the dump output
+        /// Keep the ANSI escape sequences, so colour and styling survive the dump
         #[clap(short, long)]
         ansi: bool,
     },
-    /// Dump current layout to stdout
+    /// Print the session's current layout, as the KDL a `--layout` would take
+    ///
+    /// Prints the layout and nothing else.
     DumpLayout,
-    /// Save the current session state to disk immediately
+    /// Write the session's resurrection state to disk now, rather than waiting for the next tick
     SaveSession {
         /// Also copy the saved state into the snapshot archive, as a manual snapshot
         #[clap(long)]
         archive: bool,
     },
-    /// Open the pane scrollback in your default editor
+    /// Open a pane's scrollback in a new pane running your $EDITOR
     EditScrollback {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
 
@@ -1065,81 +1122,108 @@ pub enum CliAction {
         #[clap(short, long)]
         ansi: bool,
     },
-    /// Scroll up in the focused pane
+    /// Scroll a pane up one line
     ScrollUp {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll down in focus pane.
+    /// Scroll a pane down one line
     ScrollDown {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll down to bottom in focus pane.
+    /// Scroll a pane to the bottom of its scrollback, where new output arrives
     ScrollToBottom {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll up to top in focus pane.
+    /// Scroll a pane to the top of its scrollback
     ScrollToTop {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll up one page in focus pane.
+    /// Scroll a pane up one screenful
     PageScrollUp {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll down one page in focus pane.
+    /// Scroll a pane down one screenful
     PageScrollDown {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll up half page in focus pane.
+    /// Scroll a pane up half a screenful
     HalfPageScrollUp {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Scroll down half page in focus pane.
+    /// Scroll a pane down half a screenful
     HalfPageScrollDown {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Toggle between fullscreen focus pane and normal layout.
+    /// Toggle a pane between filling its tab and the tab's normal layout
+    ///
+    /// Use `set-fullscreen on|off` to say which state you want rather than flipping whichever one
+    /// the pane is in.
     ToggleFullscreen {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    #[clap(
-        about = "Toggle between fullscreen over the entire display (including the UI bars) and normal layout"
-    )]
+    /// Toggle a pane between filling the whole terminal - status and tab bars included - and the
+    /// tab's normal layout
     ToggleNoUiFullscreen {
-        #[clap(
-            short,
-            long,
-            value_parser,
-            help = "Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid"
-        )]
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Toggle frames around panes in the UI
+    /// Toggle every pane frame in the session between the configured style and none
     TogglePaneFrames,
+    /// Set the frame style for the whole session, rather than toggling it
+    ///
+    /// Lasts for the life of the session; `pane_frame_style` in the config is the persistent form.
     SetPaneFrameStyle {
+        /// full (a box around each pane), titles (a title row only), top_only (a title row with a
+        /// rule and no separators between panes), or none
         #[clap(value_enum, value_parser)]
         style: PaneFrameStyle,
     },
-    /// Toggle between sending text commands to all panes on the current tab and normal mode.
+    /// Toggle whether typing into one pane of a tab types into all of them
+    ///
+    /// Use `set-sync-tab on|off` to say which state you want rather than flipping whichever one
+    /// the tab is in.
     ToggleActiveSyncTab {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
@@ -1147,13 +1231,17 @@ pub enum CliAction {
     /// If no direction is specified, will try to use the biggest available space.
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word handle>`
     NewPane {
-        /// Direction to open the new pane in
+        /// Split the pane it opens beside towards right or down. Without it, zellij splits
+        /// whichever side has the most room
         #[clap(short, long, value_parser, conflicts_with("floating"))]
         direction: Option<Direction>,
 
+        /// The command to run in the pane, after a `--`. Without one the pane runs your shell
         #[clap(last(true))]
         command: Vec<String>,
 
+        /// Open a plugin pane instead of a terminal, by plugin url (file:/path/to.wasm, an alias
+        /// from the config, or https://...)
         #[clap(short, long, conflicts_with("command"), conflicts_with("direction"))]
         plugin: Option<String>,
 
@@ -1165,16 +1253,16 @@ pub enum CliAction {
         #[clap(short, long)]
         floating: bool,
 
-        /// Open the new pane in place of the current pane, temporarily suspending it
+        /// Open the new pane on top of an existing one, suspending that pane until this one closes
         #[clap(short, long, conflicts_with("floating"), conflicts_with("direction"))]
         in_place: bool,
 
-        /// Close the replaced pane instead of suspending it (only effective with --in-place)
+        /// With --in-place, close the pane that was replaced instead of suspending it
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
 
-        /// The pane to replace when opening in place: terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid (only
-        /// effective with --in-place; defaults to the focused pane)
+        /// With --in-place, the pane to open on top of: terminal_1, plugin_2, a bare integer,
+        /// a handle like sunny-otter, or a pane uuid. Without this, the focused pane
         #[clap(
             long,
             value_parser,
@@ -1190,11 +1278,13 @@ pub enum CliAction {
         /// Close the pane immediately when its command exits
         #[clap(short, long, requires("command"))]
         close_on_exit: bool,
-        /// Start the command suspended, only running it after the you first press ENTER
+        /// Start the command suspended, only running it once someone presses ENTER in the pane
         #[clap(short, long, requires("command"))]
         start_suspended: bool,
+        /// With --plugin, the plugin's configuration as key=value pairs, comma separated
         #[clap(long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
+        /// With --plugin, recompile the plugin instead of loading it from the wasm cache
         #[clap(long, value_parser)]
         skip_plugin_cache: bool,
         /// The x coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
@@ -1212,13 +1302,17 @@ pub enum CliAction {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
+        /// Open the pane into a stack with the pane it opens beside. Fails if that pane cannot be
+        /// stacked, rather than opening the pane somewhere else
         #[clap(long, conflicts_with("floating"), conflicts_with("direction"))]
         stacked: bool,
-        /// Block until the command has finished and its pane has been closed
+        /// Wait until the pane closes, then exit with the command's exit status. Waiting replaces
+        /// the report: a blocking run prints no `pane_id:`, because the status is the answer
         #[clap(short, long)]
         blocking: bool,
 
-        /// Block until the command exits successfully (exit status 0) OR its pane has been closed
+        /// Wait until the command exits 0 or its pane closes, then exit with its status. Prints no
+        /// `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1227,8 +1321,8 @@ pub enum CliAction {
         )]
         block_until_exit_success: bool,
 
-        /// Block until the command exits with failure (non-zero exit status) OR its pane has been
-        /// closed
+        /// Wait until the command exits non-zero or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1237,7 +1331,8 @@ pub enum CliAction {
         )]
         block_until_exit_failure: bool,
 
-        /// Block until the command exits (regardless of exit status) OR its pane has been closed
+        /// Wait until the command exits either way or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1249,19 +1344,20 @@ pub enum CliAction {
         #[clap(skip)]
         unblock_condition: Option<UnblockCondition>,
 
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -1270,16 +1366,19 @@ pub enum CliAction {
         )]
         tab_id: Option<usize>,
     },
-    /// Open the specified file in a new zellij pane with your default EDITOR
+    /// Open a file in a new pane running your $EDITOR
+    ///
     /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     Edit {
+        /// The file to open. A relative path is resolved against --cwd, or the current directory
         file: PathBuf,
 
-        /// Direction to open the new pane in
+        /// Split the pane it opens beside towards right or down. Without it, zellij splits
+        /// whichever side has the most room
         #[clap(short, long, value_parser, conflicts_with("floating"))]
         direction: Option<Direction>,
 
-        /// Open the file in the specified line number
+        /// Put the cursor on this line when the editor opens
         #[clap(short, long, value_parser)]
         line_number: Option<usize>,
 
@@ -1313,19 +1412,20 @@ pub enum CliAction {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -1334,90 +1434,118 @@ pub enum CliAction {
         )]
         tab_id: Option<usize>,
     },
-    /// Switch input mode of all connected clients [locked|pane|tab|resize|move|search|session]
+    /// Put every client of this session into an input mode
     SwitchMode {
+        /// locked, normal, pane, tab, resize, move, search, session, scroll, prompt, tmux or enter
         input_mode: InputMode,
     },
-    /// Embed focused pane if floating or float focused pane if embedded
+    /// Toggle a pane between floating and embedded in its tab's layout
+    ///
+    /// Use `set-pane-floating on|off` to say which state you want rather than flipping whichever
+    /// one the pane is in.
     TogglePaneEmbedOrFloating {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Toggle the visibility of all floating panes in the current Tab, open one if none exist
+    /// Toggle whether a tab's floating panes are shown, opening one if the tab has none
+    ///
+    /// Use `show-floating-panes` or `hide-floating-panes` to say which state you want rather than
+    /// flipping whichever one the tab is in.
     ToggleFloatingPanes {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Show all floating panes in the specified tab (or active tab if tab_id is not provided).
+    /// Show a tab's floating panes, rather than toggling them
     ///
-    /// Returns exit code 0 if state was changed, 2 if already visible, 1 if tab not found.
+    /// Exits 0 if they were hidden and are now shown, 2 if they were already shown, 1 if there is
+    /// no such tab.
     ShowFloatingPanes {
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Hide all floating panes in the specified tab (or active tab if tab_id is not provided).
+    /// Hide a tab's floating panes, rather than toggling them
     ///
-    /// Returns exit code 0 if state was changed, 2 if already hidden, 1 if tab not found.
+    /// Exits 0 if they were shown and are now hidden, 2 if they were already hidden, 1 if there is
+    /// no such tab.
     HideFloatingPanes {
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Check if floating panes are visible in the specified tab (or active tab).
+    /// Ask whether a tab's floating panes are shown
     ///
-    /// Prints "true" to stdout and exits 0 if visible.
-    /// Prints "false" to stdout and exits 1 if not visible.
+    /// Prints `true` and exits 0 if they are, `false` and exits 1 if they are not. The 1 is an
+    /// answer here, not an error - this command predates the fork's exit-code convention.
     AreFloatingPanesVisible {
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Close a pane.
+    /// Close a pane, killing whatever runs in it
     ///
     /// Prints `closed: <pane id>`. A pane that is not there is a miss: a message on stderr and
     /// exit 2. Without --pane-id this closes the focused pane, which is only meaningful from
     /// inside a pane.
     ClosePane {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Renames the focused pane
+    /// Give a pane a name, which is what its frame and the TITLE column then show
     RenamePane {
+        /// The new name
         name: String,
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Remove a previously set pane name
+    /// Drop a name set by `rename-pane`, so the pane goes back to naming itself after its command
     UndoRenamePane {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Go to the next tab.
+    /// Move focus to the next tab by display position, wrapping at the end
     GoToNextTab,
-    /// Go to the previous tab.
+    /// Move focus to the previous tab by display position, wrapping at the start
     GoToPreviousTab,
-    /// Close a tab.
+    /// Close a tab and every pane in it
     ///
     /// Prints `closed: <tab id> <tab name>`. A tab that is not there is a miss: a message on
     /// stderr and exit 2. Without --tab-id this closes the current tab, which is only meaningful
     /// from inside a pane.
     CloseTab {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Go to tab at position [index] (1-based)
+    /// Focus the tab at a display position
     ///
     /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for the tab focus left and the
     /// tab it landed on. A switch that did not move prints only `to:`. A position no tab sits at
     /// is a miss: a message on stderr and exit 2.
     GoToTab {
+        /// The 1-based display position: 1 is the leftmost tab. This is the POSITION column of
+        /// `list-tabs` plus one, not the TAB_ID column
         index: u32,
     },
-    /// Go to tab with name [name]
+    /// Focus the tab with a given name
     ///
     /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch, and `id:
     /// <tab id>` when --create makes the tab. A name no tab answers to is a miss: a message on
@@ -1427,8 +1555,9 @@ pub enum CliAction {
     /// either way, and stdout is the answer - `id: <tab id>` if the tab is there, nothing at all
     /// if it is not.
     GoToTabName {
+        /// The tab name, matched exactly - the NAME column of `list-tabs`
         name: String,
-        /// Create a tab if one does not exist.
+        /// Create the tab if no tab answers to that name
         #[clap(short, long, value_parser)]
         create: bool,
         /// Leave focus where it is, whether the tab already existed or was just created.
@@ -1437,67 +1566,75 @@ pub enum CliAction {
         #[clap(long, value_parser)]
         no_focus: bool,
     },
-    /// Renames the focused pane
+    /// Give a tab a name, which is what the tab bar and the NAME column then show
     RenameTab {
+        /// The new name
         name: String,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Remove a previously set tab name
+    /// Drop a name set by `rename-tab`, so the tab goes back to its numbered default
     UndoRenameTab {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Go to tab with stable ID
+    /// Focus a tab by its stable id
     ///
     /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`. An id no tab answers to is a
     /// miss: a message on stderr and exit 2.
     GoToTabById {
+        /// The stable id, from the TAB_ID column of `list-tabs`
         id: u64,
     },
-    /// Close tab with stable ID
+    /// Close a tab by its stable id
     ///
     /// Prints `closed: <tab id> <tab name>`. An id no tab answers to is a miss: a message on
     /// stderr and exit 2.
     CloseTabById {
+        /// The stable id, from the TAB_ID column of `list-tabs`
         id: u64,
     },
-    /// Rename tab by stable ID
+    /// Rename a tab by its stable id
     RenameTabById {
+        /// The stable id, from the TAB_ID column of `list-tabs`
         id: u64,
+        /// The new name
         name: String,
     },
-    /// Create a new tab, optionally with a specified tab layout and name
+    /// Create a tab, optionally from a layout
     ///
-    /// Returns: `tab_id: <id>` on stdout
+    /// Returns: `tab_id: <id>`. A tab made from a layout gets whatever panes the layout names;
+    /// otherwise it opens one pane running your shell or --initial-command.
     NewTab {
-        /// Layout to use for the new tab
+        /// A layout to build the tab from: a name in the layout directory, or a path to a file
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]
         layout: Option<PathBuf>,
 
-        /// Raw KDL layout string to use directly (instead of a layout file path)
+        /// A KDL layout as a string, instead of a file to read it from
         #[clap(long, value_parser, conflicts_with = "layout")]
         layout_string: Option<String>,
 
-        /// Default folder to look for layouts
+        /// Where to look for the --layout name, overriding the configured layout directory
         #[clap(long, value_parser, requires("layout"))]
         layout_dir: Option<PathBuf>,
 
-        /// Name of the new tab
+        /// Name of the new tab. Without one the tab is numbered
         #[clap(short, long, value_parser)]
         name: Option<String>,
 
-        /// Change the working directory of the new tab
+        /// The working directory the tab's panes start in
         #[clap(short, long, value_parser)]
         cwd: Option<PathBuf>,
 
-        /// Optional initial command to run in the new tab
+        /// The command to run in the tab's first pane, after a `--`. Without one it runs your shell
         #[clap(value_parser, conflicts_with("initial_plugin"), last(true))]
         initial_command: Vec<String>,
 
-        /// Initial plugin to load in the new tab
+        /// Load a plugin in the tab's first pane instead of a terminal, by plugin url
         #[clap(long, value_parser, conflicts_with("initial_command"))]
         initial_plugin: Option<String>,
 
@@ -1509,7 +1646,8 @@ pub enum CliAction {
         #[clap(long, requires("initial_command"))]
         start_suspended: bool,
 
-        /// Block until the command exits successfully (exit status 0) OR its pane has been closed
+        /// Wait until the command exits 0 or its pane closes, then exit with its status. Prints no
+        /// `pane_id:`, as above
         #[clap(
             long,
             requires("initial_command"),
@@ -1518,7 +1656,8 @@ pub enum CliAction {
         )]
         block_until_exit_success: bool,
 
-        /// Block until the command exits with failure (non-zero exit status) OR its pane has been closed
+        /// Wait until the command exits non-zero or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             requires("initial_command"),
@@ -1527,7 +1666,8 @@ pub enum CliAction {
         )]
         block_until_exit_failure: bool,
 
-        /// Block until the command exits (regardless of exit status) OR its pane has been closed
+        /// Wait until the command exits either way or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             requires("initial_command"),
@@ -1536,10 +1676,8 @@ pub enum CliAction {
         )]
         block_until_exit: bool,
 
-        #[clap(
-            long,
-            help = "if set, will create the tab without changing the focus of any client"
-        )]
+        /// Create the tab and leave every client's focus where it is
+        #[clap(long)]
         no_focus: bool,
     },
     /// Move a tab in the specified direction. [right|left]
@@ -1549,32 +1687,48 @@ pub enum CliAction {
     /// stderr and exit 2. Without --tab-id this moves the current tab, which is only meaningful
     /// from inside a pane.
     MoveTab {
+        /// right or left: swap the tab with its neighbour on that side
         #[clap(
             value_parser,
             required_unless_present = "to_index",
             conflicts_with = "to_index"
         )]
         direction: Option<Direction>,
-        /// Move the tab to this absolute position (0-based), clamped to the last position
+        /// Move the tab to this 0-based display position, shifting the tabs in between rather
+        /// than swapping. Past the last position it lands at the end
         #[clap(long, value_parser)]
         to_index: Option<usize>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
+    /// Apply the previous swap layout to a tab
+    ///
+    /// Swap layouts are the alternative arrangements a layout file declares; this walks backwards
+    /// through them.
     PreviousSwapLayout {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
+    /// Apply the next swap layout to a tab
+    ///
+    /// Swap layouts are the alternative arrangements a layout file declares; this walks forwards
+    /// through them.
     NextSwapLayout {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Override the layout of the active tab
+    /// Rearrange the panes of a tab into a layout
+    ///
+    /// The tab's existing panes are placed into the layout's slots. Panes the layout has no room
+    /// for are closed, unless --retain-existing-terminal-panes or its plugin twin is passed.
     OverrideLayout {
-        /// Path to the layout file
+        /// A path to a layout file
         #[clap(
             value_parser,
             required_unless_present = "layout_string",
@@ -1582,76 +1736,103 @@ pub enum CliAction {
         )]
         layout: Option<PathBuf>,
 
-        /// Raw KDL layout string to use directly (instead of a layout file path)
+        /// A KDL layout as a string, instead of a file to read it from
         #[clap(long, value_parser, conflicts_with = "layout")]
         layout_string: Option<String>,
 
-        /// Default folder to look for layouts
+        /// Where to look for the layout by name, overriding the configured layout directory
         #[clap(long, value_parser)]
         layout_dir: Option<PathBuf>,
 
-        /// Retain existing terminal panes that do not fit in the layout (default: false)
+        /// Keep terminal panes the layout has no room for, instead of closing them
         #[clap(long)]
         retain_existing_terminal_panes: bool,
 
-        /// Retain existing plugin panes that do not fit with the layout default: false)
+        /// Keep plugin panes the layout has no room for, instead of closing them
         #[clap(long)]
         retain_existing_plugin_panes: bool,
 
-        /// Only apply the layout to the active tab (uses just the first layout tab if it has
-        /// multiple)
+        /// Apply only the layout's first tab, to the focused tab, instead of every tab it declares
         #[clap(long)]
         apply_only_to_active_tab: bool,
     },
+    /// Reload a running plugin's wasm, or start it if it is not running
+    ///
+    /// The reload is how a plugin under development picks up a rebuild without its pane moving.
     StartOrReloadPlugin {
+        /// The plugin url: file:/path/to.wasm, an alias from the config, or https://...
         url: String,
+        /// The plugin's configuration as key=value pairs, comma separated
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
     },
-    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>` for the plugin pane it made or focused
+    /// Focus a plugin's pane if it is already running, otherwise open it
+    ///
+    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`, for the pane it made or
+    /// the one it focused
     LaunchOrFocusPlugin {
+        /// Open it as a floating pane
         #[clap(short, long, value_parser)]
         floating: bool,
+        /// Open it on top of the focused pane, suspending that pane until this one closes
         #[clap(short, long, value_parser)]
         in_place: bool,
-        /// Close the replaced pane instead of suspending it (only effective with --in-place)
+        /// With --in-place, close the pane that was replaced instead of suspending it
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
+        /// If the plugin is already running in another tab, move its pane here rather than
+        /// focusing the tab it is in
         #[clap(short, long, value_parser)]
         move_to_focused_tab: bool,
+        /// The plugin url: file:/path/to.wasm, an alias from the config, or https://...
         url: String,
+        /// The plugin's configuration as key=value pairs, comma separated. A plugin running under
+        /// a different configuration counts as a different plugin
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
+        /// Recompile the plugin instead of loading it from the wasm cache
         #[clap(short, long, value_parser)]
         skip_plugin_cache: bool,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
+    /// Open a plugin in a new pane, even if it is already running elsewhere
+    ///
     /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`
     LaunchPlugin {
+        /// Open it as a floating pane
         #[clap(short, long, value_parser)]
         floating: bool,
+        /// Open it on top of the focused pane, suspending that pane until this one closes
         #[clap(short, long, value_parser)]
         in_place: bool,
-        /// Close the replaced pane instead of suspending it (only effective with --in-place)
+        /// With --in-place, close the pane that was replaced instead of suspending it
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
+        /// The plugin url: file:/path/to.wasm or https://...
         url: Url,
+        /// The plugin's configuration as key=value pairs, comma separated
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
+        /// Recompile the plugin instead of loading it from the wasm cache
         #[clap(short, long, value_parser)]
         skip_plugin_cache: bool,
-        #[clap(
-            long,
-            help = "if set, will open the plugin pane without changing the focus of any client"
-        )]
+        /// Open the pane and leave every client's focus where it is
+        #[clap(long)]
         no_focus: bool,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
+    /// Rename this session
+    ///
+    /// The name is what `zellij ls` lists and `zellij attach` takes. Panes that predate the rename
+    /// keep the old name in their $ZELLIJ_SESSION_NAME until they are replaced.
     RenameSession {
+        /// The new session name
         name: String,
     },
     /// Send data to one or more plugins, launch them if they are not running.
@@ -1799,44 +1980,52 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
     },
+    /// Toggle whether a floating pane stays on top of the other floating panes
+    ///
+    /// Use `set-pane-pinned on|off` to say which state you want rather than flipping whichever one
+    /// the pane is in.
     TogglePanePinned {
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Stack pane ids
-    /// Ids are a space separated list of pane ids.
-    /// They should either be in the form of `terminal_<int>` (eg. terminal_1), `plugin_<int>` (eg.
-    /// plugin_1) or bare integers in which case they'll be considered terminals (eg. 1 is
-    /// the equivalent of terminal_1)
+    /// Gather panes into one stack, in the order given
     ///
     /// Example: zellij action stack-panes -- terminal_1 plugin_2 3
     StackPanes {
+        /// The panes, after a `--`: terminal_1, plugin_2, a bare integer (3 means terminal_3), a
+        /// handle like sunny-otter, or a pane uuid
         #[clap(last(true), required(true))]
         pane_ids: Vec<String>,
     },
+    /// Move, resize or re-dress a floating pane
+    ///
+    /// Every field is optional and the ones you leave out are left alone.
     ChangeFloatingPaneCoordinates {
-        /// The pane_id of the floating pane, eg.  terminal_1, plugin_2 or 3 (equivalent to
-        /// terminal_3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. It must be floating already - `set-pane-floating on`
+        /// makes it so
         #[clap(short, long, value_parser)]
         pane_id: String,
-        /// The x coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Distance from the left edge, in columns (eg. 1) or percent of the screen (eg. 10%)
         #[clap(short, long)]
         x: Option<String>,
-        /// The y coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Distance from the top edge, in rows (eg. 1) or percent of the screen (eg. 10%)
         #[clap(short, long)]
         y: Option<String>,
-        /// The width if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Width in columns (eg. 80) or percent of the screen (eg. 50%)
         #[clap(long)]
         width: Option<String>,
-        /// The height if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Height in rows (eg. 24) or percent of the screen (eg. 50%)
         #[clap(long)]
         height: Option<String>,
-        /// Whether to pin a floating pane so that it is always on top
+        /// Whether the pane stays on top of the other floating panes
         #[clap(long)]
         pinned: Option<bool>,
-        /// change this pane to be with/without a border (warning: will make it impossible to move with the
-        /// mouse if without a border)
+        /// Whether the pane is drawn with a frame (warning: a borderless pane cannot be moved with
+        /// the mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
     },
@@ -1849,7 +2038,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1862,7 +2053,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1875,7 +2068,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -1888,21 +2083,23 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// on|off (also accepts true/false, yes/no, 1/0)
         #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
         enabled: bool,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Move panes out into a new tab
+    /// Move panes out into a tab of their own
     ///
-    /// Without --pane-id this moves the focused pane. Returns `tab_id: <id>` for the new tab.
+    /// Returns: `tab_id: <id>` for the new tab.
     BreakPane {
-        /// Move this pane (repeatable). Defaults to the focused pane.
+        /// A pane to move, repeat the flag for more than one: terminal_1, plugin_2, a bare
+        /// integer, a handle like sunny-otter, or a pane uuid. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Vec<String>,
-        /// Name for the new tab
+        /// Name for the new tab. Without one the tab is numbered
         #[clap(short, long, value_parser)]
         name: Option<String>,
-        /// Leave focus where it is instead of following the panes
+        /// Leave every client's focus where it is, instead of following the panes
         #[clap(long, value_parser)]
         no_focus: bool,
     },
@@ -1910,89 +2107,113 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     ///
     /// A tab or pane that does not exist prints the reason on stderr and exits non-zero.
     BreakPaneToTab {
-        /// Move this pane (repeatable)
+        /// A pane to move, repeat the flag for more than one: terminal_1, plugin_2, a bare
+        /// integer, a handle like sunny-otter, or a pane uuid
         #[clap(short, long, value_parser, required(true))]
         pane_id: Vec<String>,
-        /// The tab to move the panes into
+        /// The tab to move them into, by the stable id in the TAB_ID column of `list-tabs`
         #[clap(short, long, value_parser)]
         tab_id: u32,
-        /// Leave focus where it is instead of following the panes
+        /// Leave every client's focus where it is, instead of following the panes
         #[clap(long, value_parser)]
         no_focus: bool,
     },
-    /// Move the focused pane into a new tab to the right of the current one
+    /// Move the focused pane into a new tab to the right of its own
+    ///
+    /// Names no pane, so it means nothing from outside the session and is refused there. Use
+    /// `break-pane --pane-id` from a script.
     BreakPaneRight,
-    /// Move the focused pane into a new tab to the left of the current one
+    /// Move the focused pane into a new tab to the left of its own
+    ///
+    /// Names no pane, so it means nothing from outside the session and is refused there. Use
+    /// `break-pane --pane-id` from a script.
     BreakPaneLeft,
     /// Send a signal to the process running in a pane
     ///
     /// A pane that does not exist, or a plugin pane, which runs no process, prints the reason on
     /// stderr and exits non-zero.
     SignalPane {
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
         #[clap(short, long, value_parser)]
         pane_id: String,
-        /// The signal to send [int|hup|kill]
+        /// int (SIGINT), hup (SIGHUP) or kill (SIGKILL). It goes to the process the pane
+        /// started - the shell itself, where the pane runs one, not the command under it
         #[clap(short, long, value_enum, value_parser, default_value = "int")]
         signal: PaneSignal,
     },
+    /// Toggle whether a pane is drawn with a frame
+    ///
+    /// Use `set-pane-borderless` to say which state you want rather than flipping whichever one
+    /// the pane is in.
     TogglePaneBorderless {
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
         #[clap(short, long, value_parser)]
         pane_id: String,
     },
+    /// Set whether a pane is drawn with a frame, rather than toggling it
     SetPaneBorderless {
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
         #[clap(short, long, value_parser)]
         pane_id: String,
         /// Whether the pane should be borderless (flag present) or bordered (flag absent)
         #[clap(short, long, value_parser)]
         borderless: bool,
     },
-    /// Detach from the current session
+    /// Detach every client from this session, leaving the session running
     Detach,
-    /// Switch the theme to dark (uses configured `theme_dark`).
+    /// Switch every client to the configured `theme_dark`
     SetDarkTheme,
-    /// Switch the theme to light (uses configured `theme_light`).
+    /// Switch every client to the configured `theme_light`
     SetLightTheme,
-    /// Toggle between dark and light themes (used configured `theme_dark` and `theme_light`)
+    /// Switch every client between the configured `theme_dark` and `theme_light`
     ToggleTheme,
-    /// Switch to a different session
+    /// Move the clients of this session to another session, creating it if it is not running
     SwitchSession {
-        /// Name of the session to switch to
+        /// The session to switch to, as `zellij ls` names it
         name: String,
-        /// Optional tab position to focus
+        /// A 1-based tab position to focus in the session being switched to
         #[clap(long)]
         tab_position: Option<usize>,
-        /// Optional pane ID to focus (eg. "terminal_1" for terminal pane with id 1, or "plugin_2" for plugin pane with id 2)
+        /// A pane to focus in the session being switched to, as terminal_1 or plugin_2. Handles
+        /// and uuids are read against this session, not that one, so use the explicit forms
         #[clap(long)]
         pane_id: Option<String>,
-        /// Layout to apply when switching to the session (relative paths start at layout-dir)
+        /// A layout to build the session from, if it is not already running: a name in the layout
+        /// directory, or a path to a file
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]
         layout: Option<PathBuf>,
-        /// Raw KDL layout string to use directly
+        /// A KDL layout as a string, instead of a file to read it from
         #[clap(long, value_parser, conflicts_with = "layout")]
         layout_string: Option<String>,
-        /// Default folder to look for layouts
+        /// Where to look for the --layout name, overriding the configured layout directory
         #[clap(long, value_parser, requires("layout"))]
         layout_dir: Option<PathBuf>,
-        /// Change the working directory when switching
+        /// The working directory the session's panes start in, if it is not already running
         #[clap(short, long, value_parser)]
         cwd: Option<PathBuf>,
     },
-    /// Set the default foreground/background color of a pane
+    /// Set a pane's default foreground and background colour
+    ///
+    /// The colours a program in the pane sets for itself still win; this is the ground it draws on.
     SetPaneColor {
-        /// The pane, as terminal_1, plugin_2, 3 (equivalent to terminal_3), a handle like sunny-otter, or a pane uuid.
-        /// Defaults to $ZELLIJ_PANE_ID if not provided.
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. Without this, the pane named by $ZELLIJ_PANE_ID - which
+        /// is the pane the command runs in, and unset outside a pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
-        /// Foreground color (e.g. "#00e000", "rgb:00/e0/00")
+        /// Foreground colour (e.g. "#00e000", "rgb:00/e0/00")
         #[clap(long, value_parser)]
         fg: Option<String>,
-        /// Background color (e.g. "#001a3a", "rgb:00/1a/3a")
+        /// Background colour (e.g. "#001a3a", "rgb:00/1a/3a")
         #[clap(long, value_parser)]
         bg: Option<String>,
-        /// Reset pane colors to terminal defaults
+        /// Drop both colours, so the pane draws on the terminal's own defaults
         #[clap(long, value_parser, conflicts_with_all(&["fg", "bg"]))]
         reset: bool,
     },
