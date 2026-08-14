@@ -1,6 +1,8 @@
 mod commands;
 mod session_commands;
 mod session_doctor_command;
+#[cfg(target_os = "linux")]
+mod session_doctor_linux;
 #[cfg(test)]
 mod tests;
 

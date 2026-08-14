@@ -578,5 +578,15 @@ fn pin_state_of(_name: &str, pinned: &Path) -> PinState {
     session_service::pin_state(pinned, None)
 }
 
-/// What only one platform can answer. Filled in per platform; see the modules beside this one.
+/// What only one platform can answer.
+///
+/// Every platform reports on every check, including the ones it cannot make - signing and TCC come
+/// back as `n/a` on Linux rather than being left out. Silence there would read as "checked and
+/// fine", which is the one answer that is never true.
+#[cfg(target_os = "linux")]
+fn platform_checks(report: &mut Report, name: &str, _pinned: Option<&Path>, _mode: DoctorMode) {
+    crate::session_doctor_linux::checks(report, name);
+}
+
+#[cfg(not(target_os = "linux"))]
 fn platform_checks(_report: &mut Report, _name: &str, _pinned: Option<&Path>, _mode: DoctorMode) {}

@@ -385,6 +385,56 @@ impl Commander for RecordedCommander {
     }
 }
 
+/// The `KEY=value` lines of `systemctl show`, as a map.
+///
+/// A value may itself hold an `=`, so the split is on the FIRST one only. systemd omits a property
+/// it has no answer for rather than printing it empty, so a missing key and an empty value are
+/// different things and the caller is left to tell them apart.
+pub fn parse_show_properties(output: &str) -> HashMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.trim().to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// How the unit's last run ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartResult {
+    /// systemd is happy with it, whatever the session is doing.
+    Success,
+    /// systemd is not. `result` is its own word for why, which is worth quoting verbatim - it is
+    /// the term the journal and the manual both use.
+    Failed {
+        result: String,
+        exit_status: Option<String>,
+    },
+    /// Nothing to judge: the unit has never run, or systemd was not there to ask.
+    Unknown,
+}
+
+/// Read the last run out of `systemctl show`.
+///
+/// `Result=` is the property that answers this and `ActiveState=` is not: a oneshot that ran,
+/// failed and exited is `inactive` in exactly the same way as one that has never run at all. The
+/// exit status comes along because "exit-code" without the code sends the reader back to the
+/// journal for the one number they needed.
+pub fn last_start_result(properties: &HashMap<String, String>) -> StartResult {
+    let Some(result) = properties.get("Result") else {
+        return StartResult::Unknown;
+    };
+    if result == "success" {
+        return StartResult::Success;
+    }
+    StartResult::Failed {
+        result: result.to_owned(),
+        exit_status: properties
+            .get("ExecMainStatus")
+            .filter(|status| status.as_str() != "0")
+            .cloned(),
+    }
+}
+
 /// Shorthand for a recorded success.
 pub fn recorded(stdout: &str) -> CommandOutput {
     CommandOutput {
@@ -482,6 +532,60 @@ mod tests {
         let commander = RecordedCommander::new(&[]);
         let answer = commander.run("codesign", &["-v", "/pin"], None).unwrap();
         assert!(!answer.success);
+    }
+
+    /// Recorded from `systemctl --user show zellij-go-for-flight.service` on a healthy machine.
+    const HEALTHY_SHOW: &str = "\
+Result=success
+ActiveState=inactive
+SubState=dead
+ExecMainStatus=0
+NRestarts=0
+";
+
+    /// The same, from a machine whose session had not been coming up.
+    const FAILED_SHOW: &str = "\
+Result=exit-code
+ActiveState=failed
+SubState=failed
+ExecMainStatus=1
+NRestarts=0
+Environment=PATH=/usr/bin:/bin
+";
+
+    #[test]
+    fn a_healthy_unit_reports_success() {
+        let properties = parse_show_properties(HEALTHY_SHOW);
+        assert_eq!(last_start_result(&properties), StartResult::Success);
+    }
+
+    #[test]
+    fn a_failed_unit_keeps_systemds_own_word_and_the_exit_code() {
+        let properties = parse_show_properties(FAILED_SHOW);
+        assert_eq!(
+            last_start_result(&properties),
+            StartResult::Failed {
+                result: String::from("exit-code"),
+                exit_status: Some(String::from("1")),
+            }
+        );
+    }
+
+    #[test]
+    fn a_property_whose_value_holds_an_equals_sign_survives_the_split() {
+        let properties = parse_show_properties(FAILED_SHOW);
+        assert_eq!(
+            properties.get("Environment").map(String::as_str),
+            Some("PATH=/usr/bin:/bin")
+        );
+    }
+
+    #[test]
+    fn a_unit_that_has_never_run_is_unknown_rather_than_failed() {
+        assert_eq!(
+            last_start_result(&parse_show_properties("ActiveState=inactive\n")),
+            StartResult::Unknown
+        );
     }
 
     #[test]
