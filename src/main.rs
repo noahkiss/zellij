@@ -9,7 +9,7 @@ mod session_doctor_macos;
 mod tests;
 
 use zellij_utils::{
-    cli::{CliAction, CliArgs, Command, Sessions},
+    cli::{CliAction, Command, Sessions},
     cli_surface::parse_cli_args,
     consts::{create_config_and_cache_folders, VERSION},
     data::UnblockCondition,
