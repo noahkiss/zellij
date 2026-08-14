@@ -1079,6 +1079,7 @@ impl Action {
                 block_until_exit_failure,
                 block_until_exit,
                 unblock_condition,
+                new_tab,
                 near_current_pane,
                 no_focus,
                 borderless,
@@ -1109,6 +1110,59 @@ impl Action {
                         None
                     }
                 });
+                if let Some(tab_name) = new_tab {
+                    // A tab arrives with a pane in it, so "run this in a tab of its own" is one
+                    // action rather than two: the tab is described by a one-pane layout carrying
+                    // the command, and what comes back is `tab_id:` with the pane it made.
+                    if blocking {
+                        return Err("`--blocking` waits for a pane to close and cannot say which \
+                                    pane in a new tab that is. Use --block-until-exit, or open \
+                                    the tab first."
+                            .to_owned());
+                    }
+                    let run = if let Some(plugin) = plugin {
+                        Some(Run::Plugin(run_plugin_or_alias(
+                            plugin,
+                            configuration,
+                            cwd.clone(),
+                            alias_cwd,
+                            current_dir,
+                        )))
+                    } else if !command.is_empty() {
+                        let mut command = command;
+                        let (command, args) = (PathBuf::from(command.remove(0)), command);
+                        Some(Run::Command(
+                            RunCommandAction {
+                                command,
+                                args,
+                                cwd: cwd.clone(),
+                                hold_on_close: !close_on_exit,
+                                hold_on_start: start_suspended,
+                                ..Default::default()
+                            }
+                            .into(),
+                        ))
+                    } else {
+                        None
+                    };
+                    let tiled_layout = TiledPaneLayout {
+                        name,
+                        run,
+                        borderless,
+                        ..Default::default()
+                    };
+                    return Ok(vec![Action::NewTab {
+                        tiled_layout: Some(tiled_layout),
+                        floating_layouts: vec![],
+                        swap_tiled_layouts: None,
+                        swap_floating_layouts: None,
+                        tab_name,
+                        should_change_focus_to_new_tab: !no_focus,
+                        cwd,
+                        initial_panes: None,
+                        first_pane_unblock_condition: unblock_condition,
+                    }]);
+                }
                 if blocking || unblock_condition.is_some() {
                     // For blocking panes, we don't support plugins
                     if plugin.is_some() {
@@ -1165,26 +1219,8 @@ impl Action {
                         tab_id,
                     }])
                 } else if let Some(plugin) = plugin {
-                    let plugin = match RunPluginLocation::parse(&plugin, cwd.clone()) {
-                        Ok(location) => {
-                            let user_configuration = configuration.unwrap_or_default();
-                            RunPluginOrAlias::RunPlugin(RunPlugin {
-                                _allow_exec_host_cmd: false,
-                                location,
-                                configuration: user_configuration,
-                                initial_cwd: cwd.clone(),
-                            })
-                        },
-                        Err(_) => {
-                            let mut plugin_alias = PluginAlias::new(
-                                &plugin,
-                                &configuration.map(|c| c.inner().clone()),
-                                alias_cwd,
-                            );
-                            plugin_alias.set_caller_cwd_if_not_set(Some(current_dir));
-                            RunPluginOrAlias::Alias(plugin_alias)
-                        },
-                    };
+                    let plugin =
+                        run_plugin_or_alias(plugin, configuration, cwd.clone(), alias_cwd, current_dir);
                     if floating {
                         Ok(vec![Action::NewFloatingPluginPane {
                             plugin,

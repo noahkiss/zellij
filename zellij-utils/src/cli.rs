@@ -1272,6 +1272,10 @@ pub enum CliAction {
     ///
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
     /// handle>`. Without --direction the pane splits whichever side has the most room.
+    ///
+    /// Where it lands: beside the focused pane by default, beside a pane you name with --near, in
+    /// the tab --in-tab or --tab-id names, or in a tab of its own with --new-tab, which reports
+    /// `tab_id:` too.
     NewPane {
         /// Split the pane it opens beside towards right or down. Without it, zellij splits
         /// whichever side has the most room
@@ -1385,6 +1389,22 @@ pub enum CliAction {
 
         #[clap(skip)]
         unblock_condition: Option<UnblockCondition>,
+
+        /// Put the pane in a tab of its own, made now, and report `tab_id:` as well as the pane.
+        /// With a NAME the tab is called that; bare, zellij names it as it names any new tab
+        #[clap(
+            long,
+            value_name = "NAME",
+            num_args(0..=1),
+            conflicts_with("direction"),
+            conflicts_with("stacked"),
+            conflicts_with("in_place"),
+            conflicts_with("floating"),
+            conflicts_with("tab_id"),
+            conflicts_with("near_current_pane"),
+            conflicts_with("blocking")
+        )]
+        new_tab: Option<Option<String>>,
 
         /// Open the pane beside the pane this command was run from, rather than beside whichever
         /// pane the user is focused on
