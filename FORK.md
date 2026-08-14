@@ -109,6 +109,18 @@ prompt counted as "currently loading" and silently parked every later reload for
 the rest of the session; and a reload required an exact `(location, configuration)` match, so
 `start-or-reload-plugin` without a matching `-c` found nothing and spawned a stray pane instead.
 
+### A plugin whose file is missing stops erroring on every tick
+
+A pane whose `.wasm` is gone — what a snapshot taken before the plugin was deleted restores — used
+to log `Plugin with id: N not found` on every layout dump, so on every serialization tick, for the
+life of the session. The pane also serialized with no plugin at all, so the next snapshot recorded
+a plain pane where the plugin had been.
+
+The fork remembers what a plugin that failed to load was asked to run, for as long as its pane
+lives. The error is logged once, the pane keeps the loading-error state it already shows, and the
+plugin stays in the serialized layout. Reloading that pane does not bring the plugin back once the
+file returns; restoring the layout does, because the layout still names it.
+
 ### `dump-screen` works on plugin panes
 
 `zellij action dump-screen --pane-id plugin_N`, with or without `--ansi`, returns the pane's content
@@ -687,6 +699,18 @@ every later `up` refused until somebody killed a server by hand. With the lock t
 and then reports the session already running. A lock that cannot be taken in 30 seconds is a wedged
 holder rather than a busy one, so it is named and the `up` goes ahead: no session at all is a worse
 outcome than the race.
+
+`restart` takes that lock **once, for its `down` and its `up` together**, and the inner `up`
+re-enters the hold rather than waiting for it. Scoped to `up` alone the lock left the window between
+the two steps open, and the watchdog's tick fitted in it: the tick's `up` took the lock first and
+built the session fresh from the layout, and the restart's `up` then found a healthy session — and
+either reported "already running" and exited 0, or refused to restore into it. Both discard the
+snapshot the restart existed to bring back, and the case it is wanted for most is restoring a shape
+after a reboot, which is exactly when a watchdog is ticking. Re-entrancy is per thread and held in
+memory only, so a restart that dies mid-hold leaves nothing to clean up: the kernel releases the
+`flock` when the process goes. At the default `--wait-timeout` the whole restart fits inside the
+lock's own 30 seconds with room to spare; raise that timeout past about twenty seconds and a waiting
+`up` can give up on a restart that is only slow, which is the race put back by hand.
 
 ### `zellij setup --generate-service <systemd|launchd>`
 
@@ -2005,29 +2029,72 @@ A resurrected pane holds the command it was running, and `ENTER` re-runs it. For
 session id — a coding agent, a REPL that keeps state — re-running the bare command starts a *new*
 session and the old work becomes unreachable. The pane comes back; what was in it does not.
 
-A hint names a command, the environment variable that tool exports, and what to record instead when
-that variable is found among the pane's processes:
+A hint names a command, the environment variable that tool exports, and the arguments to **add** to
+the command line when that variable is found among the pane's processes:
 
 ```kdl
 resurrect_command_hints {
     claude {
         match "claude"
         env "CLAUDE_CODE_SESSION_ID"
-        rewrite "claude --resume {}"
+        resume_args "--continue"
     }
     opencode {
         match "opencode"
         env "OPENCODE_SESSION_ID"
-        rewrite "opencode --session {}"
+        resume_args "--session {}"
     }
 }
 ```
 
 `match` compares against the **basename** of the recorded command, exactly, so one hint covers both
-`claude` and `/opt/homebrew/bin/claude` and does not cover `claude-code`. `rewrite` is split on
-whitespace into a command and its arguments — it is not a shell string, so quoting and pipes mean
-nothing — and must contain `{}`, checked at parse time so `zellij setup --check` reports a hint that
-could never apply. The first matching hint wins; the block names are labels only.
+`claude` and `/opt/homebrew/bin/claude` and does not cover `claude-code`. `resume_args` is split on
+whitespace and appended to the observed argument list — it is not a shell string, so quoting and
+pipes mean nothing — with `{}` standing for the variable's value. The placeholder is optional: a
+resume flag that needs no id carries none. The first matching hint wins; the block names are labels
+only.
+
+**The observed command line is the ground truth and is never replaced.** A hint only appends, so the
+pane comes back holding a command it really ran, flags and interpreter path included. It appends
+nothing when any of its words is already in the observed arguments: a pane started as
+`claude --continue`, or as `claude --resume <id>`, already says how it resumes, and the argv beats
+anything a hint could reconstruct.
+
+That is also why the variable is a **detector**, not a source. It proves the pane is running the
+tool; its value reaches the command only through an explicit `{}`. `CLAUDE_CODE_SESSION_ID` in
+particular is not the id `claude --resume` takes — the resumable id is the transcript file name, and
+the variable can carry an internal or subagent session id read from any process under the pane. A
+hint that fed it to `--resume` recorded an id that resumed nothing. `--continue` resumes the newest
+session for the recorded cwd and needs no id at all.
+
+#### Migrating from `rewrite`
+
+`resume_args` replaces the earlier `rewrite` entry, which held a whole command line. **Edit every
+config that still says `rewrite`** — the two blocks in this fork's own documented example become:
+
+| block | was | becomes |
+|---|---|---|
+| `claude` | `rewrite "claude --resume {}"` | `resume_args "--continue"` |
+| `opencode` | `rewrite "opencode --session {}"` | `resume_args "--session {}"` |
+
+Note the value changes shape, not just the key name: `rewrite "claude --resume {}"` carried the
+command name, and `resume_args` must not — the command comes from the pane.
+
+Until that edit lands, an upgraded binary **warns and skips the hint**, and loads the rest of the
+config normally. The warning names `resume_args` and goes to the zellij log. A hint block carrying
+both keys uses `resume_args` and warns about the `rewrite` beside it.
+
+Retiring the key this way, rather than refusing it, is deliberate. A config error in this block is
+not degradable: `Config::from_kdl` fails the whole file, and every path into a session — `zellij`,
+`zellij attach -c`, the session unit — prints the parse error and exits before the terminal is
+touched. Refusing `rewrite` would therefore have stopped every machine whose config still carried
+it, over a key that only decides how nicely a pane comes back. A skipped hint costs a resumable
+command; a refused config costs the session.
+
+A `{}` keeps one residual risk, which is why the shipped `claude` hint carries none. The variable is
+read from the pane's whole process subtree, so the value can come from a child — a subagent, a hook —
+rather than from the tool the pane is running. As a detector that does not matter; substituted into
+the command, it records whatever answered first.
 
 The variable is read from the pane's pid and every process under it, breadth first, first one that
 has it wins: `/proc/<pid>/environ` on Linux, `sysctl(KERN_PROCARGS2)` on macOS — the same call
@@ -2042,8 +2109,8 @@ reaches the pty thread through the existing `Reconfigure` message, so **a config
 next serialization** without restarting the session.
 
 Note the KDL constraint that bites here: every node needs a `;` or a newline after it, the last one
-before a closing brace included, so the one-line form `{ match "x"; env "Y"; rewrite "z" }` does not
-parse. Use the multi-line form above.
+before a closing brace included, so the one-line form `{ match "x"; env "Y"; resume_args "z" }` does
+not parse. Use the multi-line form above.
 
 ### What a pane is running, when the shell has no job control
 

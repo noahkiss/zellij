@@ -141,9 +141,14 @@ impl SessionLayoutMetadata {
         // 1. The current number of panes is different than the number of panes in the base layout
         //    (meaning a pane was opened or closed)
         // 2. One or more terminal panes are running a command that is not the default shell
+        // 3. The tabs no longer match the base layout's tabs - one was renamed, added, closed or
+        //    MOVED
         let base_layout_pane_count = self.default_layout.pane_count();
         let current_pane_count = self.pane_count();
         if current_pane_count != base_layout_pane_count {
+            return true;
+        }
+        if self.tabs_diverge_from_base_layout() {
             return true;
         }
         for tab in &self.tabs {
@@ -179,6 +184,43 @@ impl SessionLayoutMetadata {
             }
         }
         false
+    }
+    /// Whether the tab list differs from the one the base layout describes - in count, in name, or
+    /// in ORDER.
+    ///
+    /// Moving a tab changes none of the things `is_dirty` used to look at: the pane count is the
+    /// same and so are the commands. A session that is otherwise clean therefore never writes its
+    /// layout again after a move, the copy on disk keeps the pre-move order, and the next restart
+    /// that resurrects from that copy hands the tab back where it started - silently, and every
+    /// time, since nothing ever marks it dirty.
+    ///
+    /// A base layout with no tabs of its own says nothing about the tabs a session grew, so it is
+    /// not compared. An unnamed base tab matches any name for the same reason: the layout did not
+    /// ask for one, so a session that named it itself has not diverged. The cost of that wildcard
+    /// is that a move between two tabs the layout left unnamed is not seen; the alternative -
+    /// comparing against the default `Tab #n` names - calls every such session dirty forever.
+    ///
+    /// Note the check is only reached today when the base layout defines no tabs of its own beyond
+    /// its template: `Layout::pane_count` adds the template's panes to the tabs' panes, so any
+    /// layout parsed from KDL with explicit tabs already fails the pane count comparison above and
+    /// `is_dirty` returns before this runs. This is the check the tab comparison would need, the
+    /// moment that count is made to mean what it says.
+    fn tabs_diverge_from_base_layout(&self) -> bool {
+        let base_tabs = &self.default_layout.tabs;
+        if base_tabs.is_empty() {
+            return false;
+        }
+        if base_tabs.len() != self.tabs.len() {
+            return true;
+        }
+        base_tabs
+            .iter()
+            .zip(self.tabs.iter())
+            .any(|((base_name, _, _), tab)| match (base_name, &tab.name) {
+                (Some(base_name), Some(name)) => base_name != name,
+                (Some(_), None) => true,
+                (None, _) => false,
+            })
     }
     fn pane_count(&self) -> usize {
         let mut pane_count = 0;
@@ -492,16 +534,21 @@ impl SessionLayoutMetadata {
             }
         }
     }
-    /// Rewrites the recorded command of any pane a `resurrect_command_hints` entry applies to, so
-    /// that the resurrected pane offers to resume the tool's session instead of starting a new one.
+    /// Appends resume arguments to the recorded command of any pane a `resurrect_command_hints`
+    /// entry applies to, so that the resurrected pane offers to resume the tool's session instead
+    /// of starting a new one.
+    ///
+    /// The observed command line is kept whole - path, arguments and all. A hint only adds, so a
+    /// resurrected pane always offers a command the pane really ran.
     ///
     /// `read_env` is the seam over the platform: it is handed a terminal id and a variable name and
     /// returns the value found in that pane's processes. Everything the hints decide is here;
     /// everything about processes is on the other side of that closure.
     ///
     /// A pane is left exactly as it was whenever anything does not line up - no hint matches, the
-    /// variable is not set, the template holds no command. There is no failure mode: a hint that
-    /// does not resolve gives the same snapshot the feature would have produced by not existing.
+    /// variable is not set, the observed arguments already resume. There is no failure mode: a hint
+    /// that does not resolve gives the same snapshot the feature would have produced by not
+    /// existing.
     pub fn apply_resurrect_command_hints<F>(
         &mut self,
         hints: &ResurrectCommandHints,
@@ -530,23 +577,23 @@ impl SessionLayoutMetadata {
                 let Some(env_value) = read_env(terminal_id, &hint.env) else {
                     continue;
                 };
-                let Some((command, args)) = hint.expand(&env_value) else {
+                let Some(extra_args) = hint.resume_args_for(&run_command.args, &env_value) else {
                     log::debug!(
-                        "resurrect_command_hints {:?}: rewrite {:?} holds no command",
+                        "resurrect_command_hints {:?}: resume_args {:?} add nothing to the observed \
+                         command of terminal {}",
                         hint.name,
-                        hint.rewrite
+                        hint.resume_args,
+                        terminal_id
                     );
                     continue;
                 };
-                let mut rewritten = RunCommand::new(PathBuf::from(command));
-                rewritten.args = args;
-                rewritten.cwd = run_command.cwd.clone();
-                rewritten.hold_on_close = run_command.hold_on_close;
-                rewritten.hold_on_start = run_command.hold_on_start;
+                let mut rewritten = run_command.clone();
+                rewritten.args.extend(extra_args);
                 log::debug!(
-                    "resurrect_command_hints {:?}: recording {:?} for terminal {}",
+                    "resurrect_command_hints {:?}: recording {:?} {:?} for terminal {}",
                     hint.name,
                     rewritten.command,
+                    rewritten.args,
                     terminal_id
                 );
                 pane.run = Some(Run::Command(rewritten));
@@ -798,6 +845,7 @@ impl ClientMetadata {
 mod tests {
     use super::*;
     use zellij_utils::data::PaneId as ZellijPaneId;
+    use zellij_utils::input::layout::TiledPaneLayout;
     use zellij_utils::pane_size::PaneGeom;
 
     fn make_command_pane(terminal_id: u32, command: &str, args: Vec<&str>) -> PaneLayoutMetadata {
@@ -816,6 +864,43 @@ mod tests {
             None,
             None,
         )
+    }
+
+    fn make_plain_pane(terminal_id: u32) -> PaneLayoutMetadata {
+        PaneLayoutMetadata::new(
+            PaneId::Terminal(terminal_id),
+            PaneGeom::default(),
+            false,
+            None,
+            None,
+            false,
+            None,
+            vec![],
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A session in exactly the shape of the layout it was built from: one plain pane per tab, the
+    /// tabs named and ordered as the layout names and orders them. Nothing about it is dirty.
+    fn session_matching_layout(tab_names: &[&str]) -> SessionLayoutMetadata {
+        let mut layout = Layout::default();
+        layout.tabs = tab_names
+            .iter()
+            .map(|name| (Some(name.to_string()), TiledPaneLayout::default(), vec![]))
+            .collect();
+        let mut session_layout_metadata = SessionLayoutMetadata::new(Box::new(layout));
+        for (i, name) in tab_names.iter().enumerate() {
+            session_layout_metadata.add_tab(
+                name.to_string(),
+                i == 0,
+                false,
+                vec![make_plain_pane(i as u32)],
+                vec![],
+            );
+        }
+        session_layout_metadata
     }
 
     fn make_edit_file_pane(
@@ -1007,13 +1092,13 @@ mod tests {
 
     fn hints(entries: &[(&str, &str, &str)]) -> ResurrectCommandHints {
         let mut hints = ResurrectCommandHints::default();
-        for (match_command, env, rewrite) in entries {
+        for (match_command, env, resume_args) in entries {
             hints.push(
                 zellij_utils::resurrect_command_hints::ResurrectCommandHint {
                     name: match_command.to_string(),
                     match_command: match_command.to_string(),
                     env: env.to_string(),
-                    rewrite: rewrite.to_string(),
+                    resume_args: resume_args.to_string(),
                 },
             );
         }
@@ -1034,38 +1119,73 @@ mod tests {
     }
 
     #[test]
-    fn rewrites_a_matching_command_when_the_variable_is_found() {
+    fn appends_resume_args_when_the_variable_is_found() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec![])]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         match get_first_tiled_run(&meta) {
             Some(Run::Command(rc)) => {
                 assert_eq!(rc.command, PathBuf::from("claude"));
-                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()]);
+                assert_eq!(rc.args, vec!["--continue".to_owned()]);
             },
             other => panic!("expected Command, got {:?}", other),
         }
     }
 
+    /// The regression: a hint used to REPLACE the command line, so the recorded command lost the
+    /// path and every flag the pane really ran. What comes back must be the observed argv plus the
+    /// resume flag, and nothing else.
     #[test]
-    fn matches_a_command_by_its_basename() {
+    fn keeps_the_observed_path_and_arguments() {
         let mut meta = session_with_panes(vec![make_command_pane(
             1,
             "/opt/homebrew/bin/claude",
-            vec!["--verbose"],
+            vec!["--dangerously-skip-permissions"],
         )]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         match get_first_tiled_run(&meta) {
             Some(Run::Command(rc)) => {
+                assert_eq!(rc.command, PathBuf::from("/opt/homebrew/bin/claude"));
+                assert_eq!(
+                    rc.args,
+                    vec![
+                        "--dangerously-skip-permissions".to_owned(),
+                        "--continue".to_owned()
+                    ]
+                );
+            },
+            other => panic!("expected Command, got {:?}", other),
+        }
+    }
+
+    /// A pane that already ran a resume flag is recorded exactly as it ran. The environment value
+    /// is a detector here, and must not become a second, contradictory resume argument.
+    #[test]
+    fn observed_arguments_that_already_resume_are_left_alone() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "claude",
+            vec!["--dangerously-skip-permissions", "--continue"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(Some("an-internal-session-id")),
+        );
+        match get_first_tiled_run(&meta) {
+            Some(Run::Command(rc)) => {
                 assert_eq!(rc.command, PathBuf::from("claude"));
-                // the recorded arguments are replaced, not appended to - the rewrite is the whole
-                // command line the resurrected pane offers
-                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()]);
+                assert_eq!(
+                    rc.args,
+                    vec![
+                        "--dangerously-skip-permissions".to_owned(),
+                        "--continue".to_owned()
+                    ]
+                );
             },
             other => panic!("expected Command, got {:?}", other),
         }
@@ -1075,7 +1195,7 @@ mod tests {
     fn leaves_the_command_alone_when_the_variable_is_missing() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["--verbose"])]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(None),
         );
         match get_first_tiled_run(&meta) {
@@ -1092,7 +1212,7 @@ mod tests {
         let mut meta = session_with_panes(vec![make_command_pane(1, "htop", vec![])]);
         let mut reads = 0;
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             |_terminal_id, _var| {
                 reads += 1;
                 Some("abc-123".to_owned())
@@ -1109,11 +1229,7 @@ mod tests {
     fn expands_a_placeholder_that_sits_in_an_argument() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "opencode", vec![])]);
         meta.apply_resurrect_command_hints(
-            &hints(&[(
-                "opencode",
-                "OPENCODE_SESSION_ID",
-                "opencode --session={} --continue",
-            )]),
+            &hints(&[("opencode", "OPENCODE_SESSION_ID", "--session={} --continue")]),
             env_always(Some("xyz")),
         );
         match get_first_tiled_run(&meta) {
@@ -1150,14 +1266,14 @@ mod tests {
         pane.run = None;
         let mut meta = session_with_panes(vec![pane]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         assert_eq!(get_first_tiled_run(&meta), None);
     }
 
     #[test]
-    fn floating_panes_are_rewritten_too() {
+    fn floating_panes_get_resume_args_too() {
         let mut meta = SessionLayoutMetadata::default();
         meta.add_tab(
             "tab1".to_string(),
@@ -1167,12 +1283,12 @@ mod tests {
             vec![make_command_pane(1, "claude", vec![])],
         );
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "claude --resume {}")]),
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
             env_always(Some("abc-123")),
         );
         match meta.tabs[0].floating_panes[0].run.as_ref() {
             Some(Run::Command(rc)) => {
-                assert_eq!(rc.args, vec!["--resume".to_owned(), "abc-123".to_owned()])
+                assert_eq!(rc.args, vec!["--continue".to_owned()])
             },
             other => panic!("expected Command, got {:?}", other),
         }
@@ -1378,5 +1494,105 @@ mod tests {
         );
         let clients = meta.all_clients_metadata();
         assert_eq!(clients.get(&1).and_then(|c| c.terminal_size()), None);
+    }
+
+    #[test]
+    fn a_session_in_the_shape_of_its_layout_is_not_dirty() {
+        let meta = session_matching_layout(&["one", "two", "three"]);
+        assert!(
+            !meta.is_dirty(),
+            "nothing has changed since the layout built it"
+        );
+    }
+
+    #[test]
+    fn a_moved_tab_makes_the_layout_dirty() {
+        // a move changes neither the pane count nor any command, so it is invisible to every other
+        // dirty check - and a layout that is never rewritten hands the tab back where it started
+        let mut meta = session_matching_layout(&["one", "two", "three"]);
+        meta.tabs.swap(1, 2);
+        assert_eq!(
+            meta.tab_names(),
+            vec!["one".to_string(), "three".to_string(), "two".to_string()],
+            "the tab really moved"
+        );
+        assert!(
+            meta.is_dirty(),
+            "the order on disk no longer matches the order the user sees"
+        );
+    }
+
+    #[test]
+    fn a_renamed_tab_makes_the_layout_dirty() {
+        let mut meta = session_matching_layout(&["one", "two"]);
+        meta.tabs[1].name = Some("renamed".to_string());
+        assert!(meta.is_dirty(), "the name on disk is the old one");
+    }
+
+    #[test]
+    fn a_layout_that_names_no_tabs_of_its_own_leaves_the_session_clean() {
+        // the base layout describes a template rather than tabs, so it says nothing about the tabs
+        // this session has - and a session that has diverged from nothing is not dirty
+        let mut layout = Layout::default();
+        layout.template = Some((TiledPaneLayout::default(), vec![]));
+        let mut meta = SessionLayoutMetadata::new(Box::new(layout));
+        meta.add_tab(
+            "Tab #1".to_string(),
+            true,
+            false,
+            vec![make_plain_pane(0)],
+            vec![],
+        );
+        assert!(
+            !meta.is_dirty(),
+            "a template-only layout must not make every session dirty"
+        );
+    }
+
+    #[test]
+    fn a_moved_tab_diverges_from_a_layout_parsed_from_kdl() {
+        // the shape a real session is built from: named tabs over a default_tab_template, parsed
+        // by the same parser that reads the layout file
+        let raw = "layout {\n \
+                   default_tab_template {\n \
+                   pane size=1 borderless=true {\n \
+                   plugin location=\"zellij:tab-bar\"\n \
+                   }\n \
+                   children\n \
+                   }\n \
+                   tab name=\"console\"\n \
+                   tab name=\"develop\"\n \
+                   }";
+        let layout = Layout::from_str(raw, "test".into(), None, None).unwrap();
+        let mut meta = SessionLayoutMetadata::new(Box::new(layout));
+        for (i, name) in ["console", "develop"].iter().enumerate() {
+            meta.add_tab(
+                name.to_string(),
+                i == 0,
+                false,
+                vec![
+                    make_plain_pane(i as u32 * 2),
+                    make_plain_pane(i as u32 * 2 + 1),
+                ],
+                vec![],
+            );
+        }
+        assert!(
+            !meta.tabs_diverge_from_base_layout(),
+            "the session is in the shape the layout describes"
+        );
+        // the reason the comparison is read directly rather than through `is_dirty`:
+        // `Layout::pane_count` counts the template's panes on top of the tabs it already expanded
+        // them into, so this session - in exactly the shape of the layout that built it - already
+        // fails the pane count comparison and is dirty before its tabs are ever looked at
+        assert!(
+            meta.is_dirty(),
+            "a parsed layout counts its template twice, so nothing here is ever clean"
+        );
+        meta.tabs.swap(0, 1);
+        assert!(
+            meta.tabs_diverge_from_base_layout(),
+            "the tabs are no longer in the order the layout lists them"
+        );
     }
 }
