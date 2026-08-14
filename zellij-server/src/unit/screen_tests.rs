@@ -14604,3 +14604,50 @@ pub fn an_unmet_unblock_condition_waits_for_the_pane_to_close() {
         "the wait ended without the command's exit status"
     );
 }
+
+#[test]
+pub fn closing_the_focused_pane_with_nothing_focused_is_a_miss() {
+    // `close-pane` against a session nobody is attached to. It used to close nothing and exit 0,
+    // which reads as "the pane is gone" on a session that still has every pane it started with
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    // the client the mock session belongs to, and one that holds no focus in it - which is what a
+    // `zellij action` client is on a session with nothing attached
+    let client_holding_the_focus = 1;
+    let client_holding_no_focus = 99;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let missed = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocus,
+        client_holding_no_focus,
+    );
+    let acted = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocus,
+        client_holding_the_focus,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        missed.error_message.as_deref(),
+        Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
+        "{:?}",
+        missed.error_message
+    );
+    assert!(
+        missed.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        missed.stdout_lines
+    );
+    // the negative control: a client that does hold the focus is not refused. Its close is handed
+    // to the tab and finished by a pty this harness does not run, so what it answers here is the
+    // harness running out of patience - never the refusal above
+    assert_ne!(
+        acted.error_message.as_deref(),
+        Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
+        "a client with a focused pane was told it had none"
+    );
+}
