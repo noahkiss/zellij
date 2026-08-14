@@ -19,9 +19,7 @@ use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermiss
 use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
-use crate::resurrect_command_hints::{
-    ResurrectCommandHint, ResurrectCommandHints, HINT_PLACEHOLDER,
-};
+use crate::resurrect_command_hints::{ResurrectCommandHint, ResurrectCommandHints};
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
 use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
@@ -3924,15 +3922,20 @@ impl Options {
     ///
     /// ```kdl
     /// resurrect_command_hints {
-    ///     claude { match "claude"; env "CLAUDE_CODE_SESSION_ID"; rewrite "claude --resume {}" }
+    ///     claude { match "claude"; env "CLAUDE_CODE_SESSION_ID"; resume_args "--continue" }
     /// }
     /// ```
     ///
     /// The block name (`claude` here) is a label - it names the hint in errors and logs and takes
-    /// no part in matching. All three entries are required, and `rewrite` must contain the `{}`
-    /// placeholder: a rewrite without one throws away the value the whole hint exists to find, so
-    /// it is a config mistake rather than a choice. It is checked here, at parse time, so that
-    /// `zellij setup --check` reports it rather than a serialization that quietly does nothing.
+    /// no part in matching. All three entries are required. `resume_args` is APPENDED to the
+    /// command the pane was observed running, and `{}` in it is optional: a resume flag that needs
+    /// no id carries none.
+    ///
+    /// The old `rewrite` entry, which replaced the whole command line, is WARNED about and its
+    /// hint skipped. It is deliberately not an error: a config error here fails the whole file and
+    /// `zellij` exits before it starts a session, so refusing the key would let an upgraded binary
+    /// brick every machine whose config still carries it. A hint that does not load costs a
+    /// resumable command; a config that does not load costs the session.
     fn resurrect_command_hints_from_kdl(
         kdl_hints: &KdlNode,
     ) -> Result<ResurrectCommandHints, ConfigError> {
@@ -3943,7 +3946,8 @@ impl Options {
             let name = kdl_name!(kdl_hint).to_owned();
             let mut match_command: Option<String> = None;
             let mut env: Option<String> = None;
-            let mut rewrite: Option<String> = None;
+            let mut resume_args: Option<String> = None;
+            let mut retired_rewrite: Option<String> = None;
             for entry in kdl_children_nodes_or_error!(
                 kdl_hint,
                 format!("empty resurrect_command_hints entry: {:?}", name)
@@ -3962,18 +3966,38 @@ impl Options {
                 match entry_name {
                     "match" => match_command = Some(value),
                     "env" => env = Some(value),
-                    "rewrite" => rewrite = Some(value),
+                    "resume_args" => resume_args = Some(value),
+                    "rewrite" => retired_rewrite = Some(value),
                     other => {
                         return Err(ConfigError::new_kdl_error(
                             format!(
                                 "Unknown resurrect_command_hints entry: {:?} (expected match, env \
-                                 or rewrite)",
+                                 or resume_args)",
                                 other
                             ),
                             entry.span().offset(),
                             entry.span().len(),
                         ))
                     },
+                }
+            }
+            if let Some(rewrite) = retired_rewrite {
+                let outcome = if resume_args.is_some() {
+                    "the resume_args beside it is used"
+                } else {
+                    "this hint is SKIPPED"
+                };
+                log::warn!(
+                    "resurrect_command_hints {:?}: \"rewrite\" is retired and {}. It replaced the \
+                     whole command line, including arguments the pane never ran. Replace it with \
+                     \"resume_args\", holding only the arguments to append: \
+                     resume_args \"--continue\". (ignored value: {:?})",
+                    name,
+                    outcome,
+                    rewrite
+                );
+                if resume_args.is_none() {
+                    continue;
                 }
             }
             let missing = |field: &str| {
@@ -3985,13 +4009,13 @@ impl Options {
             };
             let match_command = match_command.ok_or_else(|| missing("match"))?;
             let env = env.ok_or_else(|| missing("env"))?;
-            let rewrite = rewrite.ok_or_else(|| missing("rewrite"))?;
-            if !rewrite.contains(HINT_PLACEHOLDER) {
+            let resume_args = resume_args.ok_or_else(|| missing("resume_args"))?;
+            if resume_args.split_whitespace().next().is_none() {
                 return Err(ConfigError::new_kdl_error(
                     format!(
-                        "resurrect_command_hints {:?}: rewrite {:?} has no {} placeholder for the \
-                         value of {:?}",
-                        name, rewrite, HINT_PLACEHOLDER, env
+                        "resurrect_command_hints {:?}: resume_args is empty, so the hint could \
+                         never add anything",
+                        name
                     ),
                     kdl_hint.span().offset(),
                     kdl_hint.span().len(),
@@ -4001,7 +4025,7 @@ impl Options {
                 name,
                 match_command,
                 env,
-                rewrite,
+                resume_args,
             });
         }
         Ok(hints)
@@ -4018,7 +4042,7 @@ impl Options {
             for (name, value) in [
                 ("match", &hint.match_command),
                 ("env", &hint.env),
-                ("rewrite", &hint.rewrite),
+                ("resume_args", &hint.resume_args),
             ] {
                 let mut entry = KdlNode::new(name);
                 entry.push(KdlValue::String(value.to_owned()));
@@ -9612,12 +9636,12 @@ fn resurrect_command_hints_config_parsing() {
     claude {
         match "claude"
         env "CLAUDE_CODE_SESSION_ID"
-        rewrite "claude --resume {}"
+        resume_args "--continue"
     }
     opencode {
         match "opencode"
         env "OPENCODE_SESSION_ID"
-        rewrite "opencode --session {}"
+        resume_args "--session {}"
     }
 }"#,
         None,
@@ -9631,13 +9655,13 @@ fn resurrect_command_hints_config_parsing() {
                 name: "claude".to_owned(),
                 match_command: "claude".to_owned(),
                 env: "CLAUDE_CODE_SESSION_ID".to_owned(),
-                rewrite: "claude --resume {}".to_owned(),
+                resume_args: "--continue".to_owned(),
             },
             ResurrectCommandHint {
                 name: "opencode".to_owned(),
                 match_command: "opencode".to_owned(),
                 env: "OPENCODE_SESSION_ID".to_owned(),
-                rewrite: "opencode --session {}".to_owned(),
+                resume_args: "--session {}".to_owned(),
             },
         ]
     );
@@ -9663,7 +9687,7 @@ fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
             "resurrect_command_hints {
     claude {
         env \"X\"
-        rewrite \"claude {}\"
+        resume_args \"--continue\"
     }
 }",
             "match",
@@ -9672,7 +9696,7 @@ fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
             "resurrect_command_hints {
     claude {
         match \"claude\"
-        rewrite \"claude {}\"
+        resume_args \"--continue\"
     }
 }",
             "env",
@@ -9684,24 +9708,24 @@ fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
         env \"X\"
     }
 }",
-            "rewrite",
+            "resume_args",
         ),
         (
             "resurrect_command_hints {
     claude {
         match \"claude\"
         env \"X\"
-        rewrite \"claude --resume\"
+        resume_args \"  \"
     }
 }",
-            "placeholder",
+            "empty",
         ),
         (
             "resurrect_command_hints {
     claude {
         match \"claude\"
         env \"X\"
-        rewrite \"claude {}\"
+        resume_args \"--continue\"
         resume \"yes\"
     }
 }",
@@ -9718,6 +9742,100 @@ fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
             error
         );
     }
+}
+
+/// The upgrade path that must never brick a machine: a config written for the retired `rewrite`
+/// entry still LOADS. A config error here is fatal - `zellij` prints the parse failure and exits
+/// before it starts a session - so refusing the key would stop every machine whose config still
+/// carries it. The stale hint is dropped and the rest of the file survives untouched.
+#[test]
+fn a_config_still_using_the_retired_rewrite_entry_still_loads() {
+    let config = Config::from_kdl(
+        r#"default_shell "fish"
+resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+    opencode {
+        match "opencode"
+        env "OPENCODE_SESSION_ID"
+        resume_args "--session {}"
+    }
+}"#,
+        None,
+    )
+    .expect("a retired hint entry must not fail the whole config");
+
+    // the rest of the file is untouched
+    assert_eq!(
+        config.options.default_shell,
+        Some(std::path::PathBuf::from("fish"))
+    );
+
+    // the stale hint is dropped, the sound one beside it is kept
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![ResurrectCommandHint {
+            name: "opencode".to_owned(),
+            match_command: "opencode".to_owned(),
+            env: "OPENCODE_SESSION_ID".to_owned(),
+            resume_args: "--session {}".to_owned(),
+        }]
+    );
+    assert!(hints.hint_for("claude").is_none());
+}
+
+/// A config whose ONLY hint is the retired one loads to no hints at all - not to an error, and not
+/// to a hint with no arguments to add.
+#[test]
+fn a_lone_retired_hint_leaves_no_hints() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+    }
+}"#,
+        None,
+    )
+    .expect("a retired hint entry must not fail the whole config");
+    assert!(config
+        .options
+        .resurrect_command_hints
+        .as_ref()
+        .unwrap()
+        .is_empty());
+}
+
+/// Mid-migration, with both entries written, the new one is honoured and the retired one ignored.
+#[test]
+fn resume_args_wins_over_a_retired_rewrite_beside_it() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        rewrite "claude --resume {}"
+        resume_args "--continue"
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.hints,
+        vec![ResurrectCommandHint {
+            name: "claude".to_owned(),
+            match_command: "claude".to_owned(),
+            env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+            resume_args: "--continue".to_owned(),
+        }]
+    );
 }
 
 /// The entries the generator owns are rejected where a person can see it - at parse time, so that

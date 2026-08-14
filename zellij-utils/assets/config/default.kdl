@@ -739,21 +739,25 @@ load_plugins {
 // - env:     the variable to look for, in the pane's process and every process under it. The first
 //            one that has it wins. Read from /proc on Linux and from sysctl(KERN_PROCARGS2) on
 //            macOS; on any other platform nothing is found and the command is recorded as it is
-// - rewrite: what to record instead, with `{}` standing for the variable's value. Split on
-//            whitespace into a command and its arguments - it is not passed to a shell
-// A hint that does not match, or whose variable is not set, records the command unchanged
+// - resume_args: arguments APPENDED to the command the pane was observed running, with `{}`
+//            standing for the variable's value. Split on whitespace - it is not passed to a shell.
+//            `{}` is optional: a resume flag that needs no id carries none
+// A hint that does not match, or whose variable is not set, records the command unchanged. So does
+// a pane whose observed arguments already carry one of these words - the argv that ran wins
+// `resume_args` replaces the earlier `rewrite`, which held a whole command line. A hint still
+// written with `rewrite` is skipped with a warning, and the rest of the config loads as usual
 // Default: no hints, every command recorded as it is
 //
 // resurrect_command_hints {
 //     claude {
 //         match "claude"
 //         env "CLAUDE_CODE_SESSION_ID"
-//         rewrite "claude --resume {}"
+//         resume_args "--continue"
 //     }
 //     opencode {
 //         match "opencode"
 //         env "OPENCODE_SESSION_ID"
-//         rewrite "opencode --session {}"
+//         resume_args "--session {}"
 //     }
 // }
 
