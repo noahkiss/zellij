@@ -3181,40 +3181,61 @@ a switch also fires `ModeUpdate` and `PaneUpdate`, the plugin redraws for those 
 redraw satisfies the wait before the tab-aware one exists. Fixing it needs a render to say which
 event it answers, which `PluginRenderAsset` does not carry.
 
-### Notices the server draws over the viewport
+### One warning badge in the tab bar
 
-Two facts are true of a whole session, actionable, and invisible everywhere else:
+Two facts are true of a whole session, actionable, and invisible everywhere else. The bar says so
+in the space beside the clock:
 
 ```
-                        ⚠ Full Disk Access not granted for /Users/<user>/Library/…/zellij/bin/zellij
-                        ⚠ session 'main' runs a superseded build - `zellij session restart main`
+  mysession  1 edit  2 build  3 logs                              ⚠ zj TCC  7/30 3:47 PM
 ```
 
-They are drawn by the **server**, top-right, after the panes have rendered. That placement is the
-whole design:
+`zj` is a superseded build, `TCC` is missing Full Disk Access, and one triangle covers however many
+are live — two triangles side by side read as two widgets rather than one thing that is wrong. The
+codes are space-separated in a fixed order, so a badge showing both never swaps them between
+frames. **No warnings renders nothing at all**, not a space, so a healthy session's bar is
+byte-identical to what it was.
 
-- **It wins every frame.** Composited after pane rendering, so an alt-screen application repainting
-  underneath cannot clobber it.
-- **`dump-screen` never sees it.** Nothing is written into any pane's grid, so transcript reads and
-  content matching are exactly what they were.
-- **It costs no layout.** No pane gives up a row.
-- **A plugin could not do it.** Almost all zellij chrome is plugins - tab bar, status bar - and a
-  user who has replaced theirs would never see a notice living in a bundled one.
+It sits **left of the clock** rather than at the outer edge, so the clock keeps its column when a
+warning appears or clears: the clock is what gets read at a glance, and a badge that shoved it
+sideways twice a session would be worse than the badge is good. It is drawn in `exit_code_error`
+from the active theme — the colour the theme itself picked for "something is wrong" — bold, and it
+never blinks: it reports a fact that has been true for minutes and will stay true until someone acts
+on it. In the bar's overflow order the badge is in every form, so it outlives the clock; a bar too
+narrow to say something is wrong is exactly the bar that would hide it forever.
 
-Narrow viewports truncate with an ellipsis and, below 24 columns, draw nothing: a notice that
-wrapped across the top of the panes would be worse than no notice.
+**This replaced a pair of full-width lines the server composited over the top-right of the
+viewport.** That placement bought real things — an alt-screen repaint could not clobber it, it cost
+no pane rows, and `dump-screen` never saw it — but the price was a sentence and a half of prose
+across the top of the panes for a fact that does not change for hours. What is left of the old
+design is the part that mattered: the **server** still answers both questions, because the answers
+need `current_exe`, the `PATH` and a real `open` against a TCC-gated file, none of which a wasm
+plugin can reach without spawning a process. Asking once in the server costs one probe per session
+per tick however many bars draw it.
 
-Both questions are re-asked every 30 seconds, because both answers change under a running server -
-an FDA toggle takes effect immediately, and an upgrade can replace the binary at any time. When the
-answer changes, every tab is forced to re-render: output is diffed between frames, so a notice that
-simply stopped being drawn would leave its glyphs on screen.
+The answers ride **`ModeInfo.session_warnings`**, which is the smallest honest transport available:
+it is the one thing every bar already reads, it already reaches every tab's plugins, and this fork
+already extends it for `pane_frame_style`, `session_dimmed` and `session_ancestry`. No new event
+type, no new subscription. An unknown code arriving over protobuf is dropped rather than fatal, so a
+bar built against an older contract badges what it understands.
+
+Both questions are re-asked every 30 seconds, because both answers change under a running server —
+an FDA toggle takes effect immediately, and an upgrade can replace the binary at any time. A change
+sends one `ModeUpdate`; no answer moving sends nothing.
+
+The trade is stated plainly: a user who has replaced **both** bundled bars sees neither code. That
+is the cost of the badge, and it is accepted — `zellij session doctor` reports both conditions in
+full prose, and it is the tool you reach for when something is actually wrong.
 
 **Full Disk Access** (`expect_full_disk_access true`, macOS, off by default) opens the same
-FDA-gated file the startup probe uses last and reports a refusal. Opt-in, because only the user
-knows whether they mean zellij to hold that permission - and where they do, its absence IS the
-actionable fact whether or not it was ever granted. The notice names the path, because the grant is
-keyed to that exact file and [auto-registration was not observed to
-happen](#the-about-page-names-the-binary-macos-must-trust).
+FDA-gated file the startup probe uses last and reports a refusal — a real `open`, because `access(2)`
+tests permission bits while TCC denies at open. Opt-in, because only the user knows whether they
+mean zellij to hold that permission - and where they do, its absence IS the actionable fact whether
+or not it was ever granted. A probe that cannot answer — the file missing, or a failure that is not
+a permission one — is never reported as a denial. The badge is a flag, not an instruction: the
+[about page](#the-about-page-names-the-binary-macos-must-trust) and `session doctor` name the exact
+path, because the grant is keyed to that file and auto-registration was not observed to happen.
+Non-macOS builds have no such permission, so `TCC` cannot appear.
 
 **A superseded build** (`stale_build_notice`, on by default) is asked of the path this server was
 STARTED FROM: the file being gone, or holding a different build than the one running, is proof.

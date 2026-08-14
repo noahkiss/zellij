@@ -863,6 +863,8 @@ pub struct ModeUpdatePayload {
     pub session_ascended: ::core::option::Option<bool>,
     #[prost(string, repeated, tag="22")]
     pub nested_descend_keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration="SessionWarning", repeated, tag="23")]
+    pub session_warnings: ::prost::alloc::vec::Vec<i32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1330,6 +1332,33 @@ impl MouseEventName {
             "MouseHover" => Some(Self::MouseHover),
             "MouseScrollLeft" => Some(Self::MouseScrollLeft),
             "MouseScrollRight" => Some(Self::MouseScrollRight),
+            _ => None,
+        }
+    }
+}
+/// Session-wide conditions worth badging in a status bar. Ordered as they are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionWarning {
+    SupersededBuild = 0,
+    MissingFullDiskAccess = 1,
+}
+impl SessionWarning {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            SessionWarning::SupersededBuild => "SupersededBuild",
+            SessionWarning::MissingFullDiskAccess => "MissingFullDiskAccess",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SupersededBuild" => Some(Self::SupersededBuild),
+            "MissingFullDiskAccess" => Some(Self::MissingFullDiskAccess),
             _ => None,
         }
     }
