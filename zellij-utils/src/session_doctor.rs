@@ -189,21 +189,39 @@ pub struct DoctorMode {
     /// Whether the signing ladder may reach for a certificate. Signing is the one fix that writes
     /// to the user's keychain, which is why it has its own switch on top of `fix`.
     pub sign: bool,
-    /// Only so the report can say "would" instead of "did". Nothing branches on it.
+    /// Only so the report can say `--dry-run` was asked for. The tense comes off `fix`, which
+    /// `--dry-run` clears, so nothing has to branch on this.
     pub dry_run: bool,
 }
 
 impl DoctorMode {
+    /// What the three flags come to.
+    ///
+    /// Here rather than at the call site because one invariant lives in it: `--dry-run` implies
+    /// `--no-fix`, and it does so by clearing `fix` once, in one place. Every fix site asks `fix`
+    /// and nothing asks `dry_run`, so no check can act in a dry run by forgetting to ask.
+    pub fn from_flags(dry_run: bool, no_fix: bool, no_sign: bool) -> Self {
+        DoctorMode {
+            fix: !no_fix && !dry_run,
+            sign: !no_sign,
+            dry_run,
+        }
+    }
+
     /// Say what a fix did, or what it would have done, in the same words either way.
     ///
     /// The two phrasings live together here because they have to stay the same sentence: a dry run
     /// whose description of a fix has drifted from the fix is worse than no dry run, since the
     /// whole point of it is to be believed.
+    ///
+    /// "Would" is decided by `fix` and not by `dry_run`, because `--no-fix` withholds the acting
+    /// just as completely: describing an unmade change in the past tense would have the report
+    /// claim work that was never done.
     pub fn describe(&self, done: &str) -> String {
-        if self.dry_run {
-            format!("would {}", done)
-        } else {
+        if self.fix {
             done.to_owned()
+        } else {
+            format!("would {}", done)
         }
     }
 }
@@ -513,12 +531,38 @@ mod tests {
     #[test]
     fn a_dry_run_says_would_in_the_same_words() {
         let dry = DoctorMode {
+            fix: false,
             dry_run: true,
             ..DoctorMode::default()
         };
         let wet = DoctorMode::default();
-        assert_eq!(dry.describe("signed the pin"), "would signed the pin");
-        assert_eq!(wet.describe("signed the pin"), "signed the pin");
+        assert_eq!(dry.describe("sign the pin"), "would sign the pin");
+        assert_eq!(wet.describe("sign the pin"), "sign the pin");
+    }
+
+    #[test]
+    fn a_dry_run_never_fixes_however_the_other_flags_read() {
+        let dry = DoctorMode::from_flags(true, false, false);
+        assert!(!dry.fix, "--dry-run has to imply --no-fix");
+        assert!(dry.dry_run);
+        // signing is gated on `fix` above it, so `--dry-run` alone leaves this on and nothing acts
+        assert!(dry.sign);
+        assert!(!DoctorMode::from_flags(true, true, true).fix);
+        assert!(!DoctorMode::from_flags(false, true, false).fix);
+        assert!(DoctorMode::from_flags(false, false, false).fix);
+        assert!(!DoctorMode::from_flags(false, false, true).sign);
+    }
+
+    /// `--no-fix` acts no more than `--dry-run` does, so it has to read the same way. A report that
+    /// said "sign the pin" under it would be claiming a signature nobody made.
+    #[test]
+    fn no_fix_says_would_as_well_even_without_dry_run() {
+        let no_fix = DoctorMode {
+            fix: false,
+            ..DoctorMode::default()
+        };
+        assert!(!no_fix.dry_run);
+        assert_eq!(no_fix.describe("sign the pin"), "would sign the pin");
     }
 
     #[test]
