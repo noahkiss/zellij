@@ -179,6 +179,7 @@ fn new_pane_cli_action(
         unblock_condition: None,
         new_tab: None,
         in_tab: None,
+        near: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -480,6 +481,8 @@ impl TestSession {
                     Box::new(fake_client_os_api),
                     &session_name,
                     actions,
+                    // no `--near`: the anchor is whatever the client's environment says
+                    None,
                 )
             })
             .unwrap()

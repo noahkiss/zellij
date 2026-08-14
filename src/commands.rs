@@ -898,10 +898,34 @@ fn attach_with_cli_client(
         eprintln!("{}", message);
         std::process::exit(1);
     }
+    // `--near` names the pane the new one opens beside. It is resolved here, like every other pane
+    // target, and travels as the pane this command came from - the channel `--near-current-pane`
+    // reads out of the environment
+    let mut anchor_pane: Option<u32> = None;
+    let mut cli_action = cli_action;
+    if let Some(wanted) = cli_action.near_target().map(|t| t.to_owned()) {
+        match resolve_pane_target(&wanted) {
+            Ok(PaneId::Terminal(id)) => {
+                anchor_pane = Some(id);
+                cli_action.anchor_near();
+            },
+            Ok(PaneId::Plugin(_)) => {
+                eprintln!(
+                    "'{}' is a plugin pane, and `--near` anchors a new pane to a terminal one. \
+                     Name a terminal pane, or use `--in-tab` to put the pane in the same tab.",
+                    wanted
+                );
+                std::process::exit(1);
+            },
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            },
+        }
+    }
     // `--in-tab` names a tab the way a person does, and the action carries a stable id. The session
     // is the only thing that knows which is which, so it is asked before the pane is made: a tab
     // nothing answers to is a miss, and nothing is created
-    let mut cli_action = cli_action;
     if let Some(wanted) = cli_action.in_tab_target().map(|t| t.to_owned()) {
         let found = zellij_client::cli_client::resolve_tab_target(
             Box::new(get_os_input(
@@ -954,6 +978,7 @@ fn attach_with_cli_client(
                 Box::new(os_input),
                 session_name,
                 actions,
+                anchor_pane,
             );
             if should_archive {
                 match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)

@@ -1116,7 +1116,18 @@ impl Action {
                 borderless,
                 tab_id,
                 in_tab,
+                near,
             } => {
+                if near.is_some() {
+                    // `--near` is resolved and carried by the client, which is what holds the
+                    // connection to the server. Reaching here means nobody did that, and the pane
+                    // would open beside whichever pane the server found instead.
+                    return Err(
+                        "`--near` names a pane the session has to identify, and it was not \
+                         resolved before the action was built."
+                            .to_owned(),
+                    );
+                }
                 if in_tab.is_some() {
                     // `--in-tab` is a name or an id that only the session can turn into the
                     // `--tab-id` this action carries, so the CLI resolves it before building the
@@ -4328,6 +4339,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4379,6 +4391,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4430,6 +4443,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4483,6 +4497,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4528,6 +4543,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4579,6 +4595,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4630,6 +4647,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4755,6 +4773,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4806,6 +4825,7 @@ mod tests {
             unblock_condition: None,
             new_tab: None,
             in_tab: None,
+            near: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,

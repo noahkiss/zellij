@@ -1273,8 +1273,8 @@ pub enum CliAction {
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
     /// handle>`. Without --direction the pane splits whichever side has the most room.
     ///
-    /// Where it lands: beside the focused pane by default, in the tab --in-tab or --tab-id names, or
-    /// in a tab of its own with --new-tab, which reports `tab_id:` too.
+    /// Where it lands: beside the focused pane by default, beside the pane --near names, in the tab
+    /// --in-tab or --tab-id names, or in a tab of its own with --new-tab, which reports `tab_id:`.
     NewPane {
         /// Split the pane it opens beside towards right or down. Without it, zellij splits
         /// whichever side has the most room
@@ -1409,6 +1409,20 @@ pub enum CliAction {
         /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
+        /// Open the pane beside this one, in whatever tab it lives in: terminal_1, a bare integer
+        /// (3 means terminal_3), a handle like sunny-otter, or a pane uuid. It must name a terminal
+        /// pane - a plugin pane cannot anchor one
+        #[clap(
+            long,
+            value_name = "PANE",
+            value_parser,
+            conflicts_with("near_current_pane"),
+            conflicts_with("in_place"),
+            conflicts_with("tab_id"),
+            conflicts_with("in_tab"),
+            conflicts_with("new_tab")
+        )]
+        near: Option<String>,
         /// Open the pane beside the pane this command was run from and leave every client's focus
         /// where it is
         #[clap(long)]
@@ -2324,6 +2338,35 @@ impl CliAction {
         }
     }
 
+    /// The pane `--near` named, for the caller that can ask the session which pane that is.
+    ///
+    /// Same shape as [`CliAction::in_tab_target`], for the same reason: a handle names a pane only
+    /// against the session's live panes, and the anchor has to be a pane id by the time the action
+    /// goes out.
+    pub fn near_target(&self) -> Option<&str> {
+        match self {
+            CliAction::NewPane { near, .. } => near.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Anchors the new pane to the pane `--near` turned out to name.
+    ///
+    /// The anchor travels as the pane the command came from - the same channel
+    /// `--near-current-pane` reads out of `$ZELLIJ_PANE_ID` - so what is left here is to say that
+    /// there is one. The id itself is carried by the client, which is what talks to the server.
+    pub fn anchor_near(&mut self) {
+        if let CliAction::NewPane {
+            near,
+            near_current_pane,
+            ..
+        } = self
+        {
+            *near = None;
+            *near_current_pane = true;
+        }
+    }
+
     /// Puts the pane in the tab `--in-tab` turned out to name, and leaves every focus alone.
     ///
     /// `no_focus` is the flag's whole point rather than a default it happens to take: a script that
@@ -3004,6 +3047,64 @@ mod tests {
                 &Some(UnblockCondition::OnAnyExit)
             ),
             other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn near_takes_every_form_a_pane_answers_to() {
+        for target in [
+            "terminal_1",
+            "3",
+            "sunny-otter",
+            "e9b82dbd-0000-4000-8000-0000000000aa",
+        ] {
+            let action = parse_action(&["new-pane", "--near", target]);
+            assert_eq!(action.near_target(), Some(target));
+        }
+    }
+
+    #[test]
+    fn an_anchored_pane_asks_for_the_pane_the_command_came_from() {
+        // the anchor rides on the channel `--near-current-pane` uses, so what is left in the action
+        // is that there is one; the id itself is the client's to carry
+        let mut action = parse_action(&["new-pane", "--near", "sunny-otter"]);
+        action.anchor_near();
+        match &action {
+            CliAction::NewPane {
+                near,
+                near_current_pane,
+                ..
+            } => {
+                assert_eq!(near, &None, "the name is spent once it is resolved");
+                assert!(near_current_pane);
+            },
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_near_never_reaches_the_session() {
+        // without the lookup the pane would open beside whichever pane the server found, which is
+        // the pane `--near` was passed to avoid
+        let error = actions_of(&["new-pane", "--near", "sunny-otter"])
+            .expect_err("an unresolved --near is not an action");
+        assert!(error.contains("--near"), "got: {}", error);
+    }
+
+    #[test]
+    fn near_refuses_the_flags_that_place_the_pane_somewhere_else() {
+        for args in [
+            vec!["new-pane", "--near", "terminal_1", "--near-current-pane"],
+            vec!["new-pane", "--near", "terminal_1", "--tab-id", "2"],
+            vec!["new-pane", "--near", "terminal_1", "--in-tab", "logs"],
+            vec!["new-pane", "--near", "terminal_1", "--new-tab"],
+            vec!["new-pane", "--near", "terminal_1", "--in-place"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
         }
     }
 

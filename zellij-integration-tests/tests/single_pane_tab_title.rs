@@ -38,6 +38,7 @@ fn replace_pane_in_place_with_held_command(
         unblock_condition: None,
         new_tab: None,
         in_tab: None,
+        near: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,

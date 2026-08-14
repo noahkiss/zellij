@@ -308,13 +308,14 @@ is trusted to mean it. And because that variable is written when a pane is spawn
 updated in a shell that is already running — so after `zellij action rename-session`, panes that
 predate the rename read as outside the session until they are replaced.
 
-### Where a new pane goes: `--new-tab`, `--in-tab`
+### Where a new pane goes: `--new-tab`, `--near`, `--in-tab`
 
-`new-pane` placed a pane beside the focused one, or in the tab `--tab-id` named. Two flags say it
+`new-pane` placed a pane beside the focused one, or in the tab `--tab-id` named. Three flags say it
 without needing the focus to be anywhere in particular, which is what a script has:
 
 ```
 zellij action new-pane --new-tab build -- cargo test    # a tab of its own, made now
+zellij action new-pane --near sunny-otter -- htop       # beside that pane, wherever it lives
 zellij action new-pane --in-tab logs -- tail -f app.log # into that tab, without going there
 ```
 
@@ -336,6 +337,26 @@ they mean elsewhere. The flags that say where a pane goes in an existing tab - `
 `--new-tab` has already answered that question. So is bare `--blocking`: it waits for a pane to
 close and cannot name a pane in a tab that does not exist yet. `--block-until-exit` and its two
 siblings do work - they wait on the tab's first pane, which is this one.
+
+**`--near <pane>`** takes any pane target — `terminal_1`, a bare integer, a handle, a uuid — and
+opens the new pane beside that one, in whatever tab it lives in:
+
+```
+$ zellij action new-pane --near sunny-otter -- htop
+pane_id: terminal_10
+handle: quiet-pangolin
+```
+
+It is `--near-current-pane` generalised. That flag anchors to `$ZELLIJ_PANE_ID`, the pane the
+command was typed in, which is the right answer from inside a pane and no answer at all from a
+script that is not running in one. `--near` names the anchor instead, and the anchor's tab is where
+the pane lands — so `--near` conflicts with `--near-current-pane` and with every flag that names a
+tab. A target no live pane answers to is a miss, exit 2, in the resolver's own words.
+
+The anchor must be a **terminal** pane. It travels to the server as the pane the command came from,
+and that message carries a terminal id, so a target that resolves to a plugin pane is refused with a
+message and exit 1 rather than quietly placed somewhere else. `--in-tab` is the way to put a pane in
+a plugin pane's tab.
 
 **`--in-tab <name-or-id>`** puts the pane in a tab that already exists:
 

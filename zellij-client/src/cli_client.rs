@@ -16,10 +16,18 @@ use zellij_utils::{
     ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
 };
 
+/// Runs the actions one CLI invocation turned into.
+///
+/// `anchor_pane` is the pane these actions should be read as coming from - what `--near` names. A
+/// `zellij action` client is not attached to anything, so "the pane this came from" is normally the
+/// ambient `$ZELLIJ_PANE_ID`, and this is the same answer given deliberately instead of inherited.
+/// It is a terminal id because that is what the message carries; the refusal for anything else
+/// happens before this, where there is a caller to tell.
 pub fn start_cli_client(
     mut os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     actions: Vec<Action>,
+    anchor_pane: Option<u32>,
 ) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
@@ -30,9 +38,11 @@ pub fn start_cli_client(
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
     os_input.connect_to_server(&*zellij_ipc_pipe);
-    let pane_id = os_input
-        .env_variable("ZELLIJ_PANE_ID")
-        .and_then(|e| e.trim().parse().ok());
+    let pane_id = anchor_pane.or_else(|| {
+        os_input
+            .env_variable("ZELLIJ_PANE_ID")
+            .and_then(|e| e.trim().parse().ok())
+    });
 
     for action in actions {
         match action {
