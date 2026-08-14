@@ -979,7 +979,11 @@ pub enum CliAction {
     FocusNextPane,
     /// Change focus to the previous pane
     FocusPreviousPane,
-    /// Focus a specific pane by its ID
+    /// Focus a pane, and the tab it lives in
+    ///
+    /// Returns: `from:` and `to:` lines, each `<pane_id> <handle>`. A jump that landed where it
+    /// started prints only `to:`. A target no live pane answers to exits 2
+    #[clap(visible_alias = "go-to-pane")]
     FocusPaneId {
         /// The pane, as terminal_1, plugin_2, 3, a handle like sunny-otter, or a pane uuid
         pane_id: String,
