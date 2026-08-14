@@ -210,8 +210,8 @@ pub fn server_exe_for_interactive_launch(
     match install_pinned_exe(&current_exe, &pinned) {
         Ok(outcome) => Some(outcome.path().to_path_buf()),
         Err(reason) => {
-            // the ordinary cause is a server of another session already running the pinned copy,
-            // which pins it to the build it started with until that session goes down
+            // the ordinary cause is a pin directory this user cannot write; a server executing the
+            // copy no longer blocks it, because the refresh renames rather than writing in place
             eprintln!(
                 "warning: `pin_exe` is set, but the pinned copy could not be brought up to date, \
                  so this session's server runs from {}: {}",

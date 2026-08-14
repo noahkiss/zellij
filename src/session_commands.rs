@@ -31,7 +31,12 @@ use crate::commands::{get_config_options_from_cli_args, snapshot_settings, start
 
 /// How long to wait for a freshly requested server to appear before calling the creation a failure.
 /// `attach --create-background` returns as soon as the spawn is requested, not once it has happened.
-const SERVER_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Thirty seconds because launchd was measured at 15 to 20 on the fleet's Macs. The old ten
+/// reported a post-condition failure on both of them during an upgrade, on sessions that were up
+/// moments later - and a false failure on a healthy machine is worse than a slow true one, because
+/// it is the shape a real fault takes and it teaches everyone to ignore the line.
+const SERVER_APPEARANCE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The first gap between polls. Short, because a server that is going to appear usually has.
 const SERVER_APPEARANCE_FIRST_POLL: Duration = Duration::from_millis(50);
 /// The longest gap. Each poll forks `ps` to walk the whole process table, and a fixed short
@@ -903,10 +908,10 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
 ///
 /// The gap doubles, because every poll costs a `ps` over the whole process table and the two cases
 /// want opposite things from it. A session that comes up does so in the first few hundred
-/// milliseconds and wants to be noticed at once; a session that is never coming up spends the rest
-/// of the ten seconds proving it, and that is the case a launcher REPEATS every minute for as long
-/// as the fault lasts. Backing off cuts the forks on the failing machine by about eight to one and
-/// costs the healthy one nothing.
+/// milliseconds and wants to be noticed at once; a session that is never coming up spends the whole
+/// of `SERVER_APPEARANCE_TIMEOUT` proving it, and that is the case a launcher REPEATS every minute
+/// for as long as the fault lasts. Backing off cuts the forks on the failing machine by about an
+/// order of magnitude and costs the healthy one nothing.
 ///
 /// Nothing here gives up early or escalates, deliberately. This function's whole answer is "the
 /// post-condition does not hold yet", and its caller already reports that loudly and with
@@ -1132,4 +1137,34 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
         Ok(()) => 0,
         Err(()) => 1,
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use zellij_utils::session_lifecycle::UP_LOCK_TIMEOUT;
+
+    /// `restart` holds the up-lock across its down and its up, so the longest hold a healthy
+    /// machine produces is a `--wait-timeout` down plus this wait for the server. A waiting `up`
+    /// that gives up first goes ahead without the lock, which is the two-servers-for-one-name race
+    /// the lock exists to prevent - so raising one of these without the other reintroduces it.
+    #[test]
+    fn a_slow_restart_still_fits_inside_the_up_lock() {
+        // the default of `--wait-timeout` on `session restart`
+        let longest_down = Duration::from_secs(10);
+        assert!(
+            longest_down + SERVER_APPEARANCE_TIMEOUT < UP_LOCK_TIMEOUT,
+            "a restart can hold the lock for {:?}, but a waiting `up` gives up after {:?}",
+            longest_down + SERVER_APPEARANCE_TIMEOUT,
+            UP_LOCK_TIMEOUT
+        );
+    }
+
+    /// launchd was measured at 15 to 20 seconds on the fleet's Macs, and a `session up` that
+    /// reports a false post-condition failure on every slow start teaches everyone to ignore the
+    /// one line that reports a real one.
+    #[test]
+    fn the_wait_for_a_server_outlasts_a_measured_launchd_start() {
+        assert!(SERVER_APPEARANCE_TIMEOUT >= Duration::from_secs(30));
+    }
 }
