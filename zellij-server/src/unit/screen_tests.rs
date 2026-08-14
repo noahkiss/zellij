@@ -4648,7 +4648,7 @@ pub fn send_cli_undo_rename_tab() {
 }
 
 #[test]
-pub fn send_cli_query_tab_names_action() {
+pub fn query_tab_names_action_logs_the_tab_names() {
     let size = Size { cols: 80, rows: 10 };
     let client_id = 10; // fake client id should not appear in the screen's state
     let mut mock_screen = MockScreen::new(size);
@@ -4662,8 +4662,10 @@ pub fn send_cli_query_tab_names_action() {
         ServerInstruction::KillSession,
         server_receiver
     );
-    let query_tab_names = CliAction::QueryTabNames;
-    send_cli_action_to_server(&session_metadata, query_tab_names, client_id);
+    // the CLI verb is gone; the action itself lives on for keybindings and plugins, and this is
+    // still the path that answers it
+    let _ =
+        route_arbitrary_action_and_get_result(&session_metadata, Action::QueryTabNames, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_thread, screen_thread]);
     let log_tab_names_instruction = received_server_instructions

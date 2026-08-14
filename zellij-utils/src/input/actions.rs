@@ -1824,7 +1824,6 @@ impl Action {
                     apply_only_to_active_tab,
                 }])
             },
-            CliAction::QueryTabNames => Ok(vec![Action::QueryTabNames]),
             CliAction::StartOrReloadPlugin { url, configuration } => {
                 let current_dir = get_current_dir();
                 let run_plugin_or_alias = RunPluginOrAlias::from_url(

@@ -1586,8 +1586,6 @@ pub enum CliAction {
         #[clap(long)]
         apply_only_to_active_tab: bool,
     },
-    /// Query all tab names
-    QueryTabNames,
     StartOrReloadPlugin {
         url: String,
         #[clap(short, long, value_parser)]
