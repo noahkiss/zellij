@@ -2540,6 +2540,18 @@ pub struct PaneInfo {
     /// holds, which `title` and `program_title` together cannot answer.
     #[serde(default)]
     pub has_explicit_title: bool,
+    /// The two-word name a human addresses this pane by, eg. `sunny-otter`
+    ///
+    /// The pane's ADDRESS, where the uuid is its LINEAGE. Unique among the session's live panes,
+    /// and it CARRIES across a snapshot restore while the uuid rotates - an address that changed
+    /// when the session came back would not be one. A closed pane's handle returns to circulation,
+    /// so a handle names at most one pane right now, not one pane forever.
+    ///
+    /// Two lowercase words joined by a dash, drawn from a fixed append-only word list, which is
+    /// what keeps it unambiguous against every other way of naming a pane: `terminal_1`, a bare
+    /// id, a uuid.
+    #[serde(default)]
+    pub handle: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -3157,6 +3169,196 @@ impl std::fmt::Display for PaneId {
             PaneId::Terminal(id) => write!(f, "terminal_{}", id),
             PaneId::Plugin(id) => write!(f, "plugin_{}", id),
         }
+    }
+}
+
+/// Every way a pane can be named on the CLI, before anything looks it up.
+///
+/// `--pane-id` takes four forms, and only the first is an id the caller can act on directly:
+///
+/// | Form | Example | Resolved by |
+/// |---|---|---|
+/// | `terminal_N` / `plugin_N` | `terminal_7` | nothing, it is already a `PaneId` |
+/// | bare integer | `7`, meaning `terminal_7` | nothing |
+/// | handle | `sunny-otter` | the server, against its live panes |
+/// | uuid | `e9b82dbd-...` | the server, against its live panes |
+///
+/// The forms cannot be confused for one another, which is what makes one flag able to take all
+/// four: `terminal_`/`plugin_` are prefixes nothing else starts with, a bare integer is digits, and
+/// a handle is two words from a fixed list joined by a dash - a shape no uuid can take, because a
+/// uuid is hex in five dash-separated groups and no word in the list is hex.
+///
+/// Parsing says only which form a string IS. Whether a pane answers to it is the server's to
+/// decide, since the server is where the live panes are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneTarget {
+    /// An id, already usable.
+    Id(PaneId),
+    /// A pane's two-word handle, eg. `sunny-otter`.
+    Handle(String),
+    /// A pane's uuid.
+    Uuid(String),
+}
+
+impl PaneTarget {
+    /// The id, when the target is already one. `None` for a form the server has to resolve.
+    pub fn as_pane_id(&self) -> Option<PaneId> {
+        match self {
+            PaneTarget::Id(pane_id) => Some(*pane_id),
+            _ => None,
+        }
+    }
+}
+
+impl From<PaneId> for PaneTarget {
+    fn from(pane_id: PaneId) -> Self {
+        PaneTarget::Id(pane_id)
+    }
+}
+
+impl FromStr for PaneTarget {
+    type Err = String;
+    fn from_str(target: &str) -> Result<Self, Self::Err> {
+        // The id forms first, so the existing `--pane-id` semantics are untouched and a handle can
+        // never shadow one.
+        if target.starts_with("terminal_") || target.starts_with("plugin_") {
+            return PaneId::from_str(target).map(PaneTarget::Id).map_err(|_| {
+                format!(
+                    "'{}' is not a pane id: expected a number after the prefix, eg. terminal_1",
+                    target
+                )
+            });
+        }
+        if target.chars().all(|c| c.is_ascii_digit()) && !target.is_empty() {
+            return PaneId::from_str(target)
+                .map(PaneTarget::Id)
+                .map_err(|e| format!("'{}' is not a pane id: {}", target, e));
+        }
+        if crate::pane_handle::is_handle_shaped(target) {
+            return Ok(PaneTarget::Handle(target.to_owned()));
+        }
+        if uuid::Uuid::parse_str(target).is_ok() {
+            return Ok(PaneTarget::Uuid(target.to_owned()));
+        }
+        Err(format!(
+            "'{}' does not name a pane: expected terminal_1, plugin_1, a bare number, a handle like sunny-otter, or a pane uuid",
+            target
+        ))
+    }
+}
+
+impl std::fmt::Display for PaneTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaneTarget::Id(pane_id) => write!(f, "{}", pane_id),
+            PaneTarget::Handle(handle) => write!(f, "{}", handle),
+            PaneTarget::Uuid(uuid) => write!(f, "{}", uuid),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_target_tests {
+    use super::*;
+
+    #[test]
+    fn each_form_parses_as_itself() {
+        let cases: Vec<(&str, PaneTarget)> = vec![
+            ("terminal_1", PaneTarget::Id(PaneId::Terminal(1))),
+            ("terminal_0", PaneTarget::Id(PaneId::Terminal(0))),
+            ("plugin_2", PaneTarget::Id(PaneId::Plugin(2))),
+            // a bare integer keeps its existing meaning: a terminal pane
+            ("3", PaneTarget::Id(PaneId::Terminal(3))),
+            ("sunny-otter", PaneTarget::Handle("sunny-otter".to_owned())),
+            // a suffixed fallback handle is still a handle
+            (
+                "sunny-otter-2",
+                PaneTarget::Handle("sunny-otter-2".to_owned()),
+            ),
+            (
+                "e9b82dbd-0000-4000-8000-0000000000aa",
+                PaneTarget::Uuid("e9b82dbd-0000-4000-8000-0000000000aa".to_owned()),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                PaneTarget::from_str(input),
+                Ok(expected),
+                "parsing {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn what_names_no_pane_is_refused_rather_than_guessed() {
+        // the ambiguity cases: two dash-joined words that are not BOTH from the list are not a
+        // handle, and must not be silently treated as one - the miss belongs at the parser, where
+        // the message can name every accepted form
+        for input in [
+            "",
+            "otter",
+            "purple-otter",
+            "sunny-teapot",
+            "Sunny-Otter",
+            "sunny_otter",
+            "terminal_",
+            "terminal_x",
+            "plugin_-1",
+            "-1",
+            "1.5",
+            "e9b82dbd",
+        ] {
+            assert!(
+                PaneTarget::from_str(input).is_err(),
+                "should not name a pane: {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn a_uuid_is_never_read_as_a_handle() {
+        // both forms use dashes, so this is the one collision the parser has to actually rule out
+        let uuid = "e9b82dbd-0000-4000-8000-0000000000aa";
+        assert_eq!(
+            PaneTarget::from_str(uuid),
+            Ok(PaneTarget::Uuid(uuid.to_owned()))
+        );
+        assert!(!crate::pane_handle::is_handle_shaped(uuid));
+    }
+
+    #[test]
+    fn a_target_prints_back_the_way_it_was_typed() {
+        // the resolver's error message quotes the target back, so this has to survive the round
+        for input in [
+            "terminal_1",
+            "plugin_2",
+            "sunny-otter",
+            "e9b82dbd-0000-4000-8000-0000000000aa",
+        ] {
+            assert_eq!(PaneTarget::from_str(input).unwrap().to_string(), input);
+        }
+        // the one form that does not print back verbatim, because it never named itself fully
+        assert_eq!(PaneTarget::from_str("3").unwrap().to_string(), "terminal_3");
+    }
+
+    #[test]
+    fn only_an_id_is_usable_without_the_server() {
+        assert_eq!(
+            PaneTarget::from_str("terminal_1").unwrap().as_pane_id(),
+            Some(PaneId::Terminal(1))
+        );
+        assert_eq!(
+            PaneTarget::from_str("sunny-otter").unwrap().as_pane_id(),
+            None
+        );
+        assert_eq!(
+            PaneTarget::from_str("e9b82dbd-0000-4000-8000-0000000000aa")
+                .unwrap()
+                .as_pane_id(),
+            None
+        );
     }
 }
 

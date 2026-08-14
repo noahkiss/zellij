@@ -7476,6 +7476,7 @@ impl PaneInfo {
         // none of them, and neither does metadata written by an older version
         let uuid = optional_string_node!("uuid").unwrap_or_default();
         let restored_from = optional_string_node!("restored_from").unwrap_or_default();
+        let handle = optional_string_node!("handle").unwrap_or_default();
         let program_title = optional_string_node!("program_title");
         let default_fg = optional_string_node!("default_fg");
         let default_bg = optional_string_node!("default_bg");
@@ -7496,6 +7497,7 @@ impl PaneInfo {
 
         let pane_info = PaneInfo {
             restored_from,
+            handle,
             pane_cwd,
             pane_pid,
             pane_command,
@@ -7608,6 +7610,9 @@ impl PaneInfo {
         }
         if !self.restored_from.is_empty() {
             string_node!("restored_from", self.restored_from.to_string());
+        }
+        if !self.handle.is_empty() {
+            string_node!("handle", self.handle.to_string());
         }
         if let Some(program_title) = &self.program_title {
             string_node!("program_title", program_title.to_string());
@@ -7741,6 +7746,7 @@ fn serialize_and_deserialize_session_info_with_data() {
     let panes_list = vec![
         PaneInfo {
             restored_from: String::new(),
+            handle: String::new(),
             pane_cwd: None,
             pane_pid: None,
             pane_command: None,
@@ -7788,6 +7794,7 @@ fn serialize_and_deserialize_session_info_with_data() {
         },
         PaneInfo {
             restored_from: String::new(),
+            handle: String::new(),
             pane_cwd: None,
             pane_pid: None,
             pane_command: None,
@@ -7912,6 +7919,7 @@ fn session_info_round_trip_keeps_pane_identity_and_stack_fields() {
         title: "a pane".to_owned(),
         uuid: "27e1a5a8-0000-4000-8000-0000000000ff".to_owned(),
         restored_from: "8e0d1c33-0000-4000-8000-0000000000aa".to_owned(),
+        handle: "sunny-otter".to_owned(),
         program_title: Some("vim".to_owned()),
         default_fg: Some("#00e000".to_owned()),
         default_bg: Some("#001a3a".to_owned()),
@@ -7940,6 +7948,7 @@ fn session_info_round_trip_keeps_pane_identity_and_stack_fields() {
     let round_tripped_pane = &deserialized.panes.panes.get(&0).unwrap()[0];
     assert_eq!(round_tripped_pane.uuid, pane.uuid);
     assert_eq!(round_tripped_pane.restored_from, pane.restored_from);
+    assert_eq!(round_tripped_pane.handle, pane.handle);
     assert_eq!(round_tripped_pane.program_title, pane.program_title);
     assert_eq!(round_tripped_pane.stack_id, pane.stack_id);
     assert_eq!(round_tripped_pane.index_in_stack, pane.index_in_stack);

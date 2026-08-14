@@ -109,6 +109,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "default_fg"
             || property_name == "default_bg"
             || property_name == "pane_uuid"
+            || property_name == "pane_handle"
     }
     fn is_a_valid_floating_pane_property(&self, property_name: &str) -> bool {
         property_name == "borderless"
@@ -130,6 +131,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "default_fg"
             || property_name == "default_bg"
             || property_name == "pane_uuid"
+            || property_name == "pane_handle"
     }
     fn is_a_valid_tab_property(&self, property_name: &str) -> bool {
         property_name == "focus"
@@ -578,6 +580,11 @@ impl<'a> KdlLayoutParser<'a> {
         let restored_from =
             kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_uuid")
                 .map(|s| s.to_string());
+        // Written by session serialization, not by hand: the handle the pane answers to. Unlike
+        // `pane_uuid` this one stays the pane's own - the restored pane comes back at this address.
+        let pane_handle =
+            kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_handle")
+                .map(|s| s.to_string());
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -603,6 +610,7 @@ impl<'a> KdlLayoutParser<'a> {
             default_fg,
             default_bg,
             restored_from,
+            pane_handle,
             ..Default::default()
         })
     }
@@ -632,6 +640,11 @@ impl<'a> KdlLayoutParser<'a> {
         let restored_from =
             kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_uuid")
                 .map(|s| s.to_string());
+        // Written by session serialization, not by hand: the handle the pane answers to. Unlike
+        // `pane_uuid` this one stays the pane's own - the restored pane comes back at this address.
+        let pane_handle =
+            kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_handle")
+                .map(|s| s.to_string());
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -655,6 +668,7 @@ impl<'a> KdlLayoutParser<'a> {
             default_fg,
             default_bg,
             restored_from,
+            pane_handle,
             ..Default::default()
         })
     }

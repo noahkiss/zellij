@@ -204,6 +204,9 @@ message Action {
     ToggleMouseModeAction toggle_mouse_mode = 65;
     PreviousSwapLayoutAction previous_swap_layout = 66;
     NextSwapLayoutAction next_swap_layout = 67;
+    // retired: the `query-tab-names` CLI verb is gone (list-tabs answers it, and answers more).
+    // The tag stays assigned and the message stays defined - a client of an older build still
+    // sends it, and the wire contract is append-only
     QueryTabNamesAction query_tab_names = 68;
     NewTiledPluginPaneAction new_tiled_plugin_pane = 69;
     NewFloatingPluginPaneAction new_floating_plugin_pane = 70;
@@ -297,6 +300,8 @@ message Action {
     SetPanePinnedAction set_pane_pinned = 164;
     SetPaneFloatingAction set_pane_floating = 165;
     SetSyncTabAction set_sync_tab = 166;
+    ResolvePaneTargetAction resolve_pane_target = 167;
+    ListTreeAction list_tree = 168;
     MoveTabToIndexAction move_tab_to_index = 172;
   }
 }
@@ -387,6 +392,12 @@ message BreakPaneAction {}
 message BreakPaneRightAction {}
 message BreakPaneLeftAction {}
 message ListClientsAction {
+  bool output_json = 1;
+}
+message ResolvePaneTargetAction {
+  string target = 1;
+}
+message ListTreeAction {
   bool output_json = 1;
 }
 message ListPanesAction {

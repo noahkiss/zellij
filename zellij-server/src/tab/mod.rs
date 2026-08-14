@@ -749,6 +749,21 @@ pub trait Pane {
         None
     }
     fn set_restored_from(&mut self, _restored_from: Option<String>) {}
+    /// The two-word name a human addresses this pane by, eg. `sunny-otter`.
+    ///
+    /// Unique among the session's live panes, and unlike the uuid it CARRIES across a snapshot
+    /// restore - the whole point of an address is that it still reaches the same pane after the
+    /// session comes back. Empty only for a pane that is not a real one; every terminal and plugin
+    /// pane has a handle from the moment it is built.
+    fn pane_handle(&self) -> String {
+        String::new()
+    }
+    /// Puts this pane back under the handle a serialized session recorded for it.
+    ///
+    /// Called on the restore path only. If a live pane already answers to `handle` the pane keeps
+    /// a freshly generated one instead, because a restore must not end with two panes at one
+    /// address.
+    fn set_pane_handle(&mut self, _handle: &str) {}
     fn custom_title(&self) -> Option<String>;
     fn has_explicit_title(&self) -> bool {
         false
@@ -8349,6 +8364,7 @@ pub fn pane_info_for_pane(
     pane_info.program_title = pane.program_title();
     pane_info.uuid = pane.pane_uuid().to_string();
     pane_info.restored_from = pane.restored_from().unwrap_or_default();
+    pane_info.handle = pane.pane_handle();
     let geom = pane.position_and_size();
     pane_info.stack_id = geom.stacked;
     pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();

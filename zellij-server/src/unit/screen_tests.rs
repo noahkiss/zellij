@@ -24,6 +24,7 @@ use zellij_utils::input::options::{
     DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::IpcReceiverWithContext;
+use zellij_utils::pane_handle::is_handle_shaped;
 use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::position::Position;
 
@@ -128,7 +129,13 @@ fn send_cli_action_to_server(
     client_id: ClientId,
 ) {
     let get_current_dir = || PathBuf::from(".");
-    let actions = Action::actions_from_cli(cli_action, Box::new(get_current_dir), None).unwrap();
+    let actions = Action::actions_from_cli(
+        cli_action,
+        Box::new(get_current_dir),
+        None,
+        &zellij_utils::input::actions::pane_ids_only,
+    )
+    .unwrap();
     let senders = session_metadata.senders.clone();
     let default_shell = None;
     let default_mode = session_metadata
@@ -177,6 +184,37 @@ fn route_arbitrary_action_to_server(
         None,
     )
     .unwrap();
+}
+
+/// Route an action as a CLI client would, and hand back whether it reached the app at all.
+///
+/// A command that refuses before dispatch - a pane command with no pane, run from outside a pane -
+/// returns no completion result, because nothing was asked of Screen.
+fn route_action_as_cli_client(
+    session_metadata: &SessionMetaData,
+    action: Action,
+    client_id: ClientId,
+) -> Option<crate::route::ActionCompletionResult> {
+    let senders = session_metadata.senders.clone();
+    let default_mode = session_metadata
+        .session_configuration
+        .get_client_configuration(&client_id)
+        .options
+        .default_mode
+        .unwrap_or(InputMode::Normal);
+    let (_should_break, result) = route_action(
+        action,
+        client_id,
+        Some(client_id),
+        None,
+        senders,
+        None,
+        None,
+        default_mode,
+        None,
+    )
+    .unwrap();
+    result
 }
 
 // same as the above, but hands back the completion result so a test can assert on the
@@ -970,6 +1008,86 @@ fn new_tab(screen: &mut Screen, pid: u32, tab_index: usize) {
             None,
         )
         .expect("TEST");
+}
+
+use zellij_utils::data::{PaneId as ZellijUtilsPaneId, PaneTarget};
+
+/// Every pane the screen knows about, as `(handle, uuid, id)`.
+fn pane_identities(screen: &Screen) -> Vec<(String, String, u32)> {
+    screen
+        .tabs
+        .values()
+        .flat_map(|tab| screen.pane_infos_for_tab(tab))
+        .map(|pane_info| (pane_info.handle, pane_info.uuid, pane_info.id))
+        .collect()
+}
+
+#[test]
+fn a_handle_resolves_to_the_pane_that_answers_to_it() {
+    // the CLI holds a string and the server holds the panes, so this lookup is the only place a
+    // handle turns back into something an action can be pointed at
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    let identities = pane_identities(&screen);
+    assert!(identities.len() >= 2, "expected a pane per tab");
+    for (handle, uuid, id) in identities {
+        assert!(!handle.is_empty(), "a live pane had no handle");
+        assert_eq!(
+            screen.resolve_pane_target(&PaneTarget::Handle(handle.clone())),
+            Some(PaneId::Terminal(id)),
+            "handle {} did not reach its pane",
+            handle
+        );
+        assert_eq!(
+            screen.resolve_pane_target(&PaneTarget::Uuid(uuid.clone())),
+            Some(PaneId::Terminal(id)),
+            "uuid {} did not reach its pane",
+            uuid
+        );
+    }
+}
+
+#[test]
+fn a_handle_no_pane_answers_to_resolves_to_nothing() {
+    // a miss has to be a miss: the caller turns this into exit 2, and a wrong pane would be worse
+    // than no pane
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Handle("sunny-otter".to_owned())),
+        None
+    );
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Uuid(
+            "e9b82dbd-0000-4000-8000-0000000000aa".to_owned()
+        )),
+        None
+    );
+}
+
+#[test]
+fn an_id_target_needs_no_lookup() {
+    // "does this id name a live pane" is a different question, answered by the command that acts
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let screen = create_new_screen(size, true, true);
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Id(ZellijUtilsPaneId::Terminal(9))),
+        Some(PaneId::Terminal(9))
+    );
 }
 
 #[test]
@@ -3199,6 +3317,7 @@ pub fn send_cli_dump_screen_action() {
         server_receiver
     );
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/foo")),
         full: true,
         pane_id: None,
@@ -4689,7 +4808,7 @@ pub fn send_cli_undo_rename_tab() {
 }
 
 #[test]
-pub fn send_cli_query_tab_names_action() {
+pub fn query_tab_names_action_logs_the_tab_names() {
     let size = Size { cols: 80, rows: 10 };
     let client_id = 10; // fake client id should not appear in the screen's state
     let mut mock_screen = MockScreen::new(size);
@@ -4703,8 +4822,10 @@ pub fn send_cli_query_tab_names_action() {
         ServerInstruction::KillSession,
         server_receiver
     );
-    let query_tab_names = CliAction::QueryTabNames;
-    send_cli_action_to_server(&session_metadata, query_tab_names, client_id);
+    // the CLI verb is gone; the action itself lives on for keybindings and plugins, and this is
+    // still the path that answers it
+    let _ =
+        route_arbitrary_action_and_get_result(&session_metadata, Action::QueryTabNames, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_thread, screen_thread]);
     let log_tab_names_instruction = received_server_instructions
@@ -8221,6 +8342,7 @@ pub fn send_cli_dump_screen_action_with_ansi() {
         server_receiver
     );
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/foo_ansi")),
         full: true,
         pane_id: None,
@@ -8261,6 +8383,7 @@ pub fn send_cli_dump_screen_action_without_ansi_strips_codes() {
         server_receiver
     );
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/foo_plain")),
         full: true,
         pane_id: None,
@@ -9876,6 +9999,7 @@ pub fn pty_bytes_and_hold_pane_buffered_before_new_pane() {
 
     // Use DumpScreen to verify the pane received the bytes
     let cli_action = CliAction::DumpScreen {
+        file: None,
         path: Some(PathBuf::from("/tmp/dump_early_bytes")),
         full: true,
         pane_id: None,
@@ -15261,5 +15385,462 @@ pub fn a_setter_with_no_pane_id_resolves_the_focused_pane() {
         screen.tab_id_owning_pane(None, client_id),
         Some((0, PaneId::Terminal(1))),
         "no id means the focused pane"
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_reports_where_focus_came_from_and_where_it_landed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    // the session starts with one tab, so this switch lands where it started
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTab { index: 1 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.stdout_lines.len(),
+        1,
+        "a switch that did not move reports only where it is: {:?}",
+        result.stdout_lines
+    );
+    assert!(
+        result.stdout_lines[0].starts_with("to: "),
+        "{:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_position_nothing_sits_at_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTab { index: 9 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab at position 9"))
+            .unwrap_or(false),
+        "Expected a miss naming the position, got: {:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_name_nothing_answers_to_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTabName {
+            name: "no-such-tab".to_owned(),
+            create: false,
+            no_focus: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab named 'no-such-tab'"))
+            .unwrap_or(false),
+        "Expected a miss naming the tab, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn the_no_focus_probe_stays_silent_about_a_tab_that_is_not_there() {
+    // the negative control for the miss above: --no-focus is an existence question, and a "no"
+    // answer is not an error - it is an empty stdout and exit 0
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::GoToTabName {
+            name: "no-such-tab".to_owned(),
+            create: false,
+            no_focus: true,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert!(result.stdout_lines.is_empty(), "{:?}", result.stdout_lines);
+    assert_eq!(result.affected_tab_id, None);
+}
+
+#[test]
+pub fn closing_a_pane_names_the_pane_it_closed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 1 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+    assert_eq!(result.stdout_lines, vec!["closed: terminal_1".to_string()]);
+}
+
+#[test]
+pub fn closing_a_pane_that_is_not_there_reports_a_miss_and_no_report() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTerminalPane { pane_id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("not found"))
+            .unwrap_or(false),
+        "Expected a 'not found' miss, got: {:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "nothing was closed, so nothing is reported closed: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn closing_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTabById { id: 999 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab with id 999"))
+            .unwrap_or(false),
+        "Expected a miss naming the id, got: {:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn moving_a_tab_reports_the_positions_it_went_between() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    // the client the mock screen attaches: a move is reported for the tab that client is on
+    let client_id = 1;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::MoveTab {
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.stdout_lines.len(), 2, "{:?}", result.stdout_lines);
+    assert!(
+        result.stdout_lines[0].starts_with("from: ") && result.stdout_lines[1].starts_with("to: "),
+        "{:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn moving_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::MoveTabByTabId {
+            id: 999,
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No tab with id 999"))
+            .unwrap_or(false),
+        "Expected a miss naming the id, got: {:?}",
+        result.error_message
+    );
+    assert!(result.stdout_lines.is_empty(), "{:?}", result.stdout_lines);
+}
+
+#[test]
+pub fn dumping_a_screen_without_a_pane_never_reaches_the_app() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_action_as_cli_client(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: None,
+            include_scrollback: false,
+            pane_id: None,
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result.is_none(),
+        "the dump was refused before dispatch, so there is no completion to report"
+    );
+}
+
+#[test]
+pub fn dumping_a_screen_from_a_keybinding_still_takes_the_focused_pane() {
+    // the negative control: only a CLI client is refused a targetless dump. A keybinding is
+    // pressed inside a pane, where "focused" means the pane the hands are on
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: Some("/tmp/zellij-dump-screen-test".to_string()),
+            include_scrollback: false,
+            pane_id: None,
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message, None);
+}
+
+/// A session of two panes side by side, with focus on the first of them.
+fn two_pane_mock_screen(size: Size) -> (MockScreen, TiledPaneLayout) {
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    (MockScreen::new(size), initial_layout)
+}
+
+/// The handle half of a `from:`/`to:` line, once the key and the pane id are taken off it.
+fn handle_in_report_line(line: &str, expected_prefix: &str) -> String {
+    let rest = line.strip_prefix(expected_prefix).unwrap_or_else(|| {
+        panic!(
+            "expected a line starting {:?}, got: {:?}",
+            expected_prefix, line
+        )
+    });
+    rest.to_owned()
+}
+
+#[test]
+pub fn jumping_to_a_pane_reports_where_focus_came_from_and_where_it_landed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::FocusPaneByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(1),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.stdout_lines.len(), 2, "{:?}", result.stdout_lines);
+    let from = handle_in_report_line(&result.stdout_lines[0], "from: terminal_0 ");
+    let to = handle_in_report_line(&result.stdout_lines[1], "to: terminal_1 ");
+    assert!(is_handle_shaped(&from), "not a handle: {:?}", from);
+    assert!(is_handle_shaped(&to), "not a handle: {:?}", to);
+    assert_ne!(from, to, "two panes reported the same handle");
+}
+
+#[test]
+pub fn jumping_to_the_pane_you_are_already_in_reports_only_where_you_are() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::FocusPaneByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(0),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.stdout_lines.len(),
+        1,
+        "a jump that did not move reports only where it is: {:?}",
+        result.stdout_lines
+    );
+    assert!(
+        result.stdout_lines[0].starts_with("to: terminal_0 "),
+        "{:?}",
+        result.stdout_lines
+    );
+    assert_eq!(
+        result.error_message, None,
+        "landing where you are is not a miss"
+    );
+}
+
+#[test]
+pub fn jumping_to_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::FocusPaneByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert!(
+        result
+            .error_message
+            .as_ref()
+            .map(|m| m.contains("No pane answers to"))
+            .unwrap_or(false),
+        "expected a miss naming the pane, got: {:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn jumping_to_a_pane_in_another_tab_brings_the_tab_with_it() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    assert_eq!(
+        screen.tab_position_for_client(client_id),
+        Some(1),
+        "the second tab is the one in view"
+    );
+    screen
+        .focus_pane_with_id(PaneId::Terminal(1), false, false, client_id)
+        .unwrap();
+    assert_eq!(
+        screen.tab_position_for_client(client_id),
+        Some(0),
+        "focusing a pane left its tab behind"
+    );
+    assert_eq!(
+        screen.pane_summary_for_client(client_id).as_deref(),
+        Some(screen.pane_summary(PaneId::Terminal(1)).as_str()),
+        "the client is looking at the pane it was sent to"
     );
 }

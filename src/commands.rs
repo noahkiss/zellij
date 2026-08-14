@@ -1,4 +1,5 @@
 use dialoguer::Confirm;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::{path::PathBuf, process, time::Duration};
 
@@ -42,7 +43,7 @@ use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
     cli::{CliArgs, Command, SessionCommand, Sessions, SnapshotCli},
-    data::ConnectToSession,
+    data::{ConnectToSession, PaneId, PaneTarget},
     envs,
     input::{
         actions::Action,
@@ -823,7 +824,45 @@ fn attach_with_cli_client(
     );
     let snapshot_settings =
         SnapshotSettings::from_options(config.as_ref().map(|config| &config.options));
-    match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
+    // A handle or a uuid names a pane only against the session's live panes, so those forms are
+    // resolved by asking the running server before the action is built. An id form needs no
+    // lookup, and pays for nothing: the connection is only opened when there is a question.
+    let resolve_pane_target = |target: &str| -> Result<PaneId, String> {
+        match target.parse::<PaneTarget>() {
+            // a string that names no pane in any form is malformed input, which is an error and
+            // exits 1. Only a well-formed target that no live pane answers to is a miss, and the
+            // miss is what the caller below turns into exit 2
+            Err(malformed) => {
+                eprintln!("{}", malformed);
+                std::process::exit(1);
+            },
+            Ok(PaneTarget::Id(pane_id)) => Ok(pane_id),
+            Ok(_) => zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                target,
+            ),
+        }
+    };
+    // a command that acts on "the focused thing" is only meaningful from inside the session that
+    // has the focus. From a script it resolves to a pane the caller has never seen
+    let inside_the_session = envs::get_session_name()
+        .map(|ambient| ambient == session_name)
+        .unwrap_or(false);
+    if let Some(message) =
+        zellij_utils::cli::missing_target_from_outside_a_pane(&cli_action, inside_the_session)
+    {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
+    match Action::actions_from_cli(
+        cli_action,
+        Box::new(get_current_dir),
+        config,
+        &resolve_pane_target,
+    ) {
         Ok(actions) => {
             let exit_status = zellij_client::cli_client::start_cli_client(
                 Box::new(os_input),
@@ -893,14 +932,17 @@ fn attach_with_session_name(
                     "Ambiguous selection: multiple sessions names start with '{}':",
                     prefix
                 );
+                // the names are the answer here, and the ages are not known - `--short` is the
+                // listing that says only what this caller has
                 print_sessions(
                     sessions
                         .iter()
                         .map(|s| (s.clone(), Duration::default(), false))
                         .collect(),
                     false,
-                    false,
                     true,
+                    true,
+                    &BTreeMap::new(),
                 );
                 process::exit(1);
             },
@@ -1351,14 +1393,17 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
                     "Ambiguous selection: multiple sessions names start with '{}':",
                     prefix
                 );
+                // the names are the answer here, and the ages are not known - `--short` is the
+                // listing that says only what this caller has
                 print_sessions(
                     sessions
                         .iter()
                         .map(|s| (s.clone(), Duration::default(), false))
                         .collect(),
                     false,
-                    false,
                     true,
+                    true,
+                    &BTreeMap::new(),
                 );
                 process::exit(1);
             },

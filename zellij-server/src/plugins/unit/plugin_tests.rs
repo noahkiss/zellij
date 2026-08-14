@@ -13296,6 +13296,7 @@ pub fn a_plugin_whose_file_is_missing_stays_in_the_dumped_layout() {
             None,
             None,
             None,
+            None,
         )
     }
 

@@ -10,7 +10,7 @@ use crate::data::{
     CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
     PaneId, PaneSignal, Resize, UnblockCondition,
 };
-use crate::data::{FloatingPaneCoordinates, InputMode};
+use crate::data::{FloatingPaneCoordinates, InputMode, PaneTarget};
 use crate::home::{find_default_config_dir, get_layout_dir};
 use crate::input::config::{Config, ConfigError, KdlError};
 use crate::input::mouse::MouseEvent;
@@ -551,12 +551,24 @@ pub enum Action {
     ListClients {
         output_json: bool,
     },
+    /// Asks the session which pane a CLI target names.
+    ///
+    /// A handle or a uuid only means something against the live panes, which live in the server -
+    /// so the client asks before it builds the action that will act on the pane. The reply is the
+    /// pane's id, or a miss on stderr with exit 2.
+    ResolvePaneTarget {
+        target: String,
+    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
         show_state: bool,
         show_geometry: bool,
         show_all: bool,
+        output_json: bool,
+    },
+    /// Every tab with its panes nested beneath it - the shape of the session in one answer.
+    ListTree {
         output_json: bool,
     },
     ListTabs {
@@ -743,29 +755,30 @@ impl Action {
         }
     }
 
+    /// Turns one CLI invocation into the actions that carry it out.
+    ///
+    /// `resolve_pane_target` turns a `--pane-id` string into a pane id. A handle or a uuid only
+    /// means something against a session's live panes, so the caller supplies a resolver that can
+    /// ask the running server; a caller with no session to ask passes [`pane_ids_only`], which
+    /// accepts the id forms and refuses the rest. Its error message is what the user sees, so it
+    /// is passed through rather than replaced.
     pub fn actions_from_cli(
         cli_action: CliAction,
         get_current_dir: Box<dyn Fn() -> PathBuf>,
         config: Option<Config>,
+        resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
     ) -> Result<Vec<Action>, String> {
         match cli_action {
             CliAction::Write { bytes, pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let parsed_pane_id = PaneId::from_str(&pane_id_str);
+                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
                     match parsed_pane_id {
-                            Ok(parsed_pane_id) => {
-                                Ok(vec![Action::WriteToPaneId {
-                                    bytes,
-                                    pane_id: parsed_pane_id,
-                                }])
-                            },
-                            Err(_e) => {
-                                Err(format!(
-                                    "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                    pane_id_str
-                                ))
-                            }
-                        }
+                        Ok(parsed_pane_id) => Ok(vec![Action::WriteToPaneId {
+                            bytes,
+                            pane_id: parsed_pane_id,
+                        }]),
+                        Err(e) => Err(e),
+                    }
                 },
                 None => Ok(vec![Action::Write {
                     key_with_modifier: None,
@@ -775,40 +788,26 @@ impl Action {
             },
             CliAction::WriteChars { chars, pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let parsed_pane_id = PaneId::from_str(&pane_id_str);
+                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
                     match parsed_pane_id {
-                            Ok(parsed_pane_id) => {
-                                Ok(vec![Action::WriteCharsToPaneId {
-                                    chars,
-                                    pane_id: parsed_pane_id,
-                                }])
-                            },
-                            Err(_e) => {
-                                Err(format!(
-                                    "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                    pane_id_str
-                                ))
-                            }
-                        }
+                        Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
+                            chars,
+                            pane_id: parsed_pane_id,
+                        }]),
+                        Err(e) => Err(e),
+                    }
                 },
                 None => Ok(vec![Action::WriteChars { chars }]),
             },
             CliAction::Paste { chars, pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let parsed_pane_id = PaneId::from_str(&pane_id_str);
+                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
                     match parsed_pane_id {
-                        Ok(parsed_pane_id) => {
-                            Ok(vec![Action::Paste {
-                                chars,
-                                pane_id: Some(parsed_pane_id),
-                            }])
-                        },
-                        Err(_e) => {
-                            Err(format!(
-                                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                pane_id_str
-                            ))
-                        }
+                        Ok(parsed_pane_id) => Ok(vec![Action::Paste {
+                            chars,
+                            pane_id: Some(parsed_pane_id),
+                        }]),
+                        Err(e) => Err(e),
                     }
                 },
                 None => Ok(vec![Action::Paste {
@@ -842,11 +841,7 @@ impl Action {
 
                     match &pane_id {
                         Some(pane_id_str) => {
-                            let parsed_pane_id = PaneId::from_str(pane_id_str)
-                                .map_err(|_| format!(
-                                    "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                    pane_id_str
-                                ))?;
+                            let parsed_pane_id = resolve_pane_target(pane_id_str)?;
                             actions.push(Action::WriteToPaneId {
                                 bytes,
                                 pane_id: parsed_pane_id,
@@ -870,10 +865,7 @@ impl Action {
                 pane_id,
             } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ResizeByPaneId {
                         pane_id,
                         resize,
@@ -885,10 +877,7 @@ impl Action {
             CliAction::FocusNextPane => Ok(vec![Action::FocusNextPane]),
             CliAction::FocusPreviousPane => Ok(vec![Action::FocusPreviousPane]),
             CliAction::FocusPaneId { pane_id } => {
-                let pane_id = PaneId::from_str(&pane_id)
-                    .map_err(|_| format!(
-                        "Malformed pane id: {pane_id}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                    ))?;
+                let pane_id = resolve_pane_target(&pane_id)?;
                 Ok(vec![Action::FocusPaneByPaneId { pane_id }])
             },
             CliAction::FocusLastPane => Ok(vec![Action::FocusLastPane]),
@@ -898,20 +887,14 @@ impl Action {
             },
             CliAction::MovePane { direction, pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::MovePaneByPaneId { pane_id, direction }])
                 },
                 None => Ok(vec![Action::MovePane { direction }]),
             },
             CliAction::MovePaneBackwards { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::MovePaneBackwardsByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::MovePaneBackwards]),
@@ -936,154 +919,118 @@ impl Action {
             },
             CliAction::Clear { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ClearScreenByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ClearScreen]),
             },
             CliAction::DumpScreen {
+                file,
                 path,
                 full,
                 pane_id,
                 ansi,
-            } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = PaneId::from_str(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => {
-                            Ok(vec![Action::DumpScreen {
-                                file_path: path.map(|p| p.as_os_str().to_string_lossy().into()),
+            } => {
+                // the two spellings of the same argument; clap has already refused both at once
+                let file_path = path
+                    .or(file)
+                    .map(|p| p.as_os_str().to_string_lossy().into());
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::DumpScreen {
+                                file_path,
                                 include_scrollback: full,
                                 pane_id: Some(parsed_pane_id),
                                 ansi,
-                            }])
-                        },
-                        Err(_e) => {
-                            Err(format!(
-                                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                pane_id_str
-                            ))
+                            }]),
+                            Err(e) => Err(e),
                         }
-                    }
-                },
-                None => Ok(vec![Action::DumpScreen {
-                    file_path: path.map(|p| p.as_os_str().to_string_lossy().into()),
-                    include_scrollback: full,
-                    pane_id: None,
-                    ansi,
-                }]),
+                    },
+                    None => Ok(vec![Action::DumpScreen {
+                        file_path,
+                        include_scrollback: full,
+                        pane_id: None,
+                        ansi,
+                    }]),
+                }
             },
             CliAction::DumpLayout => Ok(vec![Action::DumpLayout]),
             CliAction::SaveSession { .. } => Ok(vec![Action::SaveSession]),
             CliAction::EditScrollback { pane_id, ansi } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::EditScrollbackByPaneId { pane_id, ansi }])
                 },
                 None => Ok(vec![Action::EditScrollback { ansi }]),
             },
             CliAction::ScrollUp { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ScrollUpByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ScrollUp]),
             },
             CliAction::ScrollDown { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ScrollDownByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ScrollDown]),
             },
             CliAction::ScrollToBottom { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ScrollToBottomByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ScrollToBottom]),
             },
             CliAction::ScrollToTop { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ScrollToTopByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ScrollToTop]),
             },
             CliAction::PageScrollUp { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::PageScrollUpByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::PageScrollUp]),
             },
             CliAction::PageScrollDown { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::PageScrollDownByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::PageScrollDown]),
             },
             CliAction::HalfPageScrollUp { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::HalfPageScrollUpByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::HalfPageScrollUp]),
             },
             CliAction::HalfPageScrollDown { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::HalfPageScrollDownByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::HalfPageScrollDown]),
             },
             CliAction::ToggleFullscreen { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ToggleFocusFullscreenByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ToggleFocusFullscreen]),
             },
             CliAction::ToggleNoUiFullscreen { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ToggleFocusNoUiFullscreenByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::ToggleFocusNoUiFullscreen]),
@@ -1125,14 +1072,9 @@ impl Action {
                 tab_id,
             } => {
                 let pane_id_to_replace = match pane_id {
-                    Some(pane_id_str) => match PaneId::from_str(&pane_id_str) {
+                    Some(pane_id_str) => match resolve_pane_target(&pane_id_str) {
                         Ok(parsed_pane_id) => Some(parsed_pane_id),
-                        Err(_e) => {
-                            return Err(format!(
-                                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                pane_id_str
-                            ))
-                        },
+                        Err(e) => return Err(e),
                     },
                     None => None,
                 };
@@ -1413,10 +1355,7 @@ impl Action {
             CliAction::SwitchMode { input_mode } => Ok(vec![Action::SwitchToMode { input_mode }]),
             CliAction::TogglePaneEmbedOrFloating { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::TogglePaneEmbedOrFloatingByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::TogglePaneEmbedOrFloating]),
@@ -1436,21 +1375,14 @@ impl Action {
             },
             CliAction::ClosePane { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::CloseFocusByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::CloseFocus]),
             },
             CliAction::RenamePane { name, pane_id } => {
                 let pane_id = match pane_id {
-                    Some(pane_id_str) => Some(
-                        PaneId::from_str(&pane_id_str).map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?,
-                    ),
+                    Some(pane_id_str) => Some(resolve_pane_target(&pane_id_str)?),
                     None => None,
                 };
                 Ok(vec![Action::RenamePaneByPaneId {
@@ -1460,10 +1392,7 @@ impl Action {
             },
             CliAction::UndoRenamePane { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::UndoRenamePaneByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::UndoRenamePane]),
@@ -1910,7 +1839,6 @@ impl Action {
                     apply_only_to_active_tab,
                 }])
             },
-            CliAction::QueryTabNames => Ok(vec![Action::QueryTabNames]),
             CliAction::StartOrReloadPlugin { url, configuration } => {
                 let current_dir = get_current_dir();
                 let run_plugin_or_alias = RunPluginOrAlias::from_url(
@@ -2030,6 +1958,7 @@ impl Action {
                 show_all: all,
                 output_json: json,
             }]),
+            CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
             CliAction::ListTabs {
                 state,
                 dimensions,
@@ -2050,10 +1979,7 @@ impl Action {
             },
             CliAction::TogglePanePinned { pane_id } => match pane_id {
                 Some(pane_id_str) => {
-                    let pane_id = PaneId::from_str(&pane_id_str)
-                        .map_err(|_| format!(
-                            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
-                        ))?;
+                    let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::TogglePanePinnedByPaneId { pane_id }])
                 },
                 None => Ok(vec![Action::TogglePanePinned]),
@@ -2062,20 +1988,20 @@ impl Action {
                 let mut malformed_ids = vec![];
                 let pane_ids = pane_ids
                     .iter()
-                    .filter_map(
-                        |stringified_pane_id| match PaneId::from_str(stringified_pane_id) {
+                    .filter_map(|stringified_pane_id| {
+                        match resolve_pane_target(stringified_pane_id) {
                             Ok(pane_id) => Some(pane_id),
                             Err(_e) => {
                                 malformed_ids.push(stringified_pane_id.to_owned());
                                 None
                             },
-                        },
-                    )
+                        }
+                    })
                     .collect();
                 if !malformed_ids.is_empty() {
                     Err(
                         format!(
-                            "Malformed pane ids: {}, expecting a space separated list of either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
+                            "These do not name panes: {}. Expected terminal_1, plugin_1, a bare number, a handle like sunny-otter, or a pane uuid",
                             malformed_ids.join(", ")
                         )
                     )
@@ -2097,32 +2023,25 @@ impl Action {
                 else {
                     return Err(format!("Failed to parse floating pane coordinates"));
                 };
-                let parsed_pane_id = PaneId::from_str(&pane_id);
+                let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
-                    Ok(parsed_pane_id) => {
-                        Ok(vec![Action::ChangeFloatingPaneCoordinates {
-                            pane_id: parsed_pane_id,
-                            coordinates,
-                        }])
-                    },
-                    Err(_e) => {
-                        Err(format!(
-                            "Malformed pane id: {}, expecting a space separated list of either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                            pane_id
-                        ))
-                    }
+                    Ok(parsed_pane_id) => Ok(vec![Action::ChangeFloatingPaneCoordinates {
+                        pane_id: parsed_pane_id,
+                        coordinates,
+                    }]),
+                    Err(e) => Err(e),
                 }
             },
             CliAction::SetFullscreen { enabled, pane_id } => Ok(vec![Action::SetPaneFullscreen {
-                pane_id: parse_optional_pane_id(pane_id)?,
+                pane_id: parse_optional_pane_id(pane_id, resolve_pane_target)?,
                 fullscreen: enabled,
             }]),
             CliAction::SetPanePinned { enabled, pane_id } => Ok(vec![Action::SetPanePinned {
-                pane_id: parse_optional_pane_id(pane_id)?,
+                pane_id: parse_optional_pane_id(pane_id, resolve_pane_target)?,
                 pinned: enabled,
             }]),
             CliAction::SetPaneFloating { enabled, pane_id } => Ok(vec![Action::SetPaneFloating {
-                pane_id: parse_optional_pane_id(pane_id)?,
+                pane_id: parse_optional_pane_id(pane_id, resolve_pane_target)?,
                 floating: enabled,
             }]),
             CliAction::SetSyncTab { enabled, tab_id } => Ok(vec![Action::SetSyncTab {
@@ -2138,7 +2057,7 @@ impl Action {
                     // no explicit target: the focused pane, which is what the keybinding does
                     return Ok(vec![Action::BreakPane]);
                 }
-                let pane_ids = parse_pane_ids(&pane_id)?;
+                let pane_ids = parse_pane_ids(&pane_id, resolve_pane_target)?;
                 Ok(vec![Action::BreakPanesToNewTab {
                     pane_ids,
                     name,
@@ -2150,7 +2069,7 @@ impl Action {
                 tab_id,
                 no_focus,
             } => {
-                let pane_ids = parse_pane_ids(&pane_id)?;
+                let pane_ids = parse_pane_ids(&pane_id, resolve_pane_target)?;
                 Ok(vec![Action::BreakPanesToTabWithId {
                     pane_ids,
                     tab_id,
@@ -2160,56 +2079,35 @@ impl Action {
             CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
             CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
             CliAction::SignalPane { pane_id, signal } => {
-                let parsed_pane_id = PaneId::from_str(&pane_id);
+                let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
-                    Ok(parsed_pane_id) => {
-                        Ok(vec![Action::SignalPane {
-                            pane_id: parsed_pane_id,
-                            signal,
-                        }])
-                    },
-                    Err(_e) => {
-                        Err(format!(
-                            "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                            pane_id
-                        ))
-                    }
+                    Ok(parsed_pane_id) => Ok(vec![Action::SignalPane {
+                        pane_id: parsed_pane_id,
+                        signal,
+                    }]),
+                    Err(e) => Err(e),
                 }
             },
             CliAction::TogglePaneBorderless { pane_id } => {
-                let parsed_pane_id = PaneId::from_str(&pane_id);
+                let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
-                    Ok(parsed_pane_id) => {
-                        Ok(vec![Action::TogglePaneBorderless {
-                            pane_id: parsed_pane_id,
-                        }])
-                    },
-                    Err(_e) => {
-                        Err(format!(
-                            "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                            pane_id
-                        ))
-                    }
+                    Ok(parsed_pane_id) => Ok(vec![Action::TogglePaneBorderless {
+                        pane_id: parsed_pane_id,
+                    }]),
+                    Err(e) => Err(e),
                 }
             },
             CliAction::SetPaneBorderless {
                 pane_id,
                 borderless,
             } => {
-                let parsed_pane_id = PaneId::from_str(&pane_id);
+                let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
-                    Ok(parsed_pane_id) => {
-                        Ok(vec![Action::SetPaneBorderless {
-                            pane_id: parsed_pane_id,
-                            borderless,
-                        }])
-                    },
-                    Err(_e) => {
-                        Err(format!(
-                            "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                            pane_id
-                        ))
-                    }
+                    Ok(parsed_pane_id) => Ok(vec![Action::SetPaneBorderless {
+                        pane_id: parsed_pane_id,
+                        borderless,
+                    }]),
+                    Err(e) => Err(e),
                 }
             },
             CliAction::SetPaneColor {
@@ -2224,24 +2122,17 @@ impl Action {
                         "No --pane-id provided and ZELLIJ_PANE_ID is not set".to_string()
                     })?,
                 };
-                let parsed_pane_id = PaneId::from_str(&pane_id_str);
+                let parsed_pane_id = resolve_pane_target(&pane_id_str);
                 match parsed_pane_id {
                     Ok(parsed_pane_id) => {
-                        let (fg, bg) = if reset {
-                            (None, None)
-                        } else {
-                            (fg, bg)
-                        };
+                        let (fg, bg) = if reset { (None, None) } else { (fg, bg) };
                         Ok(vec![Action::SetPaneColor {
                             pane_id: parsed_pane_id,
                             fg,
                             bg,
                         }])
                     },
-                    Err(_e) => Err(format!(
-                        "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                        pane_id_str
-                    )),
+                    Err(e) => Err(e),
                 }
             },
             CliAction::Detach => Ok(vec![Action::Detach]),
@@ -2258,15 +2149,10 @@ impl Action {
                 cwd,
             } => {
                 let pane_id = match pane_id {
-                    Some(stringified_pane_id) => match PaneId::from_str(&stringified_pane_id) {
+                    Some(stringified_pane_id) => match resolve_pane_target(&stringified_pane_id) {
                         Ok(PaneId::Terminal(id)) => Some((id, false)),
                         Ok(PaneId::Plugin(id)) => Some((id, true)),
-                        Err(_e) => {
-                            return Err(format!(
-                                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                                stringified_pane_id
-                            ));
-                        },
+                        Err(e) => return Err(e),
                     },
                     None => None,
                 };
@@ -2468,7 +2354,12 @@ mod tests {
             keys: vec!["Enter".to_string()],
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2495,7 +2386,12 @@ mod tests {
             keys: vec!["Ctrl a".to_string()],
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2521,7 +2417,12 @@ mod tests {
             keys: vec!["Ctrl a".to_string(), "F1".to_string(), "Enter".to_string()],
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 3);
@@ -2544,7 +2445,12 @@ mod tests {
             keys: vec!["Ctrl-a".to_string()],
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Use spaces instead of hyphens"));
@@ -2556,7 +2462,12 @@ mod tests {
             keys: vec!["Ctrll a".to_string()],
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Ctrl") || err.contains("modifier"));
@@ -2568,7 +2479,12 @@ mod tests {
             keys: vec!["a".to_string()],
             pane_id: Some("terminal_1".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2587,10 +2503,15 @@ mod tests {
             keys: vec!["a".to_string()],
             pane_id: Some("invalid_id".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("Malformed pane id"));
+        assert!(err.contains("does not name a pane"), "got: {}", err);
     }
 
     // =============================================
@@ -2603,7 +2524,12 @@ mod tests {
         let cli_action = CliAction::ScrollUp {
             pane_id: Some("terminal_5".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2618,7 +2544,12 @@ mod tests {
     #[test]
     fn test_scroll_up_without_pane_id() {
         let cli_action = CliAction::ScrollUp { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2631,7 +2562,12 @@ mod tests {
         let cli_action = CliAction::ScrollDown {
             pane_id: Some("terminal_2".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2646,7 +2582,12 @@ mod tests {
     #[test]
     fn test_scroll_down_without_pane_id() {
         let cli_action = CliAction::ScrollDown { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2659,7 +2600,12 @@ mod tests {
         let cli_action = CliAction::ScrollToTop {
             pane_id: Some("terminal_1".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2674,7 +2620,12 @@ mod tests {
     #[test]
     fn test_scroll_to_top_without_pane_id() {
         let cli_action = CliAction::ScrollToTop { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2687,7 +2638,12 @@ mod tests {
         let cli_action = CliAction::ScrollToBottom {
             pane_id: Some("terminal_4".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2702,7 +2658,12 @@ mod tests {
     #[test]
     fn test_scroll_to_bottom_without_pane_id() {
         let cli_action = CliAction::ScrollToBottom { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2715,7 +2676,12 @@ mod tests {
         let cli_action = CliAction::PageScrollUp {
             pane_id: Some("terminal_6".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2730,7 +2696,12 @@ mod tests {
     #[test]
     fn test_page_scroll_up_without_pane_id() {
         let cli_action = CliAction::PageScrollUp { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2743,7 +2714,12 @@ mod tests {
         let cli_action = CliAction::PageScrollDown {
             pane_id: Some("terminal_8".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2758,7 +2734,12 @@ mod tests {
     #[test]
     fn test_page_scroll_down_without_pane_id() {
         let cli_action = CliAction::PageScrollDown { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2771,7 +2752,12 @@ mod tests {
         let cli_action = CliAction::HalfPageScrollUp {
             pane_id: Some("terminal_10".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2786,7 +2772,12 @@ mod tests {
     #[test]
     fn test_half_page_scroll_up_without_pane_id() {
         let cli_action = CliAction::HalfPageScrollUp { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2799,7 +2790,12 @@ mod tests {
         let cli_action = CliAction::HalfPageScrollDown {
             pane_id: Some("terminal_12".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2814,7 +2810,12 @@ mod tests {
     #[test]
     fn test_half_page_scroll_down_without_pane_id() {
         let cli_action = CliAction::HalfPageScrollDown { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2829,7 +2830,12 @@ mod tests {
             direction: Some(Direction::Left),
             pane_id: Some("terminal_3".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2854,7 +2860,12 @@ mod tests {
             direction: Some(Direction::Left),
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2874,7 +2885,12 @@ mod tests {
             direction: Some(Direction::Right),
             pane_id: Some("terminal_9".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2893,7 +2909,12 @@ mod tests {
             direction: Some(Direction::Right),
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2911,7 +2932,12 @@ mod tests {
         let cli_action = CliAction::MovePaneBackwards {
             pane_id: Some("terminal_11".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2926,7 +2952,12 @@ mod tests {
     #[test]
     fn test_move_pane_backwards_without_pane_id() {
         let cli_action = CliAction::MovePaneBackwards { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2939,7 +2970,12 @@ mod tests {
         let cli_action = CliAction::Clear {
             pane_id: Some("terminal_14".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2954,7 +2990,12 @@ mod tests {
     #[test]
     fn test_clear_without_pane_id() {
         let cli_action = CliAction::Clear { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2968,7 +3009,12 @@ mod tests {
             pane_id: Some("terminal_15".to_string()),
             ansi: false,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -2987,7 +3033,12 @@ mod tests {
             pane_id: None,
             ansi: false,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3000,7 +3051,12 @@ mod tests {
         let cli_action = CliAction::ToggleFullscreen {
             pane_id: Some("terminal_16".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3015,7 +3071,12 @@ mod tests {
     #[test]
     fn test_toggle_fullscreen_without_pane_id() {
         let cli_action = CliAction::ToggleFullscreen { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3027,7 +3088,12 @@ mod tests {
         let cli_action = CliAction::ToggleNoUiFullscreen {
             pane_id: Some("terminal_16".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3042,7 +3108,12 @@ mod tests {
     #[test]
     fn test_toggle_no_ui_fullscreen_without_pane_id() {
         let cli_action = CliAction::ToggleNoUiFullscreen { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3055,7 +3126,12 @@ mod tests {
         let cli_action = CliAction::TogglePaneEmbedOrFloating {
             pane_id: Some("terminal_17".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3070,7 +3146,12 @@ mod tests {
     #[test]
     fn test_toggle_pane_embed_or_floating_without_pane_id() {
         let cli_action = CliAction::TogglePaneEmbedOrFloating { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3083,7 +3164,12 @@ mod tests {
         let cli_action = CliAction::ClosePane {
             pane_id: Some("terminal_18".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3098,7 +3184,12 @@ mod tests {
     #[test]
     fn test_close_pane_without_pane_id() {
         let cli_action = CliAction::ClosePane { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3112,7 +3203,12 @@ mod tests {
             name: "my-pane".to_string(),
             pane_id: Some("terminal_19".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3131,7 +3227,12 @@ mod tests {
             name: "my-pane".to_string(),
             pane_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3150,7 +3251,12 @@ mod tests {
         let cli_action = CliAction::UndoRenamePane {
             pane_id: Some("terminal_20".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3165,7 +3271,12 @@ mod tests {
     #[test]
     fn test_undo_rename_pane_without_pane_id() {
         let cli_action = CliAction::UndoRenamePane { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3178,7 +3289,12 @@ mod tests {
         let cli_action = CliAction::TogglePanePinned {
             pane_id: Some("terminal_21".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3193,7 +3309,12 @@ mod tests {
     #[test]
     fn test_toggle_pane_pinned_without_pane_id() {
         let cli_action = CliAction::TogglePanePinned { pane_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3206,7 +3327,12 @@ mod tests {
         let cli_action = CliAction::ScrollUp {
             pane_id: Some("plugin_3".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3223,7 +3349,12 @@ mod tests {
         let cli_action = CliAction::ScrollUp {
             pane_id: Some("7".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3240,10 +3371,15 @@ mod tests {
         let cli_action = CliAction::ScrollUp {
             pane_id: Some("invalid_id".to_string()),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("Malformed pane id"));
+        assert!(err.contains("does not name a pane"), "got: {}", err);
     }
 
     // =============================================
@@ -3254,7 +3390,12 @@ mod tests {
     #[test]
     fn test_close_tab_with_tab_id() {
         let cli_action = CliAction::CloseTab { tab_id: Some(5) };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3269,7 +3410,12 @@ mod tests {
     #[test]
     fn test_close_tab_without_tab_id() {
         let cli_action = CliAction::CloseTab { tab_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3282,6 +3428,7 @@ mod tests {
             CliAction::SetDarkTheme,
             Box::new(|| PathBuf::from("/tmp")),
             None,
+            &pane_ids_only,
         );
         let actions = result.expect("SetDarkTheme conversion should succeed");
         assert_eq!(actions.len(), 1);
@@ -3294,6 +3441,7 @@ mod tests {
             CliAction::SetLightTheme,
             Box::new(|| PathBuf::from("/tmp")),
             None,
+            &pane_ids_only,
         );
         let actions = result.expect("SetLightTheme conversion should succeed");
         assert_eq!(actions.len(), 1);
@@ -3306,6 +3454,7 @@ mod tests {
             CliAction::ToggleTheme,
             Box::new(|| PathBuf::from("/tmp")),
             None,
+            &pane_ids_only,
         );
         let actions = result.expect("ToggleTheme conversion should succeed");
         assert_eq!(actions.len(), 1);
@@ -3319,7 +3468,12 @@ mod tests {
             name: "my-tab".to_string(),
             tab_id: Some(3),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3338,7 +3492,12 @@ mod tests {
             name: "my-tab".to_string(),
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 2);
@@ -3350,7 +3509,12 @@ mod tests {
     #[test]
     fn test_undo_rename_tab_with_tab_id() {
         let cli_action = CliAction::UndoRenameTab { tab_id: Some(7) };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3365,7 +3529,12 @@ mod tests {
     #[test]
     fn test_undo_rename_tab_without_tab_id() {
         let cli_action = CliAction::UndoRenameTab { tab_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3376,7 +3545,12 @@ mod tests {
     #[test]
     fn test_toggle_active_sync_tab_with_tab_id() {
         let cli_action = CliAction::ToggleActiveSyncTab { tab_id: Some(2) };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3391,7 +3565,12 @@ mod tests {
     #[test]
     fn test_toggle_active_sync_tab_without_tab_id() {
         let cli_action = CliAction::ToggleActiveSyncTab { tab_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3402,7 +3581,12 @@ mod tests {
     #[test]
     fn test_toggle_floating_panes_with_tab_id() {
         let cli_action = CliAction::ToggleFloatingPanes { tab_id: Some(4) };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3417,7 +3601,12 @@ mod tests {
     #[test]
     fn test_toggle_floating_panes_without_tab_id() {
         let cli_action = CliAction::ToggleFloatingPanes { tab_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3428,7 +3617,12 @@ mod tests {
     #[test]
     fn test_previous_swap_layout_with_tab_id() {
         let cli_action = CliAction::PreviousSwapLayout { tab_id: Some(6) };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3443,7 +3637,12 @@ mod tests {
     #[test]
     fn test_previous_swap_layout_without_tab_id() {
         let cli_action = CliAction::PreviousSwapLayout { tab_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3454,7 +3653,12 @@ mod tests {
     #[test]
     fn test_next_swap_layout_with_tab_id() {
         let cli_action = CliAction::NextSwapLayout { tab_id: Some(8) };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3469,7 +3673,12 @@ mod tests {
     #[test]
     fn test_next_swap_layout_without_tab_id() {
         let cli_action = CliAction::NextSwapLayout { tab_id: None };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3484,7 +3693,12 @@ mod tests {
             to_index: None,
             tab_id: Some(10),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3504,7 +3718,12 @@ mod tests {
             to_index: None,
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3523,7 +3742,12 @@ mod tests {
             to_index: Some(2),
             tab_id: Some(10),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3543,7 +3767,12 @@ mod tests {
             to_index: Some(0),
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3563,7 +3792,12 @@ mod tests {
             to_index: None,
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
     }
 
@@ -3575,7 +3809,12 @@ mod tests {
             pane_id: None,
             ansi: true,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3588,7 +3827,12 @@ mod tests {
             pane_id: Some("terminal_15".to_string()),
             ansi: true,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3604,12 +3848,18 @@ mod tests {
     #[test]
     fn test_dump_screen_with_ansi_flag() {
         let cli_action = CliAction::DumpScreen {
+            file: None,
             path: Some(PathBuf::from("/tmp/test")),
             full: true,
             pane_id: None,
             ansi: true,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3629,12 +3879,18 @@ mod tests {
     #[test]
     fn test_dump_screen_with_pane_id_and_ansi() {
         let cli_action = CliAction::DumpScreen {
+            file: None,
             path: None,
             full: false,
             pane_id: Some("terminal_5".to_string()),
             ansi: true,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3652,7 +3908,12 @@ mod tests {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "terminal_7".to_string(),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3669,7 +3930,12 @@ mod tests {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "3".to_string(),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3686,7 +3952,12 @@ mod tests {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "plugin_2".to_string(),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3703,7 +3974,12 @@ mod tests {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "invalid_id".to_string(),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
     }
 
@@ -3724,7 +4000,12 @@ mod tests {
             block_until_exit_failure: false,
             no_focus: false,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3761,7 +4042,12 @@ mod tests {
             block_until_exit_failure: false,
             no_focus: false,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
     }
 
@@ -3775,7 +4061,12 @@ mod tests {
             retain_existing_plugin_panes: false,
             apply_only_to_active_tab: false,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3798,7 +4089,12 @@ mod tests {
             layout_dir: None,
             cwd: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3824,7 +4120,12 @@ mod tests {
             layout_dir: None,
             cwd: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
     }
 
@@ -3862,7 +4163,12 @@ mod tests {
             borderless: None,
             tab_id: Some(3),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3906,7 +4212,12 @@ mod tests {
             borderless: None,
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3950,7 +4261,12 @@ mod tests {
             borderless: None,
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -3996,9 +4312,15 @@ mod tests {
             borderless: None,
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Malformed pane id"));
+        let err = result.unwrap_err();
+        assert!(err.contains("does not name a pane"), "got: {}", err);
     }
 
     #[test]
@@ -4033,7 +4355,12 @@ mod tests {
             borderless: None,
             tab_id: Some(5),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4077,7 +4404,12 @@ mod tests {
             borderless: None,
             tab_id: Some(1),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4121,7 +4453,12 @@ mod tests {
             borderless: None,
             tab_id: Some(2),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4153,7 +4490,12 @@ mod tests {
             borderless: None,
             tab_id: Some(4),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4185,7 +4527,12 @@ mod tests {
             borderless: None,
             tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4229,7 +4576,12 @@ mod tests {
             borderless: None,
             tab_id: Some(2),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4273,7 +4625,12 @@ mod tests {
             borderless: None,
             tab_id: Some(1),
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
         assert!(result.is_ok());
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
@@ -4287,29 +4644,109 @@ mod tests {
 }
 
 /// Parse a list of `--pane-id` values, naming the first one that does not parse.
-fn parse_pane_ids(pane_ids: &[String]) -> Result<Vec<PaneId>, String> {
+/// The resolver for a caller with no running session to ask.
+///
+/// Accepts the id forms, which need nothing but parsing, and refuses a handle or a uuid - both name
+/// a pane only against live panes, and there are none here to name.
+pub fn pane_ids_only(target: &str) -> Result<PaneId, String> {
+    match target.parse::<PaneTarget>()? {
+        PaneTarget::Id(pane_id) => Ok(pane_id),
+        other => Err(format!(
+            "'{}' can only be resolved against a running session",
+            other
+        )),
+    }
+}
+
+fn parse_pane_ids(
+    pane_ids: &[String],
+    resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
+) -> Result<Vec<PaneId>, String> {
     pane_ids
         .iter()
-        .map(|pane_id| {
-            PaneId::from_str(pane_id).map_err(|_e| {
-                format!(
-                    "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                    pane_id
-                )
-            })
-        })
+        .map(|pane_id| resolve_pane_target(pane_id))
         .collect()
 }
 
 /// Parse an optional `--pane-id`. `None` means "whatever this client is focused on".
-fn parse_optional_pane_id(pane_id: Option<String>) -> Result<Option<PaneId>, String> {
+fn parse_optional_pane_id(
+    pane_id: Option<String>,
+    resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
+) -> Result<Option<PaneId>, String> {
     match pane_id {
         None => Ok(None),
-        Some(pane_id) => PaneId::from_str(&pane_id).map(Some).map_err(|_e| {
-            format!(
-                "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
-                pane_id
-            )
-        }),
+        Some(pane_id) => resolve_pane_target(&pane_id).map(Some),
+    }
+}
+
+#[cfg(test)]
+mod pane_target_resolution_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn a_caller_with_no_session_takes_the_id_forms_and_refuses_the_rest() {
+        assert_eq!(pane_ids_only("terminal_9"), Ok(PaneId::Terminal(9)));
+        assert_eq!(pane_ids_only("plugin_2"), Ok(PaneId::Plugin(2)));
+        assert_eq!(pane_ids_only("3"), Ok(PaneId::Terminal(3)));
+        // a handle and a uuid name a pane only against live panes, and there are none to name here
+        for needs_a_session in ["sunny-otter", "e9b82dbd-0000-4000-8000-0000000000aa"] {
+            let err = pane_ids_only(needs_a_session).expect_err(needs_a_session);
+            assert!(err.contains("running session"), "got: {}", err);
+        }
+    }
+
+    #[test]
+    fn a_handle_on_the_command_line_reaches_the_resolver() {
+        // the wiring: `--pane-id sunny-otter` must not be rejected before anyone can look it up
+        let asked = RefCell::new(Vec::new());
+        let resolve = |target: &str| -> Result<PaneId, String> {
+            asked.borrow_mut().push(target.to_owned());
+            Ok(PaneId::Terminal(9))
+        };
+        let actions = Action::actions_from_cli(
+            CliAction::ClosePane {
+                pane_id: Some("sunny-otter".to_owned()),
+            },
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &resolve,
+        )
+        .expect("the handle reaches the resolver");
+        assert_eq!(asked.into_inner(), vec!["sunny-otter".to_owned()]);
+        assert_eq!(
+            actions,
+            vec![Action::CloseFocusByPaneId {
+                pane_id: PaneId::Terminal(9)
+            }]
+        );
+    }
+
+    #[test]
+    fn the_resolvers_own_message_is_what_the_user_sees() {
+        // the server knows why the target missed; replacing that with "malformed" would throw away
+        // the only sentence that tells a human what to do next
+        let resolve = |_: &str| -> Result<PaneId, String> {
+            Err("No pane answers to 'sunny-otter'".to_owned())
+        };
+        let err = Action::actions_from_cli(
+            CliAction::ClosePane {
+                pane_id: Some("sunny-otter".to_owned()),
+            },
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &resolve,
+        )
+        .expect_err("a miss is an error");
+        assert_eq!(err, "No pane answers to 'sunny-otter'");
+    }
+
+    #[test]
+    fn an_id_target_is_never_sent_to_the_resolver_by_the_parser() {
+        // the id forms cost no round trip, which is why the common case is unchanged
+        assert_eq!(
+            "terminal_9".parse::<PaneTarget>().unwrap().as_pane_id(),
+            Some(PaneId::Terminal(9))
+        );
     }
 }
