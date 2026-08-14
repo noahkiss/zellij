@@ -409,6 +409,10 @@ impl ZellijPlugin for State {
                                 if let Some(result) = self.single_screen_state.get_selected_result()
                                 {
                                     match result {
+                                        UnifiedSearchResult::ActiveSession {
+                                            is_current_session: true,
+                                            ..
+                                        } => Some("Clients"),
                                         UnifiedSearchResult::ActiveSession { .. } => Some("Attach"),
                                         UnifiedSearchResult::ResurrectableSession { .. } => {
                                             Some("Resurrect")
@@ -416,7 +420,9 @@ impl ZellijPlugin for State {
                                     }
                                 } else {
                                     let typed = &self.single_screen_state.search_term;
-                                    if self.sessions.has_session(typed) {
+                                    if self.session_name.as_deref() == Some(typed.as_str()) {
+                                        Some("Clients")
+                                    } else if self.sessions.has_session(typed) {
                                         Some("Attach")
                                     } else if self.resurrectable_sessions.has_session(typed) {
                                         Some("Resurrect")
@@ -1495,7 +1501,10 @@ impl State {
                         } else if let Some(tab_position) = selected_tab {
                             go_to_tab(tab_position as u32);
                         } else {
-                            self.show_error("Already attached...");
+                            // attaching is the one thing this row cannot do, so Enter spends
+                            // itself on the next most useful answer about it: who else is here
+                            self.open_client_list();
+                            return; // so that we don't hide self
                         }
                     } else {
                         switch_session_with_focus(
@@ -1567,34 +1576,33 @@ impl State {
                         if let Some(result) = self.single_screen_state.get_selected_result() {
                             // User navigated to a specific result
                             let session_name = result.session_name().to_owned();
-                            let mut switched_session = false;
                             match result {
                                 UnifiedSearchResult::ActiveSession {
                                     is_current_session, ..
                                 } => {
                                     if *is_current_session {
-                                        // the only action the current session refuses. Say so and
-                                        // stay put - clearing the search or hiding the plugin here
-                                        // would throw away the user's place and the notice with it
-                                        self.show_error("Already attached to this session.");
+                                        // attaching is the one action this row refuses, so Enter
+                                        // spends itself on the next most useful answer about the
+                                        // session: who else is connected to it. Stay put -
+                                        // clearing the search or hiding the plugin here would
+                                        // throw away the user's place along with the list
+                                        self.open_client_list();
                                         return;
                                     }
                                     switch_session_with_focus(&session_name, None, None);
-                                    switched_session = true;
                                 },
                                 UnifiedSearchResult::ResurrectableSession { .. } => {
                                     switch_session(Some(&session_name));
-                                    switched_session = true;
                                 },
                             }
+                            // every path that reaches here switched session, so the plugin closes
+                            // rather than hides: the one path that does not returned above
                             self.single_screen_state.search_term.clear();
                             self.single_screen_state.selected_index = None;
                             if self.is_welcome_screen {
                                 quit_zellij();
-                            } else if switched_session {
-                                close_self();
                             } else {
-                                hide_self();
+                                close_self();
                             }
                         } else {
                             // No navigation - use typed name
@@ -1619,7 +1627,9 @@ impl State {
                             // Check exact match against active sessions
                             if self.sessions.has_session(&typed_name) {
                                 if self.session_name.as_deref() == Some(&typed_name) {
-                                    self.show_error("Already attached to this session.");
+                                    // typing the current session's name asks the same question
+                                    // the current row does, and gets the same answer
+                                    self.open_client_list();
                                 } else {
                                     switch_session_with_focus(&typed_name, None, None);
                                     if self.is_welcome_screen {

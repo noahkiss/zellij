@@ -7,8 +7,14 @@
 //! comes back; the work in it does not.
 //!
 //! A hint says: when a pane is running `claude`, look for `CLAUDE_CODE_SESSION_ID` in that pane's
-//! processes, and if it is there record `claude --resume <id>` instead of `claude`. The restored
-//! pane then holds the resume command, and Enter picks the session back up.
+//! processes, and if it is there record the observed command line with `--continue` appended. The
+//! restored pane then holds a command that picks the session back up.
+//!
+//! The observed command line is the ground truth and is never replaced. A hint only ADDS
+//! arguments, and adds nothing when the observed arguments already say how to resume - a pane
+//! started as `claude --continue` is recorded exactly as it ran. The variable is a detector, not a
+//! source: it says the pane really is running that tool. Its value reaches the recorded command
+//! only through an explicit `{}` in `resume_args`.
 //!
 //! Every part of this is best-effort. A hint that does not match, a variable that is not set, a
 //! platform that cannot read another process's environment - each records the command unchanged.
@@ -16,10 +22,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The placeholder a `rewrite` template substitutes the environment value into.
+/// The placeholder a `resume_args` template substitutes the environment value into. Optional: a
+/// resume flag that needs no id - `--continue` - carries no placeholder.
 pub const HINT_PLACEHOLDER: &str = "{}";
 
-/// One hint: which command it recognises, which variable carries the state, what to record.
+/// One hint: which command it recognises, which variable proves the tool is there, what to add.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResurrectCommandHint {
     /// The name of the config block this hint was written under. Carried for error messages and
@@ -29,12 +36,19 @@ pub struct ResurrectCommandHint {
     /// a pane running `claude` and one running `/opt/homebrew/bin/claude`, and does not match
     /// `claude-code`.
     pub match_command: String,
-    /// The environment variable to look for in the pane's processes.
+    /// The environment variable to look for in the pane's processes. Finding it is what makes the
+    /// hint fire.
+    ///
+    /// The search is breadth first over the pane's whole process subtree, so the value can come
+    /// from a child - a subagent, a hook - rather than from the tool the pane is running. That is
+    /// harmless while the variable is only a detector, and it is the residual risk of writing a
+    /// `{}` into `resume_args`: what lands in the command is then whichever process answered
+    /// first, which need not be the session the pane holds.
     pub env: String,
-    /// What to record instead, with `{}` standing for the variable's value. Split on whitespace
-    /// into a command and its arguments - it is not passed to a shell, so quoting, globs and
-    /// pipes mean nothing here.
-    pub rewrite: String,
+    /// The arguments to APPEND to the observed command line, with `{}` standing for the variable's
+    /// value. Split on whitespace - it is not passed to a shell, so quoting, globs and pipes mean
+    /// nothing here.
+    pub resume_args: String,
 }
 
 impl ResurrectCommandHint {
@@ -43,15 +57,37 @@ impl ResurrectCommandHint {
         basename(command) == self.match_command
     }
 
-    /// The rewritten command line: the template, split into a command and its arguments, with
-    /// every `{}` replaced by `env_value`. `None` if the template holds no command.
-    pub fn expand(&self, env_value: &str) -> Option<(String, Vec<String>)> {
-        let mut words = self
-            .rewrite
+    /// The arguments to append to `observed_args`, with every `{}` replaced by `env_value`.
+    ///
+    /// `None` means append nothing: the template is empty, the template needs a value and the
+    /// variable is set but empty, or the observed command line already carries one of these words.
+    /// A pane started as `claude --continue`, or as `claude --resume <id>`, already says how it
+    /// resumes, and the argv it actually ran beats anything this hint could reconstruct.
+    ///
+    /// Words are compared whole, never as substrings: a hint of `--continue` does not consider
+    /// itself present because the pane ran `--continue-on-error`.
+    pub fn resume_args_for(
+        &self,
+        observed_args: &[String],
+        env_value: &str,
+    ) -> Option<Vec<String>> {
+        // an exported but empty variable proves the tool is there and gives nothing to substitute;
+        // expanding it would append a bare `--session ""` the pane could not run
+        if env_value.is_empty() && self.resume_args.contains(HINT_PLACEHOLDER) {
+            return None;
+        }
+        let words: Vec<String> = self
+            .resume_args
             .split_whitespace()
-            .map(|word| word.replace(HINT_PLACEHOLDER, env_value));
-        let command = words.next()?;
-        Some((command, words.collect()))
+            .map(|word| word.replace(HINT_PLACEHOLDER, env_value))
+            .collect();
+        if words.is_empty() {
+            return None;
+        }
+        if words.iter().any(|word| observed_args.contains(word)) {
+            return None;
+        }
+        Some(words)
     }
 }
 
@@ -95,18 +131,22 @@ fn basename(command: &str) -> &str {
 mod tests {
     use super::*;
 
-    fn hint(match_command: &str, rewrite: &str) -> ResurrectCommandHint {
+    fn hint(match_command: &str, resume_args: &str) -> ResurrectCommandHint {
         ResurrectCommandHint {
             name: "test".to_owned(),
             match_command: match_command.to_owned(),
             env: "TEST_SESSION_ID".to_owned(),
-            rewrite: rewrite.to_owned(),
+            resume_args: resume_args.to_owned(),
         }
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
     }
 
     #[test]
     fn matches_on_the_basename() {
-        let hint = hint("claude", "claude --resume {}");
+        let hint = hint("claude", "--continue");
         assert!(hint.matches("claude"));
         assert!(hint.matches("/opt/homebrew/bin/claude"));
         assert!(!hint.matches("claude-code"));
@@ -115,38 +155,108 @@ mod tests {
     }
 
     #[test]
+    fn a_flag_that_needs_no_id_is_appended_on_its_own() {
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&[], "abc123"),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    #[test]
     fn expands_the_placeholder_into_an_argument() {
-        let (command, args) = hint("claude", "claude --resume {}")
-            .expand("abc123")
-            .unwrap();
-        assert_eq!(command, "claude");
-        assert_eq!(args, vec!["--resume".to_owned(), "abc123".to_owned()]);
+        assert_eq!(
+            hint("opencode", "--session {}").resume_args_for(&[], "abc123"),
+            Some(args(&["--session", "abc123"]))
+        );
     }
 
     #[test]
     fn expands_a_placeholder_glued_to_a_flag() {
-        let (command, args) = hint("opencode", "opencode --session={}")
-            .expand("xyz")
-            .unwrap();
-        assert_eq!(command, "opencode");
-        assert_eq!(args, vec!["--session=xyz".to_owned()]);
+        assert_eq!(
+            hint("opencode", "--session={}").resume_args_for(&[], "xyz"),
+            Some(args(&["--session=xyz"]))
+        );
+    }
+
+    /// An exported but empty variable still fires the hint, and there is nothing to put in the
+    /// placeholder. Appending `--session ""` would record a command the pane cannot run.
+    #[test]
+    fn an_empty_value_adds_nothing_when_the_template_needs_one() {
+        assert_eq!(
+            hint("opencode", "--session {}").resume_args_for(&[], ""),
+            None
+        );
+        assert_eq!(
+            hint("opencode", "--session={}").resume_args_for(&[], ""),
+            None
+        );
+    }
+
+    /// A template with no placeholder never touches the value, so an empty one is no obstacle -
+    /// the variable did its whole job by existing.
+    #[test]
+    fn an_empty_value_still_appends_a_template_that_needs_none() {
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&[], ""),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    /// The guard compares whole arguments. A pane running a longer flag that merely starts with
+    /// the hint's word has not resumed, and must still get the hint.
+    #[test]
+    fn a_longer_observed_flag_is_not_the_hints_word() {
+        let observed = args(&["--continue-on-error"]);
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&observed, "abc"),
+            Some(args(&["--continue"]))
+        );
     }
 
     #[test]
-    fn expands_a_template_with_no_arguments() {
-        let (command, args) = hint("tool", "resume-{}").expand("7").unwrap();
-        assert_eq!(command, "resume-7");
-        assert!(args.is_empty());
+    fn an_empty_template_adds_nothing() {
+        assert_eq!(hint("claude", "   ").resume_args_for(&[], "abc"), None);
+    }
+
+    /// The bug this whole surface exists to not have: the observed argv already resumed, and the
+    /// hint appended a second, contradictory resume flag over the top of it.
+    #[test]
+    fn observed_arguments_that_already_resume_win() {
+        let observed = args(&["--dangerously-skip-permissions", "--continue"]);
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&observed, "abc123"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_observed_resume_flag_beats_a_reconstructed_id() {
+        let observed = args(&["--resume", "the-id-that-actually-ran"]);
+        assert_eq!(
+            hint("claude", "--resume {}").resume_args_for(&observed, "some-other-id"),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_observed_arguments_do_not_block_the_hint() {
+        let observed = args(&["--dangerously-skip-permissions"]);
+        assert_eq!(
+            hint("claude", "--continue").resume_args_for(&observed, "abc123"),
+            Some(args(&["--continue"]))
+        );
     }
 
     #[test]
     fn first_matching_hint_wins() {
         let mut hints = ResurrectCommandHints::default();
-        hints.push(hint("claude", "claude --resume {}"));
-        hints.push(hint("claude", "claude --continue {}"));
+        hints.push(hint("claude", "--continue"));
+        hints.push(hint("claude", "--resume {}"));
         assert_eq!(
-            hints.hint_for("/usr/local/bin/claude").map(|h| &h.rewrite),
-            Some(&"claude --resume {}".to_owned())
+            hints
+                .hint_for("/usr/local/bin/claude")
+                .map(|h| &h.resume_args),
+            Some(&"--continue".to_owned())
         );
         assert!(hints.hint_for("bash").is_none());
     }
