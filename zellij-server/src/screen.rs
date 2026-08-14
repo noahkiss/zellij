@@ -8993,10 +8993,28 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 full,
                 pane_id,
-                completion_tx,
+                mut completion_tx,
                 cli_client_id,
                 ansi,
             ) => {
+                // a target no live pane answers to is a miss - the same one `close-pane` reports -
+                // rather than an empty dump, which reads as "this pane's screen is blank" and
+                // exits 0. Asked once here so that the file form and the stdout form agree
+                if let Some(pane_id) = pane_id {
+                    if !screen
+                        .tabs
+                        .values()
+                        .any(|tab| tab.has_pane_with_pid(&pane_id))
+                    {
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!(
+                                "No pane answers to '{}'",
+                                screen.pane_summary(pane_id)
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 match file {
                     Some(file_path) => {
                         // Write dump to file (existing behavior)

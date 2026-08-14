@@ -14358,3 +14358,72 @@ pub fn closing_a_tab_by_id_says_what_it_closed() {
         result.stdout_lines
     );
 }
+#[test]
+pub fn dumping_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: None,
+            include_scrollback: false,
+            pane_id: Some(ZellijUtilsPaneId::Terminal(9)),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss dumps nothing, not an empty line: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn dumping_a_pane_that_is_there_still_dumps_it() {
+    // the negative control for the miss check above: the guard must not refuse a live pane
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: None,
+            include_scrollback: false,
+            pane_id: Some(ZellijUtilsPaneId::Terminal(1)),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    // the dump itself is delivered by the server thread, which this harness does not run, so what
+    // is checked here is the only thing this guard could get wrong: it must not call a live pane a
+    // miss
+    assert!(
+        !result
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No pane answers to"),
+        "the guard refused a pane that is there: {:?}",
+        result.error_message
+    );
+}
