@@ -8,9 +8,9 @@ mod session_doctor_macos;
 #[cfg(test)]
 mod tests;
 
-use clap::Parser;
 use zellij_utils::{
     cli::{CliAction, CliArgs, Command, Sessions},
+    cli_surface::parse_cli_args,
     consts::{create_config_and_cache_folders, VERSION},
     data::UnblockCondition,
     envs,
@@ -24,7 +24,7 @@ use zellij_utils::{
 fn main() {
     configure_logger();
     create_config_and_cache_folders();
-    let opts = CliArgs::parse();
+    let opts = parse_cli_args();
 
     {
         let config = Config::try_from(&opts).ok();

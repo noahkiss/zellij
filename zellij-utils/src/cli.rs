@@ -56,6 +56,11 @@ fn validate_session(name: &str) -> Result<String, String> {
     version,
     name = "zellij",
     about = "A terminal workspace with batteries included",
+    long_about = "A terminal workspace with batteries included.
+
+`zellij action <verb>` drives a session that is already running - reading it, moving around it, changing it - and `zellij action --help` states the conventions all of those verbs share.
+
+`zellij setup --dump-surface` prints the whole command tree in one call: every command, its flags with their types and defaults, and what it puts on stdout.",
     styles = CLI_STYLES,
     args_override_self = true
 )]
@@ -140,7 +145,9 @@ pub enum Command {
     #[clap(name = "web", value_parser)]
     Web(WebCli),
 
-    /// Send actions to a specific session
+    /// Drive a running session: read it, move around it, change it
+    ///
+    /// `zellij action --help` states the conventions every one of these verbs follows.
     #[clap(visible_alias = "ac")]
     #[clap(subcommand)]
     Action(Box<CliAction>),
@@ -483,6 +490,7 @@ pub enum Sessions {
     },
 
     /// Run a command in a new pane
+    ///
     /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "r")]
     Run {
@@ -597,7 +605,8 @@ pub enum Sessions {
         )]
         tab_id: Option<usize>,
     },
-    /// Load a plugin
+    /// Load a plugin in a new pane
+    ///
     /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "p")]
     Plugin {
@@ -653,7 +662,8 @@ pub enum Sessions {
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
-    /// Edit file with default $EDITOR / $VISUAL
+    /// Open a file in a new pane running your $EDITOR
+    ///
     /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "e")]
     Edit {
@@ -1227,9 +1237,10 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Open a new pane in the specified direction [right|down]
-    /// If no direction is specified, will try to use the biggest available space.
-    /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word handle>`
+    /// Open a pane, running a command or your shell
+    ///
+    /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
+    /// handle>`. Without --direction the pane splits whichever side has the most room.
     NewPane {
         /// Split the pane it opens beside towards right or down. Without it, zellij splits
         /// whichever side has the most room
