@@ -70,6 +70,11 @@ fn check_tmpdir(report: &mut Report, commander: &SystemCommander) {
         .trim_end_matches('/')
         .to_owned();
     if system.is_empty() {
+        // silence here would read as "checked, and fine", which is the one thing it is not
+        report.push(Finding::ok(
+            "tmpdir",
+            "getconf named no temp directory, so there is nothing to compare this shell against",
+        ));
         return;
     }
     if ours == system {
@@ -214,40 +219,54 @@ struct PaneAnswer {
 /// terminal, and a shell prompt or a slow render would be indistinguishable from an answer. Under
 /// zellij's own temp directory, which is the one directory both this process and the server agree
 /// on by construction.
+///
+/// The client is spawned and never waited on, which is the one place doctor does not go through
+/// [`Commander`]: that trait runs a command to completion, and a client talking to a wedged server
+/// never completes. A machine whose session is stuck is exactly the machine somebody runs doctor
+/// on, so the deadline below has to cover the client as well as its answer.
 fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
     let answer_file = ZELLIJ_TMP_DIR.join(format!("doctor-probe-{}", std::process::id()));
     let _ = std::fs::remove_file(&answer_file);
     let answer_path = answer_file.display().to_string();
-    // `-r` on the TCC.db open is the whole FDA question: the open IS the probe, and nothing is
-    // read out of the file. `2>/dev/null` because a refusal's message is not the answer, the
-    // exit status is.
+    // The OPEN is the probe, and it has to be a real one: `[ -r ]` calls `access(2)`, which reads
+    // the permission bits, while TCC refuses at `open(2)` instead - so a test on the bits answers
+    // "readable" on a machine holding no grant at all. Nothing is read out of the file beyond the
+    // one byte it takes to prove the open was allowed.
+    //
+    // A TCC.db that is not there is not a refusal, and the two are reported apart rather than
+    // guessed at. `[ -e ]` is safe to ask: TCC gates the open, not the stat.
+    //
+    // `$HOME` is not trusted to be set - the server's environment comes from launchd rather than
+    // from a login shell - so it falls back to the `eval echo ~user` idiom the vitals probe uses.
     let script = format!(
         "{{ printf 'manager=%s\\n' \"$(launchctl managername 2>/dev/null)\"; \
-         if [ -r \"$HOME/Library/Application Support/com.apple.TCC/TCC.db\" ]; \
-         then echo fda=yes; else echo fda=no; fi; }} > {} 2>/dev/null",
+         home=${{HOME:-$(eval echo ~\"$(id -un)\")}}; \
+         db=\"$home/Library/Application Support/com.apple.TCC/TCC.db\"; \
+         if [ ! -e \"$db\" ]; then echo fda=unknown; \
+         elif head -c 1 \"$db\" >/dev/null 2>&1; then echo fda=yes; \
+         else echo fda=no; fi; }} > {} 2>/dev/null",
         shell_quote(&answer_path)
     );
 
-    let commander = SystemCommander;
     let zellij = std::env::current_exe().ok()?;
-    commander
-        .run(
-            &zellij.display().to_string(),
-            &[
-                "--session",
-                name,
-                "run",
-                "--floating",
-                "--close-on-exit",
-                "--name",
-                "zellij session doctor",
-                "--",
-                "sh",
-                "-c",
-                &script,
-            ],
-            None,
-        )
+    let mut client = std::process::Command::new(&zellij)
+        .args([
+            "--session",
+            name,
+            "run",
+            "--floating",
+            "--close-on-exit",
+            "--name",
+            "zellij session doctor",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
 
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
@@ -255,15 +274,25 @@ fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
         if let Ok(written) = std::fs::read_to_string(&answer_file) {
             if written.contains("fda=") {
                 let _ = std::fs::remove_file(&answer_file);
+                reap(&mut client);
                 return Some(parse_pane_answer(&written));
             }
         }
         if std::time::Instant::now() >= deadline {
             let _ = std::fs::remove_file(&answer_file);
+            reap(&mut client);
             return None;
         }
         std::thread::sleep(PROBE_POLL);
     }
+}
+
+/// Take the client down if it is still up, and collect it either way.
+fn reap(client: &mut std::process::Child) {
+    if matches!(client.try_wait(), Ok(None)) {
+        let _ = client.kill();
+    }
+    let _ = client.wait();
 }
 
 fn parse_pane_answer(written: &str) -> PaneAnswer {
