@@ -4304,7 +4304,11 @@ pub fn send_cli_toggle_floating_panes() {
 #[test]
 pub fn send_cli_close_pane_action() {
     let size = Size { cols: 80, rows: 10 };
-    let client_id = 10; // fake client id should not appear in the screen's state
+    // the client the session belongs to, so there is a focused pane for this to close. A client
+    // Screen has never heard of holds no focus, and `close-pane` now refuses that rather than
+    // closing whichever pane the fallback found - see
+    // `closing_the_focused_pane_with_nothing_focused_is_a_miss`
+    let client_id = 1;
     let mut initial_layout = TiledPaneLayout::default();
     initial_layout.children_split_direction = SplitDirection::Vertical;
     initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
