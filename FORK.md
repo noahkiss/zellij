@@ -109,6 +109,18 @@ prompt counted as "currently loading" and silently parked every later reload for
 the rest of the session; and a reload required an exact `(location, configuration)` match, so
 `start-or-reload-plugin` without a matching `-c` found nothing and spawned a stray pane instead.
 
+### A plugin whose file is missing stops erroring on every tick
+
+A pane whose `.wasm` is gone — what a snapshot taken before the plugin was deleted restores — used
+to log `Plugin with id: N not found` on every layout dump, so on every serialization tick, for the
+life of the session. The pane also serialized with no plugin at all, so the next snapshot recorded
+a plain pane where the plugin had been.
+
+The fork remembers what a plugin that failed to load was asked to run, for as long as its pane
+lives. The error is logged once, the pane keeps the loading-error state it already shows, and the
+plugin stays in the serialized layout. Reloading that pane does not bring the plugin back once the
+file returns; restoring the layout does, because the layout still names it.
+
 ### `dump-screen` works on plugin panes
 
 `zellij action dump-screen --pane-id plugin_N`, with or without `--ansi`, returns the pane's content

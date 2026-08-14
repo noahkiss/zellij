@@ -13203,3 +13203,138 @@ pub fn reconfiguration_resends_keybinds_to_opted_in_plugins() {
     // between the executor thread updating keybinds and send_initial_keybinds_to_plugin
     // reading them synchronously. The important thing is that the event IS delivered.
 }
+
+/// A snapshot taken before a `file:` plugin was deleted restores a pane pointing at a `.wasm` that
+/// is no longer there. The load fails, but the pane stays, and the plugin thread must keep
+/// answering for its id: every layout dump asks what each plugin pane runs, and a dump happens on
+/// every serialization tick, so an unanswered id is an error logged for the life of the session.
+///
+/// Answering also keeps the plugin in the dumped layout, so the next snapshot still records what
+/// the pane was meant to run instead of quietly demoting it to a plain pane.
+#[test]
+pub fn a_plugin_whose_file_is_missing_stays_in_the_dumped_layout() {
+    let temp_folder = tempdir().unwrap();
+    let plugin_host_folder = PathBuf::from(temp_folder.path());
+    let missing_plugin_path = plugin_host_folder.join("deleted-plugin.wasm");
+    let (plugin_thread_sender, screen_receiver, teardown) =
+        create_plugin_thread(Some(plugin_host_folder.clone()), None);
+
+    let client_id = 1;
+    let _ = plugin_thread_sender.send(PluginInstruction::AddClient(client_id));
+    let _ = plugin_thread_sender.send(PluginInstruction::Load(
+        Some(false),
+        false,
+        false, // close_replaced_pane
+        Some("test_plugin".to_owned()),
+        RunPluginOrAlias::RunPlugin(RunPlugin {
+            _allow_exec_host_cmd: false,
+            location: RunPluginLocation::File(missing_plugin_path.clone()),
+            configuration: Default::default(),
+            ..Default::default()
+        }),
+        Some(1), // tab index
+        None,
+        client_id,
+        Size {
+            cols: 121,
+            rows: 20,
+        },
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+
+    // the pane is added before the load is attempted, so this is the id of the pane that outlives
+    // the failure
+    let plugin_id = loop {
+        let (instruction, _err_ctx) = screen_receiver
+            .recv()
+            .expect("failed to receive screen instruction");
+        if let ScreenInstruction::AddPlugin(_, _, _, _, _, _, plugin_id, ..) = instruction {
+            break plugin_id;
+        }
+    };
+
+    fn pane_layout_metadata(
+        pane_id: crate::panes::PaneId,
+        y: usize,
+    ) -> crate::session_layout_metadata::PaneLayoutMetadata {
+        crate::session_layout_metadata::PaneLayoutMetadata::new(
+            pane_id,
+            zellij_utils::pane_size::PaneGeom {
+                x: 0,
+                y,
+                rows: zellij_utils::pane_size::Dimension::fixed(10),
+                cols: zellij_utils::pane_size::Dimension::fixed(121),
+                ..Default::default()
+            },
+            false,
+            None,
+            None,
+            false,
+            None,
+            vec![],
+            None,
+            None,
+            None,
+        )
+    }
+
+    let dump_layout = || {
+        let mut session_layout_metadata =
+            crate::session_layout_metadata::SessionLayoutMetadata::default();
+        session_layout_metadata.add_tab(
+            "tab1".to_owned(),
+            true,
+            false,
+            // a tab of one pane serializes to an empty tab, so the plugin pane sits above a
+            // terminal pane here, as it would in any real session
+            vec![
+                pane_layout_metadata(crate::panes::PaneId::Plugin(plugin_id), 0),
+                pane_layout_metadata(crate::panes::PaneId::Terminal(1), 10),
+            ],
+            vec![],
+        );
+        let (response_sender, response_receiver) = crossbeam::channel::unbounded();
+        let _ = plugin_thread_sender.send(PluginInstruction::DumpLayoutToPlugin {
+            session_layout_metadata,
+            // an id no pane in the layout has, so nothing is excluded from the dump
+            plugin_id: plugin_id + 1000,
+            response_channel: response_sender,
+        });
+        response_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("no answer to the layout dump")
+            .layout_result
+            .expect("failed to serialize the layout")
+    };
+
+    // the load runs on its own thread, so dump until it has failed rather than sleeping for a
+    // guessed interval: before the failure is recorded the dump answers the same as it would with
+    // no fix at all, and this suite runs under heavy parallel load
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let first_dump = loop {
+        let dump = dump_layout();
+        if dump.contains("deleted-plugin.wasm") {
+            break dump;
+        }
+        if std::time::Instant::now() >= deadline {
+            teardown();
+            panic!(
+                "the missing plugin was dropped from the layout, got:\n{}",
+                dump
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let second_dump = dump_layout();
+    teardown();
+
+    assert_eq!(
+        first_dump, second_dump,
+        "the layout of a session with a missing plugin is not stable between dumps"
+    );
+}
