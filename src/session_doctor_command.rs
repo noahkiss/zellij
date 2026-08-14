@@ -203,6 +203,13 @@ fn check_socket_dir(report: &mut Report, name: &str) {
 /// both go on working after they stop being right. A stale `session-env` names a socket directory
 /// this binary no longer resolves, which is exactly how one name came to have two servers.
 ///
+/// What counts as a leftover is narrow on purpose, and it is not "a file in `~/bin` with zellij in
+/// its name". A companion tool that CALLS zellij is not a fault, and telling somebody to delete
+/// the script that runs doctor would be the report at its least useful. Two shapes only: a file
+/// that shadows the binary by taking its name, and one that sets `ZELLIJ_SOCK_DIR` before zellij
+/// can resolve it for itself. The second is the fault by definition - that variable is the one
+/// thing a wrapper can decide and get wrong.
+///
 /// Reported and never removed. Doctor did not write these files and cannot see what still sources
 /// them, and a fix that deletes something a user put in their own `~/bin` is a fix that has to be
 /// asked for. The exact command is given instead, which is the whole of what the fix would be.
@@ -211,26 +218,33 @@ fn check_artifacts(report: &mut Report) {
         return;
     };
 
-    let mut wrappers: Vec<PathBuf> = std::fs::read_dir(home.join("bin"))
+    let mut wrappers: Vec<(PathBuf, &'static str)> = std::fs::read_dir(home.join("bin"))
         .into_iter()
         .flatten()
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("zellij"))
+        .filter_map(|path| {
+            let name = path.file_name().and_then(|name| name.to_str())?;
+            if name == "zellij" {
+                return Some((path, "shadows the zellij on PATH"));
+            }
+            if !name.contains("zellij") {
+                return None;
+            }
+            // a script, so a bounded read; nothing in `~/bin` that is 40 MB is a wrapper
+            let source = std::fs::read_to_string(&path).ok()?;
+            source
+                .contains("ZELLIJ_SOCK_DIR")
+                .then_some((path, "sets ZELLIJ_SOCK_DIR before zellij can resolve it"))
         })
         .collect();
     wrappers.sort();
-    for wrapper in &wrappers {
+    for (wrapper, why) in &wrappers {
         report.push(
-            Finding::needs_you(
-                "artifact",
-                format!("{} shadows or wraps zellij", wrapper.display()),
-            )
-            .note("a wrapper decides the socket directory before zellij can; remove it with")
-            .note(format!("  rm {}", wrapper.display())),
+            Finding::needs_you("artifact", format!("{} {}", wrapper.display(), why))
+                .note("a shell that runs it resolves a different socket directory, so it sees")
+                .note("a different set of sessions under the same names. Remove it with")
+                .note(format!("  rm {}", wrapper.display())),
         );
     }
 
