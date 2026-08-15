@@ -7,11 +7,11 @@ expression: snapshot
 02 (C): │ ┌ command2 ──── SCROLL:  0/1 | PIN [ ] ┐                                                                              │
 03 (C): │ │      Waiting to run: command2        │                                                                              │
 04 (C): │ │ ┌ zellij:tab-bar ───────────── PIN [ ] ┐                                                                            │
-05 (C): │ │<│I am a tab bar           ┌ zellij:status-bar ────────────────── PIN [ ] | ample-ant ┐                              │
+05 (C): │ │<│I am a tab bar           ┌ zellij:status-bar ────────────────── ample-ant | PIN [ ] ┐                              │
 06 (C): │ │l│                         │I am a                                                    │                              │
 07 (C): │ └─│                         │status bar                                                │ ┐                            │
 08 (C): │   │                         │                                                          │ │                            │
-09 (C): │   └─────────────────────────│                                                          │nt ┐                          │
+09 (C): │   └─────────────────────────│                                                          │ ] ┐                          │
 10 (C): │                             │                                                          │   │                          │
 11 (C): │                             │                                                          │   │                          │
 12 (C): │                             │                                                          │   │                          │

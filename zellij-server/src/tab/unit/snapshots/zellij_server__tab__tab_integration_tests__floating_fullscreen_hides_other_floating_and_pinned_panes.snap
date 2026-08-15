@@ -2,7 +2,7 @@
 source: zellij-server/src/tab/./unit/tab_integration_tests.rs
 expression: snapshot
 ---
-00 (C): ┌ Pane #2 ──────────────────────────────────────────────────────────────────────────────────────── PIN [ ] | active-ant ┐
+00 (C): ┌ Pane #2 ──────────────────────────────────────────────────────────────────────────────────────── active-ant | PIN [ ] ┐
 01 (C): │                                                                                                                       │
 02 (C): │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE                                                             │
 03 (C): │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE                                                             │

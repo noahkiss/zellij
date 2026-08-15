@@ -2,7 +2,7 @@
 source: zellij-server/src/tab/./unit/tab_integration_tests.rs
 expression: snapshot
 ---
-00 (C): ┌ zellij:tab-bar ──────────────────── PIN [ ] | ac┌ zellij:status-bar ────────────────── PIN [ ] | ample-ant ┐ able-ant ┐
+00 (C): ┌ zellij:tab-bar ──────────────────── active-ant |┌ zellij:status-bar ────────────────── ample-ant | PIN [ ] ┐ able-ant ┐
 01 (C): │I am a tab bar                                   │I am a                                                    │          │
 02 (C): │                                                 │status bar                                                │          │
 03 (C): │                                                 │                                                          │          │
@@ -12,7 +12,7 @@ expression: snapshot
 07 (C): │                             │                   │                                                          │          │
 08 (C): │                             │                   │                                                          │          │
 09 (C): └─────────────────────────────│                   └──────────────────────────────────────────────────────────┘          │
-10 (C): ┌ command1 ───────────────────│                   ┌ command2 ────────────────────────── PIN [ ] | amused-ant ┐          │
+10 (C): ┌ command1 ───────────────────│                   ┌ command2 ────────────────────────── amused-ant | PIN [ ] ┐          │
 11 (C): │                             │                   │                                                          │          │
 12 (C): │                             │                   │                                                          │          │
 13 (C): │                             │                   │                                                          │          │

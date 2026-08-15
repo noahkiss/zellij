@@ -811,3 +811,64 @@ fn an_unchanged_process_info_map_is_not_reported_again() {
         Some(vec!["vim".to_owned()])
     );
 }
+
+/// A pty with nothing wired up, for testing state it keeps for itself.
+fn make_bare_pty() -> Pty {
+    let bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    Pty::new(bus, false, None, None, None, None)
+}
+
+#[test]
+fn the_first_tick_writes_the_cache_even_though_the_session_is_clean() {
+    // a session that never diverges from its layout would otherwise never write a resurrection
+    // cache at all, and could not be resurrected
+    let mut pty = make_bare_pty();
+    assert!(
+        pty.should_serialize_layout(false),
+        "the base shape has to reach disk once"
+    );
+}
+
+#[test]
+fn a_clean_session_stops_writing_the_cache() {
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false); // the first tick, which always writes
+    for tick in 0..5 {
+        assert!(
+            !pty.should_serialize_layout(false),
+            "nothing changed on tick {}, so there is nothing to write",
+            tick
+        );
+    }
+}
+
+#[test]
+fn a_dirty_session_writes_the_cache_every_tick() {
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false);
+    for tick in 0..5 {
+        assert!(
+            pty.should_serialize_layout(true),
+            "the session is still diverged on tick {}",
+            tick
+        );
+    }
+}
+
+#[test]
+fn returning_to_the_base_shape_rewrites_the_cache_once() {
+    // the trap the latch exists for: a session that opens a pane and closes it again is clean, and
+    // the cache on disk still describes the pane that is gone. Without the transition write, the
+    // next resurrection hands that pane back.
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false); // the first tick
+    assert!(pty.should_serialize_layout(true), "a pane was opened");
+    assert!(
+        pty.should_serialize_layout(false),
+        "the pane was closed - the diverged cache has to be overwritten"
+    );
+    assert!(
+        !pty.should_serialize_layout(false),
+        "and only once: the cache already matches"
+    );
+}

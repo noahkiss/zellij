@@ -22,10 +22,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use uuid::Uuid;
 use vte;
-use zellij_utils::data::PaneContents;
 use zellij_utils::data::{
     BareKey, KeyWithModifier, PermissionStatus, PermissionType, PluginPermission,
 };
+use zellij_utils::data::{NoteColor, PaneContents};
 use zellij_utils::pane_size::{Offset, SizeInPixels};
 use zellij_utils::position::Position;
 use zellij_utils::{
@@ -85,6 +85,8 @@ pub(crate) struct PluginPane {
     restored_from: Option<String>,
     /// Given at creation and kept across a snapshot restore - see `Pane::pane_handle`
     handle: HeldHandle,
+    /// A short note about what is happening here - see `Pane::pane_note`
+    note: Option<(String, NoteColor)>,
     pub should_render: HashMap<ClientId, bool>,
     pub selectable: bool,
     pub geom: PaneGeom,
@@ -147,6 +149,7 @@ impl PluginPane {
             uuid: Uuid::new_v4(),
             restored_from: None,
             handle: HeldHandle::claim_new(),
+            note: None,
             should_render: HashMap::new(),
             selectable: true,
             geom: position_and_size,
@@ -562,6 +565,13 @@ impl Pane for PluginPane {
     }
     fn set_pane_handle(&mut self, handle: &str) {
         self.handle = HeldHandle::claim(handle);
+    }
+    fn pane_note(&self) -> Option<(String, NoteColor)> {
+        self.note.clone()
+    }
+    fn set_pane_note(&mut self, note: Option<(String, NoteColor)>) {
+        self.note = note;
+        self.set_should_render(true);
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
