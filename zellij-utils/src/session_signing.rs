@@ -31,6 +31,31 @@ pub const PIN_IDENTIFIER: &str = "org.zellij.nkmk";
 /// The common name of the certificate we mint when the machine has no Apple one.
 pub const SELF_SIGNED_COMMON_NAME: &str = "zellij self-signed code signing";
 
+/// The passphrase on the bundle we mint. It is a literal on purpose, and it is not a secret.
+///
+/// **An empty passphrase does not work, and that is a format problem rather than a policy one.**
+/// Apple's importer cannot verify the MAC of a PKCS#12 written with no password - OpenSSL and
+/// Apple disagree about how an empty password is encoded before it is hashed - and it reports that
+/// as the one thing that is not wrong:
+///
+/// ```text
+/// security: SecKeychainItemImport: MAC verification failed during PKCS12 import (wrong password?)
+/// ```
+///
+/// Proven on a real Mac at 0.45.0-nkmk.7 by changing nothing else: same key, same certificate, same
+/// `-macalg sha1 -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES`, same LibreSSL. With `-passout
+/// pass:` the import fails as above; with `-passout pass:zellij` and `-P zellij` it reports
+/// `1 identity imported.`
+///
+/// So the bundle needs A passphrase, and a passphrase written down beside the file it opens
+/// protects nothing - which is the point. The protection is the 0700 directory and the 0600 file,
+/// exactly as before. A passphrase the user would have to remember would instead be a way to lose
+/// the one certificate this machine may ever have.
+pub const IDENTITY_PASSPHRASE: &str = "zellij";
+
+/// The same passphrase in the spelling `openssl pkcs12 -passout` wants.
+const PKCS12_PASSOUT: &str = "pass:zellij";
+
 /// Twenty years. The certificate is never reissued - see [`mint_self_signed`] - so its lifetime
 /// has to outlast the machine rather than the release.
 const SELF_SIGNED_DAYS: &str = "7300";
@@ -129,6 +154,17 @@ pub struct Identity {
 /// Only the numbered lines, and only the quoted name off each one. The trailing "N valid
 /// identities found" is not a certificate and neither is a blank line, and a parser that took
 /// every line would offer the summary as something to sign with.
+///
+/// The name is taken between the FIRST and LAST quote rather than by stripping one off each end,
+/// because `find-identity` without `-v` writes the reason an identity is not valid after the
+/// closing quote:
+///
+/// ```text
+///   1) 5D3A... "zellij self-signed code signing" (CSSMERR_TP_NOT_TRUSTED)
+/// ```
+///
+/// A parser that required the line to END in a quote dropped exactly that line, which is the one
+/// [`find_identities`] reads the untrusted listing to find.
 pub fn parse_identities(output: &str) -> Vec<Identity> {
     output
         .lines()
@@ -140,7 +176,10 @@ pub fn parse_identities(output: &str) -> Vec<Identity> {
                 return None;
             }
             let (hash, name) = rest.trim().split_once(' ')?;
-            let name = name.trim().strip_prefix('"')?.strip_suffix('"')?;
+            let name = name.trim();
+            let opened = name.find('"')?;
+            let closed = name.rfind('"')?;
+            let name = name.get(opened + 1..closed)?;
             (!hash.is_empty() && !name.is_empty()).then(|| Identity {
                 hash: hash.to_owned(),
                 name: name.to_owned(),
@@ -155,9 +194,17 @@ pub enum Rung {
     /// A Developer ID. The best case: its designated requirement is already anchored on the team
     /// id, and a timestamped signature outlives the certificate.
     DeveloperId(Identity),
-    /// An Apple Development certificate, with the team id read off its name. The requirement has
-    /// to be written by hand for this one - see [`requirement_for`].
-    AppleDevelopment { identity: Identity, team: String },
+    /// An Apple Development certificate, with the team id read off the CERTIFICATE - never off the
+    /// name. The requirement has to be written by hand for this one - see [`requirement_for`].
+    ///
+    /// `team` is `None` until [`sign_down_the_ladder`] has asked the keychain for the certificate,
+    /// and stays `None` on a machine where that question cannot be answered. A rung with no team
+    /// writes no requirement and takes the one `codesign` derives, which is worse but is never
+    /// wrong - see [`requirement_for`].
+    AppleDevelopment {
+        identity: Identity,
+        team: Option<String>,
+    },
     /// One we minted ourselves, once, and will never mint again.
     SelfSigned(Identity),
 }
@@ -189,15 +236,79 @@ impl Rung {
     }
 }
 
-/// The team id inside an identity name - the parenthesised code at the end of it.
+/// The team id out of a certificate's subject line, which is the `OU`.
 ///
-/// `Apple Development: someone@example.com (A1B2C3D4E5)` gives `A1B2C3D4E5`. It is the same on
-/// every machine signed into the same Apple ID, which is the whole reason the requirement is
-/// anchored on it.
-pub fn team_id(name: &str) -> Option<String> {
-    let inside = name.rsplit_once('(')?.1.strip_suffix(')')?;
-    (!inside.is_empty() && inside.chars().all(|c| c.is_ascii_alphanumeric()))
-        .then(|| inside.to_owned())
+/// **The parenthesised code in the NAME is not the team id, and reading it there was a bug that
+/// shipped twice.** On a Developer ID Application certificate the two happen to be the same string,
+/// which is what let the mistake survive; on an Apple Development certificate they are not. A real
+/// one, from a machine at 0.45.0-nkmk.7:
+///
+/// ```text
+/// UID=7472L5G3Y6/CN=Apple Development: someone (DY7JA3K8QZ)/OU=U2VEDWFUF3/O=Someone/C=US
+/// ```
+///
+/// The CN parenthetical is the per-developer id, the OU is the team, and a requirement written
+/// against the first is a requirement the signed binary does not satisfy: `codesign` signs, and
+/// then `codesign --verify --verbose=2` says `does not satisfy its designated Requirement`. So the
+/// team id is read HERE, from the certificate, and nowhere else.
+///
+/// Both spellings of a subject line are accepted because both are on these machines. LibreSSL -
+/// which is `/usr/bin/openssl` on macOS - writes `/OU=VALUE/`, and OpenSSL 3 - which a Homebrew
+/// install puts first on `PATH` - writes `OU = VALUE,`. Matching the key and then taking the
+/// alphanumeric run after the `=` covers both without knowing which ran.
+pub fn team_id_from_subject(subject: &str) -> Option<String> {
+    let bytes = subject.as_bytes();
+    let mut from = 0;
+    while let Some(found) = subject.get(from..)?.find("OU") {
+        let at = from + found;
+        from = at + 2;
+        // `OU` has to be a key of its own and not the tail of a longer one, or an attribute such
+        // as `businessCategoryOU` would answer for the team
+        if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'.') {
+            continue;
+        }
+        let Some(value) = subject[at + 2..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value: String = value
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Ask the keychain for a certificate and read the team id out of it.
+///
+/// Two commands and a pipe: `security` writes the certificate as PEM, `openssl` turns it into a
+/// subject line. Both ship with macOS, and `openssl` is already needed by the rung below this one.
+///
+/// `None` on anything going wrong, and that is deliberate rather than an error path: a rung with no
+/// team id still signs, it just takes the requirement `codesign` derives instead of ours. Failing
+/// the rung over an unreadable certificate would be strictly worse than signing it slightly less
+/// well.
+fn team_id_from_keychain(commander: &dyn Commander, keychain: &str, name: &str) -> Option<String> {
+    let pem = commander
+        .run(
+            "security",
+            &["find-certificate", "-c", name, "-p", keychain],
+            None,
+        )
+        .ok()
+        .filter(|output| output.success)?;
+    let subject = commander
+        .run(
+            "openssl",
+            &["x509", "-noout", "-subject"],
+            Some(&pem.stdout),
+        )
+        .ok()
+        .filter(|output| output.success)?;
+    team_id_from_subject(&subject.stdout)
 }
 
 /// The first rung of the ladder this keychain can reach.
@@ -208,29 +319,42 @@ pub fn team_id(name: &str) -> Option<String> {
 /// Nothing below the third rung: an ad-hoc signature anchors on the code hash, which is the state
 /// signing exists to leave.
 pub fn choose_rung(identities: &[Identity]) -> Option<Rung> {
+    rung_ladder(identities).into_iter().next()
+}
+
+/// Every rung this keychain can reach, best first.
+///
+/// [`choose_rung`] is the head of this list, and the tail is what a refusal falls back to. A
+/// certificate the keychain OFFERS is not a certificate that SIGNS: `codesign` can refuse the
+/// requirement, the keychain can decline to release the key, and Apple's timestamp server can be
+/// unreachable. A run that took only the head reported `Needs you` and left the pin ad-hoc-signed
+/// with a working rung standing unused beneath it.
+pub fn rung_ladder(identities: &[Identity]) -> Vec<Rung> {
+    let mut ladder = Vec::new();
     if let Some(identity) = identities
         .iter()
         .find(|identity| identity.name.starts_with("Developer ID Application:"))
     {
-        return Some(Rung::DeveloperId(identity.clone()));
+        ladder.push(Rung::DeveloperId(identity.clone()));
     }
     if let Some(identity) = identities
         .iter()
         .find(|identity| identity.name.starts_with("Apple Development:"))
     {
-        // without a team id there is nothing stable to anchor on, so this certificate is no better
-        // than the code hash and the ladder keeps going down
-        if let Some(team) = team_id(&identity.name) {
-            return Some(Rung::AppleDevelopment {
-                identity: identity.clone(),
-                team,
-            });
-        }
+        // the team id is NOT read here. It comes off the certificate, which needs the keychain,
+        // and this function stays pure so that every rung-order test can drive it with a list.
+        ladder.push(Rung::AppleDevelopment {
+            identity: identity.clone(),
+            team: None,
+        });
     }
-    identities
+    if let Some(identity) = identities
         .iter()
         .find(|identity| identity.name.contains(SELF_SIGNED_COMMON_NAME))
-        .map(|identity| Rung::SelfSigned(identity.clone()))
+    {
+        ladder.push(Rung::SelfSigned(identity.clone()));
+    }
+    ladder
 }
 
 /// The requirement to write into the signature, when the default one would not do.
@@ -242,16 +366,46 @@ pub fn choose_rung(identities: &[Identity]) -> Option<Rung> {
 /// across a reissue. A grant recorded against a CN-anchored requirement is a grant that expires
 /// with the certificate.
 ///
+/// **The team id must come from [`team_id_from_subject`], never from the identity's name.** Writing
+/// the CN's parenthesised code into `leaf[subject.OU]` produces a requirement the freshly signed
+/// binary fails, which is a worse outcome than writing none: the signature lands, doctor reports
+/// success, and every grant made against it is void. It shipped at 0.45.0-nkmk.7 and is what this
+/// `Option` exists to make unrepresentable.
+///
+/// A rung with **no** team id writes no requirement at all and takes the CN-anchored one `codesign`
+/// derives. That is the lesser of the two: it survives every rebuild, which is what grants actually
+/// need, and only breaks when the certificate is reissued.
+///
 /// Developer ID needs nothing written: `codesign` already anchors it on `subject.OU`. Self-signed
 /// needs nothing either, and must not be given one - its default requirement names the certificate
 /// by hash, which is exactly the anchor that makes it worth having.
+///
+/// **It is a requirement SET, not a bare expression, and the `designated =>` is load-bearing.**
+/// `codesign -r` parses what it is handed as a set of `<tag> => <expression>` pairs, so a text
+/// that opens with `identifier` puts a reserved word where a tag belongs and the whole thing is
+/// refused before signing starts:
+///
+/// ```text
+/// invalid or corrupted code requirement(s)
+/// Requirement syntax error(s): line 1:1: unexpected token: identifier
+/// ```
+///
+/// Seen on a real Mac at 0.45.0-nkmk.6, on the one rung that writes a requirement at all - which
+/// is why it survived: the other two rungs pass `None` and never reach this parser. `designated`
+/// is also the only tag worth writing, because it is the requirement macOS records a grant
+/// against, and it is what [`read_signature`] reads back.
 pub fn requirement_for(rung: &Rung) -> Option<String> {
     match rung {
-        Rung::AppleDevelopment { team, .. } => Some(format!(
-            "identifier \"{}\" and anchor apple generic and certificate leaf[subject.OU] = \"{}\"",
+        Rung::AppleDevelopment {
+            team: Some(team), ..
+        } => Some(format!(
+            "designated => identifier \"{}\" and anchor apple generic and certificate \
+             leaf[subject.OU] = \"{}\"",
             PIN_IDENTIFIER, team
         )),
-        Rung::DeveloperId(_) | Rung::SelfSigned(_) => None,
+        Rung::AppleDevelopment { team: None, .. } | Rung::DeveloperId(_) | Rung::SelfSigned(_) => {
+            None
+        },
     }
 }
 
@@ -275,6 +429,10 @@ pub fn sign_arguments<'a>(
         String::from(PIN_IDENTIFIER),
     ];
     if let Some(requirement) = requirement {
+        // `-r` takes a FILE unless its value opens with `=`, which makes the rest of it the
+        // requirement text itself. One argv of `-r=<text>` hands `codesign` the value `=<text>`,
+        // which is that inline form - the text still has to be a requirement SET, see
+        // [`requirement_for`].
         args.push(format!("-r={}", requirement));
     }
     if timestamp {
@@ -321,6 +479,47 @@ pub fn sweep_stale_temps(directory: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Whether the pin refresh belongs to the signing transaction, and what to refresh from.
+///
+/// **One answer, asked by both sides.** The step that would otherwise copy the new build asks it to
+/// decide whether to skip, and the signing step asks it to decide whether to copy - and if the two
+/// ever disagreed in the "skip" direction the new build would never be pinned at all, with nothing
+/// reporting it. So the decision lives here, where it compiles and is tested on every platform,
+/// rather than in the macOS glue that supplies its inputs.
+///
+/// It defers only when there is something to lose. An **anchored** pin is a pin holding grants that
+/// a failed signing run would destroy by replacing it with a fresh ad-hoc copy - the fault this
+/// exists to prevent, see [`SigningContext::refresh_from`]. A pin that is already ad-hoc holds no
+/// grant that survives a rebuild, so refreshing it first costs nothing and pinning the new build is
+/// worth more than protecting a signature that was never load-bearing.
+///
+/// Also `None` when this run may not act (`--dry-run`) or may not sign (`--no-sign`): in both cases
+/// the ordinary refresh has to happen on its own, because nothing is coming after it.
+pub fn refresh_belongs_to_signing(
+    commander: &dyn Commander,
+    pinned: &Path,
+    mode: DoctorMode,
+    current_exe: Option<PathBuf>,
+    needs_refresh: bool,
+) -> Option<PathBuf> {
+    if !mode.fix || !mode.sign || !needs_refresh {
+        return None;
+    }
+    let current_exe = current_exe?;
+    let described = commander
+        .run(
+            "codesign",
+            &["-d", "--verbose=2", "-r-", &pinned.display().to_string()],
+            None,
+        )
+        .ok()?;
+    matches!(
+        read_signature(&described.combined()),
+        PinSignature::Anchored { .. }
+    )
+    .then_some(current_exe)
+}
+
 /// What one pass over the pinned copy's signature came to.
 pub struct SigningRun {
     pub findings: Vec<Finding>,
@@ -330,8 +529,12 @@ pub struct SigningRun {
 ///
 /// The order of the steps is the design and it is worth stating why each one is where it is.
 ///
-/// 1. Read the requirement FIRST. An already-anchored pin must not be signed again: the new
-///    signature would carry a new certificate hash and void every grant it currently holds.
+/// 1. Read the requirement FIRST, and then VERIFY it. An already-anchored pin must not be signed
+///    again: the new signature would carry a new certificate hash and void every grant it
+///    currently holds. But "anchored" is a property of the requirement's text and "holds a grant"
+///    is a property of the binary satisfying it, and a pin can have the first without the second -
+///    so the requirement being anchored is what makes the pin a candidate for being left alone,
+///    and passing verification is what actually leaves it alone.
 /// 2. Sweep before signing, not after. A sweep that runs after a step that can fail is a sweep
 ///    that never runs on the machine accumulating the files.
 /// 3. Sign a COPY. `codesign` writes in place, a running server holds the pin open for execution,
@@ -374,25 +577,70 @@ pub fn sign_pin(
         },
     };
 
-    if let PinSignature::Anchored {
-        identifier,
-        designated,
-    } = &signature
+    // An anchored-LOOKING pin is not a healthy pin, and reading the requirement is not checking it.
+    // A pin signed with a requirement the binary does not satisfy reads exactly like a good one -
+    // same identifier, same anchored text, no code hash anywhere - and doctor called that state
+    // healthy for two releases while `codesign --verify --verbose=2` rejected it. So the pin gets
+    // the same verification a freshly signed copy does, and a pin that fails it is signed again.
+    //
+    // A pending refresh is the one thing that overrides "leave an anchored pin alone": the pin has
+    // to become the new build, and the only safe way to do that is to sign the new build into
+    // place. Re-signing with the same certificate writes the same requirement, so the grants ride
+    // through it - see `follow_up`.
+    let mut broken_anchor = None;
+    let leave_it_alone = match &signature {
+        PinSignature::Anchored { .. } => context.refresh_from.is_none(),
+        _ => false,
+    };
+    if let (
+        true,
+        PinSignature::Anchored {
+            identifier,
+            designated,
+        },
+    ) = (leave_it_alone, &signature)
     {
-        findings.push(
-            Finding::ok(
-                "signing",
-                format!("{} is signed as {}", pin_display, identifier),
-            )
-            .note(designated.clone())
-            .note("the requirement names no code hash, so a rebuild keeps every grant"),
-        );
-        return SigningRun { findings };
+        match verify_signature(commander, &pin_display) {
+            Ok(_) => {
+                findings.push(
+                    Finding::ok(
+                        "signing",
+                        format!("{} is signed as {}", pin_display, identifier),
+                    )
+                    .note(designated.clone())
+                    .note("the requirement names no code hash, so a rebuild keeps every grant")
+                    .note("and the pin satisfies it, so the grants recorded against it still hold"),
+                );
+                return SigningRun { findings };
+            },
+            Err(reason) => {
+                findings.push(
+                    Finding::needs_you(
+                        "signing",
+                        format!(
+                            "{} is signed as {}, and does not satisfy its own requirement",
+                            pin_display, identifier
+                        ),
+                    )
+                    .note(designated.clone())
+                    .note(reason.clone())
+                    .note("a signature that does not verify holds no grant, whatever it reads as"),
+                );
+                broken_anchor = Some(reason);
+            },
+        }
     }
 
     let unsigned = signature == PinSignature::Unsigned;
     if !mode.sign {
-        findings.push(
+        // a broken anchor has just been reported in full, so this says what is left to say about
+        // it and does not state the fault a second time
+        findings.push(if broken_anchor.is_some() {
+            Finding::needs_you(
+                "signing",
+                "signing it again is the only recovery, and --sign was turned off for this run",
+            )
+        } else {
             Finding::needs_you(
                 "signing",
                 if unsigned {
@@ -402,18 +650,18 @@ pub fn sign_pin(
                 },
             )
             .note("every grant it holds is voided by the next build")
-            .note("--sign lets doctor fix this; it was turned off for this run"),
-        );
+            .note("--sign lets doctor fix this; it was turned off for this run")
+        });
         return SigningRun { findings };
     }
 
-    let mut rung = choose_rung(&find_identities(commander));
+    let mut ladder = rung_ladder(&find_identities(commander));
 
     // A run that is not acting stops here and says which rung it would have taken - including the
     // one that does not exist yet. Falling through to the Xcode steps would have a dry run report
     // `Needs you` on the machine the real run repairs by itself, which is every machine with no
     // Apple account: the commonest case, and the one where the dry run is read most carefully.
-    if rung.is_none() && !mode.fix {
+    if ladder.is_empty() && !mode.fix {
         findings.push(
             Finding::changed(
                 "signing",
@@ -431,7 +679,7 @@ pub fn sign_pin(
     // The third rung is not one the keychain offers - it is one we make. Only when the first two
     // are absent, only when doctor is allowed to act, and only once in the life of the machine:
     // `ensure_self_signed` re-imports an existing bundle rather than minting a second certificate.
-    if rung.is_none() && mode.fix {
+    if ladder.is_empty() && mode.fix {
         match ensure_self_signed(
             commander,
             &context.signing_dir,
@@ -441,7 +689,7 @@ pub fn sign_pin(
             Ok(minted) => {
                 findings.extend(minted);
                 findings.extend(back_up_identity(context));
-                rung = choose_rung(&find_identities(commander));
+                ladder = rung_ladder(&find_identities(commander));
             },
             Err(reason) => {
                 findings.push(
@@ -454,7 +702,7 @@ pub fn sign_pin(
         }
     }
 
-    let Some(rung) = rung else {
+    if ladder.is_empty() {
         // with no rung and no acting, the ladder never reached its third step - so the honest
         // report is what doctor WOULD do, not the "no certificate anywhere" the fix path reaches
         if !mode.fix {
@@ -475,22 +723,206 @@ pub fn sign_pin(
         }
         findings.push(xcode_steps(&pin_display));
         return SigningRun { findings };
-    };
+    }
 
     if !mode.fix {
         findings.push(Finding::ok(
             "signing",
-            mode.describe(&format!("sign {} with {}", pin_display, rung.description())),
+            mode.describe(&format!(
+                "sign {} with {}",
+                pin_display,
+                ladder[0].description()
+            )),
         ));
         return SigningRun { findings };
     }
 
-    // a machine that minted its own certificate recorded every grant against THAT one, so signing
-    // with an Apple certificate now is a change of requirement and not only a change of signature
-    let changed_certificate =
-        !matches!(rung, Rung::SelfSigned(_)) && context.signing_dir.identity_bundle().exists();
-    findings.extend(perform_signing(commander, pin, &rung, changed_certificate));
+    findings.extend(sign_down_the_ladder(
+        commander, pin, context, &signature, ladder,
+    ));
     SigningRun { findings }
+}
+
+/// Sign with the best rung that will actually sign, and say which ones would not.
+///
+/// A refusal walks DOWN the ladder rather than stopping on it. Stopping was the old behaviour and
+/// it is the worse of two bad outcomes: `session up` refreshes the pin ad-hoc-signed, doctor is
+/// what makes it anchored, and a doctor that gave up on the first refusal left the machine with
+/// the exact signature this whole file exists to remove - while a certificate that would have
+/// worked sat one rung below.
+///
+/// **The walk stops at the Apple rungs, and that boundary is the point.** Developer ID and Apple
+/// Development are interchangeable to a grant WHEN both name the same team: `codesign` derives
+/// `identifier ... and anchor apple generic and certificate leaf[subject.OU] = "TEAM"` for the
+/// first, and [`requirement_for`] writes the same text by hand for the second, so falling from one
+/// to the other keeps the requirement macOS recorded the grant against. That is the whole reason
+/// the second rung writes a requirement at all, and it holds only while the team id is read off
+/// the CERTIFICATE - a rung whose certificate could not be read falls back to the CN-anchored
+/// requirement `codesign` derives, and that one is not interchangeable with anything. The
+/// certificate we mint is not either - its requirement is its own hash - so walking into it would
+/// void every grant on the machine.
+///
+/// That matters because a refusal is not always the certificate's fault. `errSecInternalComponent`,
+/// a keychain locked over SSH, a "Deny" on the key-access dialog: each one is transient, and each
+/// one would otherwise demote the pin permanently. Permanently, because a self-signed signature IS
+/// anchored, so the next doctor run reads the pin as already correct and never climbs back.
+///
+/// So a machine that holds an Apple certificate and cannot use it gets a `Needs you` naming what
+/// each certificate said. It does not get a different requirement behind its back, and it does not
+/// get a certificate minted that it would never otherwise have had.
+fn sign_down_the_ladder(
+    commander: &dyn Commander,
+    pin: &Path,
+    context: &SigningContext,
+    before: &PinSignature,
+    mut ladder: Vec<Rung>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
+    let mut asked_for_the_key = false;
+    let apple_offered = ladder
+        .iter()
+        .any(|rung| !matches!(rung, Rung::SelfSigned(_)));
+    if apple_offered {
+        // the certificate we mint is not a rung below an Apple one. It is the rung a machine with
+        // no Apple certificate lands on, and only that.
+        ladder.retain(|rung| !matches!(rung, Rung::SelfSigned(_)));
+    }
+    let mut index = 0;
+
+    while index < ladder.len() {
+        // the team id is read off the certificate HERE and not when the ladder was built: it costs
+        // two keychain reads, and only the rung actually being attempted should pay for them
+        let rung = match ladder[index].clone() {
+            Rung::AppleDevelopment { identity, .. } => {
+                let team = team_id_from_keychain(commander, &context.keychain, &identity.name);
+                Rung::AppleDevelopment { identity, team }
+            },
+            other => other,
+        };
+        if matches!(rung, Rung::SelfSigned(_)) && !asked_for_the_key {
+            // BEFORE signing, and on every run rather than only the one that minted. The ACL that
+            // lets `codesign` reach the key is a property of the keychain, not of the certificate,
+            // and it used to be granted only on the minting run - so the very next run found a
+            // ready rung, signed with it, and was refused by a key nothing had ever approved.
+            // Proven on a real Mac: running the partition list by hand made the identical
+            // `codesign` succeed. It is cheap and idempotent when the ACL is already there.
+            //
+            // Only for our own certificate. An Apple one comes with its own ACL, and re-writing
+            // the partition list of a key we did not create is not doctor's business.
+            asked_for_the_key = true;
+            findings.extend(allow_codesign_to_reach_the_key(
+                commander,
+                &context.keychain,
+                context.keychain_password.as_deref(),
+            ));
+        }
+        let attempt = perform_signing(commander, pin, context, &rung, before, &refusals);
+        findings.extend(attempt.findings);
+        let Some(refusal) = attempt.refusal else {
+            return findings;
+        };
+        if attempt.fatal {
+            // the filesystem said no, not the certificate. Another rung would write the same
+            // error a second time and still leave the pin as it found it.
+            findings.push(what_became_of_the_pin(
+                Finding::needs_you("signing", refusal),
+                context,
+            ));
+            return findings;
+        }
+        refusals.push(refusal);
+        index += 1;
+    }
+
+    let mut exhausted = Finding::needs_you(
+        "signing",
+        format!(
+            "{} {} refused to sign {}",
+            refusals.len(),
+            if refusals.len() == 1 {
+                "certificate"
+            } else {
+                "certificates"
+            },
+            pin.display()
+        ),
+    );
+    for refusal in refusals {
+        exhausted = exhausted.note(refusal);
+    }
+    exhausted = what_became_of_the_pin(exhausted, context);
+    if apple_offered {
+        // this machine HAS a certificate, so the Xcode steps would send it after one it already
+        // holds. What refuses a certificate it can see is usually the key, not the certificate.
+        exhausted = exhausted
+            .note("nothing was signed with a different certificate: that would change the")
+            .note("requirement macOS recorded, and void every grant this path holds");
+    }
+    // The key, not the certificate, is what usually refuses - a keychain that will not release it,
+    // or a key-access dialog nobody was there to answer. Both remedies are given on EVERY
+    // exhausted ladder, including the rung we mint: a certificate doctor made itself is exactly
+    // the one whose key has never been approved.
+    exhausted = exhausted
+        .note("a locked keychain or an unanswered key-access dialog refuses like this")
+        .note(KEY_ACCESS_REMEDIES[0])
+        .note(KEY_ACCESS_REMEDIES[1])
+        .note(KEY_ACCESS_REMEDIES[2]);
+    findings.push(exhausted);
+    if !apple_offered {
+        // an Apple certificate is still a real alternative to one we minted, so the steps stay -
+        // but they come AFTER the key-access remedies, which are what usually applies.
+        findings.push(xcode_steps(&pin.display().to_string()));
+    }
+    findings
+}
+
+/// What a run that did not sign left at the pin's path, said the same way wherever it is said.
+///
+/// Two outcomes and they are not interchangeable, which is why this is one function rather than a
+/// sentence written at each site. With the refresh deferred into this transaction the pin still
+/// holds the PREVIOUS build, signature and grants intact, and nothing about it changed; without a
+/// deferred refresh it holds the build it already held. Saying "the pinned copy is untouched" in
+/// the first case was true only of the temp file, and it was the sentence that hid a pin replaced
+/// by an ad-hoc copy for two releases.
+fn what_became_of_the_pin(finding: Finding, context: &SigningContext) -> Finding {
+    if context.refresh_from.is_some() {
+        finding
+            .note("the pin was NOT refreshed: the new build could not be signed, so the")
+            .note("previously signed copy is still in place, on the previous build")
+            .note("every grant it holds is intact, and a restart now starts that build")
+    } else {
+        finding.note("the pinned copy is untouched")
+    }
+}
+
+/// Whether the requirement macOS recorded a grant against has just changed - and if so, why.
+///
+/// **Asked of the two requirements, and of nothing else.** It used to be inferred from the state of
+/// the machine: a bundle sitting in the signing directory meant "this machine has signed with a
+/// certificate of its own", so the note fired. On a Mac that had never used that rung - but had
+/// leftovers from an older shell script in its keychain and its signing directory - doctor sent the
+/// user to System Settings to re-grant three permissions against a requirement that was
+/// character-for-character the one already there. A grant is keyed to the requirement text, so the
+/// requirement text is the only thing that can answer this.
+///
+/// `None` means every grant carries over untouched, and that is worth being right about in both
+/// directions: a spurious re-grant costs a person a trip through System Settings, and a missing one
+/// costs them a session that silently cannot read their files.
+fn requirement_changed(before: &PinSignature, after: &str) -> Option<String> {
+    match before {
+        PinSignature::Anchored { designated, .. } if designated == after => None,
+        PinSignature::Anchored { .. } => Some(String::from(
+            "this pin was anchored on a different certificate before now, so the requirement \
+             macOS recorded every grant against is not the one it will evaluate from now on",
+        )),
+        // an ad-hoc or unsigned pin's requirement named the binary's own hash, so there was never
+        // a grant that could survive a rebuild. This is the FIRST requirement worth recording.
+        PinSignature::CodeHashed { .. } | PinSignature::Unsigned => Some(String::from(
+            "the pin's requirement named its own code hash until now, which no rebuild could \
+             satisfy - so the grants it holds were made against something already gone",
+        )),
+    }
 }
 
 /// Everything the ladder needs that only the platform can name.
@@ -503,23 +935,68 @@ pub struct SigningContext {
     pub signing_dir: SigningDir,
     /// The keychain to import into - the user's default, which is where `codesign` looks.
     pub keychain: String,
-    /// `ZELLIJ_KEYCHAIN_PASSWORD`, for a run over SSH where no dialog can be answered.
+    /// `ZELLIJ_KEYCHAIN_PASSWORD`, read from the environment when the user has set it and never
+    /// asked for. Not an SSH-only escape hatch: `security` prompts on the controlling terminal
+    /// wherever it runs, so a run with no password and no person watching stalls in a pane and
+    /// under launchd exactly as it does over SSH.
     pub keychain_password: Option<String>,
+    /// The build to put at the pin's path, when the refresh was handed to this transaction rather
+    /// than done before it.
+    ///
+    /// **The refresh and the signature have to be one step or neither is safe.** Doctor used to
+    /// copy the new build over the pin and sign it afterwards, so a run where every rung refused -
+    /// a locked keychain, which is every unattended launchd run - replaced a properly anchored pin
+    /// with a fresh ad-hoc one and then reported `the pinned copy is untouched`. Both halves were
+    /// wrong: the pin had been replaced, and every grant on the machine was void from the next
+    /// restart. Signing the temp and renaming only on success means a refusal leaves the previous
+    /// signed pin exactly where it was, holding its grants, on the previous build.
+    pub refresh_from: Option<PathBuf>,
     /// Where to keep a second copy of the minted identity. zellij's own resolved config directory,
     /// so it lands wherever `ZELLIJ_CONFIG_DIR` or XDG says the user's config lives.
     pub backup_dir: Option<PathBuf>,
 }
 
 /// What the keychain will offer, or nothing if it cannot be asked.
+///
+/// **Two listings, and the second one is not redundant.** `-v` means "valid only", and validity
+/// there is a TRUST decision: a certificate we minted ourselves has no chain to a trusted root, so
+/// the login keychain reports it as `(CSSMERR_TP_NOT_TRUSTED)` and `find-identity -v` ends with
+/// `0 valid identities found` - on a machine that holds it, has the key, and can sign with it
+/// perfectly well. That is not hypothetical: it is what a real Mac did at 0.45.0-nkmk.7, and it
+/// would leave doctor minting a certificate it already has, or reporting no rung at all.
+///
+/// Signing does not need trust and neither does a grant. Requirement evaluation ignores the trust
+/// status of the chain unless the requirement says `trusted`, and ours never does - so the fix is
+/// to stop asking the question, not to answer it. **NO TRUSTED ROOT IS ADDED.** `add-trusted-cert`
+/// would change what Gatekeeper accepts on the whole machine, and needs an administrator, to buy
+/// nothing that a grant reads.
+///
+/// The untrusted listing is filtered to OUR certificate by name. An Apple certificate that the
+/// keychain calls invalid is invalid for a reason - expired, revoked, no key - and taking it off
+/// this list would put the ladder on a rung that cannot sign.
 fn find_identities(commander: &dyn Commander) -> Vec<Identity> {
-    match commander.run(
+    let mut identities = match commander.run(
         "security",
         &["find-identity", "-v", "-p", "codesigning"],
         None,
     ) {
         Ok(output) => parse_identities(&output.stdout),
         Err(_) => Vec::new(),
+    };
+    if identities
+        .iter()
+        .any(|identity| identity.name.contains(SELF_SIGNED_COMMON_NAME))
+    {
+        return identities;
     }
+    if let Ok(output) = commander.run("security", &["find-identity", "-p", "codesigning"], None) {
+        identities.extend(
+            parse_identities(&output.stdout)
+                .into_iter()
+                .find(|identity| identity.name.contains(SELF_SIGNED_COMMON_NAME)),
+        );
+    }
+    identities
 }
 
 /// Keep a second copy of the minted identity where the user's other zellij files are.
@@ -568,7 +1045,8 @@ fn back_up_identity(context: &SigningContext) -> Option<Finding> {
 /// Anything that can read the key can sign as this machine's zellij, and the grants are recorded
 /// against that signature. Neither `create_dir_all` nor the file `openssl` writes asks for
 /// anything narrower than the umask allows, which on a stock account is world-readable - and the
-/// bundle carries no passphrase, deliberately, so the permissions are the whole of its protection.
+/// bundle's passphrase is a constant in this file, so the permissions are the whole of its
+/// protection. See [`IDENTITY_PASSPHRASE`] for why it cannot be one nobody knows.
 #[cfg(unix)]
 fn restrict(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -581,16 +1059,39 @@ fn restrict(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What one rung's attempt on the pin came to.
+struct SignAttempt {
+    /// What is worth reporting whatever happens next: the sweep, and the signature if there was
+    /// one. A refusal's own wording is NOT in here - the caller decides whether it is a `Needs
+    /// you` or a note on the rung below that worked.
+    findings: Vec<Finding>,
+    /// Why this rung did not sign. `None` is a signed pin.
+    refusal: Option<String>,
+    /// Whether a lower rung would hit the same wall. A `codesign` refusal is the certificate's
+    /// fault and the next rung may do better; a copy or a rename that failed is the filesystem's,
+    /// and trying again only writes the same error a second time.
+    fatal: bool,
+}
+
 /// Steps 3 through 6, once a certificate has been chosen.
+///
+/// It reports rather than decides: a refusal comes back as a `refusal` for the caller to weigh
+/// against the rungs below, because whether a refusal is the end of the run depends on what else
+/// the keychain holds - which is [`sign_down_the_ladder`]'s question, not this one's.
 fn perform_signing(
     commander: &dyn Commander,
     pin: &Path,
+    context: &SigningContext,
     rung: &Rung,
-    changed_certificate: bool,
-) -> Vec<Finding> {
+    before: &PinSignature,
+    earlier_refusals: &[String],
+) -> SignAttempt {
     let mut findings = Vec::new();
     let pin_display = pin.display().to_string();
     let directory = pin.parent().unwrap_or_else(|| Path::new("."));
+    // the new build when the refresh was deferred into this transaction, and the pin itself
+    // otherwise - see `SigningContext::refresh_from`
+    let source = context.refresh_from.as_deref().unwrap_or(pin);
 
     let swept = sweep_stale_temps(directory);
     if !swept.is_empty() {
@@ -606,13 +1107,17 @@ fn perform_signing(
 
     let temporary = directory.join(format!("{}{}.tmp", sign_temp_prefix(), std::process::id()));
     let temporary_display = temporary.display().to_string();
-    if let Err(error) = std::fs::copy(pin, &temporary) {
+    if let Err(error) = std::fs::copy(source, &temporary) {
         let _ = std::fs::remove_file(&temporary);
-        findings.push(Finding::needs_you(
-            "signing",
-            format!("could not copy {} to sign it: {}", pin_display, error),
-        ));
-        return findings;
+        return SignAttempt {
+            findings,
+            refusal: Some(format!(
+                "could not copy {} to sign it: {}",
+                source.display(),
+                error
+            )),
+            fatal: true,
+        };
     }
 
     let requirement = requirement_for(rung);
@@ -641,64 +1146,148 @@ fn perform_signing(
     }
     if !signed.0 {
         let _ = std::fs::remove_file(&temporary);
-        findings.push(
-            Finding::needs_you(
-                "signing",
-                format!("codesign refused to sign with {}", rung.description()),
-            )
-            .note(signed.1)
-            .note("the pinned copy is untouched"),
-        );
-        return findings;
+        return SignAttempt {
+            findings,
+            refusal: Some(format!(
+                "codesign refused to sign with {}: {}",
+                rung.description(),
+                the_complaint(&signed.1)
+            )),
+            fatal: false,
+        };
     }
 
-    if let Err(reason) = verify_signature(commander, &temporary_display) {
+    let after = match verify_signature(commander, &temporary_display) {
+        Ok(signature) => signature,
+        Err(reason) => {
+            let _ = std::fs::remove_file(&temporary);
+            return SignAttempt {
+                findings,
+                refusal: Some(format!(
+                    "{} signed, but the signature did not hold: {}",
+                    rung.description(),
+                    reason
+                )),
+                fatal: false,
+            };
+        },
+    };
+
+    // On the disk BEFORE the rename, and the name on the disk after it. This rename is the pin
+    // refresh now, not merely a signature swap, so it gets the same durability `install_pinned_exe`
+    // gives its own copy - a temp that is not really there is a pin that is not there after a
+    // crash, and the rename is over the only good binary the machine has.
+    if let Err(reason) = crate::session_lifecycle::flush_pin_temp(&temporary) {
         let _ = std::fs::remove_file(&temporary);
-        findings.push(
-            Finding::needs_you(
-                "signing",
-                format!("the new signature did not hold: {}", reason),
-            )
-            .note("the pinned copy is untouched"),
-        );
-        return findings;
+        return SignAttempt {
+            findings,
+            refusal: Some(reason),
+            fatal: true,
+        };
     }
-
     if let Err(error) = std::fs::rename(&temporary, pin) {
         let _ = std::fs::remove_file(&temporary);
-        findings.push(Finding::needs_you(
-            "signing",
-            format!(
+        return SignAttempt {
+            findings,
+            refusal: Some(format!(
                 "could not put the signed copy at {}: {}",
                 pin_display, error
-            ),
-        ));
-        return findings;
+            )),
+            fatal: true,
+        };
     }
+    crate::session_lifecycle::flush_pin_directory(directory);
 
+    let refreshed = context.refresh_from.is_some();
+    if refreshed {
+        // the stamp records the SOURCE the pin was made from, and the refresh that would normally
+        // have written it was handed to this transaction instead. Without this the next run reads
+        // a stale stamp, calls the pin out of date, and refreshes it all over again.
+        crate::session_lifecycle::record_pin_refreshed_from(source, pin);
+    }
     let mut done = Finding::changed(
         "signing",
         format!(
-            "signed {} with {}{}",
+            "{} {} with {}{}",
+            if refreshed {
+                "refreshed and signed"
+            } else {
+                "signed"
+            },
             pin_display,
             rung.description(),
             if timestamped { ", timestamped" } else { "" }
         ),
     )
     .note(format!("identifier {}", PIN_IDENTIFIER));
+    if refreshed {
+        done = done
+            .note("the new build and its signature went into place as one step, so a run that")
+            .note("could not sign would have left the previous signed copy where it was");
+    }
+    for earlier in earlier_refusals {
+        // the rungs above this one that would not sign. Silence here would leave a machine with a
+        // Developer ID wondering why its pin carries a certificate of ours.
+        done = done.note(format!("a rung above it did not sign: {}", earlier));
+    }
     if let Some(refusal) = refused_timestamp {
         done = done
             .note("the timestamp was refused, so it was signed without one:")
-            .note(format!("  {}", first_line(&refusal)));
+            .note(format!("  {}", the_complaint(&refusal)));
     }
     findings.push(done);
-    findings.push(follow_up(&pin_display, changed_certificate));
-    findings
+    findings.push(follow_up(
+        &pin_display,
+        requirement_changed(before, after.designated().unwrap_or_default()),
+    ));
+    SignAttempt {
+        findings,
+        refusal: None,
+        fatal: false,
+    }
 }
 
 /// The first line of a tool's complaint, which is the part worth quoting in a report.
 fn first_line(message: &str) -> &str {
     message.lines().next().unwrap_or("").trim()
+}
+
+/// What `codesign` actually complained about, which is NOT its first line.
+///
+/// **`-f` makes the first line noise, and quoting it hid every real failure.** Re-signing a pin
+/// that already carries a signature - which is every run after the first - makes `codesign` say so
+/// before it says anything else:
+///
+/// ```text
+/// /Users/…/zellij: replacing existing signature
+/// /Users/…/zellij: errSecInternalComponent
+/// ```
+///
+/// A report that quoted line 1 told the user their signing run had "failed: replacing existing
+/// signature", which names the one thing that went right. Seen on a real Mac at 0.45.0-nkmk.8,
+/// where the actual fault was a key ACL that had never been granted.
+///
+/// So the informational line is dropped and everything else is kept, joined and capped. Kept
+/// rather than reduced to the last line: `codesign` can emit several, and the one that explains a
+/// refusal is not reliably the last one either.
+fn the_complaint(message: &str) -> String {
+    let kept: Vec<&str> = message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains("replacing existing signature"))
+        .collect();
+    // nothing but the informational line is still worth quoting - a refusal with no words is
+    // harder to act on than a redundant one
+    let complaint = if kept.is_empty() {
+        first_line(message).to_owned()
+    } else {
+        kept.join("; ")
+    };
+    const ROOM: usize = 300;
+    match complaint.char_indices().nth(ROOM) {
+        Some((at, _)) => format!("{}...", &complaint[..at]),
+        None => complaint,
+    }
 }
 
 /// Run `codesign`, reporting whether it worked and what it said if it did not.
@@ -718,16 +1307,30 @@ fn run_codesign(
     }
 }
 
-/// Both halves of "did that take": the requirement no longer names a code hash, and the signature
-/// itself passes.
+/// Both halves of "did that take": the requirement no longer names a code hash, and the binary
+/// SATISFIES the requirement it now carries.
 ///
-/// Two questions and not one, because they fail apart. A signature can verify and still leave a
-/// requirement anchored on the code hash - which is a run that reported success and fixed nothing.
-fn verify_signature(commander: &dyn Commander, target: &str) -> Result<(), String> {
+/// Two questions and not one, because they fail apart in both directions. A signature can verify
+/// while its requirement still names the code hash - a run that reported success and fixed nothing.
+/// And a requirement can read perfectly while the binary does not satisfy it, which is worse,
+/// because the first question is the one a text search answers and it says yes.
+///
+/// **`--verbose=2` is load-bearing, and this is the whole of the nkmk.7 failure.** Plain
+/// `codesign -v <path>` returned 0 on a pin that `codesign -v --verbose=2 <path>` rejected with
+/// `does not satisfy its designated Requirement` and exit 3 - the designated-requirement check is
+/// what the second verbosity level adds. So the verbosity is not for the log: without it this
+/// function passes exactly the signature it exists to catch. `--strict` costs nothing here and
+/// refuses a few more things.
+///
+/// The message is matched as well as the exit status. Both were seen together on the machine this
+/// was found on, and a check that rests on the exit status alone rests on the half that had
+/// already been observed reporting success wrongly.
+fn verify_signature(commander: &dyn Commander, target: &str) -> Result<PinSignature, String> {
     let described = commander
         .run("codesign", &["-d", "--verbose=2", "-r-", target], None)
         .map_err(|reason| reason)?;
-    match read_signature(&described.combined()) {
+    let signature = read_signature(&described.combined());
+    match &signature {
         PinSignature::Anchored { .. } => {},
         PinSignature::CodeHashed { .. } => {
             return Err(String::from(
@@ -738,20 +1341,48 @@ fn verify_signature(commander: &dyn Commander, target: &str) -> Result<(), Strin
             return Err(String::from("codesign reports the copy as unsigned"))
         },
     }
-    match commander.run("codesign", &["-v", target], None) {
-        Ok(output) if output.success => Ok(()),
-        Ok(output) => Err(output.stderr.trim().to_owned()),
-        Err(reason) => Err(reason),
+    let verified = commander
+        .run(
+            "codesign",
+            &["--verify", "--strict", "--verbose=2", target],
+            None,
+        )
+        .map_err(|reason| reason)?;
+    let said = verified.combined();
+    if said.to_lowercase().contains("does not satisfy") {
+        return Err(String::from(
+            "the signature does not satisfy its own designated requirement, so it holds no grant",
+        ));
     }
+    if !verified.success {
+        return Err(first_line(said.trim()).to_owned());
+    }
+    Ok(signature)
 }
 
 /// What to do next, in the order that makes it one pass instead of two.
 ///
-/// Re-granting FIRST and restarting SECOND is the whole of the advice. The grants are recorded
-/// against the pin's path and the signature it now carries; a server started before they are
-/// re-granted comes up not holding them, and the user ends up restarting twice.
-fn follow_up(pin: &str, changed_certificate: bool) -> Finding {
-    let mut finding = Finding::needs_you(
+/// Re-granting FIRST and restarting SECOND is the advice WHEN a re-grant is needed. The grants are
+/// recorded against the pin's path and the requirement it now carries; a server started before
+/// they are re-granted comes up not holding them, and the user ends up restarting twice.
+///
+/// **When the requirement did not change there is nothing to re-grant, and saying otherwise is not
+/// a harmless extra step.** It sends a person into System Settings to revoke and re-add three
+/// permissions that were already correct, and it teaches them that doctor's advice can be ignored.
+/// A pin re-signed with the same certificate carries the same requirement - that is the whole
+/// reason this feature exists - so the ordinary case, a rebuild on a machine already set up, needs
+/// only the restart.
+fn follow_up(pin: &str, changed_requirement: Option<String>) -> Finding {
+    let Some(why) = changed_requirement else {
+        return Finding::needs_you("signing", "the signature is in place; one thing left")
+            .note("`zellij session restart`, so the new server comes up running it")
+            .note(format!(
+                "the requirement is the one macOS already recorded for {}, so every grant",
+                pin
+            ))
+            .note("it holds carries over and there is nothing to re-grant");
+    };
+    Finding::needs_you(
         "signing",
         "the signature is in place; two things left, in this order",
     )
@@ -760,15 +1391,9 @@ fn follow_up(pin: &str, changed_certificate: bool) -> Finding {
         pin
     ))
     .note("   in System Settings > Privacy & Security - once, for the new signature")
-    .note("2. THEN `zellij session restart`, so the new server comes up already holding them");
-    if changed_certificate {
-        // the machine's own certificate is still on disk, and every grant made before today names
-        // it. Saying which certificate changed is the difference between one re-grant and a hunt.
-        finding = finding
-            .note("this machine had signed with a certificate of its own before now, so the")
-            .note("requirement changed with the certificate - that is why the re-grant is needed");
-    }
-    finding
+    .note("2. THEN `zellij session restart`, so the new server comes up already holding them")
+    .note(why)
+    .note("- that is why the re-grant is needed, and not only the restart")
 }
 
 /// The last rung: no certificate, and nothing doctor may do about it.
@@ -856,6 +1481,18 @@ impl SigningDir {
 /// same certificate, same hash, same requirement, every grant intact. With no bundle, a new
 /// certificate is minted and the grants start from nothing, which is why that path is taken only
 /// once in the life of the machine.
+///
+/// **A bundle that will not import is not a bundle worth keeping, and reusing one forever was a
+/// bug that stranded a machine.** At 0.45.0-nkmk.6 the bundle was written with a passphrase Apple
+/// cannot read (see [`IDENTITY_PASSPHRASE`]); at nkmk.7 the file was still there, so this function
+/// took the re-import path on every run, failed on every run, and never reached the minting code
+/// that had just been fixed. The machine could not repair itself with any future release.
+///
+/// So a failed import now mints again - but ONLY when the keychain has never held the certificate.
+/// That condition is what keeps "mint once" true rather than weakening it: a bundle that never
+/// imported was never signed with, so no grant on the machine names it and replacing it costs
+/// nothing. A bundle whose certificate IS in the keychain is a different story entirely, and an
+/// import that fails then is reported rather than answered with a second certificate.
 pub fn ensure_self_signed(
     commander: &dyn Commander,
     dir: &SigningDir,
@@ -869,7 +1506,38 @@ pub fn ensure_self_signed(
         .map_err(|e| format!("could not lock down {}: {}", dir.root.display(), e))?;
 
     let bundle = dir.identity_bundle();
-    if !bundle.exists() {
+    let mut mint = !bundle.exists();
+    if !mint {
+        findings.push(Finding::ok(
+            "signing",
+            format!(
+                "{} already holds this machine's certificate; re-importing it",
+                bundle.display()
+            ),
+        ));
+        if let Err(reason) = import_bundle(commander, &bundle, keychain) {
+            if !unreadable_bundle(&reason) || keychain_holds_our_certificate(commander, keychain) {
+                // NOT the proven case, or a keychain that has held this certificate before. Either
+                // way a second certificate fixes nothing and costs every grant.
+                return Err(reason);
+            }
+            let aside = set_aside(&bundle)?;
+            findings.push(
+                Finding::changed(
+                    "signing",
+                    format!(
+                        "{} could not be imported, so it was set aside",
+                        aside.display()
+                    ),
+                )
+                .note(reason)
+                .note("the keychain has never held it, so nothing on this machine was signed")
+                .note("with it and no grant names it - a new one costs nothing here"),
+            );
+            mint = true;
+        }
+    }
+    if mint {
         mint_self_signed(commander, dir)?;
         findings.push(
             Finding::changed(
@@ -881,18 +1549,73 @@ pub fn ensure_self_signed(
             )
             .note("it is never minted again: its hash IS the requirement every grant records"),
         );
-    } else {
-        findings.push(Finding::ok(
-            "signing",
-            format!(
-                "{} already holds this machine's certificate; re-importing it",
-                bundle.display()
-            ),
-        ));
+        import_bundle(commander, &bundle, keychain)?;
     }
 
-    import_identity(commander, &bundle, keychain, keychain_password)?;
+    // The partition list is NOT run here. It belongs to signing, not to minting: a machine that
+    // minted last month signs today without coming through this function at all, and the ACL it
+    // needs is granted per keychain and not per certificate. `sign_down_the_ladder` runs it before
+    // every signature made with our own certificate - see there.
+    let _ = keychain_password;
     Ok(findings)
+}
+
+/// Whether an import failure is the one that a new certificate actually answers.
+///
+/// **The gate is narrow on purpose, and widening it is how a machine loses its grants.** Only one
+/// failure means "this FILE cannot be read": Apple refusing a PKCS#12 whose MAC it cannot verify,
+/// which it reports as a password problem. Every other failure - a locked keychain, a run before
+/// graphical login, an SSH session with no dialog to answer - means the KEYCHAIN would not answer,
+/// and the bundle in hand may be the machine's one certificate with every grant recorded against
+/// it. Minting there would void them all to fix nothing.
+fn unreadable_bundle(reason: &str) -> bool {
+    let reason = reason.to_lowercase();
+    reason.contains("mac verification failed") || reason.contains("wrong password")
+}
+
+/// Has this keychain ever held the certificate we mint?
+///
+/// **`find-identity` cannot answer this, and that is the whole reason for a second question.** It
+/// lists identities the keychain calls VALID, so it folds "never imported" together with "imported
+/// and untrusted" and with "the keychain will not answer right now" - and it is asked immediately
+/// before this code runs, from the one caller, having already returned nothing. Re-asking it would
+/// re-read the same answer and gate on a constant.
+///
+/// `find-certificate` asks about the certificate itself. It needs no trust decision and no access
+/// to the private key, so a locked or unanswering keychain that holds the certificate still says
+/// so - which is exactly the case the gate must not mistake for a machine that has never had one.
+fn keychain_holds_our_certificate(commander: &dyn Commander, keychain: &str) -> bool {
+    matches!(
+        commander.run(
+            "security",
+            &["find-certificate", "-c", SELF_SIGNED_COMMON_NAME, keychain],
+            None,
+        ),
+        Ok(output) if output.success
+    )
+}
+
+/// Move a bundle out of the way, keeping it rather than removing it.
+///
+/// A private key is never deleted here even when it is useless, because "useless" is this code's
+/// reading of an import failure and the file is the only copy of something that cannot be made
+/// again. The timestamp keeps a second failure from overwriting the first one's evidence.
+fn set_aside(bundle: &Path) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    let mut target = bundle.as_os_str().to_owned();
+    target.push(format!(".broken-{}", stamp));
+    let target = PathBuf::from(target);
+    std::fs::rename(bundle, &target).map_err(|error| {
+        format!(
+            "could not move {} out of the way: {}",
+            bundle.display(),
+            error
+        )
+    })?;
+    Ok(target)
 }
 
 /// Write the config, the key and the certificate, and bundle the last two together.
@@ -932,32 +1655,28 @@ fn mint_self_signed(commander: &dyn Commander, dir: &SigningDir) -> Result<(), S
     }
 
     let bundle = dir.identity_bundle().display().to_string();
-    let output = commander
-        .run(
-            "openssl",
-            &[
-                "pkcs12",
-                "-export",
-                "-inkey",
-                &key,
-                "-in",
-                &certificate,
-                "-out",
-                &bundle,
-                "-name",
-                SELF_SIGNED_COMMON_NAME,
-                // no passphrase: the file's protection is the directory it sits in, and a
-                // passphrase nobody can type is a passphrase that loses the certificate
-                "-passout",
-                "pass:",
-            ],
-            None,
-        )
-        .map_err(|reason| format!("could not run openssl: {}", reason))?;
-    if !output.success {
+    let mut refusal = String::new();
+    let mut bundled = false;
+    for legacy in [true, false] {
+        let output = commander
+            .run(
+                "openssl",
+                &pkcs12_arguments(&key, &certificate, &bundle, legacy),
+                None,
+            )
+            .map_err(|reason| format!("could not run openssl: {}", reason))?;
+        if output.success {
+            bundled = true;
+            break;
+        }
+        if refusal.is_empty() {
+            refusal = output.stderr.trim().to_owned();
+        }
+    }
+    if !bundled {
         return Err(format!(
             "openssl could not bundle the certificate: {}",
-            output.stderr.trim()
+            refusal
         ));
     }
     for private in [dir.private_key(), dir.identity_bundle()] {
@@ -967,22 +1686,68 @@ fn mint_self_signed(commander: &dyn Commander, dir: &SigningDir) -> Result<(), S
     Ok(())
 }
 
-/// Put the bundle in the keychain and let `codesign` reach the key.
+/// The argv that bundles the key and the certificate into a p12 macOS will actually import.
+///
+/// **Every algorithm here is named on purpose.** OpenSSL 3 defaults a PKCS#12 file to a SHA-256
+/// MAC and AES-based PBE, and Apple's importer accepts neither - it reports the MAC it cannot
+/// verify as a password it was not given, which points at the one thing that is not wrong:
+///
+/// ```text
+/// security: SecKeychainItemImport: MAC verification failed during PKCS12 import (wrong password?)
+/// ```
+///
+/// So the MAC is SHA-1 and both PBEs are `PBE-SHA1-3DES`, which is what `security import` has
+/// always read. `-legacy` is the flag that lets OpenSSL 3 emit them at all, and it is tried FIRST
+/// and dropped on failure rather than probed for: macOS ships LibreSSL as `/usr/bin/openssl` and
+/// LibreSSL has no `-legacy`, while an OpenSSL 3 from Homebrew may be first on `PATH` instead. A
+/// version probe would have to parse `openssl version` and be right about two projects' numbering;
+/// running the command and reading its exit status is the same answer with nothing to be wrong
+/// about.
+///
+/// The passphrase is [`IDENTITY_PASSPHRASE`], and it has to be non-empty for the same importer to
+/// read the file at all - see that constant, which is where the evidence is.
+fn pkcs12_arguments<'a>(
+    key: &'a str,
+    certificate: &'a str,
+    bundle: &'a str,
+    legacy: bool,
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "pkcs12",
+        "-export",
+        "-inkey",
+        key,
+        "-in",
+        certificate,
+        "-out",
+        bundle,
+        "-name",
+        SELF_SIGNED_COMMON_NAME,
+        "-macalg",
+        "sha1",
+        "-certpbe",
+        "PBE-SHA1-3DES",
+        "-keypbe",
+        "PBE-SHA1-3DES",
+        "-passout",
+        PKCS12_PASSOUT,
+    ];
+    if legacy {
+        args.push("-legacy");
+    }
+    args
+}
+
+/// Put the bundle in the keychain.
 ///
 /// `-T /usr/bin/codesign` names the one program allowed to use it, rather than `-A`, which would
 /// let anything on the machine sign with this machine's identity.
 ///
-/// `set-key-partition-list` is the other half and it is not optional: without it every signing run
-/// raises a GUI dialog for the key's ACL. NO TRUSTED ROOT IS ADDED anywhere here, deliberately -
-/// requirement evaluation does not consult trust unless the requirement says `trusted`, and ours
-/// never does. What signing needs is access to the key, which is exactly what this grants and
-/// nothing more.
-fn import_identity(
-    commander: &dyn Commander,
-    bundle: &Path,
-    keychain: &str,
-    keychain_password: Option<&str>,
-) -> Result<(), String> {
+/// Split from [`allow_codesign_to_reach_the_key`] because the two fail for unrelated reasons and
+/// only this one is a reason to mint again: a refused import means the FILE cannot be read, while
+/// a refused partition list means the KEYCHAIN would not answer, and a second certificate fixes
+/// neither of those but is only ever justified by the first.
+fn import_bundle(commander: &dyn Commander, bundle: &Path, keychain: &str) -> Result<(), String> {
     let bundle = bundle.display().to_string();
     let output = commander
         .run(
@@ -993,7 +1758,7 @@ fn import_identity(
                 "-k",
                 keychain,
                 "-P",
-                "",
+                IDENTITY_PASSPHRASE,
                 "-T",
                 "/usr/bin/codesign",
             ],
@@ -1007,7 +1772,33 @@ fn import_identity(
             output.stderr.trim()
         ));
     }
+    Ok(())
+}
 
+/// Let `codesign` reach the key without a dialog.
+///
+/// `set-key-partition-list` is a CONVENIENCE and not a precondition, and treating it as one cost a
+/// release. Without it macOS asks for the key once per signature, through the standard key-access
+/// dialog, instead of never - which is worse but is not a failure, and `codesign` is what raises
+/// that dialog. So a refusal here returns a `Needs you` and the run goes on to sign.
+///
+/// **It can also be the step that hangs.** With no `-k`, `security` asks for the keychain password
+/// on the controlling terminal - not through the window server, and not on stdin - so at
+/// 0.45.0-nkmk.8 it blocked forever inside a graphical session with one line on the pane's
+/// terminal and an empty report. Every child doctor runs is now put in a session of its own, which
+/// leaves it nothing to prompt on; see `SystemCommander::run`. This step therefore fails fast
+/// rather than waiting, which is exactly why its failure has to be survivable.
+///
+/// NO TRUSTED ROOT IS ADDED anywhere
+/// here, deliberately - requirement evaluation does not consult trust unless the requirement says
+/// `trusted`, and ours never does. What signing needs is access to the key, which is exactly what
+/// this grants and nothing more. See [`find_identities`] for the other half of that argument, which
+/// is where the temptation to add trust actually comes from.
+fn allow_codesign_to_reach_the_key(
+    commander: &dyn Commander,
+    keychain: &str,
+    keychain_password: Option<&str>,
+) -> Option<Finding> {
     let mut args = vec![
         String::from("set-key-partition-list"),
         String::from("-S"),
@@ -1015,32 +1806,53 @@ fn import_identity(
         String::from("-s"),
     ];
     if let Some(password) = keychain_password {
-        // ZELLIJ_KEYCHAIN_PASSWORD, and only over SSH: with no window server there is no dialog to
-        // answer, so a run that would not prompt is a run that hangs. It goes in argv because
-        // `security` reads it nowhere else, which puts it in this machine's process table for the
-        // life of one command - the reason this is an escape hatch and not the default path.
+        // ZELLIJ_KEYCHAIN_PASSWORD, when the user has set it. It goes in argv because `security`
+        // reads it nowhere else, which puts it in this machine's process table for the life of one
+        // command - the reason this is an escape hatch and not the default path. It is never
+        // asked for: doctor prompts for nothing, anywhere.
         args.push(String::from("-k"));
         args.push(password.to_owned());
     }
     args.push(keychain.to_owned());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = commander
-        .run("security", &borrowed, None)
-        .map_err(|reason| format!("could not run security: {}", reason))?;
-    if !output.success {
-        return Err(format!(
-            "could not let codesign reach the key: {}. Over SSH there is no dialog to answer; \
-             set ZELLIJ_KEYCHAIN_PASSWORD or run this from a terminal on the machine",
-            output.stderr.trim()
-        ));
-    }
-    Ok(())
+    let refusal = match commander.run("security", &borrowed, None) {
+        Ok(output) if output.success => return None,
+        Ok(output) => first_line(output.stderr.trim()).to_owned(),
+        Err(reason) => reason,
+    };
+    Some(
+        Finding::needs_you(
+            "signing",
+            format!("codesign may ask for the key: {}", refusal),
+        )
+        .note("without the partition list, macOS asks once per signature instead of never")
+        .note(KEY_ACCESS_REMEDIES[0])
+        .note(KEY_ACCESS_REMEDIES[1])
+        .note(KEY_ACCESS_REMEDIES[2]),
+    )
 }
+
+/// The two ways a person can give `codesign` the key, in the order worth trying them.
+///
+/// Written once because they belong to two findings that are reached separately: the partition
+/// list refusing (where they are a warning) and every rung refusing (where they are the answer).
+/// Neither of them is "let doctor ask you for your password" - doctor prompts for nothing. That is
+/// not a style choice: `security` prompts on the CONTROLLING TERMINAL, which a launchd job and a
+/// detached pane do not have and an SSH session cannot answer unattended, and a prompt nobody sees
+/// is a program that hangs. Every child doctor runs is put in its own session for that reason; see
+/// `SystemCommander::run`.
+const KEY_ACCESS_REMEDIES: [&str; 3] = [
+    "either run doctor from a terminal in the desktop session and click Always Allow",
+    "  on the key-access dialog macOS raises, once, for this certificate",
+    "or set ZELLIJ_KEYCHAIN_PASSWORD and run it again - doctor reads it, never asks",
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_doctor::{recorded, recorded_failure, RecordedCommander, Status};
+    use crate::session_doctor::{
+        recorded, recorded_failure, CommandOutput, RecordedCommander, Status,
+    };
 
     /// Recorded from a pin signed with a Developer ID certificate.
     const DEVELOPER_ID: &str = "\
@@ -1104,6 +1916,7 @@ Signature=adhoc
             signing_dir: SigningDir::new(root.join("signing")),
             keychain: String::from("login.keychain-db"),
             keychain_password: None,
+            refresh_from: None,
             backup_dir: None,
         }
     }
@@ -1186,22 +1999,103 @@ Signature=adhoc
     }
 
     #[test]
-    fn the_team_id_comes_off_the_name_and_the_email_does_not() {
+    fn the_team_id_comes_off_the_certificate_and_never_off_the_name() {
+        // the real subject of the certificate that produced a broken pin at 0.45.0-nkmk.7, in
+        // LibreSSL's spelling - which is what `/usr/bin/openssl` writes on macOS
         assert_eq!(
-            team_id("Apple Development: someone@example.com (F6G7H8I9J0)").as_deref(),
-            Some("F6G7H8I9J0")
+            team_id_from_subject(
+                "subject= /UID=7472L5G3Y6/CN=Apple Development: someone (DY7JA3K8QZ)\
+                 /OU=U2VEDWFUF3/O=Someone/C=US"
+            )
+            .as_deref(),
+            Some("U2VEDWFUF3")
         );
-        assert_eq!(team_id("zellij self-signed code signing"), None);
+        // OpenSSL 3's spelling of the same line. A Homebrew install puts it first on PATH.
+        assert_eq!(
+            team_id_from_subject(
+                "subject=UID = 7472L5G3Y6, CN = Apple Development: someone (DY7JA3K8QZ), \
+                 OU = U2VEDWFUF3, O = Someone, C = US"
+            )
+            .as_deref(),
+            Some("U2VEDWFUF3")
+        );
+        // the whole of the nkmk.7 bug in one assertion: the code in the CN is NOT the team id
+        assert_ne!(
+            team_id_from_subject(
+                "subject= /CN=Apple Development: someone (DY7JA3K8QZ)/OU=U2VEDWFUF3"
+            )
+            .as_deref(),
+            Some("DY7JA3K8QZ")
+        );
+        // a subject with no OU has no team id, and inventing one is what got us here
+        assert_eq!(
+            team_id_from_subject("subject= /CN=zellij self-signed code signing"),
+            None
+        );
+        // `OU` has to be a key and not the tail of another one
+        assert_eq!(
+            team_id_from_subject("subject= /CN=Someone/businessOU=NOTATEAM"),
+            None
+        );
+    }
+
+    /// The certificate is read through the keychain, and the argv that reads it is part of the
+    /// contract: a `find-certificate` that named the wrong thing would silently answer `None`, and
+    /// `None` signs with a worse requirement rather than failing.
+    #[test]
+    fn the_certificate_is_read_from_the_keychain_by_the_identity_name() {
+        let name = "Apple Development: someone@example.com (F6G7H8I9J0)";
+        let commander = RecordedCommander::new(&[
+            (
+                format!("security find-certificate -c {} -p login.keychain-db", name).as_str(),
+                recorded("-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----\n"),
+            ),
+            (
+                "openssl x509 -noout -subject",
+                recorded("subject= /CN=Apple Development: someone (F6G7H8I9J0)/OU=A1B2C3D4E5\n"),
+            ),
+        ]);
+        assert_eq!(
+            team_id_from_keychain(&commander, "login.keychain-db", name).as_deref(),
+            Some("A1B2C3D4E5")
+        );
+    }
+
+    /// A keychain that will not answer is not a failure. The rung still signs; it takes the
+    /// requirement `codesign` derives instead of ours, which is worse than ours and better than a
+    /// requirement the binary does not satisfy.
+    #[test]
+    fn a_certificate_that_cannot_be_read_gives_no_team_and_writes_no_requirement() {
+        let commander = RecordedCommander::new(&[]);
+        assert_eq!(
+            team_id_from_keychain(
+                &commander,
+                "login.keychain-db",
+                "Apple Development: someone"
+            ),
+            None
+        );
+        let rung = Rung::AppleDevelopment {
+            identity: Identity {
+                hash: String::from("AAAA"),
+                name: String::from("Apple Development: someone@example.com (F6G7H8I9J0)"),
+            },
+            team: None,
+        };
+        assert_eq!(requirement_for(&rung), None);
+        let args = sign_arguments(&rung, requirement_for(&rung).as_deref(), true, "/tmp/pin");
+        assert!(
+            !args.iter().any(|argument| argument.starts_with("-r")),
+            "{:?}",
+            args
+        );
     }
 
     /// The CN carries an email and changes on reissue; the OU is the team id and does not. A
     /// requirement anchored on the CN is a grant that expires with the certificate.
     #[test]
     fn apple_development_is_anchored_on_the_team_id_and_never_on_the_name() {
-        let rung = choose_rung(&parse_identities(
-            "  1) AAAA \"Apple Development: someone@example.com (F6G7H8I9J0)\"\n",
-        ))
-        .unwrap();
+        let rung = apple_development_rung("A1B2C3D4E5");
         let requirement = requirement_for(&rung).unwrap();
         assert!(requirement.contains("subject.OU"), "{}", requirement);
         assert!(!requirement.contains("subject.CN"), "{}", requirement);
@@ -1209,6 +2103,956 @@ Signature=adhoc
             !requirement.contains("someone@example.com"),
             "{}",
             requirement
+        );
+        // and never the code out of the name, which is the per-developer id and not the team
+        assert!(!requirement.contains("F6G7H8I9J0"), "{}", requirement);
+    }
+
+    /// The rung as the ladder builds it once the certificate has been read.
+    fn apple_development_rung(team: &str) -> Rung {
+        Rung::AppleDevelopment {
+            identity: Identity {
+                hash: String::from("AAAA"),
+                name: String::from("Apple Development: someone@example.com (F6G7H8I9J0)"),
+            },
+            team: Some(String::from(team)),
+        }
+    }
+
+    /// `codesign -r` reads a requirement SET. A text opening with `identifier` puts a reserved
+    /// word where a tag belongs, and the rung refuses with `line 1:1: unexpected token:
+    /// identifier` - which is the whole rung lost on a machine that has an Apple Development
+    /// certificate and nothing better.
+    #[test]
+    fn the_apple_development_requirement_is_a_set_and_not_a_bare_expression() {
+        let rung = apple_development_rung("F6G7H8I9J0");
+        let requirement = requirement_for(&rung).unwrap();
+        // spelled out in full: a botched string continuation would still pass a `starts_with`
+        assert_eq!(
+            requirement,
+            "designated => identifier \"org.zellij.nkmk\" and anchor apple generic and \
+             certificate leaf[subject.OU] = \"F6G7H8I9J0\""
+        );
+        // and it reaches codesign as inline text, which is what the leading `=` of `-r=` buys
+        let args = sign_arguments(&rung, Some(&requirement), false, "/tmp/pin");
+        let passed = args
+            .iter()
+            .find(|argument| argument.starts_with("-r="))
+            .unwrap_or_else(|| panic!("{:?}", args));
+        assert_eq!(passed, &format!("-r={}", requirement));
+    }
+
+    /// A certificate the keychain offers is not a certificate that signs. The run that stopped on
+    /// the first refusal left the pin ad-hoc-signed - the state signing exists to remove - with a
+    /// working rung one step below it.
+    #[test]
+    fn a_rung_that_refuses_falls_through_to_the_one_below_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let pin_display = pin.display().to_string();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin_display).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            // the Developer ID is the head of the ladder, and this machine's cannot sign
+            (
+                "codesign -s 0011223344556677889900AABBCCDDEEFF001122",
+                recorded_failure("A1B2C3D4E5: no identity found"),
+            ),
+            (
+                "codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334",
+                recorded(""),
+            ),
+            ("codesign -d --verbose=2 -r- ", recorded(APPLE_DEVELOPMENT)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        let signed = run
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.status == Status::Changed && finding.message.contains("Apple Development")
+            })
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            signed
+                .notes
+                .iter()
+                .any(|note| note.contains("Developer ID")),
+            "{:?}",
+            signed
+        );
+        // and the refusal is not also reported as a failure of the run
+        assert!(
+            !run.findings.iter().any(|finding| finding
+                .message
+                .contains("no certificate on this machine would sign")),
+            "{:?}",
+            run.findings
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.file_name() == "zellij"),
+            "a temp file was left behind"
+        );
+    }
+
+    /// Recorded from a corporate Mac: an Apple Development certificate, and one of ours from an
+    /// earlier run that had none.
+    const APPLE_AND_OURS: &str = "\
+  1) A1B2C3D4E5F60718293A4B5C6D7E8F9001122334 \"Apple Development: someone@example.com (F6G7H8I9J0)\"
+  2) 7F8C0B1A2D3E4F5061728394A5B6C7D8E9F00112 \"zellij self-signed code signing\"
+     2 valid identities found
+";
+
+    /// The walk stops at the Apple rungs. A certificate of ours has a different requirement - its
+    /// own hash - so signing with it after an Apple certificate refused would void every grant on
+    /// the machine, and it would stick: a self-signed signature is anchored, so the next run reads
+    /// the pin as already correct and never climbs back.
+    #[test]
+    fn an_apple_certificate_that_refuses_is_never_demoted_to_one_of_ours() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(APPLE_AND_OURS)),
+            (
+                "codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334",
+                recorded_failure("errSecInternalComponent"),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        assert!(
+            !commander.called_with("codesign -s 7F8C0B1A2D3E4F5061728394A5B6C7D8E9F00112"),
+            "{:?}",
+            commander.calls()
+        );
+        let refused = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("refused to sign"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert_eq!(refused.status, Status::NeedsYou);
+        assert!(
+            refused.message.starts_with("1 certificate "),
+            "{:?}",
+            refused
+        );
+        // and the machine is not sent to Xcode for a certificate it already has
+        assert!(
+            !run.findings
+                .iter()
+                .any(|finding| finding.message.contains("no signing certificate")),
+            "{:?}",
+            run.findings
+        );
+        assert_eq!(std::fs::read(&pin).unwrap(), b"the working copy".to_vec());
+    }
+
+    /// The other side of that boundary: with no Apple certificate anywhere, ours is the rung, and
+    /// a refusal there really is a machine that cannot sign.
+    #[test]
+    fn a_re_grant_is_asked_for_only_when_the_requirement_actually_changed() {
+        let anchored = |text: &str| PinSignature::Anchored {
+            identifier: String::from(PIN_IDENTIFIER),
+            designated: String::from(text),
+        };
+        let same = "designated => identifier \"org.zellij.nkmk\" and anchor apple generic";
+
+        // The mini's case, and the whole of finding 3: a pin re-signed with the certificate it
+        // already carried. Nothing to re-grant, and saying otherwise sent a user to System
+        // Settings to redo three permissions that were already right.
+        assert_eq!(requirement_changed(&anchored(same), same), None);
+        // a different anchor IS a different requirement
+        assert!(requirement_changed(&anchored(same), "designated => something else").is_some());
+        // and an ad-hoc or unsigned pin never held a requirement worth keeping
+        assert!(requirement_changed(
+            &PinSignature::CodeHashed {
+                identifier: String::from("zellij-1234"),
+                designated: String::from("designated => cdhash H\"abc\""),
+            },
+            same
+        )
+        .is_some());
+        assert!(requirement_changed(&PinSignature::Unsigned, same).is_some());
+
+        // and the advice follows it: one step when nothing changed, two when something did
+        let unchanged = follow_up("/tmp/pin", None);
+        assert!(
+            unchanged
+                .notes
+                .iter()
+                .any(|note| note.contains("carries over")),
+            "{:?}",
+            unchanged.notes
+        );
+        assert!(
+            !unchanged
+                .notes
+                .iter()
+                .any(|note| note.contains("re-grant Full Disk Access")),
+            "{:?}",
+            unchanged.notes
+        );
+        assert!(follow_up("/tmp/pin", Some(String::from("because")))
+            .notes
+            .iter()
+            .any(|note| note.contains("re-grant Full Disk Access")));
+    }
+
+    /// Apple's importer reads a SHA-1 MAC and 3DES PBE and nothing newer. OpenSSL 3 defaults to
+    /// neither, and reports the MAC it cannot verify as a password that was not given.
+    #[test]
+    fn the_bundle_is_written_with_the_algorithms_apples_importer_reads() {
+        let legacy = pkcs12_arguments("/k.pem", "/c.pem", "/id.p12", true);
+        for expected in [
+            "-macalg",
+            "sha1",
+            "-certpbe",
+            "PBE-SHA1-3DES",
+            "-keypbe",
+            "PBE-SHA1-3DES",
+        ] {
+            assert!(legacy.contains(&expected), "{:?}", legacy);
+        }
+        assert!(legacy.contains(&"-legacy"), "{:?}", legacy);
+        // LibreSSL is `/usr/bin/openssl` on macOS and has no `-legacy`, so there has to be a
+        // second form that names the algorithms without it
+        assert!(
+            !pkcs12_arguments("/k.pem", "/c.pem", "/id.p12", false).contains(&"-legacy"),
+            "the fall-back still carries -legacy"
+        );
+    }
+
+    /// The algorithms were right at 0.45.0-nkmk.7 and the file still would not import. An empty
+    /// passphrase is the reason: Apple's importer cannot verify the MAC of one, and says so as
+    /// `wrong password?`. Both ends of the pair are asserted, because a bundle written with a
+    /// passphrase and imported without it fails exactly as the empty one did.
+    #[test]
+    fn the_bundle_carries_a_passphrase_because_an_empty_one_will_not_import() {
+        let args = pkcs12_arguments("/k.pem", "/c.pem", "/id.p12", true);
+        assert!(args.contains(&"pass:zellij"), "{:?}", args);
+        assert!(!args.contains(&"pass:"), "{:?}", args);
+
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
+        let commander = RecordedCommander::new(&[
+            ("security import", recorded("")),
+            ("security set-key-partition-list", recorded("")),
+        ]);
+        ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap();
+        let import = commander
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("security import"))
+            .unwrap();
+        assert!(import.contains(" -P zellij "), "{}", import);
+    }
+
+    /// A bundle that will not import is not a bundle to keep re-importing. This is what stranded a
+    /// real Mac: the nkmk.6 file was unimportable, the nkmk.7 run re-imported it rather than
+    /// minting, and the minting code that had just been fixed never ran.
+    #[test]
+    fn a_bundle_that_will_not_import_is_set_aside_and_minted_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"a bundle apple cannot read").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                "security import",
+                recorded_failure(
+                    "security: SecKeychainItemImport: MAC verification failed during PKCS12 \
+                     import (wrong password?)",
+                ),
+            ),
+            // the keychain has never held it, so nothing is anchored on it. `find-certificate`
+            // and not `find-identity`: the second folds "never had it" together with "will not
+            // answer", and the caller has already had that answer.
+            (
+                "security find-certificate",
+                recorded_failure(
+                    "security: SecKeychainSearchCopyNext: The specified item \
+                                  could not be found in the keychain.",
+                ),
+            ),
+            ("openssl req", recorded("")),
+            ("openssl pkcs12", recorded("")),
+            ("security set-key-partition-list", recorded("")),
+        ]);
+        // the run still ends in an error - `openssl` is recorded rather than run, so it writes no
+        // key for the mint to lock down - and that is fine. What this test pins is that the run
+        // reached the mint at all, which is what nkmk.7 never did.
+        let outcome = ensure_self_signed(&commander, &dir, "login.keychain-db", None);
+        assert!(outcome.is_err(), "{:?}", outcome.map(|f| f.len()));
+        assert!(
+            commander.called_with("openssl req"),
+            "{:?}",
+            commander.calls()
+        );
+
+        let aside: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".broken-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{:?}", aside);
+        // kept, never deleted: it is the only copy of a key that cannot be made again
+        assert_eq!(
+            std::fs::read(directory.path().join(&aside[0])).unwrap(),
+            b"a bundle apple cannot read".to_vec()
+        );
+    }
+
+    /// The other half of the same rule. An import can fail for reasons that have nothing to do
+    /// with the file, and if the certificate is already in the keychain then grants name it - so a
+    /// second certificate would void them. That case reports and mints nothing.
+    #[test]
+    fn a_failed_import_of_a_certificate_the_keychain_already_holds_mints_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                "security import",
+                recorded_failure(
+                    "security: SecKeychainItemImport: MAC verification failed during PKCS12 \
+                     import (wrong password?)",
+                ),
+            ),
+            (
+                "security find-certificate",
+                recorded("-----BEGIN CERTIFICATE-----"),
+            ),
+        ]);
+        let outcome = ensure_self_signed(&commander, &dir, "login.keychain-db", None);
+
+        assert!(outcome.is_err(), "{:?}", outcome.map(|f| f.len()));
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        assert!(dir.identity_bundle().exists(), "the bundle was moved aside");
+    }
+
+    /// The 0.45.0-nkmk.8 hang, at the level a unit test can reach it. `security
+    /// set-key-partition-list` with no `-k` blocked forever on a real Mac, and when it is made to
+    /// fail instead, the run must CONTINUE: the partition list only decides whether macOS asks for
+    /// the key once per signature or never, and stopping there left a machine with a certificate
+    /// it had just imported and a pin it never signed.
+    #[test]
+    fn a_partition_list_that_refuses_does_not_stop_the_signing() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+
+        let commander = signing_with_our_own(
+            &pin,
+            recorded_failure(
+                "SecKeychainItemSetAccessWithPassword: User interaction is not allowed.",
+            ),
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        // it went on to sign, which is the whole point: `codesign` is what raises the dialog the
+        // partition list exists to avoid
+        assert!(
+            commander.called_with("codesign -s "),
+            "{:?}",
+            commander.calls()
+        );
+        let findings = run.findings;
+        let warned = findings
+            .iter()
+            .find(|finding| finding.message.contains("codesign may ask for the key"))
+            .unwrap_or_else(|| panic!("{:?}", findings));
+        // both remedies, and neither of them is doctor prompting for anything
+        assert!(
+            warned
+                .notes
+                .iter()
+                .any(|note| note.contains("Always Allow")),
+            "{:?}",
+            warned.notes
+        );
+        assert!(
+            warned
+                .notes
+                .iter()
+                .any(|note| note.contains("ZELLIJ_KEYCHAIN_PASSWORD")),
+            "{:?}",
+            warned.notes
+        );
+    }
+
+    /// Finding 1, and the reason the refresh moved: doctor refreshed the pin FIRST and signed it
+    /// SECOND, so a run where every rung refused - a locked keychain, which is every unattended
+    /// launchd run - had already replaced a properly anchored pin with a fresh ad-hoc copy, and
+    /// then reported `the pinned copy is untouched`. Both halves were wrong.
+    #[test]
+    fn a_refusal_leaves_the_previous_signed_pin_exactly_where_it_was() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build, signed, holding its grants").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            // anchored, which is what makes the refresh worth deferring
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(DEVELOPER_ID),
+            ),
+            (
+                format!("codesign --verify --strict --verbose=2 {}", pin.display()).as_str(),
+                recorded(""),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("security find-certificate", recorded_failure("not found")),
+            ("codesign -s ", recorded_failure("the keychain is locked")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build.clone());
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        // the whole point: the old signed pin is still there, byte for byte
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            b"the OLD build, signed, holding its grants".to_vec(),
+            "the refusal replaced the signed pin"
+        );
+        // and nothing is left behind
+        assert!(!directory
+            .path()
+            .join(format!(".zellij.sign.{}.tmp", std::process::id()))
+            .exists());
+        let exhausted = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("refused to sign"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("was NOT refreshed")),
+            "{:?}",
+            exhausted.notes
+        );
+        assert!(
+            !exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("the pinned copy is untouched")),
+            "it still claims the pin is untouched: {:?}",
+            exhausted.notes
+        );
+    }
+
+    /// And the success path is one step: the new build goes in ALREADY signed, so there is never a
+    /// moment when the pin is the new build without a signature.
+    #[test]
+    fn a_deferred_refresh_puts_the_new_build_in_place_already_signed() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(DEVELOPER_ID),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("security find-certificate", recorded_failure("not found")),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build);
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            b"the new build".to_vec(),
+            "the new build never reached the pin"
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.message.contains("refreshed and signed")),
+            "{:?}",
+            run.findings
+        );
+        // an anchored pin is normally left alone; a pending refresh is what overrides that
+        assert!(
+            commander.called_with("codesign -s "),
+            "{:?}",
+            commander.calls()
+        );
+        // the requirement it ends on is the one it started on, so nothing to re-grant
+        let follow = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("one thing left"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            follow
+                .notes
+                .iter()
+                .any(|note| note.contains("carries over")),
+            "{:?}",
+            follow.notes
+        );
+    }
+
+    /// Which runs defer and which do not. A pin with no signature to lose is refreshed as before -
+    /// pinning the new build is worth more than protecting an ad-hoc signature that no rebuild
+    /// could satisfy anyway.
+    #[test]
+    fn only_an_anchored_pin_is_worth_deferring_a_refresh_for() {
+        let acting = DoctorMode {
+            fix: true,
+            ..DoctorMode::default()
+        };
+        let exe = PathBuf::from("/usr/local/bin/zellij");
+        let anchored = RecordedCommander::new(&[("codesign -d ", recorded(DEVELOPER_ID))]);
+        let ad_hoc = RecordedCommander::new(&[("codesign -d ", recorded(AD_HOC))]);
+
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &anchored,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe.clone()),
+                true
+            ),
+            Some(exe.clone())
+        );
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &ad_hoc,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe.clone()),
+                true
+            ),
+            None
+        );
+        // nothing to refresh
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &anchored,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe.clone()),
+                false
+            ),
+            None
+        );
+        // a dry run refreshes nothing, and a --no-sign run has nothing coming after the refresh
+        for mode in [
+            DoctorMode {
+                fix: false,
+                ..DoctorMode::default()
+            },
+            DoctorMode {
+                sign: false,
+                ..DoctorMode::default()
+            },
+        ] {
+            assert_eq!(
+                refresh_belongs_to_signing(
+                    &anchored,
+                    Path::new("/tmp/pin"),
+                    mode,
+                    Some(exe.clone()),
+                    true
+                ),
+                None
+            );
+        }
+    }
+
+    /// `-f` makes `codesign` announce that it is replacing a signature before it says anything
+    /// else, so quoting its FIRST line reported every real failure as "replacing existing
+    /// signature" - the one thing that had gone right. Seen on a real Mac, where it hid a key ACL
+    /// that had never been granted.
+    #[test]
+    fn a_refusal_quotes_the_error_and_not_codesigns_own_chatter() {
+        assert_eq!(
+            the_complaint(
+                "/Users/someone/zellij: replacing existing signature\n\
+                 /Users/someone/zellij: errSecInternalComponent"
+            ),
+            "/Users/someone/zellij: errSecInternalComponent"
+        );
+        // several real lines are all kept, because the one that explains a refusal is not reliably
+        // the last one either
+        assert_eq!(
+            the_complaint("zellij: replacing existing signature\nfirst thing\nsecond thing"),
+            "first thing; second thing"
+        );
+        // and a complaint that is ONLY the chatter still says something
+        assert_eq!(
+            the_complaint("zellij: replacing existing signature"),
+            "zellij: replacing existing signature"
+        );
+        assert!(the_complaint(&"x".repeat(400)).ends_with("..."));
+
+        // end to end, through the report a person actually reads
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+            ("security set-key-partition-list", recorded("")),
+            (
+                "codesign -s ",
+                recorded_failure(
+                    "/tmp/pin: replacing existing signature\n/tmp/pin: errSecInternalComponent",
+                ),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+        let said = format!("{:?}", run.findings);
+        assert!(said.contains("errSecInternalComponent"), "{}", said);
+    }
+
+    /// And when `codesign` then refuses too - no window server, or a denied dialog - the report
+    /// names both remedies rather than only the SSH one it used to.
+    #[test]
+    fn a_ladder_that_refuses_names_both_ways_to_give_codesign_the_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+            ("codesign -s ", recorded_failure("errSecInternalComponent")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        let exhausted = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("refused to sign"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("Always Allow")),
+            "{:?}",
+            exhausted.notes
+        );
+        assert!(
+            exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("ZELLIJ_KEYCHAIN_PASSWORD")),
+            "{:?}",
+            exhausted.notes
+        );
+    }
+
+    /// The machine that hung has its certificate IMPORTED already - the hang came after that - so
+    /// the next run must find it and sign, not mint a second one. `find-identity -v` still cannot
+    /// see it, because it is untrusted; the non-`-v` listing is what makes this work.
+    #[test]
+    fn a_machine_whose_import_already_succeeded_signs_rather_than_minting_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        // the bundle from the run that hung is still on disk, which is what a re-mint would take
+        let signing = scratch.path().join("signing");
+        std::fs::create_dir_all(&signing).unwrap();
+        std::fs::write(signing.join("id.p12"), b"the one certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            // untrusted, so `-v` reports nothing at all
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+            (
+                "security find-identity -p codesigning",
+                recorded(
+                    "  1) BBBB \"zellij self-signed code signing\" (CSSMERR_TP_NOT_TRUSTED)\n     \
+                     1 identities found\n",
+                ),
+            ),
+            ("codesign -s BBBB", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(SELF_SIGNED)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        assert!(
+            !commander.called_with("openssl"),
+            "it minted again: {:?}",
+            commander.calls()
+        );
+        assert!(
+            !commander.called_with("security import"),
+            "{:?}",
+            commander.calls()
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::Changed
+                    && finding.message.contains("signed")),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// The gate that b5bde6cb6's first cut got wrong. It asked `find-identity`, which the ONLY
+    /// caller has just asked and had answer "nothing" - so the check gated on a constant, and any
+    /// import failure at all set the machine's one certificate aside and minted a second. A locked
+    /// keychain is the case that makes that fatal: it holds the certificate every grant names, and
+    /// it fails the import for a reason a new certificate does not fix.
+    #[test]
+    fn a_keychain_that_will_not_answer_is_not_a_keychain_that_never_held_the_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                "security import",
+                recorded_failure(
+                    "security: SecKeychainItemImport: User interaction is not allowed.",
+                ),
+            ),
+            // even with the certificate nowhere to be found, the error is not the proven one
+            (
+                "security find-certificate",
+                recorded_failure("security: could not be found in the keychain."),
+            ),
+            // and `find-identity` agrees with the caller that there is no valid identity, which is
+            // exactly the answer the broken gate mistook for permission to mint
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+        ]);
+        let outcome = ensure_self_signed(&commander, &dir, "login.keychain-db", None);
+
+        assert!(outcome.is_err(), "{:?}", outcome.map(|f| f.len()));
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        assert_eq!(
+            std::fs::read(dir.identity_bundle()).unwrap(),
+            b"the one certificate".to_vec(),
+            "the machine's only certificate was set aside"
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".broken-")),
+            "something was set aside"
+        );
+    }
+
+    /// Which failures count, spelled out. Widening this predicate is how a machine loses its
+    /// grants, so it is pinned rather than left to the call site.
+    #[test]
+    fn only_a_bundle_apple_cannot_read_justifies_a_second_certificate() {
+        assert!(unreadable_bundle(
+            "security: SecKeychainItemImport: MAC verification failed during PKCS12 import \
+             (wrong password?)"
+        ));
+        assert!(!unreadable_bundle(
+            "security: SecKeychainItemImport: User interaction is not allowed."
+        ));
+        assert!(!unreadable_bundle("security: the keychain is locked"));
+        assert!(!unreadable_bundle("could not run security: no such file"));
+    }
+
+    /// A certificate we minted has no chain to a trusted root, so `find-identity -v` - where `-v`
+    /// means "valid", and valid means TRUSTED - can report `0 valid identities found` on a machine
+    /// that holds it and can sign with it. Seen on a real Mac. The answer is the untrusted
+    /// listing, NOT a trusted root: signing and grants both ignore trust.
+    #[test]
+    fn our_own_certificate_is_found_even_when_the_keychain_calls_it_untrusted() {
+        let commander = RecordedCommander::new(&[
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+            (
+                "security find-identity -p codesigning",
+                recorded(
+                    "  1) BBBB \"zellij self-signed code signing\" (CSSMERR_TP_NOT_TRUSTED)\n     \
+                     1 identities found\n",
+                ),
+            ),
+        ]);
+        let identities = find_identities(&commander);
+        assert_eq!(identities.len(), 1, "{:?}", identities);
+        assert_eq!(identities[0].name, SELF_SIGNED_COMMON_NAME);
+        assert_eq!(identities[0].hash, "BBBB");
+        assert!(matches!(
+            choose_rung(&identities),
+            Some(Rung::SelfSigned(_))
+        ));
+        assert!(
+            !commander.called_with("add-trusted-cert"),
+            "{:?}",
+            commander.calls()
+        );
+    }
+
+    /// The untrusted listing is filtered to OUR name. An Apple certificate the keychain calls
+    /// invalid is invalid for a reason - expired, revoked, no private key - and taking it would
+    /// put the ladder on a rung that cannot sign.
+    #[test]
+    fn an_apple_certificate_the_keychain_calls_invalid_is_not_taken_off_the_untrusted_listing() {
+        let commander = RecordedCommander::new(&[
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+            (
+                "security find-identity -p codesigning",
+                recorded(
+                    "  1) CCCC \"Apple Development: someone@example.com (F6G7H8I9J0)\" \
+                     (CSSMERR_TP_CERT_EXPIRED)\n     1 identities found\n",
+                ),
+            ),
+        ]);
+        assert!(find_identities(&commander).is_empty());
+    }
+
+    /// `-legacy` is what lets OpenSSL 3 write those algorithms and it is what LibreSSL refuses to
+    /// parse. Both openssls are reachable as `openssl`, so the flag is tried and dropped rather
+    /// than decided from a version string.
+    #[test]
+    fn a_bundle_refused_with_legacy_is_written_again_without_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::create_dir_all(&dir.root).unwrap();
+        let key = dir.private_key().display().to_string();
+        let certificate = dir.certificate().display().to_string();
+        let bundle = dir.identity_bundle().display().to_string();
+        let line = |legacy: bool| {
+            format!(
+                "openssl {}",
+                pkcs12_arguments(&key, &certificate, &bundle, legacy).join(" ")
+            )
+        };
+
+        let commander = RecordedCommander::new(&[
+            ("openssl req", recorded("")),
+            (
+                line(true).as_str(),
+                recorded_failure("openssl: Unknown option: -legacy"),
+            ),
+            (line(false).as_str(), recorded("")),
+        ]);
+        // the recorded openssl writes nothing, so the files it would have made are put here
+        std::fs::write(dir.certificate(), b"certificate").unwrap();
+        std::fs::write(dir.private_key(), b"key").unwrap();
+        std::fs::write(dir.identity_bundle(), b"bundle").unwrap();
+        mint_self_signed(&commander, &dir).unwrap();
+
+        assert!(commander.called_with("-legacy"), "{:?}", commander.calls());
+        assert!(
+            commander
+                .calls()
+                .iter()
+                .any(|call| call.contains("-macalg sha1") && !call.contains("-legacy")),
+            "{:?}",
+            commander.calls()
         );
     }
 
@@ -1247,10 +3091,16 @@ Signature=adhoc
 
     #[test]
     fn an_already_anchored_pin_is_left_alone_and_never_signed_again() {
-        let commander = RecordedCommander::new(&[(
-            "codesign -d --verbose=2 -r- /tmp/pin",
-            recorded(DEVELOPER_ID),
-        )]);
+        let commander = RecordedCommander::new(&[
+            (
+                "codesign -d --verbose=2 -r- /tmp/pin",
+                recorded(DEVELOPER_ID),
+            ),
+            (
+                "codesign --verify --strict --verbose=2 /tmp/pin",
+                recorded("/tmp/pin: valid on disk"),
+            ),
+        ]);
         let scratch = tempfile::tempdir().unwrap();
         let run = sign_pin(
             &commander,
@@ -1260,6 +3110,90 @@ Signature=adhoc
         );
         assert_eq!(run.findings[0].status, Status::AlreadyCorrect);
         assert!(!commander.called_with("-s "), "{:?}", commander.calls());
+        // reading the requirement is not checking it, so the pin it leaves alone is a pin it
+        // actually verified
+        assert!(
+            commander.called_with("codesign --verify --strict --verbose=2 /tmp/pin"),
+            "{:?}",
+            commander.calls()
+        );
+    }
+
+    /// The nkmk.7 failure, in the state it left a real Mac in: a pin whose requirement reads
+    /// perfectly and whose binary does not satisfy it. doctor called that `AlreadyCorrect` and
+    /// exited 0 for two releases, so the machine could never repair itself.
+    #[test]
+    fn an_anchored_pin_that_does_not_verify_is_not_healthy_and_is_signed_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"a pretend 46 MB binary").unwrap();
+        let pin_display = pin.display().to_string();
+
+        let commander = RecordedCommander::new(&[
+            // the pin reads as anchored - identifier, no cdhash anywhere
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin_display).as_str(),
+                recorded(APPLE_DEVELOPMENT),
+            ),
+            // and fails the check that reading it cannot make
+            (
+                format!("codesign --verify --strict --verbose=2 {}", pin_display).as_str(),
+                recorded_failure(&format!(
+                    "{}: valid on disk\n{}: does not satisfy its designated Requirement",
+                    pin_display, pin_display
+                )),
+            ),
+            // the rung taken from these is Developer ID, which reads no certificate
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode::default(),
+            &context(scratch.path()),
+        );
+
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::NeedsYou
+                    && finding
+                        .message
+                        .contains("does not satisfy its own requirement")),
+            "{:?}",
+            run.findings
+        );
+        assert!(
+            commander.called_with("codesign -s "),
+            "a pin that fails verification was left as it was: {:?}",
+            commander.calls()
+        );
+    }
+
+    /// A verification that fails only at `--verbose=2` is the one that matters, because that is
+    /// the level at which the designated requirement is checked at all.
+    #[test]
+    fn a_signature_that_does_not_satisfy_its_own_requirement_refuses_the_rung() {
+        let commander = RecordedCommander::new(&[
+            (
+                "codesign --verify --strict --verbose=2 /tmp/pin",
+                recorded_failure("/tmp/pin: does not satisfy its designated Requirement"),
+            ),
+            (
+                "codesign -d --verbose=2 -r- /tmp/pin",
+                recorded(DEVELOPER_ID),
+            ),
+        ]);
+        let refusal = verify_signature(&commander, "/tmp/pin").unwrap_err();
+        assert!(
+            refusal.contains("does not satisfy its own designated requirement"),
+            "{}",
+            refusal
+        );
     }
 
     #[test]
@@ -1385,7 +3319,7 @@ Signature=adhoc
             (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
             ("codesign -s ", recorded("")),
             ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
-            ("codesign -v ", recorded("")),
+            ("codesign --verify ", recorded("")),
         ]);
         let scratch = tempfile::tempdir().unwrap();
         let run = sign_pin(
@@ -1421,7 +3355,7 @@ Signature=adhoc
         let verified = calls
             .iter()
             .enumerate()
-            .filter(|(_, call)| call.starts_with("codesign -v "))
+            .filter(|(_, call)| call.starts_with("codesign --verify "))
             .map(|(index, _)| index)
             .next()
             .unwrap();
@@ -1482,7 +3416,7 @@ Signature=adhoc
             (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
             ("codesign -s ", recorded("")),
             ("codesign -d --verbose=2 -r- ", recorded(AD_HOC)),
-            ("codesign -v ", recorded("")),
+            ("codesign --verify ", recorded("")),
         ]);
         let scratch = tempfile::tempdir().unwrap();
         let run = sign_pin(
@@ -1653,15 +3587,111 @@ Signature=adhoc
     #[test]
     fn the_keychain_password_is_passed_only_when_there_is_one() {
         let directory = tempfile::tempdir().unwrap();
-        let dir = SigningDir::new(directory.path().to_path_buf());
-        std::fs::write(dir.identity_bundle(), b"x").unwrap();
-        let commander = RecordedCommander::new(&[
-            ("security import", recorded("")),
-            ("security set-key-partition-list", recorded("")),
-        ]);
-        ensure_self_signed(&commander, &dir, "login.keychain-db", Some("hunter2")).unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = signing_with_our_own(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.keychain_password = Some(String::from("hunter2"));
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
         assert!(
             commander.called_with("-k hunter2"),
+            "{:?}",
+            commander.calls()
+        );
+    }
+
+    /// A run that signs with our own certificate, with the partition list answering `partition`.
+    fn signing_with_our_own(pin: &Path, partition: CommandOutput) -> RecordedCommander {
+        RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+            ("security set-key-partition-list", partition),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(SELF_SIGNED)),
+            ("codesign --verify ", recorded("")),
+        ])
+    }
+
+    /// The certificate is minted once and signed with for years, so granting the key ACL only on
+    /// the run that MINTED left every later run signing with a key nothing had approved. Proven on
+    /// a real Mac: the same `codesign` succeeded once the partition list had been run by hand.
+    #[test]
+    fn the_key_acl_is_granted_before_every_signature_with_our_own_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        // no bundle on disk and nothing minted in this run: the certificate is simply already in
+        // the keychain, which is every run after the first
+        let commander = signing_with_our_own(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        let calls = commander.calls();
+        let partition = commander
+            .position_of("security set-key-partition-list")
+            .unwrap_or_else(|| panic!("the key ACL was never granted: {:?}", calls));
+        let signed = commander.position_of("codesign -s ").unwrap();
+        assert!(partition < signed, "granted after it signed: {:?}", calls);
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::Changed
+                    && finding.message.contains("signed")),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// And it is NOT written for a certificate we did not create. An Apple certificate comes with
+    /// its own ACL, and rewriting the partition list of someone else's key is not doctor's job.
+    #[test]
+    fn the_key_acl_is_left_alone_on_an_apple_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+        assert!(
+            !commander.called_with("security set-key-partition-list"),
             "{:?}",
             commander.calls()
         );
@@ -1670,9 +3700,12 @@ Signature=adhoc
     /// A pid that is beyond argument finished: spawned, waited for, and reaped.
     #[cfg(unix)]
     fn a_pid_that_has_finished() -> u32 {
-        let mut child = std::process::Command::new("/bin/true")
+        // `/bin/sh`, not `/bin/true`: POSIX puts a shell at that path on every unix, while macOS
+        // keeps `true` in `/usr/bin` and has nothing at `/bin/true` to spawn.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
             .spawn()
-            .expect("every unix has one");
+            .expect("every unix has a shell");
         let pid = child.id();
         child.wait().expect("it exits at once");
         pid

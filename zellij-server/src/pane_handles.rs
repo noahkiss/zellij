@@ -13,24 +13,49 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use zellij_utils::pane_handle::generate_handle;
 
-/// Draws a handle nothing has spoken for.
-#[cfg(not(test))]
-fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
-    generate_handle(is_taken)
-}
-
-/// Under `cargo test` the draw walks the handle space in order instead of shuffling it.
+/// Whether this process names its panes in order instead of drawing them at random.
 ///
 /// A pane frame shows its handle, and a great many tests snapshot a rendered frame. A random
-/// address would make every one of those a coin toss, so a test session's panes are named in the
-/// order they are built. The counter is per thread because that is the unit a test runs on - one
-/// test's panes are numbered from zero whatever its siblings are doing in parallel.
+/// address would make every one of those a coin toss - not only because the address itself is
+/// printed, but because its WIDTH moves the centered title beside it (see
+/// `compose_bracketed_title`), so blanking the handle out of a snapshot is not enough.
+///
+/// `cfg!(test)` covers this crate's own tests. It does NOT cover the whole-app integration suite,
+/// which links this crate as an ordinary dependency and so is built without it - hence the
+/// variable, which `zellij-integration-tests` sets for its own process and nothing else reads.
+fn names_in_order() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        static IN_ORDER: OnceLock<bool> = OnceLock::new();
+        *IN_ORDER.get_or_init(|| std::env::var_os(SEQUENTIAL_HANDLES_VAR).is_some())
+    }
+}
+
+/// The variable that asks for in-order handles. Set by the integration harness, not by a user.
+pub const SEQUENTIAL_HANDLES_VAR: &str = "ZELLIJ_SEQUENTIAL_PANE_HANDLES";
+
+/// Draws a handle nothing has spoken for.
+fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
+    if names_in_order() {
+        next_handle_in_order(is_taken)
+    } else {
+        generate_handle(is_taken)
+    }
+}
+
+/// The next unclaimed handle in a fixed walk of the handle space.
+///
+/// The counter is per thread because a thread is the unit a session is driven from here - one
+/// session's panes are numbered from zero whatever another session is doing beside it.
 ///
 /// The randomness this stands in for is tested where it lives, in
 /// `zellij_utils::pane_handle`; what this module is responsible for - uniqueness among live panes,
 /// reservation, release on close - is the same either way.
-#[cfg(test)]
-fn draw_handle(is_taken: impl Fn(&str) -> bool) -> String {
+fn next_handle_in_order(is_taken: impl Fn(&str) -> bool) -> String {
     use std::cell::Cell;
     use zellij_utils::pane_handle::{handle_space_size, nth_handle};
     thread_local! {
@@ -61,8 +86,22 @@ enum Claim {
     Reserved,
 }
 
-#[cfg(not(test))]
+/// The set of claims a draw must avoid.
+///
+/// One per session. A zellij server process serves exactly one session, so process-global IS the
+/// session's set - except in the integration suite, where several sessions share one process and
+/// each is driven from its own thread. In-order naming and a per-thread registry go together:
+/// a shared registry would make one session's handles depend on what another happened to be doing
+/// beside it, which is the same coin toss the ordering exists to remove.
 fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
+    if names_in_order() {
+        per_thread_registry()
+    } else {
+        process_registry()
+    }
+}
+
+fn process_registry() -> MutexGuard<'static, HashMap<String, Claim>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Claim>>> = OnceLock::new();
     REGISTRY
         .get_or_init(Default::default)
@@ -70,16 +109,7 @@ fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Under `cargo test` the registry is per thread, so each test gets a session of its own.
-///
-/// A test thread IS a session here: one test builds its panes, names them, and drops them without
-/// any other test's panes existing as far as it is concerned. Sharing one registry across a test
-/// binary would make the handles a pane is given depend on what its siblings happen to be doing in
-/// parallel - which a test that snapshots a rendered frame cannot live with, since the frame shows
-/// the handle. Everything this module promises is per session anyway, so scoping it to the thread
-/// weakens nothing the tests are checking.
-#[cfg(test)]
-fn registry() -> MutexGuard<'static, HashMap<String, Claim>> {
+fn per_thread_registry() -> MutexGuard<'static, HashMap<String, Claim>> {
     thread_local! {
         static REGISTRY: &'static Mutex<HashMap<String, Claim>> =
             Box::leak(Box::new(Mutex::new(HashMap::new())));

@@ -673,6 +673,14 @@ fn megabytes(bytes: u64) -> String {
 fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
     use zellij_utils::session_lifecycle::{install_pinned_exe, pin_needs_refresh, PinOutcome};
 
+    if refresh_is_deferred(pinned, mode) {
+        // Not skipped: handed on. The macOS signing step copies the new build into its own temp,
+        // signs THAT, and renames it over the pin only once it verifies - so a run that cannot
+        // sign leaves the previous signed pin in place instead of replacing it with an ad-hoc
+        // copy of the new build and reporting that it had touched nothing. It reports both halves
+        // when it is done, which is why nothing is pushed here.
+        return;
+    }
     let Ok(current_exe) = std::env::current_exe() else {
         report.push(Finding::needs_you(
             "pin",
@@ -728,6 +736,22 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
 
 #[cfg(not(unix))]
 fn check_pin_freshness(_report: &mut Report, _pinned: &Path, _mode: DoctorMode) {}
+
+/// Whether the pin refresh belongs to the macOS signing transaction rather than to this step.
+///
+/// Asked of the same function the signing side asks, so the two cannot disagree - see
+/// [`deferred_refresh`](crate::session_doctor_macos::deferred_refresh), which is also where the
+/// reason lives.
+#[cfg(all(unix, target_os = "macos"))]
+fn refresh_is_deferred(pinned: &Path, mode: DoctorMode) -> bool {
+    crate::session_doctor_macos::deferred_refresh(pinned, mode).is_some()
+}
+
+/// Nowhere else has a signature to lose, so nowhere else defers.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn refresh_is_deferred(_pinned: &Path, _mode: DoctorMode) -> bool {
+    false
+}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pin_state_of(name: &str, pinned: &Path) -> PinState {

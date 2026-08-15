@@ -21,7 +21,9 @@ use zellij_utils::consts::ZELLIJ_TMP_DIR;
 use zellij_utils::session_doctor::{Commander, DoctorMode, Finding, Report, SystemCommander};
 use zellij_utils::session_lifecycle::launchctl;
 use zellij_utils::session_service::{find_session_job, installed_launch_agents, launchd_label};
-use zellij_utils::session_signing::{sign_pin, SigningContext, SigningDir};
+use zellij_utils::session_signing::{
+    refresh_belongs_to_signing, sign_pin, SigningContext, SigningDir,
+};
 
 /// How long to wait for a pane to write its answer before giving up on it.
 ///
@@ -350,9 +352,25 @@ fn check_signature(
         // an environment variable holding a password is not a thing to want; it is the only way a
         // run over SSH can answer the keychain's dialog, and a run that cannot answer it hangs
         keychain_password: std::env::var("ZELLIJ_KEYCHAIN_PASSWORD").ok(),
+        refresh_from: deferred_refresh(pinned, mode),
         backup_dir: config_dir,
     };
     report.extend(sign_pin(commander, pinned, mode, &context).findings);
+}
+
+/// The build this run must put at the pin's path, when the refresh belongs to the signing
+/// transaction rather than to the step before it.
+///
+/// Glue only: the decision is
+/// [`refresh_belongs_to_signing`](zellij_utils::session_signing::refresh_belongs_to_signing), which
+/// is where the reasoning and the tests are. This supplies the two facts only the platform can
+/// answer.
+pub fn deferred_refresh(pinned: &Path, mode: DoctorMode) -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok();
+    let needs_refresh = current_exe
+        .as_deref()
+        .is_some_and(|exe| zellij_utils::session_lifecycle::pin_needs_refresh(exe, pinned));
+    refresh_belongs_to_signing(&SystemCommander, pinned, mode, current_exe, needs_refresh)
 }
 
 /// The keychain `codesign` will look in.

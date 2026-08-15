@@ -85,6 +85,10 @@ fn isolate_process_environment(test_root: &Path) {
     std::env::set_var("XDG_DATA_HOME", test_root.join("data"));
     std::env::set_var("XDG_CONFIG_HOME", test_root.join("config"));
     std::env::set_var("XDG_RUNTIME_DIR", test_root.join("runtime"));
+    // a pane frame shows its handle, and the handle's WIDTH moves the centered title beside it,
+    // so a random address makes every frame-bearing snapshot a coin toss - see
+    // `zellij_server::pane_handles`
+    std::env::set_var(zellij_server::SEQUENTIAL_HANDLES_VAR, "1");
     std::env::remove_var("ZELLIJ");
     std::env::remove_var("ZELLIJ_SESSION_NAME");
     std::env::remove_var("ZELLIJ_CONFIG_FILE");

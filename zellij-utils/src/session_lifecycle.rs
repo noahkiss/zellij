@@ -1365,6 +1365,61 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     })
 }
 
+/// Record which source build the pin was made from, when something other than
+/// [`install_pinned_exe`] put it there.
+///
+/// The macOS signing flow refreshes and signs as one transaction - see
+/// [`SigningContext::refresh_from`](crate::session_signing::SigningContext) - so it writes the pin
+/// itself and this is how the stamp beside it stays true. Without it the next run reads a stamp
+/// naming the previous build, decides the pin is stale, and refreshes a pin that is current.
+///
+/// The order is the same as `install_pinned_exe`'s and for the same reason: the identity is taken
+/// BEFORE the hash, so a source that changed while it was read leaves a key the next pass cannot
+/// match, which is a re-hash and a correction rather than a stale hash filed under a fresh identity.
+#[cfg(unix)]
+pub fn record_pin_refreshed_from(source: &Path, target: &Path) {
+    let key = source_identity(source);
+    let source_hash = sha256_of_file(source);
+    record_pin_source(target, source_hash.as_deref(), key.as_ref());
+}
+
+/// Signing is a macOS flow, and `session_signing` compiles everywhere. A stub rather than a
+/// `cfg` at the call site: the caller states what it wants once, and the platforms that have no
+/// pin to stamp say so here.
+#[cfg(not(unix))]
+pub fn record_pin_refreshed_from(_source: &Path, _target: &Path) {}
+
+/// Flush a temp the signing flow wrote, before it is renamed over the pin.
+///
+/// The same guarantee [`install_pinned_exe`] gives its own copy, and it now matters just as much:
+/// that rename IS the pin refresh when the two steps are one transaction, so a temp that is not on
+/// the disk is a pin that may not be there after a crash. Reported rather than best-effort, for the
+/// reason [`sync_pin_temp`] gives - the next statement renames it over the only good binary there
+/// is.
+///
+/// The file is opened again rather than kept: `codesign` wrote it, so this side never held a handle
+/// to it. `fsync` on a read-only descriptor is what it needs and all it needs.
+#[cfg(unix)]
+pub fn flush_pin_temp(temporary: &Path) -> Result<(), String> {
+    let handle = std::fs::File::open(temporary)
+        .map_err(|e| format!("could not open {} to flush it: {}", temporary.display(), e))?;
+    sync_pin_temp(&handle, temporary)
+}
+
+#[cfg(not(unix))]
+pub fn flush_pin_temp(_temporary: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Put the renamed NAME on the disk too, after the rename. Best-effort; see [`sync_pin_directory`].
+#[cfg(unix)]
+pub fn flush_pin_directory(directory: &Path) {
+    sync_pin_directory(directory);
+}
+
+#[cfg(not(unix))]
+pub fn flush_pin_directory(_directory: &Path) {}
+
 /// Whether [`install_pinned_exe`] would write, asked without writing.
 ///
 /// The same two questions that function asks, in the same order, so that a dry run reports the
@@ -3168,9 +3223,12 @@ mod tests {
     /// A pid that is certainly not in use: spawned, waited for, and therefore reaped.
     #[cfg(all(unix, not(target_os = "macos")))]
     fn a_pid_that_has_finished() -> u32 {
-        let mut child = std::process::Command::new("/bin/true")
+        // `/bin/sh`, not `/bin/true`: POSIX puts a shell at that path on every unix, while macOS
+        // keeps `true` in `/usr/bin` and has nothing at `/bin/true` to spawn.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
             .spawn()
-            .expect("every unix has one");
+            .expect("every unix has a shell");
         let pid = child.id();
         child.wait().expect("it exits at once");
         pid

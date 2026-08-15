@@ -5,7 +5,7 @@ expression: normalized(&host_pane_count_unchanged)
  Zellij (test)  Tab #1  + 
                            test-1                          │                           Pane #2
  Zellij (test)  Tab #1  +      Alt <[]>  VERTICAL  │$
-            Pane #1          │           Pane #2           │
+      Pane #1                │     Pane #2                 │
 $                            │█                            │
                              │                             │
                              │                             │
@@ -25,4 +25,4 @@ $                            │█                            │
                              │                             │
                              │                             │
  Ctrl + g  p  t  n  h  s  o  q         ...│
- Ascend: Ctrl + <o> + <]>                                                                                               
+ Ascend: Ctrl + <o> + <]>

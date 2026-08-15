@@ -305,15 +305,49 @@ impl Commander for SystemCommander {
             } else {
                 Stdio::null()
             });
+        // Run every child in a session of its own, so that none of them can ever prompt.
+        //
+        // **A null stdin is not enough, and assuming it was cost a release.** `security(1)` does
+        // not read a password from stdin: it opens `/dev/tty` and writes the prompt straight to
+        // the controlling terminal, which stdin cannot reach. So `security set-key-partition-list`
+        // with no `-k` blocked forever on a real Mac at 0.45.0-nkmk.8 - inside a graphical
+        // session, where the comment in `session_signing` had assumed a dialog would appear - and
+        // doctor produced an empty report, no output, no timeout, and one line on the pane's
+        // terminal:
+        //
+        // ```text
+        // (deprecated) password to unlock /Users/…/login.keychain-db:
+        // ```
+        //
+        // `setsid` puts the child in a new session with NO controlling terminal, so `/dev/tty`
+        // cannot be opened, the prompt cannot be written, and the tool fails fast and says why
+        // instead of waiting for a person who may not be watching. Doctor is run from launchd,
+        // from a pane and over SSH; none of those can answer a prompt, and a doctor that hangs is
+        // worse than every failure it exists to report.
+        //
+        // The error is ignored on purpose: `setsid` fails only when the child is already a process
+        // group leader, which after `fork` it is not - and if it somehow were, the child already
+        // has the property this asks for.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
         let mut child = command
             .spawn()
             .map_err(|e| format!("could not run {}: {}", program, e))?;
         if let Some(stdin) = stdin {
-            // Nothing writes here yet. It is the pipe a secret would go down instead of argv,
-            // where `ps` shows it to every other process on the machine - and the one secret
+            // One caller writes here: `session_signing::team_id_from_keychain` pipes a
+            // certificate into `openssl`. It is also the pipe a secret would go down instead of
+            // argv, where `ps` shows it to every other process on the machine - and the one secret
             // doctor handles, the keychain password, cannot use it: `security
             // set-key-partition-list` reads its password from `-k` and from nowhere else. See
-            // `session_signing::import_identity`, which says the same thing from the other end.
+            // `session_signing::allow_codesign_to_reach_the_key`, which says the same thing from
+            // the other end.
             let mut pipe = child
                 .stdin
                 .take()
@@ -477,6 +511,32 @@ pub fn recorded_failure(stderr: &str) -> CommandOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 0.45.0-nkmk.8 hang, at its root. `security(1)` writes its password prompt to the
+    /// CONTROLLING TERMINAL, not to stdin, so a null stdin - which this has always had - does not
+    /// stop it. A child in a session of its own has no controlling terminal to write to.
+    ///
+    /// Linux only, because it reads the session id out of `ps`, and the two `ps` implementations
+    /// spell that column differently. The behaviour it checks is the same on macOS: `setsid(2)` is
+    /// POSIX, and the `pre_exec` that calls it is gated on `unix`, not on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_child_runs_in_a_session_of_its_own_so_none_can_stop_at_a_prompt() {
+        let ours = unsafe { libc::getsid(0) };
+        let output = SystemCommander
+            .run("sh", &["-c", "ps -o sid= -p $$"], None)
+            .expect("could not run sh");
+        assert!(output.success, "{:?}", output);
+        let theirs: i32 = output
+            .stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{:?}", output.stdout));
+        assert_ne!(
+            theirs, ours,
+            "the child shares our session, so it can still be handed a terminal to prompt on"
+        );
+    }
 
     #[test]
     fn a_report_with_nothing_waiting_on_a_person_exits_zero() {

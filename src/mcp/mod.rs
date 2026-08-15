@@ -23,7 +23,7 @@ pub mod tools;
 use std::future::Future;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
@@ -121,6 +121,30 @@ impl ZellijMcp {
     }
 }
 
+/// How long a client may treat the tool list as fresh, in milliseconds.
+///
+/// The list is compiled in - see [`tools::TOOLS`] - so it cannot change while this process is
+/// alive, and a client that reaches a new list has by definition reconnected to a new process. An
+/// hour is therefore not a guess about staleness; it is a bound on how long a client will hold a
+/// list it would get back unchanged anyway.
+const TOOL_LIST_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// The tool list, with the cache metadata protocol version `2026-07-28` requires.
+///
+/// `ttlMs` and `cacheScope` (SEP-2549) are optional in rmcp's `ListToolsResult` because that one
+/// type also models results from older protocol versions - so a server that never sets them emits
+/// a result the 2026-07-28 schema rejects. Claude Code takes that era through `server/discover`
+/// and then refuses the whole list ("ttlMs expected number"), leaving the client connected with no
+/// tools at all. Setting the pair is what makes this server conform, rather than opting out of the
+/// era by narrowing `supported_protocol_versions`.
+fn tool_list_result() -> ListToolsResult {
+    ListToolsResult::with_all_items(tools::tool_list())
+        .with_ttl_ms(TOOL_LIST_TTL_MS)
+        // the narrower of the two scopes: nothing in the list is user-specific today, but a
+        // shared cache is worth nothing to a server a client spawns for itself over stdio
+        .with_cache_scope(CacheScope::Private)
+}
+
 /// A call that failed before, or instead of, reaching the CLI.
 fn failed(message: String, structured: Value) -> CallToolResult {
     let structured = structured.as_object().cloned().unwrap_or_default();
@@ -162,7 +186,7 @@ impl ServerHandler for ZellijMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
-        async move { Ok(ListToolsResult::with_all_items(tools::tool_list())) }
+        async move { Ok(tool_list_result()) }
     }
 
     fn call_tool(
@@ -248,6 +272,21 @@ mod tests {
             let annotations = tool.annotations.as_ref().expect("annotations");
             assert!(annotations.read_only_hint.is_some(), "{}", tool.name);
         }
+    }
+
+    #[test]
+    fn the_tool_list_carries_the_cache_metadata_the_2026_schema_requires() {
+        // a client that negotiates 2026-07-28 rejects the whole list when either field is absent,
+        // and reports a connected server with no tools rather than a protocol error
+        let result = tool_list_result();
+        assert_eq!(result.ttl_ms, Some(TOOL_LIST_TTL_MS));
+        assert_eq!(result.cache_scope, Some(CacheScope::Private));
+        assert_eq!(result.tools.len(), tools::TOOLS.len());
+
+        // and on the wire, where the client actually reads them
+        let wire = serde_json::to_value(&result).expect("the tool list serializes");
+        assert!(wire["ttlMs"].is_number(), "ttlMs missing: {}", wire);
+        assert_eq!(wire["cacheScope"], json!("private"), "{}", wire);
     }
 
     #[test]
