@@ -656,6 +656,7 @@ pub fn normalized(grid_snapshot: &GridSnapshot) -> String {
     let text = replace_unique_session_name(&grid_snapshot.text);
     let text = strip_swap_layout_indication(&text);
     let text = strip_tip_indication(&text);
+    let text = blank_pane_handle_indication(&text);
     strip_trailing_whitespace(&text)
 }
 
@@ -666,6 +667,42 @@ pub fn assert_same_rendered_grid(actual: &GridSnapshot, expected: &GridSnapshot,
         actual == expected,
         "{what}\n--- expected grid ---\n{expected}\n--- actual grid ---\n{actual}"
     );
+}
+
+/// Blanks the handle a pane frame draws at the right of its title row.
+///
+/// A handle is drawn from a random adjective/noun pair (`zellij_utils::pane_handle`), so a frame
+/// that shows one makes every snapshot of it a coin toss. The handle is overwritten in place
+/// rather than deleted: it sits in a fixed-width row, and dropping the characters would shift the
+/// pane boundary that follows it.
+///
+/// Two rows draw it, and each is overwritten with the character its row is padded with:
+///
+/// - the one-line title row, as the bracketed badge `[ handle ]` - padded with spaces, or with
+///   `─` where that row is filled with a rule (a stacked pane, or `top_only` frames);
+/// - the full frame's title row, as ` handle ` inside the run of `─` - padded with `─`, and the
+///   `|` the row puts between two right-side elements goes with it.
+///
+/// Both patterns are deliberately narrow: two lowercase words joined by a hyphen, plus the
+/// numeric suffix a collision adds. Row elements a human reads (`[ MY FOCUS ]`, `PIN [ ]`,
+/// `SCROLL: 1/2`) do not match, and neither does pane text - the framed form needs a `─` beside
+/// it, which only a frame row has.
+fn blank_pane_handle_indication(text: &str) -> String {
+    const HANDLE: &str = r"[a-z]+-[a-z]+(?:-[0-9]+)?";
+    let pad_with = |text: &str, pattern: String, filler: &str| -> String {
+        regex::Regex::new(&pattern)
+            .unwrap()
+            .replace_all(text, |captures: &regex::Captures| {
+                filler.repeat(captures[0].chars().count())
+            })
+            .to_string()
+    };
+    // the `─`-anchored forms first, longest first: a badge sitting in the fill of a stacked or
+    // `top_only` row has to be overwritten with the fill, not with spaces, and the bracketed pass
+    // below would otherwise take it
+    let text = pad_with(text, format!(r"─ \[ {} \] ?", HANDLE), "─");
+    let text = pad_with(&text, format!(r"─ {} \|?", HANDLE), "─");
+    pad_with(&text, format!(r"\[ {} \]", HANDLE), " ")
 }
 
 fn strip_tip_indication(text: &str) -> String {
