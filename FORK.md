@@ -287,9 +287,15 @@ Two of those are refusals rather than shapes, and they are the same refusal: a `
 client is attached to nothing, so "the focused pane" resolves against whichever client the server
 can find. From inside a pane that is right and is the point. From a script it is a pane the caller
 has never seen — which is a wrong answer for `dump-screen` and a closed tab for `close-tab`. So
-`close-pane`, `close-tab`, `move-tab` and `break-pane` exit 1 from outside the session unless they
-name a target, and `break-pane-right`/`break-pane-left`, which cannot name one, are refused
-outright. For those, inside a pane nothing changes.
+`close-pane`, `close-tab`, `move-tab`, `break-pane`, `write`, `write-chars`, `clear`,
+`edit-scrollback` and `rename-pane` exit 1 from outside the session unless they name a target, and
+`break-pane-right`/`break-pane-left`, which cannot name one, are refused outright. For those,
+inside a pane nothing changes.
+
+The five verbs that write into a pane or wipe one are in that list for the same reason the closing
+ones are, and are the worse half of it: keystrokes that land in the wrong pane have already been
+run by the shell that received them, and there is no undo for a `clear`. Each refusal names its own
+verb and the `--pane-id` that answers it.
 
 `dump-screen` is stricter: it refuses a targetless dump from **any** `zellij action` client,
 inside a pane or out. The client that types the command is not the client that holds the focus
@@ -301,6 +307,161 @@ convenience and not a security boundary: it is an environment variable, and a ca
 is trusted to mean it. And because that variable is written when a pane is spawned, it cannot be
 updated in a shell that is already running — so after `zellij action rename-session`, panes that
 predate the rename read as outside the session until they are replaced.
+
+### Where a new pane goes: `--new-tab`, `--near`, `--in-tab`
+
+`new-pane` placed a pane beside the focused one, or in the tab `--tab-id` named. Three flags say it
+without needing the focus to be anywhere in particular, which is what a script has:
+
+```
+zellij action new-pane --new-tab build -- cargo test    # a tab of its own, made now
+zellij action new-pane --near sunny-otter -- htop       # beside that pane, wherever it lives
+zellij action new-pane --in-tab logs -- tail -f app.log # into that tab, without going there
+```
+
+**`--new-tab [NAME]`** makes the tab and puts the pane in it, and reports both.
+
+```
+$ zellij action new-pane --new-tab build -- cargo test
+tab_id: 4
+pane_id: terminal_9
+handle: sunny-otter
+```
+
+A tab arrives with a pane in it, so this is one action and not two: the command is handed to the new
+tab as its first pane, which is why the tab holds the command's pane rather than a shell with the
+command's pane beside it. The tab is built from the session's own new-tab template like every other
+tab, so it keeps its status bars and its panes are written into the saved layout. Bare, zellij names
+the tab as it names any new tab. `--cwd`, `--close-on-exit`, `--start-suspended`, `--plugin`,
+`--handle` and `--no-focus` all mean what they mean elsewhere; `--name` and `--borderless` do not
+travel, because the first pane of a new tab is described by its command and nothing else - both are
+refused rather than dropped. Name the pane with `--handle`, or rename it once it is there.
+
+`--new-tab` is the one placement flag that **does** move the focus: whoever is attached is taken to
+the new tab, the way `new-tab` itself takes them. That is what a caller opening a tab usually means,
+and `--no-focus` is how to say otherwise. `--near` and `--in-tab` never move anybody.
+
+The flags that say where a pane goes in an existing tab - `--direction`,
+`--stacked`, `--floating`, `--in-place`, `--tab-id`, `--near-current-pane` - are refused, because
+`--new-tab` has already answered that question. So is bare `--blocking`: it waits for a pane to
+close and cannot name a pane in a tab that does not exist yet. `--block-until-exit` and its two
+siblings do work - they wait on the tab's first pane, which is this one.
+
+**`--near <pane>`** takes any pane target — `terminal_1`, a bare integer, a handle, a uuid — and
+opens the new pane beside that one, in whatever tab it lives in:
+
+```
+$ zellij action new-pane --near sunny-otter -- htop
+pane_id: terminal_10
+handle: quiet-pangolin
+```
+
+It is `--near-current-pane` generalised. That flag anchors to `$ZELLIJ_PANE_ID`, the pane the
+command was typed in, which is the right answer from inside a pane and no answer at all from a
+script that is not running in one. `--near` names the anchor instead, and the anchor's tab is where
+the pane lands — so `--near` conflicts with `--near-current-pane` and with every flag that names a
+tab. A target no live pane answers to is a miss, exit 2, in the resolver's own words.
+
+The anchor must be a **terminal** pane. It travels to the server as the pane the command came from,
+and that message carries a terminal id, so a target that resolves to a plugin pane is refused with a
+message and exit 1 rather than quietly placed somewhere else. `--in-tab` is the way to put a pane in
+a plugin pane's tab.
+
+**`--in-tab <name-or-id>`** puts the pane in a tab that already exists:
+
+```
+$ zellij action new-pane --in-tab logs -- tail -f app.log
+pane_id: terminal_11
+handle: merry-narwhal
+```
+
+A value that is all digits is read as the stable `TAB_ID`, and anything else as a tab name — both
+are looked up in the same `list-tabs` answer, so an id no tab holds is a miss exactly like a name no
+tab has: exit 2, nothing created. A tab *named* `3` is reachable by its own id rather than by that
+name, which is the one case the two forms disagree about; the names are the caller's to change.
+
+**Nothing moves the focus** — not the caller's, and not that of whoever is attached. `--in-tab` is
+`--tab-id` with a name lookup and `--no-focus` built in, because a script that puts a pane in
+another tab has not asked to be taken there, and a `zellij action` client that "focuses" something
+is moving a focus that belongs to somebody else. `--tab-id` is the spelling for a caller that does
+want the view to follow.
+
+### Text on stdin: `write-chars` and `paste`
+
+```
+cat prompt.txt | zellij action write-chars --pane-id sunny-otter
+zellij action paste --pane-id sunny-otter -    # `-` reads stdin even from a terminal
+```
+
+The text these two write is a positional argument, and both now do without it: given none, they
+read stdin to EOF. Text that reaches a pane through an argument is escaped twice — once for the
+shell that types the command, once for the shell in the pane — and a multi-line prompt or a here-doc
+does not survive that. A pipe carries it as it is, newlines and quotes included.
+
+- **No argument and a pipe** reads the pipe. **No argument and a terminal** is an error, exit 1,
+  rather than a command that appears to hang while it waits for a Ctrl-D nobody expected.
+- **`-` always reads stdin**, terminal or not. It is how you say you meant it.
+- **Empty stdin writes nothing and exits 2** — a well-formed request that changed nothing, which is
+  what a miss is everywhere else in the fork.
+- **The bound is 1 MiB**, and more than that is an error, exit 1. The text is delivered as
+  keystrokes, so the pane's program reads every byte of it: the bound is what keeps a mistyped
+  redirect from wedging a shell.
+- Not valid UTF-8 is an error, exit 1, naming `zellij action write` as the command that takes raw
+  bytes.
+- The read happens after the refusal above, so a `write-chars` with no `--pane-id` from outside a
+  pane is refused without draining the pipe.
+
+### `wait`: blocking on a pane instead of polling it
+
+```
+$ zellij action wait build --for exit
+waited_ms: 41207
+exit_status: 0
+```
+
+The command a script writes instead of `send-keys`, `sleep 2`, `dump-screen`, look, `sleep 2` again.
+That loop is what every agent and every CI wrapper around this fork was writing, and it is wrong in
+both directions at once: too slow when the thing finished immediately, and too quick when it did
+not. `wait` blocks until the pane does what you named, and then says how long that took.
+
+Three conditions, and a `--timeout` on all of them:
+
+- **`--for exit`** — the pane's command ends. It prints `exit_status:`, and `-` where the pane
+  closed and took its status with it.
+- **`--for quiet`** — the pane produces nothing for `--quiet-ms`, 500 by default. What a shell
+  looks like when it has finished printing and is waiting for you again.
+- **`--for match --match <regex>`** — a line the pane delivers matches. Rust regex syntax,
+  unanchored.
+
+**The exit code is about the wait, not about the command.** Met is 0, whatever `exit_status` says;
+a timeout is 2, the fork's miss, and prints nothing on stdout; a regex that does not compile is 1.
+This is deliberately unlike `new-pane --block-until-exit`, which exits with the command's own
+status — that one made the pane and owns it, while `wait` is a question about somebody else's, and
+a script has to be able to tell "the tests failed" from "I never saw them finish". A pane that
+closes while a `--for quiet` or `--for match` is waiting is a miss too: the condition can no longer
+happen.
+
+**`--timeout` is 300 seconds unless you say otherwise, and `--timeout 0` waits forever.** A wait
+with no bound is a hang, and a script gets one only by asking for it in those words.
+
+What `--for match` can see is worth knowing before you write a pattern against it:
+
+- **It matches the rendered screen, line by line, not the byte stream.** A line the terminal wrapped
+  arrives as two lines, and a pattern spanning the wrap matches neither half. Anchor on a short
+  distinctive string — `test result:`, not the whole summary line.
+- **Lines already on screen when the wait began are the baseline**, and do not match. Only a line
+  the pane delivers afterwards does. Use `dump-screen` for what is already there.
+- **A line identical to one already on screen is not new.** Each render carries the whole viewport
+  rather than a delta, so "new" is worked out by comparing against the last one, and on a rendered
+  screen a prompt printed twice is the same line twice.
+
+`--for exit` is the one condition that is a poll rather than a subscription — every 250ms, and
+nothing about it reaches the protocol. The render stream reports a pane *closing*, and a command
+pane that ends is held open instead by default: same event to a script, no message at all on that
+stream. Asking the session is what covers both, and it covers a pane that closed outright as well.
+
+`wait` is in the `read` band. It changes nothing — the band says what a verb does to the session,
+not how long it takes — which is also why the [audit ring](#list-events) does not record it.
 
 ### Pane handles
 
@@ -315,6 +476,8 @@ zellij action dump-screen --pane-id sunny-otter
 
 - **Every `--pane-id` takes one**, alongside `terminal_1`, `plugin_2`, a bare integer and a pane
   uuid. One parser serves all four forms, so a handle works anywhere an id does.
+- **It can be chosen** — `zellij action new-pane --handle build`, or `handle "build"` on a pane in a
+  layout — and otherwise the pane names itself. See [choosing one](#choosing-a-handle) below.
 - **It survives a restore, and the uuid does not.** The handle is serialized into the session
   snapshot and the restored pane comes back under it. The uuid is the pane's *lineage* and rotates,
   because a restored pane is a new process (`restored_from` links it to the old one). Address and
@@ -330,6 +493,42 @@ zellij action dump-screen --pane-id sunny-otter
 - **Where you see it**: the `HANDLE` column of `list-panes`, the `handle:` key of every creation
   command, the `list-tree` outline, both halves of a `go-to-pane` report, and the pane frame.
 
+#### Choosing a handle
+
+```
+zellij action new-pane --handle build -- cargo watch
+```
+```kdl
+layout {
+    pane handle="build" command="cargo" { args "watch" }
+}
+```
+
+A generated handle is memorable but not predictable, and a script that wants to reach the pane it
+just made has to read the id out of the report and carry it. A chosen handle is the other way round:
+the caller decides the address before the pane exists, and every later command already knows it.
+
+- **The grammar** is up to four lowercase words joined by dashes, each at most 16 characters, at
+  most 40 in all, at least one letter somewhere. That is what keeps one `--pane-id` able to take
+  four forms: `terminal_1` has an underscore, `7` is all digits, a uuid is five groups. A name that
+  reads like one of those is refused when it is typed, not when it is used. So is a name whose first
+  word is `terminal` or `plugin` — `terminal-1` beside `terminal_1` is a name that gets typed wrong
+  on the day it matters.
+- **A handle a live pane already holds is an error**, exit 1, and nothing is created. A generated
+  handle rerolls around a collision; a chosen one must not, because the caller asked for *this*
+  name and a different one would answer a question nobody put. The check happens before the pane is
+  made, so the refusal costs nothing.
+- **The pane names itself first.** A pane is born with a generated handle and the chosen one is
+  given to it immediately after, by the client that holds the report — so `handle:` in the report is
+  always the name the caller asked for. This is also why `--handle` cannot ride with the blocking
+  family: those answer with an exit status instead of a report naming a pane.
+- **It is stored like any other handle**, which means it survives a restore: the snapshot carries
+  `pane_handle="build"` and the pane comes back at that address.
+- **In a layout**, `handle` is the spelling a person writes and `pane_handle` is what serialization
+  writes; both reach the same field, and a saved layout keeps working. A layout that names a handle
+  another pane in the same layout already took loses the tie rather than failing the restore — a
+  session coming back is not a place to refuse work — so the last pane to ask gets a generated name.
+
 #### On the frame
 
 The handle is drawn at the right of the pane's title row, the mirror of the title at the left, in
@@ -344,6 +543,46 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
   shows none of it — there is no short form.
 - A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
   counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
+
+### Pane notes
+
+```
+$ zellij action set-pane-note build --color warn "waiting on review"
+note: waiting on review
+color: warn
+
+$ zellij action set-pane-note build          # no text clears it
+note: -
+```
+
+A short line drawn on the pane's frame, saying what is happening in that pane. The handle answers
+"which pane is this"; the note answers "what is going on in it", which is the question a session
+full of agent-driven panes leaves a human asking.
+
+- **Four colours, named for what they mean** — `--color error|warn|ok|info`, `info` by default.
+  They are not colour values: the note is drawn inside whatever theme the reader is using, and each
+  name maps onto the colour that theme already picked for that meaning, so a note is legible in all
+  of them.
+- **The server leaves one itself.** A command pane whose command exits non-zero and is held open is
+  marked `exit 7`, in `error`. The frame already said `EXIT CODE: 7` while the pane was held, but
+  that line goes when the pane is scrolled or re-run, and nothing outside the server could read it
+  at all. The note is the durable mark, and `list-panes` prints it. It is cleared when the pane is
+  re-run, or by hand.
+- **`list-panes` has a `NOTE` column and `list-tree` a `note:` field**, both `error:exit 7` —
+  colour and words together, because the colour is the meaning and a table without it cannot tell a
+  pane that finished from one that failed. A pane with no note prints `-`.
+- **A note is not saved into a snapshot.** It describes the pane's live state, and a session
+  restored tomorrow would come back carrying yesterday's "waiting on review". A restored pane comes
+  back unmarked, deliberately, which is the opposite of what a handle does.
+
+On the frame it sits immediately left of the handle, and is the last element offered room:
+
+- The title takes what it needs, then the scroll and pin indications, then the handle, then the
+  note. A narrowing frame loses the note first.
+- **It is truncated where the handle is dropped**, with a `…`. Half an address reaches no pane;
+  half a sentence still says something.
+- A floating pane's pin checkbox still owns the right edge, for the same reason it always did — it
+  is a click target found by counting back from there.
 
 ### `list-tree`
 
@@ -362,6 +601,56 @@ otherwise had to do by tab id yourself. A tab with no panes still gets its line.
 `--json` is the same join rather than a summary of it: each tab exactly as `list-tabs --json`
 reports it, with its `list-panes --json` entries under a `panes` key. Asking for the tree never
 returns less than asking the two questions separately would.
+
+### `list-events`
+
+```
+$ zellij action list-events
+AT                        VERB        TARGET                  ORIGIN    COUNT
+2026-08-14T18:03:12.345Z  go-to-tab   tab_1 logs              client 1  1
+2026-08-14T18:03:14.902Z  scroll-up   terminal_3 sunny-otter  client 1  38
+2026-08-14T18:03:19.881Z  close-pane  terminal_3              cli       1
+```
+
+Who moved my tab. In a session a person and several agents are all driving at once, something
+changes and nobody knows which of them did it — and every other query in this fork answers what the
+session *is*, not what happened to it. The server keeps the last 256 things that changed, in
+memory, and this reads them back oldest first, so the end of the table is now.
+
+- **`ORIGIN` names the three ways an action can arrive**: `client 1` is somebody's keyboard,
+  `cli` is a `zellij action` call, `plugin 3` is a plugin. All three pass through the one function
+  that routes an action, so the ring sees keyboard and script alike rather than only the half a
+  script produces.
+- **`TARGET` is the name that was true at the time** — `terminal_3 sunny-otter`, `tab_1 logs`,
+  resolved as the action completed rather than when you read it. A pane the action closed has no
+  handle left to print, and shows its id alone. `-` means the action named nothing.
+- **A run of the same verb, on the same target, from the same origin is one row with a `COUNT`.**
+  A held scroll key is 38, not 38 rows: without that, the ring's whole capacity is one keypress and
+  the tab move you came looking for has already fallen out of it.
+- **`--json` carries the same rows**, structured.
+
+What is deliberately not in it:
+
+- **The `read` band**, which by definition changed nothing. The bands `zellij action --help` is
+  grouped by are the same list this reads, so the two can never disagree about which verbs matter.
+- **Keystrokes typed into a pane.** Every one is a `write`, and they would be the whole ring. The
+  same verbs *from the CLI* are recorded: a script writing into a pane is an event with an author
+  worth finding.
+- **Actions that failed.** The ring remembers what happened, not what was asked for.
+- **The CLI's own plumbing** — the target lookup every addressed call makes before it acts, and the
+  naming step that finishes a `new-pane --handle`. Each would put a row beside every real one,
+  describing it.
+
+`VERB` is the action the session ran, spelled the way the CLI spells its verbs wherever the two
+agree. One CLI verb can become several actions — `new-pane` is a `new-tiled-pane` or a
+`new-floating-pane`, and the ring says which — so it is not always the exact word that was typed.
+
+One thing to know about creations: a pane made with `--handle build` is recorded under the name it
+was *born* with, because the chosen name is given to it a moment later, by the client holding the
+report. The `set-pane-note` or the `close-pane` that comes after says `build`.
+
+This is a ring, not a log: it is bounded, it is in memory, nothing about it is written to disk, and
+it is gone when the server stops. It is for the question you are asking now.
 
 ### `go-to-pane`
 
@@ -2995,6 +3284,33 @@ if [ -n "$(zellij action go-to-tab-name build --no-focus)" ]; then echo "the tab
 The flag rides on the existing
 `GoToTabNameAction` message (field 3), so it adds no message to the client/server contract; the
 plugin API's `focus_or_create_tab` is unchanged and always focuses.
+
+### `subscribe --timestamps`
+
+```
+$ zellij subscribe --pane-id sunny-otter --timestamps
+2026-08-14T18:03:12.345Z $ cargo test
+2026-08-14T18:03:12.345Z test result: ok. 37 passed
+$ zellij subscribe --pane-id sunny-otter --format json --timestamps
+{"event":"pane_update","pane_id":"terminal_3",...,"ts":"2026-08-14T18:03:12.345Z"}
+```
+
+A stream of pane renders with no times in it cannot answer "how long did that take" or "did this
+appear before or after that", and a watcher that has to stamp the lines itself has already lost the
+moment they arrived. The flag puts the time on each line: a prefix and a space in raw mode, a `ts`
+key in json.
+
+- **The format is RFC3339, UTC, to the millisecond** — `2026-08-14T18:03:12.345Z`. It sorts as text
+  and every log tool already reads it.
+- **It is a print time, not a server time.** The clock is read by this client as the line leaves it,
+  which is after the pane produced the output by however long the render and the socket took. The
+  server does not stamp the update, so there is no time here that could be compared against another
+  machine's.
+- **One stamp per update.** Every line of one render carries the same time, because they are printed
+  in one go; a stamp that crept forward between the lines of a frame would be describing something
+  that did not happen.
+- Without the flag the output is byte for byte what it was, and in json the `ts` key is simply
+  absent — added, like every key in the fork, never renamed or removed.
 
 ## Assessed and deliberately not built
 

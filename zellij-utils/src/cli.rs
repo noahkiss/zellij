@@ -1,4 +1,4 @@
-use crate::data::{Direction, InputMode, PaneSignal, Resize, UnblockCondition};
+use crate::data::{Direction, InputMode, NoteColor, PaneSignal, Resize, UnblockCondition};
 use crate::setup::Setup;
 use crate::{
     consts::{ZELLIJ_CONFIG_DIR_ENV, ZELLIJ_CONFIG_FILE_ENV},
@@ -165,7 +165,9 @@ pub enum Command {
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]
 pub struct SubscribeCli {
-    /// Pane ID(s) to subscribe to (terminal_1, plugin_2, or a bare number like 1)
+    /// The pane(s) to subscribe to: terminal_1, plugin_2, a bare integer (3 means terminal_3), a
+    /// handle like sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of
+    /// them in its PANE_ID and HANDLE columns
     #[clap(
         short,
         long,
@@ -191,6 +193,22 @@ pub struct SubscribeCli {
     /// Preserve ANSI styling in the output
     #[clap(long)]
     pub ansi: bool,
+
+    /// Stamp every line with the UTC time it was printed: `2026-08-14T18:03:12.345Z ` before each
+    /// raw line, a `ts` key in each json object. It is when this client printed the line, not when
+    /// the pane produced it
+    #[clap(long)]
+    pub timestamps: bool,
+}
+
+/// The stamp `subscribe --timestamps` puts on a line: RFC3339, UTC, to the millisecond.
+///
+/// It is taken once per update, so every line of one render shares it - the lines were printed in
+/// one go and a stamp that drifted across them would say otherwise. It is a *print* time: the
+/// client's clock when the line left it, which is later than the pane's output by however long the
+/// render and the socket took, and is the only time this side of the connection can honestly claim.
+pub fn event_timestamp(at: std::time::SystemTime) -> String {
+    humantime::format_rfc3339_millis(at).to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ValueEnum)]
@@ -961,8 +979,137 @@ pub enum SnapshotCli {
     },
 }
 
+/// The condition a `zellij action wait` blocks on.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitFor {
+    /// The pane's command ends, or the pane goes away.
+    Exit,
+    /// The pane stops producing output for `--quiet-ms`.
+    Quiet,
+    /// A line the pane delivers matches `--match`.
+    Match,
+}
+
+impl Default for WaitFor {
+    fn default() -> Self {
+        WaitFor::Exit
+    }
+}
+
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum CliAction {
+    /// Block until a pane does something, then say what it did
+    ///
+    /// This is the one command that replaces a poll loop. Instead of `send-keys`, `sleep 2`,
+    /// `dump-screen`, look, `sleep 2` again, a script says what it is waiting for and gets woken
+    /// when it happens.
+    ///
+    ///   zellij action wait build --for exit
+    ///
+    ///   zellij action wait build --for quiet --quiet-ms 2000
+    ///
+    ///   zellij action wait build --for match --match 'test result:'
+    ///
+    /// Exit 0 means the condition was met, and the report says how long it took. Exit 2 means it
+    /// was not - the timeout ran out, or the pane closed while waiting for something else - and
+    /// nothing is printed on stdout. Exit 1 is a malformed call, such as a regex that does not
+    /// compile.
+    ///
+    /// `--for exit` prints `exit_status:`, and the wait's OWN exit code stays 0 whatever that
+    /// status is. This is deliberately unlike `new-pane --block-until-exit`, which exits with the
+    /// command's status: that one owns the pane it made, while `wait` is a question about someone
+    /// else's pane, and a script has to be able to tell "the test failed" from "I never saw it
+    /// finish".
+    ///
+    /// What `--for match` sees is the rendered viewport, line by line, as the pane draws it - not
+    /// the byte stream. A line the terminal wrapped arrives as two lines, so a pattern spanning
+    /// the wrap never matches; anchor on a short distinctive string. Lines already on screen when
+    /// the wait began are the baseline and do not match: only a line the pane delivers afterwards
+    /// does. A line identical to one already on screen is not new, and is not matched either.
+    Wait {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
+        #[clap(value_parser)]
+        pane_id: String,
+
+        /// What to wait for: the pane's command to end, the pane to fall quiet, or a line to
+        /// match
+        #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
+        wait_for: WaitFor,
+
+        /// The regex a delivered line must match, for `--for match`. Rust regex syntax, unanchored
+        #[clap(long = "match", value_parser, required_if_eq("wait_for", "match"))]
+        pattern: Option<String>,
+
+        /// How long a pane must produce nothing to count as quiet, for `--for quiet`
+        #[clap(long, value_parser, default_value = "500")]
+        quiet_ms: u64,
+
+        /// Seconds to wait before giving up and exiting 2. `0` waits forever, which is a hang a
+        /// script has to ask for by name
+        #[clap(short, long, value_parser, default_value = "300")]
+        timeout: u64,
+    },
+    /// List what has changed the session lately, and who changed it
+    ///
+    /// The answer to "who moved my tab" in a session a person and several agents are all driving
+    /// at once. The server keeps the last 256 things that changed - in memory, never on disk -
+    /// with the time, the verb, what it touched and where it came from:
+    ///
+    /// one row each. The columns are AT (UTC, to the millisecond), VERB, TARGET, ORIGIN and
+    /// COUNT. Newest last, so the end of the table is now.
+    ///
+    /// TARGET is the name that was true at the time - `terminal_3 sunny-otter`, `tab_1 logs`, or
+    /// `-` for an action that named nothing. ORIGIN is `client N` for somebody's keyboard, `cli`
+    /// for a `zellij action` call, and `plugin N` for a plugin.
+    ///
+    /// What is NOT in it: anything in the `read` band, which changed nothing; keystrokes typed
+    /// into a pane, which would fill the ring by themselves; and actions that failed - the ring
+    /// remembers what happened, not what was asked for. A run of the same verb on the same target
+    /// from the same origin is one row with a `COUNT`, so a held scroll key does not push the tab
+    /// move you are looking for out of the ring.
+    ///
+    /// `VERB` is the action the session ran, spelled the way the CLI spells its verbs. One verb
+    /// can become several actions, so it is not always the exact word that was typed.
+    ListEvents {
+        /// Output as JSON
+        #[clap(long)]
+        json: bool,
+    },
+    /// Leave a short note on a pane, or clear the one it has
+    ///
+    /// The note is drawn on the pane's frame, in the colour its meaning has in the theme. It is
+    /// how an agent says what it is doing with a pane to whoever is looking at the session:
+    ///
+    ///   zellij action set-pane-note build --color warn "waiting on review"
+    ///
+    ///   zellij action set-pane-note build            # no text clears it
+    ///
+    /// The server leaves one of these itself, coloured `error`, on a pane whose command failed and
+    /// is being held open - `exit 7`. Clearing it is yours to do, or it goes when the pane is
+    /// re-run.
+    ///
+    /// A note describes the pane right now, not what the pane is, so it is NOT saved into a
+    /// session snapshot: a restored pane comes back without one. `list-panes` and `list-tree`
+    /// print it.
+    SetPaneNote {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
+        #[clap(value_parser)]
+        pane_id: String,
+
+        /// The note. Leave it out to clear the pane's note. Long notes are cut to fit the frame,
+        /// which never gives up room the title or the handle needs
+        #[clap(value_parser)]
+        note: Option<String>,
+
+        /// What the note means, which is the colour it is drawn in
+        #[clap(long, value_enum, value_parser, default_value = "info")]
+        color: NoteColor,
+    },
     /// Write raw bytes into a pane, as if they had been typed
     Write {
         /// The bytes, as space-separated decimal values (27 91 65 is Escape [ A)
@@ -976,9 +1123,12 @@ pub enum CliAction {
     /// Write text into a pane, as if it had been typed
     ///
     /// No newline is added: `send-keys Enter` is how you submit what you wrote.
+    ///
+    /// With no text and something piped in, the text is read from stdin to EOF - so a multi-line
+    /// prompt goes in without shell escaping. Exits 2 if what arrives is empty.
     WriteChars {
-        /// The text to write
-        chars: String,
+        /// The text to write. Leave it out, or pass `-`, to read it from stdin instead (1 MiB max)
+        chars: Option<String>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
         /// in its PANE_ID and HANDLE columns. Without this, the focused pane
@@ -989,9 +1139,12 @@ pub enum CliAction {
     ///
     /// The pane's program is told the text was pasted rather than typed, which is what keeps an
     /// editor from auto-indenting it and a shell from running each line as it arrives.
+    ///
+    /// With no text and something piped in, the text is read from stdin to EOF - so a file goes in
+    /// without shell escaping. Exits 2 if what arrives is empty.
     Paste {
-        /// The text to paste
-        chars: String,
+        /// The text to paste. Leave it out, or pass `-`, to read it from stdin instead (1 MiB max)
+        chars: Option<String>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
         /// in its PANE_ID and HANDLE columns. Without this, the focused pane
@@ -1250,6 +1403,9 @@ pub enum CliAction {
     ///
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
     /// handle>`. Without --direction the pane splits whichever side has the most room.
+    ///
+    /// Where it lands: beside the focused pane by default, beside the pane --near names, in the tab
+    /// --in-tab or --tab-id names, or in a tab of its own with --new-tab, which reports `tab_id:`.
     NewPane {
         /// Split the pane it opens beside towards right or down. Without it, zellij splits
         /// whichever side has the most room
@@ -1294,6 +1450,18 @@ pub enum CliAction {
         /// Name of the new pane
         #[clap(short, long, value_parser)]
         name: Option<String>,
+
+        /// The handle to give the pane, instead of the two-word one it would name itself: lowercase
+        /// words joined by dashes, eg. build. A handle another live pane holds is an error
+        #[clap(
+            long,
+            value_parser = chosen_handle,
+            conflicts_with("blocking"),
+            conflicts_with("block_until_exit"),
+            conflicts_with("block_until_exit_success"),
+            conflicts_with("block_until_exit_failure")
+        )]
+        handle: Option<String>,
 
         /// Close the pane immediately when its command exits
         #[clap(short, long, requires("command"))]
@@ -1364,10 +1532,44 @@ pub enum CliAction {
         #[clap(skip)]
         unblock_condition: Option<UnblockCondition>,
 
+        /// Put the pane in a tab of its own, made now, and report `tab_id:` as well as the pane.
+        /// With a NAME the tab is called that; bare, zellij names it as it names any new tab. The
+        /// pane in it cannot be named with --name or drawn with --borderless: use --handle, or
+        /// rename it once it is there
+        #[clap(
+            long,
+            value_name = "NAME",
+            num_args(0..=1),
+            conflicts_with("direction"),
+            conflicts_with("stacked"),
+            conflicts_with("in_place"),
+            conflicts_with("floating"),
+            conflicts_with("tab_id"),
+            conflicts_with("near_current_pane"),
+            conflicts_with("blocking"),
+            conflicts_with("name"),
+            conflicts_with("borderless")
+        )]
+        new_tab: Option<Option<String>>,
+
         /// Open the pane beside the pane this command was run from, rather than beside whichever
         /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
+        /// Open the pane beside this one, in whatever tab it lives in: terminal_1, a bare integer
+        /// (3 means terminal_3), a handle like sunny-otter, or a pane uuid. It must name a terminal
+        /// pane - a plugin pane cannot anchor one
+        #[clap(
+            long,
+            value_name = "PANE",
+            value_parser,
+            conflicts_with("near_current_pane"),
+            conflicts_with("in_place"),
+            conflicts_with("tab_id"),
+            conflicts_with("in_tab"),
+            conflicts_with("new_tab")
+        )]
+        near: Option<String>,
         /// Open the pane beside the pane this command was run from and leave every client's focus
         /// where it is
         #[clap(long)]
@@ -1385,6 +1587,18 @@ pub enum CliAction {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
+        /// A tab that already exists, by name or by stable id, without going there: nothing moves
+        /// the focus. A tab nothing answers to is a miss and nothing is created
+        #[clap(
+            long,
+            value_name = "NAME_OR_ID",
+            value_parser,
+            conflicts_with("tab_id"),
+            conflicts_with("new_tab"),
+            conflicts_with("near_current_pane"),
+            conflicts_with("in_place")
+        )]
+        in_tab: Option<String>,
     },
     /// Open a file in a new pane running your $EDITOR
     ///
@@ -2258,6 +2472,129 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
         .unwrap()
 }
 
+/// A `--handle` value, refused at the parser when it is not a handle anyone could choose.
+///
+/// The reasons live in `pane_handle` with the grammar they come from; this is the clap end of it,
+/// so a bad name is caught before a pane is made rather than after.
+fn chosen_handle(value: &str) -> Result<String, String> {
+    match crate::pane_handle::chosen_handle_error(value) {
+        Some(reason) => Err(reason),
+        None => Ok(value.to_owned()),
+    }
+}
+
+impl CliAction {
+    /// The handle `--handle` chose, taken out of the request for the client to apply.
+    ///
+    /// A pane names itself when it is born and the CLI has no say in that moment, so a chosen
+    /// handle is given to the pane just after, by the client that is holding the report and knows
+    /// which pane was made. Taking it here is what keeps a handle from also travelling as part of
+    /// the creation action, where nothing would look at it.
+    pub fn take_chosen_handle(&mut self) -> Option<String> {
+        match self {
+            CliAction::NewPane { handle, .. } => handle.take(),
+            _ => None,
+        }
+    }
+
+    /// The tab `--in-tab` named, for the caller that can ask the session which tab that is.
+    ///
+    /// The flag takes a name or a stable id, and neither can be turned into the `--tab-id` the
+    /// action carries without the session's own list of tabs. So the CLI asks first and rewrites
+    /// the request with [`CliAction::place_in_tab`]; nothing downstream knows the flag existed.
+    pub fn in_tab_target(&self) -> Option<&str> {
+        match self {
+            CliAction::NewPane { in_tab, .. } => in_tab.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The pane `--near` named, for the caller that can ask the session which pane that is.
+    ///
+    /// Same shape as [`CliAction::in_tab_target`], for the same reason: a handle names a pane only
+    /// against the session's live panes, and the anchor has to be a pane id by the time the action
+    /// goes out.
+    pub fn near_target(&self) -> Option<&str> {
+        match self {
+            CliAction::NewPane { near, .. } => near.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Anchors the new pane to the pane `--near` turned out to name.
+    ///
+    /// The anchor travels as the pane the command came from - the same channel
+    /// `--near-current-pane` reads out of `$ZELLIJ_PANE_ID` - so what is left here is to say that
+    /// there is one. The id itself is carried by the client, which is what talks to the server.
+    pub fn anchor_near(&mut self) {
+        if let CliAction::NewPane {
+            near,
+            near_current_pane,
+            ..
+        } = self
+        {
+            *near = None;
+            *near_current_pane = true;
+        }
+    }
+
+    /// Puts the pane in the tab `--in-tab` turned out to name, and leaves every focus alone.
+    ///
+    /// `no_focus` is the flag's whole point rather than a default it happens to take: a script that
+    /// puts a pane in another tab has not asked to be taken there, and a `zellij action` client
+    /// that "focuses" something is moving a focus that belongs to whoever is attached. `--tab-id`
+    /// is the spelling for a caller that does want the view to follow.
+    pub fn place_in_tab(&mut self, tab: usize) {
+        if let CliAction::NewPane {
+            in_tab,
+            tab_id,
+            no_focus,
+            ..
+        } = self
+        {
+            *in_tab = None;
+            *tab_id = Some(tab);
+            *no_focus = true;
+        }
+    }
+}
+
+/// The most text `write-chars` and `paste` will take from stdin, in bytes.
+///
+/// A megabyte is far more than anyone types and far less than a file that was piped in by mistake.
+/// The text is delivered to the pane as keystrokes, so the pane's program reads all of it: a bound
+/// here is what keeps `zellij action paste < some.iso` from being a way to wedge a shell.
+pub const MAX_STDIN_TEXT_BYTES: usize = 1024 * 1024;
+
+/// The text a `write-chars` or a `paste` was given on stdin, bounded and checked.
+///
+/// `Ok("")` is not an error here - an empty stdin is a well-formed request that writes nothing, and
+/// the caller is what turns it into the miss it is. Both errors are the caller's exit 1: text that
+/// is not text, and text past the bound.
+pub fn text_from_stdin<R: std::io::Read>(reader: R, verb: &str) -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    // one byte past the bound, so a file exactly at it still passes and anything longer is caught
+    // without reading the rest of it
+    std::io::Read::take(reader, MAX_STDIN_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("`{}` could not read stdin: {}", verb, e))?;
+    if bytes.len() > MAX_STDIN_TEXT_BYTES {
+        return Err(format!(
+            "`{}` reads at most {} bytes from stdin, and this is more than that. \
+             Send it in pieces, or write the file into the pane's program another way.",
+            verb, MAX_STDIN_TEXT_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "`{}` writes text, and what arrived on stdin is not valid UTF-8. \
+             `zellij action write` takes raw bytes.",
+            verb
+        )
+    })
+}
+
 /// Whether a command that acts on "the focused thing" has been given something to act on.
 ///
 /// A `zellij action` client is not attached to anything. It has no focus of its own, so the server
@@ -2289,6 +2626,19 @@ pub fn missing_target_from_outside_a_pane(
     };
     match action {
         CliAction::ClosePane { pane_id: None } => needs("close-pane", "--pane-id", "list-panes"),
+        // writing into a pane is the same footgun as closing one: the keystrokes land in whichever
+        // pane the server found, and a shell that received them has already run them
+        CliAction::Write { pane_id: None, .. } => needs("write", "--pane-id", "list-panes"),
+        CliAction::WriteChars { pane_id: None, .. } => {
+            needs("write-chars", "--pane-id", "list-panes")
+        },
+        CliAction::Clear { pane_id: None } => needs("clear", "--pane-id", "list-panes"),
+        CliAction::EditScrollback { pane_id: None, .. } => {
+            needs("edit-scrollback", "--pane-id", "list-panes")
+        },
+        CliAction::RenamePane { pane_id: None, .. } => {
+            needs("rename-pane", "--pane-id", "list-panes")
+        },
         CliAction::CloseTab { tab_id: None } => needs("close-tab", "--tab-id", "list-tabs"),
         CliAction::MoveTab { tab_id: None, .. } => needs("move-tab", "--tab-id", "list-tabs"),
         CliAction::BreakPane { pane_id, .. } if pane_id.is_empty() => {
@@ -2413,6 +2763,23 @@ mod tests {
     fn subscribe_format_default_raw() {
         let s = parse_subscribe(&["subscribe", "--pane-id", "terminal_1"]);
         assert!(matches!(s.format, SubscribeFormat::Raw));
+    }
+
+    #[test]
+    fn subscribe_timestamps_are_off_until_asked_for() {
+        let bare = parse_subscribe(&["subscribe", "--pane-id", "terminal_1"]);
+        assert!(!bare.timestamps);
+        let stamped = parse_subscribe(&["subscribe", "--pane-id", "terminal_1", "--timestamps"]);
+        assert!(stamped.timestamps);
+    }
+
+    #[test]
+    fn an_event_timestamp_is_rfc3339_utc_to_the_millisecond() {
+        let epoch = event_timestamp(std::time::UNIX_EPOCH);
+        assert_eq!(epoch, "1970-01-01T00:00:00.000Z");
+        let later =
+            event_timestamp(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_234_567));
+        assert_eq!(later, "1970-01-01T00:20:34.567Z");
     }
 
     #[test]
@@ -2633,6 +3000,11 @@ mod tests {
             vec!["break-pane"],
             vec!["break-pane-right"],
             vec!["break-pane-left"],
+            vec!["write", "27"],
+            vec!["write-chars", "hello"],
+            vec!["clear"],
+            vec!["edit-scrollback"],
+            vec!["rename-pane", "build"],
         ] {
             let action = parse_action(&args);
             assert!(
@@ -2640,6 +3012,24 @@ mod tests {
                 "expected `{}` to need a target",
                 args.join(" ")
             );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_verb_and_the_flag_that_answers_it() {
+        for (args, verb) in [
+            (vec!["write", "27"], "write"),
+            (vec!["write-chars", "hello"], "write-chars"),
+            (vec!["clear"], "clear"),
+            (vec!["edit-scrollback"], "edit-scrollback"),
+            (vec!["rename-pane", "build"], "rename-pane"),
+        ] {
+            let action = parse_action(&args);
+            let message = missing_target_from_outside_a_pane(&action, false)
+                .unwrap_or_else(|| panic!("expected `{}` to be refused", args.join(" ")));
+            assert!(message.contains(verb), "got: {}", message);
+            assert!(message.contains("--pane-id"), "got: {}", message);
+            assert!(message.contains("list-panes"), "got: {}", message);
         }
     }
 
@@ -2654,6 +3044,11 @@ mod tests {
             vec!["break-pane"],
             vec!["break-pane-right"],
             vec!["break-pane-left"],
+            vec!["write", "27"],
+            vec!["write-chars", "hello"],
+            vec!["clear"],
+            vec!["edit-scrollback"],
+            vec!["rename-pane", "build"],
         ] {
             let action = parse_action(&args);
             assert_eq!(
@@ -2672,6 +3067,11 @@ mod tests {
             vec!["close-tab", "--tab-id", "2"],
             vec!["move-tab", "left", "--tab-id", "2"],
             vec!["break-pane", "--pane-id", "terminal_1"],
+            vec!["write", "27", "--pane-id", "terminal_1"],
+            vec!["write-chars", "hello", "--pane-id", "sunny-otter"],
+            vec!["clear", "--pane-id", "terminal_1"],
+            vec!["edit-scrollback", "--pane-id", "terminal_1"],
+            vec!["rename-pane", "build", "--pane-id", "terminal_1"],
         ] {
             let action = parse_action(&args);
             assert_eq!(
@@ -2696,6 +3096,343 @@ mod tests {
             let action = parse_action(&args);
             assert_eq!(missing_target_from_outside_a_pane(&action, false), None);
         }
+    }
+
+    /// The actions a `zellij action` command line turns into, with no session to ask.
+    fn actions_of(args: &[&str]) -> Result<Vec<Action>, String> {
+        Action::actions_from_cli(
+            parse_action(args),
+            Box::new(|| std::path::PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+    }
+
+    #[test]
+    fn new_tab_takes_a_name_or_none_at_all() {
+        let named = parse_action(&["new-pane", "--new-tab", "build"]);
+        let bare = parse_action(&["new-pane", "--new-tab"]);
+        let without = parse_action(&["new-pane"]);
+        let new_tab = |action: &CliAction| match action {
+            CliAction::NewPane { new_tab, .. } => new_tab.clone(),
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+        assert_eq!(new_tab(&named), Some(Some("build".to_owned())));
+        assert_eq!(new_tab(&bare), Some(None));
+        assert_eq!(new_tab(&without), None);
+    }
+
+    #[test]
+    fn a_pane_in_a_new_tab_is_one_tab_carrying_one_pane() {
+        // the point of the flag: one action, so the tab and the pane it holds are made together
+        // and reported together, rather than a tab that opens a shell and a pane beside it
+        let actions = actions_of(&["new-pane", "--new-tab", "build", "--", "cargo", "test"])
+            .expect("a new tab with a command in it");
+        assert_eq!(actions.len(), 1, "got: {:?}", actions);
+        match &actions[0] {
+            Action::NewTab {
+                tiled_layout,
+                tab_name,
+                initial_panes,
+                should_change_focus_to_new_tab,
+                ..
+            } => {
+                assert_eq!(tab_name.as_deref(), Some("build"));
+                assert!(should_change_focus_to_new_tab);
+                // no layout of our own: the tab is built from the session's new-tab template, so it
+                // keeps its status bars and its panes are serialized like any other tab's
+                assert!(tiled_layout.is_none(), "got: {:?}", tiled_layout);
+                let panes = initial_panes.as_ref().expect("the command");
+                assert_eq!(panes.len(), 1);
+                match &panes[0] {
+                    crate::data::CommandOrPlugin::Command(command) => {
+                        assert_eq!(command.command, std::path::PathBuf::from("cargo"));
+                        assert_eq!(command.args, vec!["test".to_owned()]);
+                    },
+                    other => panic!("Expected a command, got {:?}", other),
+                }
+            },
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_that_names_nothing_still_makes_the_tab() {
+        let actions = actions_of(&["new-pane", "--new-tab"]).expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                tab_name,
+                initial_panes,
+                ..
+            } => {
+                assert_eq!(tab_name, &None, "zellij names it");
+                // no command: the tab opens the shell, which is what a bare `new-pane` opens
+                assert!(initial_panes.is_none());
+            },
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_keeps_the_focus_where_it_is_when_asked() {
+        let actions = actions_of(&["new-pane", "--new-tab", "--no-focus"]).expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                should_change_focus_to_new_tab,
+                ..
+            } => assert!(!should_change_focus_to_new_tab),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_refuses_the_flags_that_place_a_pane_in_an_existing_one() {
+        // each of these says where the pane goes, and `--new-tab` has already answered that
+        for args in [
+            vec!["new-pane", "--new-tab", "--stacked"],
+            vec!["new-pane", "--new-tab", "-d", "right"],
+            vec!["new-pane", "--new-tab", "--floating"],
+            vec!["new-pane", "--new-tab", "--in-place"],
+            vec!["new-pane", "--new-tab", "--tab-id", "2"],
+            vec!["new-pane", "--new-tab", "--near-current-pane"],
+            // the pane in a new tab cannot carry a name, so the flag is refused rather than dropped
+            vec!["new-pane", "--new-tab", "--name", "shell"],
+            // and neither can it carry a frame setting, for the same reason: the first pane of a
+            // new tab is described by its command and nothing else
+            vec!["new-pane", "--new-tab", "--borderless", "true"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_tab_says_which_waiting_flag_it_can_honour() {
+        // `--blocking` waits for a pane to close and has no pane to name in a tab that does not
+        // exist yet; the conditional ones ride on the tab's first pane
+        assert!(action_parse_fails(&["new-pane", "--new-tab", "--blocking"]));
+        let actions = actions_of(&["new-pane", "--new-tab", "--block-until-exit", "--", "true"])
+            .expect("a new tab that waits for its command");
+        match &actions[0] {
+            Action::NewTab {
+                first_pane_unblock_condition,
+                ..
+            } => assert_eq!(
+                first_pane_unblock_condition,
+                &Some(UnblockCondition::OnAnyExit)
+            ),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_chosen_handle_is_taken_out_of_the_request() {
+        let mut action = parse_action(&["new-pane", "--handle", "build"]);
+        assert_eq!(action.take_chosen_handle().as_deref(), Some("build"));
+        // taken once: the client applies it, and it must not also travel with the action
+        assert_eq!(action.take_chosen_handle(), None);
+    }
+
+    #[test]
+    fn a_handle_that_could_be_read_as_an_id_is_refused_at_the_parser() {
+        for rejected in ["terminal_1", "7", "Build", "my handle", "terminal-1"] {
+            assert!(
+                action_parse_fails(&["new-pane", "--handle", rejected]),
+                "expected `--handle {}` to be refused",
+                rejected
+            );
+        }
+        // the negative control: a name a person would pick goes through
+        assert_eq!(
+            parse_action(&["new-pane", "--handle", "my-build"]).take_chosen_handle(),
+            Some("my-build".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_handle_cannot_ride_with_a_command_that_prints_no_pane() {
+        // the blocking family answers with an exit status instead of a `pane_id:`, and the handle
+        // is applied to the pane the report names
+        for waiting in [
+            "--blocking",
+            "--block-until-exit",
+            "--block-until-exit-success",
+            "--block-until-exit-failure",
+        ] {
+            assert!(
+                action_parse_fails(&["new-pane", "--handle", "build", waiting]),
+                "expected `--handle` with `{}` to be refused",
+                waiting
+            );
+        }
+    }
+
+    #[test]
+    fn an_unapplied_handle_never_reaches_the_session() {
+        let error = actions_of(&["new-pane", "--handle", "build"])
+            .expect_err("a handle still on the request is not an action");
+        assert!(error.contains("--handle"), "got: {}", error);
+    }
+
+    #[test]
+    fn near_takes_every_form_a_pane_answers_to() {
+        for target in [
+            "terminal_1",
+            "3",
+            "sunny-otter",
+            "e9b82dbd-0000-4000-8000-0000000000aa",
+        ] {
+            let action = parse_action(&["new-pane", "--near", target]);
+            assert_eq!(action.near_target(), Some(target));
+        }
+    }
+
+    #[test]
+    fn an_anchored_pane_asks_for_the_pane_the_command_came_from() {
+        // the anchor rides on the channel `--near-current-pane` uses, so what is left in the action
+        // is that there is one; the id itself is the client's to carry
+        let mut action = parse_action(&["new-pane", "--near", "sunny-otter"]);
+        action.anchor_near();
+        match &action {
+            CliAction::NewPane {
+                near,
+                near_current_pane,
+                ..
+            } => {
+                assert_eq!(near, &None, "the name is spent once it is resolved");
+                assert!(near_current_pane);
+            },
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_near_never_reaches_the_session() {
+        // without the lookup the pane would open beside whichever pane the server found, which is
+        // the pane `--near` was passed to avoid
+        let error = actions_of(&["new-pane", "--near", "sunny-otter"])
+            .expect_err("an unresolved --near is not an action");
+        assert!(error.contains("--near"), "got: {}", error);
+    }
+
+    #[test]
+    fn near_refuses_the_flags_that_place_the_pane_somewhere_else() {
+        for args in [
+            vec!["new-pane", "--near", "terminal_1", "--near-current-pane"],
+            vec!["new-pane", "--near", "terminal_1", "--tab-id", "2"],
+            vec!["new-pane", "--near", "terminal_1", "--in-tab", "logs"],
+            vec!["new-pane", "--near", "terminal_1", "--new-tab"],
+            vec!["new-pane", "--near", "terminal_1", "--in-place"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn in_tab_becomes_a_tab_id_and_takes_nobodys_focus() {
+        let mut action = parse_action(&["new-pane", "--in-tab", "logs"]);
+        assert_eq!(action.in_tab_target(), Some("logs"));
+        action.place_in_tab(4);
+        match &action {
+            CliAction::NewPane {
+                in_tab,
+                tab_id,
+                no_focus,
+                ..
+            } => {
+                assert_eq!(in_tab, &None, "the name is spent once it is resolved");
+                assert_eq!(tab_id, &Some(4));
+                assert!(no_focus, "putting a pane somewhere is not going there");
+            },
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_in_tab_never_reaches_the_session() {
+        // the guard: a caller that skipped the lookup would open the pane in the focused tab, which
+        // is the one tab `--in-tab` was passed to avoid
+        let error = actions_of(&["new-pane", "--in-tab", "logs"])
+            .expect_err("an unresolved --in-tab is not an action");
+        assert!(error.contains("--in-tab"), "got: {}", error);
+    }
+
+    #[test]
+    fn in_tab_refuses_the_other_ways_of_naming_a_tab() {
+        for args in [
+            vec!["new-pane", "--in-tab", "logs", "--tab-id", "2"],
+            vec!["new-pane", "--in-tab", "logs", "--new-tab"],
+            vec!["new-pane", "--in-tab", "logs", "--in-place"],
+            vec!["new-pane", "--in-tab", "logs", "--near-current-pane"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+        // the negative control: the flags that say how the pane is drawn, not where it goes, are
+        // still free to travel with it
+        assert_eq!(
+            parse_action(&["new-pane", "--in-tab", "logs", "-d", "right"]).in_tab_target(),
+            Some("logs")
+        );
+    }
+
+    #[test]
+    fn write_chars_and_paste_take_their_text_or_leave_it_to_stdin() {
+        for verb in ["write-chars", "paste"] {
+            let with_text = parse_action(&[verb, "hello"]);
+            let from_stdin = parse_action(&[verb]);
+            let explicit = parse_action(&[verb, "-"]);
+            let text = |action: &CliAction| match action {
+                CliAction::WriteChars { chars, .. } | CliAction::Paste { chars, .. } => {
+                    chars.clone()
+                },
+                other => panic!("Expected {}, got {:?}", verb, other),
+            };
+            assert_eq!(text(&with_text), Some("hello".to_owned()));
+            assert_eq!(text(&from_stdin), None);
+            assert_eq!(text(&explicit), Some("-".to_owned()));
+        }
+    }
+
+    #[test]
+    fn stdin_text_arrives_whole() {
+        // multi-line, and nothing added or trimmed: what was piped is what the pane is typed
+        let piped = "first line\nsecond line\n";
+        assert_eq!(
+            text_from_stdin(piped.as_bytes(), "write-chars"),
+            Ok(piped.to_owned())
+        );
+        // the negative control: an empty pipe is not an error here, it is the caller's miss
+        assert_eq!(text_from_stdin(&b""[..], "write-chars"), Ok(String::new()));
+    }
+
+    #[test]
+    fn stdin_text_stops_at_the_bound() {
+        let at_the_bound = vec![b'x'; MAX_STDIN_TEXT_BYTES];
+        assert!(text_from_stdin(&at_the_bound[..], "paste").is_ok());
+        let one_past = vec![b'x'; MAX_STDIN_TEXT_BYTES + 1];
+        let message = text_from_stdin(&one_past[..], "paste").expect_err("past the bound");
+        assert!(
+            message.contains(&MAX_STDIN_TEXT_BYTES.to_string()),
+            "{}",
+            message
+        );
+    }
+
+    #[test]
+    fn stdin_that_is_not_text_says_which_command_takes_bytes() {
+        let message = text_from_stdin(&[0xff, 0xfe][..], "write-chars").expect_err("not utf-8");
+        assert!(message.contains("write"), "{}", message);
     }
 
     #[test]

@@ -36,9 +36,13 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "dump-layout",
             "dump-screen",
             "list-clients",
+            "list-events",
             "list-panes",
             "list-tabs",
             "list-tree",
+            // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
+            // and this one changes nothing. It is also why the audit ring does not record it
+            "wait",
         ],
     },
     ActionGroup {
@@ -110,6 +114,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "set-pane-borderless",
             "set-pane-color",
             "set-pane-floating",
+            "set-pane-note",
             "set-pane-pinned",
             "set-sync-tab",
             "show-floating-panes",
@@ -145,6 +150,17 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
         ],
     },
 ];
+
+/// The band a `zellij action` verb belongs to, or `None` for a name that is not one.
+///
+/// Exported because the bands are not only a help-page heading: the action ring uses them to
+/// decide what is worth remembering, so "which verbs change nothing" is answered in one place.
+pub fn band_of(verb: &str) -> Option<&'static str> {
+    ACTION_GROUPS
+        .iter()
+        .find(|group| group.commands.contains(&verb))
+        .map(|group| group.name)
+}
 
 /// What a command puts on stdout, for the commands that put anything there.
 ///
@@ -182,10 +198,15 @@ const OUTPUTS: &[OutputSpec] = &[
         keys: "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY SIZE CURRENT",
     },
     OutputSpec {
+        command: "action list-events",
+        shape: "table",
+        keys: "AT VERB TARGET ORIGIN COUNT",
+    },
+    OutputSpec {
         command: "action list-panes",
         shape: "table",
         keys: "TAB_ID TAB_POS TAB_NAME PANE_ID HANDLE TYPE TITLE COMMAND CWD FOCUSED FLOATING \
-               EXITED X Y ROWS COLS",
+               EXITED NOTE X Y ROWS COLS",
     },
     OutputSpec {
         command: "action list-tabs",
@@ -196,12 +217,27 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action list-tree",
         shape: "outline",
-        keys: "tab_id position name active / handle pane_id title command focused",
+        keys: "tab_id position name active / handle pane_id title command focused note",
+    },
+    // `waited_ms` on every wait; `exit_status` is `--for exit`'s line and `matched` is
+    // `--for match`'s. A wait that missed prints nothing here at all
+    OutputSpec {
+        command: "action wait",
+        shape: "record",
+        keys: "waited_ms exit_status matched",
+    },
+    OutputSpec {
+        command: "action set-pane-note",
+        shape: "record",
+        // a cleared note prints `note: -` alone: there is no colour left to report
+        keys: "note color",
     },
     OutputSpec {
         command: "action new-pane",
         shape: "record",
-        keys: "pane_id handle",
+        // `tab_id` is `--new-tab`'s line: the tab it made, above the pane it put in it. Every other
+        // new-pane prints the pane alone, into a tab that already existed
+        keys: "tab_id pane_id handle",
     },
     OutputSpec {
         command: "action edit",
@@ -280,6 +316,13 @@ const OUTPUTS: &[OutputSpec] = &[
         shape: "table",
         keys: "NAME STATUS CURRENT CLIENTS CREATED",
     },
+    // a stream rather than an answer: the pane's own lines, until the pane closes. `--format json`
+    // wraps each update in a record instead, and `--timestamps` adds the time to either
+    OutputSpec {
+        command: "subscribe",
+        shape: "payload",
+        keys: "",
+    },
 ];
 
 /// The keys or columns the dump promises for a command, or `None` if it promises nothing.
@@ -312,12 +355,14 @@ How every one of these answers:
     is not there - a closed pane, a tab by a name nothing answers to.
   * A command that only acts prints nothing. The ones that report say so in their own --help.
   * A mutation run from outside the session must name what it acts on. `close-pane`, `close-tab`,
-    `move-tab` and `break-pane` refuse a targetless call from a script, because \"the focused pane\"
-    there is a pane you have never seen.
+    `move-tab`, `break-pane`, `write`, `write-chars`, `clear`, `edit-scrollback` and `rename-pane`
+    refuse a targetless call from a script, because \"the focused pane\" there is a pane you have
+    never seen.
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
-assigned when the pane is created, it survives a session restore, and `list-panes` prints it.
+assigned when the pane is created - or chosen then, with `new-pane --handle` - it survives a session
+restore, and `list-panes` prints it.
 
   zellij action dump-screen --pane-id sunny-otter
 
@@ -637,7 +682,7 @@ fn indent(text: &str, by: usize) -> String {
 const EXPECTED_LIST_TREE_RECORD: &str = concat!(
     "command: zellij action list-tree  group: read\n",
     "  about: List every tab with its panes nested beneath it\n",
-    "  prints: outline  keys: tab_id position name active / handle pane_id title command focused\n",
+    "  prints: outline  keys: tab_id position name active / handle pane_id title command focused note\n",
     "  arg: --json  type: flag  about: Output as JSON",
 );
 

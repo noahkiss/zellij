@@ -9,7 +9,7 @@ use crate::ui::hint_text::{
     HintSegment, HintTier,
 };
 use crate::ClientId;
-use zellij_utils::data::{client_id_to_colors, PaletteColor, Style};
+use zellij_utils::data::{client_id_to_colors, NoteColor, PaletteColor, Style};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::pane_size::{Offset, PaneGeom, Viewport};
 use zellij_utils::position::Position;
@@ -37,6 +37,12 @@ fn foreground_color(characters: &str, color: Option<PaletteColor>) -> Vec<Termin
             styles.foreground = Some(AnsiCode::from(palette_color));
         }
     })
+}
+
+/// How much of the title row an element takes, separator included, and nothing for one that is not
+/// there.
+fn taken(element: &Option<(Vec<TerminalCharacter>, usize)>) -> usize {
+    element.as_ref().map(|(_, length)| length + 1).unwrap_or(0)
 }
 
 fn dimmed_foreground_color(
@@ -98,6 +104,8 @@ pub struct FrameParams {
     pub blank_title: bool,
     // fork addition: the handle this pane is addressed by, drawn at the right of the title row
     pub pane_handle: String,
+    // fork addition: the note somebody left on this pane, drawn beside the handle
+    pub pane_note: Option<(String, NoteColor)>,
     // fork addition: `pane_frame_style top_only`
     pub top_only_frames: bool,
     pub mouse_scroll_resize: bool,
@@ -137,6 +145,8 @@ pub struct PaneFrame {
     guest_choice_indicator: Option<GuestChoiceIndicator>,
     // fork addition: the handle this pane is addressed by, drawn at the right of the title row
     pane_handle: String,
+    // fork addition: the note somebody left on this pane, drawn beside the handle
+    pane_note: Option<(String, NoteColor)>,
     // fork addition: `pane_frame_style top_only`
     top_only_frames: bool,
 }
@@ -178,6 +188,7 @@ impl PaneFrame {
             dimmed: frame_params.dimmed,
             guest_choice_indicator: frame_params.guest_choice_indicator,
             pane_handle: frame_params.pane_handle,
+            pane_note: frame_params.pane_note,
             top_only_frames: frame_params.top_only_frames,
         }
     }
@@ -231,33 +242,88 @@ impl PaneFrame {
         max_length: usize,
     ) -> Option<(Vec<TerminalCharacter>, usize)> {
         // fork addition: the handle sits at the far right of the title row, the mirror of the
-        // title at the far left, and is the last element to be given room
+        // title at the far left, with the note beside it. Room is offered in that order, so a
+        // narrowing frame loses the note first, then the handle, and never the title
         let indications = self.render_title_right_side_inner(max_length);
-        let space_left = match &indications {
-            Some((_, length)) => max_length.saturating_sub(length + 1), // 1 for the separator
-            None => max_length,
+        let handle = self.render_handle_indication(max_length.saturating_sub(taken(&indications)));
+        let note = self.render_note_indication(
+            max_length.saturating_sub(taken(&indications) + taken(&handle)),
+        );
+        // the pin checkbox is a click target, and `clicked_on_pinned` finds it by counting back
+        // from the right edge of the pane. So on a pane that draws one, the pin keeps the right
+        // edge and everything else goes to its left - otherwise the handle pushes the checkbox out
+        // from under the place a click looks for it, and the button a user can see stops working
+        let order = if self.draws_pin_indication() {
+            vec![note, handle, indications]
+        } else {
+            vec![indications, note, handle]
         };
-        match (indications, self.render_handle_indication(space_left)) {
-            (Some((indications, indications_len)), Some((handle, handle_len))) => {
-                // the pin checkbox is a click target, and `clicked_on_pinned` finds it by counting
-                // back from the right edge of the pane. So on a pane that draws one, the pin keeps
-                // the right edge and the handle goes to its left - otherwise the handle pushes the
-                // checkbox out from under the place a click looks for it, and the button a user can
-                // see stops working
-                let (mut first, mut second) = if self.draws_pin_indication() {
-                    (handle, indications)
-                } else {
-                    (indications, handle)
-                };
-                let mut characters: Vec<_> = first.drain(..).collect();
+        self.join_right_side(order)
+    }
+    /// Joins what the title row's right side holds, with the separator those elements already use.
+    fn join_right_side(
+        &self,
+        elements: Vec<Option<(Vec<TerminalCharacter>, usize)>>,
+    ) -> Option<(Vec<TerminalCharacter>, usize)> {
+        let mut characters: Vec<TerminalCharacter> = Vec::new();
+        let mut length = 0;
+        for (mut element, element_length) in elements.into_iter().flatten() {
+            if !characters.is_empty() {
                 characters.append(&mut foreground_color("|", self.color));
-                characters.append(&mut second);
-                Some((characters, indications_len + handle_len + 1))
-            },
-            (Some(indications), None) => Some(indications),
-            (None, Some(handle)) => Some(handle),
-            _ => None,
+                length += 1;
+            }
+            characters.append(&mut element);
+            length += element_length;
         }
+        (!characters.is_empty()).then_some((characters, length))
+    }
+    /// The colour a note of this meaning is drawn in, taken from the theme rather than chosen.
+    ///
+    /// A note is drawn inside somebody else's colour scheme, so the four meanings map onto colours
+    /// the theme has already picked for exactly those things.
+    fn note_color(&self, note_color: NoteColor) -> Option<PaletteColor> {
+        let colors = &self.style.colors;
+        Some(match note_color {
+            NoteColor::Error => colors.exit_code_error.base,
+            NoteColor::Ok => colors.exit_code_success.base,
+            NoteColor::Warn => colors.text_unselected.emphasis_0,
+            NoteColor::Info => colors.text_unselected.emphasis_1,
+        })
+    }
+    /// The note left on this pane, cut to fit.
+    ///
+    /// Unlike the handle it IS truncated: a note is prose, and half a sentence still says
+    /// something, while half an address reaches no pane.
+    fn render_note_indication(&self, max_length: usize) -> Option<(Vec<TerminalCharacter>, usize)> {
+        let (note, note_color) = self
+            .pane_note
+            .as_ref()
+            .filter(|(note, _)| !note.is_empty())?;
+        // the space either side of it, which is what separates it from the handle beside it
+        let room = max_length.checked_sub(2).filter(|room| *room > 0)?;
+        let shown = if note.width() <= room {
+            note.clone()
+        } else {
+            let mut truncated = String::new();
+            let mut width = 0;
+            for character in note.chars() {
+                let character_width = character.width().unwrap_or(0);
+                if width + character_width > room.saturating_sub(1) {
+                    break;
+                }
+                truncated.push(character);
+                width += character_width;
+            }
+            format!("{}…", truncated)
+        };
+        let text = format!(" {} ", shown);
+        let length = text.width();
+        (length <= max_length).then(|| {
+            (
+                foreground_color(&text, self.note_color(*note_color)),
+                length,
+            )
+        })
     }
     /// Whether this frame draws the pin checkbox, which is a click target and so owns the right
     /// edge of the title row - see `clicked_on_pinned`.
@@ -1006,16 +1072,36 @@ impl PaneFrame {
         let scroll = self.bracketed_scroll_indicator(max_length);
         let scroll_length = scroll.as_ref().map(|(_, length)| *length).unwrap_or(0);
         let handle = self.bracketed_handle_indicator(max_length.saturating_sub(scroll_length));
-        match (scroll, handle) {
-            (Some((mut scroll, scroll_length)), Some((mut handle, handle_length))) => {
-                let mut characters: Vec<_> = scroll.drain(..).collect();
-                characters.append(&mut handle);
-                Some((characters, scroll_length + handle_length))
-            },
-            (Some(scroll), None) => Some(scroll),
-            (None, Some(handle)) => Some(handle),
-            _ => None,
+        let handle_length = handle.as_ref().map(|(_, length)| *length).unwrap_or(0);
+        let note =
+            self.bracketed_note_indicator(max_length.saturating_sub(scroll_length + handle_length));
+        let mut characters: Vec<TerminalCharacter> = Vec::new();
+        let mut length = 0;
+        // the same order as the full frame: what a human reads first is offered room first, and
+        // the note - the newest thing on this row - is the first to be left out
+        for (mut element, element_length) in [scroll, note, handle].into_iter().flatten() {
+            characters.append(&mut element);
+            length += element_length;
         }
+        (!characters.is_empty()).then_some((characters, length))
+    }
+    /// The pane's note in the one-line row, cut to fit - see `render_note_indication`.
+    fn bracketed_note_indicator(
+        &self,
+        max_length: usize,
+    ) -> Option<(Vec<TerminalCharacter>, usize)> {
+        let (note, note_color) = self
+            .pane_note
+            .as_ref()
+            .filter(|(note, _)| !note.is_empty())?;
+        // ` [ ` and ` ] ` around it, which is what this row puts around every element
+        let room = max_length.checked_sub(6).filter(|room| *room > 0)?;
+        let shown: String = note.chars().take(room).collect();
+        let mut content = foreground_color(&shown, self.note_color(*note_color));
+        let content_length = shown.width();
+        let (part, length) =
+            self.bracketed_title_part_from_characters(content.drain(..).collect(), content_length);
+        (length <= max_length).then_some((part, length))
     }
     /// The pane's handle in the one-line row, whole or not at all - see `render_handle_indication`.
     fn bracketed_handle_indicator(
@@ -1577,6 +1663,7 @@ mod tests {
                 stack_list_entry: None,
                 blank_title: false,
                 pane_handle: String::new(),
+                pane_note: None,
                 top_only_frames: false,
                 mouse_scroll_resize,
                 dimmed: false,
@@ -1628,6 +1715,7 @@ mod tests {
                 stack_list_entry: None,
                 blank_title: false,
                 pane_handle: handle.to_owned(),
+                pane_note: None,
                 // `top_only` is the fork's frames-off style, so it renders the one-line row
                 top_only_frames: !draws_full_frame,
                 mouse_scroll_resize: false,
@@ -1635,6 +1723,91 @@ mod tests {
                 guest_choice_indicator: None,
             },
         )
+    }
+
+    /// The same frame, carrying a note as well.
+    fn frame_with_note(
+        cols: usize,
+        title: &str,
+        handle: &str,
+        note: &str,
+        draws_full_frame: bool,
+    ) -> PaneFrame {
+        let mut frame = frame_with_handle(cols, title, handle, (0, 0), draws_full_frame);
+        frame.pane_note = Some((note.to_owned(), NoteColor::Error));
+        frame
+    }
+
+    fn full_frame_title_with_note(cols: usize, title: &str, handle: &str, note: &str) -> String {
+        characters_to_string(
+            &frame_with_note(cols, title, handle, note, true)
+                .render_title()
+                .unwrap(),
+        )
+    }
+
+    fn one_line_title_with_note(cols: usize, title: &str, handle: &str, note: &str) -> String {
+        characters_to_string(
+            &frame_with_note(cols, title, handle, note, false)
+                .render_one_line_title()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_note_sits_beside_the_handle_and_leaves_it_the_right_edge() {
+        // the handle is still the last thing on the row: the note is what a pane is DOING and the
+        // handle is what it is CALLED, and the address is the one a reader copies
+        let title_row = full_frame_title_with_note(60, "Pane #1", "sunny-otter", "exit 7");
+        assert!(title_row.starts_with("┌ Pane #1 "), "got: {}", title_row);
+        assert!(title_row.contains("exit 7"), "got: {}", title_row);
+        assert!(title_row.ends_with(" sunny-otter ┐"), "got: {}", title_row);
+        assert_eq!(title_row.width(), 60);
+        let one_line = one_line_title_with_note(60, "Pane #1", "sunny-otter", "exit 7");
+        assert!(one_line.contains("exit 7"), "got: {}", one_line);
+        assert!(
+            one_line.trim_end().ends_with("[ sunny-otter ]"),
+            "got: {}",
+            one_line
+        );
+        assert_eq!(one_line.width(), 60);
+    }
+
+    #[test]
+    fn a_narrowing_row_loses_the_note_before_the_handle_and_the_handle_before_the_title() {
+        // the width contest, in the order the elements are offered room. 30 columns holds the
+        // title and the handle but not the note
+        let narrow = full_frame_title_with_note(30, "Pane #1", "sunny-otter", "exit 7");
+        assert!(!narrow.contains("exit 7"), "got: {}", narrow);
+        assert!(narrow.ends_with(" sunny-otter ┐"), "got: {}", narrow);
+        // narrower still, and the handle goes too - the title is what a human is reading
+        let narrower = full_frame_title_with_note(24, "Pane #1", "sunny-otter", "exit 7");
+        assert!(!narrower.contains("sunny-otter"), "got: {}", narrower);
+        assert!(narrower.contains("Pane #1"), "got: {}", narrower);
+        assert_eq!(narrower.width(), 24);
+    }
+
+    #[test]
+    fn a_note_too_long_for_its_room_is_cut_rather_than_dropped() {
+        // unlike the handle: half an address reaches no pane, but half a sentence still says
+        // something
+        let long = "waiting on the review that was promised on tuesday";
+        let title_row = full_frame_title_with_note(60, "Pane #1", "sunny-otter", long);
+        assert!(!title_row.contains(long), "got: {}", title_row);
+        assert!(title_row.contains("waiting on"), "got: {}", title_row);
+        assert!(title_row.contains('…'), "got: {}", title_row);
+        assert_eq!(title_row.width(), 60);
+    }
+
+    #[test]
+    fn a_pane_with_no_note_draws_the_row_it_drew_before() {
+        // the negative control: nothing about the row changes for the panes that have no note,
+        // which is nearly all of them
+        assert_eq!(
+            full_frame_title_with_note(60, "Pane #1", "sunny-otter", ""),
+            full_frame_title(60, "Pane #1", "sunny-otter"),
+            "an empty note takes no room"
+        );
     }
 
     fn full_frame_title(cols: usize, title: &str, handle: &str) -> String {

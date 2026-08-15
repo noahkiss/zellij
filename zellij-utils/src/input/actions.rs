@@ -2,13 +2,13 @@
 
 pub use super::command::{OpenFilePayload, RunCommandAction};
 use super::layout::{
-    FloatingPaneLayout, Layout, PluginAlias, RunPlugin, RunPluginLocation, RunPluginOrAlias,
-    SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
+    FloatingPaneLayout, Layout, PluginAlias, PluginUserConfiguration, RunPlugin, RunPluginLocation,
+    RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
 };
 use crate::cli::CliAction;
 use crate::data::{
-    CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
-    PaneId, PaneSignal, Resize, UnblockCondition,
+    CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, NoteColor,
+    OriginatingPlugin, PaneId, PaneSignal, Resize, UnblockCondition,
 };
 use crate::data::{FloatingPaneCoordinates, InputMode, PaneTarget};
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -555,6 +555,25 @@ pub enum Action {
     ResolvePaneTarget {
         target: String,
     },
+    /// Gives a pane the handle its creator chose for it.
+    ///
+    /// A pane names itself when it is born, and this is how a caller who had a name in mind says
+    /// so. The name must be free among the session's live panes: a handle is an address, and the
+    /// one thing an address may not do is reach two panes. A taken one is refused rather than
+    /// rerolled, because rerolling would hand back a name the caller did not ask for.
+    SetPaneHandle {
+        pane_id: PaneId,
+        handle: String,
+    },
+    /// Leaves a short note on a pane, or clears it with `None`.
+    ///
+    /// The note is live state - what is happening in the pane - rather than what the pane is, so
+    /// nothing serializes it. The server sets one itself on a command pane that failed and is
+    /// being held open.
+    SetPaneNote {
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
+    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
@@ -565,6 +584,10 @@ pub enum Action {
     },
     /// Every tab with its panes nested beneath it - the shape of the session in one answer.
     ListTree {
+        output_json: bool,
+    },
+    /// The session's action ring: what changed lately, and who changed it.
+    ListEvents {
         output_json: bool,
     },
     ListTabs {
@@ -753,6 +776,36 @@ impl Action {
         }
     }
 
+    /// The plugin a `--plugin` names: a url this build can resolve, or an alias the config names.
+    ///
+    /// Shared by the two paths that open a plugin pane - one into the current tab, one into a tab
+    /// `--new-tab` is making - so a url that works for one works for the other.
+    fn run_plugin_or_alias(
+        plugin: String,
+        configuration: Option<PluginUserConfiguration>,
+        cwd: Option<PathBuf>,
+        alias_cwd: Option<PathBuf>,
+        current_dir: PathBuf,
+    ) -> RunPluginOrAlias {
+        match RunPluginLocation::parse(&plugin, cwd.clone()) {
+            Ok(location) => RunPluginOrAlias::RunPlugin(RunPlugin {
+                _allow_exec_host_cmd: false,
+                location,
+                configuration: configuration.unwrap_or_default(),
+                initial_cwd: cwd,
+            }),
+            Err(_) => {
+                let mut plugin_alias = PluginAlias::new(
+                    &plugin,
+                    &configuration.map(|c| c.inner().clone()),
+                    alias_cwd,
+                );
+                plugin_alias.set_caller_cwd_if_not_set(Some(current_dir));
+                RunPluginOrAlias::Alias(plugin_alias)
+            },
+        }
+    }
+
     /// Turns one CLI invocation into the actions that carry it out.
     ///
     /// `resolve_pane_target` turns a `--pane-id` string into a pane id. A handle or a uuid only
@@ -784,34 +837,42 @@ impl Action {
                     is_kitty_keyboard_protocol: false,
                 }]),
             },
-            CliAction::WriteChars { chars, pane_id } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
-                            chars,
-                            pane_id: parsed_pane_id,
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::WriteChars { chars }]),
+            // the text is optional on the command line because stdin can carry it; the CLI has
+            // already read it by the time the action is built, and an empty one never gets here
+            CliAction::WriteChars { chars, pane_id } => {
+                let chars = chars.unwrap_or_default();
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
+                                chars,
+                                pane_id: parsed_pane_id,
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::WriteChars { chars }]),
+                }
             },
-            CliAction::Paste { chars, pane_id } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::Paste {
-                            chars,
-                            pane_id: Some(parsed_pane_id),
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::Paste {
-                    chars,
-                    pane_id: None,
-                }]),
+            CliAction::Paste { chars, pane_id } => {
+                let chars = chars.unwrap_or_default();
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::Paste {
+                                chars,
+                                pane_id: Some(parsed_pane_id),
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::Paste {
+                        chars,
+                        pane_id: None,
+                    }]),
+                }
             },
             CliAction::SendKeys { keys, pane_id } => {
                 let mut actions = Vec::new();
@@ -1071,11 +1132,44 @@ impl Action {
                 block_until_exit_failure,
                 block_until_exit,
                 unblock_condition,
+                new_tab,
                 near_current_pane,
                 no_focus,
                 borderless,
                 tab_id,
+                in_tab,
+                near,
+                handle,
             } => {
+                if handle.is_some() {
+                    // a chosen handle is given to the pane after it is made, by the client holding
+                    // the report. Reaching here means it would have been dropped in silence.
+                    return Err(
+                        "`--handle` is applied once the pane exists, and it was still on the request when the action was built."
+                            .to_owned(),
+                    );
+                }
+                if near.is_some() {
+                    // `--near` is resolved and carried by the client, which is what holds the
+                    // connection to the server. Reaching here means nobody did that, and the pane
+                    // would open beside whichever pane the server found instead.
+                    return Err(
+                        "`--near` names a pane the session has to identify, and it was not \
+                         resolved before the action was built."
+                            .to_owned(),
+                    );
+                }
+                if in_tab.is_some() {
+                    // `--in-tab` is a name or an id that only the session can turn into the
+                    // `--tab-id` this action carries, so the CLI resolves it before building the
+                    // action. Reaching here means a caller skipped that, and the pane would
+                    // quietly open in the wrong tab.
+                    return Err(
+                        "`--in-tab` names a tab the session has to identify, and it was not \
+                         resolved before the action was built."
+                            .to_owned(),
+                    );
+                }
                 let pane_id_to_replace = match pane_id {
                     Some(pane_id_str) => match resolve_pane_target(&pane_id_str) {
                         Ok(parsed_pane_id) => Some(parsed_pane_id),
@@ -1101,6 +1195,54 @@ impl Action {
                         None
                     }
                 });
+                if let Some(tab_name) = new_tab {
+                    // A tab arrives with a pane in it, so "run this in a tab of its own" is one
+                    // action rather than two: the command is handed to the new tab as its first
+                    // pane, and what comes back is `tab_id:` with the pane it made. The tab is
+                    // built from the session's own new-tab template like every other tab, which is
+                    // what keeps its status bars, and its panes, in the session's saved layout.
+                    if blocking {
+                        return Err(
+                            "`--blocking` waits for a pane to close and cannot say which \
+                                    pane in a new tab that is. Use --block-until-exit, or open \
+                                    the tab first."
+                                .to_owned(),
+                        );
+                    }
+                    let initial_panes = if let Some(plugin) = plugin {
+                        Some(vec![CommandOrPlugin::Plugin(Self::run_plugin_or_alias(
+                            plugin,
+                            configuration,
+                            cwd.clone(),
+                            alias_cwd,
+                            current_dir,
+                        ))])
+                    } else if !command.is_empty() {
+                        let mut command = command;
+                        let (command, args) = (PathBuf::from(command.remove(0)), command);
+                        Some(vec![CommandOrPlugin::Command(RunCommandAction {
+                            command,
+                            args,
+                            cwd: cwd.clone(),
+                            hold_on_close: !close_on_exit,
+                            hold_on_start: start_suspended,
+                            ..Default::default()
+                        })])
+                    } else {
+                        None
+                    };
+                    return Ok(vec![Action::NewTab {
+                        tiled_layout: None,
+                        floating_layouts: vec![],
+                        swap_tiled_layouts: None,
+                        swap_floating_layouts: None,
+                        tab_name,
+                        should_change_focus_to_new_tab: !no_focus,
+                        cwd,
+                        initial_panes,
+                        first_pane_unblock_condition: unblock_condition,
+                    }]);
+                }
                 if blocking || unblock_condition.is_some() {
                     // For blocking panes, we don't support plugins
                     if plugin.is_some() {
@@ -1157,26 +1299,13 @@ impl Action {
                         tab_id,
                     }])
                 } else if let Some(plugin) = plugin {
-                    let plugin = match RunPluginLocation::parse(&plugin, cwd.clone()) {
-                        Ok(location) => {
-                            let user_configuration = configuration.unwrap_or_default();
-                            RunPluginOrAlias::RunPlugin(RunPlugin {
-                                _allow_exec_host_cmd: false,
-                                location,
-                                configuration: user_configuration,
-                                initial_cwd: cwd.clone(),
-                            })
-                        },
-                        Err(_) => {
-                            let mut plugin_alias = PluginAlias::new(
-                                &plugin,
-                                &configuration.map(|c| c.inner().clone()),
-                                alias_cwd,
-                            );
-                            plugin_alias.set_caller_cwd_if_not_set(Some(current_dir));
-                            RunPluginOrAlias::Alias(plugin_alias)
-                        },
-                    };
+                    let plugin = Self::run_plugin_or_alias(
+                        plugin,
+                        configuration,
+                        cwd.clone(),
+                        alias_cwd,
+                        current_dir,
+                    );
                     if floating {
                         Ok(vec![Action::NewFloatingPluginPane {
                             plugin,
@@ -1964,6 +2093,7 @@ impl Action {
                 output_json: json,
             }]),
             CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
+            CliAction::ListEvents { json } => Ok(vec![Action::ListEvents { output_json: json }]),
             CliAction::ListTabs {
                 state,
                 dimensions,
@@ -2083,6 +2213,27 @@ impl Action {
             },
             CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
             CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
+            // `wait` is answered by the client, which holds the caller for as long as the wait
+            // lasts. It is intercepted before this, and reaching here means that interception was
+            // removed and the command would otherwise go quiet
+            CliAction::Wait { .. } => {
+                Err("`wait` is run by the client, not sent as an action".into())
+            },
+            CliAction::SetPaneNote {
+                pane_id,
+                note,
+                color,
+            } => {
+                let parsed_pane_id = resolve_pane_target(&pane_id)?;
+                Ok(vec![Action::SetPaneNote {
+                    pane_id: parsed_pane_id,
+                    // no text is the clear, and so is text that is only spaces: a note of blanks
+                    // would take room on the frame and say nothing
+                    note: note
+                        .filter(|note| !note.trim().is_empty())
+                        .map(|note| (note.trim().to_owned(), color)),
+                }])
+            },
             CliAction::SignalPane { pane_id, signal } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
@@ -2356,6 +2507,45 @@ mod tests {
     use crate::data::BareKey;
     use crate::data::KeyModifier;
     use std::path::PathBuf;
+
+    fn note_from_cli(
+        note: Option<&str>,
+        color: crate::data::NoteColor,
+    ) -> Option<(String, crate::data::NoteColor)> {
+        let actions = Action::actions_from_cli(
+            CliAction::SetPaneNote {
+                pane_id: "7".to_string(),
+                note: note.map(|note| note.to_string()),
+                color,
+            },
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .expect("a well-formed note reaches an action");
+        match &actions[0] {
+            Action::SetPaneNote { note, .. } => note.clone(),
+            other => panic!("Expected SetPaneNote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_note_with_no_text_clears_the_one_the_pane_had() {
+        use crate::data::NoteColor;
+        assert_eq!(
+            note_from_cli(Some("waiting on review"), NoteColor::Warn),
+            Some(("waiting on review".to_string(), NoteColor::Warn))
+        );
+        // no text is the clear, and so is text that is only spaces: a note of blanks would take
+        // room on the frame and say nothing
+        assert_eq!(note_from_cli(None, NoteColor::Info), None);
+        assert_eq!(note_from_cli(Some("   "), NoteColor::Error), None);
+        // the surrounding whitespace of a real note goes, and the note stays
+        assert_eq!(
+            note_from_cli(Some("  done  "), NoteColor::Ok),
+            Some(("done".to_string(), NoteColor::Ok))
+        );
+    }
 
     #[test]
     fn test_send_keys_single_key() {
@@ -4232,6 +4422,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4281,6 +4475,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4330,6 +4528,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4381,6 +4583,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4424,6 +4630,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4473,6 +4683,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4522,6 +4736,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4645,6 +4863,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4694,6 +4916,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,

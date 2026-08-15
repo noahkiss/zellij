@@ -30,9 +30,12 @@ use zellij_utils::position::Position;
 use crate::background_jobs::BackgroundJob;
 use crate::os_input_output::{AsyncReader, SendToClientError};
 use crate::pty_writer::PtyWriteInstruction;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+
+use crate::screen::{push_action_event, ACTION_RING_SIZE};
 use std::env::set_var;
 use std::sync::{Arc, Mutex};
+use zellij_utils::data::ActionEvent;
 
 use crate::{
     plugins::PluginInstruction,
@@ -2601,7 +2604,7 @@ pub fn send_cli_write_chars_action_to_screen() {
         pty_writer_receiver
     );
     let cli_action = CliAction::WriteChars {
-        chars: "input from the cli".into(),
+        chars: Some("input from the cli".into()),
         pane_id: None,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
@@ -3795,6 +3798,10 @@ pub fn send_cli_new_pane_action_with_default_parameters() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -3905,6 +3912,10 @@ pub fn send_cli_new_pane_action_with_split_direction() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -3961,6 +3972,10 @@ pub fn send_cli_new_pane_action_with_command_and_cwd() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4028,6 +4043,10 @@ pub fn send_cli_new_pane_action_with_floating_pane_and_coordinates() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -5897,6 +5916,10 @@ pub fn send_cli_new_pane_in_place_with_close_replaced_pane() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -9470,6 +9493,10 @@ pub fn send_cli_new_pane_action_with_tab_id() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -9533,6 +9560,10 @@ pub fn send_cli_new_floating_pane_action_with_tab_id() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -9645,6 +9676,10 @@ pub fn send_cli_new_pane_action_with_tab_id_and_direction() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -9707,6 +9742,10 @@ pub fn send_cli_new_pane_action_with_tab_id_and_stacked() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -14656,5 +14695,64 @@ pub fn closing_the_focused_pane_with_nothing_focused_is_a_miss() {
         acted.error_message.as_deref(),
         Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
         "a client with a focused pane was told it had none"
+    );
+}
+
+fn an_event(verb: &str, target: &str, origin: &str) -> ActionEvent {
+    ActionEvent {
+        at: "2026-08-14T18:03:12.345Z".to_owned(),
+        verb: verb.to_owned(),
+        target: target.to_owned(),
+        origin: origin.to_owned(),
+        count: 1,
+    }
+}
+
+#[test]
+fn a_run_of_the_same_action_is_one_entry_that_counts() {
+    // a held scroll key must not push the tab move somebody is looking for out of the ring
+    let mut ring = VecDeque::new();
+    for _ in 0..40 {
+        push_action_event(
+            &mut ring,
+            an_event("scroll-down", "terminal_1 sunny-otter", "client 1"),
+        );
+    }
+    assert_eq!(ring.len(), 1);
+    assert_eq!(ring[0].count, 40);
+    // the negative controls: a different verb, a different target and a different origin are each
+    // a new entry rather than another count
+    push_action_event(
+        &mut ring,
+        an_event("scroll-up", "terminal_1 sunny-otter", "client 1"),
+    );
+    push_action_event(
+        &mut ring,
+        an_event("scroll-up", "terminal_2 tender-orca", "client 1"),
+    );
+    push_action_event(
+        &mut ring,
+        an_event("scroll-up", "terminal_2 tender-orca", "cli"),
+    );
+    assert_eq!(ring.len(), 4);
+    assert!(ring.iter().skip(1).all(|event| event.count == 1));
+}
+
+#[test]
+fn the_ring_holds_its_size_and_drops_the_oldest() {
+    // the bound: this is a ring, not a log file. Nothing about it reaches the disk
+    let mut ring = VecDeque::new();
+    for index in 0..ACTION_RING_SIZE + 50 {
+        push_action_event(
+            &mut ring,
+            an_event("close-pane", &format!("terminal_{}", index), "cli"),
+        );
+    }
+    assert_eq!(ring.len(), ACTION_RING_SIZE);
+    // oldest first, so the front is the oldest that survived and the back is the newest
+    assert_eq!(ring.front().unwrap().target, "terminal_50");
+    assert_eq!(
+        ring.back().unwrap().target,
+        format!("terminal_{}", ACTION_RING_SIZE + 49)
     );
 }

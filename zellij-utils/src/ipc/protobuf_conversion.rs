@@ -1163,6 +1163,7 @@ impl From<crate::input::actions::Action>
             LaunchOrFocusPluginAction,
             LaunchPluginAction,
             ListClientsAction,
+            ListEventsAction,
             ListPanesAction,
             ListTabsAction,
             ListTreeAction,
@@ -1233,6 +1234,8 @@ impl From<crate::input::actions::Action>
             SetPaneFloatingAction,
             SetPaneFrameStyleAction,
             SetPaneFullscreenAction,
+            SetPaneHandleAction,
+            SetPaneNoteAction,
             SetPanePinnedAction,
             SetSyncTabAction,
             ShowFloatingPanesAction,
@@ -1963,8 +1966,29 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::ResolvePaneTarget { target } => {
                 ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
             },
+            crate::input::actions::Action::SetPaneHandle { pane_id, handle } => {
+                ActionType::SetPaneHandle(SetPaneHandleAction {
+                    pane_id: Some(pane_id.into()),
+                    handle,
+                })
+            },
+            crate::input::actions::Action::SetPaneNote { pane_id, note } => {
+                let (note, color) = match note {
+                    Some((note, color)) => (Some(note), color),
+                    // an absent note is the clear, and the colour rides along unread
+                    None => (None, crate::data::NoteColor::Info),
+                };
+                ActionType::SetPaneNote(SetPaneNoteAction {
+                    pane_id: Some(pane_id.into()),
+                    note,
+                    color: note_color_to_proto_i32(color),
+                })
+            },
             crate::input::actions::Action::ListTree { output_json } => {
                 ActionType::ListTree(ListTreeAction { output_json })
+            },
+            crate::input::actions::Action::ListEvents { output_json } => {
+                ActionType::ListEvents(ListEventsAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2918,7 +2942,27 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::ResolvePaneTarget(a) => {
                 Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
             },
+            ActionType::SetPaneHandle(a) => Ok(crate::input::actions::Action::SetPaneHandle {
+                pane_id: a
+                    .pane_id
+                    .ok_or_else(|| anyhow!("SetPaneHandle missing pane_id"))?
+                    .try_into()?,
+                handle: a.handle,
+            }),
+            ActionType::SetPaneNote(a) => Ok(crate::input::actions::Action::SetPaneNote {
+                pane_id: a
+                    .pane_id
+                    .ok_or_else(|| anyhow!("SetPaneNote missing pane_id"))?
+                    .try_into()?,
+                note: match a.note {
+                    Some(note) => Some((note, note_color_from_proto_i32(a.color)?)),
+                    None => None,
+                },
+            }),
             ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
+                output_json: a.output_json,
+            }),
+            ActionType::ListEvents(a) => Ok(crate::input::actions::Action::ListEvents {
                 output_json: a.output_json,
             }),
             ActionType::ListPanes(list_panes_action) => {
@@ -5050,6 +5094,29 @@ impl TryFrom<crate::client_server_contract::client_server_contract::RunPluginOrA
                 plugin_alias.try_into()?,
             )),
         }
+    }
+}
+
+/// A note's colour is what the note MEANS, so an unreadable one is a malformed message rather than
+/// a note that quietly changes meaning on the way across.
+fn note_color_to_proto_i32(color: crate::data::NoteColor) -> i32 {
+    use crate::client_server_contract::client_server_contract::NoteColor as ProtobufNoteColor;
+    match color {
+        crate::data::NoteColor::Error => ProtobufNoteColor::Error as i32,
+        crate::data::NoteColor::Warn => ProtobufNoteColor::Warn as i32,
+        crate::data::NoteColor::Ok => ProtobufNoteColor::Ok as i32,
+        crate::data::NoteColor::Info => ProtobufNoteColor::Info as i32,
+    }
+}
+
+fn note_color_from_proto_i32(color: i32) -> anyhow::Result<crate::data::NoteColor> {
+    use crate::client_server_contract::client_server_contract::NoteColor as ProtobufNoteColor;
+    match ProtobufNoteColor::try_from(color) {
+        Ok(ProtobufNoteColor::Error) => Ok(crate::data::NoteColor::Error),
+        Ok(ProtobufNoteColor::Warn) => Ok(crate::data::NoteColor::Warn),
+        Ok(ProtobufNoteColor::Ok) => Ok(crate::data::NoteColor::Ok),
+        Ok(ProtobufNoteColor::Info) => Ok(crate::data::NoteColor::Info),
+        _ => Err(anyhow::anyhow!("Unknown note colour: {}", color)),
     }
 }
 

@@ -2552,6 +2552,17 @@ pub struct PaneInfo {
     /// id, a uuid.
     #[serde(default)]
     pub handle: String,
+    /// A short note somebody left on this pane, drawn on its frame. Empty when there is none.
+    ///
+    /// It describes the pane's live state - "waiting on review", "exit 7" - and is set either by
+    /// `zellij action set-pane-note` or by the server, which marks a pane whose command failed and
+    /// is being held open. It is not part of what the pane *is*, so it is not serialized into a
+    /// snapshot: a restored pane comes back without one.
+    #[serde(default)]
+    pub note: String,
+    /// The colour `note` is drawn in. Meaningless, and `info`, when there is no note.
+    #[serde(default)]
+    pub note_color: NoteColor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -3138,6 +3149,68 @@ impl Default for PaneSignal {
     }
 }
 
+/// One entry of the session's action ring: something that changed, and who changed it.
+///
+/// The ring answers "who moved my tab" in a session several agents and a person are all driving at
+/// once. It records what the session DID rather than what it was asked to do, so an action that
+/// failed is not in it, and the names are the ones that were true at the time - a handle read back
+/// tomorrow may name a different pane.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ActionEvent {
+    /// UTC, to the millisecond, in the same spelling `subscribe --timestamps` uses.
+    pub at: String,
+    /// The action the session ran, in the CLI's spelling: `close-pane`, `move-tab`.
+    pub verb: String,
+    /// What it acted on, named the way the rest of the fork names it - `terminal_3 sunny-otter`,
+    /// `tab_1 logs` - or `-` for an action that named nothing.
+    pub target: String,
+    /// Where it came from: `client 1` for an attached client's keyboard, `cli` for a `zellij
+    /// action` call, `plugin 3` for a plugin.
+    pub origin: String,
+    /// How many times this ran in a row, from the same origin and on the same target.
+    ///
+    /// A held scroll key is one entry with a count, not four hundred entries: without this the
+    /// ring's whole capacity is one keypress and the tab move it was supposed to remember is gone.
+    pub count: usize,
+}
+
+/// What a pane note means, which is also what colour it is drawn in.
+///
+/// A small closed set rather than a colour string: the note is drawn inside somebody else's theme,
+/// and a caller picking `#ff00ff` would be picking against a background it cannot see. These four
+/// are the meanings the theme already has colours for, so a note is legible in every theme.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteColor {
+    /// Something went wrong here. What the server marks a failed command pane with.
+    Error,
+    /// Something needs attention here, but nothing is broken.
+    Warn,
+    /// This pane is finished, and finished well.
+    Ok,
+    /// Neither good nor bad: the default, and what a note carries when nobody said.
+    #[default]
+    Info,
+}
+
+impl NoteColor {
+    /// The name the CLI takes and prints, which is the one this was parsed from.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoteColor::Error => "error",
+            NoteColor::Warn => "warn",
+            NoteColor::Ok => "ok",
+            NoteColor::Info => "info",
+        }
+    }
+}
+
+impl std::fmt::Display for NoteColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl Default for PaneId {
     fn default() -> Self {
         PaneId::Terminal(0)
@@ -3185,8 +3258,9 @@ impl std::fmt::Display for PaneId {
 ///
 /// The forms cannot be confused for one another, which is what makes one flag able to take all
 /// four: `terminal_`/`plugin_` are prefixes nothing else starts with, a bare integer is digits, and
-/// a handle is two words from a fixed list joined by a dash - a shape no uuid can take, because a
-/// uuid is hex in five dash-separated groups and no word in the list is hex.
+/// a handle is up to four lowercase words joined by dashes, at least one of them holding a letter -
+/// a shape no uuid can take, because a uuid is hex in five dash-separated groups, or one group far
+/// longer than a word.
 ///
 /// Parsing says only which form a string IS. Whether a pane answers to it is the server's to
 /// decide, since the server is where the live panes are.
@@ -3292,14 +3366,12 @@ mod pane_target_tests {
 
     #[test]
     fn what_names_no_pane_is_refused_rather_than_guessed() {
-        // the ambiguity cases: two dash-joined words that are not BOTH from the list are not a
-        // handle, and must not be silently treated as one - the miss belongs at the parser, where
-        // the message can name every accepted form
+        // what is refused here is a string that is no target in any session: a handle only has to
+        // be handle-SHAPED, because a chosen handle can be any word and the parser cannot know
+        // which words a session's panes were given. A well-formed name nothing answers to is the
+        // resolver's miss, not the parser's error
         for input in [
             "",
-            "otter",
-            "purple-otter",
-            "sunny-teapot",
             "Sunny-Otter",
             "sunny_otter",
             "terminal_",
@@ -3307,12 +3379,24 @@ mod pane_target_tests {
             "plugin_-1",
             "-1",
             "1.5",
-            "e9b82dbd",
         ] {
             assert!(
                 PaneTarget::from_str(input).is_err(),
                 "should not name a pane: {:?}",
                 input
+            );
+        }
+    }
+
+    #[test]
+    fn a_chosen_handle_names_a_pane_like_a_generated_one() {
+        // `--handle build` is a name a caller picked, and every `--pane-id` has to take it back
+        for chosen in ["build", "my-build", "web-2"] {
+            assert_eq!(
+                PaneTarget::from_str(chosen),
+                Ok(PaneTarget::Handle(chosen.to_owned())),
+                "{} should read as a handle",
+                chosen
             );
         }
     }

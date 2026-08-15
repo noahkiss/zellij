@@ -299,6 +299,9 @@ message Action {
     SetSyncTabAction set_sync_tab = 166;
     ResolvePaneTargetAction resolve_pane_target = 167;
     ListTreeAction list_tree = 168;
+    SetPaneHandleAction set_pane_handle = 169;
+    SetPaneNoteAction set_pane_note = 170;
+    ListEventsAction list_events = 171;
   }
 }
 
@@ -389,7 +392,29 @@ message ListClientsAction {
 message ResolvePaneTargetAction {
   string target = 1;
 }
+message SetPaneHandleAction {
+  PaneId pane_id = 1;
+  string handle = 2;
+}
+// fork addition: the short note drawn on a pane's frame, and what it means
+enum NoteColor {
+  NOTE_COLOR_UNSPECIFIED = 0;
+  NOTE_COLOR_ERROR = 1;
+  NOTE_COLOR_WARN = 2;
+  NOTE_COLOR_OK = 3;
+  NOTE_COLOR_INFO = 4;
+}
+// an absent note is the clear: the pane is left carrying nothing
+message SetPaneNoteAction {
+  PaneId pane_id = 1;
+  optional string note = 2;
+  NoteColor color = 3;
+}
 message ListTreeAction {
+  bool output_json = 1;
+}
+// fork addition: the session's action ring
+message ListEventsAction {
   bool output_json = 1;
 }
 message ListPanesAction {

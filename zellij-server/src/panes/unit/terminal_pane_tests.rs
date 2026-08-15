@@ -1136,6 +1136,45 @@ fn every_pane_has_a_handle_from_the_moment_it_is_built() {
 }
 
 #[test]
+fn a_command_that_failed_leaves_its_own_note() {
+    // the durable "this pane failed" mark: the frame's EXIT CODE line goes when the pane is rerun
+    // or scrolled past, and nothing outside the server could ever read it
+    use zellij_utils::data::NoteColor;
+    use zellij_utils::input::command::RunCommand;
+    let run_command = RunCommand {
+        command: std::path::PathBuf::from("false"),
+        ..Default::default()
+    };
+    let mut pane = a_terminal_pane(1);
+    assert_eq!(pane.pane_note(), None, "a pane starts unmarked");
+    pane.hold(Some(7), false, run_command.clone());
+    assert_eq!(
+        pane.pane_note(),
+        Some(("exit 7".to_owned(), NoteColor::Error))
+    );
+    // and it goes when the pane is asked to run again: the mark belongs to the run that ended
+    pane.rerun();
+    assert_eq!(pane.pane_note(), None);
+}
+
+#[test]
+fn a_command_that_succeeded_is_not_marked_and_neither_is_one_that_has_not_run() {
+    // the negative controls. A pane held before its first run has nothing to report, and a
+    // command that exited 0 did what it was asked - marking either would make the mark noise
+    use zellij_utils::input::command::RunCommand;
+    let run_command = RunCommand {
+        command: std::path::PathBuf::from("true"),
+        ..Default::default()
+    };
+    let mut succeeded = a_terminal_pane(1);
+    succeeded.hold(Some(0), false, run_command.clone());
+    assert_eq!(succeeded.pane_note(), None);
+    let mut first_run = a_terminal_pane(2);
+    first_run.hold(Some(7), true, run_command);
+    assert_eq!(first_run.pane_note(), None);
+}
+
+#[test]
 fn two_live_panes_do_not_share_a_handle() {
     let first = a_terminal_pane(1);
     let second = a_terminal_pane(2);
