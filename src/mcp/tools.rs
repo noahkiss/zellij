@@ -169,7 +169,9 @@ pub const TOOLS: &[ToolSpec] = &[
         follow_up: Some("zellij_read_pane to read what the pane says once the wait returns"),
         reports: "action wait",
         tips: "A wait that times out is a miss, not an error, and says so. until=match needs a \
-               pattern; until=quiet takes the window in quiet_ms.",
+               pattern; until=quiet takes the window in quiet_ms. Every wait is bounded: without \
+               timeout_s it gives up after 300 seconds rather than blocking for the life of the \
+               pane.",
         params: &[
             SESSION,
             ParamSpec {
@@ -558,7 +560,17 @@ fn property(param: &ParamSpec) -> Value {
     }
     property.insert("description".to_owned(), json!(param_description(param)));
     if let Some(default) = param.default {
-        property.insert("default".to_owned(), json!(default));
+        // the table writes every default as a string, because that is what a command line takes.
+        // An integer property whose `default` is a string is not valid against its own schema, so
+        // it is put back into the type the property declares
+        let default = match param.kind {
+            ParamKind::Int => default
+                .parse::<i64>()
+                .map(|number| json!(number))
+                .unwrap_or_else(|_| json!(default)),
+            _ => json!(default),
+        };
+        property.insert("default".to_owned(), default);
     }
     Value::Object(property)
 }

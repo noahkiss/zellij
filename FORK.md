@@ -3769,6 +3769,13 @@ the CLI's own refusal, and there is no id anywhere for it to invent. What cannot
 Which session a call is about: the tool's own `session`, else `ZELLIJ_SESSION_NAME` in the server's
 environment.
 
+**An abandoned call costs nothing.** MCP clients time out, disconnect and restart, and they do it
+without telling the server, which simply sees the future dropped. Every child is spawned with
+`kill_on_drop`, so a dropped call takes its child with it - at cancellation and at shutdown alike,
+because the runtime drops its pending tasks when stdin reaches EOF. `zellij_wait_for` is bounded
+too: without `timeout_s` it gives up after 300 seconds rather than blocking for the life of the
+pane, which is the default its own schema has always advertised.
+
 New dependency: `rmcp` (the official Rust MCP SDK) with `server` and `transport-io` only - eight
 crates, no HTTP stack, and nothing on any wasm plugin crate.
 
