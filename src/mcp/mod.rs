@@ -1,0 +1,269 @@
+//! `zellij mcp`: the CLI's surface, served to an agent over the Model Context Protocol.
+//!
+//! Why this exists when `zellij setup --dump-surface` already describes the whole command tree in
+//! one call: a harness that cannot shell out cannot use the CLI at all, and one that can still has
+//! to be told, per call, whether a verb is allowed. MCP answers both - the tools ARE the surface,
+//! and a client gates them one by one.
+//!
+//! Three things keep it honest, and each is enforced somewhere rather than promised here:
+//!
+//! * **Seven tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
+//!   fails if it grows past eight or if a tool asks for more than eight parameters.
+//! * **The descriptions are generated.** What a tool returns, and what each of its parameters
+//!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
+//! * **The tools run the CLI.** Every call is a child process of this same binary, so a tool
+//!   behaves exactly as the command line does, misses included. See [`invoke`].
+//!
+//! Session lifecycle - `session up`, `down`, `restart`, `enable` - is deliberately absent. Those
+//! start and stop the thing this server is talking to, and they stay where a person runs them.
+
+pub mod invoke;
+pub mod tools;
+
+use std::future::Future;
+
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServerHandler, ServiceExt};
+use serde_json::{json, Map, Value};
+use zellij_utils::consts::VERSION;
+
+/// What a client is told this server is, before it asks for anything.
+const INSTRUCTIONS: &str = "\
+Drive a running zellij session: read what is on a pane, wait for something to happen in one, type
+into one, and make or rearrange panes and tabs.
+
+Start with zellij_overview. Panes are addressed by their two-word handle - `sunny-otter` - which is
+the pane's address, survives a session restore, and is what every other tool wants. An integer id
+works too.
+
+Which session a call is about: the tool's own `session` argument, or the session this server was
+started inside. Nothing here starts or stops a session; that is the command line's job.
+
+zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
+each one is - that is how you find the pane to talk to without being told its name.";
+
+/// The server itself. It holds nothing: every answer comes from a child process.
+#[derive(Clone, Debug, Default)]
+pub struct ZellijMcp {
+    /// The session an unqualified call is about, read once at startup.
+    ambient_session: Option<String>,
+}
+
+impl ZellijMcp {
+    pub fn new(session: Option<String>) -> Self {
+        ZellijMcp {
+            ambient_session: session.or_else(invoke::ambient_session),
+        }
+    }
+
+    /// One tool call: build the command line, run it, and report what the CLI said.
+    async fn call(&self, name: &str, arguments: Map<String, Value>) -> CallToolResult {
+        let argv = match invoke::argv(name, &arguments, self.ambient_session.as_deref()) {
+            Ok(argv) => argv,
+            // a call that could not be turned into a command line never ran, and the caller is
+            // told what was missing rather than being handed an empty result
+            Err(message) => return failed(message, json!({"reason": "bad_arguments"})),
+        };
+        let outcome = match invoke::run(&argv).await {
+            Ok(outcome) => outcome,
+            Err(message) => return failed(message, json!({"reason": "not_run"})),
+        };
+        let mut structured = Map::new();
+        structured.insert("exit_code".to_owned(), json!(outcome.code));
+        for (key, value) in invoke::call_context(&argv) {
+            structured.insert(key, json!(value));
+        }
+        // the CLI's JSON answers are parsed back so that a client gets structure rather than a
+        // string holding structure; anything else is carried as the lines it printed
+        match serde_json::from_str::<Value>(outcome.stdout.trim()) {
+            Ok(value) if outcome.stdout.trim_start().starts_with(['{', '[']) => {
+                structured.insert("result".to_owned(), value);
+            },
+            _ => {
+                structured.insert("output".to_owned(), json!(outcome.stdout));
+            },
+        }
+        if !outcome.stderr.trim().is_empty() {
+            structured.insert("diagnostics".to_owned(), json!(outcome.stderr.trim()));
+        }
+        if outcome.is_error() {
+            // exit 2 is the fork's "well-formed request about something that is not there". It is
+            // the reason a create tool can be honest: a pane that was not made says so, and there
+            // is no id here to invent
+            structured.insert(
+                "reason".to_owned(),
+                json!(if outcome.is_miss() { "miss" } else { "error" }),
+            );
+            let said = first_words(&outcome.stderr, &outcome.stdout);
+            let message = if outcome.is_miss() {
+                format!("Nothing matched: {}", said)
+            } else {
+                said
+            };
+            return with_structure(
+                CallToolResult::error(vec![ContentBlock::text(message)]),
+                structured,
+            );
+        }
+        let text = if outcome.stdout.trim().is_empty() {
+            format!("`zellij {}` succeeded and printed nothing.", argv.join(" "))
+        } else {
+            outcome.stdout.clone()
+        };
+        with_structure(
+            CallToolResult::success(vec![ContentBlock::text(text)]),
+            structured,
+        )
+    }
+}
+
+/// A call that failed before, or instead of, reaching the CLI.
+fn failed(message: String, structured: Value) -> CallToolResult {
+    let structured = structured.as_object().cloned().unwrap_or_default();
+    with_structure(
+        CallToolResult::error(vec![ContentBlock::text(message)]),
+        structured,
+    )
+}
+
+fn with_structure(mut result: CallToolResult, structured: Map<String, Value>) -> CallToolResult {
+    result.structured_content = Some(Value::Object(structured));
+    result
+}
+
+/// What the CLI said, preferring its diagnostics: an error's explanation goes to stderr.
+fn first_words(stderr: &str, stdout: &str) -> String {
+    let said = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if said.is_empty() {
+        "The command failed and said nothing.".to_owned()
+    } else {
+        said.to_owned()
+    }
+}
+
+impl ServerHandler for ZellijMcp {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        info.server_info = Implementation::new("zellij", VERSION);
+        info.instructions = Some(INSTRUCTIONS.to_owned());
+        info
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        async move { Ok(ListToolsResult::with_all_items(tools::tool_list())) }
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
+        async move {
+            let name = request.name.to_string();
+            // an unknown tool is a protocol error rather than a failed call: the client asked for
+            // something this server never offered
+            if tools::tool_spec(&name).is_none() {
+                return Err(ErrorData::invalid_params(
+                    format!("`{}` is not a tool of this server", name),
+                    None,
+                ));
+            }
+            let arguments = request.arguments.unwrap_or_default();
+            Ok(CallToolResponse::from(self.call(&name, arguments).await))
+        }
+    }
+}
+
+/// Serve MCP over stdin and stdout until the client goes away.
+///
+/// Returns the process exit status. Nothing in here may write to stdout: that is the protocol
+/// stream, and a stray line would end the session. Diagnostics go to stderr, which is why the
+/// tools capture their child process's output rather than letting it through.
+pub fn start(session: Option<String>) -> i32 {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Could not start the MCP server's runtime: {}", e);
+            return 1;
+        },
+    };
+    runtime.block_on(async move {
+        let service = match ZellijMcp::new(session)
+            .serve(rmcp::transport::io::stdio())
+            .await
+        {
+            Ok(service) => service,
+            Err(e) => {
+                eprintln!(
+                    "The MCP client and this server could not agree on a session: {}",
+                    e
+                );
+                return 1;
+            },
+        };
+        match service.waiting().await {
+            Ok(_) => 0,
+            Err(e) => {
+                eprintln!("The MCP session ended: {}", e);
+                1
+            },
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_server_offers_exactly_the_tools_in_the_table() {
+        let listed = tools::tool_list();
+        assert_eq!(listed.len(), tools::TOOLS.len());
+        for tool in &listed {
+            assert!(
+                tools::tool_spec(&tool.name).is_some(),
+                "{} is listed and cannot be called",
+                tool.name
+            );
+            assert!(
+                tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "{} has no description to route on",
+                tool.name
+            );
+            let annotations = tool.annotations.as_ref().expect("annotations");
+            assert!(annotations.read_only_hint.is_some(), "{}", tool.name);
+        }
+    }
+
+    #[test]
+    fn the_instructions_send_a_reader_to_the_tool_that_starts_a_task() {
+        assert!(INSTRUCTIONS.contains("zellij_overview"));
+        assert!(tools::tool_spec("zellij_overview").is_some());
+    }
+
+    #[test]
+    fn session_lifecycle_is_not_reachable() {
+        for verb in ["session_up", "session_down", "restart", "kill", "delete"] {
+            assert!(
+                !tools::TOOLS.iter().any(|tool| tool.name.contains(verb)),
+                "{} became a tool; lifecycle stays on the command line",
+                verb
+            );
+        }
+    }
+}

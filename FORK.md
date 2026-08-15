@@ -3546,6 +3546,48 @@ detect_agents false
 Being top-level, it is ignored by a binary that predates it, so it can go into a shared config ahead
 of the upgrade.
 
+### `zellij mcp`: the CLI served over the Model Context Protocol
+
+```json
+{ "mcpServers": { "zellij": { "command": "zellij", "args": ["mcp"] } } }
+```
+
+`setup --dump-surface` already describes the whole command tree in one call, which is most of what
+an agent needs. What it cannot do is help a harness that **cannot shell out**, and it cannot be
+gated per verb - an MCP client allows or denies each tool by name, which on a machine where "read a
+pane" and "close a tab" want different answers is the whole point. Hence a server, in the binary, so
+it is version-synced and there is nothing to install.
+
+**Seven tools, not eighty-seven.** `zellij_overview` (panes, agents, or the sessions on this
+machine), `zellij_read_pane`, `zellij_wait_for`, `zellij_write_input`, `zellij_create`,
+`zellij_arrange`, `zellij_snapshot`. Session lifecycle - `up`, `down`, `restart`, `enable` - is
+deliberately not among them: those start and stop the thing the server is talking to. A test fails
+if the surface grows past eight tools, or a tool past eight parameters.
+
+**The descriptions are generated from the surface map.** A tool's `Returns:` line is built from the
+same `OUTPUTS` row `--dump-surface` prints, and each input-schema property that stands for a real
+flag carries clap's own help for it. Rename a flag in `cli.rs` and the build fails rather than the
+description going stale; add a column to a table and the tool says so on the next build. Only the
+routing prose - what a tool is for, what it is *not* for, which tool to reach for next - is written
+by hand, because that is the part that decides whether a tool is called at all.
+
+**Every tool runs this same binary as a child process**, rather than calling the action path
+in-process. That path prints to stdout and exits on a miss; on a stdio server stdout is the protocol
+stream and the process is the session, so one missed pane would corrupt the first and end the
+second. A child process also maps the fork's exit convention straight through - **0 a result, 1 an
+error, 2 a miss** - which is what lets `zellij_create` be honest: a pane that was not made reports
+the CLI's own refusal, and there is no id anywhere for it to invent. What cannot be undone
+(`close_pane`, `close_tab`) passes the confirmation the CLI would otherwise refuse to run without.
+
+Which session a call is about: the tool's own `session`, else `ZELLIJ_SESSION_NAME` in the server's
+environment.
+
+New dependency: `rmcp` (the official Rust MCP SDK) with `server` and `transport-io` only - eight
+crates, no HTTP stack, and nothing on any wasm plugin crate.
+
+Two rows were added to the surface map while wiring this up: `snapshot list` and `snapshot show`
+print a table and a payload respectively, and the map had been claiming they printed nothing.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
