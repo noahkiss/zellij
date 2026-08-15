@@ -1759,7 +1759,37 @@ pub const NO_FOCUSED_PANE_TO_CLOSE: &str =
     "`close-pane` has no focused pane to close: nothing is attached to this session. \
      Pass --pane-id. `zellij action list-panes` lists them.";
 
+/// What a tab-creating command says when nothing is attached to the session.
+///
+/// A tab is built by applying a layout, and applying one needs a client to size it against. With
+/// nobody attached the tab is created empty, the caller is told a pane id for a pane that does not
+/// exist, and the whole tab is thrown away by the next client to attach. The refusal is the honest
+/// answer until a detached session can apply a layout on its own - the deep fix, which is a
+/// different piece of work.
+pub const TAB_CREATION_NEEDS_A_CLIENT: &str =
+    "Creating a tab needs a client attached to this session, and nothing is attached: the tab \
+     would be built empty and thrown away by the next client to attach. Run this from inside the \
+     session, or `zellij attach` first.";
+
+/// Whether a tab-creating instruction should be refused instead of answered.
+///
+/// Two things have to be true. It has to be a COMMAND - something is waiting for an answer, which
+/// is what `completion_tx` means - because the session's own startup builds tabs before any client
+/// has attached and must keep working. And nothing may be attached, because that is the case where
+/// the tab comes out empty.
+pub(crate) fn tab_creation_is_refused(a_command_asked: bool, a_client_is_attached: bool) -> bool {
+    a_command_asked && !a_client_is_attached
+}
+
 impl Screen {
+    /// Whether any client is attached to this session right now.
+    ///
+    /// A `zellij action` client does not count and never has: it connects, is answered, and goes.
+    /// This is about the clients a tab would be sized and drawn for.
+    pub fn has_attached_client(&self) -> bool {
+        !self.connected_clients.borrow().is_empty()
+    }
+
     /// Creates and returns a new [`Screen`].
     pub fn new(
         bus: Bus<ScreenInstruction>,
@@ -10009,6 +10039,16 @@ pub(crate) fn screen_thread_main(
                 (client_id, is_web_client),
                 completion_tx,
             ) => {
+                // a tab asked for by a command (`completion_tx` is the caller waiting for an
+                // answer) is refused when nothing is attached, rather than built empty. The
+                // session's own startup passes no completion and is untouched: it is building the
+                // tabs a client is about to attach to
+                if tab_creation_is_refused(completion_tx.is_some(), screen.has_attached_client()) {
+                    if let Some(mut c) = completion_tx {
+                        c.set_error_message(TAB_CREATION_NEEDS_A_CLIENT.to_owned());
+                    }
+                    continue;
+                }
                 let tab_index = screen.get_new_tab_id();
                 pending_tab_ids.insert(tab_index);
                 restore_reservation.extend(
@@ -10215,6 +10255,19 @@ pub(crate) fn screen_thread_main(
                 } else {
                     screen.active_tab_ids.keys().next().copied()
                 };
+                // `--create` on a session with nobody attached would make the same empty tab
+                // `new-tab` refuses to make; without it there is simply no focus to move
+                if client_id.is_none() {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(if create {
+                            TAB_CREATION_NEEDS_A_CLIENT.to_owned()
+                        } else {
+                            "`go-to-tab-name` has no client to move: nothing is attached to this \
+                             session."
+                                .to_owned()
+                        });
+                    }
+                }
                 if let Some(client_id) = client_id {
                     let is_web_client = screen
                         .connected_clients

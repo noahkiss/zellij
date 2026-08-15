@@ -563,6 +563,31 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
 - A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
   counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
 
+### Making a tab needs somebody attached
+
+```
+$ zellij -s build-box action new-tab --name logs
+Creating a tab needs a client attached to this session, and nothing is attached: the tab would be
+built empty and thrown away by the next client to attach. Run this from inside the session, or
+`zellij attach` first.
+$ echo $?
+2
+```
+
+A tab is built by applying a layout, and applying one needs a client to size it against. On a
+session nobody is attached to, the whole tab-creating family — `new-tab`, `new-tab --layout`,
+`new-pane --new-tab`, `go-to-tab-name --create` — used to make an **empty** tab, report a
+`pane_id:` for a pane that never existed, and have the tab thrown away by the next client to
+attach. A script got a success and an id, and nothing was there.
+
+They now refuse, with exit 2 and that sentence, and create nothing. This is a refusal rather than a
+fix: a detached session applying its own layouts is the real answer and is a separate piece of
+work. Until then the honest report is worth more than a pane id that names nothing.
+
+The session's own startup is untouched — it builds its tabs before any client attaches, and that
+path is exactly what tells the two cases apart: a command has a caller waiting for an answer, and
+startup has none.
+
 ### Pane notes
 
 ```

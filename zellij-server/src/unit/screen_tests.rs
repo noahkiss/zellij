@@ -4095,6 +4095,7 @@ pub fn send_cli_edit_action_with_default_parameters() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4139,6 +4140,7 @@ pub fn send_cli_edit_action_with_line_number() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4183,6 +4185,7 @@ pub fn send_cli_edit_action_with_split_direction() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -5976,6 +5979,7 @@ pub fn send_cli_edit_in_place_with_close_replaced_pane() {
         no_focus: false,
         borderless: None,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -9618,6 +9622,7 @@ pub fn send_cli_edit_action_with_tab_id() {
         no_focus: false,
         borderless: None,
         tab_id: Some(0),
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -14755,4 +14760,18 @@ fn the_ring_holds_its_size_and_drops_the_oldest() {
         ring.back().unwrap().target,
         format!("terminal_{}", ACTION_RING_SIZE + 49)
     );
+}
+
+#[test]
+fn a_tab_is_only_refused_when_a_command_asked_and_nobody_is_attached() {
+    use crate::screen::tab_creation_is_refused;
+    // the case this exists for: a script calls `new-tab` on a detached session, and the tab would
+    // be built empty, reported as if it had a pane, and thrown away by the next client to attach
+    assert!(tab_creation_is_refused(true, false));
+    // the negative controls, and both matter. The session's own startup builds its tabs before any
+    // client has attached and passes no completion - refusing there would break every layout
+    assert!(!tab_creation_is_refused(false, false));
+    // and a command with somebody attached is the ordinary case
+    assert!(!tab_creation_is_refused(true, true));
+    assert!(!tab_creation_is_refused(false, true));
 }
