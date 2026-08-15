@@ -9,6 +9,9 @@ pub mod host_query;
 pub mod os_input_output;
 pub mod output;
 mod pane_handles;
+// fork addition: the integration harness asks for in-order pane handles, so a snapshot of a
+// rendered frame is the same on every run
+pub use pane_handles::SEQUENTIAL_HANDLES_VAR;
 pub mod panes;
 pub mod tab;
 
