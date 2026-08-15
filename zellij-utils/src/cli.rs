@@ -443,6 +443,10 @@ pub enum Sessions {
         /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
         #[clap(long, value_parser, default_value("10"))]
         wait_timeout: u64,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
 
     /// Delete a session's saved state, so it can no longer be resurrected
@@ -462,6 +466,10 @@ pub enum Sessions {
         /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
         #[clap(long, value_parser, default_value("10"))]
         wait_timeout: u64,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
 
     /// Inspect and restore archived session snapshots
@@ -978,6 +986,10 @@ pub enum SnapshotCli {
         /// The snapshot id, or a unique prefix of one
         #[clap(value_parser)]
         id: String,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
     /// Adopt saved layouts left in the cache by other versions or contract versions
     Import {
@@ -998,6 +1010,10 @@ pub enum SnapshotCli {
         /// How many snapshots to keep per session name, defaults to session_snapshot_limit
         #[clap(long, value_parser)]
         keep: Option<usize>,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
 }
 
@@ -1287,6 +1303,10 @@ pub enum CliAction {
         /// session, or with a client attached
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
     /// Print what a pane is showing
     ///
@@ -1793,6 +1813,10 @@ pub enum CliAction {
         /// session, or with a client attached
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
     /// Give a pane a name, which is what its frame and the TITLE column then show
     RenamePane {
@@ -1831,6 +1855,10 @@ pub enum CliAction {
         /// session, or with a client attached
         #[clap(long, visible_alias = "current", conflicts_with = "tab_id")]
         focused: bool,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
     /// Focus the tab at a display position
     ///
@@ -2660,6 +2688,69 @@ pub fn text_from_stdin<R: std::io::Read>(reader: R, verb: &str) -> Result<String
     })
 }
 
+/// What a confirmation should do, worked out before anything is printed.
+///
+/// The rule the fork applies: **a verb whose effect cannot be undone confirms first.** On a
+/// terminal it asks; anywhere else it refuses and names `--yes`. A script must never meet a prompt
+/// it cannot answer - a command that blocks forever waiting for a keypress nobody is there to
+/// press is worse than either answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Confirmation {
+    /// Ask, and do it if the answer is yes.
+    Ask(String),
+    /// Go ahead: the caller said `--yes`, which is how a script says it meant this.
+    Proceed,
+    /// Refuse, exit 2, and say what would have allowed it.
+    Refuse(String),
+}
+
+/// Whether this call may go ahead with something it cannot take back.
+///
+/// `on_a_terminal` is the seam: it is `stdin().is_terminal()` at the call site, and a plain
+/// argument here so the whole matrix can be tested without a tty.
+pub fn confirmation_for(verb: &str, what: &str, yes: bool, on_a_terminal: bool) -> Confirmation {
+    if yes {
+        return Confirmation::Proceed;
+    }
+    if on_a_terminal {
+        return Confirmation::Ask(format!("{} {}. Are you sure?", verb, what));
+    }
+    Confirmation::Refuse(format!(
+        "`{verb}` {what}, and cannot be undone. Nothing here can answer a prompt, so pass `--yes` \
+         to say you meant it."
+    ))
+}
+
+/// What each verb destroys, in its own words.
+///
+/// One home for the wording, because the same sentence is read twice: in the question on a
+/// terminal, and in the refusal off one.
+pub mod destroys {
+    pub const CLOSE_PANE: &str = "kills whatever is running in that pane";
+    pub const CLOSE_TAB: &str = "kills every pane in that tab and everything running in them";
+    pub const CLEAR: &str = "throws away that pane's screen and its whole scrollback";
+    pub const KILL_SESSION: &str = "kills that session and everything running in it";
+    pub const DELETE_SESSION: &str = "deletes that session's saved layout";
+    pub const KILL_ALL_SESSIONS: &str = "kills every session and everything running in them";
+    pub const DELETE_ALL_SESSIONS: &str = "deletes every resurrectable session's saved layout";
+    pub const SNAPSHOT_RM: &str = "deletes that snapshot's saved layout";
+    pub const SNAPSHOT_PRUNE: &str =
+        "deletes every snapshot past the newest few of each session name";
+}
+
+/// Which `zellij action` verbs confirm, and what each of them says it destroys.
+///
+/// The table is here rather than at the call site so that what confirms - and, just as much, what
+/// does not - can be read and tested without a session to run it against.
+pub fn confirmation_needed(action: &CliAction) -> Option<(&'static str, &'static str, bool)> {
+    match action {
+        CliAction::ClosePane { yes, .. } => Some(("close-pane", destroys::CLOSE_PANE, *yes)),
+        CliAction::CloseTab { yes, .. } => Some(("close-tab", destroys::CLOSE_TAB, *yes)),
+        CliAction::Clear { yes, .. } => Some(("clear", destroys::CLEAR, *yes)),
+        _ => None,
+    }
+}
+
 /// How a `zellij action` verb behaves when it is not told what to act on.
 ///
 /// Three classes, and the difference between them is what "the focused thing" would mean:
@@ -2738,7 +2829,11 @@ enum Named {
 pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<String> {
     let class = target_class(action);
     let (verb, flag, lister, named) = match action {
-        CliAction::ClosePane { pane_id, focused } => (
+        CliAction::ClosePane {
+            pane_id,
+            focused,
+            ..
+        } => (
             "close-pane",
             "--pane-id",
             "list-panes",
@@ -2776,13 +2871,21 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
             "list-panes",
             named(pane_id.is_some(), *focused),
         ),
-        CliAction::Clear { pane_id, focused } => (
+        CliAction::Clear {
+            pane_id,
+            focused,
+            ..
+        } => (
             "clear",
             "--pane-id",
             "list-panes",
             named(pane_id.is_some(), *focused),
         ),
-        CliAction::CloseTab { tab_id, focused } => (
+        CliAction::CloseTab {
+            tab_id,
+            focused,
+            ..
+        } => (
             "close-tab",
             "--tab-id",
             "list-tabs",
@@ -3427,6 +3530,112 @@ mod tests {
                 &Some(UnblockCondition::OnAnyExit)
             ),
             other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_verb_that_cannot_be_undone_asks_first_and_never_hangs() {
+        // the whole matrix, once, because one helper answers it for every such verb
+        assert_eq!(
+            confirmation_for("close-pane", "kills what is running in it", false, true),
+            Confirmation::Ask("close-pane kills what is running in it. Are you sure?".to_owned())
+        );
+        // `--yes` is how a script says it meant this, and it works either way
+        assert_eq!(
+            confirmation_for("close-pane", "kills what is running in it", true, true),
+            Confirmation::Proceed
+        );
+        assert_eq!(
+            confirmation_for("close-pane", "kills what is running in it", true, false),
+            Confirmation::Proceed
+        );
+        // the case that matters most: no terminal and no `--yes` REFUSES rather than prompting.
+        // A script that met a prompt here would wait forever for a keypress nobody is there to
+        // press, which is worse than either answer
+        match confirmation_for("close-pane", "kills what is running in it", false, false) {
+            Confirmation::Refuse(message) => {
+                assert!(message.contains("--yes"), "the way out is named: {message}");
+                assert!(message.contains("close-pane"), "{message}");
+            },
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn only_the_action_verbs_that_destroy_something_confirm() {
+        let asks = |args: &[&str]| confirmation_needed(&parse_action(args)).map(|(v, _, y)| (v, y));
+        // one representative per confirming verb, each parsed from a real command line, so this
+        // also proves `--yes` reached the verb rather than only the helper
+        assert_eq!(
+            asks(&["close-pane", "--pane-id", "terminal_1"]),
+            Some(("close-pane", false))
+        );
+        assert_eq!(
+            asks(&["close-pane", "--pane-id", "terminal_1", "--yes"]),
+            Some(("close-pane", true))
+        );
+        assert_eq!(
+            asks(&["close-tab", "--tab-id", "2"]),
+            Some(("close-tab", false))
+        );
+        assert_eq!(
+            asks(&["close-tab", "--tab-id", "2", "--yes"]),
+            Some(("close-tab", true))
+        );
+        assert_eq!(
+            asks(&["clear", "--pane-id", "terminal_1"]),
+            Some(("clear", false))
+        );
+        assert_eq!(
+            asks(&["clear", "--pane-id", "terminal_1", "--yes"]),
+            Some(("clear", true))
+        );
+        // the negative control, and the point of the table being here: the exempt verbs. Each is
+        // exempt for its own reason - the signal's name is the intent, the write family destroys
+        // nothing of its own, and `dump-screen` is a read-band verb
+        assert_eq!(asks(&["signal-pane", "--pane-id", "terminal_1"]), None);
+        assert_eq!(
+            asks(&["write-chars", "hi", "--pane-id", "terminal_1"]),
+            None
+        );
+        assert_eq!(
+            asks(&["send-keys", "Enter", "--pane-id", "terminal_1"]),
+            None
+        );
+        assert_eq!(asks(&["paste", "hi", "--pane-id", "terminal_1"]), None);
+        assert_eq!(
+            asks(&["dump-screen", "/tmp/s", "--pane-id", "terminal_1"]),
+            None
+        );
+        assert_eq!(asks(&["rename-pane", "notes"]), None);
+        assert_eq!(asks(&["new-pane"]), None);
+    }
+
+    #[test]
+    fn every_confirming_verb_says_what_it_destroys() {
+        // the sentence is read twice - as the question and as the refusal - so it has to complete
+        // "`<verb>` <what>, and cannot be undone" in both. One home for it, checked once
+        for what in [
+            destroys::CLOSE_PANE,
+            destroys::CLOSE_TAB,
+            destroys::CLEAR,
+            destroys::KILL_SESSION,
+            destroys::DELETE_SESSION,
+            destroys::KILL_ALL_SESSIONS,
+            destroys::DELETE_ALL_SESSIONS,
+            destroys::SNAPSHOT_RM,
+            destroys::SNAPSHOT_PRUNE,
+        ] {
+            assert!(
+                !what.is_empty() && !what.ends_with('.'),
+                "it is a clause, not a sentence: {what}"
+            );
+            assert!(
+                what.starts_with("kills ")
+                    || what.starts_with("deletes ")
+                    || what.starts_with("throws away "),
+                "it names the destruction in the present tense: {what}"
+            );
         }
     }
 

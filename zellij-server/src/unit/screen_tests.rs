@@ -4354,6 +4354,7 @@ pub fn send_cli_close_pane_action() {
     let close_pane_action = CliAction::ClosePane {
         pane_id: None,
         focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, close_pane_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4607,6 +4608,7 @@ pub fn send_cli_close_tab_action() {
     let close_tab = CliAction::CloseTab {
         tab_id: None,
         focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, close_tab, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7667,6 +7669,7 @@ pub fn send_cli_clear_with_pane_id() {
     let cli_action = CliAction::Clear {
         pane_id: Some("terminal_0".to_string()),
         focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7792,6 +7795,7 @@ pub fn send_cli_close_pane_with_pane_id() {
     let cli_action = CliAction::ClosePane {
         pane_id: Some("terminal_0".to_string()),
         focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7918,6 +7922,7 @@ pub fn send_cli_close_tab_with_tab_id() {
     let cli_action = CliAction::CloseTab {
         tab_id: Some(1),
         focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));

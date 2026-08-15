@@ -1003,8 +1003,9 @@ impl Action {
             },
             CliAction::Clear {
                 pane_id,
-                // resolved by the guard before this
+                // both resolved before this: `--focused` by the guard, `--yes` by the confirm
                 focused: _,
+                yes: _,
             } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = resolve_pane_target(&pane_id_str)?;
@@ -1534,6 +1535,7 @@ impl Action {
             CliAction::ClosePane {
                 pane_id,
                 focused: _,
+                yes: _,
             } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = resolve_pane_target(&pane_id_str)?;
@@ -1560,7 +1562,11 @@ impl Action {
             },
             CliAction::GoToNextTab => Ok(vec![Action::GoToNextTab]),
             CliAction::GoToPreviousTab => Ok(vec![Action::GoToPreviousTab]),
-            CliAction::CloseTab { tab_id, focused: _ } => match tab_id {
+            CliAction::CloseTab {
+                tab_id,
+                focused: _,
+                yes: _,
+            } => match tab_id {
                 Some(id) => Ok(vec![Action::CloseTabById { id: id as u64 }]),
                 None => Ok(vec![Action::CloseTab]),
             },
@@ -3203,6 +3209,7 @@ mod tests {
         let cli_action = CliAction::Clear {
             pane_id: Some("terminal_14".to_string()),
             focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3226,6 +3233,7 @@ mod tests {
         let cli_action = CliAction::Clear {
             pane_id: None,
             focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3401,6 +3409,7 @@ mod tests {
         let cli_action = CliAction::ClosePane {
             pane_id: Some("terminal_18".to_string()),
             focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3424,6 +3433,7 @@ mod tests {
         let cli_action = CliAction::ClosePane {
             pane_id: None,
             focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3633,6 +3643,7 @@ mod tests {
         let cli_action = CliAction::CloseTab {
             tab_id: Some(5),
             focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3656,6 +3667,7 @@ mod tests {
         let cli_action = CliAction::CloseTab {
             tab_id: None,
             focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -5058,6 +5070,7 @@ mod pane_target_resolution_tests {
             CliAction::ClosePane {
                 pane_id: Some("sunny-otter".to_owned()),
                 focused: false,
+                yes: false,
             },
             Box::new(|| PathBuf::from("/tmp")),
             None,
@@ -5084,6 +5097,7 @@ mod pane_target_resolution_tests {
             CliAction::ClosePane {
                 pane_id: Some("sunny-otter".to_owned()),
                 focused: false,
+                yes: false,
             },
             Box::new(|| PathBuf::from("/tmp")),
             None,

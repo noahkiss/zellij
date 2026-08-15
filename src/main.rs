@@ -276,9 +276,14 @@ fn main() {
         ref target_session,
         no_wait,
         wait_timeout,
+        yes,
     })) = opts.command
     {
-        commands::kill_session(target_session, KillWait::from_cli(no_wait, wait_timeout));
+        commands::kill_session(
+            target_session,
+            KillWait::from_cli(no_wait, wait_timeout),
+            yes,
+        );
     } else if let Some(Command::Sessions(Sessions::DeleteAllSessions {
         yes,
         force,
@@ -292,6 +297,7 @@ fn main() {
         force,
         no_wait,
         wait_timeout,
+        yes,
     })) = opts.command
     {
         commands::delete_session(
@@ -299,6 +305,7 @@ fn main() {
             force,
             KillWait::from_cli(no_wait, wait_timeout),
             &opts,
+            yes,
         );
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);
