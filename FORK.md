@@ -3882,18 +3882,18 @@ intel mac, no Windows.
    from source, which `Release` does not — then `git tag v<version> && git push origin v<version>`.
    Tags are immutable once a formula pins them — never move one.
 3. Watch the run: `gh run watch -R noahkiss/zellij $(gh run list -R noahkiss/zellij --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')`.
-4. Bump `Formula/zellij-nkmk.rb` in the tap: `version`, the URLs, and the `sha256`
-   values. The shas are on the release as `<asset>.sha256`. `-D -` does **not** stream to stdout —
-   it creates a directory literally named `-` — so download to a temp dir and read them:
+4. The tap bump runs itself. The `bump-tap` job dispatches `bump-zellij.yml` in
+   `noahkiss/homebrew-tap` once `finalize` has published the release, then waits for it. That
+   workflow rewrites both formulae from the release's `.sha256` assets and proves them with a real
+   `brew install` on macOS and Linux before it commits. No sha is transcribed by hand.
+
+   The dispatch needs `HOMEBREW_TAP_TOKEN` — a PAT with `workflow` scope on the tap, because this
+   repo's `GITHUB_TOKEN` cannot dispatch another repo. Without it the job prints this fallback and
+   passes, so a release never fails for want of the token:
 
    ```
-   d=$(mktemp -d) && gh release download v<version> -R noahkiss/zellij -p '*.sha256' -D "$d" \
-     && cat "$d"/*.sha256
+   gh workflow run bump-zellij.yml -R noahkiss/homebrew-tap -f tag=v<version>
    ```
-
-   Better still, verify rather than transcribe: download the tarballs alongside them and run
-   `sha256sum -c *.sha256` in that directory, so a wrong value cannot reach the formula.
-   `Formula/zellij-nkmk-source.rb` takes the tag tarball's sha instead.
 
 A pour of the prebuilt formula reinstalls in about 2 seconds. If a test install takes minutes
 instead, it fell through to a source build because `brew` read a **stale local tap clone** — run
