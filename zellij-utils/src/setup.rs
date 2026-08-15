@@ -426,11 +426,14 @@ impl Setup {
             std::process::exit(0);
         }
 
+        // a call that names no question is a usage error, and a usage error exits 2 here for the
+        // same reason clap's own do: the command was refused before it ran, and nothing changed
         if self.json && !self.check {
-            return Err(anyhow!(
+            eprintln!(
                 "--json says how to print an answer and needs a question: pass it with --check or \
                  with --dump-surface"
-            ));
+            );
+            std::process::exit(2);
         }
 
         if let Some(shell) = &self.generate_completion {

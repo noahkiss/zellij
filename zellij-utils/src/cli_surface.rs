@@ -342,12 +342,17 @@ How every one of these answers:
   * A single record is `key: value` lines. A list of like things is a table with an UPPER_SNAKE
     header row. A nesting of them is an indented outline. Keys and columns are append-only:
     a release may add one, never rename or remove one.
-  * `--json` carries the same information, structured, wherever it is offered. The queries all
-    have it.
+  * `--json` carries the same information, structured, wherever it is offered: `ls`, `list-panes`,
+    `list-tabs`, `list-tree`, `list-clients`, `list-events` and `current-tab-info`. The other
+    reads and every mutation print their own shape only.
   * Results go to stdout, diagnostics go to stderr, and a payload command prints its payload
     alone.
-  * Exit 0 acted or found, 1 error, 2 miss. A miss is a well-formed request about something that
-    is not there - a closed pane, a tab by a name nothing answers to.
+  * Exit 0 acted or found, 1 error, 2 the command changed nothing. That 2 covers every way a
+    well-formed call ends without acting: a miss (a closed pane, a tab by a name nothing answers
+    to), a refusal by one of the three classes below, a confirm nothing could answer or that you
+    declined, a wait that timed out, and a call this parser would not take. A 1 means the call
+    could not be carried out at all - a regex that does not compile, a handle already taken, a
+    server that failed.
   * A command that only acts prints nothing. The ones that report say so in their own --help.
   * Three classes decide what a verb does when you do not tell it what to act on. Moving focus,
     scrolling, switching mode and every CREATING verb work anywhere: placement relative to where
@@ -889,7 +894,8 @@ mod tests {
             assert!(listing.contains(group.name), "{} is missing", group.name);
         }
         assert!(listing.contains("list-panes"));
-        assert!(ACTION_PREAMBLE.contains("Exit 0 acted or found, 1 error, 2 miss"));
+        assert!(ACTION_PREAMBLE
+            .contains("Exit 0 acted or found, 1 error, 2 the command changed nothing"));
         assert!(ACTION_PREAMBLE.contains("sunny-otter"));
         assert!(ACTION_PREAMBLE.contains("--dump-surface"));
     }

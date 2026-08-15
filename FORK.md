@@ -76,15 +76,23 @@ you how to read the next.
   another.
 - **Where `--json` exists it carries the same information, structured.** JSON is the interface for
   programs; the default output is for a human or an agent reading a shell. The goal is `--json` on
-  every query and on every mutation that reports something. The queries have it — `ls`,
-  `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `current-tab-info`. The mutations do not
+  every query and on every mutation that reports something. Seven have it — `ls`, `list-panes`,
+  `list-tabs`, `list-tree`, `list-clients`, `list-events`, `current-tab-info`; `wait` and
+  `are-floating-panes-visible` do not, and the payload commands never will. The mutations do not
   yet, so for those this bullet is a direction rather than a promise you can write a script
   against.
 - **Results go to stdout, diagnostics go to stderr.** A command whose output you are capturing never
   mixes an explanation into it.
-- **Exit codes are `0` acted, `1` error, `2` miss.** A miss is a well-formed request about something
-  that is not there — a pane that no longer exists, a tab by a name nothing answers to. It is not a
-  failure, and it prints its sentence on stderr like one so that `set -e` scripts stop either way.
+- **Exit codes are `0` acted, `1` error, `2` the command changed nothing.** The `2` is one bucket
+  with several doors into it: a **miss** — a well-formed request about something that is not there,
+  a pane that no longer exists, a tab by a name nothing answers to; a **refusal** by one of the
+  three classes below; a **confirm** nothing could answer, or that you declined; a **wait** that
+  timed out; and a call clap would not accept in the first place. None of those is a failure, and
+  each prints its sentence on stderr like one so that `set -e` scripts stop either way. A `1` is
+  narrower: the call could not be carried out at all — a regex that does not compile, a handle a
+  live pane already holds, a target the command cannot address, text too large or not UTF-8, a
+  server that failed. **The sentence on stderr, not the exit code, says which door it came
+  through.**
 - **A payload command prints the payload and nothing else.** `dump-screen` writes screen content to
   stdout; it does not introduce it.
 
@@ -123,7 +131,7 @@ each one by name. A flag added tomorrow is in the map tomorrow, and cannot quiet
 The dump runs before the configuration is read, like `--dump-config` and `--dump-layout` beside it:
 what the CLI accepts does not depend on a config file, and a broken one must not take the map away.
 `zellij setup --json` now answers to `--check` or to `--dump-surface`; with neither it says which
-ones it takes, on stderr, and exits 1.
+ones it takes, on stderr, and exits 2 — a usage error, like the ones clap raises itself.
 
 ### `zellij action --help`
 
@@ -295,15 +303,18 @@ verbs are in three classes, and a new verb is put in one when it is written:
 
 | Class | What it means with no target | Verbs | Which of them confirm |
 |---|---|---|---|
-| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
-| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-tab`, the `break-pane` family, the `toggle-pane-*` family, `clear` | `clear` |
+| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `toggle-pane-frames`, `toggle-pane-borderless`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
+| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `undo-rename-pane`, `undo-rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-pane-backwards`, `move-tab`, the `break-pane` family, `toggle-pane-embed-or-floating`, `toggle-pane-pinned`, `clear` | `clear` |
 | 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` | `close-pane`, `close-tab` |
 
 **Class 1 is additive**, and placement relative to wherever you are is the whole point of it. A
-script calling `new-pane` is asking for exactly that.
+script calling `new-pane` is asking for exactly that. A verb whose target clap already requires is
+class 1 too — `toggle-pane-borderless` cannot be called without one, so there is no absence left for
+a class to reason about.
 
 **Class 2 is the recoverable half.** Inside a pane, "focused" is the pane your hands are on and
-nothing changes. From a script it exits 1 and names the `--pane-id` or `--tab-id` that answers it.
+nothing changes. From a script it exits 2 — a refusal changes nothing — and names the `--pane-id`
+or `--tab-id` that answers it.
 `break-pane-right` and `break-pane-left` cannot name a target at all, so from outside they are
 refused outright, pointing at `break-pane --pane-id`.
 
@@ -333,7 +344,7 @@ and names `--yes`. A script must never meet a prompt it cannot answer: a command
 waiting for a keypress nobody is there to press is worse than either answer.
 
 **A refusal and a declined prompt both exit 2**, on stderr, because each is a well-formed request
-that changed nothing — which is what this fork's exit codes call a miss. `kill-all-sessions` and
+that changed nothing — which is [what a 2 means](#the-cli-output-convention). `kill-all-sessions` and
 `delete-all-sessions` answered a declined prompt with 1 before, and now answer it with 2 like the
 rest.
 
@@ -348,8 +359,9 @@ readable: it is the same table, read for what is missing from it.
 For `close-pane`, `close-tab` and `clear` the confirm runs after the guards the client can settle
 by itself — the targetless refusal and the cross-session one — so a call that was never going to be
 sent is never asked about. It runs **before** the server is reached, so a `--pane-id` that no live
-pane answers to is confirmed first and reported as a miss afterwards. Both exit 2, and the sentence
-on stderr is what tells them apart, which is the rule the whole `action` band already follows.
+pane answers to is confirmed first and reported as a miss afterwards. Both exit 2 — a refusal and a
+miss are two doors into the same bucket — and the sentence on stderr is what tells them apart,
+which is the rule the whole `action` band already follows.
 
 `close-pane` and `close-tab` keep their class-3 target requirement **and** gain the confirm, and
 both are wanted in a script: the target proves *what*, `--yes` proves the destruction is meant.
