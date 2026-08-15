@@ -1,3 +1,4 @@
+use crate::agent_detect::PaneAgent;
 use crate::home::default_layout_dir;
 use crate::input::actions::{Action, RunCommandAction};
 use crate::input::config::{ConversionError, KdlError};
@@ -2572,9 +2573,53 @@ pub struct PaneListEntry {
     pub tab_id: usize,
     pub tab_position: usize,
     pub tab_name: String,
+    /// The coding agent running in this pane, if one is.
+    ///
+    /// Absent for every pane that is not running a harness this build recognises, and absent
+    /// entirely when `detect_agents` is off. It lives here rather than on `PaneInfo` on purpose:
+    /// the readers are `list-panes`, `list-agents` and the MCP server, all of them on this side of
+    /// the plugin contract, and a field on `PaneInfo` would cost a protobuf tag to tell them
+    /// something they can already be told for free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<PaneAgent>,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;
+
+/// One pane that is running a coding agent: `zellij action list-agents`.
+///
+/// A projection of [`PaneListEntry`] rather than a second walk of the session - the same pane
+/// list, filtered to the panes with an `agent`, carrying the fields a reader needs to address the
+/// pane and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentListEntry {
+    /// The pane's two-word handle: its address, and what a reader should use to talk to it.
+    pub handle: String,
+    /// The pane's integer id, for a caller that already speaks in them.
+    pub pane_id: u32,
+    pub tab_id: usize,
+    pub tab_position: usize,
+    pub tab_name: String,
+    /// The pane's title, which several harnesses set to what they are working on.
+    pub title: String,
+    /// The harness, its session id if it exports one, and what the answer rests on.
+    #[serde(flatten)]
+    pub agent: PaneAgent,
+    /// The command line this row was decided on, so a wrong row is obvious rather than mysterious.
+    ///
+    /// Which of a pane's two lines that is depends on which one matched: the live argv for a pane
+    /// the process table has answered for, the line the pane was STARTED with otherwise. It is the
+    /// line detection used, not whichever one was handy - a column that exists to expose a wrong
+    /// row is no use if it can contradict the row it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+pub type ListAgentsResponse = Vec<AgentListEntry>;
 pub type ListTabsResponse = Vec<TabInfo>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

@@ -45,6 +45,7 @@ Options {
     session_service: None,
     resurrect_command_hints: None,
     report_pane_env: None,
+    detect_agents: None,
     default_floating_size: None,
     styled_underlines: None,
     serialization_interval: None,
