@@ -3149,6 +3149,31 @@ impl Default for PaneSignal {
     }
 }
 
+/// One entry of the session's action ring: something that changed, and who changed it.
+///
+/// The ring answers "who moved my tab" in a session several agents and a person are all driving at
+/// once. It records what the session DID rather than what it was asked to do, so an action that
+/// failed is not in it, and the names are the ones that were true at the time - a handle read back
+/// tomorrow may name a different pane.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ActionEvent {
+    /// UTC, to the millisecond, in the same spelling `subscribe --timestamps` uses.
+    pub at: String,
+    /// The action the session ran, in the CLI's spelling: `close-pane`, `move-tab`.
+    pub verb: String,
+    /// What it acted on, named the way the rest of the fork names it - `terminal_3 sunny-otter`,
+    /// `tab_1 logs` - or `-` for an action that named nothing.
+    pub target: String,
+    /// Where it came from: `client 1` for an attached client's keyboard, `cli` for a `zellij
+    /// action` call, `plugin 3` for a plugin.
+    pub origin: String,
+    /// How many times this ran in a row, from the same origin and on the same target.
+    ///
+    /// A held scroll key is one entry with a count, not four hundred entries: without this the
+    /// ring's whole capacity is one keypress and the tab move it was supposed to remember is gone.
+    pub count: usize,
+}
+
 /// What a pane note means, which is also what colour it is drawn in.
 ///
 /// A small closed set rather than a colour string: the note is drawn inside somebody else's theme,

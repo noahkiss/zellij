@@ -18,9 +18,10 @@ use uuid::Uuid;
 use zellij_utils::{
     channels::SenderWithContext,
     data::{
-        BareKey, ConnectToSession, Direction, Event, InputMode, KeyModifier, ListPanesResponse,
-        ListTabsResponse, NewPanePlacement, NoteColor, PaneId as ZellijUtilsPaneId, PaneListEntry,
-        PaneTarget, ResizeStrategy, TabInfo, UnblockCondition,
+        ActionEvent, BareKey, ConnectToSession, Direction, Event, InputMode, KeyModifier,
+        ListPanesResponse, ListTabsResponse, NewPanePlacement, NoteColor,
+        PaneId as ZellijUtilsPaneId, PaneListEntry, PaneTarget, ResizeStrategy, TabInfo,
+        UnblockCondition,
     },
     envs,
     errors::prelude::*,
@@ -272,6 +273,7 @@ pub(crate) fn route_action(
     let action_name = action.to_string();
     // read off the action before the match below consumes it
     let id_keys = IdReportKeys::for_action(&action);
+    let asked_about = target_of(&action);
 
     if !action.is_mouse_action() {
         // mouse actions should only send InputReceived to plugins
@@ -1954,6 +1956,25 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::ListEvents { output_json } => {
+            match request_events_from_screen(&senders).with_context(err_context)? {
+                Some(events) => {
+                    let output_lines = if output_json {
+                        vec![serde_json::to_string_pretty(&events)
+                            .unwrap_or_else(|_| "[]".to_string())]
+                    } else {
+                        format_events_table(&events)
+                    };
+                    send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
+                },
+                None => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout listing the session's events",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::CurrentTabInfo { output_json } => {
             let maybe_tab_info = request_current_tab_info_from_screen(&senders, client_id)
                 .with_context(err_context)?;
@@ -2395,6 +2416,25 @@ pub(crate) fn route_action(
         },
     }
     let result = wait_for_action_completion(completion_rx, &action_name, wait_forever);
+    // the audit ring: what the session actually did, and who asked. It goes in after the wait
+    // because that is where the ids of what was touched are known, and it goes in only for an
+    // action that reported no error - the ring remembers what happened, not what was attempted
+    let verb = ring_verb(&action_name);
+    let origin = origin_of(cli_client_id, pane_id, client_id);
+    if result.error_message.is_none() && is_worth_recording(&verb, &origin) {
+        senders
+            .send_to_screen(ScreenInstruction::RecordAction {
+                verb,
+                // what the action reported touching, and otherwise what it was told to touch: a
+                // creation only knows the first, and most of the rest only the second
+                pane_id: result
+                    .affected_pane_id
+                    .or_else(|| asked_about.0.map(|pane_id| pane_id.into())),
+                tab_id: result.affected_tab_id.or(asked_about.1),
+                origin,
+            })
+            .non_fatal();
+    }
     if let Some(error_message) = &result.error_message {
         if let Some(cli_client_id) = cli_client_id {
             if let Some(ref os_input) = os_input {
@@ -2425,6 +2465,136 @@ pub(crate) fn route_action(
         }
     }
     Ok((should_break, Some(result)))
+}
+
+/// The `Action` variant's name as the CLI spells its verbs: `ClosePane` becomes `close-pane`.
+///
+/// The two enums are not the same list - one CLI verb can become several actions, and a few
+/// actions have no verb at all - so this is the spelling the ring records, and the ring's own help
+/// says so. It is right for every verb a person types.
+fn kebab_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, character) in name.chars().enumerate() {
+        if character.is_uppercase() && index > 0 {
+            out.push('-');
+        }
+        out.extend(character.to_lowercase());
+    }
+    out
+}
+
+/// Who asked for this action, read off the way it arrived.
+///
+/// The three callers of `route_action` each fill these in differently and always have: a CLI
+/// client carries the transient id it connected under, a plugin names its own pane, and a keyboard
+/// carries neither.
+fn origin_of(
+    cli_client_id: Option<ClientId>,
+    pane_id: Option<PaneId>,
+    client_id: ClientId,
+) -> String {
+    match (cli_client_id, pane_id) {
+        (Some(_), _) => "cli".to_owned(),
+        (None, Some(PaneId::Plugin(plugin_id))) => format!("plugin {}", plugin_id),
+        _ => format!("client {}", client_id),
+    }
+}
+
+/// The name the ring records an action under: the CLI's spelling wherever the two agree.
+///
+/// Two things happen to the raw variant name. A `...ByPaneId` or `...ByTabId` suffix goes, because
+/// it says how the action found its target and the `TARGET` column already says which one it was -
+/// and dropping it is what makes `scroll-up` and `rename-pane` read as the verbs they are. Then
+/// the handful of actions whose internal name says something different from the verb people type
+/// are given that verb.
+///
+/// What is left is still the action rather than the command: one CLI verb can become several
+/// actions, and the ring's own `--help` says so.
+fn ring_verb(action_name: &str) -> String {
+    let verb = kebab_case(action_name);
+    let verb = verb
+        .strip_suffix("-by-pane-id")
+        .or_else(|| verb.strip_suffix("-by-tab-id"))
+        .unwrap_or(&verb);
+    match verb {
+        // the action closes "the focus", which the CLI has only ever called closing a pane
+        "close-focus" | "close-terminal-pane" | "close-plugin-pane" => "close-pane",
+        other => other,
+    }
+    .to_owned()
+}
+
+/// The pane or the tab an action names, for the ring to record when the action's own result did
+/// not say what it touched.
+///
+/// Not every action is in here. One that names nothing - and one whose target is spelled in a way
+/// nobody has needed the ring to read yet - records a `-`, which is honest: the ring says what was
+/// touched when that is known and does not invent it when it is not.
+fn target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usize>) {
+    use Action::*;
+    match action {
+        WriteToPaneId { pane_id, .. }
+        | WriteCharsToPaneId { pane_id, .. }
+        | SetPaneColor { pane_id, .. }
+        | SetPaneNote { pane_id, .. }
+        | ChangeFloatingPaneCoordinates { pane_id, .. }
+        | SignalPane { pane_id, .. }
+        | TogglePaneBorderless { pane_id, .. }
+        | SetPaneBorderless { pane_id, .. }
+        | ScrollUpByPaneId { pane_id, .. }
+        | ScrollDownByPaneId { pane_id, .. }
+        | ScrollToTopByPaneId { pane_id, .. }
+        | ScrollToBottomByPaneId { pane_id, .. }
+        | PageScrollUpByPaneId { pane_id, .. }
+        | PageScrollDownByPaneId { pane_id, .. }
+        | HalfPageScrollUpByPaneId { pane_id, .. }
+        | HalfPageScrollDownByPaneId { pane_id, .. }
+        | ResizeByPaneId { pane_id, .. }
+        | MovePaneByPaneId { pane_id, .. }
+        | MovePaneBackwardsByPaneId { pane_id, .. }
+        | ClearScreenByPaneId { pane_id, .. }
+        | EditScrollbackByPaneId { pane_id, .. }
+        | ToggleFocusFullscreenByPaneId { pane_id, .. }
+        | ToggleFocusNoUiFullscreenByPaneId { pane_id, .. }
+        | TogglePaneEmbedOrFloatingByPaneId { pane_id, .. }
+        | CloseFocusByPaneId { pane_id, .. }
+        | UndoRenamePaneByPaneId { pane_id, .. }
+        | TogglePanePinnedByPaneId { pane_id, .. }
+        | FocusPaneByPaneId { pane_id, .. } => (Some(*pane_id), None),
+        Paste { pane_id, .. }
+        | SetPaneFullscreen { pane_id, .. }
+        | SetPanePinned { pane_id, .. }
+        | SetPaneFloating { pane_id, .. }
+        | RenamePaneByPaneId { pane_id, .. } => (*pane_id, None),
+        GoToTab { index, .. } => (None, Some(*index as usize)),
+        RenameTab { tab_index, .. } => (None, Some(*tab_index as usize)),
+        BreakPanesToTabWithId { tab_id, .. } => (None, Some(*tab_id as usize)),
+        CloseTabById { id } | RenameTabById { id, .. } | MoveTabByTabId { id, .. } => {
+            (None, Some(*id as usize))
+        },
+        MoveTabToIndex { id: Some(id), .. } => (None, Some(*id as usize)),
+        _ => (None, None),
+    }
+}
+
+/// Whether this action belongs in the ring.
+///
+/// Two things are left out, and both are about keeping the ring readable rather than complete:
+///
+/// - **The `read` band**, which by definition changed nothing. That is what the bands are for.
+/// - **Typing.** Every keystroke an attached client sends is a `write`, and a ring full of those
+///   is a ring with no room for the tab move somebody is looking for. The same verbs from the CLI
+///   ARE recorded: a script writing into a pane is an event with an author worth finding.
+fn is_worth_recording(verb: &str, origin: &str) -> bool {
+    if zellij_utils::cli_surface::band_of(verb) == Some("read") {
+        return false;
+    }
+    let is_typing = matches!(verb, "write" | "write-chars") && origin.starts_with("client ");
+    // the CLI's own plumbing: `resolve-pane-target` is the question every targeted call asks
+    // before it acts, and `set-pane-handle` is how `new-pane --handle` finishes creating a pane.
+    // Both would double the ring with rows describing the row beside them
+    let is_plumbing = matches!(verb, "resolve-pane-target" | "set-pane-handle");
+    !is_typing && !is_plumbing
 }
 
 /// The keys an action names its ids with.
@@ -3308,6 +3478,47 @@ fn request_pane_handle(
     }
 }
 
+/// Asks Screen for its action ring. `None` when Screen did not answer in time.
+fn request_events_from_screen(senders: &ThreadSenders) -> Result<Option<Vec<ActionEvent>>> {
+    use crossbeam::channel::{unbounded, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (response_sender, response_receiver) = unbounded();
+    senders.send_to_screen(ScreenInstruction::ListEvents {
+        response_channel: response_sender,
+    })?;
+
+    match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(events) => Ok(Some(events)),
+        Err(RecvTimeoutError::Timeout) => {
+            log::error!("ListEvents timed out waiting for Screen response");
+            Ok(None)
+        },
+        Err(RecvTimeoutError::Disconnected) => {
+            log::error!("ListEvents channel disconnected");
+            Ok(None)
+        },
+    }
+}
+
+/// The action ring as a table, oldest first - so the end of it is now.
+fn format_events_table(events: &[ActionEvent]) -> Vec<String> {
+    let mut lines = vec![["AT", "VERB", "TARGET", "ORIGIN", "COUNT"].join("  ")];
+    for event in events {
+        lines.push(
+            [
+                event.at.as_str(),
+                event.verb.as_str(),
+                event.target.as_str(),
+                event.origin.as_str(),
+                &event.count.to_string(),
+            ]
+            .join("  "),
+        );
+    }
+    lines
+}
+
 /// Asks Screen to leave a note on a pane. `None` when Screen did not answer in time.
 fn request_pane_note(
     senders: &ThreadSenders,
@@ -4006,6 +4217,102 @@ mod tests {
                 command
             );
         }
+    }
+
+    #[test]
+    fn an_action_is_recorded_under_the_name_the_cli_gives_it() {
+        assert_eq!(kebab_case("ClosePane"), "close-pane");
+        assert_eq!(kebab_case("GoToTabName"), "go-to-tab-name");
+        // a one-word action keeps its one word, without a leading dash
+        assert_eq!(kebab_case("Clear"), "clear");
+    }
+
+    #[test]
+    fn the_ring_records_the_verb_a_person_would_type() {
+        // the `ByPaneId` suffix says how the action found its pane; the TARGET column already says
+        // which one, and without the suffix these read as the verbs the CLI actually has
+        assert_eq!(ring_verb("ScrollUpByPaneId"), "scroll-up");
+        assert_eq!(ring_verb("RenamePaneByPaneId"), "rename-pane");
+        // and the handful whose internal name says something else
+        assert_eq!(ring_verb("CloseFocusByPaneId"), "close-pane");
+        assert_eq!(ring_verb("CloseTerminalPane"), "close-pane");
+        // the negative control: a name that already reads right is left alone
+        assert_eq!(ring_verb("MoveTab"), "move-tab");
+        assert_eq!(ring_verb("NewTab"), "new-tab");
+    }
+
+    #[test]
+    fn the_ring_says_where_each_action_came_from() {
+        // the three callers of `route_action`, told apart by what they always fill in
+        assert_eq!(origin_of(Some(9), None, 1), "cli");
+        assert_eq!(origin_of(None, Some(PaneId::Plugin(3)), 1), "plugin 3");
+        assert_eq!(origin_of(None, None, 1), "client 1");
+        // a CLI call that named a terminal pane is still a CLI call
+        assert_eq!(origin_of(Some(9), Some(PaneId::Terminal(2)), 1), "cli");
+    }
+
+    #[test]
+    fn the_ring_leaves_out_what_would_fill_it() {
+        // a mutation is what the ring is for
+        assert!(is_worth_recording("close-pane", "client 1"));
+        assert!(is_worth_recording("go-to-tab", "cli"));
+        // the negative controls: a read-band verb changed nothing, and every keystroke an attached
+        // client sends is a `write` - a ring full of those has no room for the tab move
+        assert!(!is_worth_recording("list-panes", "cli"));
+        assert!(!is_worth_recording("dump-screen", "client 1"));
+        assert!(!is_worth_recording("write", "client 1"));
+        // and the CLI's own plumbing, which would double the ring with rows about the row beside
+        // them
+        assert!(!is_worth_recording("resolve-pane-target", "cli"));
+        assert!(!is_worth_recording("set-pane-handle", "cli"));
+        assert!(!is_worth_recording("write-chars", "client 1"));
+        // but a script writing into a pane is an event with an author worth finding
+        assert!(is_worth_recording("write-chars", "cli"));
+        assert!(is_worth_recording("write", "plugin 2"));
+    }
+
+    #[test]
+    fn the_ring_falls_back_to_what_the_action_was_told_to_touch() {
+        // most actions do not report the ids of what they touched, and a ring of `-` answers
+        // nobody's question about who moved what
+        assert_eq!(
+            target_of(&Action::CloseFocusByPaneId {
+                pane_id: ZellijUtilsPaneId::Terminal(3)
+            }),
+            (Some(ZellijUtilsPaneId::Terminal(3)), None)
+        );
+        assert_eq!(target_of(&Action::GoToTab { index: 2 }), (None, Some(2)));
+        assert_eq!(
+            target_of(&Action::RenameTabById {
+                id: 1,
+                name: "archive".to_owned()
+            }),
+            (None, Some(1))
+        );
+        // the negative control: an action that names nothing is recorded as naming nothing,
+        // rather than being given the focused pane it never mentioned
+        assert_eq!(target_of(&Action::ToggleFloatingPanes), (None, None));
+    }
+
+    #[test]
+    fn the_event_table_prints_the_columns_the_dump_promises() {
+        let header = format_events_table(&[]).remove(0);
+        assert_eq!(
+            zellij_utils::cli_surface::promised_output_keys("action list-events")
+                .expect("list-events promises columns in the dump")
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            header.split_whitespace().collect::<Vec<_>>()
+        );
+        let table = format_events_table(&[ActionEvent {
+            at: "2026-08-14T18:03:12.345Z".to_owned(),
+            verb: "close-pane".to_owned(),
+            target: "terminal_3 sunny-otter".to_owned(),
+            origin: "cli".to_owned(),
+            count: 1,
+        }]);
+        assert!(table[1].contains("close-pane"), "{}", table[1]);
+        assert!(table[1].contains("terminal_3 sunny-otter"), "{}", table[1]);
     }
 
     #[test]

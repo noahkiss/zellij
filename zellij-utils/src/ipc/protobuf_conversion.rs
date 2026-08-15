@@ -1163,6 +1163,7 @@ impl From<crate::input::actions::Action>
             LaunchOrFocusPluginAction,
             LaunchPluginAction,
             ListClientsAction,
+            ListEventsAction,
             ListPanesAction,
             ListTabsAction,
             ListTreeAction,
@@ -1985,6 +1986,9 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::ListTree { output_json } => {
                 ActionType::ListTree(ListTreeAction { output_json })
+            },
+            crate::input::actions::Action::ListEvents { output_json } => {
+                ActionType::ListEvents(ListEventsAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2956,6 +2960,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 },
             }),
             ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
+                output_json: a.output_json,
+            }),
+            ActionType::ListEvents(a) => Ok(crate::input::actions::Action::ListEvents {
                 output_json: a.output_json,
             }),
             ActionType::ListPanes(list_panes_action) => {

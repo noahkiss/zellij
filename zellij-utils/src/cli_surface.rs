@@ -36,6 +36,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "dump-layout",
             "dump-screen",
             "list-clients",
+            "list-events",
             "list-panes",
             "list-tabs",
             "list-tree",
@@ -150,6 +151,17 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
     },
 ];
 
+/// The band a `zellij action` verb belongs to, or `None` for a name that is not one.
+///
+/// Exported because the bands are not only a help-page heading: the action ring uses them to
+/// decide what is worth remembering, so "which verbs change nothing" is answered in one place.
+pub fn band_of(verb: &str) -> Option<&'static str> {
+    ACTION_GROUPS
+        .iter()
+        .find(|group| group.commands.contains(&verb))
+        .map(|group| group.name)
+}
+
 /// What a command puts on stdout, for the commands that put anything there.
 ///
 /// The one thing clap cannot introspect. A command absent from this table prints nothing when it
@@ -184,6 +196,11 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action list-clients",
         shape: "table",
         keys: "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY SIZE CURRENT",
+    },
+    OutputSpec {
+        command: "action list-events",
+        shape: "table",
+        keys: "AT VERB TARGET ORIGIN COUNT",
     },
     OutputSpec {
         command: "action list-panes",

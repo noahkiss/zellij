@@ -596,6 +596,56 @@ otherwise had to do by tab id yourself. A tab with no panes still gets its line.
 reports it, with its `list-panes --json` entries under a `panes` key. Asking for the tree never
 returns less than asking the two questions separately would.
 
+### `list-events`
+
+```
+$ zellij action list-events
+AT                        VERB        TARGET                  ORIGIN    COUNT
+2026-08-14T18:03:12.345Z  go-to-tab   tab_1 logs              client 1  1
+2026-08-14T18:03:14.902Z  scroll-up   terminal_3 sunny-otter  client 1  38
+2026-08-14T18:03:19.881Z  close-pane  terminal_3              cli       1
+```
+
+Who moved my tab. In a session a person and several agents are all driving at once, something
+changes and nobody knows which of them did it — and every other query in this fork answers what the
+session *is*, not what happened to it. The server keeps the last 256 things that changed, in
+memory, and this reads them back oldest first, so the end of the table is now.
+
+- **`ORIGIN` names the three ways an action can arrive**: `client 1` is somebody's keyboard,
+  `cli` is a `zellij action` call, `plugin 3` is a plugin. All three pass through the one function
+  that routes an action, so the ring sees keyboard and script alike rather than only the half a
+  script produces.
+- **`TARGET` is the name that was true at the time** — `terminal_3 sunny-otter`, `tab_1 logs`,
+  resolved as the action completed rather than when you read it. A pane the action closed has no
+  handle left to print, and shows its id alone. `-` means the action named nothing.
+- **A run of the same verb, on the same target, from the same origin is one row with a `COUNT`.**
+  A held scroll key is 38, not 38 rows: without that, the ring's whole capacity is one keypress and
+  the tab move you came looking for has already fallen out of it.
+- **`--json` carries the same rows**, structured.
+
+What is deliberately not in it:
+
+- **The `read` band**, which by definition changed nothing. The bands `zellij action --help` is
+  grouped by are the same list this reads, so the two can never disagree about which verbs matter.
+- **Keystrokes typed into a pane.** Every one is a `write`, and they would be the whole ring. The
+  same verbs *from the CLI* are recorded: a script writing into a pane is an event with an author
+  worth finding.
+- **Actions that failed.** The ring remembers what happened, not what was asked for.
+- **The CLI's own plumbing** — the target lookup every addressed call makes before it acts, and the
+  naming step that finishes a `new-pane --handle`. Each would put a row beside every real one,
+  describing it.
+
+`VERB` is the action the session ran, spelled the way the CLI spells its verbs wherever the two
+agree. One CLI verb can become several actions — `new-pane` is a `new-tiled-pane` or a
+`new-floating-pane`, and the ring says which — so it is not always the exact word that was typed.
+
+One thing to know about creations: a pane made with `--handle build` is recorded under the name it
+was *born* with, because the chosen name is given to it a moment later, by the client holding the
+report. The `set-pane-note` or the `close-pane` that comes after says `build`.
+
+This is a ring, not a log: it is bounded, it is in memory, nothing about it is written to disk, and
+it is gone when the server stops. It is for the question you are asking now.
+
 ### `go-to-pane`
 
 ```

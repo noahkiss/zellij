@@ -392,6 +392,8 @@ pub enum ScreenContext {
     ResolvePaneTarget,
     SetPaneHandle,
     SetPaneNote,
+    RecordAction,
+    ListEvents,
     ListTabs,
     GetCurrentTabInfo,
     Reconfigure,

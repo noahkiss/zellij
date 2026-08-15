@@ -586,6 +586,10 @@ pub enum Action {
     ListTree {
         output_json: bool,
     },
+    /// The session's action ring: what changed lately, and who changed it.
+    ListEvents {
+        output_json: bool,
+    },
     ListTabs {
         show_state: bool,
         show_dimensions: bool,
@@ -2089,6 +2093,7 @@ impl Action {
                 output_json: json,
             }]),
             CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
+            CliAction::ListEvents { json } => Ok(vec![Action::ListEvents { output_json: json }]),
             CliAction::ListTabs {
                 state,
                 dimensions,

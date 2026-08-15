@@ -40,11 +40,12 @@ use crate::route::NotificationEnd;
 
 use log::{debug, warn};
 use zellij_utils::data::{
-    CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
-    HostTerminalThemeMode, KeyWithModifier, LayoutInfo, LayoutWithError, ListPanesResponse,
-    ListTabsResponse, NewPanePlacement, NoteColor, PaneContents, PaneInfo, PaneListEntry,
-    PaneManifest, PaneRenderReport, PaneScrollbackResponse, PaneTarget, PluginPermission,
-    RegexHighlight, Resize, ResizeStrategy, SessionInfo, Styling, TabInfo, ThemeHue, WebSharing,
+    ActionEvent, CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates,
+    GetFocusedPaneInfoResponse, HostTerminalThemeMode, KeyWithModifier, LayoutInfo,
+    LayoutWithError, ListPanesResponse, ListTabsResponse, NewPanePlacement, NoteColor,
+    PaneContents, PaneInfo, PaneListEntry, PaneManifest, PaneRenderReport, PaneScrollbackResponse,
+    PaneTarget, PluginPermission, RegexHighlight, Resize, ResizeStrategy, SessionInfo, Styling,
+    TabInfo, ThemeHue, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::actions::Action;
@@ -774,6 +775,20 @@ pub enum ScreenInstruction {
         handle: String,
         response_channel: crossbeam::channel::Sender<Result<(), String>>,
     },
+    /// Adds one thing that happened to the session's action ring.
+    ///
+    /// It is sent rather than asked: nothing waits for the ring, and an action that has already
+    /// happened must not be slowed down by being remembered.
+    RecordAction {
+        verb: String,
+        pane_id: Option<PaneId>,
+        tab_id: Option<usize>,
+        origin: String,
+    },
+    /// Reads the action ring back, oldest first.
+    ListEvents {
+        response_channel: crossbeam::channel::Sender<Vec<ActionEvent>>,
+    },
     /// Leaves a short note on a pane's frame, or clears it with `None`.
     SetPaneNote {
         pane_id: PaneId,
@@ -1201,6 +1216,8 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
             ScreenInstruction::SetPaneHandle { .. } => ScreenContext::SetPaneHandle,
             ScreenInstruction::SetPaneNote { .. } => ScreenContext::SetPaneNote,
+            ScreenInstruction::RecordAction { .. } => ScreenContext::RecordAction,
+            ScreenInstruction::ListEvents { .. } => ScreenContext::ListEvents,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
@@ -1587,6 +1604,8 @@ pub(crate) struct Screen {
     web_clients_allowed: bool,
     web_sharing: WebSharing,
     current_pane_group: Rc<RefCell<PaneGroups>>,
+    /// fork addition: the last few hundred things that changed the session, and who changed them
+    action_events: VecDeque<ActionEvent>,
     advanced_mouse_actions: bool,
     osc133_command_selection: bool,
     word_separators: String,
@@ -1702,6 +1721,33 @@ const STARTUP_SENTINEL_TOKEN: u32 = 0;
 /// network-pathological cases ever see this fire.
 const SERVER_FORWARD_TIMEOUT_MS: u64 = 1000;
 
+/// How many entries the action ring holds before the oldest falls out.
+///
+/// Big enough to cover the working session somebody is asking about - "who moved the tab I was
+/// using" is a question about the last few minutes - and small enough that the ring is never a log
+/// file with a retention policy. Nothing is written to disk.
+pub(crate) const ACTION_RING_SIZE: usize = 256;
+
+/// Adds one event to a ring, collapsing a repeat and dropping the oldest once it is full.
+///
+/// A run of the same verb, on the same target, from the same origin - a held scroll key - becomes
+/// one entry with a count. Without that, the ring's whole capacity is one keypress and the tab
+/// move it exists to remember has already fallen out of it.
+pub(crate) fn push_action_event(ring: &mut VecDeque<ActionEvent>, event: ActionEvent) {
+    if let Some(last) = ring.back_mut() {
+        if last.verb == event.verb && last.origin == event.origin && last.target == event.target {
+            last.count += 1;
+            // the entry says when this last happened, which is the question a reader is asking
+            last.at = event.at;
+            return;
+        }
+    }
+    ring.push_back(event);
+    while ring.len() > ACTION_RING_SIZE {
+        ring.pop_front();
+    }
+}
+
 /// What `close-pane` answers when it is asked to close the focused pane and nothing is focused.
 ///
 /// A detached session has no client holding the focus, so the request is well formed and its
@@ -1816,6 +1862,7 @@ impl Screen {
             web_clients_allowed,
             web_sharing,
             current_pane_group: Rc::new(RefCell::new(current_pane_group)),
+            action_events: VecDeque::new(),
             currently_marking_pane_group: Rc::new(RefCell::new(HashMap::new())),
             advanced_mouse_actions,
             osc133_command_selection,
@@ -5396,6 +5443,62 @@ impl Screen {
             .ok_or_else(|| format!("No pane answers to '{}'", pane_id))?;
         pane.set_pane_note(note.clone());
         Ok(note)
+    }
+
+    /// Adds one thing that happened to the session's ring, naming what it touched.
+    ///
+    /// The names are resolved HERE rather than where the action was routed, because this is where
+    /// the panes and the tabs are - and because a handle is only true while the pane lives. What
+    /// goes in the ring is the name that was right at the time.
+    pub fn record_action(
+        &mut self,
+        verb: String,
+        pane_id: Option<PaneId>,
+        tab_id: Option<usize>,
+        origin: String,
+    ) {
+        let target = self.name_of_target(pane_id, tab_id);
+        push_action_event(
+            &mut self.action_events,
+            ActionEvent {
+                at: zellij_utils::cli::event_timestamp(std::time::SystemTime::now()),
+                verb,
+                target,
+                origin,
+                count: 1,
+            },
+        );
+    }
+
+    /// What an action touched, spelled the way the rest of the fork spells it.
+    ///
+    /// A pane wins over a tab when an action reports both: the pane is the more specific answer,
+    /// and its tab is one `list-tree` away.
+    fn name_of_target(&self, pane_id: Option<PaneId>, tab_id: Option<usize>) -> String {
+        if let Some(pane_id) = pane_id {
+            let handle = self
+                .tabs
+                .values()
+                .find_map(|tab| tab.get_pane_with_id(pane_id).map(|pane| pane.pane_handle()));
+            return match handle {
+                Some(handle) if !handle.is_empty() => format!("{} {}", pane_id, handle),
+                // the pane is already gone - `close-pane` is the obvious case - and the id is the
+                // whole of what can honestly be said about it
+                _ => pane_id.to_string(),
+            };
+        }
+        if let Some(tab_id) = tab_id {
+            return match self.tabs.get(&tab_id) {
+                Some(tab) => format!("tab_{} {}", tab_id, tab.name),
+                None => format!("tab_{}", tab_id),
+            };
+        }
+        "-".to_owned()
+    }
+
+    /// The ring, oldest first - the order it reads in.
+    pub fn collect_action_events(&self) -> Vec<ActionEvent> {
+        self.action_events.iter().cloned().collect()
     }
 
     pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
@@ -9254,6 +9357,17 @@ pub(crate) fn screen_thread_main(
             } => {
                 let _ = response_channel.send(screen.set_pane_handle(pane_id, &handle));
                 screen.render(None)?;
+            },
+            ScreenInstruction::RecordAction {
+                verb,
+                pane_id,
+                tab_id,
+                origin,
+            } => {
+                screen.record_action(verb, pane_id, tab_id, origin);
+            },
+            ScreenInstruction::ListEvents { response_channel } => {
+                let _ = response_channel.send(screen.collect_action_events());
             },
             ScreenInstruction::SetPaneNote {
                 pane_id,

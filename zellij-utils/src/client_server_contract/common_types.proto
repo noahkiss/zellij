@@ -301,6 +301,7 @@ message Action {
     ListTreeAction list_tree = 168;
     SetPaneHandleAction set_pane_handle = 169;
     SetPaneNoteAction set_pane_note = 170;
+    ListEventsAction list_events = 171;
   }
 }
 
@@ -410,6 +411,10 @@ message SetPaneNoteAction {
   NoteColor color = 3;
 }
 message ListTreeAction {
+  bool output_json = 1;
+}
+// fork addition: the session's action ring
+message ListEventsAction {
   bool output_json = 1;
 }
 message ListPanesAction {
