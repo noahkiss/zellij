@@ -3168,9 +3168,12 @@ mod tests {
     /// A pid that is certainly not in use: spawned, waited for, and therefore reaped.
     #[cfg(all(unix, not(target_os = "macos")))]
     fn a_pid_that_has_finished() -> u32 {
-        let mut child = std::process::Command::new("/bin/true")
+        // `/bin/sh`, not `/bin/true`: POSIX puts a shell at that path on every unix, while macOS
+        // keeps `true` in `/usr/bin` and has nothing at `/bin/true` to spawn.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
             .spawn()
-            .expect("every unix has one");
+            .expect("every unix has a shell");
         let pid = child.id();
         child.wait().expect("it exits at once");
         pid
