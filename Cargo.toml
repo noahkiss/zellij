@@ -23,12 +23,15 @@ clap = { workspace = true }
 dialoguer = { workspace = true }
 humantime = { workspace = true }
 interprocess = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 log = { workspace = true }
 miette = { workspace = true }
 names = { workspace = true }
 suggest = { workspace = true }
 thiserror = { workspace = true }
 isahc = { workspace = true }
+rmcp = { version = "3.1.2", default-features = false, features = ["server", "transport-io"] }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = { workspace = true }

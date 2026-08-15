@@ -3189,7 +3189,9 @@ pub(crate) fn route_thread_main(
                             }
                         },
                         ClientToServerMsg::ClientExited => {
-                            let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
+                            // the removal is announced once, after the route loop below - not here.
+                            // Announcing it twice is what made `new-pane --handle` report a miss for
+                            // a pane it had made: see the comment on that announcement
                             return Ok(true);
                         },
                         ClientToServerMsg::KillSession => {
@@ -3441,7 +3443,7 @@ pub(crate) fn route_thread_main(
                             exit_reason: ExitReason::Error("Received empty message".to_string()),
                         },
                     );
-                    let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
+                    // the removal is announced once, after the loop
                     break 'route_loop;
                 }
             },
@@ -3452,7 +3454,18 @@ pub(crate) fn route_thread_main(
         // connected user)
         let _ = os_input.send_to_client(client_id, ServerToClientMsg::UnblockInputThread);
     }
-    // route thread exited, make sure we clean up
+    // route thread exited, make sure we clean up.
+    //
+    // This is the ONLY place a route thread announces its client's removal, and it has to stay that
+    // way. `SessionState::new_client` hands out the lowest client id that is not in use, so in a
+    // session nothing is attached to every `zellij action` connection is client 1, one after
+    // another. Removing the client is what frees the id - so announcing it from inside the loop as
+    // well frees the id while this thread is still running, the process's next connection is given
+    // that same id, and the second announcement then removes THAT connection's sender. Dropping a
+    // sender writes `Exit { Disconnect }` down its socket, which the new client reads as the answer
+    // to the command it just sent. That is how `new-pane --handle` came to report "no pane was
+    // created" for a pane the session had made and confirmed: the `--handle` preflight connection
+    // closed, and its route thread tore down the connection that replaced it.
     let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
     Ok(())
 }
@@ -3731,6 +3744,10 @@ fn build_table_header(
         header.push("COLS");
     }
 
+    // last, and outside every group: the columns are append-only, so a new one goes on the end
+    // rather than between two a reader is already counting past
+    header.push("AGENT");
+
     header.join("  ")
 }
 
@@ -3773,7 +3790,21 @@ fn build_table_row(
         row.push(entry.pane_info.pane_columns.to_string());
     }
 
+    row.push(format_agent(entry));
+
     row.join("  ")
+}
+
+/// The harness running in a pane, for the table's `AGENT` column, or `-` for a pane with none.
+///
+/// The kind alone: the session id and what the detection rested on are `list-agents`' business,
+/// and a column nobody can read at a glance is not worth the width here.
+fn format_agent(entry: &PaneListEntry) -> String {
+    entry
+        .agent
+        .as_ref()
+        .map(|agent| agent.kind.clone())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_pane_id(pane_info: &zellij_utils::data::PaneInfo) -> String {
@@ -4132,6 +4163,7 @@ mod tests {
             tab_id: 1,
             tab_position: 0,
             tab_name: "tab1".to_string(),
+            agent: None,
         }
     }
 
@@ -4363,9 +4395,10 @@ mod tests {
         let tree = format_tree(&[tab_info(1, "tab1", true)], &[noted]);
         assert!(tree[1].contains("note: error:exit 7"), "{}", tree[1]);
         // the negative control: a pane with no note prints the `-` this fork prints for an empty
-        // field everywhere else, rather than a blank column nobody can parse
+        // field everywhere else, rather than a blank column nobody can parse. The trailing `-` is
+        // AGENT, which the same rule covers for a pane running no coding agent
         let plain = format_panes_table(&[pane_entry(8, "tender-orca")], true, true, true, true);
-        assert!(plain[1].ends_with("  -  0  0  0  0"), "{}", plain[1]);
+        assert!(plain[1].ends_with("  -  0  0  0  0  -"), "{}", plain[1]);
     }
 
     #[test]
@@ -4380,12 +4413,15 @@ mod tests {
     fn the_pane_table_prints_all_four_column_groups() {
         let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
         let header = &table[0];
-        for column in [
-            "TAB_ID", "TAB_POS", "TAB_NAME", "PANE_ID", "HANDLE", "TYPE", "TITLE", "COMMAND",
-            "CWD", "FOCUSED", "FLOATING", "EXITED", "NOTE", "X", "Y", "ROWS", "COLS",
-        ] {
-            assert!(header.contains(column), "missing {}: {}", column, header);
-        }
+        // pinned to the dump rather than transcribed, the way the event table's test is: a column
+        // added to one and not the other is what this catches
+        assert_eq!(
+            zellij_utils::cli_surface::promised_output_keys("action list-panes")
+                .expect("list-panes promises columns in the dump")
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            header.split_whitespace().collect::<Vec<_>>()
+        );
     }
 
     #[test]
