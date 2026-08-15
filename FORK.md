@@ -2056,6 +2056,84 @@ A refresh under a **running session** is allowed and does not disturb it. The re
 file in place under a name nobody holds, so the server keeps executing the build it started with
 until it is restarted, and the next start picks up the new copy.
 
+**The copy is flushed to the disk before the rename, and a flush that fails stops the refresh.**
+Atomic against other processes and atomic against the power going out are different guarantees, and
+`rename(2)` only gives the first. It orders nothing against the disk: the directory entry can land
+while the 40 MB it names is still in page cache, and the machine that comes back up has a pinned
+path holding a short file. Nothing above the pin could tell — the stamp beside it describes the
+SOURCE, which is intact — so a truncated pin would read as current and be executed at every start
+until somebody upgraded. So the temp file is `fsync`ed after its mode is set and before the rename,
+and the directory is `fsync`ed after it, which is what puts the new NAME on the disk. The file
+flush is the one operation here that is not best-effort: a copy that may not have reached the disk
+must not be renamed over the only working binary there is, and refusing costs a refresh.
+
+**The hash is cached against the source's identity, in `<pin>.source-key`.** Deciding not to copy
+still meant reading 40 MB to hash the source, on every `session up` — every minute, from the
+watchdog — and on every interactive launch. That was around 75 ms of each one, spent to learn that
+nothing had happened. The key file records the hash the stamp carries, next to what the source
+looked like to `stat` when it was taken: device, inode, size and mtime to the nanosecond. When all
+five still match, the hash is not taken again.
+
+It is a **cache, and never the answer**. The stamp remains the only thing that decides staleness,
+and the key can only skip the hash, never supply one. Everything it is unsure about falls through
+to hashing, which is exactly what happened before it existed: no key file, a key that does not
+parse, a key recorded against a hash the stamp does not carry, a source that will not `stat`. The
+stamp is written first and the key second, so a crash between the two leaves a key nothing believes.
+
+**The `stat` in the key is the one taken BEFORE the hash, never a fresh one taken after the copy.**
+The key's whole claim is "this hash came from a source that looked like this", and the two halves
+have to describe the same moment. A source that changed while it was being read then leaves a key
+the next pass cannot match, so the hash is taken again and the change is caught. Re-`stat`ing after
+the copy looks safer and is the opposite: it files the OLD hash under the NEW identity, the next
+pass matches, skips the hash, and calls the pin current for as long as the source sits still.
+
+Two consequences worth stating.
+
+- **A separate file, not a second line in the stamp.** `<pin>.source-sha256` is still exactly
+  `<hash>\n`, compared with a `trim()`. A build from before this change reads it as it always did.
+  Appending to the stamp instead would have made every older binary on the machine call the pin
+  stale and copy 40 MB to correct it.
+- **The blind spot.** A source rewritten IN PLACE — same size, same inode, mtime put back — is one
+  the key cannot tell from the source it recorded, so the pin is left alone though its source now
+  holds different bytes. Nothing short of hashing every pass can see that; the trade is the 75 ms.
+  It takes a writer that preserves all three together, which no package manager does: `install` and
+  `cp` do not, and `cp -p` keeps the mtime but only writes through the same inode when the target
+  was not unlinked first. Deleting `<pin>.source-key` puts the pin back under the hash's judgement,
+  and `zellij session doctor --fix` then settles it. An upgrade is caught the ordinary way, because
+  an unpacked build is a new file and a new file has a new inode however its mtime was preserved.
+
+**Once the launcher runs the pin, the watchdog cannot be what notices an upgrade.** This is the
+ordinary configuration — it is what `pin_exe` is for — and the consequence is easy to read past.
+`session up` refreshes the pin from the binary it is itself running. Started by the launcher, that
+binary IS the pin, so the stamp is compared against the file it was taken from and always agrees.
+Every pass of the minutely watchdog therefore says the pin is current, however old it is, and it is
+right to: nothing in that process has ever seen the package.
+
+An upgrade reaches the pin from **any zellij run off another path**, which in practice means it
+reaches it quickly:
+
+- an interactive `zellij` — the launch resolves the server binary through the pin and refreshes it
+  on the way past, which is the common case and needs nobody to remember anything;
+- `zellij session up` or `zellij session doctor --fix`, typed in a shell, where the binary on `PATH`
+  is the new one;
+- `zellij session enable`, which installs the copy before it writes the unit.
+
+The refreshed copy still does not reach the **running** server, which keeps the build it started
+with until `zellij session restart`. So the honest summary of `pin_exe` on an upgraded machine is:
+the package is new, the pin becomes new the next time a shell runs zellij, and the session becomes
+new when it is restarted. Nothing here detects an upgrade on its own; every step is driven by
+something the user did.
+
+**A source that is the target is refused outright**, and on macOS that is not a nicety. The pin is
+signed there, so it deliberately differs from the source the stamp was taken from. Allowed through,
+the self-compare finds a stamp that does not match the pin's own bytes, calls the signed pin stale,
+copies it over itself — and re-stamps it with the signed copy's hash. The stamp then names the pin
+instead of the package, so the next run off `PATH`, with the package binary unchanged and no
+upgrade anywhere, reads it as stale and copies the unsigned package over the signature. Every grant
+that signature held goes with it, silently, and the machine has to be signed again. Refusing the
+self-compare costs nothing — there was never a copy worth making — and it is what makes the
+paragraph above true rather than nearly true.
+
 **The unit records the path, and the refresh uses the recorded one.** `up` reads the binary out of
 the installed unit rather than deriving the path again. The canonical directory honours
 `XDG_DATA_HOME`, and a launcher's environment is not the calling shell's — so a re-derived path can
@@ -2138,14 +2216,44 @@ The two commands cannot describe one machine differently.
 **Everywhere**: which `zellij` a shell runs and whether it is this one; whether the config loads;
 the socket directory, and any server serving this name from another one or under another contract
 version; leftover wrapper scripts; the unit, its load state and its drift; one server and only one;
-whether a dead session's saved layout is holding the name; whether the running server is this build;
-the pin.
+whether a dead session's saved layout is holding the name; whether the running server is this build; the pin, and the temp copies an interrupted refresh left
+beside it.
 
 A leftover is narrow on purpose. A script in `~/bin` that merely calls zellij is a companion tool,
 not a fault, and a `zellij` there that resolves to this very binary is where zellij is installed —
 neither is reported. Two shapes are: a different build taking the name, and a script that sets
 `ZELLIJ_SOCK_DIR` before zellij can resolve it. Both are reported and never removed; the `rm` is
 printed for the user to run.
+
+**Doctor is what sweeps the abandoned pin temps.** A refresh writes `.zellij.pin.<pid>.tmp` and
+renames it. Killed between the two — an OOM kill, a reboot, a power cut — it leaves 40 MB behind
+for good, because the next refresh writes a new one under a new pid rather than reusing it. Nothing
+else on the machine knows what the file is.
+
+```
+Changed
+  pin       removed 2 abandoned temp copies in ~/.local/share/zellij/bin, holding 79.4 MB
+```
+
+Two gates, and the first is the one that matters. **A temp whose pid is still running is never
+touched**, because it belongs to a refresh that is still copying into it, and removing it would
+leave that refresh renaming a name nothing holds; `kill(pid, 0)` answers that, and `EPERM` counts
+as alive. **A temp younger than an hour is left alone** as a second belt, for a temp being written
+by a process nothing has observed yet. Neither gate covers a recycled pid, and the age gate is not
+the one that would: a pid recycled onto a live process makes `kill(pid, 0)` say yes at any age, so
+that one temp is kept for good. The sweep reclaims space; it does not promise to.
+
+**The `.zellij.sign.` temps of the macOS signing flow ask the same two questions.** A separate
+prefix and a separate call site, so neither sweep takes the other's files, but one implementation
+of the gates. The signing sweep used to remove every `.zellij.sign.*.tmp` it found, which is the
+one thing a sweep must not do — the temp of a signing run happening right now is named the same
+way, and taking it leaves `codesign` writing into a deleted inode and that run renaming a name
+nothing holds.
+
+It is doctor's job and **not `install_pinned_exe`'s**. The install path runs before anything takes
+a lock, on every `session up` and every interactive launch, so two of them overlap routinely — and
+a sweep there would be one refresh deleting another's temp file mid-copy. Doctor is the pin path a
+person runs on purpose, one at a time.
 
 **Linux** adds what only systemd knows: whether the timer is armed — loaded and armed are different
 states, and a disarmed timer beside a healthy install is how a session stops coming back — and how
@@ -2978,6 +3086,35 @@ the next resurrection would hand back the pane that was closed. The pty thread k
 this: a tick writes if the session is dirty OR if the tick before it was. The same bool starts
 `true`, so a session that never diverges from its layout still writes its base shape once instead
 of never being resurrectable.
+
+### What a clean session still has to write
+
+Being able to be clean brought a new way to be wrong. `is_dirty` asks whether the session has
+diverged from the layout that built it; the cache holds a copy of the SESSION, not of the layout.
+A session can be clean and still have changed. Rename a pane and the pane count is the same, the
+tabs are the same and the commands are the same - so the session is dirty by nothing, writes
+nothing, and the copy on disk keeps the old name for as long as the session stays clean. Every
+serialized attribute the dirty checks do not look at has that shape: cwd, geometry, pinning,
+borderlessness, focus, uuid, handle, colours, viewport contents. Before the pane count was fixed
+this could not happen, because a layout with tabs was dirty from birth and rewrote every tick.
+
+So a tick now also writes when the layout it WOULD write differs from the one it last wrote,
+decided by a fingerprint: a hash of every field that reaches `GlobalLayoutManifest`, taken from the
+metadata the tick has already gathered. Nothing is serialized to compute it. Both metadata structs
+are destructured field by field, so a field added later fails to compile until someone says which
+side of the fingerprint it belongs on. Two are deliberately outside it - the base layout, which
+`Screen` hands to every tick unchanged, and the editor, which is not serialized and whose only
+effect is already in a pane's recorded command.
+
+The geometry is hashed through its `Debug` rendering rather than its `Hash`: `PaneGeom` compares
+and hashes without `is_pinned` on purpose, and the serialized layout writes `pinned`.
+
+A clean, unchanging session is still silent - its fingerprint is the one already on disk - so the
+saving the pane-count fix was made for is intact. Note also that the disk write was already
+deduplicated by content, so what any of this saves is CPU, never IO.
+
+A pane's NOTE is not covered, because a note is not serialized at all. That is a gap in what the
+snapshot holds, not staleness in what it holds.
 
 ### A tab bar in a tab you are not looking at
 

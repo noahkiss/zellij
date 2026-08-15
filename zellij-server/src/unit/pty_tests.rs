@@ -815,8 +815,12 @@ fn an_unchanged_process_info_map_is_not_reported_again() {
 /// A pty with nothing wired up, for testing state it keeps for itself.
 fn make_bare_pty() -> Pty {
     let bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
-    Pty::new(bus, false, None, None, None, None)
+    Pty::new(bus, false, None, None, None, None, None)
 }
+
+/// A fingerprint that stands for "nothing that gets serialized has changed", so that these tests
+/// exercise the dirty/latch arms of `should_serialize_layout` on their own.
+const UNCHANGED: u64 = 7;
 
 #[test]
 fn the_first_tick_writes_the_cache_even_though_the_session_is_clean() {
@@ -824,7 +828,7 @@ fn the_first_tick_writes_the_cache_even_though_the_session_is_clean() {
     // cache at all, and could not be resurrected
     let mut pty = make_bare_pty();
     assert!(
-        pty.should_serialize_layout(false),
+        pty.should_serialize_layout(false, UNCHANGED),
         "the base shape has to reach disk once"
     );
 }
@@ -832,10 +836,10 @@ fn the_first_tick_writes_the_cache_even_though_the_session_is_clean() {
 #[test]
 fn a_clean_session_stops_writing_the_cache() {
     let mut pty = make_bare_pty();
-    pty.should_serialize_layout(false); // the first tick, which always writes
+    pty.should_serialize_layout(false, UNCHANGED); // the first tick, which always writes
     for tick in 0..5 {
         assert!(
-            !pty.should_serialize_layout(false),
+            !pty.should_serialize_layout(false, UNCHANGED),
             "nothing changed on tick {}, so there is nothing to write",
             tick
         );
@@ -845,10 +849,10 @@ fn a_clean_session_stops_writing_the_cache() {
 #[test]
 fn a_dirty_session_writes_the_cache_every_tick() {
     let mut pty = make_bare_pty();
-    pty.should_serialize_layout(false);
+    pty.should_serialize_layout(false, UNCHANGED);
     for tick in 0..5 {
         assert!(
-            pty.should_serialize_layout(true),
+            pty.should_serialize_layout(true, UNCHANGED),
             "the session is still diverged on tick {}",
             tick
         );
@@ -861,14 +865,51 @@ fn returning_to_the_base_shape_rewrites_the_cache_once() {
     // the cache on disk still describes the pane that is gone. Without the transition write, the
     // next resurrection hands that pane back.
     let mut pty = make_bare_pty();
-    pty.should_serialize_layout(false); // the first tick
-    assert!(pty.should_serialize_layout(true), "a pane was opened");
+    pty.should_serialize_layout(false, UNCHANGED); // the first tick
     assert!(
-        pty.should_serialize_layout(false),
+        pty.should_serialize_layout(true, UNCHANGED),
+        "a pane was opened"
+    );
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED),
         "the pane was closed - the diverged cache has to be overwritten"
     );
     assert!(
-        !pty.should_serialize_layout(false),
+        !pty.should_serialize_layout(false, UNCHANGED),
         "and only once: the cache already matches"
+    );
+}
+
+#[test]
+fn a_clean_session_writes_the_cache_when_a_serialized_attribute_changes() {
+    // the regression this guards: a session that stays in the shape of its layout is never dirty,
+    // so before the fingerprint it wrote its cache once and then went silent forever - and a pane
+    // renamed after that point was lost to the next resurrection.
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED); // the first tick
+    assert!(
+        !pty.should_serialize_layout(false, UNCHANGED),
+        "still clean and still identical"
+    );
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED + 1),
+        "the session is clean, but something it serializes is not what is on disk"
+    );
+    assert!(
+        !pty.should_serialize_layout(false, UNCHANGED + 1),
+        "and only once: the cache now matches again"
+    );
+}
+
+#[test]
+fn a_serialized_attribute_that_changes_back_writes_both_times() {
+    // a fingerprint the cache has seen before is not the fingerprint the cache HOLDS: renaming a
+    // pane and renaming it back has to reach disk twice, or the cache keeps the middle name.
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED);
+    assert!(pty.should_serialize_layout(false, UNCHANGED + 1), "renamed");
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED),
+        "renamed back - the cache holds the middle name and has to be overwritten"
     );
 }

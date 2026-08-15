@@ -538,10 +538,20 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
         return;
     };
     match pin_state_of(name, pinned) {
-        PinState::Recorded(path) => report.push(Finding::ok(
-            "pin",
-            format!("{} - the launcher runs it", path.display()),
-        )),
+        // and therefore `session up` runs FROM the pin, which is the state finding 2 is about: a
+        // watchdog comparing the pin with itself. Said here because it reads as a clean bill of
+        // health, and the thing it does not cover is the upgrade the user is most likely waiting on
+        PinState::Recorded(path) => report.push(
+            Finding::ok("pin", format!("{} - the launcher runs it", path.display()))
+                .note(
+                    "so `session up` from the launcher compares the pin with itself and the \
+                     watchdog cannot see a newer build",
+                )
+                .note(
+                    "an upgrade reaches the pin from a zellij run off another path - an \
+                     interactive launch, or this command with --fix",
+                ),
+        ),
         PinState::Unrecorded(path) => report.push(
             Finding::ok(
                 "pin",
@@ -565,7 +575,92 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
             .note("a macOS grant names one exact path, so the two have to be the same file"),
         ),
     }
+    check_pin_temps(report, pinned, mode);
     check_pin_freshness(report, pinned, mode);
+}
+
+/// The 40 MB copies a refresh that was killed part-way left in the pin directory.
+///
+/// Before the refresh below, not after. A sweep that runs after a step which can fail is a sweep
+/// that never runs on the machine that is accumulating the files - the same reason the signing
+/// flow sweeps first.
+///
+/// The gates are in
+/// [`stale_pin_temps`](zellij_utils::session_lifecycle::stale_pin_temps): a temp whose pid is still
+/// running belongs to a refresh that is still going, and one younger than an hour is not yet
+/// abandoned. Doctor is the only thing that sweeps, because it is the only pin path a user runs on
+/// purpose and one at a time; `session up` runs from a watchdog and overlaps itself.
+#[cfg(unix)]
+fn check_pin_temps(report: &mut Report, pinned: &Path, mode: DoctorMode) {
+    use zellij_utils::session_lifecycle::{
+        pin_directory, stale_pin_temps, sweep_stale_pin_temps, PIN_TEMP_MINIMUM_AGE,
+    };
+
+    let directory = pin_directory(pinned);
+    let abandoned = stale_pin_temps(&directory, PIN_TEMP_MINIMUM_AGE);
+    if abandoned.is_empty() {
+        report.push(Finding::ok(
+            "pin",
+            format!("no abandoned temp copies in {}", directory.display()),
+        ));
+        return;
+    }
+    // measured before anything is removed, because it is the megabytes that make this worth saying
+    let reclaimed = abandoned
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    let subject = format!(
+        "abandoned temp {} in {}, holding {}",
+        if abandoned.len() == 1 {
+            "copy"
+        } else {
+            "copies"
+        },
+        directory.display(),
+        megabytes(reclaimed),
+    );
+    if !mode.fix {
+        report.push(
+            Finding::ok(
+                "pin",
+                mode.describe(&format!("remove {} {}", abandoned.len(), subject)),
+            )
+            .note("each one is a refresh that was killed between writing the copy and renaming it"),
+        );
+        return;
+    }
+    let swept = sweep_stale_pin_temps(&directory, PIN_TEMP_MINIMUM_AGE);
+    if swept.len() == abandoned.len() {
+        report.push(Finding::changed(
+            "pin",
+            format!("removed {} {}", swept.len(), subject),
+        ));
+        return;
+    }
+    let mut finding = Finding::needs_you(
+        "pin",
+        format!("removed {} of {} {}", swept.len(), abandoned.len(), subject),
+    )
+    .note("the rest are in a directory this user cannot write in");
+    for left in abandoned.iter().filter(|path| !swept.contains(path)) {
+        finding = finding.note(format!("  rm {}", left.display()));
+    }
+    report.push(finding);
+}
+
+#[cfg(not(unix))]
+fn check_pin_temps(_report: &mut Report, _pinned: &Path, _mode: DoctorMode) {}
+
+/// A byte count as a person reads it. One decimal place, which is all that is wanted for a number
+/// whose job is to say "this is worth removing".
+///
+/// Gated with its only caller. `check_pin_temps` is `#[cfg(unix)]`, so on Windows this is dead code
+/// and the warning is CI's, not a local build's.
+#[cfg(unix)]
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Whether the pinned copy was made from the build running now.
