@@ -723,6 +723,7 @@ fn sign_down_the_ladder(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
+    let mut asked_for_the_key = false;
     let apple_offered = ladder
         .iter()
         .any(|rung| !matches!(rung, Rung::SelfSigned(_)));
@@ -743,6 +744,23 @@ fn sign_down_the_ladder(
             },
             other => other,
         };
+        if matches!(rung, Rung::SelfSigned(_)) && !asked_for_the_key {
+            // BEFORE signing, and on every run rather than only the one that minted. The ACL that
+            // lets `codesign` reach the key is a property of the keychain, not of the certificate,
+            // and it used to be granted only on the minting run - so the very next run found a
+            // ready rung, signed with it, and was refused by a key nothing had ever approved.
+            // Proven on a real Mac: running the partition list by hand made the identical
+            // `codesign` succeed. It is cheap and idempotent when the ACL is already there.
+            //
+            // Only for our own certificate. An Apple one comes with its own ACL, and re-writing
+            // the partition list of a key we did not create is not doctor's business.
+            asked_for_the_key = true;
+            findings.extend(allow_codesign_to_reach_the_key(
+                commander,
+                &context.keychain,
+                context.keychain_password.as_deref(),
+            ));
+        }
         let changed_certificate = changes_certificate(
             &rung,
             context.signing_dir.identity_bundle().exists(),
@@ -1055,7 +1073,7 @@ fn perform_signing(
             refusal: Some(format!(
                 "codesign refused to sign with {}: {}",
                 rung.description(),
-                first_line(&signed.1)
+                the_complaint(&signed.1)
             )),
             fatal: false,
         };
@@ -1104,7 +1122,7 @@ fn perform_signing(
     if let Some(refusal) = refused_timestamp {
         done = done
             .note("the timestamp was refused, so it was signed without one:")
-            .note(format!("  {}", first_line(&refusal)));
+            .note(format!("  {}", the_complaint(&refusal)));
     }
     findings.push(done);
     findings.push(follow_up(&pin_display, changed_certificate));
@@ -1118,6 +1136,44 @@ fn perform_signing(
 /// The first line of a tool's complaint, which is the part worth quoting in a report.
 fn first_line(message: &str) -> &str {
     message.lines().next().unwrap_or("").trim()
+}
+
+/// What `codesign` actually complained about, which is NOT its first line.
+///
+/// **`-f` makes the first line noise, and quoting it hid every real failure.** Re-signing a pin
+/// that already carries a signature - which is every run after the first - makes `codesign` say so
+/// before it says anything else:
+///
+/// ```text
+/// /Users/…/zellij: replacing existing signature
+/// /Users/…/zellij: errSecInternalComponent
+/// ```
+///
+/// A report that quoted line 1 told the user their signing run had "failed: replacing existing
+/// signature", which names the one thing that went right. Seen on a real Mac at 0.45.0-nkmk.8,
+/// where the actual fault was a key ACL that had never been granted.
+///
+/// So the informational line is dropped and everything else is kept, joined and capped. Kept
+/// rather than reduced to the last line: `codesign` can emit several, and the one that explains a
+/// refusal is not reliably the last one either.
+fn the_complaint(message: &str) -> String {
+    let kept: Vec<&str> = message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.contains("replacing existing signature"))
+        .collect();
+    // nothing but the informational line is still worth quoting - a refusal with no words is
+    // harder to act on than a redundant one
+    let complaint = if kept.is_empty() {
+        first_line(message).to_owned()
+    } else {
+        kept.join("; ")
+    };
+    const ROOM: usize = 300;
+    match complaint.char_indices().nth(ROOM) {
+        Some((at, _)) => format!("{}...", &complaint[..at]),
+        None => complaint,
+    }
 }
 
 /// Run `codesign`, reporting whether it worked and what it said if it did not.
@@ -1371,14 +1427,11 @@ pub fn ensure_self_signed(
         import_bundle(commander, &bundle, keychain)?;
     }
 
-    // NOT `?`. The partition list is a convenience, not a precondition - see
-    // `allow_codesign_to_reach_the_key` - and stopping here was what left a machine with a
-    // certificate it had just imported and a pin it never signed.
-    findings.extend(allow_codesign_to_reach_the_key(
-        commander,
-        keychain,
-        keychain_password,
-    ));
+    // The partition list is NOT run here. It belongs to signing, not to minting: a machine that
+    // minted last month signs today without coming through this function at all, and the ACL it
+    // needs is granted per keychain and not per certificate. `sign_down_the_ladder` runs it before
+    // every signature made with our own certificate - see there.
+    let _ = keychain_password;
     Ok(findings)
 }
 
@@ -1672,7 +1725,9 @@ const KEY_ACCESS_REMEDIES: [&str; 3] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_doctor::{recorded, recorded_failure, RecordedCommander, Status};
+    use crate::session_doctor::{
+        recorded, recorded_failure, CommandOutput, RecordedCommander, Status,
+    };
 
     /// Recorded from a pin signed with a Developer ID certificate.
     const DEVELOPER_ID: &str = "\
@@ -2320,21 +2375,34 @@ Signature=adhoc
     #[test]
     fn a_partition_list_that_refuses_does_not_stop_the_signing() {
         let directory = tempfile::tempdir().unwrap();
-        let dir = SigningDir::new(directory.path().to_path_buf());
-        std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
 
-        let commander = RecordedCommander::new(&[
-            ("security import", recorded("1 identity imported.")),
-            (
-                "security set-key-partition-list",
-                recorded_failure(
-                    "SecKeychainItemSetAccessWithPassword: User interaction is not allowed.",
-                ),
+        let commander = signing_with_our_own(
+            &pin,
+            recorded_failure(
+                "SecKeychainItemSetAccessWithPassword: User interaction is not allowed.",
             ),
-        ]);
-        let findings = ensure_self_signed(&commander, &dir, "login.keychain-db", None)
-            .expect("a refused partition list stopped the run");
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
 
+        // it went on to sign, which is the whole point: `codesign` is what raises the dialog the
+        // partition list exists to avoid
+        assert!(
+            commander.called_with("codesign -s "),
+            "{:?}",
+            commander.calls()
+        );
+        let findings = run.findings;
         let warned = findings
             .iter()
             .find(|finding| finding.message.contains("codesign may ask for the key"))
@@ -2356,6 +2424,64 @@ Signature=adhoc
             "{:?}",
             warned.notes
         );
+    }
+
+    /// `-f` makes `codesign` announce that it is replacing a signature before it says anything
+    /// else, so quoting its FIRST line reported every real failure as "replacing existing
+    /// signature" - the one thing that had gone right. Seen on a real Mac, where it hid a key ACL
+    /// that had never been granted.
+    #[test]
+    fn a_refusal_quotes_the_error_and_not_codesigns_own_chatter() {
+        assert_eq!(
+            the_complaint(
+                "/Users/someone/zellij: replacing existing signature\n\
+                 /Users/someone/zellij: errSecInternalComponent"
+            ),
+            "/Users/someone/zellij: errSecInternalComponent"
+        );
+        // several real lines are all kept, because the one that explains a refusal is not reliably
+        // the last one either
+        assert_eq!(
+            the_complaint("zellij: replacing existing signature\nfirst thing\nsecond thing"),
+            "first thing; second thing"
+        );
+        // and a complaint that is ONLY the chatter still says something
+        assert_eq!(
+            the_complaint("zellij: replacing existing signature"),
+            "zellij: replacing existing signature"
+        );
+        assert!(the_complaint(&"x".repeat(400)).ends_with("..."));
+
+        // end to end, through the report a person actually reads
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+            ("security set-key-partition-list", recorded("")),
+            (
+                "codesign -s ",
+                recorded_failure(
+                    "/tmp/pin: replacing existing signature\n/tmp/pin: errSecInternalComponent",
+                ),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+        let said = format!("{:?}", run.findings);
+        assert!(said.contains("errSecInternalComponent"), "{}", said);
     }
 
     /// And when `codesign` then refuses too - no window server, or a denied dialog - the report
@@ -3153,15 +3279,111 @@ Signature=adhoc
     #[test]
     fn the_keychain_password_is_passed_only_when_there_is_one() {
         let directory = tempfile::tempdir().unwrap();
-        let dir = SigningDir::new(directory.path().to_path_buf());
-        std::fs::write(dir.identity_bundle(), b"x").unwrap();
-        let commander = RecordedCommander::new(&[
-            ("security import", recorded("")),
-            ("security set-key-partition-list", recorded("")),
-        ]);
-        ensure_self_signed(&commander, &dir, "login.keychain-db", Some("hunter2")).unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = signing_with_our_own(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.keychain_password = Some(String::from("hunter2"));
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
         assert!(
             commander.called_with("-k hunter2"),
+            "{:?}",
+            commander.calls()
+        );
+    }
+
+    /// A run that signs with our own certificate, with the partition list answering `partition`.
+    fn signing_with_our_own(pin: &Path, partition: CommandOutput) -> RecordedCommander {
+        RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+            ("security set-key-partition-list", partition),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(SELF_SIGNED)),
+            ("codesign --verify ", recorded("")),
+        ])
+    }
+
+    /// The certificate is minted once and signed with for years, so granting the key ACL only on
+    /// the run that MINTED left every later run signing with a key nothing had approved. Proven on
+    /// a real Mac: the same `codesign` succeeded once the partition list had been run by hand.
+    #[test]
+    fn the_key_acl_is_granted_before_every_signature_with_our_own_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        // no bundle on disk and nothing minted in this run: the certificate is simply already in
+        // the keychain, which is every run after the first
+        let commander = signing_with_our_own(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        let calls = commander.calls();
+        let partition = commander
+            .position_of("security set-key-partition-list")
+            .unwrap_or_else(|| panic!("the key ACL was never granted: {:?}", calls));
+        let signed = commander.position_of("codesign -s ").unwrap();
+        assert!(partition < signed, "granted after it signed: {:?}", calls);
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::Changed
+                    && finding.message.contains("signed")),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// And it is NOT written for a certificate we did not create. An Apple certificate comes with
+    /// its own ACL, and rewriting the partition list of someone else's key is not doctor's job.
+    #[test]
+    fn the_key_acl_is_left_alone_on_an_apple_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+        assert!(
+            !commander.called_with("security set-key-partition-list"),
             "{:?}",
             commander.calls()
         );
