@@ -483,6 +483,21 @@ pub enum Sessions {
     #[clap(subcommand)]
     Session(SessionLifecycleCli),
 
+    /// Serve this CLI to an agent over the Model Context Protocol, on stdin and stdout
+    ///
+    /// Seven tools rather than one per verb: read a pane, wait on one, type into one, make and
+    /// rearrange panes and tabs, and ask which panes are running a coding agent. Each one runs
+    /// this same binary, so a tool behaves exactly as the command line does. Session lifecycle is
+    /// deliberately not among them.
+    ///
+    /// Speaks the protocol on stdout, so nothing else may be printed there. Run it from an MCP
+    /// client's server configuration, not from a terminal.
+    Mcp {
+        /// The session an unqualified tool call is about. Defaults to ZELLIJ_SESSION_NAME
+        #[clap(short, long, value_parser)]
+        session: Option<String>,
+    },
+
     /// Stop every session's server, keeping the sessions resurrectable
     ///
     /// Attempts every session and exits non-zero if any server did not go.
@@ -2300,6 +2315,19 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// Returns: one line per tab, then its panes indented below it, each line `key: value` pairs
     /// two spaces apart - or the same tree structured with --json
     ListTree {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
+    /// List the panes running a coding agent, and which agent each one is
+    ///
+    /// A filtered `list-panes`: the panes whose command is a harness this build recognises -
+    /// claude, opencode, codex, pi - with the harness's own session id where it exports one.
+    /// `SOURCE` says what the row rests on: `command` when only the pane's command matched,
+    /// `command+env` when an identity variable was found in the pane's processes as well.
+    ///
+    /// Returns: a table, or the same rows with --json. No agents prints the header alone.
+    ListAgents {
         /// Output as JSON
         #[clap(short, long, value_parser)]
         json: bool,

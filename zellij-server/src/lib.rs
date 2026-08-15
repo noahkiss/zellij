@@ -526,6 +526,7 @@ impl SessionMetaData {
                     post_command_discovery_hook: new_config.options.post_command_discovery_hook,
                     resurrect_command_hints: new_config.options.resurrect_command_hints,
                     report_pane_env: new_config.options.report_pane_env,
+                    detect_agents: new_config.options.detect_agents,
                 })
                 .unwrap();
         }
@@ -842,6 +843,29 @@ mod session_state_tests {
             vec![cli_client, attached_client],
             "both are still clients: only the unblock treats them differently"
         );
+    }
+
+    #[test]
+    fn a_client_id_is_handed_out_again_the_moment_it_is_removed() {
+        // the precondition the route thread's single removal announcement rests on. Ids are the
+        // lowest free number, so in a session nothing is attached to every transient `zellij
+        // action` connection is client 1, one after another. Removing a client is what frees its
+        // id - which is why the announcement has to come after that thread's last act, and why
+        // announcing it twice let the second one tear down whatever connection had since been
+        // given the id. If this test ever fails, read the comment at the end of `route_thread_main`
+        // before deciding the change is harmless
+        let mut session_state = SessionState::new();
+        let first = session_state.new_client();
+        assert_eq!(first, 1);
+        session_state.remove_client(first);
+        assert_eq!(
+            session_state.new_client(),
+            first,
+            "the next connection is given the id the last one had just freed"
+        );
+        // and while the first is still registered, the next connection gets a different id - which
+        // is what makes the removal announcement, not the client's departure, the moment of danger
+        assert_eq!(session_state.new_client(), 2);
     }
 
     #[test]
@@ -2355,6 +2379,7 @@ fn init_session(
                 config_options.post_command_discovery_hook.clone(),
                 config_options.resurrect_command_hints.clone(),
                 config_options.report_pane_env.clone(),
+                config_options.detect_agents,
             );
 
             move || pty_thread_main(pty, layout.clone()).fatal()
