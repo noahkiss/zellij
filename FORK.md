@@ -3724,6 +3724,12 @@ Turn it off with the top-level key, on a machine where reading a process's envir
 detect_agents false
 ```
 
+**Off means off, both phases.** The pty tick stops reading identity variables and the pane list
+stops matching commands, so `list-agents` prints its header and nothing else, `list-panes` prints
+`-` in `AGENT`, and `list-panes --json` carries no `agent` key on any entry. Both halves of the
+answer live in different threads, so the option travels to the pane list with the process info it
+governs, and a config reload flips it in either direction without a restart.
+
 Being top-level, it is ignored by a binary that predates it, so it can go into a shared config ahead
 of the upgrade.
 

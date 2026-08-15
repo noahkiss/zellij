@@ -273,6 +273,9 @@ pub(crate) struct Pty {
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
+    /// The `detect_agents` value last sent to Screen, so a config flip reaches it even on a
+    /// session whose process info has not changed. `None` until the first report.
+    last_reported_detect_agents: Option<bool>,
     /// The last map `report_pane_process_info` sent, so an unchanged tick sends nothing.
     last_reported_process_info: HashMap<u32, PaneProcessInfo>,
     /// Whether the next serialization tick must write the resurrection cache even though the
@@ -1042,6 +1045,7 @@ impl Pty {
             terminal_envs: HashMap::new(),
             detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
             terminal_agent_envs: HashMap::new(),
+            last_reported_detect_agents: None,
             last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
@@ -2382,7 +2386,9 @@ impl Pty {
     /// pid. Building it touches no OS: it is a walk of three `HashMap`s the tick above just filled.
     ///
     /// A map equal to the last one sent is dropped instead: an idle session would otherwise wake
-    /// the screen thread once a second forever to tell it nothing.
+    /// the screen thread once a second forever to tell it nothing. `detect_agents` is compared
+    /// alongside it, because a config reload that flips the option changes nothing in the map and
+    /// would otherwise never reach Screen on an idle session.
     fn report_pane_process_info(&mut self) {
         let process_info: HashMap<u32, PaneProcessInfo> = self
             .id_to_child_pid
@@ -2410,14 +2416,20 @@ impl Pty {
                 )
             })
             .collect();
-        if process_info == self.last_reported_process_info {
+        if process_info == self.last_reported_process_info
+            && self.last_reported_detect_agents == Some(self.detect_agents)
+        {
             return;
         }
         self.last_reported_process_info = process_info.clone();
+        self.last_reported_detect_agents = Some(self.detect_agents);
         let _ = self
             .bus
             .senders
-            .send_to_screen(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+            .send_to_screen(ScreenInstruction::UpdatePaneProcessInfo {
+                process_info,
+                detect_agents: self.detect_agents,
+            });
     }
 
     fn refresh_cwds_and_commands(&mut self) {

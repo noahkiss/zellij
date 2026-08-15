@@ -228,7 +228,7 @@ fn collect_process_info_reports(
 ) -> Vec<HashMap<u32, PaneProcessInfo>> {
     let mut reports = Vec::new();
     while let Ok((instruction, _)) = rx.try_recv() {
-        if let ScreenInstruction::UpdatePaneProcessInfo(process_info) = instruction {
+        if let ScreenInstruction::UpdatePaneProcessInfo { process_info, .. } = instruction {
             reports.push(process_info);
         }
     }

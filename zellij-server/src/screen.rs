@@ -92,7 +92,10 @@ use crate::{
     panes::sixel::SixelImageStore,
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction, PluginRenderAsset},
-    pty::{get_default_shell, ClientTabIndexOrPaneId, PaneProcessInfo, PtyInstruction, VteBytes},
+    pty::{
+        get_default_shell, ClientTabIndexOrPaneId, PaneProcessInfo, PtyInstruction, VteBytes,
+        DETECT_AGENTS_DEFAULT,
+    },
     pty_writer::PtyWriteInstruction,
     tab::{GuestChoiceIndicator, SuppressedPanes, Tab, CANNOT_STACK_WITHOUT_ANCHOR},
     thread_bus::Bus,
@@ -337,7 +340,15 @@ pub enum ScreenInstruction {
     PtyBytes(u32, VteBytes),
     /// The pty thread's once-a-second report of what each terminal pane is running, keyed by
     /// terminal id. Screen keeps it only to stamp `PaneInfo`.
-    UpdatePaneProcessInfo(HashMap<u32, PaneProcessInfo>),
+    ///
+    /// `detect_agents` rides along because the pty thread owns that option and Screen answers the
+    /// question it governs. Sending it with the data it gates is what stops the two halves from
+    /// disagreeing: there is no tick on which Screen has process info and a stale opinion about
+    /// whether it may look at it.
+    UpdatePaneProcessInfo {
+        process_info: HashMap<u32, PaneProcessInfo>,
+        detect_agents: bool,
+    },
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -992,7 +1003,7 @@ impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
             ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
-            ScreenInstruction::UpdatePaneProcessInfo(..) => ScreenContext::UpdatePaneProcessInfo,
+            ScreenInstruction::UpdatePaneProcessInfo { .. } => ScreenContext::UpdatePaneProcessInfo,
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
             ScreenInstruction::RenderToClients => ScreenContext::RenderToClients,
@@ -1660,6 +1671,9 @@ pub(crate) struct Screen {
     /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
     /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
     pane_process_info: HashMap<u32, PaneProcessInfo>,
+    /// Whether this session answers "which panes run a coding agent" at all. `detect_agents`,
+    /// default true, owned by the pty thread and told to Screen with the process info it gates.
+    detect_agents: bool,
     mobile_web_prefs: HashMap<ClientId, MobileWebPrefs>,
     bell_dwell: BellDwellTracker,
 }
@@ -1936,6 +1950,7 @@ impl Screen {
             last_mobile_state_sent: HashMap::new(),
             pane_output_activity: HashMap::new(),
             pane_process_info: HashMap::new(),
+            detect_agents: DETECT_AGENTS_DEFAULT,
             mobile_web_prefs: HashMap::new(),
             bell_dwell: {
                 let mut bell_dwell = BellDwellTracker::default();
@@ -5429,6 +5444,12 @@ impl Screen {
     /// a pane whose command had already matched, so a pane running a shell costs one string
     /// compare and nothing else. A plugin pane has no process and is never an agent.
     fn agent_in_pane(&self, pane_info: &PaneInfo) -> Option<PaneAgent> {
+        // `detect_agents false` means the question is not asked, not that half of it is skipped.
+        // The pty tick stops reading identity variables; this stops the match that would report a
+        // harness without one, so `list-agents` prints nothing and no pane carries an `agent`
+        if !self.detect_agents {
+            return None;
+        }
         if pane_info.is_plugin {
             return None;
         }
@@ -8532,8 +8553,12 @@ pub(crate) fn screen_thread_main(
         let _resize_cache = ResizeCache::new(thread_senders.clone());
 
         match event {
-            ScreenInstruction::UpdatePaneProcessInfo(process_info) => {
+            ScreenInstruction::UpdatePaneProcessInfo {
+                process_info,
+                detect_agents,
+            } => {
                 screen.pane_process_info = process_info;
+                screen.detect_agents = detect_agents;
             },
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
                 screen

@@ -9,7 +9,7 @@ use insta::assert_snapshot;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use zellij_utils::cli::CliAction;
-use zellij_utils::data::{Event, EventType, Resize, Style, WebSharing};
+use zellij_utils::data::{Event, EventType, ListPanesResponse, Resize, Style, WebSharing};
 use zellij_utils::errors::{prelude::*, ErrorContext};
 use zellij_utils::input::actions::Action;
 use zellij_utils::input::command::{RunCommand, TerminalAction};
@@ -13023,7 +13023,10 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
     );
     let _ = mock_screen
         .to_screen
-        .send(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents: true,
+        });
     // any state change makes screen rebuild the manifest and report it
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
         PaneId::Terminal(0),
@@ -13048,6 +13051,73 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
         Some("/home/user/develop/thing")
     );
     assert_eq!(reported.pane_command.as_deref(), Some("claude --resume"));
+}
+
+/// `list-panes` as Screen builds it, for a session whose pane 1 runs `claude`.
+///
+/// The whole point of the pair below is the `detect_agents` argument, so the setup is shared and
+/// only that value differs between them.
+fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+
+    let mut process_info = HashMap::new();
+    process_info.insert(
+        1,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: None,
+            command: Some(vec!["claude".to_owned()]),
+            env: Default::default(),
+            agent_env: Default::default(),
+        },
+    );
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents,
+        });
+    let (response_channel, panes) = crossbeam::channel::unbounded();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ListPanes {
+        show_all: true,
+        response_channel,
+    });
+    let pane_list = panes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("screen should answer ListPanes");
+    mock_screen.teardown(vec![screen_thread]);
+    pane_list
+}
+
+#[test]
+pub fn a_pane_running_a_harness_is_reported_as_an_agent() {
+    let pane_list = pane_list_for_a_claude_pane(true);
+    let reported = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .expect("terminal pane 1 should be in the pane list");
+    let agent = reported
+        .agent
+        .as_ref()
+        .expect("a pane running claude is an agent");
+    assert_eq!(agent.kind, "claude");
+    assert_eq!(agent.source, "command");
+}
+
+#[test]
+pub fn detect_agents_off_reports_no_agent_at_all() {
+    // the negative control for the test above: the same pane, the same command, the option off.
+    // Gating only the environment read would leave `kind: claude` here, which is the bug this
+    // pair exists to catch
+    let pane_list = pane_list_for_a_claude_pane(false);
+    let reported = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .expect("terminal pane 1 should be in the pane list");
+    assert_eq!(reported.agent, None);
+    assert!(pane_list.iter().all(|entry| entry.agent.is_none()));
 }
 
 #[test]
@@ -13306,7 +13376,10 @@ pub fn pane_info_carries_the_allowlisted_environment() {
     );
     let _ = mock_screen
         .to_screen
-        .send(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents: true,
+        });
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
         PaneId::Terminal(0),
         None,
