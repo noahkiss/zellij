@@ -2513,6 +2513,28 @@ cannot sign is still a machine worth reporting on. The Xcode steps come with it 
 keychain held no Apple certificate; a machine whose certificate merely refused is pointed at the
 key and the keychain instead, which is what refuses like that.
 
+**The refresh and the signature are one transaction, and they have to be.** Doctor used to refresh
+the pin first and sign it second. A run where every rung refused — a locked keychain, which is
+*every* unattended launchd run — had therefore already replaced a properly anchored pin with a fresh
+ad-hoc copy of the new build, and then reported `the pinned copy is untouched`. Both halves were
+wrong: the pin had been replaced, and every grant on the machine was void from the next restart,
+which is a symptom that surfaces later and somewhere else. Measured on a real Mac at 0.45.0-nkmk.9,
+where the requirement a dry run had confirmed sixty seconds earlier was simply gone.
+
+So when the pin is **anchored** and out of date, the copy is handed to the signing step: it writes
+the new build into its own temp, signs THAT, verifies it, and renames only on success. A refusal
+leaves the previous signed pin exactly where it was — previous build, signature intact, grants
+intact — and says so. The deferral is decided by one function that both steps ask, because a
+disagreement in the "skip" direction would drop the refresh with nothing reporting it. A pin that is
+already **ad-hoc** is refreshed first as before: it holds no grant a rebuild could keep, so pinning
+the new build is worth more than protecting a signature that was never load-bearing.
+
+**Known gap: `session up` still refreshes the pin on its own.** `install_pinned_exe` does a plain
+copy → rename with no signing step, so an upgrade whose first command is `session up` — rather than
+`session doctor` — puts an ad-hoc pin in place exactly as the old doctor did, and the grants go with
+it until doctor is next run. Recorded rather than fixed here; the fix belongs with `session up` and
+is not a signing change.
+
 **Known limitation: the rename is not coordinated with `session up`.** Signing is copy → sign →
 verify → `rename`, and `install_pinned_exe` does its own copy → rename. A `session up` that lands a
 newer pin while doctor is mid-run can be clobbered by doctor's signed copy of the older one. It is
@@ -2525,6 +2547,21 @@ walk compares neither the team id nor the requirement it would derive. A keychai
 certificates from two different teams would fall to a different `certificate leaf[subject.OU]`,
 which changes the requirement and drops every grant exactly as a demotion would. One machine
 holding both, from two teams, is rare enough that this is recorded rather than guarded.
+
+**A re-grant is asked for only when the requirement actually changed**, and the question is put to
+the two requirement TEXTS — the one read off the pin before signing and the one read off the signed
+copy after. It used to be inferred from the state of the machine: a bundle sitting in the signing
+directory meant "this machine has signed with a certificate of its own". On a Mac that had never
+used that rung, but carried leftovers from an older shell script, that sent the user into System
+Settings to redo three permissions against a requirement that was character-for-character the one
+already there. A pin re-signed with the same certificate carries the same requirement — that is the
+entire premise of this feature — so the ordinary case, a rebuild on a machine already set up, needs
+only the restart.
+
+**`codesign --verify` exiting 0 says nothing about whether a grant survived.** It answers "is this
+signature intact", not "is this the requirement macOS recorded" — an ad-hoc pin verifies perfectly
+and holds nothing past its next rebuild. The requirement is what doctor prints and compares, and
+verification is a second question asked alongside it, never instead of it.
 
 **A refusal quotes `codesign`'s error and not its first line.** `-f` makes it announce
 `<path>: replacing existing signature` before anything else on every run after the first, so a
