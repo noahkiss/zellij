@@ -655,6 +655,10 @@ fn check_pin_temps(_report: &mut Report, _pinned: &Path, _mode: DoctorMode) {}
 
 /// A byte count as a person reads it. One decimal place, which is all that is wanted for a number
 /// whose job is to say "this is worth removing".
+///
+/// Gated with its only caller. `check_pin_temps` is `#[cfg(unix)]`, so on Windows this is dead code
+/// and the warning is CI's, not a local build's.
+#[cfg(unix)]
 fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }

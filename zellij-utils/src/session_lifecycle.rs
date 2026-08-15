@@ -1351,13 +1351,13 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         return Err(pin_write_error(target, &error));
     }
     sync_pin_directory(&directory);
-    // the source is re-`stat`ed rather than reusing `key`: the copy took time, and a source that
-    // changed while it was being read must not be recorded under the identity it had before
-    record_pin_source(
-        target,
-        source_hash.as_deref(),
-        source_identity(source).as_ref(),
-    );
+    // `key` is reused rather than re-`stat`ing the source, and the pairing is the safety. The key
+    // exists to say "this hash was taken from a source that looked like THIS", so it has to name
+    // the source as it looked WHEN IT WAS HASHED. A source that changed while it was being read
+    // then leaves a key the next pass cannot match, which is a re-hash and a correction. A
+    // post-copy `stat` would instead file the OLD hash under the NEW identity - the next pass
+    // matches, skips the hash, and calls the pin current for as long as the source sits still.
+    record_pin_source(target, source_hash.as_deref(), key.as_ref());
     Ok(if refreshing {
         PinOutcome::Refreshed(target.to_path_buf())
     } else {
@@ -3067,6 +3067,89 @@ mod tests {
             install_pinned_exe(&source, &target),
             Ok(PinOutcome::Refreshed(target.clone())),
             "removing the key has to put the pin back under the hash's judgement"
+        );
+    }
+
+    /// A source that changes after it is hashed must not be filed under the identity it ENDED up
+    /// with. The key says "this hash came from a source that looked like this"; pairing the old
+    /// hash with the new identity makes the next pass match, skip the hash, and believe a pin that
+    /// was never made from the file now sitting at the source path.
+    ///
+    /// A FIFO at the source path is what holds the run still. `install_pinned_exe` reads the
+    /// source twice - once to hash it, once to copy it - and a read of a FIFO blocks until a
+    /// writer arrives and ends when that writer leaves. So the writer decides when the hash
+    /// finishes, and renaming a plain file over the path BEFORE it closes puts the change squarely
+    /// between the hash and everything after it. No sleeps and no polling: the ordering is the
+    /// FIFO's, not the scheduler's.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_that_changed_after_it_was_hashed_is_not_cached_under_its_new_identity() {
+        use std::ffi::CString;
+        use std::io::Write;
+
+        let scratch = ScratchDir::new("pin-key-race");
+        let source = scratch.0.join("zellij");
+        let target = scratch.0.join("pinned");
+        let raw = CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(raw.as_ptr(), 0o644) },
+            0,
+            "the scratch directory would not take a FIFO"
+        );
+        // taken before anything writes to the FIFO, so it is the identity the run itself sees
+        let hashed_identity = source_identity(&source).expect("a FIFO still `stat`s");
+
+        let hashed_bytes = elf_with_build_id(&[0xab; 20], 4096);
+        let replacement_bytes = elf_with_build_id(&[0xcd; 20], 8192);
+        let writer_path = source.clone();
+        let writer_bytes = hashed_bytes.clone();
+        let writer_replacement = replacement_bytes.clone();
+        let writer = std::thread::spawn(move || {
+            // blocks until the hash opens the FIFO to read it
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .unwrap();
+            handle.write_all(&writer_bytes).unwrap();
+            // the source is replaced while the hash still holds the FIFO open. The rename lands
+            // before this writer closes, and the hash cannot end until it does - so the copy that
+            // follows opens the REPLACEMENT, and any `stat` after the copy sees it too.
+            let staged = writer_path.with_extension("replacement");
+            std::fs::write(&staged, &writer_replacement).unwrap();
+            std::fs::rename(&staged, &writer_path).unwrap();
+            drop(handle);
+        });
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Installed(target.clone()))
+        );
+        writer.join().expect("the writer thread panicked");
+
+        // the run is only interesting if the source really did move under it
+        assert_ne!(
+            source_identity(&source),
+            Some(hashed_identity),
+            "the source never changed, so this test no longer tests the race"
+        );
+        let recorded = std::fs::read_to_string(pin_source_key(&target)).unwrap();
+        assert!(
+            recorded.contains(&hashed_identity.encode()),
+            "the key was filed under the identity the source ENDED with: {}",
+            recorded.trim()
+        );
+
+        // and the behaviour that costs, if it is filed wrong: the next pass matches its own
+        // `stat`, skips the hash, and calls a pin the source never produced current
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "the change was cached away - the pin is now wrong for as long as the source sits still"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            replacement_bytes,
+            "the refresh did not put the pin on the source that is actually there"
         );
     }
 

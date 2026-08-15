@@ -2080,6 +2080,13 @@ to hashing, which is exactly what happened before it existed: no key file, a key
 parse, a key recorded against a hash the stamp does not carry, a source that will not `stat`. The
 stamp is written first and the key second, so a crash between the two leaves a key nothing believes.
 
+**The `stat` in the key is the one taken BEFORE the hash, never a fresh one taken after the copy.**
+The key's whole claim is "this hash came from a source that looked like this", and the two halves
+have to describe the same moment. A source that changed while it was being read then leaves a key
+the next pass cannot match, so the hash is taken again and the change is caught. Re-`stat`ing after
+the copy looks safer and is the opposite: it files the OLD hash under the NEW identity, the next
+pass matches, skips the hash, and calls the pin current for as long as the source sits still.
+
 Two consequences worth stating.
 
 - **A separate file, not a second line in the stamp.** `<pin>.source-sha256` is still exactly
