@@ -287,7 +287,7 @@ of what moved to get there.
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
-| `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id |
+| `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id. A pane no tab took is not reported at all: [the miss says so and exits 2](#a-pane-is-reported-only-once-a-tab-has-taken-it) |
 | `break-pane` | `tab_id:` — the tab it made. The pane it moved kept the id and handle it already had |
 | `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
 | `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
@@ -1279,6 +1279,47 @@ are placed successfully are unaffected and still return immediately.
 
 Nothing guesses a stack target. Picking some pane to stack under when the caller did not name one
 would put a confidently wrong answer where an error belongs.
+
+### A pane is reported only once a tab has taken it
+
+The `--stacked` refusal above closes one case of a general problem, and this closes the rest of it.
+Upstream reports a new pane **as soon as its pty spawns**, which is before any tab has agreed to
+hold it. A tab that declines does so by dropping the pty rather than by failing, so the CLI printed
+`pane_id:` and `handle:` and exited 0 for a pane that was never made, and the next command a script
+ran missed:
+
+```
+$ zellij -s S action break-pane --pane-id terminal_0 --no-focus
+tab_id: 1
+$ zellij -s S action new-pane --in-tab 1 --handle ghost1
+pane_id: terminal_1
+handle: ghost1                        # exit 0, and terminal_1 is in no `list-panes`
+$ zellij -s S action wait ghost1 --for exit
+No pane answers to 'ghost1'
+```
+
+The id is now written into the report **after** the placement, and only for a pane some tab really
+holds. A miss says so and exits 2:
+
+```
+$ zellij -s S action new-pane --in-tab 1 --handle ghost1
+No pane was created: the session took the request and reported no pane.
+```
+
+It is one rule in two halves, and both are needed. The **session** stops asserting an id it only
+asked for — `new-pane` in every placement, the in-place replacement, and a plugin pane. The
+**client** holds each pane-making verb to answering with a pane: no `pane_id:` line from a verb
+whose whole point is a pane means no pane, which is a miss rather than a silent success. Successful
+creations are untouched and still print the id and the handle.
+
+This is not a fix for one tab. An unsized tab is how it shows up — a tab no client has ever attached
+to has no size to place a pane in, and `break-pane` makes one on a detached session — but a
+targetless `new-pane` on such a session ghosted the same way, and so did `new-pane --plugin`. Any
+future route that declines a pane is reported honestly without knowing about this.
+
+The exit is **2**: the session changed nothing the caller can address, so it sits in the same
+bucket as every other miss (see [the CLI output convention](#the-cli-output-convention)). The stderr sentence says
+which door it came through.
 
 ### Session lifecycle: `zellij session up|down|restart`
 

@@ -6568,6 +6568,19 @@ impl Screen {
         }
     }
 
+    /// Whether a pane the session was asked to make is actually in a tab.
+    ///
+    /// A pane is asked for by an id that exists before the pane does: the pty is spawned first and
+    /// the tab is offered it afterwards. A tab may decline - it has no size until a client has
+    /// attached to it once, and some placements need a focused pane there is none of - and it
+    /// declines by dropping the pty, silently. So this is the only thing that separates "made" from
+    /// "asked for", and a report that names a pane has to pass through it first.
+    ///
+    /// Suppressed panes count: a pane opened in place of another is real and addressable, and the
+    /// pane it replaced is still there behind it.
+    pub fn pane_exists(&self, pane_id: &PaneId) -> bool {
+        self.tabs.values().any(|tab| tab.has_pane_with_pid(pane_id))
+    }
     pub fn focus_pane_with_id(
         &mut self,
         pane_id: PaneId,
@@ -8554,7 +8567,9 @@ pub(crate) fn screen_thread_main(
                 mut completion_tx,
                 set_blocking,
             ) => {
-                completion_tx.as_mut().map(|c| c.set_affected_pane_id(pid));
+                // the id is NOT reported here: at this point it names a pty, not a pane. Whether
+                // the pane exists is decided by the tab below, and the report is written after it
+                // - see the confirmation at the end of this arm.
 
                 // A stacked pane with no explicit target has to join some client's focused pane.
                 // With no client connected there is none, and the tab refuses the pane and closes
@@ -8577,7 +8592,13 @@ pub(crate) fn screen_thread_main(
                     }
                 }
 
-                let blocking_notification = if set_blocking { completion_tx } else { None };
+                // taken rather than moved, so the confirmation below still has the notification in
+                // the non-blocking case - a blocking pane answers with its exit status instead
+                let blocking_notification = if set_blocking {
+                    completion_tx.take()
+                } else {
+                    None
+                };
 
                 match client_or_tab_index {
                     ClientTabIndexOrPaneId::ClientId(client_id)
@@ -8717,6 +8738,19 @@ pub(crate) fn screen_thread_main(
                         }
                     },
                 };
+                // the pane is reported only if a tab took it. Every route above can decline - a
+                // tab no client has ever attached to has no size to place a pane in, and a
+                // placement can want a focused pane there is none of - and each of them declines
+                // by dropping the pty rather than by failing, so asking the tabs afterwards is
+                // what tells the two apart. Reporting the id from the request instead is how
+                // `new-pane` came to print a pane that was never made
+                if let Some(completion) = completion_tx.as_mut() {
+                    if screen.pane_exists(&pid) {
+                        completion.set_affected_pane_id(pid);
+                    } else {
+                        log::error!("No tab took the new pane {:?}, so it was not created", pid);
+                    }
+                }
                 if let Some(pending_events) = pending_events_waiting_for_pane.remove(&pid) {
                     for event in pending_events {
                         screen.bus.senders.send_to_screen(event).non_fatal();
@@ -11178,10 +11212,8 @@ pub(crate) fn screen_thread_main(
                 });
                 let run_plugin = Run::Plugin(run_plugin_or_alias);
 
-                // Set affected pane ID for CLI client output
-                if let Some(ref mut completion) = completion_tx {
-                    completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
-                }
+                // the id is reported at the end of this arm, once a tab has taken the pane - see
+                // the confirmation below
 
                 if should_be_in_place {
                     if let Some(pane_id_to_replace) = pane_id_to_replace {
@@ -11237,6 +11269,19 @@ pub(crate) fn screen_thread_main(
                     )?;
                 } else {
                     log::error!("Tab index not found: {:?}", tab_index);
+                }
+                // Set affected pane ID for CLI client output - only if a tab took the pane, so
+                // that a plugin no tab would have is a miss rather than a reported id
+                if let Some(ref mut completion) = completion_tx {
+                    let plugin_pane_id = PaneId::Plugin(plugin_id);
+                    if screen.pane_exists(&plugin_pane_id) {
+                        completion.set_affected_pane_id(plugin_pane_id);
+                    } else {
+                        log::error!(
+                            "No tab took the new plugin pane {:?}, so it was not created",
+                            plugin_pane_id
+                        );
+                    }
                 }
                 if let Some(loading_indication) = plugin_loading_message_cache.remove(&plugin_id) {
                     screen.update_plugin_loading_stage(plugin_id, loading_indication);
@@ -11766,9 +11811,6 @@ pub(crate) fn screen_thread_main(
                 client_id_tab_index_or_pane_id,
                 mut completion_tx,
             ) => {
-                completion_tx
-                    .as_mut()
-                    .map(|c| c.set_affected_pane_id(new_pane_id));
                 screen.replace_pane(
                     new_pane_id,
                     hold_for_command,
@@ -11777,6 +11819,19 @@ pub(crate) fn screen_thread_main(
                     close_replaced_pane,
                     client_id_tab_index_or_pane_id,
                 )?;
+                // reported after the replacement, and only if it happened - `replace_pane` logs
+                // and returns when it cannot find the pane to replace, and a report written before
+                // it names a pane that does not exist
+                if let Some(completion) = completion_tx.as_mut() {
+                    if screen.pane_exists(&new_pane_id) {
+                        completion.set_affected_pane_id(new_pane_id);
+                    } else {
+                        log::error!(
+                            "No tab took the new pane {:?}, so it was not created",
+                            new_pane_id
+                        );
+                    }
+                }
 
                 screen.log_and_report_session_state()?;
             },

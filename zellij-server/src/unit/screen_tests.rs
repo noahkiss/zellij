@@ -14696,6 +14696,44 @@ pub fn a_non_blocking_pane_answers_as_soon_as_it_is_made() {
 }
 
 #[test]
+pub fn a_pane_no_tab_took_is_not_reported_as_made() {
+    // The pty is spawned before any tab has agreed to hold the pane, so the id in the instruction
+    // names a pty and not yet a pane. A tab that declines does it by dropping the pty rather than
+    // by failing, so the answer must be written after the placement and only for a pane that is
+    // really there - otherwise `new-pane` prints `pane_id:` and exits 0 for a pane that was never
+    // created, and the next command a script runs misses.
+    //
+    // A tab index nothing answers to is the deterministic refusal. In the wild it is an unsized
+    // tab on a session no client has attached to.
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(new_pane_id),
+        Some("sh".to_string()),
+        None, // hold_for_command
+        None, // invoked_with
+        NewPanePlacement::default(),
+        false, // start_suppressed
+        ClientTabIndexOrPaneId::TabIndex(99),
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+        false, // set_blocking
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a pane no tab took never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.affected_pane_id, None,
+        "the answer named a pane that no tab took"
+    );
+}
+
+#[test]
 pub fn an_unmet_unblock_condition_waits_for_the_pane_to_close() {
     // `--block-until-exit-success` on a command that fails: the condition is not met, so the wait
     // runs on until the pane itself goes away - and the status it answers with is still the
