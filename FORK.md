@@ -283,7 +283,7 @@ of what moved to get there.
 | `list-tabs` | every column, always. The gating flags stay accepted and do nothing |
 | `list-clients` | gains `TTY`, `SIZE` and `CURRENT` — the fields that were reachable only through `--json` |
 | `ls` | a table: `NAME STATUS CURRENT CLIENTS CREATED`. `-s` is untouched |
-| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2. `--no-focus` stays the existence probe, answering `id: <n>` |
+| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2 — including with nobody attached, where `go-to-tab` used to queue the switch for a tab that was never coming and exit 0. `--no-focus` stays the existence probe, answering `id: <n>` |
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
@@ -292,6 +292,7 @@ of what moved to get there.
 | `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
 | `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
+| `rename-tab --tab-id`, `edit-scrollback --pane-id`, `toggle-pane-borderless --pane-id` | a target nothing answers to exits 2 with `No tab with id 99` / `No pane answers to 'terminal_99'`, like every sibling. All three used to log the miss server-side and exit 0, which reads as a rename, an editor and a toggle that happened |
 | `query-tab-names` | gone. `list-tabs` answers it |
 
 ### What a verb does when you do not tell it what to act on

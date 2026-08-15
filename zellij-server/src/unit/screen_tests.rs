@@ -14485,6 +14485,133 @@ pub fn closing_a_pane_id_that_is_not_there_is_a_miss() {
 }
 
 #[test]
+pub fn renaming_a_tab_id_that_is_not_there_is_a_miss() {
+    // `close-tab --tab-id` and `undo-rename-tab --tab-id` both refuse an id no tab answers to.
+    // This one used to log and exit 0, which reads as a rename that happened.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::RenameTabById {
+            id: 99,
+            name: "nowhere".to_string(),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab with id 99"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn editing_the_scrollback_of_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::EditScrollbackByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss opens no editor and says so: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn toggling_the_borderlessness_of_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::TogglePaneBorderless {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss toggles nothing and says so: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_position_that_is_not_there_is_a_miss_with_nobody_attached() {
+    // the detached half of the same gap: with no client to move, the switch used to be queued for
+    // a tab that is never coming and the CLI exited 0. `go-to-tab-name` refuses in this state
+    // already. The check is asked before the client is looked for, so it answers either way.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::GoToTab(
+        99,
+        None, // nobody is attached
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a tab position nothing sits at never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab at position 99"),
+        "{:?}",
+        result.error_message
+    );
+}
+
+#[test]
 pub fn closing_a_tab_by_id_says_what_it_closed() {
     let size = Size {
         cols: 121,

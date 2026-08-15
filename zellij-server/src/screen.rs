@@ -10259,6 +10259,23 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::GoToTab(tab_index, client_id, mut completion_tx) => {
+                // a position nothing sits at is a miss, not a silent no-op: the report below would
+                // otherwise name the tab the client never left, and with nobody attached the
+                // switch would be queued for a tab that is never coming. `go-to-tab-name` refuses
+                // in both states already.
+                //
+                // Only asked once the tab list has settled - a pending tab may still be about to
+                // take that position, which is the same reason the switch itself waits for it
+                if pending_tab_ids.is_empty()
+                    && screen
+                        .get_tab_id_at_position(tab_index.saturating_sub(1) as usize)
+                        .is_none()
+                {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!("No tab at position {}", tab_index));
+                    }
+                    continue;
+                }
                 let client_id_to_switch = if client_id.is_none() {
                     None
                 } else if screen
@@ -10276,17 +10293,6 @@ pub(crate) fn screen_thread_main(
                     // the client focus, which should have happened before this instruction and not
                     // after)
                     Some(client_id) if pending_tab_ids.is_empty() => {
-                        // a position nothing sits at is a miss, not a silent no-op: without this
-                        // the report below would name the tab the client never left
-                        if screen
-                            .get_tab_id_at_position(tab_index.saturating_sub(1) as usize)
-                            .is_none()
-                        {
-                            if let Some(c) = completion_tx.as_mut() {
-                                c.set_error_message(format!("No tab at position {}", tab_index));
-                            }
-                            continue;
-                        }
                         let from = screen.tab_summary_for_client(client_id);
                         screen.go_to_tab(tab_index as usize, client_id)?;
                         screen.render(None)?;
@@ -11716,13 +11722,19 @@ pub(crate) fn screen_thread_main(
                     }
                 }
             },
-            ScreenInstruction::RenameTabWithId(tab_id, new_name, _completion_tx) => {
+            ScreenInstruction::RenameTabWithId(tab_id, new_name, mut completion_tx) => {
                 // Use get_tab_by_id_mut() helper method
                 if let Some(tab) = screen.get_tab_by_id_mut(tab_id) {
                     tab.name = String::from_utf8_lossy(&new_name).to_string();
                     screen.log_and_report_session_state()?;
                 } else {
+                    // an id no tab answers to is a miss, and the same one `close-tab --tab-id`
+                    // and `undo-rename-tab --tab-id` report. Silence here reads as a rename that
+                    // happened
                     log::error!("Failed to find tab with ID: {}", tab_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!("No tab with id {}", tab_id));
+                    }
                 }
             },
             ScreenInstruction::CloseTabWithId(tab_id, mut completion_tx) => {
@@ -12641,7 +12653,22 @@ pub(crate) fn screen_thread_main(
                 screen.change_floating_panes_coordinates(pane_ids_and_coordinates);
                 let _ = screen.render(None);
             },
-            ScreenInstruction::TogglePaneBorderless(pane_id, _completion_tx) => {
+            ScreenInstruction::TogglePaneBorderless(pane_id, mut completion_tx) => {
+                // an id no live pane answers to is a miss, not a silent no-op - the same answer
+                // `toggle-pane-pinned` and `toggle-pane-embed-or-floating` give
+                if !screen
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_pane_with_pid(&pane_id))
+                {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!(
+                            "No pane answers to '{}'",
+                            screen.pane_summary(pane_id)
+                        ));
+                    }
+                    continue;
+                }
                 screen.toggle_pane_borderless(pane_id);
                 let _ = screen.render(None);
             },
@@ -13165,9 +13192,25 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::EditScrollbackWithPaneId(pane_id, ansi, completion_tx) => {
+            ScreenInstruction::EditScrollbackWithPaneId(pane_id, ansi, mut completion_tx) => {
+                // asked before the loop, because the loop hands the notification to the tab that
+                // takes the pane. An id no live pane answers to is the same miss every other pane
+                // target reports; silence here reads as a scrollback editor that opened
+                if !screen
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_pane_with_pid(&pane_id))
+                {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!(
+                            "No pane answers to '{}'",
+                            screen.pane_summary(pane_id)
+                        ));
+                    }
+                    continue;
+                }
                 let all_tabs = screen.get_tabs_mut();
-                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
                         if ansi {
@@ -13177,12 +13220,8 @@ pub(crate) fn screen_thread_main(
                             tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx)
                                 .non_fatal();
                         }
-                        found = true;
                         break;
                     }
-                }
-                if !found {
-                    log::error!("Pane with id {:?} not found", pane_id);
                 }
                 screen.render(None)?;
             },
