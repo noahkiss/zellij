@@ -1339,6 +1339,7 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         let _ = std::fs::remove_file(&temporary);
         return Err(pin_write_error(target, &error));
     }
+    sync_pin_directory(&directory);
     // the source is re-`stat`ed rather than reusing `key`: the copy took time, and a source that
     // changed while it was being read must not be recorded under the identity it had before
     record_pin_source(
@@ -1591,8 +1592,15 @@ fn pin_directory(target: &Path) -> PathBuf {
     }
 }
 
-/// Fill the temp copy and make it executable BEFORE it takes the pinned path, so the file that
-/// appears there is complete and runnable from its first instant.
+/// Fill the temp copy, make it executable and get it ONTO THE DISK before it takes the pinned
+/// path, so the file that appears there is complete and runnable from its first instant.
+///
+/// The rename is atomic against other processes, which is a different guarantee from atomic
+/// against the power going out. `rename(2)` orders nothing: the directory entry can reach the disk
+/// while the 40 MB it points at is still in page cache, and the machine that comes back up then
+/// has a pinned path holding a short file. Nothing above could tell - the stamp beside it describes
+/// the SOURCE, and the source is intact - so a truncated pin would be judged current and executed
+/// on every start until somebody upgraded.
 #[cfg(unix)]
 fn write_pin_temp(source: &mut std::fs::File, temporary: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -1603,7 +1611,43 @@ fn write_pin_temp(source: &mut std::fs::File, temporary: &Path) -> Result<(), St
         .map_err(|e| format!("could not write {}: {}", temporary.display(), e))?;
     output
         .set_permissions(std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not make {} executable: {}", temporary.display(), e))
+        .map_err(|e| format!("could not make {} executable: {}", temporary.display(), e))?;
+    // after the mode, not before: this has to carry the permission bits down with the bytes
+    sync_pin_temp(&output, temporary)
+}
+
+/// Flush one finished temp copy to the disk, and REPORT IT WHEN IT FAILS.
+///
+/// Not best-effort. Everything else here treats a failure as one wasted copy, because the pinned
+/// path still holds a working binary. This one is different: a sync that failed is a copy that may
+/// not be on the disk, and the very next statement renames it over the only good binary there is.
+/// Refusing to rename costs a refresh; renaming anyway can cost the session.
+#[cfg(unix)]
+fn sync_pin_temp(output: &std::fs::File, temporary: &Path) -> Result<(), String> {
+    output.sync_all().map_err(|error| {
+        format!(
+            "could not flush {} to the disk: {}",
+            temporary.display(),
+            error
+        )
+    })
+}
+
+/// Flush the pin directory, so the renamed name is on the disk too.
+///
+/// The other half of the same problem, and the cheaper half: syncing the file puts 40 MB of bytes
+/// somewhere durable, and syncing the directory puts the NAME that reaches them there. Without it
+/// a crash can lose the rename and leave the old pin in place - which is a stale pin rather than a
+/// broken one, and no worse than never having refreshed.
+///
+/// Best-effort for exactly that reason, and because the rename has already happened by the time it
+/// is called: there is nothing left to refuse to do. Not every filesystem lets a directory be
+/// opened for `fsync` at all.
+#[cfg(unix)]
+fn sync_pin_directory(directory: &Path) {
+    if let Ok(handle) = std::fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
 }
 
 /// Why the pinned copy could not be written, saying what to do about the cause that is ordinary:
@@ -2890,6 +2934,58 @@ mod tests {
         ];
         let set = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
         assert_eq!(set, 0, "could not put the mtime back");
+    }
+
+    /// The temp copy is flushed to the disk before anything renames it over the pinned path, and a
+    /// flush that fails STOPS the refresh instead of renaming a file that may not be there.
+    ///
+    /// `fsync` on a character device is `EINVAL` on Linux, which is the only way to make the flush
+    /// fail without a filesystem that is coming apart. It also has to be asked of the flush on its
+    /// own: the whole of [`write_pin_temp`] cannot be pointed at `/dev/null`, because setting the
+    /// mode on it fails first for a user that does not own it.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_temp_copy_that_will_not_flush_is_a_refusal_and_not_a_warning() {
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("every unix has one");
+
+        let refused = sync_pin_temp(&sink, Path::new("/dev/null"));
+        assert!(
+            refused.is_err(),
+            "fsync on a character device stopped failing, so this no longer proves anything"
+        );
+        assert!(
+            refused.unwrap_err().contains("could not flush"),
+            "the refusal has to name what went wrong, or `session up` prints nothing useful"
+        );
+    }
+
+    /// And the ordinary path runs the flush and completes: same bytes, still executable.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_finished_copy_is_flushed_before_it_takes_the_pinned_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("pin-flush");
+        let contents = elf_with_build_id(&[0xab; 20], 4096);
+        let source = scratch.write("zellij", &contents);
+        let temporary = scratch.0.join(".zellij.pin.1.tmp");
+        let mut handle = std::fs::File::open(&source).unwrap();
+
+        assert_eq!(write_pin_temp(&mut handle, &temporary), Ok(()));
+        assert_eq!(std::fs::read(&temporary).unwrap(), contents);
+        let mode = std::fs::metadata(&temporary).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "the flush has to come after the mode, or it carries down the wrong metadata"
+        );
+
+        // the directory flush is the best-effort half: it must not panic, and it must not care
+        sync_pin_directory(&scratch.0);
+        sync_pin_directory(&scratch.0.join("no-such-directory"));
     }
 
     /// The stamp cannot answer for a source that will not read, and refusing to answer would leave

@@ -2056,6 +2056,17 @@ A refresh under a **running session** is allowed and does not disturb it. The re
 file in place under a name nobody holds, so the server keeps executing the build it started with
 until it is restarted, and the next start picks up the new copy.
 
+**The copy is flushed to the disk before the rename, and a flush that fails stops the refresh.**
+Atomic against other processes and atomic against the power going out are different guarantees, and
+`rename(2)` only gives the first. It orders nothing against the disk: the directory entry can land
+while the 40 MB it names is still in page cache, and the machine that comes back up has a pinned
+path holding a short file. Nothing above the pin could tell — the stamp beside it describes the
+SOURCE, which is intact — so a truncated pin would read as current and be executed at every start
+until somebody upgraded. So the temp file is `fsync`ed after its mode is set and before the rename,
+and the directory is `fsync`ed after it, which is what puts the new NAME on the disk. The file
+flush is the one operation here that is not best-effort: a copy that may not have reached the disk
+must not be renamed over the only working binary there is, and refusing costs a refresh.
+
 **The hash is cached against the source's identity, in `<pin>.source-key`.** Deciding not to copy
 still meant reading 40 MB to hash the source, on every `session up` — every minute, from the
 watchdog — and on every interactive launch. That was around 75 ms of each one, spent to learn that
