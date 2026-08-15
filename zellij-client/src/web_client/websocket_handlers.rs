@@ -352,7 +352,10 @@ fn control_payload_to_server_msg(
                 PaneId::Terminal(pane_id)
             };
             ClientToServerMsg::Action {
-                action: Action::FocusPaneByPaneId { pane_id },
+                action: Action::FocusPaneByPaneId {
+                    pane_id,
+                    no_focus: false,
+                },
                 terminal_id: None,
                 client_id: None,
                 is_cli_client: false,

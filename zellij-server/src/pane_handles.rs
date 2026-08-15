@@ -99,6 +99,14 @@ fn is_spoken_for(registry: &HashMap<String, Claim>, candidate: &str) -> bool {
     registry.contains_key(candidate)
 }
 
+/// Whether a live pane already answers to `handle`.
+///
+/// A reserved name counts as taken: a pane is coming back under it, and handing it to somebody else
+/// in the meantime would take the address away from the pane that had it first.
+pub fn is_live(handle: &str) -> bool {
+    is_spoken_for(&registry(), handle)
+}
+
 /// A handle held by a live pane, freed when that pane drops.
 #[derive(Debug)]
 pub struct HeldHandle(String);

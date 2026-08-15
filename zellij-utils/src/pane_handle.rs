@@ -88,29 +88,167 @@ fn random_index(len: usize) -> usize {
     (draw % len as u64) as usize
 }
 
-/// Whether `candidate` is shaped like a handle: two of this crate's words joined by a dash.
+/// The most words a handle can be made of, counting a numeric suffix as one.
+const MAX_HANDLE_WORDS: usize = 4;
+/// The most characters one of those words can be.
+const MAX_HANDLE_WORD_LEN: usize = 16;
+/// The most characters a whole handle can be.
 ///
-/// Shape only - it says nothing about whether a pane answers to it. Membership in the word lists
-/// is what keeps the target parser unambiguous: `sunny-otter` can only be a handle, and a string
-/// that merely looks two-worded is not mistaken for one.
+/// A handle is drawn on the pane frame and typed by hand, and both of those have opinions. The
+/// generated ones are well inside this; the bound is here for the chosen ones.
+pub const MAX_HANDLE_LEN: usize = 40;
+
+/// Whether `candidate` is shaped like a handle: lowercase words joined by dashes.
+///
+/// Shape only - it says nothing about whether a pane answers to it. This is what makes the target
+/// parser unambiguous, so the grammar is drawn to exclude the other forms a `--pane-id` takes:
+///
+/// - `terminal_7`, `plugin_2`: underscores are not in the grammar
+/// - a bare integer: a handle has at least one letter in it
+/// - a uuid: five dash-separated groups, and a handle is at most four words
+///
+/// It is a *grammar* rather than a word list because a handle can be chosen - `zellij action
+/// new-pane --handle build` - and the CLI has no way to know which names a session's panes were
+/// given. So a well-formed name that no pane answers to is a miss (exit 2) rather than malformed
+/// input (exit 1); only a string that is not a handle in any session is refused by the parser.
 pub fn is_handle_shaped(candidate: &str) -> bool {
-    let Some((adjective, noun)) = candidate.split_once(HANDLE_SEPARATOR) else {
-        return false;
-    };
-    // A suffixed fallback handle (`sunny-otter-2`) is still a handle; anything else after the
-    // noun is not, so a three-word string does not sneak through as one.
-    let noun = match noun.split_once(HANDLE_SEPARATOR) {
-        Some((noun, suffix)) if suffix.parse::<usize>().is_ok() => noun,
-        Some(_) => return false,
-        None => noun,
-    };
-    ADJECTIVES.contains(&adjective) && NOUNS.contains(&noun)
+    handle_grammar_error(candidate).is_none()
+}
+
+/// Why `candidate` is not shaped like a handle, in words a caller can print.
+///
+/// `None` means it is. This is [`is_handle_shaped`] with its reasons kept, for the one caller that
+/// has somebody to tell: whoever typed `--handle`.
+pub fn handle_grammar_error(candidate: &str) -> Option<String> {
+    let says = |reason: &str| Some(format!("'{}' is not a handle: {}", candidate, reason));
+    if candidate.is_empty() {
+        return says("a handle has at least one word in it");
+    }
+    if candidate.len() > MAX_HANDLE_LEN {
+        return says(&format!(
+            "a handle is at most {} characters",
+            MAX_HANDLE_LEN
+        ));
+    }
+    let words: Vec<&str> = candidate.split(HANDLE_SEPARATOR).collect();
+    if words.len() > MAX_HANDLE_WORDS {
+        return says(&format!(
+            "a handle is at most {} words joined by '{}'",
+            MAX_HANDLE_WORDS, HANDLE_SEPARATOR
+        ));
+    }
+    for word in &words {
+        if word.is_empty() {
+            return says("every word has to have something in it");
+        }
+        if word.len() > MAX_HANDLE_WORD_LEN {
+            return says(&format!(
+                "a word is at most {} characters",
+                MAX_HANDLE_WORD_LEN
+            ));
+        }
+        if !word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
+            return says("a handle is lowercase letters and digits, joined by dashes");
+        }
+    }
+    if !candidate.chars().any(|c| c.is_ascii_lowercase()) {
+        // digits alone are how a bare `--pane-id 7` is spelled, and it means terminal_7
+        return says("a handle has at least one letter in it, so a number stays a pane id");
+    }
+    None
+}
+
+/// Why `candidate` is not a handle somebody may choose, in words the caller can print.
+///
+/// `None` means it is one. Stricter than the grammar, on one point: a handle that starts with
+/// `terminal` or `plugin` is refused even though it parses, because `terminal-1` beside
+/// `terminal_1` is a name that will be typed wrong on the day it matters.
+pub fn chosen_handle_error(candidate: &str) -> Option<String> {
+    if let Some(reason) = handle_grammar_error(candidate) {
+        return Some(reason);
+    }
+    let first_word = candidate
+        .split(HANDLE_SEPARATOR)
+        .next()
+        .unwrap_or(candidate);
+    if first_word == "terminal" || first_word == "plugin" {
+        return Some(format!(
+            "'{}' is too close to the pane id '{}_1' to be a handle. Pick a name that cannot be \
+             read as an id.",
+            candidate, first_word
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_chosen_handle_is_words_a_person_would_pick() {
+        for chosen in [
+            "build",
+            "web",
+            "my-build",
+            "web-2",
+            "one-two-three-four",
+            "sunny-otter",
+        ] {
+            assert_eq!(chosen_handle_error(chosen), None, "refused: {}", chosen);
+            assert!(is_handle_shaped(chosen), "not handle-shaped: {}", chosen);
+        }
+    }
+
+    #[test]
+    fn a_chosen_handle_cannot_be_shaped_like_another_target_form() {
+        // the grammar exists to keep one flag able to take four forms: anything that could be read
+        // as an id or a uuid is not a handle
+        for (rejected, why) in [
+            ("terminal_1", "underscore"),
+            ("plugin_2", "underscore"),
+            ("7", "a bare number is terminal_7"),
+            ("2-3", "digits alone"),
+            ("e9b82dbd-0000-4000-8000-0000000000aa", "a uuid"),
+            ("e9b82dbd0000400080000000000000aa", "a uuid, undashed"),
+            ("Sunny-Otter", "uppercase"),
+            ("sunny otter", "a space"),
+            ("", "nothing at all"),
+            ("-otter", "an empty word"),
+            ("otter-", "an empty word"),
+            ("sunny--otter", "an empty word"),
+            ("one-two-three-four-five", "too many words"),
+            ("terminal-1", "too close to an id"),
+            ("plugin-inspector", "too close to an id"),
+        ] {
+            assert!(
+                chosen_handle_error(rejected).is_some(),
+                "should be refused ({}): {:?}",
+                why,
+                rejected
+            );
+        }
+    }
+
+    #[test]
+    fn a_handle_is_bounded_in_length() {
+        let too_long_word = "a".repeat(MAX_HANDLE_WORD_LEN + 1);
+        assert!(chosen_handle_error(&too_long_word).is_some());
+        let whole_thing = vec!["abcdefghijkl"; 4].join("-");
+        assert!(whole_thing.len() > MAX_HANDLE_LEN);
+        assert!(chosen_handle_error(&whole_thing).is_some());
+    }
+
+    #[test]
+    fn a_grammar_error_says_what_was_wrong_with_it() {
+        let message = handle_grammar_error("Sunny").expect("uppercase is not a handle");
+        assert!(message.contains("Sunny"), "got: {}", message);
+        assert!(message.contains("lowercase"), "got: {}", message);
+    }
 
     #[test]
     fn a_generated_handle_is_two_words_from_the_lists() {
@@ -223,23 +361,34 @@ mod tests {
     fn handle_shape_rejects_what_is_not_a_handle() {
         for not_a_handle in [
             "",
-            "otter",
-            "sunny",
             "terminal_1",
             "plugin_2",
             "3",
             "f1e5dce9-a073-4594-b270-41f002924a9b",
-            "sunny_otter",        // wrong separator
-            "sunny-walrus-otter", // three words: only a numeric suffix may follow the noun
-            "Sunny-Otter",        // handles are lowercase
-            "purple-otter",       // `purple` is not in the adjective list
-            "sunny-teapot",       // `teapot` is not in the noun list
+            "sunny_otter", // wrong separator
+            "Sunny-Otter", // handles are lowercase
         ] {
             assert!(
                 !is_handle_shaped(not_a_handle),
                 "should not read as a handle: {:?}",
                 not_a_handle
             );
+        }
+    }
+
+    #[test]
+    fn a_name_off_the_word_lists_is_still_a_handle() {
+        // the word lists are how handles are GENERATED, not what makes a string one. A chosen
+        // handle can be any word, and the parser cannot know which words a session's panes were
+        // given - so these are well-formed targets that no pane may answer to, which is a miss and
+        // not malformed input
+        for chosen in [
+            "otter",
+            "purple-otter",
+            "sunny-teapot",
+            "sunny-walrus-otter",
+        ] {
+            assert!(is_handle_shaped(chosen), "should be a handle: {}", chosen);
         }
     }
 

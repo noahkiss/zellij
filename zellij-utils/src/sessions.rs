@@ -361,14 +361,27 @@ fn probe_socket(_path: &std::path::Path) -> bool {
     false
 }
 
-pub fn print_sessions(
+/// One row of the `zellij ls` table, already stringified.
+///
+/// `CREATED` is last and is the only column that can hold spaces: a duration reads as "2days 3h"
+/// to a human, and putting it last keeps every other column reachable with a field split.
+pub struct SessionListRow {
+    pub name: String,
+    pub status: &'static str,
+    pub is_current: bool,
+    pub clients: String,
+    pub created: String,
+}
+
+pub const SESSION_LIST_HEADER: [&str; 5] = ["NAME", "STATUS", "CURRENT", "CLIENTS", "CREATED"];
+
+/// Build the table `zellij ls` prints, in the order it prints it.
+pub fn session_list_rows(
     mut sessions: Vec<(String, Duration, bool)>,
-    no_formatting: bool,
-    short: bool,
+    current_session: &str,
+    live_session_states: &BTreeMap<String, SessionInfo>,
     reverse: bool,
-) {
-    // (session_name, timestamp, is_dead)
-    let curr_session = envs::get_session_name().unwrap_or_else(|_| "".into());
+) -> Vec<SessionListRow> {
     sessions.sort_by(|a, b| {
         // the age is truncated to whole seconds, so sessions made in the same second tie. Break
         // the tie on the name, or the listing reorders itself between two runs
@@ -380,45 +393,94 @@ pub fn print_sessions(
         }
     });
     sessions
-        .iter()
-        .for_each(|(session_name, timestamp, is_dead)| {
-            if short {
-                // the name stays the first whitespace-separated field so `zellij ls -s` remains
-                // cut/awk-parseable, but a resurrectable session is no longer indistinguishable
-                // from a running one
-                if *is_dead {
-                    println!("{} (EXITED)", session_name);
-                } else {
-                    println!("{}", session_name);
-                }
-                return;
-            }
-            if no_formatting {
-                let suffix = if curr_session == *session_name {
-                    format!("(current)")
-                } else if *is_dead {
-                    format!("(EXITED - attach to resurrect)")
-                } else {
-                    String::new()
-                };
-                let timestamp = format!("[Created {} ago]", format_duration(*timestamp));
-                println!("{} {} {}", session_name, timestamp, suffix);
-            } else {
-                let formatted_session_name = format!("\u{1b}[32;1m{}\u{1b}[m", session_name);
-                let suffix = if curr_session == *session_name {
-                    format!("(current)")
-                } else if *is_dead {
-                    format!("(\u{1b}[31;1mEXITED\u{1b}[m - attach to resurrect)")
-                } else {
-                    String::new()
-                };
-                let timestamp = format!(
-                    "[Created \u{1b}[35;1m{}\u{1b}[m ago]",
-                    format_duration(*timestamp)
-                );
-                println!("{} {} {}", formatted_session_name, timestamp, suffix);
-            }
+        .into_iter()
+        .map(|(name, timestamp, is_dead)| SessionListRow {
+            status: if is_dead { "exited" } else { "live" },
+            is_current: name == current_session,
+            clients: live_session_states
+                .get(&name)
+                .map(|info| info.connected_clients.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            created: format_duration(timestamp).to_string(),
+            name,
         })
+        .collect()
+}
+
+pub fn print_sessions(
+    sessions: Vec<(String, Duration, bool)>,
+    no_formatting: bool,
+    short: bool,
+    reverse: bool,
+    live_session_states: &BTreeMap<String, SessionInfo>,
+) {
+    let curr_session = envs::get_session_name().unwrap_or_else(|_| "".into());
+    let rows = session_list_rows(sessions, &curr_session, live_session_states, reverse);
+    if short {
+        // the name stays the first whitespace-separated field so `zellij ls -s` remains
+        // cut/awk-parseable, but a resurrectable session is no longer indistinguishable
+        // from a running one
+        for row in &rows {
+            if row.status == "exited" {
+                println!("{} (EXITED)", row.name);
+            } else {
+                println!("{}", row.name);
+            }
+        }
+        return;
+    }
+    let mut widths: Vec<usize> = SESSION_LIST_HEADER.iter().map(|h| h.len()).collect();
+    let cells: Vec<[String; 5]> = rows
+        .iter()
+        .map(|row| {
+            [
+                row.name.clone(),
+                row.status.to_owned(),
+                row.is_current.to_string(),
+                row.clients.clone(),
+                row.created.clone(),
+            ]
+        })
+        .collect();
+    for cell_row in &cells {
+        for (i, cell) in cell_row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    // the columns are padded from the plain text and coloured afterwards, so a colour escape never
+    // counts toward a width. The last column is never padded, so no line ends in whitespace
+    let last = SESSION_LIST_HEADER.len() - 1;
+    let pad = move |text: &str, i: usize, widths: &[usize]| {
+        if i == last {
+            text.to_owned()
+        } else {
+            format!("{:width$}", text, width = widths[i])
+        }
+    };
+    println!(
+        "{}",
+        SESSION_LIST_HEADER
+            .iter()
+            .enumerate()
+            .map(|(i, header)| pad(header, i, &widths))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    for (row, cell_row) in rows.iter().zip(cells.iter()) {
+        let mut printed: Vec<String> = cell_row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| pad(cell, i, &widths))
+            .collect();
+        if !no_formatting {
+            printed[0] = format!("\u{1b}[32;1m{}\u{1b}[m", printed[0]);
+            if row.status == "exited" {
+                printed[1] = format!("\u{1b}[31;1m{}\u{1b}[m", printed[1]);
+            }
+            printed[4] = format!("\u{1b}[35;1m{}\u{1b}[m", printed[4]);
+        }
+        println!("{}", printed.join("  "));
+    }
 }
 
 pub fn print_sessions_with_index(sessions: Vec<String>) {
@@ -840,7 +902,16 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool, json: bool
                         serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
                     );
                 } else {
-                    print_sessions(sessions, no_formatting, short, reverse);
+                    let current_session = envs::get_session_name().unwrap_or_else(|_| "".into());
+                    let live_session_states =
+                        read_live_session_states_default_dirs(&current_session);
+                    print_sessions(
+                        sessions,
+                        no_formatting,
+                        short,
+                        reverse,
+                        &live_session_states,
+                    );
                 }
                 print_other_socket_dir_warning();
                 0
@@ -1393,6 +1464,46 @@ mod tests {
             session_list_entries(sessions.clone(), "", &BTreeMap::new(), reverse)
                 .into_iter()
                 .map(|e| e.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false), vec!["old", "new"]);
+        assert_eq!(names(true), vec!["new", "old"]);
+    }
+
+    #[test]
+    fn the_session_table_says_which_are_live_and_who_is_on_them() {
+        let mut states = BTreeMap::new();
+        states.insert("alive".to_string(), live(2, 3, 2));
+        let rows = session_list_rows(
+            vec![
+                ("alive".to_string(), Duration::from_secs(90), false),
+                ("gone".to_string(), Duration::from_secs(5), true),
+            ],
+            "alive",
+            &states,
+            false,
+        );
+        assert_eq!(rows[0].name, "alive");
+        assert_eq!(rows[0].status, "live");
+        assert!(rows[0].is_current);
+        assert_eq!(rows[0].clients, "2");
+        assert_eq!(rows[1].name, "gone");
+        assert_eq!(rows[1].status, "exited");
+        assert!(!rows[1].is_current);
+        // a dead session has no metadata to read, so the count is absent rather than zero
+        assert_eq!(rows[1].clients, "-");
+    }
+
+    #[test]
+    fn the_session_table_is_ordered_like_the_json_listing() {
+        let sessions = vec![
+            ("old".to_string(), Duration::from_secs(500), false),
+            ("new".to_string(), Duration::from_secs(5), false),
+        ];
+        let names = |reverse| {
+            session_list_rows(sessions.clone(), "", &BTreeMap::new(), reverse)
+                .into_iter()
+                .map(|row| row.name)
                 .collect::<Vec<_>>()
         };
         assert_eq!(names(false), vec!["old", "new"]);

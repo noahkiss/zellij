@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod cli;
+pub mod cli_surface;
 pub mod client_server_contract;
 pub mod consts;
 pub mod data;

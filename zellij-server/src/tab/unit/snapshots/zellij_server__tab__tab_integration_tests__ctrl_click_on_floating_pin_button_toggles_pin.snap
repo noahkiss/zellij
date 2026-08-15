@@ -7,7 +7,7 @@ expression: "format!(\"{}\", snapshot_after)"
 02 (C): │                                                                                                                       │
 03 (C): │                                                                                                                       │
 04 (C): │                                                                                                                       │
-05 (C): │                             ┌ Pane #2 ─────────────────────────── PIN [+] | active-ant ┐                              │
+05 (C): │                             ┌ Pane #2 ─────────────────────────── active-ant | PIN [+] ┐                              │
 06 (C): │                             │Pin toggle test                                           │                              │
 07 (C): │                             │                                                          │                              │
 08 (C): │                             │                                                          │                              │

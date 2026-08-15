@@ -8,9 +8,9 @@ mod session_doctor_macos;
 #[cfg(test)]
 mod tests;
 
-use clap::Parser;
 use zellij_utils::{
-    cli::{CliAction, CliArgs, Command, Sessions},
+    cli::{CliAction, Command, Sessions},
+    cli_surface::parse_cli_args,
     consts::{create_config_and_cache_folders, VERSION},
     data::UnblockCondition,
     envs,
@@ -24,7 +24,7 @@ use zellij_utils::{
 fn main() {
     configure_logger();
     create_config_and_cache_folders();
-    let opts = CliArgs::parse();
+    let opts = parse_cli_args();
 
     {
         let config = Config::try_from(&opts).ok();
@@ -60,6 +60,7 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
+            handle,
         })) = opts.command
         {
             let cwd = cwd.or_else(|| std::env::current_dir().ok());
@@ -101,6 +102,10 @@ fn main() {
                 block_until_exit_failure: false,
                 block_until_exit: false,
                 unblock_condition,
+                new_tab: None,
+                in_tab: None,
+                near: None,
+                handle,
                 near_current_pane,
                 no_focus,
                 borderless,
@@ -124,6 +129,7 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
+            handle,
         })) = opts.command
         {
             let cwd = None;
@@ -155,6 +161,10 @@ fn main() {
                 block_until_exit_failure: false,
                 block_until_exit: false,
                 unblock_condition,
+                new_tab: None,
+                in_tab: None,
+                near: None,
+                handle,
                 near_current_pane: false,
                 no_focus,
                 borderless,
@@ -180,6 +190,7 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
+            handle,
         })) = opts.command
         {
             let mut file = file;
@@ -206,6 +217,7 @@ fn main() {
                 no_focus,
                 borderless,
                 tab_id,
+                handle,
             };
             commands::send_action_to_session(command_cli_action, opts.session, config);
             std::process::exit(0);
@@ -264,9 +276,14 @@ fn main() {
         ref target_session,
         no_wait,
         wait_timeout,
+        yes,
     })) = opts.command
     {
-        commands::kill_session(target_session, KillWait::from_cli(no_wait, wait_timeout));
+        commands::kill_session(
+            target_session,
+            KillWait::from_cli(no_wait, wait_timeout),
+            yes,
+        );
     } else if let Some(Command::Sessions(Sessions::DeleteAllSessions {
         yes,
         force,
@@ -280,6 +297,7 @@ fn main() {
         force,
         no_wait,
         wait_timeout,
+        yes,
     })) = opts.command
     {
         commands::delete_session(
@@ -287,6 +305,7 @@ fn main() {
             force,
             KillWait::from_cli(no_wait, wait_timeout),
             &opts,
+            yes,
         );
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);

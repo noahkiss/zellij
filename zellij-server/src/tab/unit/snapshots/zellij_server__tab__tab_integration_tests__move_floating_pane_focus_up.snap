@@ -7,11 +7,11 @@ expression: snapshot
 02 (C): │ ┌ Pane #5 ───── SCROLL:  0/1 | PIN [ ] ┐                                                                              │
 03 (C): │ │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│                                                                              │
 04 (C): │ │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│ ┐                                                                            │
-05 (C): │ │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│E│─────────────────────── PIN [ ] | active-ant ┐                              │
+05 (C): │ │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│E│─────────────────────── active-ant | PIN [ ] ┐                              │
 06 (C): │ │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│E│                                             │                              │
-07 (C): │ └──────────────────────────────────────┘E│─────────── SCROLL:  0/1 | PIN [ ] | alert-ant ┐                            │
+07 (C): │ └──────────────────────────────────────┘E│─────────── alert-ant | SCROLL:  0/1 | PIN [ ] ┐                            │
 08 (C): │   │EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│                            │
-09 (C): │   └──────────────────────────────────────┘───────────── SCROLL:  0/1 | PIN [ ] | alive-ant ┐                          │
+09 (C): │   └──────────────────────────────────────┘───────────── alive-ant | SCROLL:  0/1 | PIN [ ] ┐                          │
 10 (C): │                             │ │E│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│                          │
 11 (C): │                             │ │E│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│                          │
 12 (C): │                             │ │E│EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE│                          │
