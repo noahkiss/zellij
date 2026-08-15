@@ -2552,6 +2552,17 @@ pub struct PaneInfo {
     /// id, a uuid.
     #[serde(default)]
     pub handle: String,
+    /// A short note somebody left on this pane, drawn on its frame. Empty when there is none.
+    ///
+    /// It describes the pane's live state - "waiting on review", "exit 7" - and is set either by
+    /// `zellij action set-pane-note` or by the server, which marks a pane whose command failed and
+    /// is being held open. It is not part of what the pane *is*, so it is not serialized into a
+    /// snapshot: a restored pane comes back without one.
+    #[serde(default)]
+    pub note: String,
+    /// The colour `note` is drawn in. Meaningless, and `info`, when there is no note.
+    #[serde(default)]
+    pub note_color: NoteColor,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -3135,6 +3146,43 @@ pub enum PaneSignal {
 impl Default for PaneSignal {
     fn default() -> Self {
         PaneSignal::Int
+    }
+}
+
+/// What a pane note means, which is also what colour it is drawn in.
+///
+/// A small closed set rather than a colour string: the note is drawn inside somebody else's theme,
+/// and a caller picking `#ff00ff` would be picking against a background it cannot see. These four
+/// are the meanings the theme already has colours for, so a note is legible in every theme.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteColor {
+    /// Something went wrong here. What the server marks a failed command pane with.
+    Error,
+    /// Something needs attention here, but nothing is broken.
+    Warn,
+    /// This pane is finished, and finished well.
+    Ok,
+    /// Neither good nor bad: the default, and what a note carries when nobody said.
+    #[default]
+    Info,
+}
+
+impl NoteColor {
+    /// The name the CLI takes and prints, which is the one this was parsed from.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoteColor::Error => "error",
+            NoteColor::Warn => "warn",
+            NoteColor::Ok => "ok",
+            NoteColor::Info => "info",
+        }
+    }
+}
+
+impl std::fmt::Display for NoteColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 

@@ -113,6 +113,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "set-pane-borderless",
             "set-pane-color",
             "set-pane-floating",
+            "set-pane-note",
             "set-pane-pinned",
             "set-sync-tab",
             "show-floating-panes",
@@ -188,7 +189,7 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action list-panes",
         shape: "table",
         keys: "TAB_ID TAB_POS TAB_NAME PANE_ID HANDLE TYPE TITLE COMMAND CWD FOCUSED FLOATING \
-               EXITED X Y ROWS COLS",
+               EXITED NOTE X Y ROWS COLS",
     },
     OutputSpec {
         command: "action list-tabs",
@@ -199,7 +200,7 @@ const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action list-tree",
         shape: "outline",
-        keys: "tab_id position name active / handle pane_id title command focused",
+        keys: "tab_id position name active / handle pane_id title command focused note",
     },
     // `waited_ms` on every wait; `exit_status` is `--for exit`'s line and `matched` is
     // `--for match`'s. A wait that missed prints nothing here at all
@@ -664,7 +665,7 @@ fn indent(text: &str, by: usize) -> String {
 const EXPECTED_LIST_TREE_RECORD: &str = concat!(
     "command: zellij action list-tree  group: read\n",
     "  about: List every tab with its panes nested beneath it\n",
-    "  prints: outline  keys: tab_id position name active / handle pane_id title command focused\n",
+    "  prints: outline  keys: tab_id position name active / handle pane_id title command focused note\n",
     "  arg: --json  type: flag  about: Output as JSON",
 );
 

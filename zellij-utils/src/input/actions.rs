@@ -7,8 +7,8 @@ use super::layout::{
 };
 use crate::cli::CliAction;
 use crate::data::{
-    CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
-    PaneId, PaneSignal, Resize, UnblockCondition,
+    CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, NoteColor,
+    OriginatingPlugin, PaneId, PaneSignal, Resize, UnblockCondition,
 };
 use crate::data::{FloatingPaneCoordinates, InputMode, PaneTarget};
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -564,6 +564,15 @@ pub enum Action {
     SetPaneHandle {
         pane_id: PaneId,
         handle: String,
+    },
+    /// Leaves a short note on a pane, or clears it with `None`.
+    ///
+    /// The note is live state - what is happening in the pane - rather than what the pane is, so
+    /// nothing serializes it. The server sets one itself on a command pane that failed and is
+    /// being held open.
+    SetPaneNote {
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
     },
     ListPanes {
         show_tab: bool,
@@ -2205,6 +2214,21 @@ impl Action {
             CliAction::Wait { .. } => {
                 Err("`wait` is run by the client, not sent as an action".into())
             },
+            CliAction::SetPaneNote {
+                pane_id,
+                note,
+                color,
+            } => {
+                let parsed_pane_id = resolve_pane_target(&pane_id)?;
+                Ok(vec![Action::SetPaneNote {
+                    pane_id: parsed_pane_id,
+                    // no text is the clear, and so is text that is only spaces: a note of blanks
+                    // would take room on the frame and say nothing
+                    note: note
+                        .filter(|note| !note.trim().is_empty())
+                        .map(|note| (note.trim().to_owned(), color)),
+                }])
+            },
             CliAction::SignalPane { pane_id, signal } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
@@ -2478,6 +2502,45 @@ mod tests {
     use crate::data::BareKey;
     use crate::data::KeyModifier;
     use std::path::PathBuf;
+
+    fn note_from_cli(
+        note: Option<&str>,
+        color: crate::data::NoteColor,
+    ) -> Option<(String, crate::data::NoteColor)> {
+        let actions = Action::actions_from_cli(
+            CliAction::SetPaneNote {
+                pane_id: "7".to_string(),
+                note: note.map(|note| note.to_string()),
+                color,
+            },
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .expect("a well-formed note reaches an action");
+        match &actions[0] {
+            Action::SetPaneNote { note, .. } => note.clone(),
+            other => panic!("Expected SetPaneNote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_note_with_no_text_clears_the_one_the_pane_had() {
+        use crate::data::NoteColor;
+        assert_eq!(
+            note_from_cli(Some("waiting on review"), NoteColor::Warn),
+            Some(("waiting on review".to_string(), NoteColor::Warn))
+        );
+        // no text is the clear, and so is text that is only spaces: a note of blanks would take
+        // room on the frame and say nothing
+        assert_eq!(note_from_cli(None, NoteColor::Info), None);
+        assert_eq!(note_from_cli(Some("   "), NoteColor::Error), None);
+        // the surrounding whitespace of a real note goes, and the note stays
+        assert_eq!(
+            note_from_cli(Some("  done  "), NoteColor::Ok),
+            Some(("done".to_string(), NoteColor::Ok))
+        );
+    }
 
     #[test]
     fn test_send_keys_single_key() {

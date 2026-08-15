@@ -1,4 +1,4 @@
-use crate::data::{Direction, InputMode, PaneSignal, Resize, UnblockCondition};
+use crate::data::{Direction, InputMode, NoteColor, PaneSignal, Resize, UnblockCondition};
 use crate::setup::Setup;
 use crate::{
     consts::{ZELLIJ_CONFIG_DIR_ENV, ZELLIJ_CONFIG_FILE_ENV},
@@ -1049,6 +1049,38 @@ pub enum CliAction {
         /// script has to ask for by name
         #[clap(short, long, value_parser, default_value = "300")]
         timeout: u64,
+    },
+    /// Leave a short note on a pane, or clear the one it has
+    ///
+    /// The note is drawn on the pane's frame, in the colour its meaning has in the theme. It is
+    /// how an agent says what it is doing with a pane to whoever is looking at the session:
+    ///
+    ///   zellij action set-pane-note build --color warn "waiting on review"
+    ///
+    ///   zellij action set-pane-note build            # no text clears it
+    ///
+    /// The server leaves one of these itself, coloured `error`, on a pane whose command failed and
+    /// is being held open - `exit 7`. Clearing it is yours to do, or it goes when the pane is
+    /// re-run.
+    ///
+    /// A note describes the pane right now, not what the pane is, so it is NOT saved into a
+    /// session snapshot: a restored pane comes back without one. `list-panes` and `list-tree`
+    /// print it.
+    SetPaneNote {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
+        #[clap(value_parser)]
+        pane_id: String,
+
+        /// The note. Leave it out to clear the pane's note. Long notes are cut to fit the frame,
+        /// which never gives up room the title or the handle needs
+        #[clap(value_parser)]
+        note: Option<String>,
+
+        /// What the note means, which is the colour it is drawn in
+        #[clap(long, value_enum, value_parser, default_value = "info")]
+        color: NoteColor,
     },
     /// Write raw bytes into a pane, as if they had been typed
     Write {

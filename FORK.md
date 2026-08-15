@@ -538,6 +538,46 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
 - A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
   counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
 
+### Pane notes
+
+```
+$ zellij action set-pane-note build --color warn "waiting on review"
+note: waiting on review
+color: warn
+
+$ zellij action set-pane-note build          # no text clears it
+note: -
+```
+
+A short line drawn on the pane's frame, saying what is happening in that pane. The handle answers
+"which pane is this"; the note answers "what is going on in it", which is the question a session
+full of agent-driven panes leaves a human asking.
+
+- **Four colours, named for what they mean** — `--color error|warn|ok|info`, `info` by default.
+  They are not colour values: the note is drawn inside whatever theme the reader is using, and each
+  name maps onto the colour that theme already picked for that meaning, so a note is legible in all
+  of them.
+- **The server leaves one itself.** A command pane whose command exits non-zero and is held open is
+  marked `exit 7`, in `error`. The frame already said `EXIT CODE: 7` while the pane was held, but
+  that line goes when the pane is scrolled or re-run, and nothing outside the server could read it
+  at all. The note is the durable mark, and `list-panes` prints it. It is cleared when the pane is
+  re-run, or by hand.
+- **`list-panes` has a `NOTE` column and `list-tree` a `note:` field**, both `error:exit 7` —
+  colour and words together, because the colour is the meaning and a table without it cannot tell a
+  pane that finished from one that failed. A pane with no note prints `-`.
+- **A note is not saved into a snapshot.** It describes the pane's live state, and a session
+  restored tomorrow would come back carrying yesterday's "waiting on review". A restored pane comes
+  back unmarked, deliberately, which is the opposite of what a handle does.
+
+On the frame it sits immediately left of the handle, and is the last element offered room:
+
+- The title takes what it needs, then the scroll and pin indications, then the handle, then the
+  note. A narrowing frame loses the note first.
+- **It is truncated where the handle is dropped**, with a `…`. Half an address reaches no pane;
+  half a sentence still says something.
+- A floating pane's pin checkbox still owns the right edge, for the same reason it always did — it
+  is a click target found by counting back from there.
+
 ### `list-tree`
 
 ```

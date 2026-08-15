@@ -42,9 +42,9 @@ use log::{debug, warn};
 use zellij_utils::data::{
     CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
     HostTerminalThemeMode, KeyWithModifier, LayoutInfo, LayoutWithError, ListPanesResponse,
-    ListTabsResponse, NewPanePlacement, PaneContents, PaneInfo, PaneListEntry, PaneManifest,
-    PaneRenderReport, PaneScrollbackResponse, PaneTarget, PluginPermission, RegexHighlight, Resize,
-    ResizeStrategy, SessionInfo, Styling, TabInfo, ThemeHue, WebSharing,
+    ListTabsResponse, NewPanePlacement, NoteColor, PaneContents, PaneInfo, PaneListEntry,
+    PaneManifest, PaneRenderReport, PaneScrollbackResponse, PaneTarget, PluginPermission,
+    RegexHighlight, Resize, ResizeStrategy, SessionInfo, Styling, TabInfo, ThemeHue, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::actions::Action;
@@ -774,6 +774,12 @@ pub enum ScreenInstruction {
         handle: String,
         response_channel: crossbeam::channel::Sender<Result<(), String>>,
     },
+    /// Leaves a short note on a pane's frame, or clears it with `None`.
+    SetPaneNote {
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
+        response_channel: crossbeam::channel::Sender<Result<Option<(String, NoteColor)>, String>>,
+    },
     ListTabs {
         client_id: ClientId,
         response_channel: crossbeam::channel::Sender<ListTabsResponse>,
@@ -1194,6 +1200,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ListPanes { .. } => ScreenContext::ListPanes,
             ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
             ScreenInstruction::SetPaneHandle { .. } => ScreenContext::SetPaneHandle,
+            ScreenInstruction::SetPaneNote { .. } => ScreenContext::SetPaneNote,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
@@ -5373,6 +5380,24 @@ impl Screen {
         Ok(())
     }
 
+    /// Leaves a note on a pane, or clears it, and says what the pane now carries.
+    ///
+    /// `Ok(None)` is a cleared note. A pane nothing answers to is `Err`, which the caller turns
+    /// into the fork's miss.
+    pub fn set_pane_note(
+        &mut self,
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
+    ) -> Result<Option<(String, NoteColor)>, String> {
+        let pane = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(pane_id))
+            .ok_or_else(|| format!("No pane answers to '{}'", pane_id))?;
+        pane.set_pane_note(note.clone());
+        Ok(note)
+    }
+
     pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
         let matches: Box<dyn Fn(&PaneInfo) -> bool> = match target {
             PaneTarget::Id(pane_id) => return Some((*pane_id).into()),
@@ -9228,6 +9253,14 @@ pub(crate) fn screen_thread_main(
                 response_channel,
             } => {
                 let _ = response_channel.send(screen.set_pane_handle(pane_id, &handle));
+                screen.render(None)?;
+            },
+            ScreenInstruction::SetPaneNote {
+                pane_id,
+                note,
+                response_channel,
+            } => {
+                let _ = response_channel.send(screen.set_pane_note(pane_id, note));
                 screen.render(None)?;
             },
             ScreenInstruction::ListTabs {

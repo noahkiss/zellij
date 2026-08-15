@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::time::{self, Instant};
 use uuid::Uuid;
 use vte;
-use zellij_utils::data::PaneContents;
+use zellij_utils::data::{NoteColor, PaneContents};
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::pane_size::Offset;
@@ -140,6 +140,8 @@ pub struct TerminalPane {
     restored_from: Option<String>,
     /// Given at creation and kept across a snapshot restore - see `Pane::pane_handle`
     handle: HeldHandle,
+    /// A short note about what is happening here - see `Pane::pane_note`
+    note: Option<(String, NoteColor)>,
     pub selectable: bool,
     pub geom: PaneGeom,
     pub geom_override: Option<PaneGeom>,
@@ -697,6 +699,13 @@ impl Pane for TerminalPane {
     fn set_pane_handle(&mut self, handle: &str) {
         self.handle = HeldHandle::claim(handle);
     }
+    fn pane_note(&self) -> Option<(String, NoteColor)> {
+        self.note.clone()
+    }
+    fn set_pane_note(&mut self, note: Option<(String, NoteColor)>) {
+        self.note = note;
+        self.set_should_render(true);
+    }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
             self.geom.rows.set_percent(p - percent);
@@ -1087,6 +1096,15 @@ impl Pane for TerminalPane {
     }
     fn hold(&mut self, exit_status: Option<i32>, is_first_run: bool, run_command: RunCommand) {
         self.invoked_with = Some(Run::Command(run_command.clone()));
+        // fork addition: a command that failed and is being held leaves its own note. The frame
+        // says "EXIT CODE: 7" while the pane is held, but that line goes when the pane is re-run
+        // or scrolled past, and nothing outside the server could read it at all - the note is the
+        // durable mark, and `list-panes` prints it
+        if let Some(status) = exit_status.filter(|status| *status != 0) {
+            if !is_first_run {
+                self.set_pane_note(Some((format!("exit {}", status), NoteColor::Error)));
+            }
+        }
         self.is_held = Some((exit_status, is_first_run, run_command));
         if let Some(notification_end) = self.notification_end.as_mut() {
             if let Some(exit_status) = exit_status {
@@ -1201,6 +1219,8 @@ impl Pane for TerminalPane {
         // is not in the right sort of state
         self.is_held.take().map(|(_, _, run_command)| {
             self.is_held = None;
+            // the failure mark describes the run that just ended, and this is a new one
+            self.note = None;
             self.grid.reset_terminal_state();
             self.set_should_render(true);
             self.remove_banner();
@@ -1403,6 +1423,7 @@ impl TerminalPane {
             uuid: Uuid::new_v4(),
             restored_from: None,
             handle: HeldHandle::claim_new(),
+            note: None,
             frame: HashMap::new(),
             content_offset: Offset::default(),
             pid,
@@ -1610,6 +1631,8 @@ impl TerminalPane {
     fn handle_held_run(&mut self) -> Option<AdjustedInput> {
         self.is_held.take().map(|(_, _, run_command)| {
             self.is_held = None;
+            // see `rerun`: the mark belongs to the run that ended, not to this one
+            self.note = None;
             self.grid.reset_terminal_state();
             self.set_should_render(true);
             self.remove_banner();
