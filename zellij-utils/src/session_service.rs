@@ -176,6 +176,53 @@ pub fn configured_pinned_exe(extras: Option<&SessionServiceOptions>) -> Option<P
     }
 }
 
+/// The binary an interactive launch should start the SERVER from, when `pin_exe` asks for one.
+///
+/// `pin_exe` was built for the generated service unit, and for a while that was the only thing it
+/// covered - so a session started by TYPING `zellij` ran a server from wherever the package manager
+/// had put the binary this week. On macOS that is the whole problem the pin exists to solve: TCC
+/// records a grant against a file, a package manager installs each release in its own versioned
+/// directory, and a server at a versioned path is a client the system has never seen before. Full
+/// Disk Access was therefore re-granted after every upgrade for every session not started by the
+/// launcher.
+///
+/// The SERVER is the process that matters - it owns the panes and opens the files, and the client
+/// that spawned it is gone from TCC's point of view - so only the server is redirected. What the
+/// user typed keeps running as the client, and `zellij --version` still answers for the binary on
+/// PATH.
+///
+/// Returns `None` whenever the current binary should be used, which is every case that is not a
+/// pinned copy holding THIS build: no `pin_exe`, already running from the pinned path, or a copy
+/// that could not be brought up to date. That last one matters more than it looks - a pinned copy
+/// of a different build is a server that would not speak to its client, so the fallback is not a
+/// nicety, it is the only correct answer.
+#[cfg(unix)]
+pub fn server_exe_for_interactive_launch(
+    extras: Option<&SessionServiceOptions>,
+) -> Option<PathBuf> {
+    use crate::session_lifecycle::install_pinned_exe;
+
+    let pinned = configured_pinned_exe(extras)?;
+    let current_exe = std::env::current_exe().ok()?;
+    if same_exe_path(&current_exe, &pinned) {
+        return None;
+    }
+    match install_pinned_exe(&current_exe, &pinned) {
+        Ok(outcome) => Some(outcome.path().to_path_buf()),
+        Err(reason) => {
+            // the ordinary cause is a pin directory this user cannot write; a server executing the
+            // copy no longer blocks it, because the refresh renames rather than writing in place
+            eprintln!(
+                "warning: `pin_exe` is set, but the pinned copy could not be brought up to date, \
+                 so this session's server runs from {}: {}",
+                current_exe.display(),
+                reason
+            );
+            None
+        },
+    }
+}
+
 /// The launchd label of the agent that keeps `session` up.
 ///
 /// One label per session name, because one label is one job: a fixed label would mean the second
@@ -2813,6 +2860,24 @@ mod tests {
             .data_dir()
             .to_path_buf();
         assert!(path.starts_with(data), "{}", path.display());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn no_pin_means_an_interactive_launch_starts_the_server_it_already_is() {
+        assert_eq!(server_exe_for_interactive_launch(None), None);
+        let options = SessionServiceOptions::default();
+        assert_eq!(server_exe_for_interactive_launch(Some(&options)), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_pin_that_names_the_running_binary_redirects_nothing() {
+        // the launcher's own server IS the pinned copy, and copying a file over itself would
+        // truncate the binary that is running
+        let mut options = SessionServiceOptions::default();
+        options.pin_exe = Some(PinnedExe::At(std::env::current_exe().unwrap()));
+        assert_eq!(server_exe_for_interactive_launch(Some(&options)), None);
     }
 
     #[test]
