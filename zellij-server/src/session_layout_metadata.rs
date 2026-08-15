@@ -206,11 +206,6 @@ impl SessionLayoutMetadata {
     /// is that a move between two tabs the layout left unnamed is not seen; the alternative -
     /// comparing against the default `Tab #n` names - calls every such session dirty forever.
     ///
-    /// Note the check is only reached today when the base layout defines no tabs of its own beyond
-    /// its template: `Layout::pane_count` adds the template's panes to the tabs' panes, so any
-    /// layout parsed from KDL with explicit tabs already fails the pane count comparison above and
-    /// `is_dirty` returns before this runs. This is the check the tab comparison would need, the
-    /// moment that count is made to mean what it says.
     fn tabs_diverge_from_base_layout(&self) -> bool {
         let base_tabs = &self.default_layout.tabs;
         if base_tabs.is_empty() {
@@ -1677,18 +1672,22 @@ mod tests {
             !meta.tabs_diverge_from_base_layout(),
             "the session is in the shape the layout describes"
         );
-        // the reason the comparison is read directly rather than through `is_dirty`:
-        // `Layout::pane_count` counts the template's panes on top of the tabs it already expanded
-        // them into, so this session - in exactly the shape of the layout that built it - already
-        // fails the pane count comparison and is dirty before its tabs are ever looked at
+        // this used to assert the opposite: `Layout::pane_count` counted the template's panes on
+        // top of the tabs it had already been expanded into, so a session in exactly the shape of
+        // the layout that built it failed the pane count comparison and was dirty before its tabs
+        // were ever looked at
         assert!(
-            meta.is_dirty(),
-            "a parsed layout counts its template twice, so nothing here is ever clean"
+            !meta.is_dirty(),
+            "a session in the shape of the layout that parsed it is clean"
         );
         meta.tabs.swap(0, 1);
         assert!(
             meta.tabs_diverge_from_base_layout(),
             "the tabs are no longer in the order the layout lists them"
+        );
+        assert!(
+            meta.is_dirty(),
+            "and `is_dirty` now reaches the tab comparison to see it"
         );
     }
 }

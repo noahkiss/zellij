@@ -2948,6 +2948,37 @@ layout recreates tabs in the order it lists them. `query-tab-names` read the sam
 which is worse than it sounds: it is the command you would reach for to check the order, and it
 confirmed the wrong one. Both now sort by position.
 
+### A layout's pane count is the panes it produces
+
+A session serializes itself to `session-layout.kdl` every minute so a dead server can be
+resurrected, and `is_dirty` decides whether that tick has anything to write: it compares the panes
+the session has against the panes its layout describes.
+
+`Layout::pane_count` answered that second question wrong. A layout carries tabs AND a template,
+and the template is what a tab is expanded FROM - the parser fills it in even for a layout that
+declares its own tabs. Counting both added the template's panes on top of the tabs they had
+already built, so a real layout file reported more panes than any session it could produce, and
+every session grown from one was dirty from the moment it started. One layout in daily use claimed
+40 panes for the 36-pane session it built.
+
+The count now branches the way the spawn loop branches: tabs if the layout has tabs, the template
+if it has none. Swap layouts are alternative arrangements of panes that already exist, so they
+still add nothing.
+
+Two things follow from a session finally being able to be clean.
+
+**A clean session stops rewriting the cache.** That is the point. It also makes the rest of
+`is_dirty` reachable: the checks after the pane count - the commands panes are running, and whether
+the tab list still matches the layout - never ran for a layout with tabs, because the count
+returned first every time.
+
+**A session that returns to its base shape rewrites it once more.** Opening a pane and closing it
+again leaves the session clean and the file on disk diverged, and nothing would ever overwrite it -
+the next resurrection would hand back the pane that was closed. The pty thread keeps one bool for
+this: a tick writes if the session is dirty OR if the tick before it was. The same bool starts
+`true`, so a session that never diverges from its layout still writes its base shape once instead
+of never being resurrectable.
+
 ### A tab bar in a tab you are not looking at
 
 Moving, renaming, adding or closing a tab left every *other* tab's tab-bar plugin drawing the old
