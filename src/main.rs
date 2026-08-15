@@ -1,4 +1,5 @@
 mod commands;
+mod mcp;
 mod session_commands;
 mod session_doctor_command;
 #[cfg(target_os = "linux")]
@@ -263,6 +264,10 @@ fn main() {
         commands::watch_session(session_name.clone(), opts);
     } else if let Some(Command::Sessions(Sessions::Snapshot(snapshot_cli))) = opts.command.clone() {
         commands::snapshot_command(snapshot_cli, opts);
+    } else if let Some(Command::Sessions(Sessions::Mcp { session })) = opts.command.clone() {
+        // the protocol owns stdout from here on, and the server never returns until the client
+        // goes away
+        std::process::exit(mcp::start(session));
     } else if let Some(Command::Sessions(Sessions::Session(session_cli))) = opts.command.clone() {
         session_commands::session_lifecycle_command(session_cli, opts);
     } else if let Some(Command::Sessions(Sessions::KillAllSessions {
