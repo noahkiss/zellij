@@ -796,6 +796,36 @@ pub(crate) fn subscribe_to_session(
             }
         },
     };
+    // `--pane-id` takes every form a pane answers to, here as everywhere else. The two id forms
+    // mean the same thing without asking anyone; a handle or a uuid names a pane only against the
+    // session's live panes, so it is resolved before the subscription goes out and the stream is
+    // opened on a pane id like it always was.
+    let mut subscribe_cli = subscribe_cli;
+    for target in subscribe_cli.pane_id.iter_mut() {
+        match target.parse::<PaneTarget>() {
+            // a string that names no pane in any form is malformed input: an error, exit 1
+            Err(malformed) => {
+                eprintln!("{}", malformed);
+                std::process::exit(1);
+            },
+            // an id form is the same pane in any session, so nothing is asked
+            Ok(PaneTarget::Id(_)) => continue,
+            Ok(_) => match zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                &session_name,
+                target,
+            ) {
+                Ok(pane_id) => *target = pane_id.to_string(),
+                // a well-formed target no live pane answers to is a miss, exit 2
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(2);
+                },
+            },
+        }
+    }
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     zellij_client::cli_client::start_subscribe_client(
         Box::new(os_input),

@@ -165,7 +165,9 @@ pub enum Command {
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]
 pub struct SubscribeCli {
-    /// Pane ID(s) to subscribe to (terminal_1, plugin_2, or a bare number like 1)
+    /// The pane(s) to subscribe to: terminal_1, plugin_2, a bare integer (3 means terminal_3), a
+    /// handle like sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of
+    /// them in its PANE_ID and HANDLE columns
     #[clap(
         short,
         long,
