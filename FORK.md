@@ -1322,6 +1322,30 @@ The exit is **2**: the session changed nothing the caller can address, so it sit
 bucket as every other miss (see [the CLI output convention](#the-cli-output-convention)). The stderr sentence says
 which door it came through.
 
+#### The miss has to be a real one
+
+Holding the client to a report makes a lost report indistinguishable from a pane that was never
+made, so a report the session wrote and the client never received now reads as a miss. That is what
+`new-pane --handle` did, about one call in ten: the pane was there in `list-panes` under a generated
+handle while the CLI said none had been made.
+
+Nothing about the pane was at fault. `--handle` is checked against the live panes before anything is
+created, and that check is a whole extra connection, made and closed immediately before the one that
+carries the `new-pane`. A client id is the lowest number not in use, so in a session nothing is
+attached to both connections are client 1 — and a route thread announced its client's removal twice,
+once as the client left and once as the thread ended. The first announcement freed the id, the next
+connection was given it, and the second announcement removed **that** connection's sender. Dropping
+a sender writes an `Exit { Disconnect }` down its socket, which the waiting client read as the
+answer to its `new-pane`.
+
+So a route thread now announces its client's removal exactly once, after its last act, and the id
+cannot be handed out while that thread can still reach it. The client also stops reading a
+disconnect as an empty report: it is a dropped connection, said out loud, and exits 1 — the command
+may well have run, and that is a different thing from a session that answered with nothing.
+
+The same preflight is made by `--in-tab` and by `--near`, and `zellij run`, `zellij edit` and
+`--plugin` all travel the same path, so all of them were exposed to it and all of them are covered.
+
 ### Session lifecycle: `zellij session up|down|restart`
 
 ```
