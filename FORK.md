@@ -405,6 +405,58 @@ does not survive that. A pipe carries it as it is, newlines and quotes included.
 - The read happens after the refusal above, so a `write-chars` with no `--pane-id` from outside a
   pane is refused without draining the pipe.
 
+### `wait`: blocking on a pane instead of polling it
+
+```
+$ zellij action wait build --for exit
+waited_ms: 41207
+exit_status: 0
+```
+
+The command a script writes instead of `send-keys`, `sleep 2`, `dump-screen`, look, `sleep 2` again.
+That loop is what every agent and every CI wrapper around this fork was writing, and it is wrong in
+both directions at once: too slow when the thing finished immediately, and too quick when it did
+not. `wait` blocks until the pane does what you named, and then says how long that took.
+
+Three conditions, and a `--timeout` on all of them:
+
+- **`--for exit`** — the pane's command ends. It prints `exit_status:`, and `-` where the pane
+  closed and took its status with it.
+- **`--for quiet`** — the pane produces nothing for `--quiet-ms`, 500 by default. What a shell
+  looks like when it has finished printing and is waiting for you again.
+- **`--for match --match <regex>`** — a line the pane delivers matches. Rust regex syntax,
+  unanchored.
+
+**The exit code is about the wait, not about the command.** Met is 0, whatever `exit_status` says;
+a timeout is 2, the fork's miss, and prints nothing on stdout; a regex that does not compile is 1.
+This is deliberately unlike `new-pane --block-until-exit`, which exits with the command's own
+status — that one made the pane and owns it, while `wait` is a question about somebody else's, and
+a script has to be able to tell "the tests failed" from "I never saw them finish". A pane that
+closes while a `--for quiet` or `--for match` is waiting is a miss too: the condition can no longer
+happen.
+
+**`--timeout` is 300 seconds unless you say otherwise, and `--timeout 0` waits forever.** A wait
+with no bound is a hang, and a script gets one only by asking for it in those words.
+
+What `--for match` can see is worth knowing before you write a pattern against it:
+
+- **It matches the rendered screen, line by line, not the byte stream.** A line the terminal wrapped
+  arrives as two lines, and a pattern spanning the wrap matches neither half. Anchor on a short
+  distinctive string — `test result:`, not the whole summary line.
+- **Lines already on screen when the wait began are the baseline**, and do not match. Only a line
+  the pane delivers afterwards does. Use `dump-screen` for what is already there.
+- **A line identical to one already on screen is not new.** Each render carries the whole viewport
+  rather than a delta, so "new" is worked out by comparing against the last one, and on a rendered
+  screen a prompt printed twice is the same line twice.
+
+`--for exit` is the one condition that is a poll rather than a subscription — every 250ms, and
+nothing about it reaches the protocol. The render stream reports a pane *closing*, and a command
+pane that ends is held open instead by default: same event to a script, no message at all on that
+stream. Asking the session is what covers both, and it covers a pane that closed outright as well.
+
+`wait` is in the `read` band. It changes nothing — the band says what a verb does to the session,
+not how long it takes — which is also why the [audit ring](#list-events) does not record it.
+
 ### Pane handles
 
 Every pane carries a two-word handle — `sunny-otter` — assigned when the pane is created and unique

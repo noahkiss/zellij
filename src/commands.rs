@@ -898,6 +898,50 @@ fn attach_with_cli_client(
         eprintln!("{}", message);
         std::process::exit(1);
     }
+    // `wait` never becomes an action the server runs. It is a question asked over and over, or a
+    // subscription read until something happens, and both of those are the client's to hold: the
+    // server would have to keep a caller alive across an unbounded stretch of time to do it here
+    if let zellij_utils::cli::CliAction::Wait {
+        pane_id,
+        wait_for,
+        pattern,
+        quiet_ms,
+        timeout,
+    } = &cli_action
+    {
+        let pane = match resolve_pane_target(pane_id) {
+            Ok(pane) => pane,
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            },
+        };
+        let condition = match wait_for {
+            zellij_utils::cli::WaitFor::Exit => zellij_client::cli_client::WaitCondition::Exit,
+            zellij_utils::cli::WaitFor::Quiet => {
+                zellij_client::cli_client::WaitCondition::Quiet(Duration::from_millis(*quiet_ms))
+            },
+            // clap requires `--match` for this mode, so an absent pattern here is unreachable
+            // rather than a case with a sensible answer. The wait compiles it and refuses one that
+            // is not a regex
+            zellij_utils::cli::WaitFor::Match => {
+                zellij_client::cli_client::WaitCondition::Match(pattern.clone().unwrap_or_default())
+            },
+        };
+        let exit_status = zellij_client::cli_client::start_wait_client(
+            &|| {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            },
+            session_name,
+            pane,
+            condition,
+            // `--timeout 0` is the caller asking, by name, for a wait that can hang
+            (*timeout > 0).then(|| Duration::from_secs(*timeout)),
+        );
+        std::process::exit(exit_status);
+    }
     // `--handle` is applied to the pane once it exists, by the client that gets the report. It is
     // checked against the live panes first, so a name that is already taken is an error before
     // anything is created rather than a pane that came out under a name nobody asked for

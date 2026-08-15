@@ -4,13 +4,16 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::process;
 use std::str::FromStr;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
 use crate::os_input_output::ClientOsApi;
+use regex::Regex;
 use uuid::Uuid;
 use zellij_utils::{
     cli::{SubscribeCli, SubscribeFormat},
-    data::PaneId,
+    data::{PaneId, PaneListEntry},
     errors::prelude::*,
     input::actions::Action,
     ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
@@ -493,6 +496,312 @@ fn add_timestamp(event: &mut serde_json::Value, timestamps: bool) {
     }
 }
 
+/// How often a `--for exit` wait asks the session about its pane.
+///
+/// The render stream says when a pane *closes*, and a command pane that ends is normally *held*
+/// open instead - same event to a script, no message at all on that stream. So this one condition
+/// is a poll rather than a subscription, and the interval is what a person can tolerate as latency
+/// on a build that just finished.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What one look at the session says about the pane a `--for exit` wait is watching.
+#[derive(Debug, PartialEq, Eq)]
+enum PaneState {
+    /// Still running: nothing to report yet.
+    Running,
+    /// The command ended and the pane is still there, holding its status.
+    Exited(Option<i32>),
+    /// The pane is not in the session any more. Whatever status it had went with it.
+    Gone,
+}
+
+/// The condition a wait blocks on, as the caller spelled it.
+///
+/// The pattern arrives as text rather than as a compiled regex so that the caller does not need the
+/// regex crate to ask a question about a pane; compiling it is the first thing the wait does, and a
+/// pattern that does not compile is an error before anything is subscribed to.
+pub enum WaitCondition {
+    Exit,
+    Quiet(Duration),
+    Match(String),
+}
+
+/// Reads `list-panes --json` for the one pane the wait is about.
+///
+/// A pane missing from the list is `Gone` rather than an error: a wait for an exit that ended in
+/// the pane closing got what it asked for.
+fn pane_state(panes_json: &str, pane: PaneId) -> Result<PaneState, String> {
+    let panes: Vec<PaneListEntry> =
+        serde_json::from_str(panes_json).map_err(|e| format!("Could not read the panes: {}", e))?;
+    let found = panes.iter().find(|entry| {
+        let info = &entry.pane_info;
+        match pane {
+            PaneId::Terminal(id) => !info.is_plugin && info.id == id,
+            PaneId::Plugin(id) => info.is_plugin && info.id == id,
+        }
+    });
+    Ok(match found {
+        None => PaneState::Gone,
+        Some(entry) if entry.pane_info.exited => PaneState::Exited(entry.pane_info.exit_status),
+        Some(_) => PaneState::Running,
+    })
+}
+
+/// The lines of a render update that were not on screen before it.
+///
+/// Each update carries the whole viewport rather than a delta, so "what is new" has to be worked
+/// out here. Membership rather than position is what survives a scroll: a line that moved up the
+/// screen is not new, and would otherwise match again on every render.
+///
+/// The cost of that choice is that a line identical to one already on screen is not new either. A
+/// prompt printed twice looks like the same line, because on the rendered screen it is.
+fn new_lines<'a>(previous: &[String], current: &'a [String]) -> Vec<&'a str> {
+    let seen: HashSet<&str> = previous.iter().map(|line| line.as_str()).collect();
+    current
+        .iter()
+        .map(|line| line.as_str())
+        .filter(|line| !seen.contains(line))
+        .collect()
+}
+
+/// The first of these lines the pattern matches, if any.
+fn first_match<'a>(pattern: &Regex, lines: &[&'a str]) -> Option<&'a str> {
+    lines.iter().copied().find(|line| pattern.is_match(line))
+}
+
+/// How long is left before a deadline, or `None` once it has passed.
+fn remaining(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(now))
+}
+
+/// The report a met wait prints: how long it took, and what it saw.
+fn wait_report(waited: Duration, found: Option<String>) -> Vec<String> {
+    let mut lines = vec![format!("waited_ms: {}", waited.as_millis())];
+    lines.extend(found);
+    lines
+}
+
+/// Blocks until the pane meets the condition, and reports what happened.
+///
+/// `make_os_input` is a factory rather than one connection because `--for exit` asks the session
+/// the same question repeatedly, and `ask` opens and closes a connection for each question.
+///
+/// Returns the process exit status: 0 met, 2 missed - a timeout, or a pane that closed while the
+/// wait was for something else - and 1 for a call that could not be carried out at all.
+pub fn start_wait_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    condition: WaitCondition,
+    timeout: Option<Duration>,
+) -> i32 {
+    let started = Instant::now();
+    let deadline = timeout.map(|timeout| started + timeout);
+    let outcome = match condition {
+        WaitCondition::Exit => wait_for_exit(make_os_input, session_name, pane, deadline),
+        WaitCondition::Quiet(window) => wait_on_renders(
+            make_os_input(),
+            session_name,
+            pane,
+            Watching::Quiet(window),
+            deadline,
+        ),
+        WaitCondition::Match(pattern) => match Regex::new(&pattern) {
+            Ok(pattern) => wait_on_renders(
+                make_os_input(),
+                session_name,
+                pane,
+                Watching::Match(pattern),
+                deadline,
+            ),
+            Err(e) => Err(WaitMiss::Failed(format!("`--match` is not a regex: {}", e))),
+        },
+    };
+    match outcome {
+        Ok(found) => {
+            for line in wait_report(started.elapsed(), found) {
+                println!("{}", line);
+            }
+            0
+        },
+        Err(WaitMiss::Missed(message)) => {
+            eprintln!("{}", message);
+            2
+        },
+        Err(WaitMiss::Failed(message)) => {
+            eprintln!("{}", message);
+            1
+        },
+    }
+}
+
+/// A wait that ended without its condition: the sentence to print, and which exit code it is.
+enum WaitMiss {
+    Missed(String),
+    Failed(String),
+}
+
+/// `--for exit`, asked of the session rather than of the render stream.
+fn wait_for_exit(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    deadline: Option<Instant>,
+) -> Result<Option<String>, WaitMiss> {
+    loop {
+        let lines = ask(
+            make_os_input(),
+            session_name,
+            Action::ListPanes {
+                show_tab: false,
+                show_command: false,
+                show_state: false,
+                show_geometry: false,
+                show_all: true,
+                output_json: true,
+            },
+            &pane.to_string(),
+        )
+        .map_err(WaitMiss::Failed)?;
+        match pane_state(&lines.join("\n"), pane).map_err(WaitMiss::Failed)? {
+            PaneState::Running => {},
+            // a pane that closed took its status with it, and `-` is how the fork's output says a
+            // field has no value rather than a value of nothing
+            PaneState::Gone => return Ok(Some("exit_status: -".to_owned())),
+            PaneState::Exited(status) => {
+                return Ok(Some(match status {
+                    Some(status) => format!("exit_status: {}", status),
+                    None => "exit_status: -".to_owned(),
+                }))
+            },
+        }
+        match remaining(deadline, Instant::now()) {
+            Some(left) if left.is_zero() => {
+                return Err(WaitMiss::Missed(format!(
+                    "{} was still running when the wait timed out.",
+                    pane
+                )))
+            },
+            Some(left) => std::thread::sleep(EXIT_POLL_INTERVAL.min(left)),
+            None => std::thread::sleep(EXIT_POLL_INTERVAL),
+        }
+    }
+}
+
+/// `--for quiet` and `--for match`, both of which are questions about output as it arrives.
+///
+/// The render stream is read on a thread so that the deadline is still reachable while nothing is
+/// arriving - `recv_from_server` blocks, and a pane that fell silent is exactly the case where it
+/// blocks longest.
+/// The two conditions the render stream can answer, ready to be tested.
+enum Watching {
+    Quiet(Duration),
+    Match(Regex),
+}
+
+fn wait_on_renders(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    watching: Watching,
+    deadline: Option<Instant>,
+) -> Result<Option<String>, WaitMiss> {
+    let zellij_ipc_pipe = socket_for(session_name).map_err(WaitMiss::Failed)?;
+    os_input.connect_to_server(&zellij_ipc_pipe);
+    os_input.send_to_server(ClientToServerMsg::SubscribeToPaneRenders {
+        pane_ids: vec![pane],
+        scrollback: None,
+        ansi: false,
+    });
+    let (sender, updates) = mpsc::channel();
+    let reader = os_input.box_clone();
+    std::thread::spawn(move || {
+        while let Some((message, _)) = reader.recv_from_server() {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+
+    // the viewport as it stood at the last update: the baseline new lines are measured against
+    let mut on_screen: Vec<String> = Vec::new();
+    // a pane that has said nothing yet is not quiet - it has not been watched long enough to know
+    let mut last_output = Instant::now();
+    let answer = loop {
+        let quiet_deadline = match watching {
+            Watching::Quiet(window) => Some(last_output + window),
+            _ => None,
+        };
+        let next = match (deadline, quiet_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let waited = match next {
+            Some(next) => updates.recv_timeout(next.saturating_duration_since(Instant::now())),
+            None => updates.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match waited {
+            Ok(ServerToClientMsg::PaneRenderUpdate {
+                viewport,
+                is_initial,
+                ..
+            }) => {
+                if !is_initial {
+                    if let Watching::Match(ref pattern) = watching {
+                        if let Some(line) = first_match(pattern, &new_lines(&on_screen, &viewport))
+                        {
+                            break Ok(Some(format!("matched: {}", line)));
+                        }
+                    }
+                }
+                last_output = Instant::now();
+                on_screen = viewport;
+            },
+            Ok(ServerToClientMsg::SubscribedPaneClosed { .. }) => {
+                break Err(WaitMiss::Missed(format!(
+                    "{} closed before the wait was satisfied.",
+                    pane
+                )))
+            },
+            Ok(ServerToClientMsg::LogError { lines }) => {
+                break Err(WaitMiss::Failed(lines.join("\n")))
+            },
+            Ok(ServerToClientMsg::Exit { .. }) => {
+                break Err(WaitMiss::Missed(
+                    "The session exited before the wait was satisfied.".to_owned(),
+                ))
+            },
+            Ok(_) => {},
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(WaitMiss::Failed(
+                    "The session stopped answering while the wait was running.".to_owned(),
+                ))
+            },
+            // the only timer that can be the one that fired, when the overall deadline has not
+            // arrived, is the quiet window
+            Err(RecvTimeoutError::Timeout) => {
+                let timed_out = remaining(deadline, Instant::now()) == Some(Duration::ZERO);
+                if timed_out {
+                    break Err(WaitMiss::Missed(format!("The wait on {} timed out.", pane)));
+                }
+                break Ok(None);
+            },
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    answer
+}
+
+/// The session's socket, which every client here opens the same way.
+fn socket_for(session_name: &str) -> Result<PathBuf, String> {
+    let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+    fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
+    zellij_utils::shared::set_permissions(&sock_dir, 0o700).map_err(|e| e.to_string())?;
+    sock_dir.push(session_name);
+    crate::check_ipc_pipe_length(&sock_dir);
+    Ok(sock_dir)
+}
+
 pub fn start_subscribe_client(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
@@ -689,6 +998,119 @@ mod tests {
         assert!(action_answers_with_its_own_report(&blocking_pane(Some(
             UnblockCondition::OnAnyExit
         ))));
+    }
+
+    /// A `list-panes --json` answer, built from the structs the server serializes rather than
+    /// written out by hand: a field added to `PaneInfo` must not break a test about exit status.
+    fn panes_json(entries: &[(u32, bool, bool, Option<i32>)]) -> String {
+        let entries: Vec<PaneListEntry> = entries
+            .iter()
+            .map(|(id, is_plugin, exited, exit_status)| PaneListEntry {
+                pane_info: zellij_utils::data::PaneInfo {
+                    id: *id,
+                    is_plugin: *is_plugin,
+                    exited: *exited,
+                    exit_status: *exit_status,
+                    ..Default::default()
+                },
+                tab_id: 0,
+                tab_position: 0,
+                tab_name: "tab".to_owned(),
+            })
+            .collect();
+        serde_json::to_string(&entries).unwrap()
+    }
+
+    #[test]
+    fn a_wait_for_exit_reads_the_pane_it_was_asked_about() {
+        let panes = panes_json(&[(1, false, false, None), (2, false, true, Some(7))]);
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(1)).unwrap(),
+            PaneState::Running
+        );
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(2)).unwrap(),
+            PaneState::Exited(Some(7))
+        );
+        // a pane that is not in the list is gone, which is an exit the wait was asking about and
+        // not an error
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(9)).unwrap(),
+            PaneState::Gone
+        );
+        // the id spaces do not run together: plugin_1 is not terminal_1
+        assert_eq!(
+            pane_state(&panes, PaneId::Plugin(1)).unwrap(),
+            PaneState::Gone
+        );
+    }
+
+    #[test]
+    fn a_pane_that_exited_without_a_status_says_so_rather_than_inventing_one() {
+        let panes = panes_json(&[(3, false, true, None)]);
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(3)).unwrap(),
+            PaneState::Exited(None)
+        );
+        // the negative control: an answer that is not a pane list is an error, not "gone"
+        assert!(pane_state("not json", PaneId::Terminal(3)).is_err());
+    }
+
+    #[test]
+    fn only_a_line_that_was_not_on_screen_is_new() {
+        let before = vec!["building".to_owned(), "linking".to_owned()];
+        let after = vec!["linking".to_owned(), "done".to_owned()];
+        assert_eq!(new_lines(&before, &after), vec!["done"]);
+        // a viewport that scrolled carries the same lines at different rows, and none of them is
+        // new - position would have said all of them were
+        let scrolled = vec!["linking".to_owned(), "building".to_owned()];
+        assert!(new_lines(&before, &scrolled).is_empty());
+        // the negative control: nothing changed, nothing is new
+        assert!(new_lines(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn a_match_is_tested_against_one_delivered_line_at_a_time() {
+        let pattern = Regex::new("test result:").unwrap();
+        assert_eq!(
+            first_match(&pattern, &["ok", "test result: ok. 12 passed"]),
+            Some("test result: ok. 12 passed")
+        );
+        // the negative control, and the limitation worth knowing: the terminal wrapped this line,
+        // so the two halves arrive as two lines and a pattern spanning the wrap matches neither
+        assert_eq!(first_match(&pattern, &["test resu", "lt: ok"]), None);
+    }
+
+    #[test]
+    fn a_wait_reports_how_long_it_waited_and_what_it_saw() {
+        assert_eq!(
+            wait_report(
+                Duration::from_millis(1500),
+                Some("exit_status: 0".to_owned())
+            ),
+            vec!["waited_ms: 1500".to_owned(), "exit_status: 0".to_owned()]
+        );
+        // `--for quiet` has nothing to show but the wait itself
+        assert_eq!(
+            wait_report(Duration::from_millis(80), None),
+            vec!["waited_ms: 80".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_wait_with_no_timeout_never_runs_out_of_time() {
+        let now = Instant::now();
+        // `--timeout 0` carries no deadline, and no amount of elapsed time turns into one
+        assert_eq!(remaining(None, now), None);
+        assert_eq!(
+            remaining(Some(now - Duration::from_secs(1)), now),
+            Some(Duration::ZERO),
+            "a deadline that has passed has nothing left, rather than wrapping"
+        );
+        assert_eq!(
+            remaining(Some(now + Duration::from_secs(5)), now),
+            Some(Duration::from_secs(5))
+        );
     }
 
     #[test]

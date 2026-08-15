@@ -977,8 +977,79 @@ pub enum SnapshotCli {
     },
 }
 
+/// The condition a `zellij action wait` blocks on.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitFor {
+    /// The pane's command ends, or the pane goes away.
+    Exit,
+    /// The pane stops producing output for `--quiet-ms`.
+    Quiet,
+    /// A line the pane delivers matches `--match`.
+    Match,
+}
+
+impl Default for WaitFor {
+    fn default() -> Self {
+        WaitFor::Exit
+    }
+}
+
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum CliAction {
+    /// Block until a pane does something, then say what it did
+    ///
+    /// This is the one command that replaces a poll loop. Instead of `send-keys`, `sleep 2`,
+    /// `dump-screen`, look, `sleep 2` again, a script says what it is waiting for and gets woken
+    /// when it happens.
+    ///
+    ///   zellij action wait build --for exit
+    ///
+    ///   zellij action wait build --for quiet --quiet-ms 2000
+    ///
+    ///   zellij action wait build --for match --match 'test result:'
+    ///
+    /// Exit 0 means the condition was met, and the report says how long it took. Exit 2 means it
+    /// was not - the timeout ran out, or the pane closed while waiting for something else - and
+    /// nothing is printed on stdout. Exit 1 is a malformed call, such as a regex that does not
+    /// compile.
+    ///
+    /// `--for exit` prints `exit_status:`, and the wait's OWN exit code stays 0 whatever that
+    /// status is. This is deliberately unlike `new-pane --block-until-exit`, which exits with the
+    /// command's status: that one owns the pane it made, while `wait` is a question about someone
+    /// else's pane, and a script has to be able to tell "the test failed" from "I never saw it
+    /// finish".
+    ///
+    /// What `--for match` sees is the rendered viewport, line by line, as the pane draws it - not
+    /// the byte stream. A line the terminal wrapped arrives as two lines, so a pattern spanning
+    /// the wrap never matches; anchor on a short distinctive string. Lines already on screen when
+    /// the wait began are the baseline and do not match: only a line the pane delivers afterwards
+    /// does. A line identical to one already on screen is not new, and is not matched either.
+    Wait {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
+        #[clap(value_parser)]
+        pane_id: String,
+
+        /// What to wait for: the pane's command to end, the pane to fall quiet, or a line to
+        /// match
+        #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
+        wait_for: WaitFor,
+
+        /// The regex a delivered line must match, for `--for match`. Rust regex syntax, unanchored
+        #[clap(long = "match", value_parser, required_if_eq("wait_for", "match"))]
+        pattern: Option<String>,
+
+        /// How long a pane must produce nothing to count as quiet, for `--for quiet`
+        #[clap(long, value_parser, default_value = "500")]
+        quiet_ms: u64,
+
+        /// Seconds to wait before giving up and exiting 2. `0` waits forever, which is a hang a
+        /// script has to ask for by name
+        #[clap(short, long, value_parser, default_value = "300")]
+        timeout: u64,
+    },
     /// Write raw bytes into a pane, as if they had been typed
     Write {
         /// The bytes, as space-separated decimal values (27 91 65 is Escape [ A)

@@ -2199,6 +2199,12 @@ impl Action {
             },
             CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
             CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
+            // `wait` is answered by the client, which holds the caller for as long as the wait
+            // lasts. It is intercepted before this, and reaching here means that interception was
+            // removed and the command would otherwise go quiet
+            CliAction::Wait { .. } => {
+                Err("`wait` is run by the client, not sent as an action".into())
+            },
             CliAction::SignalPane { pane_id, signal } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {

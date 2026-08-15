@@ -39,6 +39,9 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "list-panes",
             "list-tabs",
             "list-tree",
+            // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
+            // and this one changes nothing. It is also why the audit ring does not record it
+            "wait",
         ],
     },
     ActionGroup {
@@ -197,6 +200,19 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action list-tree",
         shape: "outline",
         keys: "tab_id position name active / handle pane_id title command focused",
+    },
+    // `waited_ms` on every wait; `exit_status` is `--for exit`'s line and `matched` is
+    // `--for match`'s. A wait that missed prints nothing here at all
+    OutputSpec {
+        command: "action wait",
+        shape: "record",
+        keys: "waited_ms exit_status matched",
+    },
+    OutputSpec {
+        command: "action set-pane-note",
+        shape: "record",
+        // a cleared note prints `note: -` alone: there is no colour left to report
+        keys: "note color",
     },
     OutputSpec {
         command: "action new-pane",
