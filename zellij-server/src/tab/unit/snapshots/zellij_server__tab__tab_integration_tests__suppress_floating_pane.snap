@@ -7,7 +7,7 @@ expression: snapshot
 02 (C): │                                                                                                                       │
 03 (C): │                                                                                                                       │
 04 (C): │                                                                                                                       │
-05 (C): │                             ┌ EDITING SCROLLBACK ───────────────── PIN [ ] | alert-ant ┐                              │
+05 (C): │                             ┌ EDITING SCROLLBACK ───────────────── alert-ant | PIN [ ] ┐                              │
 06 (C): │                             │                                                          │                              │
 07 (C): │                             │                                                          │                              │
 08 (C): │                             │                                                          │                              │

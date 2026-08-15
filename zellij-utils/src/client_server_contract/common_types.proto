@@ -299,6 +299,9 @@ message Action {
     SetSyncTabAction set_sync_tab = 166;
     ResolvePaneTargetAction resolve_pane_target = 167;
     ListTreeAction list_tree = 168;
+    SetPaneHandleAction set_pane_handle = 169;
+    SetPaneNoteAction set_pane_note = 170;
+    ListEventsAction list_events = 171;
   }
 }
 
@@ -389,7 +392,29 @@ message ListClientsAction {
 message ResolvePaneTargetAction {
   string target = 1;
 }
+message SetPaneHandleAction {
+  PaneId pane_id = 1;
+  string handle = 2;
+}
+// fork addition: the short note drawn on a pane's frame, and what it means
+enum NoteColor {
+  NOTE_COLOR_UNSPECIFIED = 0;
+  NOTE_COLOR_ERROR = 1;
+  NOTE_COLOR_WARN = 2;
+  NOTE_COLOR_OK = 3;
+  NOTE_COLOR_INFO = 4;
+}
+// an absent note is the clear: the pane is left carrying nothing
+message SetPaneNoteAction {
+  PaneId pane_id = 1;
+  optional string note = 2;
+  NoteColor color = 3;
+}
 message ListTreeAction {
+  bool output_json = 1;
+}
+// fork addition: the session's action ring
+message ListEventsAction {
   bool output_json = 1;
 }
 message ListPanesAction {
@@ -978,6 +1003,9 @@ message TiledPaneLayout {
   optional string pane_initial_contents = 13;
   optional string default_fg = 14;
   optional string default_bg = 15;
+  // fork addition: the handle a layout chose for this pane. `restored_from` is still absent on
+  // purpose - that is provenance the server assigns - but a handle IS something a layout declares
+  optional string pane_handle = 16;
   // NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
 }
 
@@ -996,6 +1024,8 @@ message FloatingPaneLayout {
   optional bool borderless = 12;
   optional string default_fg = 13;
   optional string default_bg = 14;
+  // fork addition: see TiledPaneLayout.pane_handle
+  optional string pane_handle = 15;
 }
 
 message SwapTiledLayout {
@@ -1298,7 +1328,11 @@ message CloseFocusByPaneIdAction { PaneId pane_id = 1; }
 message RenamePaneByPaneIdAction { PaneId pane_id = 1; bytes name = 2; }
 message UndoRenamePaneByPaneIdAction { PaneId pane_id = 1; }
 message TogglePanePinnedByPaneIdAction { PaneId pane_id = 1; }
-message FocusPaneByPaneIdAction { PaneId pane_id = 1; }
+message FocusPaneByPaneIdAction {
+  PaneId pane_id = 1;
+  // the existence probe: resolve the pane and report it, but leave focus where it is
+  bool no_focus = 2;
+}
 
 // Tab-targeting action messages
 message UndoRenameTabByTabIdAction { uint64 id = 1; }

@@ -74,14 +74,12 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             wait_timeout,
         } => {
             let name = resolve_session_name(session_name, &opts, true);
-            // the pre-restart shape is what a restart is almost always for, so restoring it is the
-            // default and --fresh is the deliberate exception, for picking up a layout edit
-            let restore = if fresh {
-                None
-            } else {
-                Some(restore.unwrap_or_else(|| "latest".to_owned()))
-            };
-            restart(&name, restore, wait_timeout, &opts);
+            restart(
+                &name,
+                restart_restore_target(fresh, restore),
+                wait_timeout,
+                &opts,
+            );
         },
         SessionLifecycleCli::Enable {
             session_name,
@@ -1067,6 +1065,20 @@ fn drop_configured_env(opts: &CliArgs) {
 /// group and SIGKILLed shortly after. The double fork plus `setsid` that daemonizes the server is
 /// reused here for the same reason it exists there.
 #[cfg(unix)]
+
+/// What a `session restart` comes back from.
+///
+/// The pre-restart shape is what a restart is almost always for - the process is the thing being
+/// replaced, not the layout - so a snapshot is restored by default and `--fresh` is the deliberate
+/// exception, for picking up a layout edit. Clap refuses the two together, so this never has to.
+fn restart_restore_target(fresh: bool, restore: Option<String>) -> Option<String> {
+    if fresh {
+        None
+    } else {
+        Some(restore.unwrap_or_else(|| "latest".to_owned()))
+    }
+}
+
 fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArgs) -> ! {
     use zellij_utils::consts::ZELLIJ_STATE_DIR;
 
@@ -1159,6 +1171,28 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_comes_back_from_the_newest_snapshot() {
+        assert_eq!(
+            restart_restore_target(false, None),
+            Some("latest".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_restart_can_be_told_which_snapshot() {
+        assert_eq!(
+            restart_restore_target(false, Some("abc123".to_owned())),
+            Some("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_fresh_restart_restores_nothing() {
+        // the negative control: --fresh is the only way back to the layout, and it stays that way
+        assert_eq!(restart_restore_target(true, None), None);
+    }
     use zellij_utils::session_lifecycle::UP_LOCK_TIMEOUT;
 
     /// The default `--wait-timeout` on `session restart`, read from the parser rather than copied,

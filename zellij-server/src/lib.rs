@@ -710,6 +710,18 @@ impl SessionState {
     pub fn client_ids(&self) -> Vec<ClientId> {
         self.clients.keys().copied().collect()
     }
+    /// The clients that have attached a terminal, and so have an input thread to unblock.
+    ///
+    /// A `zellij action` client is registered like any other but never attaches, so its entry has
+    /// no size and stays `None`. It has no input to unblock either: its action is answered by the
+    /// route thread serving it, in order, and a broadcast that reaches it first is read as that
+    /// answer and ends the command early.
+    pub fn attached_client_ids(&self) -> Vec<ClientId> {
+        self.clients
+            .iter()
+            .filter_map(|(client_id, attachment)| attachment.map(|_| *client_id))
+            .collect()
+    }
     pub fn watcher_client_ids(&self) -> Vec<ClientId> {
         self.watchers.keys().copied().collect()
     }
@@ -799,6 +811,27 @@ mod session_state_tests {
         let mut s = SessionState::new();
         s.clients.insert(id, None);
         s
+    }
+
+    #[test]
+    fn a_client_that_never_attached_is_not_one_to_unblock() {
+        // this is what keeps a `close-pane` report from being outrun: the pty thread broadcasts an
+        // unblock as a pane is torn down, and a `zellij action` client reads the first message it
+        // gets as the answer to its command. It is registered like any other client but never
+        // attaches, so it is not in `attached_client_ids` and the broadcast passes it by
+        let mut session_state = SessionState::new();
+        let cli_client = session_state.new_client();
+        let attached_client = session_state.new_client();
+        session_state.set_client_data(attached_client, Size { rows: 20, cols: 80 }, false);
+
+        assert_eq!(session_state.attached_client_ids(), vec![attached_client]);
+        let mut all = session_state.client_ids();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            vec![cli_client, attached_client],
+            "both are still clients: only the unblock treats them differently"
+        );
     }
 
     #[test]
@@ -1352,7 +1385,13 @@ pub fn start_server_impl(
                     .unwrap();
             },
             ServerInstruction::UnblockInputThread => {
-                let client_ids = session_state.read().unwrap().client_ids();
+                // attached clients only: this says "input is yours again", which is meaningless to
+                // a `zellij action` client and, worse, is read by it as the answer to the command
+                // it is waiting for. A pane or tab teardown broadcasts this from the pty thread
+                // while the route thread is still assembling that command's report, and whichever
+                // arrived first won - which is why `close-pane` printed `closed:` some of the time
+                // and, when the dying pane held the channel, none of the time
+                let client_ids = session_state.read().unwrap().attached_client_ids();
                 for client_id in client_ids {
                     send_to_client!(
                         client_id,

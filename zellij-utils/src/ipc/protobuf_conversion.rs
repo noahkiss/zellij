@@ -1169,6 +1169,7 @@ impl From<crate::input::actions::Action>
             LaunchOrFocusPluginAction,
             LaunchPluginAction,
             ListClientsAction,
+            ListEventsAction,
             ListPanesAction,
             ListTabsAction,
             ListTreeAction,
@@ -1239,6 +1240,8 @@ impl From<crate::input::actions::Action>
             SetPaneFloatingAction,
             SetPaneFrameStyleAction,
             SetPaneFullscreenAction,
+            SetPaneHandleAction,
+            SetPaneNoteAction,
             SetPanePinnedAction,
             SetSyncTabAction,
             ShowFloatingPanesAction,
@@ -1969,8 +1972,29 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::ResolvePaneTarget { target } => {
                 ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
             },
+            crate::input::actions::Action::SetPaneHandle { pane_id, handle } => {
+                ActionType::SetPaneHandle(SetPaneHandleAction {
+                    pane_id: Some(pane_id.into()),
+                    handle,
+                })
+            },
+            crate::input::actions::Action::SetPaneNote { pane_id, note } => {
+                let (note, color) = match note {
+                    Some((note, color)) => (Some(note), color),
+                    // an absent note is the clear, and the colour rides along unread
+                    None => (None, crate::data::NoteColor::Info),
+                };
+                ActionType::SetPaneNote(SetPaneNoteAction {
+                    pane_id: Some(pane_id.into()),
+                    note,
+                    color: note_color_to_proto_i32(color),
+                })
+            },
             crate::input::actions::Action::ListTree { output_json } => {
                 ActionType::ListTree(ListTreeAction { output_json })
+            },
+            crate::input::actions::Action::ListEvents { output_json } => {
+                ActionType::ListEvents(ListEventsAction { output_json })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -2160,9 +2184,10 @@ impl From<crate::input::actions::Action>
                     pane_id: Some(pane_id.into()),
                 })
             },
-            crate::input::actions::Action::FocusPaneByPaneId { pane_id } => {
+            crate::input::actions::Action::FocusPaneByPaneId { pane_id, no_focus } => {
                 ActionType::FocusPaneByPaneId(FocusPaneByPaneIdAction {
                     pane_id: Some(pane_id.into()),
+                    no_focus,
                 })
             },
             // Tab-targeting CLI-only variants
@@ -2923,7 +2948,27 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::ResolvePaneTarget(a) => {
                 Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
             },
+            ActionType::SetPaneHandle(a) => Ok(crate::input::actions::Action::SetPaneHandle {
+                pane_id: a
+                    .pane_id
+                    .ok_or_else(|| anyhow!("SetPaneHandle missing pane_id"))?
+                    .try_into()?,
+                handle: a.handle,
+            }),
+            ActionType::SetPaneNote(a) => Ok(crate::input::actions::Action::SetPaneNote {
+                pane_id: a
+                    .pane_id
+                    .ok_or_else(|| anyhow!("SetPaneNote missing pane_id"))?
+                    .try_into()?,
+                note: match a.note {
+                    Some(note) => Some((note, note_color_from_proto_i32(a.color)?)),
+                    None => None,
+                },
+            }),
             ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
+                output_json: a.output_json,
+            }),
+            ActionType::ListEvents(a) => Ok(crate::input::actions::Action::ListEvents {
                 output_json: a.output_json,
             }),
             ActionType::ListPanes(list_panes_action) => {
@@ -3186,6 +3231,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                         .pane_id
                         .ok_or_else(|| anyhow!("FocusPaneByPaneId missing pane_id"))?
                         .try_into()?,
+                    no_focus: a.no_focus,
                 })
             },
             // Tab-targeting CLI-only variants
@@ -4334,6 +4380,7 @@ impl From<crate::input::layout::TiledPaneLayout>
             pane_initial_contents: layout.pane_initial_contents,
             default_fg: layout.default_fg,
             default_bg: layout.default_bg,
+            pane_handle: layout.pane_handle,
         }
     }
 }
@@ -4357,6 +4404,7 @@ impl From<crate::input::layout::FloatingPaneLayout>
             borderless: layout.borderless,
             default_fg: layout.default_fg,
             default_bg: layout.default_bg,
+            pane_handle: layout.pane_handle,
         }
     }
 }
@@ -4756,9 +4804,11 @@ impl TryFrom<crate::client_server_contract::client_server_contract::TiledPaneLay
             // Not carried across this contract: `restored_from` is provenance the SERVER assigns
             // when it rebuilds a pane from a serialized session, never something a sender declares.
             restored_from: None,
-            // Not carried across this contract for the same reason as `restored_from`: a pane's
-            // handle is the server's to assign, never something a sender declares.
-            pane_handle: None,
+            // A handle IS something a sender declares - `handle "build"` on a pane in a layout -
+            // unlike `restored_from` above, which is provenance the server assigns. It used to be
+            // dropped here, so a layout sent over IPC came back with a generated name while the
+            // same layout restored from disk kept the chosen one.
+            pane_handle: layout.pane_handle,
             children_split_direction,
             name: layout.name,
             children: children?,
@@ -4798,9 +4848,11 @@ impl TryFrom<crate::client_server_contract::client_server_contract::FloatingPane
             // Not carried across this contract: `restored_from` is provenance the SERVER assigns
             // when it rebuilds a pane from a serialized session, never something a sender declares.
             restored_from: None,
-            // Not carried across this contract for the same reason as `restored_from`: a pane's
-            // handle is the server's to assign, never something a sender declares.
-            pane_handle: None,
+            // A handle IS something a sender declares - `handle "build"` on a pane in a layout -
+            // unlike `restored_from` above, which is provenance the server assigns. It used to be
+            // dropped here, so a layout sent over IPC came back with a generated name while the
+            // same layout restored from disk kept the chosen one.
+            pane_handle: layout.pane_handle,
             name: layout.name,
             height,
             width,
@@ -5057,6 +5109,29 @@ impl TryFrom<crate::client_server_contract::client_server_contract::RunPluginOrA
     }
 }
 
+/// A note's colour is what the note MEANS, so an unreadable one is a malformed message rather than
+/// a note that quietly changes meaning on the way across.
+fn note_color_to_proto_i32(color: crate::data::NoteColor) -> i32 {
+    use crate::client_server_contract::client_server_contract::NoteColor as ProtobufNoteColor;
+    match color {
+        crate::data::NoteColor::Error => ProtobufNoteColor::Error as i32,
+        crate::data::NoteColor::Warn => ProtobufNoteColor::Warn as i32,
+        crate::data::NoteColor::Ok => ProtobufNoteColor::Ok as i32,
+        crate::data::NoteColor::Info => ProtobufNoteColor::Info as i32,
+    }
+}
+
+fn note_color_from_proto_i32(color: i32) -> anyhow::Result<crate::data::NoteColor> {
+    use crate::client_server_contract::client_server_contract::NoteColor as ProtobufNoteColor;
+    match ProtobufNoteColor::try_from(color) {
+        Ok(ProtobufNoteColor::Error) => Ok(crate::data::NoteColor::Error),
+        Ok(ProtobufNoteColor::Warn) => Ok(crate::data::NoteColor::Warn),
+        Ok(ProtobufNoteColor::Ok) => Ok(crate::data::NoteColor::Ok),
+        Ok(ProtobufNoteColor::Info) => Ok(crate::data::NoteColor::Info),
+        _ => Err(anyhow::anyhow!("Unknown note colour: {}", color)),
+    }
+}
+
 /// `PaneSignal` never crosses as the unspecified variant: an unset field is a malformed message,
 /// not a default signal, because the default here would be one that kills something.
 fn pane_signal_to_proto_i32(signal: crate::data::PaneSignal) -> i32 {
@@ -5075,5 +5150,45 @@ fn pane_signal_from_proto_i32(signal: i32) -> anyhow::Result<crate::data::PaneSi
         Ok(ProtobufPaneSignal::Hup) => Ok(crate::data::PaneSignal::Hup),
         Ok(ProtobufPaneSignal::Kill) => Ok(crate::data::PaneSignal::Kill),
         _ => Err(anyhow::anyhow!("Unknown pane signal: {}", signal)),
+    }
+}
+
+#[cfg(test)]
+mod layout_handle_tests {
+    use crate::client_server_contract::client_server_contract as proto;
+    use crate::input::layout::{FloatingPaneLayout, TiledPaneLayout};
+
+    #[test]
+    fn a_layouts_chosen_handle_survives_the_trip_to_the_server() {
+        // `new-tab --layout` sends the layout over IPC, and the handle used to be dropped on the
+        // way in - so a layout that named a pane `alpha-pane` produced a generated name, while the
+        // same layout restored from disk (which takes no IPC hop) kept it
+        let mut tiled = TiledPaneLayout::default();
+        tiled.pane_handle = Some("alpha-pane".to_owned());
+        let crossed: TiledPaneLayout = proto::TiledPaneLayout::from(tiled).try_into().unwrap();
+        assert_eq!(crossed.pane_handle.as_deref(), Some("alpha-pane"));
+
+        let mut floating = FloatingPaneLayout::default();
+        floating.pane_handle = Some("beta-pane".to_owned());
+        let crossed: FloatingPaneLayout = proto::FloatingPaneLayout::from(floating)
+            .try_into()
+            .unwrap();
+        assert_eq!(crossed.pane_handle.as_deref(), Some("beta-pane"));
+    }
+
+    #[test]
+    fn a_layout_that_names_no_handle_still_names_none() {
+        // the negative control, and the one that says the pane names itself: an absent handle must
+        // not become an empty one, which is a name no pane can answer to
+        let crossed: TiledPaneLayout = proto::TiledPaneLayout::from(TiledPaneLayout::default())
+            .try_into()
+            .unwrap();
+        assert_eq!(crossed.pane_handle, None);
+        // `restored_from` is still deliberately dropped: that is provenance the server assigns,
+        // and a sender declaring it would be claiming a history it does not have
+        let mut tiled = TiledPaneLayout::default();
+        tiled.restored_from = Some("some-uuid".to_owned());
+        let crossed: TiledPaneLayout = proto::TiledPaneLayout::from(tiled).try_into().unwrap();
+        assert_eq!(crossed.restored_from, None);
     }
 }

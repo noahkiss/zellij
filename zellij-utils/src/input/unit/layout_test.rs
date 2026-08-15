@@ -2535,3 +2535,187 @@ fn tiled_pane_still_rejects_zero_percent() {
     let result = SplitSize::from_str("1%");
     assert!(result.is_ok());
 }
+
+/// The panes a server actually spawns for this layout, counted through the same public entry
+/// points the spawn loop uses (`zellij-server/src/lib.rs`, and `apply_layout` in
+/// `zellij-server/src/plugins/zellij_exports.rs`): one tab per `tabs()` entry, or a single tab
+/// from `new_tab()` when the layout declares none.
+///
+/// `Layout::pane_count` has to agree with this for every layout, because `is_dirty` compares it
+/// against the panes a running session reports.
+fn panes_the_server_would_spawn(layout: &Layout) -> usize {
+    let tabs = if layout.has_tabs() {
+        layout.tabs()
+    } else {
+        let (tiled_panes, floating_panes) = layout.new_tab();
+        vec![(None, tiled_panes, floating_panes)]
+    };
+    tabs.iter()
+        .map(|(_name, tiled_panes, floating_panes)| tiled_panes.pane_count() + floating_panes.len())
+        .sum()
+}
+
+#[test]
+fn pane_count_of_a_layout_with_tabs_over_a_template() {
+    // the shape of a real layout file: a default_tab_template every tab is expanded into. Two
+    // tabs, each a tab-bar pane over one terminal, is four panes - not the six it would be if the
+    // template were counted on top of the tabs it built.
+    let kdl_layout = r#"
+        layout {
+            default_tab_template {
+                pane size=1 borderless=true {
+                    plugin location="zellij:tab-bar"
+                }
+                children
+            }
+            tab name="console"
+            tab name="develop"
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert!(
+        layout.template.is_some(),
+        "the parser fills the template even for a layout that declares its own tabs - the case \
+         the count used to get wrong"
+    );
+    assert_eq!(layout.pane_count(), 4);
+    assert_eq!(layout.pane_count(), panes_the_server_would_spawn(&layout));
+}
+
+#[test]
+fn pane_count_grows_with_the_number_of_tabs() {
+    for tab_count in 1..=4 {
+        let tabs: String = (0..tab_count)
+            .map(|i| format!("tab name=\"tab{}\"\n", i))
+            .collect();
+        let kdl_layout = format!(
+            "layout {{\n\
+             default_tab_template {{\n\
+             pane size=1 borderless=true {{\n\
+             plugin location=\"zellij:tab-bar\"\n\
+             }}\n\
+             children\n\
+             }}\n\
+             {}\
+             }}",
+            tabs
+        );
+        let layout =
+            Layout::from_kdl(&kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+        assert_eq!(
+            layout.pane_count(),
+            tab_count * 2,
+            "{} tabs of two panes each",
+            tab_count
+        );
+        assert_eq!(layout.pane_count(), panes_the_server_would_spawn(&layout));
+    }
+}
+
+#[test]
+fn pane_count_of_a_layout_that_is_only_tabs() {
+    // no template of its own, so each tab is exactly what it declares
+    let kdl_layout = r#"
+        layout {
+            tab name="one" {
+                pane
+                pane
+            }
+            tab name="two" {
+                pane
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert_eq!(layout.pane_count(), 3);
+    assert_eq!(layout.pane_count(), panes_the_server_would_spawn(&layout));
+}
+
+#[test]
+fn pane_count_of_a_layout_that_is_only_a_template() {
+    // a layout with no tabs spawns one tab from its template, so the template is what is counted
+    let kdl_layout = r#"
+        layout {
+            pane
+            pane split_direction="vertical" {
+                pane
+                pane
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert!(
+        !layout.has_tabs(),
+        "this layout is a template, so the template is the thing that gets counted"
+    );
+    // three panes, not four: the split node is a container, and only its leaves become panes
+    assert_eq!(layout.pane_count(), 3);
+    assert_eq!(layout.pane_count(), panes_the_server_would_spawn(&layout));
+}
+
+#[test]
+fn pane_count_counts_floating_panes_once() {
+    let kdl_layout = r#"
+        layout {
+            tab name="one" {
+                pane
+                floating_panes {
+                    pane
+                    pane
+                }
+            }
+            tab name="two" {
+                pane
+            }
+        }
+    "#;
+    let layout = Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+    assert_eq!(layout.pane_count(), 4, "two tiled panes and two floating");
+    assert_eq!(layout.pane_count(), panes_the_server_would_spawn(&layout));
+}
+
+#[test]
+fn swap_layouts_add_no_panes_to_the_count() {
+    // a swap layout is an alternative ARRANGEMENT of the panes that already exist, so it must not
+    // change the count - otherwise every session with a swap layout is dirty forever
+    let base = r#"
+        layout {
+            tab name="one" {
+                pane
+                pane
+            }
+        }
+    "#;
+    let with_swaps = r#"
+        layout {
+            tab name="one" {
+                pane
+                pane
+            }
+            swap_tiled_layout name="vertical" {
+                tab {
+                    pane split_direction="vertical" {
+                        pane
+                        pane
+                    }
+                }
+            }
+            swap_floating_layout name="staggered" {
+                floating_panes
+            }
+        }
+    "#;
+    let base = Layout::from_kdl(base, Some("layout_file_name".into()), None, None).unwrap();
+    let with_swaps =
+        Layout::from_kdl(with_swaps, Some("layout_file_name".into()), None, None).unwrap();
+    assert!(
+        !with_swaps.swap_tiled_layouts.is_empty(),
+        "the swap layouts really parsed"
+    );
+    assert_eq!(with_swaps.pane_count(), 2);
+    assert_eq!(with_swaps.pane_count(), base.pane_count());
+    assert_eq!(
+        with_swaps.pane_count(),
+        panes_the_server_would_spawn(&with_swaps)
+    );
+}
