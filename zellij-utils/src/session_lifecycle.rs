@@ -1303,12 +1303,36 @@ impl PinOutcome {
 /// its source - signing it changes it deliberately - so a comparison of the two files would call a
 /// signed pin stale and copy over the signature on the next `session up`.
 ///
+/// That question is asked of a SHA-256 of the source, which is 40 MB of reading on a pass that
+/// nearly always concludes nothing has to be done. [`pin_hash_can_be_skipped`] is a cache in front
+/// of it, keyed on what the source looks like to `stat`. It is a cache and not an answer: it can
+/// only skip the hash, never supply one, and every case it is unsure about falls through to
+/// hashing.
+///
 /// A write that fails part-way leaves nothing behind: the temp file is removed and the pinned path
 /// still holds whatever it held before, which is a working binary rather than a short one.
+///
+/// **A source that IS the target is refused before any of that.** Once the launcher runs the pin,
+/// `session up` passes the pin as its own source - see `pin_this_build_at` - and there is nothing
+/// a copy could achieve. Allowed through, it does harm: a SIGNED pin fails the stamp comparison,
+/// because signing changed the very file the stamp was taken from, so the refresh copies the pin
+/// over itself AND rewrites the stamp to the signed copy's own hash. The next zellij run off
+/// `PATH` then reads its unchanged package binary as stale and copies it over the signature,
+/// taking every macOS grant with it. Nothing upstream of here can tell the two paths apart.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
+    if is_the_same_file(source, target) {
+        return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+    }
+    let key = source_identity(source);
+    if target.exists() && pin_hash_can_be_skipped(target, key.as_ref()) {
+        return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+    }
     let source_hash = sha256_of_file(source);
     if target.exists() && !pin_is_stale(source, target, source_hash.as_deref()) {
+        // the pin is current, but nothing here could say so without hashing 40 MB. Record what the
+        // source looked like while it was hashed, so the next pass answers from two `stat`s.
+        record_pin_source(target, source_hash.as_deref(), key.as_ref());
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let refreshing = target.exists();
@@ -1317,7 +1341,7 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     let mut input = std::fs::File::open(source)
         .map_err(|e| format!("could not read {}: {}", source.display(), e))?;
     // the same directory, or the rename would cross a filesystem and stop being a rename
-    let temporary = directory.join(format!(".zellij.pin.{}.tmp", std::process::id()));
+    let temporary = directory.join(format!("{}{}.tmp", pin_temp_prefix(), std::process::id()));
     if let Err(reason) = write_pin_temp(&mut input, &temporary) {
         let _ = std::fs::remove_file(&temporary);
         return Err(reason);
@@ -1326,7 +1350,14 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         let _ = std::fs::remove_file(&temporary);
         return Err(pin_write_error(target, &error));
     }
-    record_pin_source(target, source_hash.as_deref());
+    sync_pin_directory(&directory);
+    // `key` is reused rather than re-`stat`ing the source, and the pairing is the safety. The key
+    // exists to say "this hash was taken from a source that looked like THIS", so it has to name
+    // the source as it looked WHEN IT WAS HASHED. A source that changed while it was being read
+    // then leaves a key the next pass cannot match, which is a re-hash and a correction. A
+    // post-copy `stat` would instead file the OLD hash under the NEW identity - the next pass
+    // matches, skips the hash, and calls the pin current for as long as the source sits still.
+    record_pin_source(target, source_hash.as_deref(), key.as_ref());
     Ok(if refreshing {
         PinOutcome::Refreshed(target.to_path_buf())
     } else {
@@ -1354,6 +1385,133 @@ pub fn pin_source_stamp(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".source-sha256");
     pin_directory(target).join(name)
+}
+
+/// The file caching WHICH source the stamp's hash was taken from, as the source looked at the time.
+///
+/// A second file rather than a second line in the stamp, for two reasons. The stamp is the
+/// authority and this is a cache, and a reader that cannot tell them apart will eventually trust
+/// the wrong one. And the stamp's format is `<hash>\n` and is compared with `trim()`, so a build
+/// that predates this file reads a one-line stamp exactly as it always did - append a line and
+/// every older binary on the machine calls the pin stale and copies 40 MB to fix it.
+#[cfg(unix)]
+pub fn pin_source_key(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".source-key");
+    pin_directory(target).join(name)
+}
+
+/// What a source file looks like from the outside, cheaply.
+///
+/// Device and inode as well as size and mtime, because they cost nothing here and they close the
+/// commonest way the other three lie: a package manager that unpacks a new build over the old path
+/// writes a NEW file, and a new file has a new inode however carefully its mtime was preserved.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: u32,
+}
+
+#[cfg(unix)]
+impl SourceIdentity {
+    fn encode(&self) -> String {
+        format!(
+            "{} {} {} {} {}",
+            self.device, self.inode, self.size, self.modified_seconds, self.modified_nanoseconds
+        )
+    }
+
+    /// Anything that does not parse is no answer rather than a wrong one - the caller then hashes,
+    /// which is what it would have done without this file at all.
+    fn decode(fields: &[&str]) -> Option<SourceIdentity> {
+        let [device, inode, size, seconds, nanoseconds] = fields else {
+            return None;
+        };
+        Some(SourceIdentity {
+            device: device.parse().ok()?,
+            inode: inode.parse().ok()?,
+            size: size.parse().ok()?,
+            modified_seconds: seconds.parse().ok()?,
+            modified_nanoseconds: nanoseconds.parse().ok()?,
+        })
+    }
+}
+
+/// Whether two paths name one file, asked of the inode rather than of the spelling.
+///
+/// A symlink, a hard link and a second spelling of the same directory all reach the pin under a
+/// name that is not the pin's, and every one of them is still the pin.
+#[cfg(unix)]
+fn is_the_same_file(one: &Path, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(one), Ok(other)) = (std::fs::metadata(one), std::fs::metadata(other)) else {
+        return false;
+    };
+    one.dev() == other.dev() && one.ino() == other.ino()
+}
+
+#[cfg(unix)]
+fn source_identity(source: &Path) -> Option<SourceIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(source).ok()?;
+    Some(SourceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec() as u32,
+    })
+}
+
+/// Whether the 40 MB hash of the source can be skipped on this pass.
+///
+/// THIS IS A CACHE AND NOT THE ANSWER. The question the pin actually turns on is the one
+/// [`pin_is_stale`] asks - does the stamp name the hash of the source in front of us - and the
+/// recorded hash stays the only thing allowed to settle it. All this decides is whether the hash
+/// has to be TAKEN AGAIN, and it says yes to anything it is not certain about: no key file, a key
+/// file that does not parse, a key file recorded against a different stamp, a source that will not
+/// `stat`. Every one of those falls through to hashing, which is the behaviour that existed before
+/// this cache did.
+///
+/// It earns its place on the pass that does nothing, which is nearly every pass. `session up` runs
+/// from a watchdog every minute and an interactive launch runs it too, and hashing 40 MB to
+/// discover that nothing changed cost around 75 ms of every one of them.
+///
+/// **The blind spot, stated plainly.** A source rewritten in place, to the same size, with its
+/// mtime restored and its inode kept, is a source this returns `true` for - so the pin is left
+/// alone though its source now holds different bytes. Nothing short of hashing can see that, which
+/// is the trade. It needs a writer that preserves size, mtime and inode together: no package
+/// manager does, `install` and `cp` do not, and `cp -p` keeps the mtime but writes through a new
+/// file only when the target is unlinked first. The recovery is `zellij session doctor --fix` after
+/// removing the key file, or any change to the source that moves one of the five fields.
+#[cfg(unix)]
+fn pin_hash_can_be_skipped(target: &Path, key: Option<&SourceIdentity>) -> bool {
+    let Some(key) = key else {
+        return false;
+    };
+    let Ok(recorded) = std::fs::read_to_string(pin_source_key(target)) else {
+        return false;
+    };
+    let fields: Vec<&str> = recorded.split_whitespace().collect();
+    let Some((recorded_hash, recorded_identity)) = fields.split_first() else {
+        return false;
+    };
+    if SourceIdentity::decode(recorded_identity) != Some(*key) {
+        return false;
+    }
+    // the key names the hash it was recorded beside. A stamp rewritten by anything else - an older
+    // build, a hand-edit, the signing flow re-stamping the pin - leaves the two disagreeing, and a
+    // key that does not belong to the stamp in force is not allowed to speak for it.
+    match std::fs::read_to_string(pin_source_stamp(target)) {
+        Ok(stamped) => stamped.trim() == *recorded_hash,
+        Err(_) => false,
+    }
 }
 
 /// Whether the pinned copy has to be written again.
@@ -1389,16 +1547,36 @@ fn pin_is_stale(source: &Path, target: &Path, source_hash: Option<&str>) -> bool
 /// could not be written costs one needless 40 MB copy on the next pass rather than a failed
 /// `session up`. A partial write is self-correcting for the same reason - it cannot match, so the
 /// pin reads stale and is written again.
+///
+/// The stamp is written FIRST and the key second, and the order is the safety. A key naming a hash
+/// the stamp does not carry is ignored by [`pin_hash_can_be_skipped`], so a crash between the two
+/// writes costs one hash and never a wrong answer - where the reverse order would leave a key
+/// vouching for a stamp that was never written.
 #[cfg(unix)]
-fn record_pin_source(target: &Path, source_hash: Option<&str>) {
+fn record_pin_source(target: &Path, source_hash: Option<&str>, key: Option<&SourceIdentity>) {
     let stamp = pin_source_stamp(target);
+    let key_file = pin_source_key(target);
     match source_hash {
         Some(hash) => {
-            let _ = std::fs::write(stamp, format!("{}\n", hash));
+            if std::fs::write(stamp, format!("{}\n", hash)).is_err() {
+                // no stamp means no authority, and a cache for an authority that is not there is
+                // the one state that could outlive its stamp and be believed later
+                let _ = std::fs::remove_file(&key_file);
+                return;
+            }
+            match key {
+                Some(key) => {
+                    let _ = std::fs::write(key_file, format!("{} {}\n", hash, key.encode()));
+                },
+                None => {
+                    let _ = std::fs::remove_file(key_file);
+                },
+            }
         },
         // a stamp left over from an earlier pin would name a source this copy did not come from
         None => {
             let _ = std::fs::remove_file(stamp);
+            let _ = std::fs::remove_file(key_file);
         },
     }
 }
@@ -1432,15 +1610,152 @@ fn sha256_of_file(path: &Path) -> Option<String> {
 
 /// The directory the pinned copy lives in, for a target that may name no directory at all.
 #[cfg(unix)]
-fn pin_directory(target: &Path) -> PathBuf {
+pub fn pin_directory(target: &Path) -> PathBuf {
     match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
 }
 
-/// Fill the temp copy and make it executable BEFORE it takes the pinned path, so the file that
-/// appears there is complete and runnable from its first instant.
+/// The name a half-finished refresh leaves behind in the pin directory.
+///
+/// Its own prefix, distinct from the signing flow's `.zellij.sign.`, so that sweeping one never
+/// removes the other. Both live in the pin's directory because a rename has to stay inside one
+/// filesystem.
+#[cfg(unix)]
+pub fn pin_temp_prefix() -> &'static str {
+    ".zellij.pin."
+}
+
+/// How long an abandoned pin temp has to have sat there before anything removes it.
+///
+/// An hour, which is far longer than the copy it belongs to could possibly take, and short enough
+/// that a `session doctor` run the day after a crash still finds it. The number is not load-bearing
+/// - the pid check below is what makes the sweep safe - it is the second belt.
+#[cfg(unix)]
+pub const PIN_TEMP_MINIMUM_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The abandoned temp copies in a pin directory: 40 MB each, and nothing else ever removes them.
+///
+/// A refresh writes `.zellij.pin.<pid>.tmp` and renames it. Killed with `SIGKILL` between the two -
+/// an OOM kill, a reboot, a power cut - it leaves the temp file behind for good, and the next
+/// refresh writes a new one under a new pid rather than reusing it.
+///
+/// **Two gates, and the pid one is the important one.** A temp file whose pid is still running
+/// belongs to a refresh that is still going, and removing it would make that refresh rename a name
+/// nothing holds. `kill(pid, 0)` answers that: `EPERM` counts as alive, because a pid this user may
+/// not signal is still a pid in use. The age gate is the second belt, for a fresh temp being
+/// written by a process that has not been observed yet, and for a clock or a filesystem that makes
+/// the mtime unreadable.
+///
+/// Neither gate covers pid reuse, and the age gate is not the one that would. A pid recycled onto
+/// an unrelated LIVE process makes `kill(pid, 0)` say yes however old the file is, so that temp is
+/// kept for good - which is the safe direction, and is why the sweep is a reclamation and not a
+/// guarantee.
+///
+/// **Deliberately not called from [`install_pinned_exe`].** That runs before anything takes a lock,
+/// on every `session up` and every interactive launch, so two of them overlap routinely - and a
+/// sweep there would be one refresh deleting another's temp file mid-copy. Sweeping belongs to
+/// `session doctor`, which the user runs on purpose, one at a time.
+#[cfg(unix)]
+pub fn stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Vec<PathBuf> {
+    stale_temps(directory, pin_temp_prefix(), minimum_age)
+}
+
+/// The same two gates, for any `<prefix><pid>.tmp` written beside the pin.
+///
+/// The pin's refresh is not the only thing that writes one: the macOS signing flow copies the pin
+/// to `.zellij.sign.<pid>.tmp`, signs the copy and renames it, and it is abandoned by exactly the
+/// same accidents. Both prefixes therefore ask the same question here rather than each keeping its
+/// own answer - see [`crate::session_signing::sweep_stale_temps`], which used to remove every
+/// `.zellij.sign.*.tmp` it found, including the one a concurrent run was signing into.
+#[cfg(unix)]
+pub fn stale_temps(
+    directory: &Path,
+    prefix: &str,
+    minimum_age: std::time::Duration,
+) -> Vec<PathBuf> {
+    let now = std::time::SystemTime::now();
+    let mut abandoned: Vec<PathBuf> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let Some(pid) = name
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+            else {
+                return false;
+            };
+            // a name shaped like ours but not written by us is not ours to remove
+            let Ok(pid) = pid.parse::<i32>() else {
+                return false;
+            };
+            if process_is_running(pid) {
+                return false;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                return false;
+            };
+            metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= minimum_age)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    abandoned.sort();
+    abandoned
+}
+
+/// Remove what [`stale_pin_temps`] found, reporting only what actually went.
+#[cfg(unix)]
+pub fn sweep_stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Vec<PathBuf> {
+    sweep_stale_temps(directory, pin_temp_prefix(), minimum_age)
+}
+
+/// Remove what [`stale_temps`] found under one prefix, reporting only what actually went.
+#[cfg(unix)]
+pub fn sweep_stale_temps(
+    directory: &Path,
+    prefix: &str,
+    minimum_age: std::time::Duration,
+) -> Vec<PathBuf> {
+    stale_temps(directory, prefix, minimum_age)
+        .into_iter()
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
+}
+
+/// Whether a pid is in use, asked the only way that is portable across unix.
+///
+/// Signal 0 is the "check, do not send" signal. `EPERM` means a process is there and belongs to
+/// somebody else, which for this purpose is the same answer as yes.
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Fill the temp copy, make it executable and get it ONTO THE DISK before it takes the pinned
+/// path, so the file that appears there is complete and runnable from its first instant.
+///
+/// The rename is atomic against other processes, which is a different guarantee from atomic
+/// against the power going out. `rename(2)` orders nothing: the directory entry can reach the disk
+/// while the 40 MB it points at is still in page cache, and the machine that comes back up then
+/// has a pinned path holding a short file. Nothing above could tell - the stamp beside it describes
+/// the SOURCE, and the source is intact - so a truncated pin would be judged current and executed
+/// on every start until somebody upgraded.
 #[cfg(unix)]
 fn write_pin_temp(source: &mut std::fs::File, temporary: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -1451,7 +1766,43 @@ fn write_pin_temp(source: &mut std::fs::File, temporary: &Path) -> Result<(), St
         .map_err(|e| format!("could not write {}: {}", temporary.display(), e))?;
     output
         .set_permissions(std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not make {} executable: {}", temporary.display(), e))
+        .map_err(|e| format!("could not make {} executable: {}", temporary.display(), e))?;
+    // after the mode, not before: this has to carry the permission bits down with the bytes
+    sync_pin_temp(&output, temporary)
+}
+
+/// Flush one finished temp copy to the disk, and REPORT IT WHEN IT FAILS.
+///
+/// Not best-effort. Everything else here treats a failure as one wasted copy, because the pinned
+/// path still holds a working binary. This one is different: a sync that failed is a copy that may
+/// not be on the disk, and the very next statement renames it over the only good binary there is.
+/// Refusing to rename costs a refresh; renaming anyway can cost the session.
+#[cfg(unix)]
+fn sync_pin_temp(output: &std::fs::File, temporary: &Path) -> Result<(), String> {
+    output.sync_all().map_err(|error| {
+        format!(
+            "could not flush {} to the disk: {}",
+            temporary.display(),
+            error
+        )
+    })
+}
+
+/// Flush the pin directory, so the renamed name is on the disk too.
+///
+/// The other half of the same problem, and the cheaper half: syncing the file puts 40 MB of bytes
+/// somewhere durable, and syncing the directory puts the NAME that reaches them there. Without it
+/// a crash can lose the rename and leave the old pin in place - which is a stale pin rather than a
+/// broken one, and no worse than never having refreshed.
+///
+/// Best-effort for exactly that reason, and because the rename has already happened by the time it
+/// is called: there is nothing left to refuse to do. Not every filesystem lets a directory be
+/// opened for `fsync` at all.
+#[cfg(unix)]
+fn sync_pin_directory(directory: &Path) {
+    if let Ok(handle) = std::fs::File::open(directory) {
+        let _ = handle.sync_all();
+    }
 }
 
 /// Why the pinned copy could not be written, saying what to do about the cause that is ordinary:
@@ -2531,6 +2882,477 @@ mod tests {
         );
     }
 
+    /// The point of the key file. The pass that finds nothing to do is nearly every pass, and it
+    /// used to hash 40 MB of source to reach that conclusion.
+    ///
+    /// Proved by making the hash IMPOSSIBLE to take while leaving the five recorded fields exactly
+    /// where they were: the source is chmod-ed unreadable, which moves its ctime and nothing the
+    /// key looks at. A pass that reaches the hash gets `None` from it, falls through to
+    /// [`compare_builds`], finds a pin that is bigger than its source - the signed shape - calls it
+    /// stale, and then fails outright because the copy cannot open the source either. So `UpToDate`
+    /// is reachable here only by never taking the hash.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_that_has_not_moved_is_not_hashed_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("pin-key");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let key = std::fs::read_to_string(pin_source_key(&target)).expect("a key beside the stamp");
+        let recorded_hash = key.split_whitespace().next().unwrap().to_owned();
+        assert_eq!(
+            recorded_hash,
+            sha256_of_file(&source).unwrap(),
+            "the key has to name the hash it was recorded beside, or it cannot vouch for it"
+        );
+        // what signing does: the pin stops matching its source by size, so the fallback that a
+        // missing hash lands on would call this pin stale
+        let mut signed = std::fs::read(&target).unwrap();
+        signed.extend(std::iter::repeat(0xcd).take(900));
+        std::fs::write(&target, &signed).unwrap();
+
+        let before = source_identity(&source).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(sha256_of_file(&source), None, "the hash is now impossible");
+        assert_eq!(
+            source_identity(&source),
+            Some(before),
+            "chmod moved a field the key reads, so this no longer tests what it says"
+        );
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "the source was hashed, or the pin was judged without its hash"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pin_source_stamp(&target))
+                .unwrap()
+                .trim(),
+            recorded_hash,
+            "the stamp is still the authority and still says what it said"
+        );
+        // or the scratch directory cannot be removed
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// An old pin carries a stamp and no key, and must not be copied over for want of one. It is
+    /// hashed once, as it always was, and the key it lacked is written while the hash is in hand.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_stamp_from_before_the_key_is_given_one_without_a_copy() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = ScratchDir::new("pin-migrate");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        // what a pin installed by a build that predates the key looks like
+        std::fs::remove_file(pin_source_key(&target)).unwrap();
+        let inode = std::fs::metadata(&target).unwrap().ino();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "a pin whose stamp agrees is current, key file or no key file"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            inode,
+            "40 MB was copied to make up for a missing cache entry"
+        );
+        assert!(
+            std::fs::read_to_string(pin_source_key(&target))
+                .unwrap()
+                .starts_with(&sha256_of_file(&source).unwrap()),
+            "the key was not written, so every later pass hashes the source again"
+        );
+    }
+
+    /// The cache may never outvote the stamp. A key recorded against some other hash is a key from
+    /// a recording that is no longer in force, and the source gets hashed.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_key_that_does_not_belong_to_the_stamp_is_ignored() {
+        let scratch = ScratchDir::new("pin-key-orphan");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+
+        // the stamp now names a source this pin did not come from. The key still describes the
+        // source in front of us, and must not be allowed to say the pin is current.
+        std::fs::write(pin_source_stamp(&target), "a hash of some other build\n").unwrap();
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "the key spoke for a stamp it was not recorded against"
+        );
+    }
+
+    /// A source that moved is hashed, and the pin is refreshed when the hash disagrees. The key
+    /// gates the hash and nothing else, so a NEW build at the same path is still caught.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_that_changed_is_still_caught_through_the_key() {
+        let scratch = ScratchDir::new("pin-key-upgrade");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+
+        // an upgrade: a new file over the same path, which is a new inode whatever else it keeps
+        std::fs::remove_file(&source).unwrap();
+        scratch.write("zellij", &elf_with_build_id(&[0xcd; 20], 4096));
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone()))
+        );
+        assert_eq!(
+            identify_executable(target.clone()).build_id,
+            Some(vec![0xcd; 20]),
+            "the pin was left on the build before the upgrade"
+        );
+        assert!(
+            std::fs::read_to_string(pin_source_key(&target))
+                .unwrap()
+                .starts_with(&sha256_of_file(&source).unwrap()),
+            "the key still names the source the pin no longer came from"
+        );
+    }
+
+    /// The accepted blind spot, asserted rather than described, so that the day it stops being
+    /// true this test says so.
+    ///
+    /// A source rewritten in place - same size, same inode, mtime put back - is a source the key
+    /// cannot tell apart from the one it recorded, and the pin is left alone. Nothing short of
+    /// hashing every pass can see this, which is the whole trade. See FORK.md.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_rewritten_under_its_own_identity_is_the_blind_spot() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let scratch = ScratchDir::new("pin-key-blind");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let recorded = std::fs::read_to_string(pin_source_key(&target)).unwrap();
+
+        // written THROUGH the file, so the inode and the size are the ones the key recorded
+        let replacement = elf_with_build_id(&[0xcd; 20], 4096);
+        let mut handle = OpenOptions::new().write(true).open(&source).unwrap();
+        handle.write_all(&replacement).unwrap();
+        handle.flush().unwrap();
+        drop(handle);
+        // and the mtime put back where it was, which is the last of the five fields to move
+        let key_fields: Vec<&str> = recorded.split_whitespace().collect();
+        let seconds: i64 = key_fields[4].parse().unwrap();
+        let nanoseconds: i64 = key_fields[5].parse().unwrap();
+        set_modified_time(&source, seconds, nanoseconds);
+        assert_eq!(
+            source_identity(&source).map(|identity| identity.encode()),
+            Some(key_fields[1..].join(" ")),
+            "the identity moved, so this is no longer the blind spot it means to test"
+        );
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "the blind spot closed, which is good news and makes this test wrong"
+        );
+        // and the recovery FORK.md names: drop the cache, and the hash settles it
+        std::fs::remove_file(pin_source_key(&target)).unwrap();
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "removing the key has to put the pin back under the hash's judgement"
+        );
+    }
+
+    /// A source that changes after it is hashed must not be filed under the identity it ENDED up
+    /// with. The key says "this hash came from a source that looked like this"; pairing the old
+    /// hash with the new identity makes the next pass match, skip the hash, and believe a pin that
+    /// was never made from the file now sitting at the source path.
+    ///
+    /// A FIFO at the source path is what holds the run still. `install_pinned_exe` reads the
+    /// source twice - once to hash it, once to copy it - and a read of a FIFO blocks until a
+    /// writer arrives and ends when that writer leaves. So the writer decides when the hash
+    /// finishes, and renaming a plain file over the path BEFORE it closes puts the change squarely
+    /// between the hash and everything after it. No sleeps and no polling: the ordering is the
+    /// FIFO's, not the scheduler's.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_that_changed_after_it_was_hashed_is_not_cached_under_its_new_identity() {
+        use std::ffi::CString;
+        use std::io::Write;
+
+        let scratch = ScratchDir::new("pin-key-race");
+        let source = scratch.0.join("zellij");
+        let target = scratch.0.join("pinned");
+        let raw = CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(raw.as_ptr(), 0o644) },
+            0,
+            "the scratch directory would not take a FIFO"
+        );
+        // taken before anything writes to the FIFO, so it is the identity the run itself sees
+        let hashed_identity = source_identity(&source).expect("a FIFO still `stat`s");
+
+        let hashed_bytes = elf_with_build_id(&[0xab; 20], 4096);
+        let replacement_bytes = elf_with_build_id(&[0xcd; 20], 8192);
+        let writer_path = source.clone();
+        let writer_bytes = hashed_bytes.clone();
+        let writer_replacement = replacement_bytes.clone();
+        let writer = std::thread::spawn(move || {
+            // blocks until the hash opens the FIFO to read it
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .unwrap();
+            handle.write_all(&writer_bytes).unwrap();
+            // the source is replaced while the hash still holds the FIFO open. The rename lands
+            // before this writer closes, and the hash cannot end until it does - so the copy that
+            // follows opens the REPLACEMENT, and any `stat` after the copy sees it too.
+            let staged = writer_path.with_extension("replacement");
+            std::fs::write(&staged, &writer_replacement).unwrap();
+            std::fs::rename(&staged, &writer_path).unwrap();
+            drop(handle);
+        });
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Installed(target.clone()))
+        );
+        writer.join().expect("the writer thread panicked");
+
+        // the run is only interesting if the source really did move under it
+        assert_ne!(
+            source_identity(&source),
+            Some(hashed_identity),
+            "the source never changed, so this test no longer tests the race"
+        );
+        let recorded = std::fs::read_to_string(pin_source_key(&target)).unwrap();
+        assert!(
+            recorded.contains(&hashed_identity.encode()),
+            "the key was filed under the identity the source ENDED with: {}",
+            recorded.trim()
+        );
+
+        // and the behaviour that costs, if it is filed wrong: the next pass matches its own
+        // `stat`, skips the hash, and calls a pin the source never produced current
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "the change was cached away - the pin is now wrong for as long as the source sits still"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            replacement_bytes,
+            "the refresh did not put the pin on the source that is actually there"
+        );
+    }
+
+    /// `utimensat`, which `std::fs` has no wrapper for. Only a test needs it: the blind spot cannot
+    /// be reached without putting an mtime back where it was.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn set_modified_time(path: &Path, seconds: i64, nanoseconds: i64) {
+        use std::ffi::CString;
+
+        let raw = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: nanoseconds,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: nanoseconds,
+            },
+        ];
+        let set = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(set, 0, "could not put the mtime back");
+    }
+
+    /// A pid that is certainly not in use: spawned, waited for, and therefore reaped.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pid_that_has_finished() -> u32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("every unix has one");
+        let pid = child.id();
+        child.wait().expect("it exits at once");
+        pid
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn an_abandoned_temp(scratch: &ScratchDir, pid: u32, age: std::time::Duration) -> PathBuf {
+        let path = scratch.write(
+            &format!("{}{}.tmp", pin_temp_prefix(), pid),
+            &vec![0x7f; 512],
+        );
+        let when = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            - age;
+        set_modified_time(&path, when.as_secs() as i64, 0);
+        path
+    }
+
+    /// The file finding 3 is about: `SIGKILL` between the copy and the rename leaves 40 MB in the
+    /// pin directory, the next refresh writes a new one under a new pid, and nothing else ever
+    /// removes them.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn an_abandoned_temp_copy_is_swept_once_it_is_old_enough() {
+        let scratch = ScratchDir::new("pin-sweep");
+        let abandoned = an_abandoned_temp(
+            &scratch,
+            a_pid_that_has_finished(),
+            std::time::Duration::from_secs(2 * 60 * 60),
+        );
+
+        assert_eq!(
+            sweep_stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            vec![abandoned.clone()]
+        );
+        assert!(!abandoned.exists(), "it is still there");
+    }
+
+    /// The gate that makes the sweep safe. A temp file whose pid is alive belongs to a refresh
+    /// that is still copying into it, and removing it would leave that refresh renaming a name
+    /// nothing holds.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_temp_copy_whose_process_is_alive_is_never_swept() {
+        let scratch = ScratchDir::new("pin-sweep-live");
+        // this process, which is beyond argument the most alive pid available
+        let live = an_abandoned_temp(
+            &scratch,
+            std::process::id(),
+            std::time::Duration::from_secs(48 * 60 * 60),
+        );
+
+        assert!(process_is_running(std::process::id() as i32));
+        assert_eq!(
+            sweep_stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            Vec::<PathBuf>::new(),
+            "a refresh in flight had its temp file deleted under it"
+        );
+        assert!(live.exists());
+    }
+
+    /// The second belt: a pid can be recycled onto some unrelated process, and a temp written
+    /// moments ago by a process nothing has observed yet must survive that coincidence.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_temp_copy_younger_than_the_gate_is_left_alone() {
+        let scratch = ScratchDir::new("pin-sweep-young");
+        let fresh = an_abandoned_temp(
+            &scratch,
+            a_pid_that_has_finished(),
+            std::time::Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            Vec::<PathBuf>::new()
+        );
+        assert!(fresh.exists());
+    }
+
+    /// The pin directory holds the pin, its two stamps and the signing flow's own temp files. A
+    /// sweep that took any of those would be worse than the files it is there to remove.
+    ///
+    /// The signing temp is given THE SAME dead pid as the pin temp, deliberately. Any other pid
+    /// and the liveness gate would be what spares it, and the prefix - the thing that actually
+    /// keeps the two sweeps out of each other's files - would go untested.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_sweep_takes_nothing_that_is_not_a_pin_temp() {
+        let scratch = ScratchDir::new("pin-sweep-others");
+        let old = std::time::Duration::from_secs(48 * 60 * 60);
+        let finished = a_pid_that_has_finished();
+        let sign_temp = format!(".zellij.sign.{}.tmp", finished);
+        let bystanders = [
+            sign_temp.as_str(),
+            "zellij",
+            "zellij.source-sha256",
+            "zellij.source-key",
+            ".zellij.pin.not-a-pid.tmp",
+            ".zellij.pin.1",
+        ];
+        for name in bystanders {
+            let path = scratch.write(name, b"whatever");
+            let when = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                - old;
+            set_modified_time(&path, when.as_secs() as i64, 0);
+        }
+        let ours = an_abandoned_temp(&scratch, finished, old);
+
+        assert_eq!(
+            sweep_stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            vec![ours]
+        );
+        for name in bystanders {
+            assert!(scratch.0.join(name).exists(), "{} was swept", name);
+        }
+    }
+
+    /// The temp copy is flushed to the disk before anything renames it over the pinned path, and a
+    /// flush that fails STOPS the refresh instead of renaming a file that may not be there.
+    ///
+    /// `fsync` on a character device is `EINVAL` on Linux, which is the only way to make the flush
+    /// fail without a filesystem that is coming apart. It also has to be asked of the flush on its
+    /// own: the whole of [`write_pin_temp`] cannot be pointed at `/dev/null`, because setting the
+    /// mode on it fails first for a user that does not own it.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_temp_copy_that_will_not_flush_is_a_refusal_and_not_a_warning() {
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("every unix has one");
+
+        let refused = sync_pin_temp(&sink, Path::new("/dev/null"));
+        assert!(
+            refused.is_err(),
+            "fsync on a character device stopped failing, so this no longer proves anything"
+        );
+        assert!(
+            refused.unwrap_err().contains("could not flush"),
+            "the refusal has to name what went wrong, or `session up` prints nothing useful"
+        );
+    }
+
+    /// And the ordinary path runs the flush and completes: same bytes, still executable.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_finished_copy_is_flushed_before_it_takes_the_pinned_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("pin-flush");
+        let contents = elf_with_build_id(&[0xab; 20], 4096);
+        let source = scratch.write("zellij", &contents);
+        let temporary = scratch.0.join(".zellij.pin.1.tmp");
+        let mut handle = std::fs::File::open(&source).unwrap();
+
+        assert_eq!(write_pin_temp(&mut handle, &temporary), Ok(()));
+        assert_eq!(std::fs::read(&temporary).unwrap(), contents);
+        let mode = std::fs::metadata(&temporary).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "the flush has to come after the mode, or it carries down the wrong metadata"
+        );
+
+        // the directory flush is the best-effort half: it must not panic, and it must not care
+        sync_pin_directory(&scratch.0);
+        sync_pin_directory(&scratch.0.join("no-such-directory"));
+    }
+
     /// The stamp cannot answer for a source that will not read, and refusing to answer would leave
     /// the pin unmanaged. The build comparison is the same judgement the pin used before stamps.
     #[test]
@@ -2780,5 +3602,50 @@ mod tests {
             "the session was built more than once"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The launcher execs the pin, so `session up` hands the pin to itself as its own source. A
+    /// copy could achieve nothing there, and the ordinary path does harm.
+    ///
+    /// Signing deliberately changes the pin, and the stamp was taken from the file signing
+    /// changed. Left to fall through, the self-compare calls the signed pin stale, copies it over
+    /// itself and re-stamps it with the signed copy's own hash - and the next run off `PATH`, with
+    /// the package binary UNCHANGED and no upgrade anywhere, then reads that stamp, calls the pin
+    /// stale and copies the unsigned package over the signature. Every macOS grant goes with it.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_pin_handed_to_itself_as_its_own_source_is_left_exactly_alone() {
+        let scratch = ScratchDir::new("pin-self");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let stamped = std::fs::read_to_string(pin_source_stamp(&target)).unwrap();
+
+        // what signing does: the pin stops being byte-identical to the source it came from
+        let mut signed = std::fs::read(&target).unwrap();
+        signed.extend(std::iter::repeat(0xcd).take(900));
+        std::fs::write(&target, &signed).unwrap();
+
+        assert_eq!(
+            install_pinned_exe(&target, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "the pin was compared with itself and copied over itself"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pin_source_stamp(&target)).unwrap(),
+            stamped,
+            "the self-compare re-stamped the pin with its own hash, which is the damage"
+        );
+
+        // and the package binary, unchanged and still the source the stamp names, stays current
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            signed,
+            "the signature was copied over by a refresh nothing had asked for"
+        );
     }
 }
