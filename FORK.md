@@ -2056,6 +2056,34 @@ A refresh under a **running session** is allowed and does not disturb it. The re
 file in place under a name nobody holds, so the server keeps executing the build it started with
 until it is restarted, and the next start picks up the new copy.
 
+**The hash is cached against the source's identity, in `<pin>.source-key`.** Deciding not to copy
+still meant reading 40 MB to hash the source, on every `session up` — every minute, from the
+watchdog — and on every interactive launch. That was around 75 ms of each one, spent to learn that
+nothing had happened. The key file records the hash the stamp carries, next to what the source
+looked like to `stat` when it was taken: device, inode, size and mtime to the nanosecond. When all
+five still match, the hash is not taken again.
+
+It is a **cache, and never the answer**. The stamp remains the only thing that decides staleness,
+and the key can only skip the hash, never supply one. Everything it is unsure about falls through
+to hashing, which is exactly what happened before it existed: no key file, a key that does not
+parse, a key recorded against a hash the stamp does not carry, a source that will not `stat`. The
+stamp is written first and the key second, so a crash between the two leaves a key nothing believes.
+
+Two consequences worth stating.
+
+- **A separate file, not a second line in the stamp.** `<pin>.source-sha256` is still exactly
+  `<hash>\n`, compared with a `trim()`. A build from before this change reads it as it always did.
+  Appending to the stamp instead would have made every older binary on the machine call the pin
+  stale and copy 40 MB to correct it.
+- **The blind spot.** A source rewritten IN PLACE — same size, same inode, mtime put back — is one
+  the key cannot tell from the source it recorded, so the pin is left alone though its source now
+  holds different bytes. Nothing short of hashing every pass can see that; the trade is the 75 ms.
+  It takes a writer that preserves all three together, which no package manager does: `install` and
+  `cp` do not, and `cp -p` keeps the mtime but only writes through the same inode when the target
+  was not unlinked first. Deleting `<pin>.source-key` puts the pin back under the hash's judgement,
+  and `zellij session doctor --fix` then settles it. An upgrade is caught the ordinary way, because
+  an unpacked build is a new file and a new file has a new inode however its mtime was preserved.
+
 **The unit records the path, and the refresh uses the recorded one.** `up` reads the binary out of
 the installed unit rather than deriving the path again. The canonical directory honours
 `XDG_DATA_HOME`, and a launcher's environment is not the calling shell's — so a re-derived path can

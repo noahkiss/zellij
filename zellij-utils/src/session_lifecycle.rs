@@ -1303,12 +1303,25 @@ impl PinOutcome {
 /// its source - signing it changes it deliberately - so a comparison of the two files would call a
 /// signed pin stale and copy over the signature on the next `session up`.
 ///
+/// That question is asked of a SHA-256 of the source, which is 40 MB of reading on a pass that
+/// nearly always concludes nothing has to be done. [`pin_hash_can_be_skipped`] is a cache in front
+/// of it, keyed on what the source looks like to `stat`. It is a cache and not an answer: it can
+/// only skip the hash, never supply one, and every case it is unsure about falls through to
+/// hashing.
+///
 /// A write that fails part-way leaves nothing behind: the temp file is removed and the pinned path
 /// still holds whatever it held before, which is a working binary rather than a short one.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
+    let key = source_identity(source);
+    if target.exists() && pin_hash_can_be_skipped(target, key.as_ref()) {
+        return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+    }
     let source_hash = sha256_of_file(source);
     if target.exists() && !pin_is_stale(source, target, source_hash.as_deref()) {
+        // the pin is current, but nothing here could say so without hashing 40 MB. Record what the
+        // source looked like while it was hashed, so the next pass answers from two `stat`s.
+        record_pin_source(target, source_hash.as_deref(), key.as_ref());
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let refreshing = target.exists();
@@ -1326,7 +1339,13 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         let _ = std::fs::remove_file(&temporary);
         return Err(pin_write_error(target, &error));
     }
-    record_pin_source(target, source_hash.as_deref());
+    // the source is re-`stat`ed rather than reusing `key`: the copy took time, and a source that
+    // changed while it was being read must not be recorded under the identity it had before
+    record_pin_source(
+        target,
+        source_hash.as_deref(),
+        source_identity(source).as_ref(),
+    );
     Ok(if refreshing {
         PinOutcome::Refreshed(target.to_path_buf())
     } else {
@@ -1354,6 +1373,119 @@ pub fn pin_source_stamp(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".source-sha256");
     pin_directory(target).join(name)
+}
+
+/// The file caching WHICH source the stamp's hash was taken from, as the source looked at the time.
+///
+/// A second file rather than a second line in the stamp, for two reasons. The stamp is the
+/// authority and this is a cache, and a reader that cannot tell them apart will eventually trust
+/// the wrong one. And the stamp's format is `<hash>\n` and is compared with `trim()`, so a build
+/// that predates this file reads a one-line stamp exactly as it always did - append a line and
+/// every older binary on the machine calls the pin stale and copies 40 MB to fix it.
+#[cfg(unix)]
+pub fn pin_source_key(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".source-key");
+    pin_directory(target).join(name)
+}
+
+/// What a source file looks like from the outside, cheaply.
+///
+/// Device and inode as well as size and mtime, because they cost nothing here and they close the
+/// commonest way the other three lie: a package manager that unpacks a new build over the old path
+/// writes a NEW file, and a new file has a new inode however carefully its mtime was preserved.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: u32,
+}
+
+#[cfg(unix)]
+impl SourceIdentity {
+    fn encode(&self) -> String {
+        format!(
+            "{} {} {} {} {}",
+            self.device, self.inode, self.size, self.modified_seconds, self.modified_nanoseconds
+        )
+    }
+
+    /// Anything that does not parse is no answer rather than a wrong one - the caller then hashes,
+    /// which is what it would have done without this file at all.
+    fn decode(fields: &[&str]) -> Option<SourceIdentity> {
+        let [device, inode, size, seconds, nanoseconds] = fields else {
+            return None;
+        };
+        Some(SourceIdentity {
+            device: device.parse().ok()?,
+            inode: inode.parse().ok()?,
+            size: size.parse().ok()?,
+            modified_seconds: seconds.parse().ok()?,
+            modified_nanoseconds: nanoseconds.parse().ok()?,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn source_identity(source: &Path) -> Option<SourceIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(source).ok()?;
+    Some(SourceIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec() as u32,
+    })
+}
+
+/// Whether the 40 MB hash of the source can be skipped on this pass.
+///
+/// THIS IS A CACHE AND NOT THE ANSWER. The question the pin actually turns on is the one
+/// [`pin_is_stale`] asks - does the stamp name the hash of the source in front of us - and the
+/// recorded hash stays the only thing allowed to settle it. All this decides is whether the hash
+/// has to be TAKEN AGAIN, and it says yes to anything it is not certain about: no key file, a key
+/// file that does not parse, a key file recorded against a different stamp, a source that will not
+/// `stat`. Every one of those falls through to hashing, which is the behaviour that existed before
+/// this cache did.
+///
+/// It earns its place on the pass that does nothing, which is nearly every pass. `session up` runs
+/// from a watchdog every minute and an interactive launch runs it too, and hashing 40 MB to
+/// discover that nothing changed cost around 75 ms of every one of them.
+///
+/// **The blind spot, stated plainly.** A source rewritten in place, to the same size, with its
+/// mtime restored and its inode kept, is a source this returns `true` for - so the pin is left
+/// alone though its source now holds different bytes. Nothing short of hashing can see that, which
+/// is the trade. It needs a writer that preserves size, mtime and inode together: no package
+/// manager does, `install` and `cp` do not, and `cp -p` keeps the mtime but writes through a new
+/// file only when the target is unlinked first. The recovery is `zellij session doctor --fix` after
+/// removing the key file, or any change to the source that moves one of the five fields.
+#[cfg(unix)]
+fn pin_hash_can_be_skipped(target: &Path, key: Option<&SourceIdentity>) -> bool {
+    let Some(key) = key else {
+        return false;
+    };
+    let Ok(recorded) = std::fs::read_to_string(pin_source_key(target)) else {
+        return false;
+    };
+    let fields: Vec<&str> = recorded.split_whitespace().collect();
+    let Some((recorded_hash, recorded_identity)) = fields.split_first() else {
+        return false;
+    };
+    if SourceIdentity::decode(recorded_identity) != Some(*key) {
+        return false;
+    }
+    // the key names the hash it was recorded beside. A stamp rewritten by anything else - an older
+    // build, a hand-edit, the signing flow re-stamping the pin - leaves the two disagreeing, and a
+    // key that does not belong to the stamp in force is not allowed to speak for it.
+    match std::fs::read_to_string(pin_source_stamp(target)) {
+        Ok(stamped) => stamped.trim() == *recorded_hash,
+        Err(_) => false,
+    }
 }
 
 /// Whether the pinned copy has to be written again.
@@ -1389,16 +1521,36 @@ fn pin_is_stale(source: &Path, target: &Path, source_hash: Option<&str>) -> bool
 /// could not be written costs one needless 40 MB copy on the next pass rather than a failed
 /// `session up`. A partial write is self-correcting for the same reason - it cannot match, so the
 /// pin reads stale and is written again.
+///
+/// The stamp is written FIRST and the key second, and the order is the safety. A key naming a hash
+/// the stamp does not carry is ignored by [`pin_hash_can_be_skipped`], so a crash between the two
+/// writes costs one hash and never a wrong answer - where the reverse order would leave a key
+/// vouching for a stamp that was never written.
 #[cfg(unix)]
-fn record_pin_source(target: &Path, source_hash: Option<&str>) {
+fn record_pin_source(target: &Path, source_hash: Option<&str>, key: Option<&SourceIdentity>) {
     let stamp = pin_source_stamp(target);
+    let key_file = pin_source_key(target);
     match source_hash {
         Some(hash) => {
-            let _ = std::fs::write(stamp, format!("{}\n", hash));
+            if std::fs::write(stamp, format!("{}\n", hash)).is_err() {
+                // no stamp means no authority, and a cache for an authority that is not there is
+                // the one state that could outlive its stamp and be believed later
+                let _ = std::fs::remove_file(&key_file);
+                return;
+            }
+            match key {
+                Some(key) => {
+                    let _ = std::fs::write(key_file, format!("{} {}\n", hash, key.encode()));
+                },
+                None => {
+                    let _ = std::fs::remove_file(key_file);
+                },
+            }
         },
         // a stamp left over from an earlier pin would name a source this copy did not come from
         None => {
             let _ = std::fs::remove_file(stamp);
+            let _ = std::fs::remove_file(key_file);
         },
     }
 }
@@ -2529,6 +2681,215 @@ mod tests {
             Ok(PinOutcome::Refreshed(target.clone())),
             "an unstamped pin is one nothing here put there, and is not trusted"
         );
+    }
+
+    /// The point of the key file. The pass that finds nothing to do is nearly every pass, and it
+    /// used to hash 40 MB of source to reach that conclusion.
+    ///
+    /// Proved by making the hash IMPOSSIBLE to take while leaving the five recorded fields exactly
+    /// where they were: the source is chmod-ed unreadable, which moves its ctime and nothing the
+    /// key looks at. A pass that reaches the hash gets `None` from it, falls through to
+    /// [`compare_builds`], finds a pin that is bigger than its source - the signed shape - calls it
+    /// stale, and then fails outright because the copy cannot open the source either. So `UpToDate`
+    /// is reachable here only by never taking the hash.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_that_has_not_moved_is_not_hashed_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new("pin-key");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let key = std::fs::read_to_string(pin_source_key(&target)).expect("a key beside the stamp");
+        let recorded_hash = key.split_whitespace().next().unwrap().to_owned();
+        assert_eq!(
+            recorded_hash,
+            sha256_of_file(&source).unwrap(),
+            "the key has to name the hash it was recorded beside, or it cannot vouch for it"
+        );
+        // what signing does: the pin stops matching its source by size, so the fallback that a
+        // missing hash lands on would call this pin stale
+        let mut signed = std::fs::read(&target).unwrap();
+        signed.extend(std::iter::repeat(0xcd).take(900));
+        std::fs::write(&target, &signed).unwrap();
+
+        let before = source_identity(&source).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(sha256_of_file(&source), None, "the hash is now impossible");
+        assert_eq!(
+            source_identity(&source),
+            Some(before),
+            "chmod moved a field the key reads, so this no longer tests what it says"
+        );
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "the source was hashed, or the pin was judged without its hash"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pin_source_stamp(&target))
+                .unwrap()
+                .trim(),
+            recorded_hash,
+            "the stamp is still the authority and still says what it said"
+        );
+        // or the scratch directory cannot be removed
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// An old pin carries a stamp and no key, and must not be copied over for want of one. It is
+    /// hashed once, as it always was, and the key it lacked is written while the hash is in hand.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_stamp_from_before_the_key_is_given_one_without_a_copy() {
+        use std::os::unix::fs::MetadataExt;
+
+        let scratch = ScratchDir::new("pin-migrate");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        // what a pin installed by a build that predates the key looks like
+        std::fs::remove_file(pin_source_key(&target)).unwrap();
+        let inode = std::fs::metadata(&target).unwrap().ino();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "a pin whose stamp agrees is current, key file or no key file"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            inode,
+            "40 MB was copied to make up for a missing cache entry"
+        );
+        assert!(
+            std::fs::read_to_string(pin_source_key(&target))
+                .unwrap()
+                .starts_with(&sha256_of_file(&source).unwrap()),
+            "the key was not written, so every later pass hashes the source again"
+        );
+    }
+
+    /// The cache may never outvote the stamp. A key recorded against some other hash is a key from
+    /// a recording that is no longer in force, and the source gets hashed.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_key_that_does_not_belong_to_the_stamp_is_ignored() {
+        let scratch = ScratchDir::new("pin-key-orphan");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+
+        // the stamp now names a source this pin did not come from. The key still describes the
+        // source in front of us, and must not be allowed to say the pin is current.
+        std::fs::write(pin_source_stamp(&target), "a hash of some other build\n").unwrap();
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "the key spoke for a stamp it was not recorded against"
+        );
+    }
+
+    /// A source that moved is hashed, and the pin is refreshed when the hash disagrees. The key
+    /// gates the hash and nothing else, so a NEW build at the same path is still caught.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_that_changed_is_still_caught_through_the_key() {
+        let scratch = ScratchDir::new("pin-key-upgrade");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+
+        // an upgrade: a new file over the same path, which is a new inode whatever else it keeps
+        std::fs::remove_file(&source).unwrap();
+        scratch.write("zellij", &elf_with_build_id(&[0xcd; 20], 4096));
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone()))
+        );
+        assert_eq!(
+            identify_executable(target.clone()).build_id,
+            Some(vec![0xcd; 20]),
+            "the pin was left on the build before the upgrade"
+        );
+        assert!(
+            std::fs::read_to_string(pin_source_key(&target))
+                .unwrap()
+                .starts_with(&sha256_of_file(&source).unwrap()),
+            "the key still names the source the pin no longer came from"
+        );
+    }
+
+    /// The accepted blind spot, asserted rather than described, so that the day it stops being
+    /// true this test says so.
+    ///
+    /// A source rewritten in place - same size, same inode, mtime put back - is a source the key
+    /// cannot tell apart from the one it recorded, and the pin is left alone. Nothing short of
+    /// hashing every pass can see this, which is the whole trade. See FORK.md.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_source_rewritten_under_its_own_identity_is_the_blind_spot() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let scratch = ScratchDir::new("pin-key-blind");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let recorded = std::fs::read_to_string(pin_source_key(&target)).unwrap();
+
+        // written THROUGH the file, so the inode and the size are the ones the key recorded
+        let replacement = elf_with_build_id(&[0xcd; 20], 4096);
+        let mut handle = OpenOptions::new().write(true).open(&source).unwrap();
+        handle.write_all(&replacement).unwrap();
+        handle.flush().unwrap();
+        drop(handle);
+        // and the mtime put back where it was, which is the last of the five fields to move
+        let key_fields: Vec<&str> = recorded.split_whitespace().collect();
+        let seconds: i64 = key_fields[4].parse().unwrap();
+        let nanoseconds: i64 = key_fields[5].parse().unwrap();
+        set_modified_time(&source, seconds, nanoseconds);
+        assert_eq!(
+            source_identity(&source).map(|identity| identity.encode()),
+            Some(key_fields[1..].join(" ")),
+            "the identity moved, so this is no longer the blind spot it means to test"
+        );
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "the blind spot closed, which is good news and makes this test wrong"
+        );
+        // and the recovery FORK.md names: drop the cache, and the hash settles it
+        std::fs::remove_file(pin_source_key(&target)).unwrap();
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone())),
+            "removing the key has to put the pin back under the hash's judgement"
+        );
+    }
+
+    /// `utimensat`, which `std::fs` has no wrapper for. Only a test needs it: the blind spot cannot
+    /// be reached without putting an mtime back where it was.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn set_modified_time(path: &Path, seconds: i64, nanoseconds: i64) {
+        use std::ffi::CString;
+
+        let raw = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: nanoseconds,
+            },
+            libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: nanoseconds,
+            },
+        ];
+        let set = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(set, 0, "could not put the mtime back");
     }
 
     /// The stamp cannot answer for a source that will not read, and refusing to answer would leave
