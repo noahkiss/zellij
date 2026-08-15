@@ -33,9 +33,12 @@ use crate::notifications::NotificationProtocol;
 use crate::os_input_output::{AsyncReader, SendToClientError};
 use crate::panes::grid::PendingNotification;
 use crate::pty_writer::PtyWriteInstruction;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+
+use crate::screen::{push_action_event, ACTION_RING_SIZE};
 use std::env::set_var;
 use std::sync::{Arc, Mutex};
+use zellij_utils::data::ActionEvent;
 
 use crate::{
     plugins::PluginInstruction,
@@ -46,7 +49,10 @@ use zellij_utils::ipc::PixelDimensions;
 use interprocess::local_socket::Stream as LocalSocketStream;
 use zellij_utils::{
     channels::{self, ChannelWithContext, Receiver},
-    data::{Direction, FloatingPaneCoordinates, InputMode, ModeInfo, NewPanePlacement, Palette},
+    data::{
+        Direction, FloatingPaneCoordinates, InputMode, ModeInfo, NewPanePlacement, Palette,
+        UnblockCondition,
+    },
     ipc::{ClientAttributes, ClientToServerMsg, ServerToClientMsg},
 };
 
@@ -2725,8 +2731,9 @@ pub fn send_cli_write_chars_action_to_screen() {
         pty_writer_receiver
     );
     let cli_action = CliAction::WriteChars {
-        chars: "input from the cli".into(),
+        chars: Some("input from the cli".into()),
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -2754,6 +2761,7 @@ pub fn send_cli_write_action_to_screen() {
     let cli_action = CliAction::Write {
         bytes: vec![102, 111, 111],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -2894,14 +2902,12 @@ pub fn close_pane_by_pane_id_for_missing_pane_reports_an_error() {
         client_id,
     );
     mock_screen.teardown(vec![screen_thread]);
-    assert_eq!(result.exit_status, Some(1));
-    assert!(
-        result
-            .error_message
-            .as_ref()
-            .map(|m| m.contains("not found"))
-            .unwrap_or(false),
-        "Expected a 'not found' error, got: {:?}",
+    // a miss, not a failure: the sentence is the one every pane target answers with, and the
+    // exit status is left to the miss convention rather than claimed as an error here
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_999'"),
+        "{:?}",
         result.error_message
     );
 }
@@ -2958,6 +2964,7 @@ pub fn send_cli_send_keys_action_to_screen() {
     let cli_action = CliAction::SendKeys {
         keys: vec!["Ctrl a".to_string(), "x".to_string()],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2994,6 +3001,7 @@ pub fn send_cli_ctrl_c_reaches_pty_writer() {
     let cli_action = CliAction::SendKeys {
         keys: vec!["Ctrl c".to_string()],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3028,6 +3036,7 @@ pub fn send_cli_ctrl_w_reaches_pty_writer() {
     let cli_action = CliAction::SendKeys {
         keys: vec!["Ctrl w".to_string()],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3856,6 +3865,7 @@ pub fn send_cli_toggle_active_tab_sync_action() {
     let cli_write_action = CliAction::Write {
         bytes: vec![102, 111, 111],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(
         &session_metadata,
@@ -3921,6 +3931,10 @@ pub fn send_cli_new_pane_action_with_default_parameters() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4031,6 +4045,10 @@ pub fn send_cli_new_pane_action_with_split_direction() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4087,6 +4105,10 @@ pub fn send_cli_new_pane_action_with_command_and_cwd() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4154,6 +4176,10 @@ pub fn send_cli_new_pane_action_with_floating_pane_and_coordinates() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4202,6 +4228,7 @@ pub fn send_cli_edit_action_with_default_parameters() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4246,6 +4273,7 @@ pub fn send_cli_edit_action_with_line_number() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4290,6 +4318,7 @@ pub fn send_cli_edit_action_with_split_direction() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4430,7 +4459,11 @@ pub fn send_cli_toggle_floating_panes() {
 #[test]
 pub fn send_cli_close_pane_action() {
     let size = Size { cols: 80, rows: 10 };
-    let client_id = 10; // fake client id should not appear in the screen's state
+    // the client the session belongs to, so there is a focused pane for this to close. A client
+    // Screen has never heard of holds no focus, and `close-pane` now refuses that rather than
+    // closing whichever pane the fallback found - see
+    // `closing_the_focused_pane_with_nothing_focused_is_a_miss`
+    let client_id = 1;
     let mut initial_layout = TiledPaneLayout::default();
     initial_layout.children_split_direction = SplitDirection::Vertical;
     initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
@@ -4445,7 +4478,11 @@ pub fn send_cli_close_pane_action() {
         ServerInstruction::KillSession,
         server_receiver
     );
-    let close_pane_action = CliAction::ClosePane { pane_id: None };
+    let close_pane_action = CliAction::ClosePane {
+        pane_id: None,
+        focused: false,
+        yes: false,
+    };
     send_cli_action_to_server(&session_metadata, close_pane_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_instruction, screen_thread]);
@@ -4695,7 +4732,11 @@ pub fn send_cli_close_tab_action() {
         ServerInstruction::KillSession,
         server_receiver
     );
-    let close_tab = CliAction::CloseTab { tab_id: None };
+    let close_tab = CliAction::CloseTab {
+        tab_id: None,
+        focused: false,
+        yes: false,
+    };
     send_cli_action_to_server(&session_metadata, close_tab, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_thread, screen_thread]);
@@ -6019,6 +6060,10 @@ pub fn send_cli_new_pane_in_place_with_close_replaced_pane() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -6075,6 +6120,7 @@ pub fn send_cli_edit_in_place_with_close_replaced_pane() {
         no_focus: false,
         borderless: None,
         tab_id: None,
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7750,6 +7796,8 @@ pub fn send_cli_clear_with_pane_id() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let cli_action = CliAction::Clear {
         pane_id: Some("terminal_0".to_string()),
+        focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7874,6 +7922,8 @@ pub fn send_cli_close_pane_with_pane_id() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let cli_action = CliAction::ClosePane {
         pane_id: Some("terminal_0".to_string()),
+        focused: false,
+        yes: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7997,7 +8047,11 @@ pub fn send_cli_close_tab_with_tab_id() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.new_tab(TiledPaneLayout::default());
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let cli_action = CliAction::CloseTab { tab_id: Some(1) };
+    let cli_action = CliAction::CloseTab {
+        tab_id: Some(1),
+        focused: false,
+        yes: false,
+    };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_thread, screen_thread]);
@@ -9593,6 +9647,10 @@ pub fn send_cli_new_pane_action_with_tab_id() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -9656,6 +9714,10 @@ pub fn send_cli_new_floating_pane_action_with_tab_id() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -9710,6 +9772,7 @@ pub fn send_cli_edit_action_with_tab_id() {
         no_focus: false,
         borderless: None,
         tab_id: Some(0),
+        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -9768,6 +9831,10 @@ pub fn send_cli_new_pane_action_with_tab_id_and_direction() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -9830,6 +9897,10 @@ pub fn send_cli_new_pane_action_with_tab_id_and_stacked() {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -13660,7 +13731,11 @@ pub fn closing_focused_pane_syncs_scroll_mode_on_fallback_pane() {
 
     send_cli_action_to_server(
         &session_metadata,
-        CliAction::ClosePane { pane_id: None },
+        CliAction::ClosePane {
+            pane_id: None,
+            focused: false,
+            yes: false,
+        },
         client_id,
     );
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -15564,6 +15639,77 @@ pub fn closing_a_pane_that_is_not_there_reports_a_miss_and_no_report() {
 }
 
 #[test]
+pub fn are_floating_panes_visible_answers_on_stdout_either_way() {
+    // a question is answered, not failed: `false` is as much an answer as `true`, so both leave on
+    // stdout and neither becomes the error message the CLI turns into a non-zero exit
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    // the tab needs a floating pane for the surface to have anything to show, and the tab is named
+    // rather than left to the focus: a test client holds none
+    let mut floating_pane = FloatingPaneLayout::default();
+    floating_pane.name = Some("floating".to_owned());
+    let screen_thread = mock_screen.run(Some(TiledPaneLayout::default()), vec![floating_pane]);
+
+    let _ = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::HideFloatingPanes { tab_id: Some(0) },
+        client_id,
+    );
+    let hidden = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(0) },
+        client_id,
+    );
+    let _ = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::ShowFloatingPanes { tab_id: Some(0) },
+        client_id,
+    );
+    let shown = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(0) },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+
+    assert_eq!(hidden.error_message, None, "a `false` is not an error");
+    assert_eq!(hidden.stdout_lines, vec!["visible: false".to_string()]);
+    assert_eq!(shown.error_message, None);
+    assert_eq!(shown.stdout_lines, vec!["visible: true".to_string()]);
+}
+
+#[test]
+pub fn are_floating_panes_visible_for_a_tab_that_is_not_there_is_a_miss() {
+    // the answer is about a tab, so a tab nothing answers to has no answer - that IS an error, and
+    // stays one, which is what keeps the stdout answer above meaningful
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(TiledPaneLayout::default()), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(999) },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message.as_deref(), Some("Tab not found"));
+    assert!(
+        result.stdout_lines.is_empty(),
+        "there is no answer to print: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
 pub fn closing_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
     let size = Size {
         cols: 121,
@@ -15734,6 +15880,7 @@ pub fn jumping_to_a_pane_reports_where_focus_came_from_and_where_it_landed() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(1),
+            no_focus: false,
         },
         client_id,
     );
@@ -15760,6 +15907,7 @@ pub fn jumping_to_the_pane_you_are_already_in_reports_only_where_you_are() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(0),
+            no_focus: false,
         },
         client_id,
     );
@@ -15795,6 +15943,7 @@ pub fn jumping_to_a_pane_that_is_not_there_is_a_miss() {
         &session_metadata,
         Action::FocusPaneByPaneId {
             pane_id: ZellijUtilsPaneId::Terminal(9),
+            no_focus: false,
         },
         client_id,
     );
@@ -15843,4 +15992,490 @@ pub fn jumping_to_a_pane_in_another_tab_brings_the_tab_with_it() {
         Some(screen.pane_summary(PaneId::Terminal(1)).as_str()),
         "the client is looking at the pane it was sent to"
     );
+}
+
+#[test]
+pub fn closing_a_pane_by_id_says_what_it_closed() {
+    // the route the CLI actually takes: `close-pane --pane-id` becomes CloseFocusByPaneId, which
+    // reaches ScreenInstruction::CloseFocusWithPaneId - not the CloseTerminalPane that the older
+    // tests drove and that no CLI invocation sends
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocusByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(1),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.stdout_lines,
+        vec!["closed: terminal_1".to_string()],
+        "{:?}",
+        result.stdout_lines
+    );
+    assert_eq!(result.error_message, None);
+}
+
+#[test]
+pub fn closing_a_pane_id_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocusByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn closing_a_tab_by_id_says_what_it_closed() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseTabById { id: 0 },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.stdout_lines.len(), 1, "{:?}", result.stdout_lines);
+    assert!(
+        result.stdout_lines[0].starts_with("closed: 0 "),
+        "{:?}",
+        result.stdout_lines
+    );
+}
+#[test]
+pub fn dumping_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: None,
+            include_scrollback: false,
+            pane_id: Some(ZellijUtilsPaneId::Terminal(9)),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss dumps nothing, not an empty line: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn dumping_a_pane_that_is_there_still_dumps_it() {
+    // the negative control for the miss check above: the guard must not refuse a live pane
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::DumpScreen {
+            file_path: None,
+            include_scrollback: false,
+            pane_id: Some(ZellijUtilsPaneId::Terminal(1)),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    // the dump itself is delivered by the server thread, which this harness does not run, so what
+    // is checked here is the only thing this guard could get wrong: it must not call a live pane a
+    // miss
+    assert!(
+        !result
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No pane answers to"),
+        "the guard refused a pane that is there: {:?}",
+        result.error_message
+    );
+}
+
+/// The screen-side half of `new-pane --block-until-exit`: the pane keeps the answer until the
+/// command it runs is done with it.
+///
+/// `set_blocking` is what hands the `NotificationEnd` to the pane instead of dropping it at the end
+/// of the `NewPane` handler, so this drives the same instruction the pty thread sends and asserts
+/// on the channel the CLI client is parked on.
+fn spawn_pane_and_take_its_completion_channel(
+    mock_screen: &MockScreen,
+    pane_id: u32,
+    client_id: ClientId,
+    unblock_condition: Option<UnblockCondition>,
+    set_blocking: bool,
+) -> tokio::sync::oneshot::Receiver<crate::route::ActionCompletionResult> {
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let notification_end = match unblock_condition {
+        Some(condition) => {
+            crate::route::NotificationEnd::new_with_condition(completion_tx, condition)
+        },
+        None => crate::route::NotificationEnd::new(completion_tx),
+    };
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(pane_id),
+        Some("sh".to_string()),
+        None, // hold_for_command
+        None, // invoked_with
+        NewPanePlacement::default(),
+        false, // start_suppressed
+        ClientTabIndexOrPaneId::ClientId(client_id),
+        Some(notification_end),
+        set_blocking,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    completion_rx
+}
+
+fn held_command() -> RunCommand {
+    RunCommand {
+        command: PathBuf::from("sh"),
+        args: vec!["-c".to_string(), "exit 7".to_string()],
+        hold_on_close: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+pub fn a_blocking_pane_answers_with_the_commands_exit_status() {
+    let size = Size { cols: 80, rows: 20 };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let mut completion_rx = spawn_pane_and_take_its_completion_channel(
+        &mock_screen,
+        new_pane_id,
+        client_id,
+        Some(UnblockCondition::OnAnyExit),
+        true,
+    );
+
+    // the pane exists and the command is still running: the CLI client is parked, so nothing may
+    // have been sent down this channel yet
+    assert!(
+        matches!(
+            completion_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the blocking pane answered before its command exited"
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::HoldPane(
+        PaneId::Terminal(new_pane_id),
+        Some(7),
+        held_command(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let result = completion_rx
+        .try_recv()
+        .expect("the blocking pane never answered after its command exited");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.exit_status,
+        Some(7),
+        "the command's exit status did not reach the answer"
+    );
+}
+
+#[test]
+pub fn a_non_blocking_pane_answers_as_soon_as_it_is_made() {
+    // the negative control for the test above: without `set_blocking` the same instruction answers
+    // at once, with the pane id and no exit status - which is what `new-pane` prints
+    let size = Size { cols: 80, rows: 20 };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let mut completion_rx = spawn_pane_and_take_its_completion_channel(
+        &mock_screen,
+        new_pane_id,
+        client_id,
+        None,
+        false,
+    );
+    let result = completion_rx
+        .try_recv()
+        .expect("a non-blocking pane did not answer once it was made");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.affected_pane_id,
+        Some(PaneId::Terminal(new_pane_id)),
+        "the answer did not name the pane that was made"
+    );
+    assert_eq!(
+        result.exit_status, None,
+        "a non-blocking pane answered with an exit status"
+    );
+}
+
+#[test]
+pub fn a_pane_no_tab_took_is_not_reported_as_made() {
+    // The pty is spawned before any tab has agreed to hold the pane, so the id in the instruction
+    // names a pty and not yet a pane. A tab that declines does it by dropping the pty rather than
+    // by failing, so the answer must be written after the placement and only for a pane that is
+    // really there - otherwise `new-pane` prints `pane_id:` and exits 0 for a pane that was never
+    // created, and the next command a script runs misses.
+    //
+    // A tab index nothing answers to is the deterministic refusal. In the wild it is an unsized
+    // tab on a session no client has attached to.
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(new_pane_id),
+        Some("sh".to_string()),
+        None, // hold_for_command
+        None, // invoked_with
+        NewPanePlacement::default(),
+        false, // start_suppressed
+        ClientTabIndexOrPaneId::TabIndex(99),
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+        false, // set_blocking
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a pane no tab took never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.affected_pane_id, None,
+        "the answer named a pane that no tab took"
+    );
+}
+
+#[test]
+pub fn an_unmet_unblock_condition_waits_for_the_pane_to_close() {
+    // `--block-until-exit-success` on a command that fails: the condition is not met, so the wait
+    // runs on until the pane itself goes away - and the status it answers with is still the
+    // command's own
+    let size = Size { cols: 80, rows: 20 };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let mut completion_rx = spawn_pane_and_take_its_completion_channel(
+        &mock_screen,
+        new_pane_id,
+        client_id,
+        Some(UnblockCondition::OnExitSuccess),
+        true,
+    );
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::HoldPane(
+        PaneId::Terminal(new_pane_id),
+        Some(7),
+        held_command(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        matches!(
+            completion_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "a failing command released a wait that only ends on success"
+    );
+
+    // the pane-id form of `close-pane`, which finds the pane by scanning the tabs and needs no
+    // client of its own - the same one a detached session answers
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(new_pane_id),
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let result = completion_rx
+        .try_recv()
+        .expect("closing the pane did not end the wait");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.exit_status,
+        Some(7),
+        "the wait ended without the command's exit status"
+    );
+}
+
+#[test]
+pub fn closing_the_focused_pane_with_nothing_focused_is_a_miss() {
+    // `close-pane` against a session nobody is attached to. It used to close nothing and exit 0,
+    // which reads as "the pane is gone" on a session that still has every pane it started with
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    // the client the mock session belongs to, and one that holds no focus in it - which is what a
+    // `zellij action` client is on a session with nothing attached
+    let client_holding_the_focus = 1;
+    let client_holding_no_focus = 99;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let missed = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocus,
+        client_holding_no_focus,
+    );
+    let acted = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::CloseFocus,
+        client_holding_the_focus,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        missed.error_message.as_deref(),
+        Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
+        "{:?}",
+        missed.error_message
+    );
+    assert!(
+        missed.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        missed.stdout_lines
+    );
+    // the negative control: a client that does hold the focus is not refused. Its close is handed
+    // to the tab and finished by a pty this harness does not run, so what it answers here is the
+    // harness running out of patience - never the refusal above
+    assert_ne!(
+        acted.error_message.as_deref(),
+        Some(crate::screen::NO_FOCUSED_PANE_TO_CLOSE),
+        "a client with a focused pane was told it had none"
+    );
+}
+
+fn an_event(verb: &str, target: &str, origin: &str) -> ActionEvent {
+    ActionEvent {
+        at: "2026-08-14T18:03:12.345Z".to_owned(),
+        verb: verb.to_owned(),
+        target: target.to_owned(),
+        origin: origin.to_owned(),
+        count: 1,
+    }
+}
+
+#[test]
+fn a_run_of_the_same_action_is_one_entry_that_counts() {
+    // a held scroll key must not push the tab move somebody is looking for out of the ring
+    let mut ring = VecDeque::new();
+    for _ in 0..40 {
+        push_action_event(
+            &mut ring,
+            an_event("scroll-down", "terminal_1 sunny-otter", "client 1"),
+        );
+    }
+    assert_eq!(ring.len(), 1);
+    assert_eq!(ring[0].count, 40);
+    // the negative controls: a different verb, a different target and a different origin are each
+    // a new entry rather than another count
+    push_action_event(
+        &mut ring,
+        an_event("scroll-up", "terminal_1 sunny-otter", "client 1"),
+    );
+    push_action_event(
+        &mut ring,
+        an_event("scroll-up", "terminal_2 tender-orca", "client 1"),
+    );
+    push_action_event(
+        &mut ring,
+        an_event("scroll-up", "terminal_2 tender-orca", "cli"),
+    );
+    assert_eq!(ring.len(), 4);
+    assert!(ring.iter().skip(1).all(|event| event.count == 1));
+}
+
+#[test]
+fn the_ring_holds_its_size_and_drops_the_oldest() {
+    // the bound: this is a ring, not a log file. Nothing about it reaches the disk
+    let mut ring = VecDeque::new();
+    for index in 0..ACTION_RING_SIZE + 50 {
+        push_action_event(
+            &mut ring,
+            an_event("close-pane", &format!("terminal_{}", index), "cli"),
+        );
+    }
+    assert_eq!(ring.len(), ACTION_RING_SIZE);
+    // oldest first, so the front is the oldest that survived and the back is the newest
+    assert_eq!(ring.front().unwrap().target, "terminal_50");
+    assert_eq!(
+        ring.back().unwrap().target,
+        format!("terminal_{}", ACTION_RING_SIZE + 49)
+    );
+}
+
+#[test]
+fn a_tab_is_only_refused_when_a_command_asked_and_nobody_is_attached() {
+    use crate::screen::tab_creation_is_refused;
+    // the case this exists for: a script calls `new-tab` on a detached session, and the tab would
+    // be built empty, reported as if it had a pane, and thrown away by the next client to attach
+    assert!(tab_creation_is_refused(true, false));
+    // the negative controls, and both matter. The session's own startup builds its tabs before any
+    // client has attached and passes no completion - refusing there would break every layout
+    assert!(!tab_creation_is_refused(false, false));
+    // and a command with somebody attached is the ordinary case
+    assert!(!tab_creation_is_refused(true, true));
+    assert!(!tab_creation_is_refused(false, true));
 }

@@ -257,10 +257,16 @@ pub struct Setup {
     #[clap(long, value_parser)]
     pub check: bool,
 
+    /// Print the whole CLI surface - every command, its flags with their types and defaults, and
+    /// what it prints - so an agent can read the lot in one call instead of one --help at a time
+    #[clap(long, value_parser)]
+    pub dump_surface: bool,
+
     /// With `--check`, report the version and this build's capabilities as JSON on stdout, and
     /// nothing else. Gate on the capability names: the fork counter resets when the upstream
-    /// version moves, so it cannot be compared across an upgrade
-    #[clap(long, value_parser, requires = "check")]
+    /// version moves, so it cannot be compared across an upgrade. With `--dump-surface`, print the
+    /// surface as JSON
+    #[clap(long, value_parser)]
     pub json: bool,
 
     /// Dump specified layout to stdout
@@ -405,6 +411,29 @@ impl Setup {
         if self.dump_config {
             dump_default_config()?;
             std::process::exit(0);
+        }
+
+        if self.dump_surface {
+            // before the config is read, like the other dumps: what the CLI accepts does not
+            // depend on a config file, and a broken one must not take the map away
+            // `| head` is how a map this size gets read, and a closed pipe is not a crash
+            let surface = if self.json {
+                crate::cli_surface::dump_surface_json()
+            } else {
+                crate::cli_surface::dump_surface_text()
+            };
+            let _ = std::io::stdout().write_all(surface.as_bytes());
+            std::process::exit(0);
+        }
+
+        // a call that names no question is a usage error, and a usage error exits 2 here for the
+        // same reason clap's own do: the command was refused before it ran, and nothing changed
+        if self.json && !self.check {
+            eprintln!(
+                "--json says how to print an answer and needs a question: pass it with --check or \
+                 with --dump-surface"
+            );
+            std::process::exit(2);
         }
 
         if let Some(shell) = &self.generate_completion {

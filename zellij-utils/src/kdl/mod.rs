@@ -7498,6 +7498,10 @@ impl PaneInfo {
         let pane_info = PaneInfo {
             restored_from,
             handle,
+            // a note describes live state, and a saved layout describes what a pane IS, so a
+            // restored pane comes back without one
+            note: String::new(),
+            note_color: Default::default(),
             pane_cwd,
             pane_pid,
             pane_command,
@@ -7747,6 +7751,8 @@ fn serialize_and_deserialize_session_info_with_data() {
         PaneInfo {
             restored_from: String::new(),
             handle: String::new(),
+            note: String::new(),
+            note_color: Default::default(),
             pane_cwd: None,
             pane_pid: None,
             pane_command: None,
@@ -7795,6 +7801,8 @@ fn serialize_and_deserialize_session_info_with_data() {
         PaneInfo {
             restored_from: String::new(),
             handle: String::new(),
+            note: String::new(),
+            note_color: Default::default(),
             pane_cwd: None,
             pane_pid: None,
             pane_command: None,

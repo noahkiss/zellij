@@ -2564,9 +2564,44 @@ mod pane_handle_tests {
 
     #[test]
     fn a_hand_written_layout_needs_no_handle() {
-        // `pane_handle` is written by serialization, never by a user
         let parsed = parse_single_pane("layout {\n    pane name=\"shell\"\n}");
         assert_eq!(parsed.pane_handle, None);
+    }
+
+    #[test]
+    fn a_chosen_handle_survives_the_round_trip_like_any_other() {
+        // a name the caller picked is stored the same way a generated one is, so `--handle build`
+        // still reaches the pane after the session has been restored
+        let manifest = manifest_with_handle(Some("build"));
+        let layout = tiled_pane_layout_from_manifest(Some(&manifest), None);
+        let kdl = serialize_tiled_pane(&layout, false, &mut BTreeMap::new()).to_string();
+        assert!(kdl.contains("pane_handle=\"build\""), "got: {}", kdl);
+        let parsed = parse_single_pane(&format!("layout {{\n{}\n}}", kdl));
+        assert_eq!(parsed.pane_handle.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn a_hand_written_layout_may_choose_one() {
+        // `handle` is the spelling a person writes; `pane_handle` is what serialization writes, and
+        // both reach the same field so a saved layout and a written one mean the same thing
+        let chosen = parse_single_pane("layout {\n    pane handle=\"build\"\n}");
+        assert_eq!(chosen.pane_handle.as_deref(), Some("build"));
+        let serialized = parse_single_pane("layout {\n    pane pane_handle=\"sunny-otter\"\n}");
+        assert_eq!(serialized.pane_handle.as_deref(), Some("sunny-otter"));
+    }
+
+    #[test]
+    fn a_layout_handle_that_is_not_a_handle_is_a_layout_error() {
+        // the same grammar `--handle` is held to: a name that could be read as a pane id would
+        // reach the wrong pane the first time somebody typed it into `--pane-id`
+        for rejected in ["terminal_1", "7", "Build"] {
+            let layout = format!("layout {{\n    pane handle=\"{}\"\n}}", rejected);
+            assert!(
+                Layout::from_kdl(&layout, None, None, None).is_err(),
+                "expected `handle=\"{}\"` to be refused",
+                rejected
+            );
+        }
     }
 
     #[test]

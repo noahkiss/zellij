@@ -177,6 +177,10 @@ fn new_pane_cli_action(
         block_until_exit_failure: false,
         block_until_exit,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
+        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -488,6 +492,10 @@ impl TestSession {
                     Box::new(fake_client_os_api),
                     &session_name,
                     actions,
+                    // no `--near`: the anchor is whatever the client's environment says
+                    None,
+                    // no `--handle`: the pane keeps the one it named itself
+                    None,
                 )
             })
             .unwrap()

@@ -262,3 +262,34 @@ fn the_last_of_fix_and_no_fix_wins_whichever_it_is() {
         other => panic!("Expected `doctor`, got {:?}", other),
     }
 }
+
+/// The session lifecycle verbs that cannot be undone each take `--yes`, and none of them assumes
+/// it. The `action` verbs are covered where the table that drives them lives, in `zellij-utils`.
+#[test]
+fn the_session_verbs_that_destroy_something_take_yes_and_default_to_asking() {
+    let yes_for = |args: &[&str]| match parse_cli(args).unwrap().command {
+        Some(Command::Sessions(Sessions::KillSession { yes, .. })) => yes,
+        Some(Command::Sessions(Sessions::DeleteSession { yes, .. })) => yes,
+        Some(Command::Sessions(Sessions::KillAllSessions { yes, .. })) => yes,
+        Some(Command::Sessions(Sessions::DeleteAllSessions { yes, .. })) => yes,
+        other => panic!("Expected a session verb, got {:?}", other),
+    };
+    for verb in [
+        "kill-session",
+        "delete-session",
+        "kill-all-sessions",
+        "delete-all-sessions",
+    ] {
+        // the named-session verbs want their target; the all-variants ignore the extra argument
+        let named: &[&str] = &["zellij", verb, "work"];
+        let bare: &[&str] = &["zellij", verb];
+        let args = if parse_cli(named).is_ok() {
+            named
+        } else {
+            bare
+        };
+        assert!(!yes_for(args), "{verb} assumed yes without being told");
+        let with_yes: Vec<&str> = args.iter().copied().chain(["--yes"]).collect();
+        assert!(yes_for(&with_yes), "{verb} did not take --yes");
+    }
+}

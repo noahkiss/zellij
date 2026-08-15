@@ -15,11 +15,11 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
-use zellij_utils::data::PaneContents;
 use zellij_utils::data::{
     Direction, KeyWithModifier, NewPanePlacement, PaneInfo, PermissionStatus, PermissionType,
     PluginPermission, RegexHighlight, ResizeStrategy, Style, StyledText, WebSharing,
 };
+use zellij_utils::data::{NoteColor, PaneContents};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
@@ -764,6 +764,16 @@ pub trait Pane {
     /// a freshly generated one instead, because a restore must not end with two panes at one
     /// address.
     fn set_pane_handle(&mut self, _handle: &str) {}
+    /// The short note somebody left on this pane, and what colour it says it is.
+    ///
+    /// Unlike the handle, a note is about what is happening in the pane rather than about which
+    /// pane this is: it is set and cleared while the pane lives, and a pane that comes back from a
+    /// snapshot comes back without one.
+    fn pane_note(&self) -> Option<(String, NoteColor)> {
+        None
+    }
+    /// Leaves a note on this pane, or clears the one it has.
+    fn set_pane_note(&mut self, _note: Option<(String, NoteColor)>) {}
     fn custom_title(&self) -> Option<String>;
     fn has_explicit_title(&self) -> bool {
         false
@@ -8365,6 +8375,10 @@ pub fn pane_info_for_pane(
     pane_info.uuid = pane.pane_uuid().to_string();
     pane_info.restored_from = pane.restored_from().unwrap_or_default();
     pane_info.handle = pane.pane_handle();
+    if let Some((note, color)) = pane.pane_note() {
+        pane_info.note = note;
+        pane_info.note_color = color;
+    }
     let geom = pane.position_and_size();
     pane_info.stack_id = geom.stacked;
     pane_info.is_expanded_in_stack = geom.is_stacked() && geom.rows.is_percent();
