@@ -189,6 +189,15 @@ fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
 /// Silent when the copy is already this build, which is every pass but the first after an upgrade:
 /// `session up` runs this each time, and a line saying nothing happened, every minute, from a
 /// watchdog, is a line nobody reads.
+///
+/// **THIS BINARY is the source, and once the launcher runs the pin this binary IS the pin.** That
+/// is the ordinary configuration, and in it the comparison is the pin against itself: it always
+/// agrees, so the watchdog never refreshes and never can. Nothing is wrong with that - the process
+/// has not seen the package and has nothing to compare against - but it means the watchdog is not
+/// what notices an upgrade. What does is any zellij run off another path: an interactive launch,
+/// which resolves the server binary through here on the way past, or `session up`, `session doctor
+/// --fix` or `session enable` typed in a shell, where `PATH` leads to the new build. See FORK.md,
+/// "Once the launcher runs the pin".
 #[cfg(unix)]
 fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
     use zellij_utils::session_lifecycle::{install_pinned_exe, PinOutcome};

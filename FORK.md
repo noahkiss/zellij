@@ -2095,6 +2095,34 @@ Two consequences worth stating.
   and `zellij session doctor --fix` then settles it. An upgrade is caught the ordinary way, because
   an unpacked build is a new file and a new file has a new inode however its mtime was preserved.
 
+**Once the launcher runs the pin, the watchdog cannot be what notices an upgrade.** This is the
+ordinary configuration — it is what `pin_exe` is for — and the consequence is easy to read past.
+`session up` refreshes the pin from the binary it is itself running. Started by the launcher, that
+binary IS the pin, so the stamp is compared against the file it was taken from and always agrees.
+Every pass of the minutely watchdog therefore says the pin is current, however old it is, and it is
+right to: nothing in that process has ever seen the package.
+
+An upgrade reaches the pin from **any zellij run off another path**, which in practice means it
+reaches it quickly:
+
+- an interactive `zellij` — the launch resolves the server binary through the pin and refreshes it
+  on the way past, which is the common case and needs nobody to remember anything;
+- `zellij session up` or `zellij session doctor --fix`, typed in a shell, where the binary on `PATH`
+  is the new one;
+- `zellij session enable`, which installs the copy before it writes the unit.
+
+The refreshed copy still does not reach the **running** server, which keeps the build it started
+with until `zellij session restart`. So the honest summary of `pin_exe` on an upgraded machine is:
+the package is new, the pin becomes new the next time a shell runs zellij, and the session becomes
+new when it is restarted. Nothing here detects an upgrade on its own; every step is driven by
+something the user did.
+
+One wrinkle on macOS, where the pin is signed and so differs from its source. A launcher-run
+`session up` finds a stamp that does not match the pin's own bytes, calls it stale, and copies the
+pin over itself once — 40 MB for nothing, after which the stamp names the pin and the pass settles.
+It costs a copy and never correctness: the next run from the package path still sees a source hash
+the stamp does not carry, and refreshes properly.
+
 **The unit records the path, and the refresh uses the recorded one.** `up` reads the binary out of
 the installed unit rather than deriving the path again. The canonical directory honours
 `XDG_DATA_HOME`, and a launcher's environment is not the calling shell's — so a re-derived path can

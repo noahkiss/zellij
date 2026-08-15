@@ -538,10 +538,20 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
         return;
     };
     match pin_state_of(name, pinned) {
-        PinState::Recorded(path) => report.push(Finding::ok(
-            "pin",
-            format!("{} - the launcher runs it", path.display()),
-        )),
+        // and therefore `session up` runs FROM the pin, which is the state finding 2 is about: a
+        // watchdog comparing the pin with itself. Said here because it reads as a clean bill of
+        // health, and the thing it does not cover is the upgrade the user is most likely waiting on
+        PinState::Recorded(path) => report.push(
+            Finding::ok("pin", format!("{} - the launcher runs it", path.display()))
+                .note(
+                    "so `session up` from the launcher compares the pin with itself and the \
+                     watchdog cannot see a newer build",
+                )
+                .note(
+                    "an upgrade reaches the pin from a zellij run off another path - an \
+                     interactive launch, or this command with --fix",
+                ),
+        ),
         PinState::Unrecorded(path) => report.push(
             Finding::ok(
                 "pin",
