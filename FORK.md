@@ -96,6 +96,25 @@ you how to read the next.
 - **A payload command prints the payload and nothing else.** `dump-screen` writes screen content to
   stdout; it does not introduce it.
 
+**A session nothing answers to is a miss, and answers like one.** A wrong name, a name whose server
+is gone, or no name at all where the CLI cannot choose one prints its sentence and the live session
+names **on stderr**, writes nothing to stdout, and exits **2**:
+
+```
+$ zellij -s no-such-session action list-panes --json
+                                      # nothing on stdout
+Session 'no-such-session' not found. The following sessions are active:   # stderr
+work
+notes                                 # exit 2
+```
+
+It used to exit **0** with the `ls` table on stdout, so a script that mistyped a session name got a
+successful answer of the wrong shape. The cause was that every one of these paths printed its
+sentence and then called `list_sessions`, which writes the table to stdout and ends in
+`process::exit(0)` — making the `exit(1)` written on the next line unreachable. The same held for
+`zellij attach` with no session to choose from. Only the listing that was **asked** for, `zellij ls`,
+still goes to stdout.
+
 A mutation reports what it changed rather than acknowledging that it ran: `close-pane` prints
 `closed: terminal_3`, `move-tab` prints the `from:` and `to:` positions, `go-to-tab` prints the tab
 it left and the tab it landed on. The point is that the answer is usable — a script that moved a tab
