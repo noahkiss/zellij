@@ -3155,7 +3155,9 @@ pub(crate) fn route_thread_main(
                             }
                         },
                         ClientToServerMsg::ClientExited => {
-                            let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
+                            // the removal is announced once, after the route loop below - not here.
+                            // Announcing it twice is what made `new-pane --handle` report a miss for
+                            // a pane it had made: see the comment on that announcement
                             return Ok(true);
                         },
                         ClientToServerMsg::KillSession => {
@@ -3406,7 +3408,7 @@ pub(crate) fn route_thread_main(
                             exit_reason: ExitReason::Error("Received empty message".to_string()),
                         },
                     );
-                    let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
+                    // the removal is announced once, after the loop
                     break 'route_loop;
                 }
             },
@@ -3417,7 +3419,18 @@ pub(crate) fn route_thread_main(
         // connected user)
         let _ = os_input.send_to_client(client_id, ServerToClientMsg::UnblockInputThread);
     }
-    // route thread exited, make sure we clean up
+    // route thread exited, make sure we clean up.
+    //
+    // This is the ONLY place a route thread announces its client's removal, and it has to stay that
+    // way. `SessionState::new_client` hands out the lowest client id that is not in use, so in a
+    // session nothing is attached to every `zellij action` connection is client 1, one after
+    // another. Removing the client is what frees the id - so announcing it from inside the loop as
+    // well frees the id while this thread is still running, the process's next connection is given
+    // that same id, and the second announcement then removes THAT connection's sender. Dropping a
+    // sender writes `Exit { Disconnect }` down its socket, which the new client reads as the answer
+    // to the command it just sent. That is how `new-pane --handle` came to report "no pane was
+    // created" for a pane the session had made and confirmed: the `--handle` preflight connection
+    // closed, and its route thread tore down the connection that replaced it.
     let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
     Ok(())
 }

@@ -104,14 +104,17 @@ pub fn harness_for_command(command: &str) -> Option<&'static AgentHarness> {
         .find(|harness| harness.match_commands.contains(&name))
 }
 
-/// Every environment variable name any harness might keep its identity in.
+/// The environment variable names to ask the process walk for, for a pane that matched `harness`.
 ///
-/// This is the list the server asks the process walk for, once it already knows a pane matched.
-/// Sorted and deduplicated so the walk sees a stable set.
-pub fn identity_env_names() -> Vec<String> {
-    let mut names: Vec<String> = HARNESSES
+/// One harness's names, not every harness's. The walk stops as soon as it has found everything it
+/// was asked for, so asking for the union would mean a pane running `claude` could never satisfy
+/// the walk - `codex`'s variables are not going to be there - and every descendant of every agent
+/// pane would be read in full, every time. Asking only for the two names that could be there lets
+/// the walk stop at the process that has them.
+pub fn identity_env_names_for(harness: &AgentHarness) -> Vec<String> {
+    let mut names: Vec<String> = harness
+        .identity_env
         .iter()
-        .flat_map(|harness| harness.identity_env.iter())
         .map(|name| (*name).to_owned())
         .collect();
     names.sort();
@@ -165,6 +168,32 @@ pub fn detect_command_line(
     detect(&argv, env)
 }
 
+/// The agent running in a pane, and the command line that answered.
+///
+/// A pane can offer two lines - the live argv, which is what it is running NOW, and the line it
+/// was STARTED with, which is all there is for a pane the process table has not been asked about
+/// yet. The live one wins, and whichever won is returned alongside the agent.
+///
+/// Both readers of the question go through here, and that is the point. Screen wants the agent;
+/// `agents_from_pane_list` wants the line, because the `COMMAND` column of `list-agents` exists to
+/// make a wrong row obvious and can only do that if it names the line the row was decided on. Two
+/// implementations of "which line answered" would eventually disagree, and the column would be
+/// contradicting its own row.
+pub fn detect_in_pane<'a>(
+    live_command: Option<&'a str>,
+    recorded_command_line: Option<&'a str>,
+    env: &BTreeMap<String, String>,
+) -> Option<(PaneAgent, &'a str)> {
+    if let Some(live_command) = live_command {
+        if let Some(agent) = detect_command_line(live_command, env) {
+            return Some((agent, live_command));
+        }
+    }
+    let recorded_command_line = recorded_command_line?;
+    let agent = detect_command_line(recorded_command_line, env)?;
+    Some((agent, recorded_command_line))
+}
+
 /// The agents in a pane list: `zellij action list-agents`.
 ///
 /// A projection of `list-panes`, not a second question. The pane list already carries the answer
@@ -175,7 +204,15 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
     panes
         .into_iter()
         .filter_map(|entry| {
-            let agent = entry.agent?;
+            let agent = entry.agent.clone()?;
+            // the line the match was made on, which is the one the COMMAND column reports. The
+            // identity is already on the entry, so this asks only which line answered
+            let command = detect_in_pane(
+                entry.pane_info.pane_command.as_deref(),
+                entry.pane_info.terminal_command.as_deref(),
+                &BTreeMap::new(),
+            )
+            .map(|(_, command)| command.to_owned());
             Some(AgentListEntry {
                 handle: entry.pane_info.handle.clone(),
                 pane_id: entry.pane_info.id,
@@ -184,7 +221,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
                 tab_name: entry.tab_name,
                 title: entry.pane_info.title.clone(),
                 agent,
-                command: entry.pane_info.pane_command.clone(),
+                command,
                 cwd: entry.pane_info.pane_cwd.as_deref().map(PathBuf::from),
                 pid: entry.pane_info.pane_pid,
             })
@@ -266,6 +303,7 @@ fn basename(command: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::PaneInfo;
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
@@ -380,6 +418,51 @@ mod tests {
     }
 
     #[test]
+    fn the_line_that_answered_is_the_one_reported() {
+        // a pane whose live argv is not a harness, detected from the line it was started with:
+        // the COMMAND column has to name that line, not the argv that did not match
+        let (agent, command) = detect_in_pane(
+            Some("sleep 900"),
+            Some("/opt/bin/claude --continue"),
+            &env(&[]),
+        )
+        .expect("the recorded line is a harness");
+        assert_eq!(agent.kind, "claude");
+        assert_eq!(command, "/opt/bin/claude --continue");
+
+        // and when the live argv is the one that matched, it wins over the recorded line
+        let (_, command) = detect_in_pane(Some("/usr/bin/claude"), Some("zsh"), &env(&[]))
+            .expect("the live argv is a harness");
+        assert_eq!(command, "/usr/bin/claude");
+
+        assert_eq!(
+            detect_in_pane(Some("zsh"), Some("vim claude.md"), &env(&[])),
+            None
+        );
+        assert_eq!(detect_in_pane(None, None, &env(&[])), None);
+    }
+
+    #[test]
+    fn the_command_column_names_the_line_the_row_was_decided_on() {
+        let entry = PaneListEntry {
+            pane_info: PaneInfo {
+                id: 3,
+                handle: "sunny-otter".to_owned(),
+                pane_command: Some("sleep 900".to_owned()),
+                terminal_command: Some("/opt/bin/claude".to_owned()),
+                ..Default::default()
+            },
+            tab_id: 1,
+            tab_position: 0,
+            tab_name: "develop".to_owned(),
+            agent: detect_command_line("/opt/bin/claude", &env(&[])),
+        };
+        let agents = agents_from_pane_list(vec![entry]);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].command.as_deref(), Some("/opt/bin/claude"));
+    }
+
+    #[test]
     fn a_harness_named_later_in_a_recorded_line_is_not_what_the_pane_runs() {
         // the pane was started as `env`, which is what it is: the line's first word decides
         assert_eq!(
@@ -390,8 +473,8 @@ mod tests {
 
     #[test]
     fn every_harnesss_identity_variables_are_asked_for() {
-        let asked = identity_env_names();
         for harness in HARNESSES {
+            let asked = identity_env_names_for(harness);
             for name in harness.identity_env {
                 assert!(
                     asked.contains(&(*name).to_owned()),
@@ -400,6 +483,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_pane_is_only_asked_about_the_harness_it_matched() {
+        // the walk stops when it has everything it asked for, so asking a claude pane about
+        // codex's variables would mean never stopping
+        let claude = harness_for_command("claude").expect("claude is a harness");
+        let asked = identity_env_names_for(claude);
+        assert_eq!(asked.len(), claude.identity_env.len());
+        assert!(!asked.iter().any(|name| name.starts_with("CODEX_")));
     }
 
     #[test]

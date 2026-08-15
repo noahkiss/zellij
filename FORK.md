@@ -96,6 +96,25 @@ you how to read the next.
 - **A payload command prints the payload and nothing else.** `dump-screen` writes screen content to
   stdout; it does not introduce it.
 
+**A session nothing answers to is a miss, and answers like one.** A wrong name, a name whose server
+is gone, or no name at all where the CLI cannot choose one prints its sentence and the live session
+names **on stderr**, writes nothing to stdout, and exits **2**:
+
+```
+$ zellij -s no-such-session action list-panes --json
+                                      # nothing on stdout
+Session 'no-such-session' not found. The following sessions are active:   # stderr
+work
+notes                                 # exit 2
+```
+
+It used to exit **0** with the `ls` table on stdout, so a script that mistyped a session name got a
+successful answer of the wrong shape. The cause was that every one of these paths printed its
+sentence and then called `list_sessions`, which writes the table to stdout and ends in
+`process::exit(0)` — making the `exit(1)` written on the next line unreachable. The same held for
+`zellij attach` with no session to choose from. Only the listing that was **asked** for, `zellij ls`,
+still goes to stdout.
+
 A mutation reports what it changed rather than acknowledging that it ran: `close-pane` prints
 `closed: terminal_3`, `move-tab` prints the `from:` and `to:` positions, `go-to-tab` prints the tab
 it left and the tab it landed on. The point is that the answer is usable — a script that moved a tab
@@ -283,7 +302,7 @@ of what moved to get there.
 | `list-tabs` | every column, always. The gating flags stay accepted and do nothing |
 | `list-clients` | gains `TTY`, `SIZE` and `CURRENT` — the fields that were reachable only through `--json` |
 | `ls` | a table: `NAME STATUS CURRENT CLIENTS CREATED`. `-s` is untouched |
-| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2. `--no-focus` stays the existence probe, answering `id: <n>` |
+| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2 — including with nobody attached, where `go-to-tab` used to queue the switch for a tab that was never coming and exit 0. `--no-focus` stays the existence probe, answering `id: <n>` |
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
@@ -292,6 +311,7 @@ of what moved to get there.
 | `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
 | `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
+| `rename-tab --tab-id`, `edit-scrollback --pane-id`, `toggle-pane-borderless --pane-id` | a target nothing answers to exits 2 with `No tab with id 99` / `No pane answers to 'terminal_99'`, like every sibling. All three used to log the miss server-side and exit 0, which reads as a rename, an editor and a toggle that happened |
 | `query-tab-names` | gone. `list-tabs` answers it |
 
 ### What a verb does when you do not tell it what to act on
@@ -1320,6 +1340,30 @@ future route that declines a pane is reported honestly without knowing about thi
 The exit is **2**: the session changed nothing the caller can address, so it sits in the same
 bucket as every other miss (see [the CLI output convention](#the-cli-output-convention)). The stderr sentence says
 which door it came through.
+
+#### The miss has to be a real one
+
+Holding the client to a report makes a lost report indistinguishable from a pane that was never
+made, so a report the session wrote and the client never received now reads as a miss. That is what
+`new-pane --handle` did, about one call in ten: the pane was there in `list-panes` under a generated
+handle while the CLI said none had been made.
+
+Nothing about the pane was at fault. `--handle` is checked against the live panes before anything is
+created, and that check is a whole extra connection, made and closed immediately before the one that
+carries the `new-pane`. A client id is the lowest number not in use, so in a session nothing is
+attached to both connections are client 1 — and a route thread announced its client's removal twice,
+once as the client left and once as the thread ended. The first announcement freed the id, the next
+connection was given it, and the second announcement removed **that** connection's sender. Dropping
+a sender writes an `Exit { Disconnect }` down its socket, which the waiting client read as the
+answer to its `new-pane`.
+
+So a route thread now announces its client's removal exactly once, after its last act, and the id
+cannot be handed out while that thread can still reach it. The client also stops reading a
+disconnect as an empty report: it is a dropped connection, said out loud, and exits 1 — the command
+may well have run, and that is a different thing from a session that answered with nothing.
+
+The same preflight is made by `--in-tab` and by `--near`, and `zellij run`, `zellij edit` and
+`--plugin` all travel the same path, so all of them were exposed to it and all of them are covered.
 
 ### Session lifecycle: `zellij session up|down|restart`
 
@@ -3659,6 +3703,21 @@ filtered to the panes that have one.
   environment of the pane's processes, and that means walking the subtree - the same walk
   `report_pane_env` does, on the same tick, through the same code. **A session with no agent pane in
   it does not read the process table at all.**
+- *And it runs once per pane, not once per second.* A walk is a full process-table read plus one
+  environment read per descendant, and its answer does not change while the pane runs the same
+  program. So a pane is walked when it appears, when its process is replaced, and - only while
+  nothing has been found - once every thirty seconds. A pane whose harness has been identified is
+  never walked again. The walk is also asked only for the matched harness's own variable names, not
+  for every harness's, which is what lets it stop at the process that has them instead of reading
+  the whole subtree every time.
+
+  Measured on a session with one agent pane, the pty thread went from **9,800 read syscalls and
+  2.1 MB a second** to the same numbers as the same session with detection turned off - the walk had
+  been running on every tick.
+
+`COMMAND` names the command line the row was decided on - the pane's live argv when that is what
+matched, the line the pane was STARTED with when the fallback answered. The column exists to make a
+wrong row obvious, and it cannot do that while showing a line the row was not decided on.
 
 `SOURCE` says which phase answered: `command` when only the pane's command matched, `command+env`
 when an identity variable was found too. A reader that needs to know whether a missing `AGENT_ID`
@@ -3679,6 +3738,12 @@ Turn it off with the top-level key, on a machine where reading a process's envir
 ```kdl
 detect_agents false
 ```
+
+**Off means off, both phases.** The pty tick stops reading identity variables and the pane list
+stops matching commands, so `list-agents` prints its header and nothing else, `list-panes` prints
+`-` in `AGENT`, and `list-panes --json` carries no `agent` key on any entry. Both halves of the
+answer live in different threads, so the option travels to the pane list with the process info it
+governs, and a config reload flips it in either direction without a restart.
 
 Being top-level, it is ignored by a binary that predates it, so it can go into a shared config ahead
 of the upgrade.
@@ -3719,6 +3784,19 @@ the CLI's own refusal, and there is no id anywhere for it to invent. What cannot
 Which session a call is about: the tool's own `session`, else `ZELLIJ_SESSION_NAME` in the server's
 environment.
 
+**An abandoned call costs nothing.** MCP clients time out, disconnect and restart, and they do it
+without telling the server, which simply sees the future dropped. Every child is spawned with
+`kill_on_drop`, so a dropped call takes its child with it - at cancellation and at shutdown alike,
+because the runtime drops its pending tasks when stdin reaches EOF. `zellij_wait_for` is bounded
+too: without `timeout_s` it gives up after 300 seconds rather than blocking for the life of the
+pane, which is the default its own schema has always advertised.
+
+**Every tool declares the shape of what it returns**, and it is the same shape for all seven: the
+CLI's exit code, what it printed - parsed when that was JSON - what it wrote to stderr, and on a
+failure whether it was a miss or an error. The per-operation part stays in the `Returns:` line,
+which is generated. A tool that multiplexes several operations says what each of them returns
+rather than promising the first one's shape for all of them.
+
 New dependency: `rmcp` (the official Rust MCP SDK) with `server` and `transport-io` only - eight
 crates, no HTTP stack, and nothing on any wasm plugin crate.
 
@@ -3739,6 +3817,12 @@ print a table and a payload respectively, and the map had been claiming they pri
 - **`--plugin-watch` as a CLI flag.** `Options` crosses the client/server protobuf contract, and
   carrying a new field over it means regenerating the checked-in generated Rust. The setting is
   config-file only rather than pay that cost.
+- **Truncating `zellij_overview scope=panes`.** It hands back the whole `list-panes --json`, around
+  thirty keys per pane including geometry nobody asked for, and it is the tool the server's own
+  instructions say to call first. A `verbosity` parameter, or a default projection down to the keys
+  that address a pane, would be the fix. Not done because it is a new shape for the tool to return
+  rather than a flag to pass through, and every drift gate here rests on a tool returning exactly
+  what its CLI command prints.
 - **Unwatching a plugin's `.wasm` when it unloads.** Watches accumulate for the life of the
   session; a change to a no-longer-loaded plugin resolves to no running instances and does nothing.
 

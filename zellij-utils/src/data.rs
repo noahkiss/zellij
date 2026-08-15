@@ -2605,7 +2605,12 @@ pub struct AgentListEntry {
     /// The harness, its session id if it exports one, and what the answer rests on.
     #[serde(flatten)]
     pub agent: PaneAgent,
-    /// The pane's recorded command line, so a wrong row is obvious rather than mysterious.
+    /// The command line this row was decided on, so a wrong row is obvious rather than mysterious.
+    ///
+    /// Which of a pane's two lines that is depends on which one matched: the live argv for a pane
+    /// the process table has answered for, the line the pane was STARTED with otherwise. It is the
+    /// line detection used, not whichever one was handy - a column that exists to expose a wrong
+    /// row is no use if it can contradict the row it is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

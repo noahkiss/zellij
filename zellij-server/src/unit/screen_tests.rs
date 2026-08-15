@@ -9,7 +9,7 @@ use insta::assert_snapshot;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use zellij_utils::cli::CliAction;
-use zellij_utils::data::{Event, EventType, Resize, Style, WebSharing};
+use zellij_utils::data::{Event, EventType, ListPanesResponse, Resize, Style, WebSharing};
 use zellij_utils::errors::{prelude::*, ErrorContext};
 use zellij_utils::input::actions::Action;
 use zellij_utils::input::command::{RunCommand, TerminalAction};
@@ -13023,7 +13023,10 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
     );
     let _ = mock_screen
         .to_screen
-        .send(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents: true,
+        });
     // any state change makes screen rebuild the manifest and report it
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
         PaneId::Terminal(0),
@@ -13048,6 +13051,73 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
         Some("/home/user/develop/thing")
     );
     assert_eq!(reported.pane_command.as_deref(), Some("claude --resume"));
+}
+
+/// `list-panes` as Screen builds it, for a session whose pane 1 runs `claude`.
+///
+/// The whole point of the pair below is the `detect_agents` argument, so the setup is shared and
+/// only that value differs between them.
+fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+
+    let mut process_info = HashMap::new();
+    process_info.insert(
+        1,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: None,
+            command: Some(vec!["claude".to_owned()]),
+            env: Default::default(),
+            agent_env: Default::default(),
+        },
+    );
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents,
+        });
+    let (response_channel, panes) = crossbeam::channel::unbounded();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ListPanes {
+        show_all: true,
+        response_channel,
+    });
+    let pane_list = panes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("screen should answer ListPanes");
+    mock_screen.teardown(vec![screen_thread]);
+    pane_list
+}
+
+#[test]
+pub fn a_pane_running_a_harness_is_reported_as_an_agent() {
+    let pane_list = pane_list_for_a_claude_pane(true);
+    let reported = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .expect("terminal pane 1 should be in the pane list");
+    let agent = reported
+        .agent
+        .as_ref()
+        .expect("a pane running claude is an agent");
+    assert_eq!(agent.kind, "claude");
+    assert_eq!(agent.source, "command");
+}
+
+#[test]
+pub fn detect_agents_off_reports_no_agent_at_all() {
+    // the negative control for the test above: the same pane, the same command, the option off.
+    // Gating only the environment read would leave `kind: claude` here, which is the bug this
+    // pair exists to catch
+    let pane_list = pane_list_for_a_claude_pane(false);
+    let reported = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .expect("terminal pane 1 should be in the pane list");
+    assert_eq!(reported.agent, None);
+    assert!(pane_list.iter().all(|entry| entry.agent.is_none()));
 }
 
 #[test]
@@ -13306,7 +13376,10 @@ pub fn pane_info_carries_the_allowlisted_environment() {
     );
     let _ = mock_screen
         .to_screen
-        .send(ScreenInstruction::UpdatePaneProcessInfo(process_info));
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents: true,
+        });
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
         PaneId::Terminal(0),
         None,
@@ -14481,6 +14554,133 @@ pub fn closing_a_pane_id_that_is_not_there_is_a_miss() {
         result.stdout_lines.is_empty(),
         "a miss reports nothing on stdout: {:?}",
         result.stdout_lines
+    );
+}
+
+#[test]
+pub fn renaming_a_tab_id_that_is_not_there_is_a_miss() {
+    // `close-tab --tab-id` and `undo-rename-tab --tab-id` both refuse an id no tab answers to.
+    // This one used to log and exit 0, which reads as a rename that happened.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::RenameTabById {
+            id: 99,
+            name: "nowhere".to_string(),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab with id 99"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn editing_the_scrollback_of_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::EditScrollbackByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss opens no editor and says so: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn toggling_the_borderlessness_of_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::TogglePaneBorderless {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss toggles nothing and says so: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_position_that_is_not_there_is_a_miss_with_nobody_attached() {
+    // the detached half of the same gap: with no client to move, the switch used to be queued for
+    // a tab that is never coming and the CLI exited 0. `go-to-tab-name` refuses in this state
+    // already. The check is asked before the client is looked for, so it answers either way.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::GoToTab(
+        99,
+        None, // nobody is attached
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a tab position nothing sits at never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab at position 99"),
+        "{:?}",
+        result.error_message
     );
 }
 

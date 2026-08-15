@@ -52,9 +52,13 @@ pub struct ToolSpec {
     pub not_for: &'static str,
     /// The tool to reach for next, and when.
     pub follow_up: Option<&'static str>,
-    /// The CLI command whose printed output this tool returns. The `Returns:` line is generated
-    /// from that command's row in the surface map, so it cannot promise a key nothing prints.
-    pub reports: &'static str,
+    /// The CLI commands whose printed output this tool returns. The `Returns:` line is generated
+    /// from their rows in the surface map, so it cannot promise a key nothing prints.
+    ///
+    /// A list, because a tool that multiplexes several operations returns a different shape for
+    /// each of them, and one command's row cannot speak for the others. One entry is the ordinary
+    /// case; several make the line say which operation returns what.
+    pub reports: &'static [&'static str],
     /// Anything the caller has to know that the generated half cannot say - a discipline the CLI
     /// enforces, a value that has to be named explicitly. Empty for a tool with none.
     pub tips: &'static str,
@@ -63,6 +67,9 @@ pub struct ToolSpec {
     /// Whether a call can destroy something a caller cannot get back. Only meaningful when
     /// `read_only` is false.
     pub destructive: bool,
+    /// Whether repeating a call leaves the session as one call would. A read-only tool changes
+    /// nothing, so it is always true for one of those - the hint only carries information for a
+    /// tool that writes.
     pub idempotent: bool,
 }
 
@@ -89,7 +96,7 @@ pub const TOOLS: &[ToolSpec] = &[
             "zellij_read_pane to read one pane's screen, or zellij_wait_for to block until \
              something happens in it",
         ),
-        reports: "action list-panes",
+        reports: &["action list-panes"],
         tips: "scope=agents narrows the same walk to the panes running claude, opencode, codex or \
                pi, each with the harness's own session id where it exports one. scope=sessions \
                answers about the machine rather than about one session.",
@@ -125,7 +132,7 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "waiting for output that has not arrived yet, and not for a pane you cannot \
                   name: there is no default pane here.",
         follow_up: Some("zellij_wait_for when the output you want is not there yet"),
-        reports: "action dump-screen",
+        reports: &["action dump-screen"],
         tips: "",
         params: &[
             SESSION,
@@ -167,9 +174,11 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "a pane that is already in the state you want - read it instead. This call \
                   blocks, so it is not free.",
         follow_up: Some("zellij_read_pane to read what the pane says once the wait returns"),
-        reports: "action wait",
+        reports: &["action wait"],
         tips: "A wait that times out is a miss, not an error, and says so. until=match needs a \
-               pattern; until=quiet takes the window in quiet_ms.",
+               pattern; until=quiet takes the window in quiet_ms. Every wait is bounded: without \
+               timeout_s it gives up after 300 seconds rather than blocking for the life of the \
+               pane.",
         params: &[
             SESSION,
             ParamSpec {
@@ -214,8 +223,11 @@ pub const TOOLS: &[ToolSpec] = &[
             },
         ],
         read_only: true,
+        // `idempotentHint` describes what repeating a call does to the session, and a read-only
+        // call does nothing to it. Saying `false` here while the other read-only tool says `true`
+        // was noise a client could route on
         destructive: false,
-        idempotent: false,
+        idempotent: true,
     },
     ToolSpec {
         name: "zellij_write_input",
@@ -225,7 +237,7 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "starting something in a NEW pane, and not for a pane you have not named. There \
                   is no focused pane here: an unnamed target would be a pane you have never seen.",
         follow_up: Some("zellij_wait_for or zellij_read_pane to see what the pane did with it"),
-        reports: "action send-keys",
+        reports: &["action send-keys"],
         tips: "keys goes through the key parser, so `Enter`, `C-c` and `Escape` mean those keys; \
                text is written literally and presses nothing. Pass one or the other.",
         params: &[
@@ -266,7 +278,7 @@ pub const TOOLS: &[ToolSpec] = &[
                    order to talk to it afterwards.",
         not_for: "running something in a pane that already exists - write to it instead.",
         follow_up: Some("zellij_write_input or zellij_wait_for, using the handle this returns"),
-        reports: "action new-pane",
+        reports: &["action new-pane"],
         tips: "The handle in the answer is the pane's address and survives a session restore; use \
                it, not the integer id. A session with no client attached cannot lay out a new tab, \
                and this reports that miss rather than returning a pane that does not exist.",
@@ -332,7 +344,14 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "anything you cannot name a target for. Every operation here takes one, \
                   including from inside the session.",
         follow_up: Some("zellij_overview to see the shape the session ended up in"),
-        reports: "action move-pane",
+        reports: &[
+            "action move-pane",
+            "action move-tab",
+            "action stack-panes",
+            "action break-pane",
+            "action close-pane",
+            "action close-tab",
+        ],
         tips: "close_pane and close_tab cannot be undone and are confirmed for a person; this \
                tool passes the confirmation for you, so treat them as final.",
         params: &[
@@ -406,8 +425,10 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "saving one. A snapshot is written when a session is taken down, by the CLI, and \
                   session lifecycle is deliberately not reachable from here.",
         follow_up: Some("zellij_overview once a restore has rebuilt the session"),
-        reports: "snapshot list",
-        tips: "An id may be given as a unique prefix, and `latest` is a valid id for a restore.",
+        reports: &["snapshot list", "snapshot show", "snapshot restore"],
+        tips: "An id may be given as a unique prefix, and `latest` is a valid id for a restore. \
+               list and show only read; restore rebuilds a whole session, which is why this tool \
+               is marked destructive.",
         params: &[
             ParamSpec {
                 name: "operation",
@@ -436,7 +457,7 @@ pub const TOOLS: &[ToolSpec] = &[
             },
         ],
         read_only: false,
-        destructive: false,
+        destructive: true,
         idempotent: false,
     },
 ];
@@ -451,13 +472,67 @@ pub fn tool_list() -> Vec<Tool> {
     TOOLS.iter().map(describe).collect()
 }
 
+/// The shape of every tool's `structuredContent`, which is the same for all seven.
+///
+/// One schema rather than seven, because every tool is the same child process reported the same
+/// way: how the CLI exited, what it printed - parsed when it printed JSON, carried as lines when
+/// it did not - and, on a failure, whether it was a miss or an error. The per-tool part is the
+/// `result` payload, whose shape the `Returns:` line already describes in the words the surface
+/// map uses, so pinning it here would be a second copy of it to keep in step.
+fn output_schema() -> JsonObject {
+    let mut properties = Map::new();
+    properties.insert(
+        "exit_code".to_owned(),
+        json!({
+            "type": "integer",
+            "description": "The CLI's exit status: 0 acted or found, 1 an error, 2 a miss - a \
+                            well-formed request about something that is not there.",
+        }),
+    );
+    properties.insert(
+        "result".to_owned(),
+        json!({
+            "description": "What the command printed, when it printed JSON. Its shape is the one \
+                            the tool's Returns line describes.",
+        }),
+    );
+    properties.insert(
+        "output".to_owned(),
+        json!({
+            "type": "string",
+            "description": "What the command printed, when it did not print JSON.",
+        }),
+    );
+    properties.insert(
+        "diagnostics".to_owned(),
+        json!({
+            "type": "string",
+            "description": "Anything the command wrote to stderr.",
+        }),
+    );
+    properties.insert(
+        "reason".to_owned(),
+        json!({
+            "type": "string",
+            "enum": ["miss", "error", "bad_arguments", "not_run"],
+            "description": "Present only on a failed call, saying which kind it was.",
+        }),
+    );
+    let mut schema = Map::new();
+    schema.insert("type".to_owned(), json!("object"));
+    schema.insert("properties".to_owned(), Value::Object(properties));
+    schema.insert("required".to_owned(), json!([]));
+    schema
+}
+
 /// One tool, description and schema alike.
 fn describe(spec: &'static ToolSpec) -> Tool {
     let mut tool = Tool::new(
         Cow::Borrowed(spec.name),
         Cow::Owned(description(spec)),
         Arc::new(input_schema(spec)),
-    );
+    )
+    .with_raw_output_schema(Arc::new(output_schema()));
     tool.annotations = Some(
         ToolAnnotations::new()
             .read_only(spec.read_only)
@@ -478,7 +553,7 @@ pub fn description(spec: &ToolSpec) -> String {
     let mut out = String::from(spec.summary);
     out.push_str("\n\n");
     out.push_str(&format!("Best for: {}\n", spec.best_for));
-    out.push_str(&format!("Returns: {}\n", returns_line(spec.reports)));
+    out.push_str(&format!("Returns: {}\n", returns_for(spec)));
     out.push_str(&format!("Not for: {}\n", spec.not_for));
     if !spec.tips.is_empty() {
         out.push_str(&format!("Notes: {}\n", spec.tips));
@@ -487,6 +562,30 @@ pub fn description(spec: &ToolSpec) -> String {
         out.push_str(&format!("Follow up with {}.\n", follow_up));
     }
     out
+}
+
+/// What a tool puts out, across every operation it multiplexes.
+///
+/// One command gets one sentence. Several get one sentence each, named by the command, because a
+/// tool whose `restore` rebuilds a session and whose `list` prints a table cannot honestly promise
+/// the table for both - and a client that was promised columns and handed a payload has been lied
+/// to by the description it routed on.
+pub fn returns_for(spec: &ToolSpec) -> String {
+    match spec.reports {
+        [] => "nothing.".to_owned(),
+        [only] => returns_line(only),
+        many => {
+            let mut out = String::from("it depends on the operation.");
+            for command in many {
+                out.push_str(&format!(
+                    " `zellij {}` returns {}",
+                    command,
+                    returns_line(command)
+                ));
+            }
+            out
+        },
+    }
 }
 
 /// What a command puts out, said in a sentence, from the shape and keys the surface map records.
@@ -558,7 +657,17 @@ fn property(param: &ParamSpec) -> Value {
     }
     property.insert("description".to_owned(), json!(param_description(param)));
     if let Some(default) = param.default {
-        property.insert("default".to_owned(), json!(default));
+        // the table writes every default as a string, because that is what a command line takes.
+        // An integer property whose `default` is a string is not valid against its own schema, so
+        // it is put back into the type the property declares
+        let default = match param.kind {
+            ParamKind::Int => default
+                .parse::<i64>()
+                .map(|number| json!(number))
+                .unwrap_or_else(|_| json!(default)),
+            _ => json!(default),
+        };
+        property.insert("default".to_owned(), default);
     }
     Value::Object(property)
 }
@@ -638,29 +747,80 @@ mod tests {
     #[test]
     fn every_returns_line_is_the_surface_maps_own_keys() {
         for tool in TOOLS {
-            let line = returns_line(tool.reports);
-            let keys = cli_surface::promised_output_keys(tool.reports);
-            assert!(
-                cli_surface::surface_command(tool.reports).is_some(),
-                "{} reports `zellij {}`, which is not a command",
-                tool.name,
-                tool.reports,
-            );
-            if cli_surface::promised_output_shape(tool.reports).is_none() {
-                // a verb that only acts, and a Returns line that says exactly that
-                assert!(line.starts_with("nothing when it succeeds"), "{}", line);
-            }
-            if let Some(keys) = keys {
-                for key in keys.split_whitespace() {
-                    assert!(
-                        line.contains(key),
-                        "{}'s Returns line drops the `{}` key of `zellij {}`",
-                        tool.name,
-                        key,
-                        tool.reports,
-                    );
+            assert!(!tool.reports.is_empty(), "{} reports nothing", tool.name);
+            let spec_line = returns_for(tool);
+            for command in tool.reports {
+                let line = returns_line(command);
+                assert!(
+                    cli_surface::surface_command(command).is_some(),
+                    "{} reports `zellij {}`, which is not a command",
+                    tool.name,
+                    command,
+                );
+                if cli_surface::promised_output_shape(command).is_none() {
+                    // a verb that only acts, and a Returns line that says exactly that
+                    assert!(line.starts_with("nothing when it succeeds"), "{}", line);
                 }
+                if let Some(keys) = cli_surface::promised_output_keys(command) {
+                    for key in keys.split_whitespace() {
+                        assert!(
+                            line.contains(key),
+                            "{}'s Returns line drops the `{}` key of `zellij {}`",
+                            tool.name,
+                            key,
+                            command,
+                        );
+                    }
+                }
+                // and every operation's shape reaches the description the client routes on
+                assert!(
+                    spec_line.contains(&line),
+                    "{}'s description drops what `zellij {}` returns",
+                    tool.name,
+                    command,
+                );
             }
+        }
+    }
+
+    #[test]
+    fn a_tool_that_multiplexes_says_what_each_operation_returns() {
+        // `snapshot list` prints a table and `snapshot show` prints a payload; promising the
+        // table for both is the kind of lie a client cannot detect
+        let snapshot = tool_spec("zellij_snapshot").expect("a tool");
+        let line = returns_for(snapshot);
+        assert!(line.starts_with("it depends on the operation"), "{}", line);
+        assert!(line.contains("snapshot list"), "{}", line);
+        assert!(line.contains("the payload itself"), "{}", line);
+    }
+
+    #[test]
+    fn a_read_only_tool_is_idempotent_and_a_multiplexed_one_owns_its_worst_operation() {
+        for tool in TOOLS {
+            if tool.read_only {
+                assert!(
+                    tool.idempotent,
+                    "{} reads only, so repeating it cannot change anything",
+                    tool.name
+                );
+            }
+        }
+        // restore rebuilds a whole session, so the tool that offers it is destructive whatever its
+        // other two operations do
+        assert!(tool_spec("zellij_snapshot").expect("a tool").destructive);
+    }
+
+    #[test]
+    fn every_tool_declares_the_shape_of_what_it_returns() {
+        for tool in tool_list() {
+            let schema = tool.output_schema.as_ref().expect("an output schema");
+            assert_eq!(schema.get("type"), Some(&json!("object")));
+            let properties = schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .expect("properties");
+            assert!(properties.contains_key("exit_code"), "{}", tool.name);
+            assert!(properties.contains_key("result"), "{}", tool.name);
         }
     }
 

@@ -455,20 +455,44 @@ fn individual_messages_client(
                 log_lines.iter().for_each(|line| eprintln!("{line}"));
                 return ActionOutcome::Done(2);
             },
-            Some((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
-                ExitReason::Error(e) => {
-                    eprintln!("{}", e);
-                    return ActionOutcome::Done(2);
-                },
-                ExitReason::CustomExitStatus(exit_status) => {
-                    return ActionOutcome::Done(exit_status);
-                },
-                _ => {
-                    return ActionOutcome::Reported(Vec::new());
-                },
+            Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                let (outcome, diagnostic) = outcome_of_exit(exit_reason);
+                if let Some(diagnostic) = diagnostic {
+                    eprintln!("{}", diagnostic);
+                }
+                return outcome;
             },
             _ => {},
         }
+    }
+}
+
+/// What an `Exit` from the session means for the command that is waiting for its report, and the
+/// sentence to print on stderr before returning it.
+///
+/// A **disconnect is not an answer**. The session hands one to a client whose sender it dropped,
+/// which happens to a `zellij action` client that has done nothing wrong: client ids are reused as
+/// soon as they are freed, so a connection can be torn down by the departure of the one before it.
+/// Reading that as "the session reported nothing" is what made `new-pane --handle` print `No pane
+/// was created` for a pane the session had made and confirmed. The command may well have run, so
+/// the honest answer is to say the connection went and let the caller ask.
+///
+/// The rest keep their meanings: an error is the server's own words and the one exit code the
+/// client has for them, a custom status is the status, and an ordinary end of the session is a
+/// command that reported nothing.
+fn outcome_of_exit(exit_reason: ExitReason) -> (ActionOutcome, Option<String>) {
+    match exit_reason {
+        ExitReason::Error(e) => (ActionOutcome::Done(2), Some(e)),
+        ExitReason::CustomExitStatus(exit_status) => (ActionOutcome::Done(exit_status), None),
+        ExitReason::Disconnect => (
+            ActionOutcome::Done(1),
+            Some(
+                "The session dropped this connection before it answered. Whether the command ran \
+                 is unknown; ask the session before sending it again."
+                    .to_owned(),
+            ),
+        ),
+        _ => (ActionOutcome::Reported(Vec::new()), None),
     }
 }
 
@@ -1046,6 +1070,40 @@ mod tests {
             with_handle(vec!["tab_id: 4".to_owned()], "build"),
             vec!["tab_id: 4".to_owned(), "handle: build".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_dropped_connection_is_not_an_empty_report() {
+        // the session drops a `zellij action` connection for reasons that say nothing about the
+        // command: client ids are reused, so the departure of the connection before this one can
+        // take this one's sender with it. Reading the disconnect as "the session reported nothing"
+        // is what made `new-pane --handle` print a miss for a pane that had been made
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::Disconnect);
+        assert!(
+            matches!(outcome, ActionOutcome::Done(1)),
+            "a disconnect is a failed call, not a report with nothing in it"
+        );
+        assert!(
+            diagnostic.is_some_and(|line| line.contains("dropped this connection")),
+            "and it says so, rather than leaving the caller to read an empty report"
+        );
+
+        // the controls: the other reasons keep their meanings
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::Error("boom".to_owned()));
+        assert!(matches!(outcome, ActionOutcome::Done(2)));
+        assert_eq!(diagnostic.as_deref(), Some("boom"));
+
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::CustomExitStatus(7));
+        assert!(matches!(outcome, ActionOutcome::Done(7)));
+        assert_eq!(diagnostic, None);
+
+        // an ordinary end of the session IS a report with nothing in it, and stays one
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::Normal);
+        assert!(
+            matches!(&outcome, ActionOutcome::Reported(lines) if lines.is_empty()),
+            "an ordinary exit still means the command reported nothing"
+        );
+        assert_eq!(diagnostic, None);
     }
 
     #[test]

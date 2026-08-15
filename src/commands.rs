@@ -709,6 +709,24 @@ fn find_indexed_session(
     }
 }
 
+/// A session nothing answers to, said the way every other miss is said.
+///
+/// The sentence and the names of the sessions that DO exist go to stderr, and the exit is 2. Both
+/// halves matter and neither was true before: these paths called `list_sessions`, which prints the
+/// `ls` table to **stdout** and ends in `process::exit(0)` - so the `exit(1)` written after it was
+/// unreachable, and `zellij -s no-such-session action list-panes --json` answered a caller parsing
+/// stdout with a session table and a success. A miss changed nothing the caller can address, which
+/// is exit 2; see the CLI output convention in FORK.md.
+///
+/// This never returns.
+fn no_session_answers_to(sentence: String) -> ! {
+    eprintln!("{}", sentence);
+    for (name, _) in get_sessions().unwrap_or_default() {
+        eprintln!("{}", name);
+    }
+    process::exit(2);
+}
+
 /// Client entrypoint for all [`zellij_utils::cli::CliAction`]
 ///
 /// Checks session to send the action to and attaches with client
@@ -719,18 +737,15 @@ pub(crate) fn send_action_to_session(
 ) {
     match get_active_session() {
         ActiveSession::None => {
-            eprintln!("There is no active session!");
-            std::process::exit(1);
+            no_session_answers_to("There is no active session!".to_owned());
         },
         ActiveSession::One(session_name) => {
             if let Some(requested_session_name) = requested_session_name {
                 if requested_session_name != session_name {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         requested_session_name
-                    );
-                    eprintln!("{}", session_name);
-                    std::process::exit(1);
+                    ));
                 }
             }
             attach_with_cli_client(cli_action, &session_name, config);
@@ -745,19 +760,19 @@ pub(crate) fn send_action_to_session(
                 if existing_sessions.contains(&session_name) {
                     attach_with_cli_client(cli_action, &session_name, config);
                 } else {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         session_name
-                    );
-                    list_sessions(false, false, true, false);
-                    std::process::exit(1);
+                    ));
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
                 attach_with_cli_client(cli_action, &session_name, config);
             } else {
-                eprintln!("Please specify the session name to send actions to. The following sessions are active:");
-                list_sessions(false, false, true, false);
-                std::process::exit(1);
+                no_session_answers_to(
+                    "Please specify the session name to send actions to. The following sessions \
+                     are active:"
+                        .to_owned(),
+                );
             }
         },
     };
@@ -769,18 +784,15 @@ pub(crate) fn subscribe_to_session(
 ) {
     let session_name = match get_active_session() {
         ActiveSession::None => {
-            eprintln!("There is no active session!");
-            std::process::exit(1);
+            no_session_answers_to("There is no active session!".to_owned());
         },
         ActiveSession::One(session_name) => {
             if let Some(ref requested) = requested_session_name {
                 if *requested != session_name {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         requested
-                    );
-                    eprintln!("{}", session_name);
-                    std::process::exit(1);
+                    ));
                 }
             }
             session_name
@@ -795,19 +807,19 @@ pub(crate) fn subscribe_to_session(
                 if existing_sessions.contains(&session_name) {
                     session_name
                 } else {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         session_name
-                    );
-                    list_sessions(false, false, true, false);
-                    std::process::exit(1);
+                    ));
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
                 session_name
             } else {
-                eprintln!("Please specify the session name to subscribe to. The following sessions are active:");
-                list_sessions(false, false, true, false);
-                std::process::exit(1);
+                no_session_answers_to(
+                    "Please specify the session name to subscribe to. The following sessions are \
+                     active:"
+                        .to_owned(),
+                );
             }
         },
     };
@@ -1199,14 +1211,15 @@ fn attach_with_session_name(
         None => match get_active_session() {
             ActiveSession::None if create => create_new_client(),
             ActiveSession::None => {
-                eprintln!("No active zellij sessions found.");
-                process::exit(1);
+                no_session_answers_to("No active zellij sessions found.".to_owned());
             },
             ActiveSession::One(session_name) => ClientInfo::Attach(session_name, config_options),
             ActiveSession::Many => {
-                println!("Please specify the session to attach to, either by using the full name or a unique prefix.\nThe following sessions are active:");
-                list_sessions(false, false, true, false);
-                process::exit(1);
+                no_session_answers_to(
+                    "Please specify the session to attach to, either by using the full name or a \
+                     unique prefix.\nThe following sessions are active:"
+                        .to_owned(),
+                );
             },
         },
     }

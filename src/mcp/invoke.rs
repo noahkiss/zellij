@@ -23,6 +23,12 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 
+/// How long `zellij_wait_for` waits when the caller did not say.
+///
+/// The same string the tool's `timeout_s` parameter documents as its default - one constant, so a
+/// description that promises a bound and a command line that has none cannot drift apart.
+pub const WAIT_TIMEOUT_DEFAULT_S: &str = "300";
+
 /// What the CLI said, and how it ended.
 pub struct Outcome {
     pub code: i32,
@@ -46,11 +52,18 @@ pub fn zellij_binary() -> Result<PathBuf, String> {
 }
 
 /// Run the CLI and collect what it said. Never writes to this process's stdout.
+///
+/// `kill_on_drop` is what makes an abandoned call cost nothing. A tool call that blocks - `wait`
+/// is the whole point of one - is a child process that outlives its caller if nobody kills it, and
+/// a client that times out, disconnects or restarts drops the future without saying so. Dropping
+/// the future now drops the child, at client cancellation and at shutdown alike: the runtime drops
+/// its pending tasks when it goes, so an EOF on stdin reaps whatever was still in flight.
 pub async fn run(argv: &[String]) -> Result<Outcome, String> {
     let binary = zellij_binary()?;
     let output = tokio::process::Command::new(&binary)
         .args(argv)
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| {
@@ -194,10 +207,15 @@ pub fn argv(
                 rest.push("--quiet-ms".to_owned());
                 rest.push(quiet_ms);
             }
-            if let Some(timeout) = args.string("timeout_s") {
-                rest.push("--timeout".to_owned());
-                rest.push(timeout);
-            }
+            // a wait with no timeout blocks until the pane does something, which for a pane that
+            // never will is forever. The tool's own description has always named this default;
+            // applying it here is what makes the two agree, and it is what stops an abandoned
+            // call from holding a client connection to the session for the life of the pane
+            rest.push("--timeout".to_owned());
+            rest.push(
+                args.string("timeout_s")
+                    .unwrap_or_else(|| WAIT_TIMEOUT_DEFAULT_S.to_owned()),
+            );
             Ok(scoped(rest))
         },
         "zellij_write_input" => {
@@ -551,7 +569,7 @@ mod tests {
                 json!({"pane": "3", "until": "match", "pattern": "done"}),
                 None
             ),
-            "action wait 3 --for match --match done"
+            "action wait 3 --for match --match done --timeout 300"
         );
         assert!(
             refusal("zellij_wait_for", json!({"pane": "3", "until": "match"}))
@@ -563,8 +581,27 @@ mod tests {
     fn a_wait_defaults_to_the_panes_command_exiting() {
         assert_eq!(
             line("zellij_wait_for", json!({"pane": "3"}), None),
-            "action wait 3 --for exit"
+            "action wait 3 --for exit --timeout 300"
         );
+    }
+
+    #[test]
+    fn a_wait_is_always_bounded_and_the_bound_is_the_one_advertised() {
+        // an unbounded wait is a child process that outlives the client that asked for it. The
+        // default is the one the tool's own parameter description promises
+        assert_eq!(
+            crate::mcp::tools::tool_spec("zellij_wait_for")
+                .and_then(|spec| spec.params.iter().find(|p| p.name == "timeout_s"))
+                .and_then(|param| param.default),
+            Some(WAIT_TIMEOUT_DEFAULT_S)
+        );
+        assert!(line("zellij_wait_for", json!({"pane": "3"}), None).contains("--timeout 300"));
+        assert!(line(
+            "zellij_wait_for",
+            json!({"pane": "3", "timeout_s": 5}),
+            None
+        )
+        .contains("--timeout 5"));
     }
 
     #[test]
