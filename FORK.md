@@ -2458,6 +2458,14 @@ So every child doctor runs is now started with `setsid(2)`, in a session of its 
 controlling terminal. A tool that would have prompted fails fast and says why instead. A null stdin
 had always been set and does not help — the prompt never goes there.
 
+`set-key-partition-list` runs before **every** signature made with our own certificate, and not
+only on the run that minted it. The ACL it grants belongs to the keychain, not to the certificate,
+and a certificate is minted once and signed with for years — so granting it at minting time meant
+the very next run found a ready rung, signed with it, and was refused by a key nothing had ever
+approved. Proven on a real Mac: running the partition list by hand made the identical `codesign`
+succeed. It is cheap and idempotent when the ACL is already there. It is never run for an Apple
+certificate, which comes with its own.
+
 `set-key-partition-list` is also no longer allowed to end the run. It decides whether macOS asks
 for the key once per signature or never; `codesign` raises that dialog itself, and a person at the
 desktop can answer it with **Always Allow**, once. So a refusal is reported and signing continues,
@@ -2517,6 +2525,12 @@ walk compares neither the team id nor the requirement it would derive. A keychai
 certificates from two different teams would fall to a different `certificate leaf[subject.OU]`,
 which changes the requirement and drops every grant exactly as a demotion would. One machine
 holding both, from two teams, is rare enough that this is recorded rather than guarded.
+
+**A refusal quotes `codesign`'s error and not its first line.** `-f` makes it announce
+`<path>: replacing existing signature` before anything else on every run after the first, so a
+report that quoted line 1 told the user their run had failed with the one thing that had gone
+right — hiding, on a real Mac, a key ACL that had never been granted. The informational line is
+dropped and the rest is kept, joined and capped.
 
 After a signing, the follow-up is given in the order that makes it one pass: re-grant Full Disk
 Access, Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
