@@ -207,6 +207,9 @@ pub struct SubscribeCli {
 /// one go and a stamp that drifted across them would say otherwise. It is a *print* time: the
 /// client's clock when the line left it, which is later than the pane's output by however long the
 /// render and the socket took, and is the only time this side of the connection can honestly claim.
+// `humantime` is a native-only dependency; plugins compile this crate for wasm and never
+// stamp events, so the helper does not exist there
+#[cfg(not(target_family = "wasm"))]
 pub fn event_timestamp(at: std::time::SystemTime) -> String {
     humantime::format_rfc3339_millis(at).to_string()
 }
