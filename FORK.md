@@ -2227,9 +2227,17 @@ Changed
 Two gates, and the first is the one that matters. **A temp whose pid is still running is never
 touched**, because it belongs to a refresh that is still copying into it, and removing it would
 leave that refresh renaming a name nothing holds; `kill(pid, 0)` answers that, and `EPERM` counts
-as alive. **A temp younger than an hour is left alone** as a second belt, for a pid that has been
-recycled onto something unrelated. The `.zellij.sign.` temps are a separate prefix and a separate
-sweep, and neither takes the other's files.
+as alive. **A temp younger than an hour is left alone** as a second belt, for a temp being written
+by a process nothing has observed yet. Neither gate covers a recycled pid, and the age gate is not
+the one that would: a pid recycled onto a live process makes `kill(pid, 0)` say yes at any age, so
+that one temp is kept for good. The sweep reclaims space; it does not promise to.
+
+**The `.zellij.sign.` temps of the macOS signing flow ask the same two questions.** A separate
+prefix and a separate call site, so neither sweep takes the other's files, but one implementation
+of the gates. The signing sweep used to remove every `.zellij.sign.*.tmp` it found, which is the
+one thing a sweep must not do — the temp of a signing run happening right now is named the same
+way, and taking it leaves `codesign` writing into a deleted inode and that run renaming a name
+nothing holds.
 
 It is doctor's job and **not `install_pinned_exe`'s**. The install path runs before anything takes
 a lock, on every `session up` and every interactive launch, so two of them overlap routinely — and

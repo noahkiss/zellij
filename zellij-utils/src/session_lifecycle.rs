@@ -1619,9 +1619,14 @@ pub const PIN_TEMP_MINIMUM_AGE: std::time::Duration = std::time::Duration::from_
 /// **Two gates, and the pid one is the important one.** A temp file whose pid is still running
 /// belongs to a refresh that is still going, and removing it would make that refresh rename a name
 /// nothing holds. `kill(pid, 0)` answers that: `EPERM` counts as alive, because a pid this user may
-/// not signal is still a pid in use. The age gate is the second belt, for the window where a pid
-/// has been recycled onto some unrelated process, or a fresh temp is being written by a process
-/// that has not been observed yet.
+/// not signal is still a pid in use. The age gate is the second belt, for a fresh temp being
+/// written by a process that has not been observed yet, and for a clock or a filesystem that makes
+/// the mtime unreadable.
+///
+/// Neither gate covers pid reuse, and the age gate is not the one that would. A pid recycled onto
+/// an unrelated LIVE process makes `kill(pid, 0)` say yes however old the file is, so that temp is
+/// kept for good - which is the safe direction, and is why the sweep is a reclamation and not a
+/// guarantee.
 ///
 /// **Deliberately not called from [`install_pinned_exe`].** That runs before anything takes a lock,
 /// on every `session up` and every interactive launch, so two of them overlap routinely - and a
@@ -1629,6 +1634,22 @@ pub const PIN_TEMP_MINIMUM_AGE: std::time::Duration = std::time::Duration::from_
 /// `session doctor`, which the user runs on purpose, one at a time.
 #[cfg(unix)]
 pub fn stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Vec<PathBuf> {
+    stale_temps(directory, pin_temp_prefix(), minimum_age)
+}
+
+/// The same two gates, for any `<prefix><pid>.tmp` written beside the pin.
+///
+/// The pin's refresh is not the only thing that writes one: the macOS signing flow copies the pin
+/// to `.zellij.sign.<pid>.tmp`, signs the copy and renames it, and it is abandoned by exactly the
+/// same accidents. Both prefixes therefore ask the same question here rather than each keeping its
+/// own answer - see [`crate::session_signing::sweep_stale_temps`], which used to remove every
+/// `.zellij.sign.*.tmp` it found, including the one a concurrent run was signing into.
+#[cfg(unix)]
+pub fn stale_temps(
+    directory: &Path,
+    prefix: &str,
+    minimum_age: std::time::Duration,
+) -> Vec<PathBuf> {
     let now = std::time::SystemTime::now();
     let mut abandoned: Vec<PathBuf> = std::fs::read_dir(directory)
         .into_iter()
@@ -1640,7 +1661,7 @@ pub fn stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Ve
                 return false;
             };
             let Some(pid) = name
-                .strip_prefix(pin_temp_prefix())
+                .strip_prefix(prefix)
                 .and_then(|rest| rest.strip_suffix(".tmp"))
             else {
                 return false;
@@ -1670,7 +1691,17 @@ pub fn stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Ve
 /// Remove what [`stale_pin_temps`] found, reporting only what actually went.
 #[cfg(unix)]
 pub fn sweep_stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Vec<PathBuf> {
-    stale_pin_temps(directory, minimum_age)
+    sweep_stale_temps(directory, pin_temp_prefix(), minimum_age)
+}
+
+/// Remove what [`stale_temps`] found under one prefix, reporting only what actually went.
+#[cfg(unix)]
+pub fn sweep_stale_temps(
+    directory: &Path,
+    prefix: &str,
+    minimum_age: std::time::Duration,
+) -> Vec<PathBuf> {
+    stale_temps(directory, prefix, minimum_age)
         .into_iter()
         .filter(|path| std::fs::remove_file(path).is_ok())
         .collect()
