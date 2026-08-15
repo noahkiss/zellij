@@ -913,3 +913,39 @@ fn a_serialized_attribute_that_changes_back_writes_both_times() {
         "renamed back - the cache holds the middle name and has to be overwritten"
     );
 }
+
+#[test]
+fn a_pane_whose_identity_is_known_is_never_walked_again() {
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        found: true,
+        ticks_since_probe: 10_000,
+    };
+    assert!(!probe.needs_another_walk(42));
+}
+
+#[test]
+fn a_new_process_in_the_pane_is_a_new_question() {
+    // the identity belongs to the program, so replacing the program invalidates it even when the
+    // last walk answered
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        found: true,
+        ticks_since_probe: 0,
+    };
+    assert!(probe.needs_another_walk(43));
+}
+
+#[test]
+fn a_pane_with_no_identity_yet_is_retried_but_not_every_tick() {
+    let mut probe = AgentEnvProbe {
+        child_pid: 42,
+        found: false,
+        ticks_since_probe: 0,
+    };
+    assert!(!probe.needs_another_walk(42));
+    probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS - 1;
+    assert!(!probe.needs_another_walk(42));
+    probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS;
+    assert!(probe.needs_another_walk(42));
+}

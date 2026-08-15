@@ -19,7 +19,7 @@ use std::{
     path::PathBuf,
 };
 use tokio::task::JoinHandle;
-use zellij_utils::agent_detect;
+use zellij_utils::agent_detect::{self, AgentHarness};
 use zellij_utils::{
     data::{
         CommandOrPlugin, Event, FloatingPaneCoordinates, GetPaneCwdResponse, GetPanePidResponse,
@@ -223,6 +223,41 @@ impl From<&PtyInstruction> for PtyContext {
 /// session with no agent pane in it reads nothing.
 pub const DETECT_AGENTS_DEFAULT: bool = true;
 
+/// How many ticks a matched pane that has shown no identity yet waits before it is walked again.
+///
+/// A harness exports its session id when it starts, so the answer for a pane whose process has not
+/// changed is almost always the answer from last time. Re-walking it once a second buys nothing and
+/// costs a full process-table read. Thirty seconds is late enough to be free and early enough that
+/// a harness which exports its id after a slow start-up is still picked up while the pane is young.
+const AGENT_ENV_RETRY_TICKS: u32 = 30;
+
+/// What the last identity walk of a pane found, and what would make another one worth doing.
+///
+/// The walk is the expensive half of agent detection, and its answer is stable: a pane is one
+/// program, and that program's environment does not change under it. So a pane is walked when it is
+/// new, when its process is replaced, and - if nothing was found - once every
+/// [`AGENT_ENV_RETRY_TICKS`]. A pane whose identity is known is never walked again.
+#[derive(Debug)]
+struct AgentEnvProbe {
+    /// The pane's child pid at the time of the walk. A different pid is a different program, and
+    /// the only thing that can make a known identity wrong.
+    child_pid: u32,
+    /// Whether the walk found an identity. Once it has, the question is answered for this pid.
+    found: bool,
+    /// Ticks since the walk, counted only while `found` is false.
+    ticks_since_probe: u32,
+}
+
+impl AgentEnvProbe {
+    /// Whether this record is worth replacing with another walk.
+    ///
+    /// The whole cost policy, in one place so it can be read and tested without a process table.
+    fn needs_another_walk(&self, child_pid: u32) -> bool {
+        self.child_pid != child_pid
+            || (!self.found && self.ticks_since_probe >= AGENT_ENV_RETRY_TICKS)
+    }
+}
+
 /// What the pty thread knows about the process it started in a terminal pane.
 ///
 /// Everything here comes out of the caches `update_and_report_cwds` refreshes once a second for
@@ -268,6 +303,9 @@ pub(crate) struct Pty {
     /// terminal_id -> the harness session-id variables last found in that pane's processes. Only
     /// panes whose command matched a harness appear here.
     terminal_agent_envs: HashMap<u32, BTreeMap<String, String>>,
+    /// terminal_id -> when that pane was last walked for an identity, and what came of it. This is
+    /// what keeps the walk off the tick for a pane whose answer is already known.
+    agent_env_probes: HashMap<u32, AgentEnvProbe>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1045,6 +1083,7 @@ impl Pty {
             terminal_envs: HashMap::new(),
             detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
             terminal_agent_envs: HashMap::new(),
+            agent_env_probes: HashMap::new(),
             last_reported_detect_agents: None,
             last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
@@ -2313,33 +2352,57 @@ impl Pty {
     ///   which by default it does not.
     /// * Agent detection asks only about panes whose OWN command already matched a harness - which
     ///   is a string compare against a cache this tick already filled, not a probe - and then only
-    ///   for the fixed session-id variable names in `agent_detect`. A session with no agent pane
-    ///   in it therefore reads nothing, and the process table is not touched at all.
+    ///   for the session-id variable names of the harness that matched. A session with no agent
+    ///   pane in it therefore reads nothing, and the process table is not touched at all.
+    ///
+    /// **And a matched pane is not walked every tick either.** The walk is the expensive half: a
+    /// full process-table read plus one environment read per descendant. Its answer does not change
+    /// while the pane runs the same program, so it is done when a pane is new, when its process is
+    /// replaced, and - only while nothing has been found - once every [`AGENT_ENV_RETRY_TICKS`].
+    /// A session whose agents have all been identified pays a string compare a second, the same as
+    /// a session with no agents at all. See [`AgentEnvProbe`].
     ///
     /// Either way the variable lives on a process the shell started, not on the shell, so this
     /// walks down from the pane's own child - the same problem `resurrect_command_hints` solves,
     /// and the same code solving it.
     fn refresh_pane_envs(&mut self) {
-        let agent_panes: Vec<(u32, u32)> = if self.detect_agents {
+        let agent_panes: Vec<(u32, u32, &'static AgentHarness)> = if self.detect_agents {
             self.id_to_child_pid
                 .iter()
-                .filter(|(terminal_id, _)| {
-                    self.reported_command_for(**terminal_id)
-                        .and_then(|command| {
-                            command
-                                .first()
-                                .and_then(|argv0| agent_detect::harness_for_command(argv0))
-                        })
-                        .is_some()
+                .filter_map(|(terminal_id, child_pid)| {
+                    let harness = self
+                        .reported_command_for(*terminal_id)
+                        .and_then(|command| command.first())
+                        .and_then(|argv0| agent_detect::harness_for_command(argv0))?;
+                    Some((*terminal_id, *child_pid, harness))
                 })
-                .map(|(terminal_id, child_pid)| (*terminal_id, *child_pid))
                 .collect()
         } else {
             Vec::new()
         };
-        if self.report_pane_env.is_empty() && agent_panes.is_empty() {
+        // a pane that closed, or stopped running a harness, keeps neither an answer nor a record of
+        // having been asked - and detection being turned off empties both, which is the same thing
+        let is_agent_pane =
+            |terminal_id: &u32| agent_panes.iter().any(|(id, _, _)| id == terminal_id);
+        self.terminal_agent_envs
+            .retain(|terminal_id, _| is_agent_pane(terminal_id));
+        self.agent_env_probes
+            .retain(|terminal_id, _| is_agent_pane(terminal_id));
+
+        // the panes worth a walk this tick, and a tick counted against the ones that are not
+        let mut to_probe: Vec<(u32, u32, &'static AgentHarness)> = Vec::new();
+        for (terminal_id, child_pid, harness) in &agent_panes {
+            if let Some(probe) = self.agent_env_probes.get_mut(terminal_id) {
+                if !probe.needs_another_walk(*child_pid) {
+                    probe.ticks_since_probe = probe.ticks_since_probe.saturating_add(1);
+                    continue;
+                }
+            }
+            to_probe.push((*terminal_id, *child_pid, *harness));
+        }
+
+        if self.report_pane_env.is_empty() && to_probe.is_empty() {
             self.terminal_envs.clear();
-            self.terminal_agent_envs.clear();
             return;
         }
         let process_tree = ProcessTree::read();
@@ -2355,16 +2418,23 @@ impl Pty {
                 })
                 .collect();
         }
-        let identity_vars = agent_detect::identity_env_names();
-        self.terminal_agent_envs = agent_panes
-            .into_iter()
-            .map(|(terminal_id, child_pid)| {
-                (
-                    terminal_id,
-                    process_tree.find_all_envs(child_pid, &identity_vars),
-                )
-            })
-            .collect();
+        for (terminal_id, child_pid, harness) in to_probe {
+            let identity_vars = agent_detect::identity_env_names_for(harness);
+            let found = process_tree.find_all_envs(child_pid, &identity_vars);
+            self.agent_env_probes.insert(
+                terminal_id,
+                AgentEnvProbe {
+                    child_pid,
+                    found: !found.is_empty(),
+                    ticks_since_probe: 0,
+                },
+            );
+            if found.is_empty() {
+                self.terminal_agent_envs.remove(&terminal_id);
+            } else {
+                self.terminal_agent_envs.insert(terminal_id, found);
+            }
+        }
     }
 
     /// The command this tick would report for a pane: its foreground process, or its shell.

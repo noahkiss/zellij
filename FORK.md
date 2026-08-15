@@ -3703,6 +3703,17 @@ filtered to the panes that have one.
   environment of the pane's processes, and that means walking the subtree - the same walk
   `report_pane_env` does, on the same tick, through the same code. **A session with no agent pane in
   it does not read the process table at all.**
+- *And it runs once per pane, not once per second.* A walk is a full process-table read plus one
+  environment read per descendant, and its answer does not change while the pane runs the same
+  program. So a pane is walked when it appears, when its process is replaced, and - only while
+  nothing has been found - once every thirty seconds. A pane whose harness has been identified is
+  never walked again. The walk is also asked only for the matched harness's own variable names, not
+  for every harness's, which is what lets it stop at the process that has them instead of reading
+  the whole subtree every time.
+
+  Measured on a session with one agent pane, the pty thread went from **9,800 read syscalls and
+  2.1 MB a second** to the same numbers as the same session with detection turned off - the walk had
+  been running on every tick.
 
 `SOURCE` says which phase answered: `command` when only the pane's command matched, `command+env`
 when an identity variable was found too. A reader that needs to know whether a missing `AGENT_ID`

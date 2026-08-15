@@ -104,14 +104,17 @@ pub fn harness_for_command(command: &str) -> Option<&'static AgentHarness> {
         .find(|harness| harness.match_commands.contains(&name))
 }
 
-/// Every environment variable name any harness might keep its identity in.
+/// The environment variable names to ask the process walk for, for a pane that matched `harness`.
 ///
-/// This is the list the server asks the process walk for, once it already knows a pane matched.
-/// Sorted and deduplicated so the walk sees a stable set.
-pub fn identity_env_names() -> Vec<String> {
-    let mut names: Vec<String> = HARNESSES
+/// One harness's names, not every harness's. The walk stops as soon as it has found everything it
+/// was asked for, so asking for the union would mean a pane running `claude` could never satisfy
+/// the walk - `codex`'s variables are not going to be there - and every descendant of every agent
+/// pane would be read in full, every time. Asking only for the two names that could be there lets
+/// the walk stop at the process that has them.
+pub fn identity_env_names_for(harness: &AgentHarness) -> Vec<String> {
+    let mut names: Vec<String> = harness
+        .identity_env
         .iter()
-        .flat_map(|harness| harness.identity_env.iter())
         .map(|name| (*name).to_owned())
         .collect();
     names.sort();
@@ -390,8 +393,8 @@ mod tests {
 
     #[test]
     fn every_harnesss_identity_variables_are_asked_for() {
-        let asked = identity_env_names();
         for harness in HARNESSES {
+            let asked = identity_env_names_for(harness);
             for name in harness.identity_env {
                 assert!(
                     asked.contains(&(*name).to_owned()),
@@ -400,6 +403,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_pane_is_only_asked_about_the_harness_it_matched() {
+        // the walk stops when it has everything it asked for, so asking a claude pane about
+        // codex's variables would mean never stopping
+        let claude = harness_for_command("claude").expect("claude is a harness");
+        let asked = identity_env_names_for(claude);
+        assert_eq!(asked.len(), claude.identity_env.len());
+        assert!(!asked.iter().any(|name| name.starts_with("CODEX_")));
     }
 
     #[test]
