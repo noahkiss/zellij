@@ -2333,19 +2333,54 @@ unsigned or ad-hoc-signed binary has no identity to name, so the requirement is 
 worked yesterday. A signature anchored on a certificate ends that, and it runs by default;
 `--no-sign` opts out.
 
-Four rungs, first hit wins:
+Four rungs, best first — and a rung that **refuses** is walked past, not stopped on:
 
 1. **Developer ID Application** — `codesign` already anchors it on the team id. Timestamped.
 2. **Apple Development** — the requirement is written by hand, anchored on `subject.OU`. Never on
    the CN: the CN carries an email that changes on reissue and differs between two of one person's
    machines, while the OU is the team id and is the same everywhere that Apple ID is. Timestamped.
+   The text is a requirement **set** — `designated => identifier "…" and anchor apple generic and
+   certificate leaf[subject.OU] = "…"` — and the `designated =>` is not decoration. `codesign -r`
+   parses what it is handed as a set of `tag => expression` pairs, so a text opening with
+   `identifier` puts a reserved word where a tag belongs and the whole rung is refused before
+   signing starts, with `Requirement syntax error(s): line 1:1: unexpected token: identifier`. It
+   reaches `codesign` as one argv, `-r=<text>`: the leading `=` is what makes the value inline
+   text rather than a path to a file.
 3. **One we mint**, kept 0700/0600 in `~/Library/Application Support/zellij/signing/`, with a copy
    of `id.p12` in zellij's resolved config directory — and a copy that could not be written is a
    `Needs you`, because the bundle carries no passphrase and cannot be minted a second time. Minted
    **once**: its own hash is the requirement, so a second certificate voids every grant recorded
    against the first — a keychain that lost it is re-imported from the bundle rather than given a
-   new one. Never timestamped: Apple's server needs a real chain and would only refuse.
+   new one. Never timestamped: Apple's server needs a real chain and would only refuse. The `.p12`
+   is written with a SHA-1 MAC and `PBE-SHA1-3DES` for both key and certificate, because that is
+   what `security import` reads — OpenSSL 3 defaults to neither and macOS reports the MAC it
+   cannot verify as a password it was not given: `SecKeychainItemImport: MAC verification failed
+   during PKCS12 import (wrong password?)`. `-legacy` is what lets OpenSSL 3 write those
+   algorithms, and it is tried first and dropped on failure rather than decided from a version
+   string: macOS ships LibreSSL as `/usr/bin/openssl` and LibreSSL has no such flag, while a
+   Homebrew OpenSSL 3 may be first on `PATH` instead.
 4. **Nothing** — the Xcode steps, as a `Needs you`.
+
+A certificate the keychain OFFERS is not a certificate that SIGNS, so the two Apple rungs are
+walked and not merely sampled. When one refuses, the other is tried, and the signature that lands
+says which rung above it would not sign. Stopping on the first refusal was the old behaviour and it
+was the worse of two outcomes: `session up` refreshes the pin ad-hoc-signed and doctor is what
+makes it anchored, so a doctor that gave up left the machine in exactly the state this rung exists
+to remove, with a working certificate standing one step below. Only a failure the certificate
+cannot explain — a copy or a rename that the filesystem refused — stops the walk, because another
+rung would write the same error a second time.
+
+**The walk stops at the Apple rungs, and that boundary is the point.** Falling from a Developer ID
+to an Apple Development certificate of the same team keeps the requirement: `codesign` derives the
+same `identifier … and anchor apple generic and certificate leaf[subject.OU] = "TEAM"` for the
+first that we write by hand for the second. The certificate we mint does **not** — its requirement
+is its own hash — so walking into it would void every grant on the machine. And a refusal is not
+always the certificate's fault: `errSecInternalComponent`, a keychain locked over SSH, a "Deny" on
+the key-access dialog. Each is transient, and each would otherwise demote the pin permanently —
+permanently, because a self-signed signature *is* anchored, so the next doctor run reads the pin as
+already correct and never climbs back. So rung 3 is reached only when the keychain offers no Apple
+certificate at all. A machine that holds one and cannot use it gets a `Needs you` naming what each
+certificate said, and nothing is minted that the machine would never otherwise have had.
 
 Nothing is ever signed ad-hoc: that anchors on the code hash, which is the fault under a new name.
 No trusted root is ever added — requirement evaluation does not consult trust unless the requirement
@@ -2365,8 +2400,17 @@ The round trip is a copy, a sign, two verifications and a rename. `codesign` wri
 running server holds the pin open, so an in-place sign fails `ETXTBSY` exactly when a session is up.
 The two verifications are two questions because they fail apart: a signature can verify while its
 requirement still names the code hash, which is a run that reported success and fixed nothing.
-Anything that goes wrong leaves the working pin untouched and reports a `Needs you` — a machine that
-cannot sign is still a machine worth reporting on.
+Anything that goes wrong leaves the working pin untouched, and a run that reached the bottom of the
+ladder reports a `Needs you` naming every rung that refused and what each one said — a machine that
+cannot sign is still a machine worth reporting on. The Xcode steps come with it only when the
+keychain held no Apple certificate; a machine whose certificate merely refused is pointed at the
+key and the keychain instead, which is what refuses like that.
+
+**Known limitation: the rename is not coordinated with `session up`.** Signing is copy → sign →
+verify → `rename`, and `install_pinned_exe` does its own copy → rename. A `session up` that lands a
+newer pin while doctor is mid-run can be clobbered by doctor's signed copy of the older one. It is
+pre-existing and unlikely — the two are typed seconds apart at worst — and the recovery is to run
+`zellij session doctor --fix` again, which sees the stale pin and replaces it.
 
 After a signing, the follow-up is given in the order that makes it one pass: re-grant Full Disk
 Access, Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
