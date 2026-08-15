@@ -1402,7 +1402,8 @@ pub enum CliAction {
         unblock_condition: Option<UnblockCondition>,
 
         /// Put the pane in a tab of its own, made now, and report `tab_id:` as well as the pane.
-        /// With a NAME the tab is called that; bare, zellij names it as it names any new tab
+        /// With a NAME the tab is called that; bare, zellij names it as it names any new tab. The
+        /// pane in it cannot be named with --name: use --handle, or rename it once it is there
         #[clap(
             long,
             value_name = "NAME",
@@ -1413,7 +1414,8 @@ pub enum CliAction {
             conflicts_with("floating"),
             conflicts_with("tab_id"),
             conflicts_with("near_current_pane"),
-            conflicts_with("blocking")
+            conflicts_with("blocking"),
+            conflicts_with("name")
         )]
         new_tab: Option<Option<String>>,
 
@@ -3004,11 +3006,13 @@ mod tests {
             } => {
                 assert_eq!(tab_name.as_deref(), Some("build"));
                 assert!(should_change_focus_to_new_tab);
-                assert!(initial_panes.is_none(), "the layout carries the command");
-                let layout = tiled_layout.as_ref().expect("a layout for the one pane");
-                assert!(layout.children.is_empty(), "one pane, not a tree of them");
-                match layout.run.as_ref().expect("the command") {
-                    crate::input::layout::Run::Command(command) => {
+                // no layout of our own: the tab is built from the session's new-tab template, so it
+                // keeps its status bars and its panes are serialized like any other tab's
+                assert!(tiled_layout.is_none(), "got: {:?}", tiled_layout);
+                let panes = initial_panes.as_ref().expect("the command");
+                assert_eq!(panes.len(), 1);
+                match &panes[0] {
+                    crate::data::CommandOrPlugin::Command(command) => {
                         assert_eq!(command.command, std::path::PathBuf::from("cargo"));
                         assert_eq!(command.args, vec!["test".to_owned()]);
                     },
@@ -3025,12 +3029,12 @@ mod tests {
         match &actions[0] {
             Action::NewTab {
                 tab_name,
-                tiled_layout,
+                initial_panes,
                 ..
             } => {
                 assert_eq!(tab_name, &None, "zellij names it");
-                // a pane with no command is the shell, which is what a bare `new-pane` opens
-                assert!(tiled_layout.as_ref().expect("a layout").run.is_none());
+                // no command: the tab opens the shell, which is what a bare `new-pane` opens
+                assert!(initial_panes.is_none());
             },
             other => panic!("Expected NewTab, got {:?}", other),
         }
@@ -3058,6 +3062,8 @@ mod tests {
             vec!["new-pane", "--new-tab", "--in-place"],
             vec!["new-pane", "--new-tab", "--tab-id", "2"],
             vec!["new-pane", "--new-tab", "--near-current-pane"],
+            // the pane in a new tab cannot carry a name, so the flag is refused rather than dropped
+            vec!["new-pane", "--new-tab", "--name", "shell"],
         ] {
             assert!(
                 action_parse_fails(&args),

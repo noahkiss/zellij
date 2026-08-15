@@ -2,9 +2,8 @@
 
 pub use super::command::{OpenFilePayload, RunCommandAction};
 use super::layout::{
-    FloatingPaneLayout, Layout, PluginAlias, PluginUserConfiguration, Run, RunPlugin,
-    RunPluginLocation, RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo,
-    TiledPaneLayout,
+    FloatingPaneLayout, Layout, PluginAlias, PluginUserConfiguration, RunPlugin, RunPluginLocation,
+    RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
 };
 use crate::cli::CliAction;
 use crate::data::{
@@ -1133,7 +1132,7 @@ impl Action {
                     // a chosen handle is given to the pane after it is made, by the client holding
                     // the report. Reaching here means it would have been dropped in silence.
                     return Err(
-                        "`--handle` is applied once the pane exists, and it was still on the                          request when the action was built."
+                        "`--handle` is applied once the pane exists, and it was still on the request when the action was built."
                             .to_owned(),
                     );
                 }
@@ -1185,8 +1184,10 @@ impl Action {
                 });
                 if let Some(tab_name) = new_tab {
                     // A tab arrives with a pane in it, so "run this in a tab of its own" is one
-                    // action rather than two: the tab is described by a one-pane layout carrying
-                    // the command, and what comes back is `tab_id:` with the pane it made.
+                    // action rather than two: the command is handed to the new tab as its first
+                    // pane, and what comes back is `tab_id:` with the pane it made. The tab is
+                    // built from the session's own new-tab template like every other tab, which is
+                    // what keeps its status bars, and its panes, in the session's saved layout.
                     if blocking {
                         return Err(
                             "`--blocking` waits for a pane to close and cannot say which \
@@ -1195,46 +1196,37 @@ impl Action {
                                 .to_owned(),
                         );
                     }
-                    let run = if let Some(plugin) = plugin {
-                        Some(Run::Plugin(Self::run_plugin_or_alias(
+                    let initial_panes = if let Some(plugin) = plugin {
+                        Some(vec![CommandOrPlugin::Plugin(Self::run_plugin_or_alias(
                             plugin,
                             configuration,
                             cwd.clone(),
                             alias_cwd,
                             current_dir,
-                        )))
+                        ))])
                     } else if !command.is_empty() {
                         let mut command = command;
                         let (command, args) = (PathBuf::from(command.remove(0)), command);
-                        Some(Run::Command(
-                            RunCommandAction {
-                                command,
-                                args,
-                                cwd: cwd.clone(),
-                                hold_on_close: !close_on_exit,
-                                hold_on_start: start_suspended,
-                                ..Default::default()
-                            }
-                            .into(),
-                        ))
+                        Some(vec![CommandOrPlugin::Command(RunCommandAction {
+                            command,
+                            args,
+                            cwd: cwd.clone(),
+                            hold_on_close: !close_on_exit,
+                            hold_on_start: start_suspended,
+                            ..Default::default()
+                        })])
                     } else {
                         None
                     };
-                    let tiled_layout = TiledPaneLayout {
-                        name,
-                        run,
-                        borderless,
-                        ..Default::default()
-                    };
                     return Ok(vec![Action::NewTab {
-                        tiled_layout: Some(tiled_layout),
+                        tiled_layout: None,
                         floating_layouts: vec![],
                         swap_tiled_layouts: None,
                         swap_floating_layouts: None,
                         tab_name,
                         should_change_focus_to_new_tab: !no_focus,
                         cwd,
-                        initial_panes: None,
+                        initial_panes,
                         first_pane_unblock_condition: unblock_condition,
                     }]);
                 }
