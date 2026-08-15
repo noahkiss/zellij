@@ -3967,6 +3967,16 @@ failure whether it was a miss or an error. The per-operation part stays in the `
 which is generated. A tool that multiplexes several operations says what each of them returns
 rather than promising the first one's shape for all of them.
 
+**The tool list carries `ttlMs` and `cacheScope`**, which protocol version `2026-07-28` requires of
+every list result (SEP-2549). rmcp models both as optional, because one Rust type has to serve the
+older revisions too, so a server that never sets them compiles and then emits a list the newer
+schema rejects. A client that opens with `server/discover` - Claude Code does - is told the server
+speaks `2026-07-28`, sends `tools/list` in that era, and refuses the reply: the connection succeeds
+and **no tools reach the model**, which reads as a missing server rather than a protocol fault. A
+client that negotiates `2025-11-25` through `initialize` never sees it. The fields are set rather
+than the advertised versions narrowed, so the server conforms to the era it claims instead of
+opting out of it, and a test asserts both are on the wire.
+
 New dependency: `rmcp` (the official Rust MCP SDK) with `server` and `transport-io` only - eight
 crates, no HTTP stack, and nothing on any wasm plugin crate.
 
