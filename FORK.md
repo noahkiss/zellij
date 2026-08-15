@@ -2441,8 +2441,28 @@ certificate said, and nothing is minted that the machine would never otherwise h
 Nothing is ever signed ad-hoc: that anchors on the code hash, which is the fault under a new name.
 No trusted root is ever added — requirement evaluation does not consult trust unless the requirement
 says `trusted`, and ours never does. What signing needs is keychain ACL access, and
-`ZELLIJ_KEYCHAIN_PASSWORD` is the escape hatch for a run over SSH, where there is no dialog to
-answer.
+`ZELLIJ_KEYCHAIN_PASSWORD` is how a run gets it without a person present. It is read from the
+environment when it is set, and doctor never asks for it.
+
+**That variable is not an SSH-only escape hatch, and calling it one was wrong twice over.**
+`security(1)` writes its password prompt to the **controlling terminal** — not through the window
+server, and not to stdin — so being inside a graphical session buys nothing. At 0.45.0-nkmk.8
+`security set-key-partition-list` with no `-k` blocked forever in a pane on a real Mac: no
+SecurityAgent process, no dialog, no timeout, an empty report, and one line on the pane's terminal:
+
+```text
+(deprecated) password to unlock /Users/…/login.keychain-db:
+```
+
+So every child doctor runs is now started with `setsid(2)`, in a session of its own with no
+controlling terminal. A tool that would have prompted fails fast and says why instead. A null stdin
+had always been set and does not help — the prompt never goes there.
+
+`set-key-partition-list` is also no longer allowed to end the run. It decides whether macOS asks
+for the key once per signature or never; `codesign` raises that dialog itself, and a person at the
+desktop can answer it with **Always Allow**, once. So a refusal is reported and signing continues,
+and a `codesign` that then refuses too names both remedies: run doctor from a terminal in the
+desktop session and click Always Allow, or set `ZELLIJ_KEYCHAIN_PASSWORD`.
 
 That rule has a consequence in the *discovery* step, and it is not obvious. `security find-identity
 -v -p codesigning` lists valid identities, and validity there is a **trust** decision — so a
