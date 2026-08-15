@@ -2304,6 +2304,19 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
     },
+    /// List the panes running a coding agent, and which agent each one is
+    ///
+    /// A filtered `list-panes`: the panes whose command is a harness this build recognises -
+    /// claude, opencode, codex, pi - with the harness's own session id where it exports one.
+    /// `SOURCE` says what the row rests on: `command` when only the pane's command matched,
+    /// `command+env` when an identity variable was found in the pane's processes as well.
+    ///
+    /// Returns: a table, or the same rows with --json. No agents prints the header alone.
+    ListAgents {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// Get information about the currently active tab
     ///
     /// Returns: `name:`, `id:` and `position:` lines, or the full TabInfo with --json

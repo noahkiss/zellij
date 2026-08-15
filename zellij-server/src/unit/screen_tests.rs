@@ -13018,6 +13018,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
             cwd: Some(std::path::PathBuf::from("/home/user/develop/thing")),
             command: Some(vec!["claude".to_owned(), "--resume".to_owned()]),
             env: Default::default(),
+            agent_env: Default::default(),
         },
     );
     let _ = mock_screen
@@ -13300,6 +13301,7 @@ pub fn pane_info_carries_the_allowlisted_environment() {
             env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
                 .into_iter()
                 .collect(),
+            agent_env: Default::default(),
         },
     );
     let _ = mock_screen

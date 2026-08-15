@@ -415,6 +415,16 @@ pub struct Options {
     #[serde(default)]
     pub report_pane_env: Option<Vec<String>>,
 
+    /// Whether to work out which panes are running a coding agent, so that `list-agents` and
+    /// `list-panes` can say so. Default: true. Detection is by the pane's own command first, which
+    /// costs nothing; only a pane that already matched has its processes read, and then only for
+    /// the fixed list of session-id variables the harnesses export. Set it false on a machine
+    /// where reading a process's environment is not wanted at all.
+    /// config.kdl only - it is read by the server when it reports pane state.
+    #[clap(skip)]
+    #[serde(default)]
+    pub detect_agents: Option<bool>,
+
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
     #[clap(skip)]
@@ -679,6 +689,7 @@ impl Options {
             .report_pane_env
             .clone()
             .or_else(|| self.report_pane_env.clone());
+        let detect_agents = other.detect_agents.or(self.detect_agents);
         let default_floating_size = other
             .default_floating_size
             .clone()
@@ -772,6 +783,7 @@ impl Options {
             session_service,
             resurrect_command_hints,
             report_pane_env,
+            detect_agents,
             default_floating_size,
             styled_underlines,
             serialization_interval,
@@ -885,6 +897,7 @@ impl Options {
             .report_pane_env
             .clone()
             .or_else(|| self.report_pane_env.clone());
+        let detect_agents = other.detect_agents.or(self.detect_agents);
         let default_floating_size = other
             .default_floating_size
             .clone()
@@ -978,6 +991,7 @@ impl Options {
             session_service,
             resurrect_command_hints,
             report_pane_env,
+            detect_agents,
             default_floating_size,
             styled_underlines,
             serialization_interval,

@@ -3048,6 +3048,8 @@ impl Options {
             ),
             None => None,
         };
+        let detect_agents =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "detect_agents").map(|(v, _)| v);
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -3206,6 +3208,7 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             report_pane_env,
+            detect_agents,
             session_service,
             resurrect_command_hints,
             default_floating_size,
@@ -3612,6 +3615,13 @@ impl Options {
         for name in names {
             node.push(KdlValue::String(name.to_owned()));
         }
+        Some(node)
+    }
+    /// The `detect_agents` node: whether panes are checked for a coding agent at all.
+    fn detect_agents_to_kdl(&self) -> Option<KdlNode> {
+        let detect_agents = self.detect_agents?;
+        let mut node = KdlNode::new("detect_agents");
+        node.push(KdlValue::Bool(detect_agents));
         Some(node)
     }
     fn session_restart_drop_env_to_kdl(&self) -> Option<KdlNode> {
@@ -5360,6 +5370,9 @@ impl Options {
         }
         if let Some(report_pane_env) = self.report_pane_env_to_kdl() {
             nodes.push(report_pane_env);
+        }
+        if let Some(detect_agents) = self.detect_agents_to_kdl() {
+            nodes.push(detect_agents);
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);

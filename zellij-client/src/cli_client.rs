@@ -12,6 +12,7 @@ use crate::os_input_output::ClientOsApi;
 use regex::Regex;
 use uuid::Uuid;
 use zellij_utils::{
+    agent_detect,
     cli::{SubscribeCli, SubscribeFormat},
     data::{PaneId, PaneListEntry},
     errors::prelude::*,
@@ -672,6 +673,67 @@ pub fn start_wait_client(
     }
 }
 
+/// `zellij action list-agents`: the panes running a coding agent.
+///
+/// Answered by the client, from one `list-panes --json`. The pane list already carries the
+/// detection on every entry, so this is a filter and a printer - which is what keeps `list-agents`
+/// off the client/server contract entirely.
+///
+/// Returns the process exit status: 0 answered - an empty list is still an answer - and 1 for a
+/// call the session could not carry out.
+pub fn start_list_agents_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    output_json: bool,
+) -> i32 {
+    let lines = match ask(
+        os_input,
+        session_name,
+        Action::ListPanes {
+            show_tab: true,
+            show_command: true,
+            show_state: false,
+            show_geometry: false,
+            show_all: false,
+            output_json: true,
+        },
+        "the panes of this session",
+    ) {
+        Ok(lines) => lines,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    let panes: Vec<PaneListEntry> = match serde_json::from_str(&lines.join("\n")) {
+        Ok(panes) => panes,
+        // a session that answered with something other than a pane list is a bug rather than a
+        // miss, so it is an error and says what it could not read
+        Err(e) => {
+            eprintln!(
+                "Could not read the pane list this session answered with: {}",
+                e
+            );
+            return 1;
+        },
+    };
+    let agents = agent_detect::agents_from_pane_list(panes);
+    if output_json {
+        match serde_json::to_string_pretty(&agents) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Could not write the agent list as JSON: {}", e);
+                return 1;
+            },
+        }
+    } else {
+        for line in agent_detect::agent_table(&agents) {
+            println!("{}", line);
+        }
+    }
+    0
+}
+
 /// A wait that ended without its condition: the sentence to print, and which exit code it is.
 enum WaitMiss {
     Missed(String),
@@ -1092,6 +1154,7 @@ mod tests {
                 tab_id: 0,
                 tab_position: 0,
                 tab_name: "tab".to_owned(),
+                agent: None,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()
