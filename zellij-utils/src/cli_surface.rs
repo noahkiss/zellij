@@ -10,6 +10,8 @@
 //! What is written down is guarded by the tests at the bottom: a new `CliAction` variant that
 //! nobody grouped fails the build, rather than quietly going missing from the map.
 
+use std::sync::OnceLock;
+
 use clap::{ArgAction, Command as ClapCommand, CommandFactory, FromArgMatches};
 
 use crate::cli::CliArgs;
@@ -317,6 +319,16 @@ const OUTPUTS: &[OutputSpec] = &[
         shape: "table",
         keys: "NAME STATUS CURRENT CLIENTS CREATED",
     },
+    OutputSpec {
+        command: "snapshot list",
+        shape: "table",
+        keys: "ID SESSION SAVED REASON TABS PANES",
+    },
+    OutputSpec {
+        command: "snapshot show",
+        shape: "payload",
+        keys: "",
+    },
     // a stream rather than an answer: the pane's own lines, until the pane closes. `--format json`
     // wraps each update in a record instead, and `--timestamps` adds the time to either
     OutputSpec {
@@ -458,7 +470,6 @@ pub fn parse_cli_args() -> CliArgs {
 /// One record per command, deepest path spelled out in full, so a reader can grep for the command
 /// it wants and get the flags with it.
 pub fn dump_surface_text() -> String {
-    let cmd = CliArgs::command();
     let mut out = String::new();
     out.push_str(&format!("version: {}\n", VERSION));
     out.push_str("convention: record is `key: value` lines, list is a table with an UPPER_SNAKE header, nesting is an indented outline\n");
@@ -466,16 +477,15 @@ pub fn dump_surface_text() -> String {
     out.push_str("prints: a command with no `prints:` line prints nothing when it succeeds\n");
     out.push_str("pane_target: terminal_1 | plugin_2 | 3 | sunny-otter (handle) | uuid\n");
     out.push('\n');
-    for command in walk(&cmd) {
-        out.push_str(&command_record(&command));
+    for command in surface_commands() {
+        out.push_str(&command_record(command));
     }
     out
 }
 
 /// The same map, structured, for a program rather than an agent reading a shell.
 pub fn dump_surface_json() -> String {
-    let cmd = CliArgs::command();
-    let commands: Vec<serde_json::Value> = walk(&cmd)
+    let commands: Vec<serde_json::Value> = surface_commands()
         .iter()
         .map(|c| {
             let output = OUTPUTS.iter().find(|o| o.command == c.path);
@@ -515,22 +525,79 @@ pub fn dump_surface_json() -> String {
     serde_json::to_string_pretty(&document).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
 }
 
-struct SurfaceCommand {
-    path: String,
-    group: Option<&'static str>,
-    about: String,
-    aliases: Vec<String>,
-    args: Vec<SurfaceArg>,
+/// One command of the tree, as the dump describes it.
+///
+/// Public because the dump is not the only reader of this map any more: the MCP server builds its
+/// tool descriptions and input schemas out of the same records, so that a flag cannot exist in one
+/// and not the other.
+pub struct SurfaceCommand {
+    /// The command path, without the leading `zellij `. `action dump-screen`.
+    pub path: String,
+    /// The band, for an `action` verb; `None` for everything else.
+    pub group: Option<&'static str>,
+    pub about: String,
+    pub aliases: Vec<String>,
+    pub args: Vec<SurfaceArg>,
 }
 
-struct SurfaceArg {
-    name: String,
-    positional: bool,
-    kind: String,
-    required: bool,
-    repeatable: bool,
-    default: Option<String>,
-    about: String,
+/// One argument of one command, as clap declares it.
+pub struct SurfaceArg {
+    /// `--json`, `-p`, or a positional's own name.
+    pub name: String,
+    pub positional: bool,
+    /// `flag`, `value`, or the possible values joined by `|` for a closed set.
+    pub kind: String,
+    pub required: bool,
+    pub repeatable: bool,
+    pub default: Option<String>,
+    pub about: String,
+}
+
+impl SurfaceCommand {
+    /// The argument by the name the dump prints for it: `--json`, `--pane-id`, `command`.
+    pub fn arg(&self, name: &str) -> Option<&SurfaceArg> {
+        self.args.iter().find(|arg| arg.name == name)
+    }
+}
+
+impl SurfaceArg {
+    /// The possible values of a closed set, or `None` for a flag or a free value.
+    pub fn possible_values(&self) -> Option<Vec<&str>> {
+        if self.kind == "flag" || self.kind == "value" {
+            return None;
+        }
+        Some(self.kind.split('|').collect())
+    }
+}
+
+/// Every command in the tree, as the dump sees it.
+///
+/// The one walk of the clap parser, shared by `--dump-surface` and by the MCP server. Walked once
+/// per process and kept: building the clap tree is not cheap, and the MCP server asks about a
+/// different argument for every parameter of every tool.
+///
+/// The walk happens on a big stack. Clap builds the tree recursively and this one is deep enough
+/// to overflow a thread's default stack - which is how a test thread finds out, rather than the
+/// main thread, whose stack is larger.
+pub fn surface_commands() -> &'static [SurfaceCommand] {
+    static SURFACE: OnceLock<Vec<SurfaceCommand>> = OnceLock::new();
+    SURFACE.get_or_init(|| crate::cli::on_big_stack(|| walk(&CliArgs::command())))
+}
+
+/// One command of the tree by its path, or `None` for a path that is not one.
+pub fn surface_command(path: &str) -> Option<&'static SurfaceCommand> {
+    surface_commands()
+        .iter()
+        .find(|command| command.path == path)
+}
+
+/// The shape a command prints - `record`, `table`, `outline`, `payload` - or `None` for a command
+/// that prints nothing when it succeeds.
+pub fn promised_output_shape(command: &str) -> Option<&'static str> {
+    OUTPUTS
+        .iter()
+        .find(|o| o.command == command)
+        .map(|o| o.shape)
 }
 
 /// Every command in the tree, leaves and branches alike, in the order clap declares them.
