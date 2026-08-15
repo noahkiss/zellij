@@ -5458,18 +5458,17 @@ impl Screen {
             .map(|process_info| &process_info.agent_env)
             .cloned()
             .unwrap_or_default();
-        // the live argv first: it is what the pane is running NOW, and it is the only one the pty
-        // tick also matched on, so it is the only one that can carry an identity
-        if let Some(command) = process_info.and_then(|info| info.command.as_deref()) {
-            if let Some(agent) = agent_detect::detect(command, &agent_env) {
-                return Some(agent);
-            }
-        }
-        // and the command the pane was STARTED with, for a pane the process table has not been
-        // asked about yet. A command pane is only probed once it produces output, so a harness
-        // that has not printed anything is invisible to the line above from the moment it is made
-        // until the moment it speaks
-        agent_detect::detect_command_line(pane_info.terminal_command.as_deref()?, &agent_env)
+        // the live argv first, then the command the pane was STARTED with - the second for a pane
+        // the process table has not been asked about yet, since a command pane is only probed once
+        // it produces output and a harness that has printed nothing has no live argv to match.
+        // `list-agents` re-asks which of the two answered, to fill its COMMAND column, so the rule
+        // lives in one place rather than in two that could disagree
+        agent_detect::detect_in_pane(
+            pane_info.pane_command.as_deref(),
+            pane_info.terminal_command.as_deref(),
+            &agent_env,
+        )
+        .map(|(agent, _command)| agent)
     }
 
     /// Gives a live pane the handle its creator chose for it.

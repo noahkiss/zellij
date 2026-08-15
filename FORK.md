@@ -3715,6 +3715,10 @@ filtered to the panes that have one.
   2.1 MB a second** to the same numbers as the same session with detection turned off - the walk had
   been running on every tick.
 
+`COMMAND` names the command line the row was decided on - the pane's live argv when that is what
+matched, the line the pane was STARTED with when the fallback answered. The column exists to make a
+wrong row obvious, and it cannot do that while showing a line the row was not decided on.
+
 `SOURCE` says which phase answered: `command` when only the pane's command matched, `command+env`
 when an identity variable was found too. A reader that needs to know whether a missing `AGENT_ID`
 means "the harness does not export one" or "we never looked" reads that column rather than guessing.
@@ -3787,6 +3791,12 @@ because the runtime drops its pending tasks when stdin reaches EOF. `zellij_wait
 too: without `timeout_s` it gives up after 300 seconds rather than blocking for the life of the
 pane, which is the default its own schema has always advertised.
 
+**Every tool declares the shape of what it returns**, and it is the same shape for all seven: the
+CLI's exit code, what it printed - parsed when that was JSON - what it wrote to stderr, and on a
+failure whether it was a miss or an error. The per-operation part stays in the `Returns:` line,
+which is generated. A tool that multiplexes several operations says what each of them returns
+rather than promising the first one's shape for all of them.
+
 New dependency: `rmcp` (the official Rust MCP SDK) with `server` and `transport-io` only - eight
 crates, no HTTP stack, and nothing on any wasm plugin crate.
 
@@ -3807,6 +3817,12 @@ print a table and a payload respectively, and the map had been claiming they pri
 - **`--plugin-watch` as a CLI flag.** `Options` crosses the client/server protobuf contract, and
   carrying a new field over it means regenerating the checked-in generated Rust. The setting is
   config-file only rather than pay that cost.
+- **Truncating `zellij_overview scope=panes`.** It hands back the whole `list-panes --json`, around
+  thirty keys per pane including geometry nobody asked for, and it is the tool the server's own
+  instructions say to call first. A `verbosity` parameter, or a default projection down to the keys
+  that address a pane, would be the fix. Not done because it is a new shape for the tool to return
+  rather than a flag to pass through, and every drift gate here rests on a tool returning exactly
+  what its CLI command prints.
 - **Unwatching a plugin's `.wasm` when it unloads.** Watches accumulate for the life of the
   session; a change to a no-longer-loaded plugin resolves to no running instances and does nothing.
 
