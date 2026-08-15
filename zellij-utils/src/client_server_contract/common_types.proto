@@ -1003,6 +1003,9 @@ message TiledPaneLayout {
   optional string pane_initial_contents = 13;
   optional string default_fg = 14;
   optional string default_bg = 15;
+  // fork addition: the handle a layout chose for this pane. `restored_from` is still absent on
+  // purpose - that is provenance the server assigns - but a handle IS something a layout declares
+  optional string pane_handle = 16;
   // NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
 }
 
@@ -1021,6 +1024,8 @@ message FloatingPaneLayout {
   optional bool borderless = 12;
   optional string default_fg = 13;
   optional string default_bg = 14;
+  // fork addition: see TiledPaneLayout.pane_handle
+  optional string pane_handle = 15;
 }
 
 message SwapTiledLayout {

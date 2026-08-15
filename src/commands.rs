@@ -42,7 +42,7 @@ use zellij_utils::web_authentication_tokens::{
 use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
-    cli::{CliArgs, Command, SessionCommand, Sessions, SnapshotCli},
+    cli::{destroys, CliArgs, Command, SessionCommand, Sessions, SnapshotCli},
     data::{ConnectToSession, PaneId, PaneTarget},
     envs,
     input::{
@@ -55,6 +55,36 @@ use zellij_utils::{
 
 pub(crate) use zellij_utils::sessions::list_sessions;
 
+/// Asks before something that cannot be undone, or refuses when nothing can answer.
+///
+/// One implementation for every such verb, so the wording and the behaviour on a pipe are the same
+/// wherever you meet them. `what` completes the sentence "`<verb>` <what>, and cannot be undone".
+///
+/// A refusal and a declined prompt both exit 2: each is a well-formed request that changed
+/// nothing, which is what the fork's exit codes call a miss.
+pub(crate) fn confirm_or_exit(verb: &str, what: &str, yes: bool) {
+    use std::io::IsTerminal;
+    match zellij_utils::cli::confirmation_for(verb, what, yes, std::io::stdin().is_terminal()) {
+        zellij_utils::cli::Confirmation::Proceed => {},
+        zellij_utils::cli::Confirmation::Refuse(message) => {
+            eprintln!("{}", message);
+            process::exit(2);
+        },
+        zellij_utils::cli::Confirmation::Ask(prompt) => {
+            // a prompt that cannot be read is a no, not a panic: the default is no either way
+            let answered_yes = Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !answered_yes {
+                eprintln!("Abort.");
+                process::exit(2);
+            }
+        },
+    }
+}
+
 pub(crate) fn kill_all_sessions(yes: bool, wait: KillWait) {
     match get_sessions() {
         Ok(sessions) if sessions.is_empty() => {
@@ -62,17 +92,7 @@ pub(crate) fn kill_all_sessions(yes: bool, wait: KillWait) {
             process::exit(1);
         },
         Ok(sessions) => {
-            if !yes {
-                println!("WARNING: this action will kill all sessions.");
-                if !Confirm::new()
-                    .with_prompt("Do you want to continue?")
-                    .interact()
-                    .unwrap()
-                {
-                    println!("Abort.");
-                    process::exit(1);
-                }
-            }
+            confirm_or_exit("kill-all-sessions", destroys::KILL_ALL_SESSIONS, yes);
             // every session is attempted before the exit code is decided: a wedged server should
             // not stop the rest of them from being killed
             let mut all_gone = true;
@@ -190,8 +210,9 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
             }));
             start_client(opts);
         },
-        SnapshotCli::Rm { id } => {
+        SnapshotCli::Rm { id, yes } => {
             let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            confirm_or_exit("snapshot rm", destroys::SNAPSHOT_RM, yes);
             match remove_snapshot(&snapshot) {
                 Ok(()) => println!("Deleted snapshot {}", snapshot.id),
                 Err(e) => {
@@ -207,8 +228,9 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
         } => {
             import_snapshots_command(&settings, from, dry_run, prune_source);
         },
-        SnapshotCli::Prune { keep } => {
+        SnapshotCli::Prune { keep, yes } => {
             let keep = keep.unwrap_or(settings.limit);
+            confirm_or_exit("snapshot prune", destroys::SNAPSHOT_PRUNE, yes);
             let removed = prune_all(&settings, keep);
             println!(
                 "Pruned {} snapshot(s), keeping {} per session.",
@@ -383,17 +405,7 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool, wait: KillWait, opts: 
         sessions_to_delete.retain(|name| !active_sessions.contains(name));
         active_sessions.clone()
     };
-    if !yes {
-        println!("WARNING: this action will delete all resurrectable sessions.");
-        if !Confirm::new()
-            .with_prompt("Do you want to continue?")
-            .interact()
-            .unwrap()
-        {
-            println!("Abort.");
-            process::exit(1);
-        }
-    }
+    confirm_or_exit("delete-all-sessions", destroys::DELETE_ALL_SESSIONS, yes);
     // every session is attempted before the exit code is decided: one wedged server should not
     // stop the rest of them from being deleted
     let mut all_gone = true;
@@ -413,10 +425,11 @@ pub(crate) fn delete_all_sessions(yes: bool, force: bool, wait: KillWait, opts: 
     });
 }
 
-pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait) {
+pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait, yes: bool) {
     match target_session {
         Some(target_session) => {
             assert_session(target_session);
+            confirm_or_exit("kill-session", destroys::KILL_SESSION, yes);
             let gone = kill_session_impl(target_session, wait);
             process::exit(if gone { 0 } else { 1 });
         },
@@ -432,6 +445,7 @@ pub(crate) fn delete_session(
     force: bool,
     wait: KillWait,
     opts: &CliArgs,
+    yes: bool,
 ) {
     match target_session {
         Some(target_session) => {
@@ -440,6 +454,7 @@ pub(crate) fn delete_session(
                 process::exit(1);
             }
             assert_dead_session(target_session, force);
+            confirm_or_exit("delete-session", destroys::DELETE_SESSION, yes);
             let gone = delete_session_impl(target_session, force, &snapshot_settings(opts), wait);
             process::exit(if gone { 0 } else { 1 });
         },
@@ -916,9 +931,7 @@ fn attach_with_cli_client(
     let inside_the_session = envs::get_session_name()
         .map(|ambient| ambient == session_name)
         .unwrap_or(false);
-    if let Some(message) =
-        zellij_utils::cli::missing_target_from_outside_a_pane(&cli_action, inside_the_session)
-    {
+    if let Some(message) = zellij_utils::cli::missing_target(&cli_action, inside_the_session) {
         eprintln!("{}", message);
         std::process::exit(1);
     }
@@ -927,6 +940,11 @@ fn attach_with_cli_client(
     if let Some(message) = zellij_utils::cli::cross_session_pane_target_needs_an_id(&cli_action) {
         eprintln!("{}", message);
         std::process::exit(1);
+    }
+    // what cannot be undone is confirmed last of the guards and before anything is sent: a call
+    // that was never going to reach a pane should not ask about closing one
+    if let Some((verb, what, yes)) = zellij_utils::cli::confirmation_needed(&cli_action) {
+        confirm_or_exit(verb, what, yes);
     }
     // `wait` never becomes an action the server runs. It is a question asked over and over, or a
     // subscription read until something happens, and both of those are the client's to hold: the
@@ -1041,17 +1059,23 @@ fn attach_with_cli_client(
     // the text these two write can come from stdin. It is read here, after the refusals above, so a
     // call that was never going to reach a pane does not drain the pipe on its way out
     let cli_action = match cli_action {
-        zellij_utils::cli::CliAction::WriteChars { chars, pane_id } => {
-            zellij_utils::cli::CliAction::WriteChars {
-                chars: Some(text_for(chars, "write-chars")),
-                pane_id,
-            }
+        zellij_utils::cli::CliAction::WriteChars {
+            chars,
+            pane_id,
+            focused,
+        } => zellij_utils::cli::CliAction::WriteChars {
+            chars: Some(text_for(chars, "write-chars")),
+            pane_id,
+            focused,
         },
-        zellij_utils::cli::CliAction::Paste { chars, pane_id } => {
-            zellij_utils::cli::CliAction::Paste {
-                chars: Some(text_for(chars, "paste")),
-                pane_id,
-            }
+        zellij_utils::cli::CliAction::Paste {
+            chars,
+            pane_id,
+            focused,
+        } => zellij_utils::cli::CliAction::Paste {
+            chars: Some(text_for(chars, "paste")),
+            pane_id,
+            focused,
         },
         other => other,
     };

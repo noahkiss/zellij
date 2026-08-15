@@ -283,30 +283,84 @@ of what moved to get there.
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
 | `query-tab-names` | gone. `list-tabs` answers it |
 
-Two of those are refusals rather than shapes, and they are the same refusal: a `zellij action`
-client is attached to nothing, so "the focused pane" resolves against whichever client the server
-can find. From inside a pane that is right and is the point. From a script it is a pane the caller
-has never seen — which is a wrong answer for `dump-screen` and a closed tab for `close-tab`. So
-`close-pane`, `close-tab`, `move-tab`, `break-pane`, `write`, `write-chars`, `clear`,
-`edit-scrollback` and `rename-pane` exit 1 from outside the session unless they name a target, and
-`break-pane-right`/`break-pane-left`, which cannot name one, are refused outright. For those,
-inside a pane nothing changes.
+### What a verb does when you do not tell it what to act on
 
-The five verbs that write into a pane or wipe one are in that list for the same reason the closing
-ones are, and are the worse half of it: keystrokes that land in the wrong pane have already been
-run by the shell that received them, and there is no undo for a `clear`. Each refusal names its own
-verb and the `--pane-id` that answers it.
+A `zellij action` client is attached to nothing, so "the focused pane" resolves against whichever
+client the server can find. From inside a pane that is right and is the point. From a script it is
+a pane the caller has never seen. Which of those matters depends on what the verb DOES, so the
+verbs are in three classes, and a new verb is put in one when it is written:
 
-`dump-screen` is stricter: it refuses a targetless dump from **any** `zellij action` client,
-inside a pane or out. The client that types the command is not the client that holds the focus
-either way, so there is no reading of "the focused pane" that a `zellij action dump-screen` could
-mean. A keybinding is unaffected.
+| Class | What it means with no target | Verbs | Which of them confirm |
+|---|---|---|---|
+| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
+| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-tab`, the `break-pane` family, the `toggle-pane-*` family, `clear` | `clear` |
+| 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` | `close-pane`, `close-tab` |
 
-Two caveats on the refusal. "Outside" is read from the ambient `$ZELLIJ_SESSION_NAME`, which is a
-convenience and not a security boundary: it is an environment variable, and a caller that sets it
-is trusted to mean it. And because that variable is written when a pane is spawned, it cannot be
-updated in a shell that is already running — so after `zellij action rename-session`, panes that
-predate the rename read as outside the session until they are replaced.
+**Class 1 is additive**, and placement relative to wherever you are is the whole point of it. A
+script calling `new-pane` is asking for exactly that.
+
+**Class 2 is the recoverable half.** Inside a pane, "focused" is the pane your hands are on and
+nothing changes. From a script it exits 1 and names the `--pane-id` or `--tab-id` that answers it.
+`break-pane-right` and `break-pane-left` cannot name a target at all, so from outside they are
+refused outright, pointing at `break-pane --pane-id`.
+
+**Class 3 always names its target, from inside too** — that is what moved. Run from inside a pane,
+"the focused pane" is the shell that ran the command: a targetless `write-chars` types into the
+very shell you typed it in, and a targetless `close-pane` closes it. Nobody means either.
+**`--focused`** (or `--current`) is how you say you did, and it is valid only where a focus exists —
+from a script it is refused, naming `--pane-id`, because there are no hands there to mean it.
+
+None of this governs keybindings. A key is pressed by somebody looking at the thing it acts on,
+which is the case all three classes reason about the absence of.
+
+### Anything that cannot be undone asks first
+
+```
+$ zellij action close-pane --pane-id build
+close-pane kills whatever is running in that pane. Are you sure? [y/N]
+
+$ zellij action close-pane --pane-id build < /dev/null
+`close-pane` kills whatever is running in that pane, and cannot be undone. Nothing here can answer
+a prompt, so pass `--yes` to say you meant it.
+```
+
+One rule, one implementation, one wording: **a verb whose effect cannot be undone confirms first.**
+On a terminal it asks, defaulting to no. Anywhere else — a pipe, a cron job, an agent — it refuses
+and names `--yes`. A script must never meet a prompt it cannot answer: a command that blocks forever
+waiting for a keypress nobody is there to press is worse than either answer.
+
+**A refusal and a declined prompt both exit 2**, on stderr, because each is a well-formed request
+that changed nothing — which is what this fork's exit codes call a miss. `kill-all-sessions` and
+`delete-all-sessions` answered a declined prompt with 1 before, and now answer it with 2 like the
+rest.
+
+It covers `close-pane`, `close-tab`, `clear`, `kill-session`, `delete-session`, `snapshot rm` and
+`snapshot prune`. `kill-all-sessions` and `delete-all-sessions` already prompted, and now do it
+through the same helper, so the wording and the behaviour off a terminal are the same everywhere.
+
+Each verb's sentence — what it destroys — has one home, and the `action` verbs that confirm are one
+table rather than a check spread through the call sites. That is what makes the exempt list below
+readable: it is the same table, read for what is missing from it.
+
+For `close-pane`, `close-tab` and `clear` the confirm runs after the guards the client can settle
+by itself — the targetless refusal and the cross-session one — so a call that was never going to be
+sent is never asked about. It runs **before** the server is reached, so a `--pane-id` that no live
+pane answers to is confirmed first and reported as a miss afterwards. Both exit 2, and the sentence
+on stderr is what tells them apart, which is the rule the whole `action` band already follows.
+
+`close-pane` and `close-tab` keep their class-3 target requirement **and** gain the confirm, and
+both are wanted in a script: the target proves *what*, `--yes` proves the destruction is meant.
+
+What deliberately does not confirm:
+
+- **`signal-pane`** — the signal's NAME is the stated intent, and the target is already explicit.
+- **`session down`** — the fork takes a snapshot first, so it is recoverable.
+- **The write family** — it injects input but destroys nothing of its own; class-3 targeting is the
+  guard it needs.
+- **`dump-screen --path` over an existing file.** It overwrites, and that is documented rather than
+  confirmed. The file is outside zellij's own state, every tool that takes an output path behaves
+  this way, and `dump-screen` is a `read`-band verb — a prompt there would be the only one in a
+  band whose whole meaning is "changes nothing".
 
 ### Where a new pane goes: `--new-tab`, `--near`, `--in-tab`
 
@@ -497,12 +551,27 @@ zellij action dump-screen --pane-id sunny-otter
 
 ```
 zellij action new-pane --handle build -- cargo watch
+zellij run --handle build -- cargo watch
+zellij edit --handle notes ~/notes.md
+zellij plugin --handle board -- file:/path/to.wasm
 ```
 ```kdl
 layout {
     pane handle="build" command="cargo" { args "watch" }
 }
 ```
+
+**Every command that reports the pane it made takes it**, on the same terms: `new-pane` and `edit`
+under `zellij action`, and the `run`, `edit` and `plugin` shorthands beside them. A caller should
+not have to know which verb made the pane to know whether it could have named it.
+
+`action launch-plugin` and `action launch-or-focus-plugin` are the exception, and the reason is
+worth writing down: **they print nothing at all.** A plugin's pane is built on the plugin thread
+after the action has already been answered, so nothing comes back carrying an id - and a chosen
+handle is applied to the pane the report names. The surface map used to promise `pane_id:` and
+`handle:` for both; it never printed either, and the promise has been removed rather than the
+reader being taught a report that never arrives. `zellij plugin` goes through the pane-creating
+path instead, reports what it made, and takes `--handle`.
 
 A generated handle is memorable but not predictable, and a script that wants to reach the pane it
 just made has to read the id out of the report and carry it. A chosen handle is the other way round:
@@ -523,7 +592,11 @@ the caller decides the address before the pane exists, and every later command a
   always the name the caller asked for. This is also why `--handle` cannot ride with the blocking
   family: those answer with an exit status instead of a report naming a pane.
 - **It is stored like any other handle**, which means it survives a restore: the snapshot carries
-  `pane_handle="build"` and the pane comes back at that address.
+  `pane_handle="build"` and the pane comes back at that address. It also survives the trip to the
+  server, which is what makes `new-tab --layout` and `zellij --layout` honour a `handle` a layout
+  wrote: the client/server contract carries it alongside the pane's other declared properties.
+  `restored_from` deliberately does not cross - that is provenance the server assigns, and a sender
+  declaring it would be claiming a history it does not have.
 - **In a layout**, `handle` is the spelling a person writes and `pane_handle` is what serialization
   writes; both reach the same field, and a saved layout keeps working. A layout that names a handle
   another pane in the same layout already took loses the tie rather than failing the restore — a
@@ -543,6 +616,31 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
   shows none of it — there is no short form.
 - A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
   counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
+
+### Making a tab needs somebody attached
+
+```
+$ zellij -s build-box action new-tab --name logs
+Creating a tab needs a client attached to this session, and nothing is attached: the tab would be
+built empty and thrown away by the next client to attach. Run this from inside the session, or
+`zellij attach` first.
+$ echo $?
+2
+```
+
+A tab is built by applying a layout, and applying one needs a client to size it against. On a
+session nobody is attached to, the whole tab-creating family — `new-tab`, `new-tab --layout`,
+`new-pane --new-tab`, `go-to-tab-name --create` — used to make an **empty** tab, report a
+`pane_id:` for a pane that never existed, and have the tab thrown away by the next client to
+attach. A script got a success and an id, and nothing was there.
+
+They now refuse, with exit 2 and that sentence, and create nothing. This is a refusal rather than a
+fix: a detached session applying its own layouts is the real answer and is a separate piece of
+work. Until then the honest report is worth more than a pane id that names nothing.
+
+The session's own startup is untouched — it builds its tabs before any client attaches, and that
+path is exactly what tells the two cases apart: a command has a caller waiting for an answer, and
+startup has none.
 
 ### Pane notes
 

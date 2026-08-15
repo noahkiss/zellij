@@ -176,6 +176,11 @@ struct OutputSpec {
     keys: &'static str,
 }
 
+// `launch-plugin` and `launch-or-focus-plugin` are deliberately absent: they print nothing today.
+// The map used to promise `pane_id` and `handle` for both, and neither ever printed a line - the
+// plugin's pane is made on the plugin thread after the action has already been answered, so the
+// completion result carries no id to report. The printer is the authority, so the promise went
+// rather than the reader being taught a report that never arrives.
 const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action current-tab-info",
@@ -241,16 +246,6 @@ const OUTPUTS: &[OutputSpec] = &[
     },
     OutputSpec {
         command: "action edit",
-        shape: "record",
-        keys: "pane_id handle",
-    },
-    OutputSpec {
-        command: "action launch-plugin",
-        shape: "record",
-        keys: "pane_id handle",
-    },
-    OutputSpec {
-        command: "action launch-or-focus-plugin",
         shape: "record",
         keys: "pane_id handle",
     },
@@ -354,10 +349,18 @@ How every one of these answers:
   * Exit 0 acted or found, 1 error, 2 miss. A miss is a well-formed request about something that
     is not there - a closed pane, a tab by a name nothing answers to.
   * A command that only acts prints nothing. The ones that report say so in their own --help.
-  * A mutation run from outside the session must name what it acts on. `close-pane`, `close-tab`,
-    `move-tab`, `break-pane`, `write`, `write-chars`, `clear`, `edit-scrollback` and `rename-pane`
-    refuse a targetless call from a script, because \"the focused pane\" there is a pane you have
-    never seen.
+  * Three classes decide what a verb does when you do not tell it what to act on. Moving focus,
+    scrolling, switching mode and every CREATING verb work anywhere: placement relative to where
+    you are is their point. Recoverable mutations - rename, resize, move, break-pane,
+    edit-scrollback, clear - mean the focused thing INSIDE the session, and are refused from a
+    script, where \"focused\" is something you have never seen. `close-pane`, `close-tab`, `write`,
+    `write-chars`, `send-keys` and `paste` always name their target, from inside too: there the
+    focused pane is the shell that ran the command. `--focused` (`--current`) is how you name that
+    pane on purpose.
+  * A verb whose effect cannot be undone confirms first: `[y/N]` on a terminal, and off a terminal
+    it refuses and names `--yes`. `close-pane`, `close-tab`, `clear`, `kill-session`,
+    `delete-session`, `kill-all-sessions`, `delete-all-sessions`, `snapshot rm` and
+    `snapshot prune`. A script passes `--yes`; it never meets a prompt it cannot answer.
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
