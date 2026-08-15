@@ -283,30 +283,35 @@ of what moved to get there.
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
 | `query-tab-names` | gone. `list-tabs` answers it |
 
-Two of those are refusals rather than shapes, and they are the same refusal: a `zellij action`
-client is attached to nothing, so "the focused pane" resolves against whichever client the server
-can find. From inside a pane that is right and is the point. From a script it is a pane the caller
-has never seen — which is a wrong answer for `dump-screen` and a closed tab for `close-tab`. So
-`close-pane`, `close-tab`, `move-tab`, `break-pane`, `write`, `write-chars`, `clear`,
-`edit-scrollback` and `rename-pane` exit 1 from outside the session unless they name a target, and
-`break-pane-right`/`break-pane-left`, which cannot name one, are refused outright. For those,
-inside a pane nothing changes.
+### What a verb does when you do not tell it what to act on
 
-The five verbs that write into a pane or wipe one are in that list for the same reason the closing
-ones are, and are the worse half of it: keystrokes that land in the wrong pane have already been
-run by the shell that received them, and there is no undo for a `clear`. Each refusal names its own
-verb and the `--pane-id` that answers it.
+A `zellij action` client is attached to nothing, so "the focused pane" resolves against whichever
+client the server can find. From inside a pane that is right and is the point. From a script it is
+a pane the caller has never seen. Which of those matters depends on what the verb DOES, so the
+verbs are in three classes, and a new verb is put in one when it is written:
 
-`dump-screen` is stricter: it refuses a targetless dump from **any** `zellij action` client,
-inside a pane or out. The client that types the command is not the client that holds the focus
-either way, so there is no reading of "the focused pane" that a `zellij action dump-screen` could
-mean. A keybinding is unaffected.
+| Class | What it means with no target | Verbs |
+|---|---|---|
+| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) |
+| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-tab`, the `break-pane` family, the `toggle-pane-*` family, `clear` |
+| 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` |
 
-Two caveats on the refusal. "Outside" is read from the ambient `$ZELLIJ_SESSION_NAME`, which is a
-convenience and not a security boundary: it is an environment variable, and a caller that sets it
-is trusted to mean it. And because that variable is written when a pane is spawned, it cannot be
-updated in a shell that is already running — so after `zellij action rename-session`, panes that
-predate the rename read as outside the session until they are replaced.
+**Class 1 is additive**, and placement relative to wherever you are is the whole point of it. A
+script calling `new-pane` is asking for exactly that.
+
+**Class 2 is the recoverable half.** Inside a pane, "focused" is the pane your hands are on and
+nothing changes. From a script it exits 1 and names the `--pane-id` or `--tab-id` that answers it.
+`break-pane-right` and `break-pane-left` cannot name a target at all, so from outside they are
+refused outright, pointing at `break-pane --pane-id`.
+
+**Class 3 always names its target, from inside too** — that is what moved. Run from inside a pane,
+"the focused pane" is the shell that ran the command: a targetless `write-chars` types into the
+very shell you typed it in, and a targetless `close-pane` closes it. Nobody means either.
+**`--focused`** (or `--current`) is how you say you did, and it is valid only where a focus exists —
+from a script it is refused, naming `--pane-id`, because there are no hands there to mean it.
+
+None of this governs keybindings. A key is pressed by somebody looking at the thing it acts on,
+which is the case all three classes reason about the absence of.
 
 ### Where a new pane goes: `--new-tab`, `--near`, `--in-tab`
 

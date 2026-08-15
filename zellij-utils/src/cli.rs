@@ -1138,9 +1138,14 @@ pub enum CliAction {
         bytes: Vec<u8>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
     },
     /// Write text into a pane, as if it had been typed
     ///
@@ -1153,9 +1158,14 @@ pub enum CliAction {
         chars: Option<String>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
     },
     /// Paste text into a pane in bracketed paste mode
     ///
@@ -1169,9 +1179,14 @@ pub enum CliAction {
         chars: Option<String>,
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
     },
     /// Send named keys to a pane
     ///
@@ -1184,9 +1199,14 @@ pub enum CliAction {
 
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
     },
     /// Grow or shrink a pane at one of its borders
     Resize {
@@ -1262,6 +1282,11 @@ pub enum CliAction {
         /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
     },
     /// Print what a pane is showing
     ///
@@ -1271,7 +1296,8 @@ pub enum CliAction {
     ///
     /// Prints the pane content and nothing else - no header, no trailing summary.
     DumpScreen {
-        /// Write the content to this file instead of stdout
+        /// Write the content to this file instead of stdout. An existing file is overwritten,
+        /// like any other command that takes an output path
         #[clap(value_parser, conflicts_with = "path")]
         file: Option<PathBuf>,
 
@@ -1759,9 +1785,14 @@ pub enum CliAction {
     ClosePane {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
     },
     /// Give a pane a name, which is what its frame and the TITLE column then show
     RenamePane {
@@ -1792,9 +1823,14 @@ pub enum CliAction {
     /// from inside a pane.
     CloseTab {
         /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
-        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
+        /// the 1-based display position `go-to-tab` takes. Required: this verb never guesses, so pass --focused for the tab you are in
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
+        /// Act on the focused tab, saying so. This verb never guesses a target, so this is how
+        /// you name the tab your hands are on. Only valid where a focus exists - from inside the
+        /// session, or with a client attached
+        #[clap(long, visible_alias = "current", conflicts_with = "tab_id")]
+        focused: bool,
     },
     /// Focus the tab at a display position
     ///
@@ -2624,6 +2660,70 @@ pub fn text_from_stdin<R: std::io::Read>(reader: R, verb: &str) -> Result<String
     })
 }
 
+/// How a `zellij action` verb behaves when it is not told what to act on.
+///
+/// Three classes, and the difference between them is what "the focused thing" would mean:
+///
+/// * [`Anywhere`](TargetClass::Anywhere) - moving focus, scrolling, switching mode, and every verb
+///   that CREATES something. Placement relative to wherever you are is the whole point of these,
+///   and a script that calls one is asking for exactly that.
+/// * [`InsideOnly`](TargetClass::InsideOnly) - recoverable mutations: renaming, resizing, moving a
+///   pane or a tab. Inside a pane, "focused" is the pane your hands are on. From a script it is a
+///   pane the caller has never seen, so a target is required there.
+/// * [`AlwaysExplicit`](TargetClass::AlwaysExplicit) - closing something, and writing into
+///   something. These are refused without a target from ANYWHERE, inside included: run from inside
+///   a pane, "the focused pane" is the shell that ran the command, and nobody means to close or
+///   type into that. `--focused` is how you say you did.
+///
+/// Keybindings are not governed by any of this. A key is pressed by a person who is looking at the
+/// thing it acts on, which is the case all three classes are reasoning about the absence of.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TargetClass {
+    Anywhere,
+    InsideOnly,
+    AlwaysExplicit,
+}
+
+/// The class a verb belongs to. Everything not named here is [`TargetClass::Anywhere`].
+///
+/// A verb that takes no target at all is `Anywhere` by definition - there is nothing to leave out.
+pub fn target_class(action: &CliAction) -> TargetClass {
+    match action {
+        // destroys, or types into something that will run what it is told
+        CliAction::ClosePane { .. }
+        | CliAction::CloseTab { .. }
+        | CliAction::Write { .. }
+        | CliAction::WriteChars { .. }
+        | CliAction::SendKeys { .. }
+        | CliAction::Paste { .. } => TargetClass::AlwaysExplicit,
+        // changes something a person can put back
+        CliAction::Clear { .. }
+        | CliAction::EditScrollback { .. }
+        | CliAction::RenamePane { .. }
+        | CliAction::RenameTab { .. }
+        | CliAction::UndoRenamePane { .. }
+        | CliAction::UndoRenameTab { .. }
+        | CliAction::Resize { .. }
+        | CliAction::MovePane { .. }
+        | CliAction::MovePaneBackwards { .. }
+        | CliAction::MoveTab { .. }
+        | CliAction::BreakPane { .. }
+        | CliAction::BreakPaneRight
+        | CliAction::BreakPaneLeft
+        | CliAction::TogglePaneBorderless { .. }
+        | CliAction::TogglePaneEmbedOrFloating { .. }
+        | CliAction::TogglePanePinned { .. } => TargetClass::InsideOnly,
+        _ => TargetClass::Anywhere,
+    }
+}
+
+/// What this call named to act on: a target, the focus, or nothing.
+enum Named {
+    Target,
+    Focus,
+    Nothing,
+}
+
 /// Whether a command that acts on "the focused thing" has been given something to act on.
 ///
 /// A `zellij action` client is not attached to anything. It has no focus of its own, so the server
@@ -2631,56 +2731,132 @@ pub fn text_from_stdin<R: std::io::Read>(reader: R, verb: &str) -> Result<String
 /// caller has never seen. For a mutation that is not a wrong answer, it is a wrong tab getting
 /// closed or moved.
 ///
-/// Run from inside a pane, `focused` means the pane the hands are on, and that is exactly what the
-/// caller meant, so nothing here applies. `inside_the_session` is that test: the ambient session is
-/// this session.
+/// `inside_the_session` is the test for "there is a focus here": the ambient session is this
+/// session, so the command was typed in a pane somebody is looking at.
 ///
 /// Returns the sentence to print, naming the flag that would have made the command unambiguous.
-pub fn missing_target_from_outside_a_pane(
-    action: &CliAction,
-    inside_the_session: bool,
-) -> Option<String> {
-    if inside_the_session {
-        return None;
-    }
-    let needs = |verb: &str, flag: &str, lister: &str| {
-        Some(format!(
-            "`{verb}` run from outside a pane has no focused {thing} to act on. \
-             Pass {flag}, or run it from inside the session. `zellij action {lister}` lists them.",
-            verb = verb,
-            thing = if flag == "--pane-id" { "pane" } else { "tab" },
-            flag = flag,
-            lister = lister,
-        ))
-    };
-    match action {
-        CliAction::ClosePane { pane_id: None } => needs("close-pane", "--pane-id", "list-panes"),
-        // writing into a pane is the same footgun as closing one: the keystrokes land in whichever
-        // pane the server found, and a shell that received them has already run them
-        CliAction::Write { pane_id: None, .. } => needs("write", "--pane-id", "list-panes"),
-        CliAction::WriteChars { pane_id: None, .. } => {
-            needs("write-chars", "--pane-id", "list-panes")
-        },
-        CliAction::Clear { pane_id: None } => needs("clear", "--pane-id", "list-panes"),
-        CliAction::EditScrollback { pane_id: None, .. } => {
-            needs("edit-scrollback", "--pane-id", "list-panes")
-        },
-        CliAction::RenamePane { pane_id: None, .. } => {
-            needs("rename-pane", "--pane-id", "list-panes")
-        },
-        CliAction::CloseTab { tab_id: None } => needs("close-tab", "--tab-id", "list-tabs"),
-        CliAction::MoveTab { tab_id: None, .. } => needs("move-tab", "--tab-id", "list-tabs"),
-        CliAction::BreakPane { pane_id, .. } if pane_id.is_empty() => {
-            needs("break-pane", "--pane-id", "list-panes")
-        },
+pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<String> {
+    let class = target_class(action);
+    let (verb, flag, lister, named) = match action {
+        CliAction::ClosePane { pane_id, focused } => (
+            "close-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::Write {
+            pane_id, focused, ..
+        } => (
+            "write",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::WriteChars {
+            pane_id, focused, ..
+        } => (
+            "write-chars",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::SendKeys {
+            pane_id, focused, ..
+        } => (
+            "send-keys",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::Paste {
+            pane_id, focused, ..
+        } => (
+            "paste",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::Clear { pane_id, focused } => (
+            "clear",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::CloseTab { tab_id, focused } => (
+            "close-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), *focused),
+        ),
+        CliAction::EditScrollback { pane_id, .. } => (
+            "edit-scrollback",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::RenamePane { pane_id, .. } => (
+            "rename-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::MoveTab { tab_id, .. } => (
+            "move-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), false),
+        ),
+        CliAction::BreakPane { pane_id, .. } => (
+            "break-pane",
+            "--pane-id",
+            "list-panes",
+            named(!pane_id.is_empty(), false),
+        ),
         // these two name no pane at all, by design - they are keybindings that happen to be
         // reachable from the CLI, so the way to aim them is to use the verb that can be aimed
-        CliAction::BreakPaneRight | CliAction::BreakPaneLeft => Some(
-            "`break-pane-right` and `break-pane-left` act on the focused pane and cannot name \
-             one, so they mean nothing from outside a pane. Use `break-pane --pane-id` instead."
-                .to_owned(),
-        ),
-        _ => None,
+        CliAction::BreakPaneRight | CliAction::BreakPaneLeft if !inside_the_session => {
+            return Some(
+                "`break-pane-right` and `break-pane-left` act on the focused pane and cannot name \
+                 one, so they mean nothing from outside a pane. Use `break-pane --pane-id` instead."
+                    .to_owned(),
+            )
+        },
+        _ => return None,
+    };
+    let thing = if flag == "--pane-id" { "pane" } else { "tab" };
+    match named {
+        // a target was named: nothing to complain about, wherever the call came from
+        Named::Target => None,
+        // `--focused` is only a target where a focus exists
+        Named::Focus if !inside_the_session => Some(format!(
+            "`{verb} --focused` names the {thing} your hands are on, and this call was made from \
+             outside the session, where there are no hands. Pass {flag}. \
+             `zellij action {lister}` lists them."
+        )),
+        Named::Focus => None,
+        Named::Nothing => match class {
+            TargetClass::Anywhere => None,
+            TargetClass::InsideOnly if inside_the_session => None,
+            TargetClass::InsideOnly => Some(format!(
+                "`{verb}` run from outside a pane has no focused {thing} to act on. \
+                 Pass {flag}, or run it from inside the session. \
+                 `zellij action {lister}` lists them."
+            )),
+            TargetClass::AlwaysExplicit => Some(format!(
+                "`{verb}` always names what it acts on. Pass {flag}, or `--focused` for the \
+                 {thing} your hands are on. `zellij action {lister}` lists them."
+            )),
+        },
+    }
+}
+
+fn named(has_target: bool, focused: bool) -> Named {
+    if has_target {
+        Named::Target
+    } else if focused {
+        Named::Focus
+    } else {
+        Named::Nothing
     }
 }
 
@@ -3037,7 +3213,7 @@ mod tests {
         ] {
             let action = parse_action(&args);
             assert!(
-                missing_target_from_outside_a_pane(&action, false).is_some(),
+                missing_target(&action, false).is_some(),
                 "expected `{}` to need a target",
                 args.join(" ")
             );
@@ -3054,7 +3230,7 @@ mod tests {
             (vec!["rename-pane", "build"], "rename-pane"),
         ] {
             let action = parse_action(&args);
-            let message = missing_target_from_outside_a_pane(&action, false)
+            let message = missing_target(&action, false)
                 .unwrap_or_else(|| panic!("expected `{}` to be refused", args.join(" ")));
             assert!(message.contains(verb), "got: {}", message);
             assert!(message.contains("--pane-id"), "got: {}", message);
@@ -3064,24 +3240,21 @@ mod tests {
 
     #[test]
     fn the_same_commands_are_untouched_from_inside_a_pane() {
-        // the negative control: inside the session, "focused" is the pane the hands are on, which
-        // is what the caller meant
+        // class 2 inside the session: "focused" is the pane the hands are on, which is what the
+        // caller meant. Class 3 is NOT here - it names its target from inside too, because there
+        // "the focused pane" is the shell that ran the command
         for args in [
-            vec!["close-pane"],
-            vec!["close-tab"],
             vec!["move-tab", "left"],
             vec!["break-pane"],
             vec!["break-pane-right"],
             vec!["break-pane-left"],
-            vec!["write", "27"],
-            vec!["write-chars", "hello"],
             vec!["clear"],
             vec!["edit-scrollback"],
             vec!["rename-pane", "build"],
         ] {
             let action = parse_action(&args);
             assert_eq!(
-                missing_target_from_outside_a_pane(&action, true),
+                missing_target(&action, true),
                 None,
                 "`{}` should be untouched from inside a pane",
                 args.join(" ")
@@ -3104,7 +3277,7 @@ mod tests {
         ] {
             let action = parse_action(&args);
             assert_eq!(
-                missing_target_from_outside_a_pane(&action, false),
+                missing_target(&action, false),
                 None,
                 "`{}` names its target",
                 args.join(" ")
@@ -3123,7 +3296,7 @@ mod tests {
             vec!["new-tab"],
         ] {
             let action = parse_action(&args);
-            assert_eq!(missing_target_from_outside_a_pane(&action, false), None);
+            assert_eq!(missing_target(&action, false), None);
         }
     }
 
@@ -3258,6 +3431,88 @@ mod tests {
     }
 
     #[test]
+    fn the_three_classes_say_what_each_verb_does_without_a_target() {
+        // one representative of each class, and the negative controls are each other
+        let optionless = |args: &[&str]| target_class(&parse_action(args));
+        // class 1: placement relative to where you are is the point
+        assert_eq!(optionless(&["move-focus", "left"]), TargetClass::Anywhere);
+        assert_eq!(optionless(&["go-to-next-tab"]), TargetClass::Anywhere);
+        assert_eq!(optionless(&["scroll-up"]), TargetClass::Anywhere);
+        assert_eq!(optionless(&["new-pane"]), TargetClass::Anywhere);
+        assert_eq!(
+            optionless(&["switch-mode", "locked"]),
+            TargetClass::Anywhere
+        );
+        // class 2: recoverable, and "focused" means something when you are looking at it
+        assert_eq!(
+            optionless(&["rename-pane", "notes"]),
+            TargetClass::InsideOnly
+        );
+        assert_eq!(optionless(&["resize", "increase"]), TargetClass::InsideOnly);
+        assert_eq!(optionless(&["move-tab", "left"]), TargetClass::InsideOnly);
+        // class 3: destroys, or types into something that runs what it is told
+        assert_eq!(optionless(&["close-pane"]), TargetClass::AlwaysExplicit);
+        assert_eq!(optionless(&["close-tab"]), TargetClass::AlwaysExplicit);
+        assert_eq!(
+            optionless(&["send-keys", "Enter"]),
+            TargetClass::AlwaysExplicit
+        );
+        assert_eq!(
+            optionless(&["write-chars", "hello"]),
+            TargetClass::AlwaysExplicit
+        );
+    }
+
+    #[test]
+    fn class_three_names_its_target_from_inside_the_session_too() {
+        // the point of the class: run from inside a pane, "the focused pane" is the shell that ran
+        // the command, and nobody means to close or type into that
+        for args in [
+            vec!["close-pane"],
+            vec!["send-keys", "Enter"],
+            vec!["write-chars", "hello"],
+        ] {
+            let action = parse_action(&args);
+            let inside = missing_target(&action, true);
+            assert!(
+                inside.is_some(),
+                "`{}` should name its target even from inside",
+                args.join(" ")
+            );
+            assert!(
+                inside.unwrap().contains("--focused"),
+                "the way out is named"
+            );
+            assert!(missing_target(&action, false).is_some(), "and from outside");
+        }
+    }
+
+    #[test]
+    fn focused_is_a_target_where_a_focus_exists_and_nowhere_else() {
+        let action = parse_action(&["close-pane", "--focused"]);
+        assert!(
+            missing_target(&action, true).is_none(),
+            "inside the session there are hands to name"
+        );
+        let outside = missing_target(&action, false).expect("outside there are none");
+        assert!(outside.contains("--pane-id"), "{outside}");
+        // `--current` is the same token by another name
+        assert!(missing_target(&parse_action(&["close-pane", "--current"]), true).is_none());
+        // the negative control: a named target is fine from anywhere, and needs no focus
+        let targeted = parse_action(&["close-pane", "--pane-id", "terminal_1"]);
+        assert!(missing_target(&targeted, false).is_none());
+        assert!(missing_target(&targeted, true).is_none());
+    }
+
+    #[test]
+    fn class_two_still_means_the_focused_thing_from_inside() {
+        // the class that did not move: optionless is fine inside a pane, refused from a script
+        let action = parse_action(&["rename-pane", "notes"]);
+        assert!(missing_target(&action, true).is_none());
+        assert!(missing_target(&action, false).is_some());
+    }
+
+    #[test]
     fn a_chosen_handle_is_taken_out_of_the_request() {
         let mut action = parse_action(&["new-pane", "--handle", "build"]);
         assert_eq!(action.take_chosen_handle().as_deref(), Some("build"));
@@ -3269,16 +3524,7 @@ mod tests {
     fn every_command_that_makes_a_pane_can_be_told_what_to_call_it() {
         // one address mechanism, on every surface that creates a pane - a caller should not have
         // to know which verb made the pane to know whether it could have named it
-        for args in [
-            vec!["edit", "--handle", "notes", "/tmp/x"],
-            vec!["launch-plugin", "--handle", "board", "file:/tmp/x.wasm"],
-            vec![
-                "launch-or-focus-plugin",
-                "--handle",
-                "board",
-                "zellij:strider",
-            ],
-        ] {
+        for args in [vec!["edit", "--handle", "notes", "/tmp/x"]] {
             let mut action = parse_action(&args);
             assert_eq!(
                 action.take_chosen_handle().as_deref(),
@@ -3329,13 +3575,8 @@ mod tests {
         for args in [
             vec!["edit", "--handle", "terminal_1", "/tmp/x"],
             vec!["edit", "--handle", "7", "/tmp/x"],
-            vec!["launch-plugin", "--handle", "Board", "file:/tmp/x.wasm"],
-            vec![
-                "launch-or-focus-plugin",
-                "--handle",
-                "plugin-2",
-                "zellij:strider",
-            ],
+            vec!["edit", "--handle", "Board", "/tmp/x"],
+            vec!["edit", "--handle", "plugin-2", "/tmp/x"],
         ] {
             assert!(
                 action_parse_fails(&args),

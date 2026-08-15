@@ -2606,6 +2606,7 @@ pub fn send_cli_write_chars_action_to_screen() {
     let cli_action = CliAction::WriteChars {
         chars: Some("input from the cli".into()),
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -2633,6 +2634,7 @@ pub fn send_cli_write_action_to_screen() {
     let cli_action = CliAction::Write {
         bytes: vec![102, 111, 111],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -2835,6 +2837,7 @@ pub fn send_cli_send_keys_action_to_screen() {
     let cli_action = CliAction::SendKeys {
         keys: vec!["Ctrl a".to_string(), "x".to_string()],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2871,6 +2874,7 @@ pub fn send_cli_ctrl_c_reaches_pty_writer() {
     let cli_action = CliAction::SendKeys {
         keys: vec!["Ctrl c".to_string()],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2905,6 +2909,7 @@ pub fn send_cli_ctrl_w_reaches_pty_writer() {
     let cli_action = CliAction::SendKeys {
         keys: vec!["Ctrl w".to_string()],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -3733,6 +3738,7 @@ pub fn send_cli_toggle_active_tab_sync_action() {
     let cli_write_action = CliAction::Write {
         bytes: vec![102, 111, 111],
         pane_id: None,
+        focused: false,
     };
     send_cli_action_to_server(
         &session_metadata,
@@ -4345,7 +4351,10 @@ pub fn send_cli_close_pane_action() {
         ServerInstruction::KillSession,
         server_receiver
     );
-    let close_pane_action = CliAction::ClosePane { pane_id: None };
+    let close_pane_action = CliAction::ClosePane {
+        pane_id: None,
+        focused: false,
+    };
     send_cli_action_to_server(&session_metadata, close_pane_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_instruction, screen_thread]);
@@ -4595,7 +4604,10 @@ pub fn send_cli_close_tab_action() {
         ServerInstruction::KillSession,
         server_receiver
     );
-    let close_tab = CliAction::CloseTab { tab_id: None };
+    let close_tab = CliAction::CloseTab {
+        tab_id: None,
+        focused: false,
+    };
     send_cli_action_to_server(&session_metadata, close_tab, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_thread, screen_thread]);
@@ -7654,6 +7666,7 @@ pub fn send_cli_clear_with_pane_id() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let cli_action = CliAction::Clear {
         pane_id: Some("terminal_0".to_string()),
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7778,6 +7791,7 @@ pub fn send_cli_close_pane_with_pane_id() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let cli_action = CliAction::ClosePane {
         pane_id: Some("terminal_0".to_string()),
+        focused: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -7901,7 +7915,10 @@ pub fn send_cli_close_tab_with_tab_id() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.new_tab(TiledPaneLayout::default());
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let cli_action = CliAction::CloseTab { tab_id: Some(1) };
+    let cli_action = CliAction::CloseTab {
+        tab_id: Some(1),
+        focused: false,
+    };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
     mock_screen.teardown(vec![server_thread, screen_thread]);

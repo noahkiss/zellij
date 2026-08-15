@@ -820,7 +820,13 @@ impl Action {
         resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
     ) -> Result<Vec<Action>, String> {
         match cli_action {
-            CliAction::Write { bytes, pane_id } => match pane_id {
+            CliAction::Write {
+                bytes,
+                pane_id,
+                // resolved by the guard before this: `--focused` means the same pane an
+                // absent target does, and only the refusal cared which was typed
+                focused: _,
+            } => match pane_id {
                 Some(pane_id_str) => {
                     let parsed_pane_id = resolve_pane_target(&pane_id_str);
                     match parsed_pane_id {
@@ -839,7 +845,11 @@ impl Action {
             },
             // the text is optional on the command line because stdin can carry it; the CLI has
             // already read it by the time the action is built, and an empty one never gets here
-            CliAction::WriteChars { chars, pane_id } => {
+            CliAction::WriteChars {
+                chars,
+                pane_id,
+                focused: _,
+            } => {
                 let chars = chars.unwrap_or_default();
                 match pane_id {
                     Some(pane_id_str) => {
@@ -855,7 +865,11 @@ impl Action {
                     None => Ok(vec![Action::WriteChars { chars }]),
                 }
             },
-            CliAction::Paste { chars, pane_id } => {
+            CliAction::Paste {
+                chars,
+                pane_id,
+                focused: _,
+            } => {
                 let chars = chars.unwrap_or_default();
                 match pane_id {
                     Some(pane_id_str) => {
@@ -874,7 +888,11 @@ impl Action {
                     }]),
                 }
             },
-            CliAction::SendKeys { keys, pane_id } => {
+            CliAction::SendKeys {
+                keys,
+                pane_id,
+                focused: _,
+            } => {
                 let mut actions = Vec::new();
 
                 for (index, key_str) in keys.iter().enumerate() {
@@ -983,7 +1001,11 @@ impl Action {
                 },
                 (None, None) => Err("move-tab needs either a direction or --to-index".into()),
             },
-            CliAction::Clear { pane_id } => match pane_id {
+            CliAction::Clear {
+                pane_id,
+                // resolved by the guard before this
+                focused: _,
+            } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ClearScreenByPaneId { pane_id }])
@@ -1509,7 +1531,10 @@ impl Action {
             CliAction::AreFloatingPanesVisible { tab_id } => {
                 Ok(vec![Action::AreFloatingPanesVisible { tab_id }])
             },
-            CliAction::ClosePane { pane_id } => match pane_id {
+            CliAction::ClosePane {
+                pane_id,
+                focused: _,
+            } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::CloseFocusByPaneId { pane_id }])
@@ -1535,7 +1560,7 @@ impl Action {
             },
             CliAction::GoToNextTab => Ok(vec![Action::GoToNextTab]),
             CliAction::GoToPreviousTab => Ok(vec![Action::GoToPreviousTab]),
-            CliAction::CloseTab { tab_id } => match tab_id {
+            CliAction::CloseTab { tab_id, focused: _ } => match tab_id {
                 Some(id) => Ok(vec![Action::CloseTabById { id: id as u64 }]),
                 None => Ok(vec![Action::CloseTab]),
             },
@@ -2554,6 +2579,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Enter".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2586,6 +2612,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrl a".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2617,6 +2644,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrl a".to_string(), "F1".to_string(), "Enter".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2645,6 +2673,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrl-a".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2662,6 +2691,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrll a".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2679,6 +2709,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["a".to_string()],
             pane_id: Some("terminal_1".to_string()),
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2703,6 +2734,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["a".to_string()],
             pane_id: Some("invalid_id".to_string()),
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3170,6 +3202,7 @@ mod tests {
     fn test_clear_with_pane_id() {
         let cli_action = CliAction::Clear {
             pane_id: Some("terminal_14".to_string()),
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3190,7 +3223,10 @@ mod tests {
 
     #[test]
     fn test_clear_without_pane_id() {
-        let cli_action = CliAction::Clear { pane_id: None };
+        let cli_action = CliAction::Clear {
+            pane_id: None,
+            focused: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3364,6 +3400,7 @@ mod tests {
     fn test_close_pane_with_pane_id() {
         let cli_action = CliAction::ClosePane {
             pane_id: Some("terminal_18".to_string()),
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3384,7 +3421,10 @@ mod tests {
 
     #[test]
     fn test_close_pane_without_pane_id() {
-        let cli_action = CliAction::ClosePane { pane_id: None };
+        let cli_action = CliAction::ClosePane {
+            pane_id: None,
+            focused: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3590,7 +3630,10 @@ mod tests {
     // 20. CloseTab
     #[test]
     fn test_close_tab_with_tab_id() {
-        let cli_action = CliAction::CloseTab { tab_id: Some(5) };
+        let cli_action = CliAction::CloseTab {
+            tab_id: Some(5),
+            focused: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3610,7 +3653,10 @@ mod tests {
 
     #[test]
     fn test_close_tab_without_tab_id() {
-        let cli_action = CliAction::CloseTab { tab_id: None };
+        let cli_action = CliAction::CloseTab {
+            tab_id: None,
+            focused: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -5011,6 +5057,7 @@ mod pane_target_resolution_tests {
         let actions = Action::actions_from_cli(
             CliAction::ClosePane {
                 pane_id: Some("sunny-otter".to_owned()),
+                focused: false,
             },
             Box::new(|| PathBuf::from("/tmp")),
             None,
@@ -5036,6 +5083,7 @@ mod pane_target_resolution_tests {
         let err = Action::actions_from_cli(
             CliAction::ClosePane {
                 pane_id: Some("sunny-otter".to_owned()),
+                focused: false,
             },
             Box::new(|| PathBuf::from("/tmp")),
             None,

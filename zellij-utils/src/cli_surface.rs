@@ -349,10 +349,14 @@ How every one of these answers:
   * Exit 0 acted or found, 1 error, 2 miss. A miss is a well-formed request about something that
     is not there - a closed pane, a tab by a name nothing answers to.
   * A command that only acts prints nothing. The ones that report say so in their own --help.
-  * A mutation run from outside the session must name what it acts on. `close-pane`, `close-tab`,
-    `move-tab`, `break-pane`, `write`, `write-chars`, `clear`, `edit-scrollback` and `rename-pane`
-    refuse a targetless call from a script, because \"the focused pane\" there is a pane you have
-    never seen.
+  * Three classes decide what a verb does when you do not tell it what to act on. Moving focus,
+    scrolling, switching mode and every CREATING verb work anywhere: placement relative to where
+    you are is their point. Recoverable mutations - rename, resize, move, break-pane,
+    edit-scrollback, clear - mean the focused thing INSIDE the session, and are refused from a
+    script, where \"focused\" is something you have never seen. `close-pane`, `close-tab`, `write`,
+    `write-chars`, `send-keys` and `paste` always name their target, from inside too: there the
+    focused pane is the shell that ran the command. `--focused` (`--current`) is how you name that
+    pane on purpose.
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is

@@ -916,9 +916,7 @@ fn attach_with_cli_client(
     let inside_the_session = envs::get_session_name()
         .map(|ambient| ambient == session_name)
         .unwrap_or(false);
-    if let Some(message) =
-        zellij_utils::cli::missing_target_from_outside_a_pane(&cli_action, inside_the_session)
-    {
+    if let Some(message) = zellij_utils::cli::missing_target(&cli_action, inside_the_session) {
         eprintln!("{}", message);
         std::process::exit(1);
     }
@@ -1041,17 +1039,23 @@ fn attach_with_cli_client(
     // the text these two write can come from stdin. It is read here, after the refusals above, so a
     // call that was never going to reach a pane does not drain the pipe on its way out
     let cli_action = match cli_action {
-        zellij_utils::cli::CliAction::WriteChars { chars, pane_id } => {
-            zellij_utils::cli::CliAction::WriteChars {
-                chars: Some(text_for(chars, "write-chars")),
-                pane_id,
-            }
+        zellij_utils::cli::CliAction::WriteChars {
+            chars,
+            pane_id,
+            focused,
+        } => zellij_utils::cli::CliAction::WriteChars {
+            chars: Some(text_for(chars, "write-chars")),
+            pane_id,
+            focused,
         },
-        zellij_utils::cli::CliAction::Paste { chars, pane_id } => {
-            zellij_utils::cli::CliAction::Paste {
-                chars: Some(text_for(chars, "paste")),
-                pane_id,
-            }
+        zellij_utils::cli::CliAction::Paste {
+            chars,
+            pane_id,
+            focused,
+        } => zellij_utils::cli::CliAction::Paste {
+            chars: Some(text_for(chars, "paste")),
+            pane_id,
+            focused,
         },
         other => other,
     };
