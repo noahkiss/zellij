@@ -1792,8 +1792,8 @@ pub enum CliAction {
     },
     /// Ask whether a tab's floating panes are shown
     ///
-    /// Prints `true` and exits 0 if they are, `false` and exits 1 if they are not. The 1 is an
-    /// answer here, not an error - this command predates the fork's exit-code convention.
+    /// Prints `visible: true` or `visible: false`, and exits 0 either way: both are answers, and
+    /// only a tab nothing answers to is a miss. A tab that is not there exits 2.
     AreFloatingPanesVisible {
         /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
         /// the 1-based display position `go-to-tab` takes. Without this, the focused tab

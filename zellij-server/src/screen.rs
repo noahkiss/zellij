@@ -4703,14 +4703,11 @@ impl Screen {
                 }
             },
             Some(tab) => {
-                if tab.are_floating_panes_visible() {
-                    if let Some(c) = completion.as_mut() {
-                        c.set_stdout_message("true".to_string());
-                    }
-                } else {
-                    if let Some(c) = completion.as_mut() {
-                        c.set_error_message("false".to_string());
-                    }
+                // a question answers on stdout whichever way it comes out: `false` is the answer,
+                // not a failure to answer, so it does not travel as an error message and does not
+                // become the exit code an error message turns into
+                if let Some(c) = completion.as_mut() {
+                    c.set_stdout_message(format!("visible: {}", tab.are_floating_panes_visible()));
                 }
             },
         }

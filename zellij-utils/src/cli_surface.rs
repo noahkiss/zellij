@@ -303,8 +303,8 @@ const OUTPUTS: &[OutputSpec] = &[
     },
     OutputSpec {
         command: "action are-floating-panes-visible",
-        shape: "payload",
-        keys: "",
+        shape: "record",
+        keys: "visible",
     },
     OutputSpec {
         command: "ls",

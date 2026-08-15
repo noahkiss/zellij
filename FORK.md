@@ -279,7 +279,10 @@ of what moved to get there.
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
-| `new-pane`, `new-tab`, `break-pane`, `launch-or-focus-plugin` | `pane_id:` / `tab_id:` / `handle:` instead of a bare id |
+| `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id |
+| `break-pane` | `tab_id:` — the tab it made. The pane it moved kept the id and handle it already had |
+| `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
+| `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
 | `query-tab-names` | gone. `list-tabs` answers it |
 

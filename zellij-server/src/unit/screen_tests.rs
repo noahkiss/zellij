@@ -14066,6 +14066,77 @@ pub fn closing_a_pane_that_is_not_there_reports_a_miss_and_no_report() {
 }
 
 #[test]
+pub fn are_floating_panes_visible_answers_on_stdout_either_way() {
+    // a question is answered, not failed: `false` is as much an answer as `true`, so both leave on
+    // stdout and neither becomes the error message the CLI turns into a non-zero exit
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    // the tab needs a floating pane for the surface to have anything to show, and the tab is named
+    // rather than left to the focus: a test client holds none
+    let mut floating_pane = FloatingPaneLayout::default();
+    floating_pane.name = Some("floating".to_owned());
+    let screen_thread = mock_screen.run(Some(TiledPaneLayout::default()), vec![floating_pane]);
+
+    let _ = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::HideFloatingPanes { tab_id: Some(0) },
+        client_id,
+    );
+    let hidden = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(0) },
+        client_id,
+    );
+    let _ = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::ShowFloatingPanes { tab_id: Some(0) },
+        client_id,
+    );
+    let shown = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(0) },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+
+    assert_eq!(hidden.error_message, None, "a `false` is not an error");
+    assert_eq!(hidden.stdout_lines, vec!["visible: false".to_string()]);
+    assert_eq!(shown.error_message, None);
+    assert_eq!(shown.stdout_lines, vec!["visible: true".to_string()]);
+}
+
+#[test]
+pub fn are_floating_panes_visible_for_a_tab_that_is_not_there_is_a_miss() {
+    // the answer is about a tab, so a tab nothing answers to has no answer - that IS an error, and
+    // stays one, which is what keeps the stdout answer above meaningful
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(TiledPaneLayout::default()), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(999) },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message.as_deref(), Some("Tab not found"));
+    assert!(
+        result.stdout_lines.is_empty(),
+        "there is no answer to print: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
 pub fn closing_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
     let size = Size {
         cols: 121,
