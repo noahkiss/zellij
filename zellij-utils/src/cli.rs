@@ -1534,7 +1534,8 @@ pub enum CliAction {
 
         /// Put the pane in a tab of its own, made now, and report `tab_id:` as well as the pane.
         /// With a NAME the tab is called that; bare, zellij names it as it names any new tab. The
-        /// pane in it cannot be named with --name: use --handle, or rename it once it is there
+        /// pane in it cannot be named with --name or drawn with --borderless: use --handle, or
+        /// rename it once it is there
         #[clap(
             long,
             value_name = "NAME",
@@ -1546,7 +1547,8 @@ pub enum CliAction {
             conflicts_with("tab_id"),
             conflicts_with("near_current_pane"),
             conflicts_with("blocking"),
-            conflicts_with("name")
+            conflicts_with("name"),
+            conflicts_with("borderless")
         )]
         new_tab: Option<Option<String>>,
 
@@ -3195,6 +3197,9 @@ mod tests {
             vec!["new-pane", "--new-tab", "--near-current-pane"],
             // the pane in a new tab cannot carry a name, so the flag is refused rather than dropped
             vec!["new-pane", "--new-tab", "--name", "shell"],
+            // and neither can it carry a frame setting, for the same reason: the first pane of a
+            // new tab is described by its command and nothing else
+            vec!["new-pane", "--new-tab", "--borderless", "true"],
         ] {
             assert!(
                 action_parse_fails(&args),

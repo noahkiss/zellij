@@ -333,9 +333,15 @@ tab as its first pane, which is why the tab holds the command's pane rather than
 command's pane beside it. The tab is built from the session's own new-tab template like every other
 tab, so it keeps its status bars and its panes are written into the saved layout. Bare, zellij names
 the tab as it names any new tab. `--cwd`, `--close-on-exit`, `--start-suspended`, `--plugin`,
-`--handle` and `--no-focus` all mean what they mean elsewhere; `--name` does not travel, because the
-first pane of a new tab is described by its command and nothing else - name the pane with `--handle`,
-or rename it once it is there. The flags that say where a pane goes in an existing tab - `--direction`,
+`--handle` and `--no-focus` all mean what they mean elsewhere; `--name` and `--borderless` do not
+travel, because the first pane of a new tab is described by its command and nothing else - both are
+refused rather than dropped. Name the pane with `--handle`, or rename it once it is there.
+
+`--new-tab` is the one placement flag that **does** move the focus: whoever is attached is taken to
+the new tab, the way `new-tab` itself takes them. That is what a caller opening a tab usually means,
+and `--no-focus` is how to say otherwise. `--near` and `--in-tab` never move anybody.
+
+The flags that say where a pane goes in an existing tab - `--direction`,
 `--stacked`, `--floating`, `--in-place`, `--tab-id`, `--near-current-pane` - are refused, because
 `--new-tab` has already answered that question. So is bare `--blocking`: it waits for a pane to
 close and cannot name a pane in a tab that does not exist yet. `--block-until-exit` and its two
