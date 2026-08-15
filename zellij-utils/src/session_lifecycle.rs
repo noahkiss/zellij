@@ -1311,8 +1311,19 @@ impl PinOutcome {
 ///
 /// A write that fails part-way leaves nothing behind: the temp file is removed and the pinned path
 /// still holds whatever it held before, which is a working binary rather than a short one.
+///
+/// **A source that IS the target is refused before any of that.** Once the launcher runs the pin,
+/// `session up` passes the pin as its own source - see `pin_this_build_at` - and there is nothing
+/// a copy could achieve. Allowed through, it does harm: a SIGNED pin fails the stamp comparison,
+/// because signing changed the very file the stamp was taken from, so the refresh copies the pin
+/// over itself AND rewrites the stamp to the signed copy's own hash. The next zellij run off
+/// `PATH` then reads its unchanged package binary as stale and copies it over the signature,
+/// taking every macOS grant with it. Nothing upstream of here can tell the two paths apart.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
+    if is_the_same_file(source, target) {
+        return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+    }
     let key = source_identity(source);
     if target.exists() && pin_hash_can_be_skipped(target, key.as_ref()) {
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
@@ -1428,6 +1439,20 @@ impl SourceIdentity {
             modified_nanoseconds: nanoseconds.parse().ok()?,
         })
     }
+}
+
+/// Whether two paths name one file, asked of the inode rather than of the spelling.
+///
+/// A symlink, a hard link and a second spelling of the same directory all reach the pin under a
+/// name that is not the pin's, and every one of them is still the pin.
+#[cfg(unix)]
+fn is_the_same_file(one: &Path, other: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(one), Ok(other)) = (std::fs::metadata(one), std::fs::metadata(other)) else {
+        return false;
+    };
+    one.dev() == other.dev() && one.ino() == other.ino()
 }
 
 #[cfg(unix)]
@@ -3494,5 +3519,50 @@ mod tests {
             "the session was built more than once"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The launcher execs the pin, so `session up` hands the pin to itself as its own source. A
+    /// copy could achieve nothing there, and the ordinary path does harm.
+    ///
+    /// Signing deliberately changes the pin, and the stamp was taken from the file signing
+    /// changed. Left to fall through, the self-compare calls the signed pin stale, copies it over
+    /// itself and re-stamps it with the signed copy's own hash - and the next run off `PATH`, with
+    /// the package binary UNCHANGED and no upgrade anywhere, then reads that stamp, calls the pin
+    /// stale and copies the unsigned package over the signature. Every macOS grant goes with it.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_pin_handed_to_itself_as_its_own_source_is_left_exactly_alone() {
+        let scratch = ScratchDir::new("pin-self");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let stamped = std::fs::read_to_string(pin_source_stamp(&target)).unwrap();
+
+        // what signing does: the pin stops being byte-identical to the source it came from
+        let mut signed = std::fs::read(&target).unwrap();
+        signed.extend(std::iter::repeat(0xcd).take(900));
+        std::fs::write(&target, &signed).unwrap();
+
+        assert_eq!(
+            install_pinned_exe(&target, &target),
+            Ok(PinOutcome::UpToDate(target.clone())),
+            "the pin was compared with itself and copied over itself"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pin_source_stamp(&target)).unwrap(),
+            stamped,
+            "the self-compare re-stamped the pin with its own hash, which is the damage"
+        );
+
+        // and the package binary, unchanged and still the source the stamp names, stays current
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            signed,
+            "the signature was copied over by a refresh nothing had asked for"
+        );
     }
 }

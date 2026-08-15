@@ -2117,11 +2117,15 @@ the package is new, the pin becomes new the next time a shell runs zellij, and t
 new when it is restarted. Nothing here detects an upgrade on its own; every step is driven by
 something the user did.
 
-One wrinkle on macOS, where the pin is signed and so differs from its source. A launcher-run
-`session up` finds a stamp that does not match the pin's own bytes, calls it stale, and copies the
-pin over itself once — 40 MB for nothing, after which the stamp names the pin and the pass settles.
-It costs a copy and never correctness: the next run from the package path still sees a source hash
-the stamp does not carry, and refreshes properly.
+**A source that is the target is refused outright**, and on macOS that is not a nicety. The pin is
+signed there, so it deliberately differs from the source the stamp was taken from. Allowed through,
+the self-compare finds a stamp that does not match the pin's own bytes, calls the signed pin stale,
+copies it over itself — and re-stamps it with the signed copy's hash. The stamp then names the pin
+instead of the package, so the next run off `PATH`, with the package binary unchanged and no
+upgrade anywhere, reads it as stale and copies the unsigned package over the signature. Every grant
+that signature held goes with it, silently, and the machine has to be signed again. Refusing the
+self-compare costs nothing — there was never a copy worth making — and it is what makes the
+paragraph above true rather than nearly true.
 
 **The unit records the path, and the refresh uses the recorded one.** `up` reads the binary out of
 the installed unit rather than deriving the path again. The canonical directory honours
