@@ -479,6 +479,47 @@ pub fn sweep_stale_temps(directory: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Whether the pin refresh belongs to the signing transaction, and what to refresh from.
+///
+/// **One answer, asked by both sides.** The step that would otherwise copy the new build asks it to
+/// decide whether to skip, and the signing step asks it to decide whether to copy - and if the two
+/// ever disagreed in the "skip" direction the new build would never be pinned at all, with nothing
+/// reporting it. So the decision lives here, where it compiles and is tested on every platform,
+/// rather than in the macOS glue that supplies its inputs.
+///
+/// It defers only when there is something to lose. An **anchored** pin is a pin holding grants that
+/// a failed signing run would destroy by replacing it with a fresh ad-hoc copy - the fault this
+/// exists to prevent, see [`SigningContext::refresh_from`]. A pin that is already ad-hoc holds no
+/// grant that survives a rebuild, so refreshing it first costs nothing and pinning the new build is
+/// worth more than protecting a signature that was never load-bearing.
+///
+/// Also `None` when this run may not act (`--dry-run`) or may not sign (`--no-sign`): in both cases
+/// the ordinary refresh has to happen on its own, because nothing is coming after it.
+pub fn refresh_belongs_to_signing(
+    commander: &dyn Commander,
+    pinned: &Path,
+    mode: DoctorMode,
+    current_exe: Option<PathBuf>,
+    needs_refresh: bool,
+) -> Option<PathBuf> {
+    if !mode.fix || !mode.sign || !needs_refresh {
+        return None;
+    }
+    let current_exe = current_exe?;
+    let described = commander
+        .run(
+            "codesign",
+            &["-d", "--verbose=2", "-r-", &pinned.display().to_string()],
+            None,
+        )
+        .ok()?;
+    matches!(
+        read_signature(&described.combined()),
+        PinSignature::Anchored { .. }
+    )
+    .then_some(current_exe)
+}
+
 /// What one pass over the pinned copy's signature came to.
 pub struct SigningRun {
     pub findings: Vec<Finding>,
@@ -541,14 +582,26 @@ pub fn sign_pin(
     // same identifier, same anchored text, no code hash anywhere - and doctor called that state
     // healthy for two releases while `codesign --verify --verbose=2` rejected it. So the pin gets
     // the same verification a freshly signed copy does, and a pin that fails it is signed again.
+    //
+    // A pending refresh is the one thing that overrides "leave an anchored pin alone": the pin has
+    // to become the new build, and the only safe way to do that is to sign the new build into
+    // place. Re-signing with the same certificate writes the same requirement, so the grants ride
+    // through it - see `follow_up`.
     let mut broken_anchor = None;
-    if let PinSignature::Anchored {
-        identifier,
-        designated,
-    } = &signature
+    let leave_it_alone = match &signature {
+        PinSignature::Anchored { .. } => context.refresh_from.is_none(),
+        _ => false,
+    };
+    if let (
+        true,
+        PinSignature::Anchored {
+            identifier,
+            designated,
+        },
+    ) = (leave_it_alone, &signature)
     {
         match verify_signature(commander, &pin_display) {
-            Ok(()) => {
+            Ok(_) => {
                 findings.push(
                     Finding::ok(
                         "signing",
@@ -684,7 +737,9 @@ pub fn sign_pin(
         return SigningRun { findings };
     }
 
-    findings.extend(sign_down_the_ladder(commander, pin, context, ladder));
+    findings.extend(sign_down_the_ladder(
+        commander, pin, context, &signature, ladder,
+    ));
     SigningRun { findings }
 }
 
@@ -719,6 +774,7 @@ fn sign_down_the_ladder(
     commander: &dyn Commander,
     pin: &Path,
     context: &SigningContext,
+    before: &PinSignature,
     mut ladder: Vec<Rung>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -761,13 +817,7 @@ fn sign_down_the_ladder(
                 context.keychain_password.as_deref(),
             ));
         }
-        let changed_certificate = changes_certificate(
-            &rung,
-            context.signing_dir.identity_bundle().exists(),
-            apple_offered,
-            !refusals.is_empty(),
-        );
-        let attempt = perform_signing(commander, pin, &rung, changed_certificate, &refusals);
+        let attempt = perform_signing(commander, pin, context, &rung, before, &refusals);
         findings.extend(attempt.findings);
         let Some(refusal) = attempt.refusal else {
             return findings;
@@ -775,8 +825,10 @@ fn sign_down_the_ladder(
         if attempt.fatal {
             // the filesystem said no, not the certificate. Another rung would write the same
             // error a second time and still leave the pin as it found it.
-            findings
-                .push(Finding::needs_you("signing", refusal).note("the pinned copy is untouched"));
+            findings.push(what_became_of_the_pin(
+                Finding::needs_you("signing", refusal),
+                context,
+            ));
             return findings;
         }
         refusals.push(refusal);
@@ -799,7 +851,7 @@ fn sign_down_the_ladder(
     for refusal in refusals {
         exhausted = exhausted.note(refusal);
     }
-    exhausted = exhausted.note("the pinned copy is untouched");
+    exhausted = what_became_of_the_pin(exhausted, context);
     if apple_offered {
         // this machine HAS a certificate, so the Xcode steps would send it after one it already
         // holds. What refuses a certificate it can see is usually the key, not the certificate.
@@ -825,41 +877,51 @@ fn sign_down_the_ladder(
     findings
 }
 
-/// Whether signing with `rung` changes WHICH CERTIFICATE the requirement names.
+/// What a run that did not sign left at the pin's path, said the same way wherever it is said.
 ///
-/// Not a cosmetic distinction: a changed certificate is a changed requirement, and every grant
-/// recorded against the old one stops applying. `follow_up` says so, and a user who is told to
-/// re-grant is owed the reason.
+/// Two outcomes and they are not interchangeable, which is why this is one function rather than a
+/// sentence written at each site. With the refresh deferred into this transaction the pin still
+/// holds the PREVIOUS build, signature and grants intact, and nothing about it changed; without a
+/// deferred refresh it holds the build it already held. Saying "the pinned copy is untouched" in
+/// the first case was true only of the temp file, and it was the sentence that hid a pin replaced
+/// by an ad-hoc copy for two releases.
+fn what_became_of_the_pin(finding: Finding, context: &SigningContext) -> Finding {
+    if context.refresh_from.is_some() {
+        finding
+            .note("the pin was NOT refreshed: the new build could not be signed, so the")
+            .note("previously signed copy is still in place, on the previous build")
+            .note("every grant it holds is intact, and a restart now starts that build")
+    } else {
+        finding.note("the pinned copy is untouched")
+    }
+}
+
+/// Whether the requirement macOS recorded a grant against has just changed - and if so, why.
 ///
-/// The pin being re-signed is ad-hoc or unsigned - an anchored one is left alone before the ladder
-/// is reached - so the previous certificate cannot be read off the pin. Two signals stand in for
-/// it: the bundle on disk says this machine has signed with one of ours, and the keychain says it
-/// has an Apple one to have used.
-fn changes_certificate(
-    rung: &Rung,
-    ours_on_disk: bool,
-    apple_offered: bool,
-    fell_from_a_higher_rung: bool,
-) -> Option<&'static str> {
-    let ours_before = "this machine had signed with a certificate of its own before now, so the \
-                       requirement changed with the certificate";
-    match rung {
-        // An Apple Development certificate whose team id could not be read writes no requirement
-        // and takes the CN-anchored one `codesign` derives. That one is not interchangeable with
-        // the OU-anchored requirement the rung above it writes, so falling into it changes what
-        // macOS recorded - and the user is owed the reason rather than a bare "re-grant".
-        Rung::AppleDevelopment { team: None, .. } if fell_from_a_higher_rung => Some(
-            "the rung above this one would not sign, and this certificate could not be read for \
-             its team id - so the requirement is anchored differently and every grant changes with it",
-        ),
-        // an Apple certificate on a machine that had minted its own
-        Rung::DeveloperId(_) | Rung::AppleDevelopment { .. } => {
-            ours_on_disk.then_some(ours_before)
-        },
-        // ours on a machine that has an Apple certificate. The ladder no longer walks into this
-        // rung from an Apple one, so this arm should not be reachable - it is written out rather
-        // than assumed away, because the day it becomes reachable is the day it must say so.
-        Rung::SelfSigned(_) => apple_offered.then_some(ours_before),
+/// **Asked of the two requirements, and of nothing else.** It used to be inferred from the state of
+/// the machine: a bundle sitting in the signing directory meant "this machine has signed with a
+/// certificate of its own", so the note fired. On a Mac that had never used that rung - but had
+/// leftovers from an older shell script in its keychain and its signing directory - doctor sent the
+/// user to System Settings to re-grant three permissions against a requirement that was
+/// character-for-character the one already there. A grant is keyed to the requirement text, so the
+/// requirement text is the only thing that can answer this.
+///
+/// `None` means every grant carries over untouched, and that is worth being right about in both
+/// directions: a spurious re-grant costs a person a trip through System Settings, and a missing one
+/// costs them a session that silently cannot read their files.
+fn requirement_changed(before: &PinSignature, after: &str) -> Option<String> {
+    match before {
+        PinSignature::Anchored { designated, .. } if designated == after => None,
+        PinSignature::Anchored { .. } => Some(String::from(
+            "this pin was anchored on a different certificate before now, so the requirement \
+             macOS recorded every grant against is not the one it will evaluate from now on",
+        )),
+        // an ad-hoc or unsigned pin's requirement named the binary's own hash, so there was never
+        // a grant that could survive a rebuild. This is the FIRST requirement worth recording.
+        PinSignature::CodeHashed { .. } | PinSignature::Unsigned => Some(String::from(
+            "the pin's requirement named its own code hash until now, which no rebuild could \
+             satisfy - so the grants it holds were made against something already gone",
+        )),
     }
 }
 
@@ -878,6 +940,17 @@ pub struct SigningContext {
     /// wherever it runs, so a run with no password and no person watching stalls in a pane and
     /// under launchd exactly as it does over SSH.
     pub keychain_password: Option<String>,
+    /// The build to put at the pin's path, when the refresh was handed to this transaction rather
+    /// than done before it.
+    ///
+    /// **The refresh and the signature have to be one step or neither is safe.** Doctor used to
+    /// copy the new build over the pin and sign it afterwards, so a run where every rung refused -
+    /// a locked keychain, which is every unattended launchd run - replaced a properly anchored pin
+    /// with a fresh ad-hoc one and then reported `the pinned copy is untouched`. Both halves were
+    /// wrong: the pin had been replaced, and every grant on the machine was void from the next
+    /// restart. Signing the temp and renaming only on success means a refusal leaves the previous
+    /// signed pin exactly where it was, holding its grants, on the previous build.
+    pub refresh_from: Option<PathBuf>,
     /// Where to keep a second copy of the minted identity. zellij's own resolved config directory,
     /// so it lands wherever `ZELLIJ_CONFIG_DIR` or XDG says the user's config lives.
     pub backup_dir: Option<PathBuf>,
@@ -1008,13 +1081,17 @@ struct SignAttempt {
 fn perform_signing(
     commander: &dyn Commander,
     pin: &Path,
+    context: &SigningContext,
     rung: &Rung,
-    changed_certificate: Option<&str>,
+    before: &PinSignature,
     earlier_refusals: &[String],
 ) -> SignAttempt {
     let mut findings = Vec::new();
     let pin_display = pin.display().to_string();
     let directory = pin.parent().unwrap_or_else(|| Path::new("."));
+    // the new build when the refresh was deferred into this transaction, and the pin itself
+    // otherwise - see `SigningContext::refresh_from`
+    let source = context.refresh_from.as_deref().unwrap_or(pin);
 
     let swept = sweep_stale_temps(directory);
     if !swept.is_empty() {
@@ -1030,13 +1107,14 @@ fn perform_signing(
 
     let temporary = directory.join(format!("{}{}.tmp", sign_temp_prefix(), std::process::id()));
     let temporary_display = temporary.display().to_string();
-    if let Err(error) = std::fs::copy(pin, &temporary) {
+    if let Err(error) = std::fs::copy(source, &temporary) {
         let _ = std::fs::remove_file(&temporary);
         return SignAttempt {
             findings,
             refusal: Some(format!(
                 "could not copy {} to sign it: {}",
-                pin_display, error
+                source.display(),
+                error
             )),
             fatal: true,
         };
@@ -1079,19 +1157,34 @@ fn perform_signing(
         };
     }
 
-    if let Err(reason) = verify_signature(commander, &temporary_display) {
+    let after = match verify_signature(commander, &temporary_display) {
+        Ok(signature) => signature,
+        Err(reason) => {
+            let _ = std::fs::remove_file(&temporary);
+            return SignAttempt {
+                findings,
+                refusal: Some(format!(
+                    "{} signed, but the signature did not hold: {}",
+                    rung.description(),
+                    reason
+                )),
+                fatal: false,
+            };
+        },
+    };
+
+    // On the disk BEFORE the rename, and the name on the disk after it. This rename is the pin
+    // refresh now, not merely a signature swap, so it gets the same durability `install_pinned_exe`
+    // gives its own copy - a temp that is not really there is a pin that is not there after a
+    // crash, and the rename is over the only good binary the machine has.
+    if let Err(reason) = crate::session_lifecycle::flush_pin_temp(&temporary) {
         let _ = std::fs::remove_file(&temporary);
         return SignAttempt {
             findings,
-            refusal: Some(format!(
-                "{} signed, but the signature did not hold: {}",
-                rung.description(),
-                reason
-            )),
-            fatal: false,
+            refusal: Some(reason),
+            fatal: true,
         };
     }
-
     if let Err(error) = std::fs::rename(&temporary, pin) {
         let _ = std::fs::remove_file(&temporary);
         return SignAttempt {
@@ -1103,17 +1196,35 @@ fn perform_signing(
             fatal: true,
         };
     }
+    crate::session_lifecycle::flush_pin_directory(directory);
 
+    let refreshed = context.refresh_from.is_some();
+    if refreshed {
+        // the stamp records the SOURCE the pin was made from, and the refresh that would normally
+        // have written it was handed to this transaction instead. Without this the next run reads
+        // a stale stamp, calls the pin out of date, and refreshes it all over again.
+        crate::session_lifecycle::record_pin_refreshed_from(source, pin);
+    }
     let mut done = Finding::changed(
         "signing",
         format!(
-            "signed {} with {}{}",
+            "{} {} with {}{}",
+            if refreshed {
+                "refreshed and signed"
+            } else {
+                "signed"
+            },
             pin_display,
             rung.description(),
             if timestamped { ", timestamped" } else { "" }
         ),
     )
     .note(format!("identifier {}", PIN_IDENTIFIER));
+    if refreshed {
+        done = done
+            .note("the new build and its signature went into place as one step, so a run that")
+            .note("could not sign would have left the previous signed copy where it was");
+    }
     for earlier in earlier_refusals {
         // the rungs above this one that would not sign. Silence here would leave a machine with a
         // Developer ID wondering why its pin carries a certificate of ours.
@@ -1125,7 +1236,10 @@ fn perform_signing(
             .note(format!("  {}", the_complaint(&refusal)));
     }
     findings.push(done);
-    findings.push(follow_up(&pin_display, changed_certificate));
+    findings.push(follow_up(
+        &pin_display,
+        requirement_changed(before, after.designated().unwrap_or_default()),
+    ));
     SignAttempt {
         findings,
         refusal: None,
@@ -1211,11 +1325,12 @@ fn run_codesign(
 /// The message is matched as well as the exit status. Both were seen together on the machine this
 /// was found on, and a check that rests on the exit status alone rests on the half that had
 /// already been observed reporting success wrongly.
-fn verify_signature(commander: &dyn Commander, target: &str) -> Result<(), String> {
+fn verify_signature(commander: &dyn Commander, target: &str) -> Result<PinSignature, String> {
     let described = commander
         .run("codesign", &["-d", "--verbose=2", "-r-", target], None)
         .map_err(|reason| reason)?;
-    match read_signature(&described.combined()) {
+    let signature = read_signature(&described.combined());
+    match &signature {
         PinSignature::Anchored { .. } => {},
         PinSignature::CodeHashed { .. } => {
             return Err(String::from(
@@ -1242,16 +1357,32 @@ fn verify_signature(commander: &dyn Commander, target: &str) -> Result<(), Strin
     if !verified.success {
         return Err(first_line(said.trim()).to_owned());
     }
-    Ok(())
+    Ok(signature)
 }
 
 /// What to do next, in the order that makes it one pass instead of two.
 ///
-/// Re-granting FIRST and restarting SECOND is the whole of the advice. The grants are recorded
-/// against the pin's path and the signature it now carries; a server started before they are
-/// re-granted comes up not holding them, and the user ends up restarting twice.
-fn follow_up(pin: &str, changed_certificate: Option<&str>) -> Finding {
-    let mut finding = Finding::needs_you(
+/// Re-granting FIRST and restarting SECOND is the advice WHEN a re-grant is needed. The grants are
+/// recorded against the pin's path and the requirement it now carries; a server started before
+/// they are re-granted comes up not holding them, and the user ends up restarting twice.
+///
+/// **When the requirement did not change there is nothing to re-grant, and saying otherwise is not
+/// a harmless extra step.** It sends a person into System Settings to revoke and re-add three
+/// permissions that were already correct, and it teaches them that doctor's advice can be ignored.
+/// A pin re-signed with the same certificate carries the same requirement - that is the whole
+/// reason this feature exists - so the ordinary case, a rebuild on a machine already set up, needs
+/// only the restart.
+fn follow_up(pin: &str, changed_requirement: Option<String>) -> Finding {
+    let Some(why) = changed_requirement else {
+        return Finding::needs_you("signing", "the signature is in place; one thing left")
+            .note("`zellij session restart`, so the new server comes up running it")
+            .note(format!(
+                "the requirement is the one macOS already recorded for {}, so every grant",
+                pin
+            ))
+            .note("it holds carries over and there is nothing to re-grant");
+    };
+    Finding::needs_you(
         "signing",
         "the signature is in place; two things left, in this order",
     )
@@ -1260,15 +1391,9 @@ fn follow_up(pin: &str, changed_certificate: Option<&str>) -> Finding {
         pin
     ))
     .note("   in System Settings > Privacy & Security - once, for the new signature")
-    .note("2. THEN `zellij session restart`, so the new server comes up already holding them");
-    if let Some(why) = changed_certificate {
-        // the requirement macOS recorded is not the one it will evaluate from now on. Saying which
-        // certificate changed, and why, is the difference between one re-grant and a hunt.
-        finding = finding
-            .note(why)
-            .note("- that is why the re-grant is needed, and not only the restart");
-    }
-    finding
+    .note("2. THEN `zellij session restart`, so the new server comes up already holding them")
+    .note(why)
+    .note("- that is why the re-grant is needed, and not only the restart")
 }
 
 /// The last rung: no certificate, and nothing doctor may do about it.
@@ -1791,6 +1916,7 @@ Signature=adhoc
             signing_dir: SigningDir::new(root.join("signing")),
             keychain: String::from("login.keychain-db"),
             keychain_password: None,
+            refresh_from: None,
             backup_dir: None,
         }
     }
@@ -2157,79 +2283,52 @@ Signature=adhoc
     /// The other side of that boundary: with no Apple certificate anywhere, ours is the rung, and
     /// a refusal there really is a machine that cannot sign.
     #[test]
-    fn a_refusal_on_the_rung_we_mint_still_reaches_the_xcode_steps() {
-        let directory = tempfile::tempdir().unwrap();
-        let pin = directory.path().join("zellij");
-        std::fs::write(&pin, b"the working copy").unwrap();
-
-        let commander = RecordedCommander::new(&[
-            (
-                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
-                recorded(AD_HOC),
-            ),
-            (FIND_IDENTITY, recorded(ONLY_OURS)),
-            (
-                "codesign -s 7F8C0B1A2D3E4F5061728394A5B6C7D8E9F00112",
-                recorded_failure("the keychain is locked"),
-            ),
-        ]);
-        let scratch = tempfile::tempdir().unwrap();
-        let run = sign_pin(
-            &commander,
-            &pin,
-            DoctorMode {
-                fix: true,
-                ..DoctorMode::default()
-            },
-            &context(scratch.path()),
-        );
-
-        assert!(
-            run.findings
-                .iter()
-                .any(|finding| finding.message.contains("no signing certificate")),
-            "{:?}",
-            run.findings
-        );
-    }
-
-    /// A changed certificate is a changed requirement, and the re-grant note that says so has to
-    /// name the change in whichever direction it happened.
-    #[test]
-    fn a_changed_certificate_is_named_in_both_directions() {
-        let apple = choose_rung(&parse_identities(TWO_IDENTITIES)).unwrap();
-        let ours = choose_rung(&parse_identities(ONLY_OURS)).unwrap();
-        // an Apple certificate on a machine that had minted its own
-        assert!(changes_certificate(&apple, true, true, false).is_some());
-        assert!(changes_certificate(&apple, false, true, false).is_none());
-        // ours on a machine that has an Apple certificate
-        assert!(changes_certificate(&ours, true, true, false).is_some());
-        assert!(changes_certificate(&ours, true, false, false).is_none());
-    }
-
-    /// A fall from Developer ID onto an Apple Development certificate keeps the requirement only
-    /// while the second one's team id could be read. When it could not, the rung writes no
-    /// requirement and takes a CN-anchored one, which is a different requirement and therefore a
-    /// re-grant - so the user gets told why rather than a bare "re-grant".
-    #[test]
-    fn a_fall_onto_a_rung_with_no_team_id_says_the_requirement_changed() {
-        let no_team = Rung::AppleDevelopment {
-            identity: Identity {
-                hash: String::from("AAAA"),
-                name: String::from("Apple Development: someone@example.com (F6G7H8I9J0)"),
-            },
-            team: None,
+    fn a_re_grant_is_asked_for_only_when_the_requirement_actually_changed() {
+        let anchored = |text: &str| PinSignature::Anchored {
+            identifier: String::from(PIN_IDENTIFIER),
+            designated: String::from(text),
         };
-        // reached by falling from the rung above: the requirement is not the one it was
-        let why = changes_certificate(&no_team, false, true, true).unwrap();
-        assert!(why.contains("team id"), "{}", why);
-        assert!(follow_up("/tmp/pin", Some(why))
+        let same = "designated => identifier \"org.zellij.nkmk\" and anchor apple generic";
+
+        // The mini's case, and the whole of finding 3: a pin re-signed with the certificate it
+        // already carried. Nothing to re-grant, and saying otherwise sent a user to System
+        // Settings to redo three permissions that were already right.
+        assert_eq!(requirement_changed(&anchored(same), same), None);
+        // a different anchor IS a different requirement
+        assert!(requirement_changed(&anchored(same), "designated => something else").is_some());
+        // and an ad-hoc or unsigned pin never held a requirement worth keeping
+        assert!(requirement_changed(
+            &PinSignature::CodeHashed {
+                identifier: String::from("zellij-1234"),
+                designated: String::from("designated => cdhash H\"abc\""),
+            },
+            same
+        )
+        .is_some());
+        assert!(requirement_changed(&PinSignature::Unsigned, same).is_some());
+
+        // and the advice follows it: one step when nothing changed, two when something did
+        let unchanged = follow_up("/tmp/pin", None);
+        assert!(
+            unchanged
+                .notes
+                .iter()
+                .any(|note| note.contains("carries over")),
+            "{:?}",
+            unchanged.notes
+        );
+        assert!(
+            !unchanged
+                .notes
+                .iter()
+                .any(|note| note.contains("re-grant Full Disk Access")),
+            "{:?}",
+            unchanged.notes
+        );
+        assert!(follow_up("/tmp/pin", Some(String::from("because")))
             .notes
             .iter()
-            .any(|note| note.contains("team id")));
-        // reached as the FIRST rung, which is the ordinary machine with only an Apple Development
-        // certificate: nothing above it signed, so nothing changed
-        assert!(changes_certificate(&no_team, false, true, false).is_none());
+            .any(|note| note.contains("re-grant Full Disk Access")));
     }
 
     /// Apple's importer reads a SHA-1 MAC and 3DES PBE and nothing newer. OpenSSL 3 defaults to
@@ -2424,6 +2523,215 @@ Signature=adhoc
             "{:?}",
             warned.notes
         );
+    }
+
+    /// Finding 1, and the reason the refresh moved: doctor refreshed the pin FIRST and signed it
+    /// SECOND, so a run where every rung refused - a locked keychain, which is every unattended
+    /// launchd run - had already replaced a properly anchored pin with a fresh ad-hoc copy, and
+    /// then reported `the pinned copy is untouched`. Both halves were wrong.
+    #[test]
+    fn a_refusal_leaves_the_previous_signed_pin_exactly_where_it_was() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build, signed, holding its grants").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            // anchored, which is what makes the refresh worth deferring
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(DEVELOPER_ID),
+            ),
+            (
+                format!("codesign --verify --strict --verbose=2 {}", pin.display()).as_str(),
+                recorded(""),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("security find-certificate", recorded_failure("not found")),
+            ("codesign -s ", recorded_failure("the keychain is locked")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build.clone());
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        // the whole point: the old signed pin is still there, byte for byte
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            b"the OLD build, signed, holding its grants".to_vec(),
+            "the refusal replaced the signed pin"
+        );
+        // and nothing is left behind
+        assert!(!directory
+            .path()
+            .join(format!(".zellij.sign.{}.tmp", std::process::id()))
+            .exists());
+        let exhausted = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("refused to sign"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("was NOT refreshed")),
+            "{:?}",
+            exhausted.notes
+        );
+        assert!(
+            !exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("the pinned copy is untouched")),
+            "it still claims the pin is untouched: {:?}",
+            exhausted.notes
+        );
+    }
+
+    /// And the success path is one step: the new build goes in ALREADY signed, so there is never a
+    /// moment when the pin is the new build without a signature.
+    #[test]
+    fn a_deferred_refresh_puts_the_new_build_in_place_already_signed() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(DEVELOPER_ID),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("security find-certificate", recorded_failure("not found")),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build);
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            b"the new build".to_vec(),
+            "the new build never reached the pin"
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.message.contains("refreshed and signed")),
+            "{:?}",
+            run.findings
+        );
+        // an anchored pin is normally left alone; a pending refresh is what overrides that
+        assert!(
+            commander.called_with("codesign -s "),
+            "{:?}",
+            commander.calls()
+        );
+        // the requirement it ends on is the one it started on, so nothing to re-grant
+        let follow = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("one thing left"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            follow
+                .notes
+                .iter()
+                .any(|note| note.contains("carries over")),
+            "{:?}",
+            follow.notes
+        );
+    }
+
+    /// Which runs defer and which do not. A pin with no signature to lose is refreshed as before -
+    /// pinning the new build is worth more than protecting an ad-hoc signature that no rebuild
+    /// could satisfy anyway.
+    #[test]
+    fn only_an_anchored_pin_is_worth_deferring_a_refresh_for() {
+        let acting = DoctorMode {
+            fix: true,
+            ..DoctorMode::default()
+        };
+        let exe = PathBuf::from("/usr/local/bin/zellij");
+        let anchored = RecordedCommander::new(&[("codesign -d ", recorded(DEVELOPER_ID))]);
+        let ad_hoc = RecordedCommander::new(&[("codesign -d ", recorded(AD_HOC))]);
+
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &anchored,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe.clone()),
+                true
+            ),
+            Some(exe.clone())
+        );
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &ad_hoc,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe.clone()),
+                true
+            ),
+            None
+        );
+        // nothing to refresh
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &anchored,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe.clone()),
+                false
+            ),
+            None
+        );
+        // a dry run refreshes nothing, and a --no-sign run has nothing coming after the refresh
+        for mode in [
+            DoctorMode {
+                fix: false,
+                ..DoctorMode::default()
+            },
+            DoctorMode {
+                sign: false,
+                ..DoctorMode::default()
+            },
+        ] {
+            assert_eq!(
+                refresh_belongs_to_signing(
+                    &anchored,
+                    Path::new("/tmp/pin"),
+                    mode,
+                    Some(exe.clone()),
+                    true
+                ),
+                None
+            );
+        }
     }
 
     /// `-f` makes `codesign` announce that it is replacing a signature before it says anything
