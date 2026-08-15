@@ -538,7 +538,11 @@ the caller decides the address before the pane exists, and every later command a
   always the name the caller asked for. This is also why `--handle` cannot ride with the blocking
   family: those answer with an exit status instead of a report naming a pane.
 - **It is stored like any other handle**, which means it survives a restore: the snapshot carries
-  `pane_handle="build"` and the pane comes back at that address.
+  `pane_handle="build"` and the pane comes back at that address. It also survives the trip to the
+  server, which is what makes `new-tab --layout` and `zellij --layout` honour a `handle` a layout
+  wrote: the client/server contract carries it alongside the pane's other declared properties.
+  `restored_from` deliberately does not cross - that is provenance the server assigns, and a sender
+  declaring it would be claiming a history it does not have.
 - **In a layout**, `handle` is the spelling a person writes and `pane_handle` is what serialization
   writes; both reach the same field, and a saved layout keeps working. A layout that names a handle
   another pane in the same layout already took loses the tie rather than failing the restore — a
