@@ -2412,6 +2412,13 @@ newer pin while doctor is mid-run can be clobbered by doctor's signed copy of th
 pre-existing and unlikely — the two are typed seconds apart at worst — and the recovery is to run
 `zellij session doctor --fix` again, which sees the stale pin and replaces it.
 
+**Known limitation: the same-team assumption is not enforced.** Falling from a Developer ID to an
+Apple Development certificate keeps the requirement only while both carry the same team, and the
+walk compares neither the team id nor the requirement it would derive. A keychain holding
+certificates from two different teams would fall to a different `certificate leaf[subject.OU]`,
+which changes the requirement and drops every grant exactly as a demotion would. One machine
+holding both, from two teams, is rare enough that this is recorded rather than guarded.
+
 After a signing, the follow-up is given in the order that makes it one pass: re-grant Full Disk
 Access, Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
 restart`, so the new server comes up already holding them.
