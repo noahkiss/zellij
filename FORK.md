@@ -290,11 +290,11 @@ client the server can find. From inside a pane that is right and is the point. F
 a pane the caller has never seen. Which of those matters depends on what the verb DOES, so the
 verbs are in three classes, and a new verb is put in one when it is written:
 
-| Class | What it means with no target | Verbs |
-|---|---|---|
-| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) |
-| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-tab`, the `break-pane` family, the `toggle-pane-*` family, `clear` |
-| 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` |
+| Class | What it means with no target | Verbs | Which of them confirm |
+|---|---|---|---|
+| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
+| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-tab`, the `break-pane` family, the `toggle-pane-*` family, `clear` | `clear` |
+| 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` | `close-pane`, `close-tab` |
 
 **Class 1 is additive**, and placement relative to wherever you are is the whole point of it. A
 script calling `new-pane` is asking for exactly that.
@@ -312,6 +312,55 @@ from a script it is refused, naming `--pane-id`, because there are no hands ther
 
 None of this governs keybindings. A key is pressed by somebody looking at the thing it acts on,
 which is the case all three classes reason about the absence of.
+
+### Anything that cannot be undone asks first
+
+```
+$ zellij action close-pane --pane-id build
+close-pane kills whatever is running in that pane. Are you sure? [y/N]
+
+$ zellij action close-pane --pane-id build < /dev/null
+`close-pane` kills whatever is running in that pane, and cannot be undone. Nothing here can answer
+a prompt, so pass `--yes` to say you meant it.
+```
+
+One rule, one implementation, one wording: **a verb whose effect cannot be undone confirms first.**
+On a terminal it asks, defaulting to no. Anywhere else — a pipe, a cron job, an agent — it refuses
+and names `--yes`. A script must never meet a prompt it cannot answer: a command that blocks forever
+waiting for a keypress nobody is there to press is worse than either answer.
+
+**A refusal and a declined prompt both exit 2**, on stderr, because each is a well-formed request
+that changed nothing — which is what this fork's exit codes call a miss. `kill-all-sessions` and
+`delete-all-sessions` answered a declined prompt with 1 before, and now answer it with 2 like the
+rest.
+
+It covers `close-pane`, `close-tab`, `clear`, `kill-session`, `delete-session`, `snapshot rm` and
+`snapshot prune`. `kill-all-sessions` and `delete-all-sessions` already prompted, and now do it
+through the same helper, so the wording and the behaviour off a terminal are the same everywhere.
+
+Each verb's sentence — what it destroys — has one home, and the `action` verbs that confirm are one
+table rather than a check spread through the call sites. That is what makes the exempt list below
+readable: it is the same table, read for what is missing from it.
+
+For `close-pane`, `close-tab` and `clear` the confirm runs after the guards the client can settle
+by itself — the targetless refusal and the cross-session one — so a call that was never going to be
+sent is never asked about. It runs **before** the server is reached, so a `--pane-id` that no live
+pane answers to is confirmed first and reported as a miss afterwards. Both exit 2, and the sentence
+on stderr is what tells them apart, which is the rule the whole `action` band already follows.
+
+`close-pane` and `close-tab` keep their class-3 target requirement **and** gain the confirm, and
+both are wanted in a script: the target proves *what*, `--yes` proves the destruction is meant.
+
+What deliberately does not confirm:
+
+- **`signal-pane`** — the signal's NAME is the stated intent, and the target is already explicit.
+- **`session down`** — the fork takes a snapshot first, so it is recoverable.
+- **The write family** — it injects input but destroys nothing of its own; class-3 targeting is the
+  guard it needs.
+- **`dump-screen --path` over an existing file.** It overwrites, and that is documented rather than
+  confirmed. The file is outside zellij's own state, every tool that takes an output path behaves
+  this way, and `dump-screen` is a `read`-band verb — a prompt there would be the only one in a
+  band whose whole meaning is "changes nothing".
 
 ### Where a new pane goes: `--new-tab`, `--near`, `--in-tab`
 

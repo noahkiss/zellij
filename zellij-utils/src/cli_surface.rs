@@ -357,6 +357,10 @@ How every one of these answers:
     `write-chars`, `send-keys` and `paste` always name their target, from inside too: there the
     focused pane is the shell that ran the command. `--focused` (`--current`) is how you name that
     pane on purpose.
+  * A verb whose effect cannot be undone confirms first: `[y/N]` on a terminal, and off a terminal
+    it refuses and names `--yes`. `close-pane`, `close-tab`, `clear`, `kill-session`,
+    `delete-session`, `kill-all-sessions`, `delete-all-sessions`, `snapshot rm` and
+    `snapshot prune`. A script passes `--yes`; it never meets a prompt it cannot answer.
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
