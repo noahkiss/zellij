@@ -3087,6 +3087,35 @@ this: a tick writes if the session is dirty OR if the tick before it was. The sa
 `true`, so a session that never diverges from its layout still writes its base shape once instead
 of never being resurrectable.
 
+### What a clean session still has to write
+
+Being able to be clean brought a new way to be wrong. `is_dirty` asks whether the session has
+diverged from the layout that built it; the cache holds a copy of the SESSION, not of the layout.
+A session can be clean and still have changed. Rename a pane and the pane count is the same, the
+tabs are the same and the commands are the same - so the session is dirty by nothing, writes
+nothing, and the copy on disk keeps the old name for as long as the session stays clean. Every
+serialized attribute the dirty checks do not look at has that shape: cwd, geometry, pinning,
+borderlessness, focus, uuid, handle, colours, viewport contents. Before the pane count was fixed
+this could not happen, because a layout with tabs was dirty from birth and rewrote every tick.
+
+So a tick now also writes when the layout it WOULD write differs from the one it last wrote,
+decided by a fingerprint: a hash of every field that reaches `GlobalLayoutManifest`, taken from the
+metadata the tick has already gathered. Nothing is serialized to compute it. Both metadata structs
+are destructured field by field, so a field added later fails to compile until someone says which
+side of the fingerprint it belongs on. Two are deliberately outside it - the base layout, which
+`Screen` hands to every tick unchanged, and the editor, which is not serialized and whose only
+effect is already in a pane's recorded command.
+
+The geometry is hashed through its `Debug` rendering rather than its `Hash`: `PaneGeom` compares
+and hashes without `is_pinned` on purpose, and the serialized layout writes `pinned`.
+
+A clean, unchanging session is still silent - its fingerprint is the one already on disk - so the
+saving the pane-count fix was made for is intact. Note also that the disk write was already
+deduplicated by content, so what any of this saves is CPU, never IO.
+
+A pane's NOTE is not covered, because a note is not serialized at all. That is a gap in what the
+snapshot holds, not staleness in what it holds.
+
 ### A tab bar in a tab you are not looking at
 
 Moving, renaming, adding or closing a tab left every *other* tab's tab-bar plugin drawing the old

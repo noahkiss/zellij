@@ -288,6 +288,13 @@ pub(crate) struct Pty {
     /// otherwise never write a cache at all and could not be resurrected. The first tick writes
     /// the base shape, and every clean tick after it is silent.
     pending_layout_serialization: bool,
+    /// The digest of the metadata at the last tick that serialized, so a tick can tell whether
+    /// anything it would write has changed. `None` until the first one.
+    ///
+    /// It is what keeps a clean session's cache honest: `pending_layout_serialization` above only
+    /// knows whether the session diverges from its layout, and a session can be clean and still
+    /// have renamed a pane, moved one, changed a cwd or pinned a floating pane.
+    last_serialized_layout_fingerprint: Option<u64>,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -859,7 +866,8 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::LogLayoutToHd(mut session_layout_metadata) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
-                if pty.should_serialize_layout(session_layout_metadata.is_dirty()) {
+                let fingerprint = session_layout_metadata.serialization_fingerprint();
+                if pty.should_serialize_layout(session_layout_metadata.is_dirty(), fingerprint) {
                     match session_serialization::serialize_session_layout(
                         session_layout_metadata.into(),
                     ) {
@@ -1041,17 +1049,31 @@ impl Pty {
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
             pending_layout_serialization: true,
+            last_serialized_layout_fingerprint: None,
         }
     }
-    /// Whether this serialization tick writes the resurrection cache, given whether the session
-    /// has diverged from its layout.
+    /// Whether this serialization tick writes the resurrection cache.
     ///
-    /// A dirty tick always writes. So does the FIRST tick after a dirty one, even though that tick
-    /// is clean: the session has returned to its base shape and the cache still holds the diverged
-    /// one, and nothing would ever overwrite it. Every clean tick after that is silent.
-    fn should_serialize_layout(&mut self, is_dirty: bool) -> bool {
-        let should_serialize = is_dirty || self.pending_layout_serialization;
+    /// Three things make a tick write, and the third is the one that makes the cache trustworthy:
+    ///
+    /// 1. The session has diverged from the layout that built it (`is_dirty`).
+    /// 2. The tick before it had, even though this one has not: the session has returned to its
+    ///    base shape and the cache still holds the diverged one, so it has to be overwritten once.
+    /// 3. Anything that gets serialized has changed since the last write (`fingerprint`).
+    ///
+    /// Without (3) a session that is clean and stays clean never writes again, and every
+    /// serialized attribute `is_dirty` does not look at - a pane title, a cwd, geometry, pinning,
+    /// focus - is lost to the next resurrection. `is_dirty` cannot answer that question: it
+    /// compares the session against its base layout, and the cache is a copy of the session, not
+    /// of the layout.
+    ///
+    /// A clean, unchanging session still writes nothing, which is the whole point of (1) and (2):
+    /// its fingerprint is the one already on disk.
+    fn should_serialize_layout(&mut self, is_dirty: bool, fingerprint: u64) -> bool {
+        let fingerprint_changed = self.last_serialized_layout_fingerprint != Some(fingerprint);
+        let should_serialize = is_dirty || self.pending_layout_serialization || fingerprint_changed;
         self.pending_layout_serialization = is_dirty;
+        self.last_serialized_layout_fingerprint = Some(fingerprint);
         should_serialize
     }
     pub fn get_default_terminal(
