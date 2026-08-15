@@ -5388,16 +5388,6 @@ impl Screen {
         Ok(pane_entries)
     }
 
-    /// Which pane, if any, a CLI target names.
-    ///
-    /// The handle and uuid forms are resolved here because here is where the live panes are - the
-    /// CLI holds a string and no way to turn it into a pane. An id form needs no lookup and is
-    /// returned as given, which deliberately means an id for a pane that does not exist resolves:
-    /// "does this id name a live pane" is a different question, and the commands that care already
-    /// answer it themselves.
-    ///
-    /// Non-selectable panes are searched too. They have handles like any other pane, and a target
-    /// naming one should reach it rather than silently miss.
     /// Gives a live pane the handle its creator chose for it.
     ///
     /// The name has to be free among the session's live panes: a handle is an address, and an
@@ -5501,6 +5491,16 @@ impl Screen {
         self.action_events.iter().cloned().collect()
     }
 
+    /// Which pane, if any, a CLI target names.
+    ///
+    /// The handle and uuid forms are resolved here because here is where the live panes are - the
+    /// CLI holds a string and no way to turn it into a pane. An id form needs no lookup and is
+    /// returned as given, which deliberately means an id for a pane that does not exist resolves:
+    /// "does this id name a live pane" is a different question, and the commands that care already
+    /// answer it themselves.
+    ///
+    /// Non-selectable panes are searched too. They have handles like any other pane, and a target
+    /// naming one should reach it rather than silently miss.
     pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
         let matches: Box<dyn Fn(&PaneInfo) -> bool> = match target {
             PaneTarget::Id(pane_id) => return Some((*pane_id).into()),
