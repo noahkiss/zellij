@@ -2346,12 +2346,53 @@ Four rungs, best first — and a rung that **refuses** is walked past, not stopp
    signing starts, with `Requirement syntax error(s): line 1:1: unexpected token: identifier`. It
    reaches `codesign` as one argv, `-r=<text>`: the leading `=` is what makes the value inline
    text rather than a path to a file.
+
+   **The team id is read off the CERTIFICATE, and reading it off the identity's NAME was a bug
+   that shipped twice.** `security find-certificate -c "<name>" -p` piped into `openssl x509
+   -noout -subject` gives the subject, and the `OU` in it is the team. The parenthesised code in
+   the CN is *not*: on a Developer ID Application certificate the two are the same string, which
+   is what let the mistake through, and on an Apple Development certificate they are not. A real
+   subject, off the machine this was found on:
+
+   ```text
+   UID=7472L5G3Y6/CN=Apple Development: someone (DY7JA3K8QZ)/OU=U2VEDWFUF3/O=Someone/C=US
+   ```
+
+   Both spellings of that line are parsed, because both are in play: LibreSSL is `/usr/bin/openssl`
+   and writes `/OU=VALUE/`, while a Homebrew OpenSSL 3 may be first on `PATH` and writes
+   `OU = VALUE,`.
+
+   The lookup asks the **default keychain only** — the one `codesign` itself looks in. An Apple
+   identity that `find-identity` sees on the search list but that lives in another keychain yields
+   no team id, and degrades to the no-requirement case below rather than to a wrong one.
+
+   A certificate that cannot be read gives **no** team id, and a rung with no team id writes no
+   requirement at all and takes the CN-anchored one `codesign` derives. That is the lesser of two
+   evils by a wide margin: the derived requirement survives every rebuild, which is what a grant
+   actually needs, and only breaks when the certificate is reissued — whereas a requirement built
+   from the wrong field is one the signed binary does not satisfy, which voids the grant
+   immediately while looking correct. Writing a wrong requirement is worse than writing none.
 3. **One we mint**, kept 0700/0600 in `~/Library/Application Support/zellij/signing/`, with a copy
    of `id.p12` in zellij's resolved config directory — and a copy that could not be written is a
-   `Needs you`, because the bundle carries no passphrase and cannot be minted a second time. Minted
+   `Needs you`, because the bundle cannot be minted a second time. Minted
    **once**: its own hash is the requirement, so a second certificate voids every grant recorded
    against the first — a keychain that lost it is re-imported from the bundle rather than given a
-   new one. Never timestamped: Apple's server needs a real chain and would only refuse. The `.p12`
+   new one. The one exception is a bundle that **will not import**: it is moved to
+   `id.p12.broken-<epoch>` and a new one is minted — but only behind **two** gates, and both are
+   needed. The import error has to name the proven case (`MAC verification failed` / `wrong
+   password`), and `security find-certificate -c "<our CN>" <keychain>` has to find nothing. Any
+   other failure is reported and mints nothing. That is what keeps "mint once" true rather than
+   weakening it: a bundle that never imported was never signed with, so no grant on the machine
+   names it, whereas a locked keychain or a run with no dialog to answer fails the import while
+   holding the certificate every grant does name.
+
+   `find-identity` cannot be the second gate, and the first cut of this used it. It lists
+   identities the keychain calls *valid*, so it folds "never imported" together with "imported but
+   untrusted" and with "the keychain will not answer right now" — and it has just been asked, by
+   the only caller, and answered nothing. `find-certificate` asks about the certificate itself,
+   needing neither a trust decision nor access to the private key, which is exactly the distinction
+   the gate needs. Never timestamped: Apple's server needs a real chain and
+   would only refuse. The `.p12`
    is written with a SHA-1 MAC and `PBE-SHA1-3DES` for both key and certificate, because that is
    what `security import` reads — OpenSSL 3 defaults to neither and macOS reports the MAC it
    cannot verify as a password it was not given: `SecKeychainItemImport: MAC verification failed
@@ -2359,6 +2400,16 @@ Four rungs, best first — and a rung that **refuses** is walked past, not stopp
    algorithms, and it is tried first and dropped on failure rather than decided from a version
    string: macOS ships LibreSSL as `/usr/bin/openssl` and LibreSSL has no such flag, while a
    Homebrew OpenSSL 3 may be first on `PATH` instead.
+
+   **The bundle also needs a non-empty passphrase, and that is a format requirement rather than a
+   security one.** The algorithms above are necessary and not sufficient: Apple's importer cannot
+   verify the MAC of a PKCS#12 written with an empty password either, and reports it with the same
+   misleading `wrong password?`. Proven on a real Mac by changing nothing else — same key, same
+   certificate, same algorithms, same LibreSSL — `-passout pass:` fails and `-passout pass:zellij`
+   with `security import -P zellij` reports `1 identity imported.` So the passphrase is the
+   constant `zellij`, written in the source beside the file it opens. It protects nothing and is
+   not meant to: the protection is still the 0700 directory and the 0600 file. A passphrase nobody
+   could look up would instead be a way to lose the one certificate the machine may ever have.
 4. **Nothing** — the Xcode steps, as a `Needs you`.
 
 A certificate the keychain OFFERS is not a certificate that SIGNS, so the two Apple rungs are
@@ -2373,7 +2424,12 @@ rung would write the same error a second time.
 **The walk stops at the Apple rungs, and that boundary is the point.** Falling from a Developer ID
 to an Apple Development certificate of the same team keeps the requirement: `codesign` derives the
 same `identifier … and anchor apple generic and certificate leaf[subject.OU] = "TEAM"` for the
-first that we write by hand for the second. The certificate we mint does **not** — its requirement
+first that we write by hand for the second — which holds only while that team id comes off the
+certificate, and not at all for a rung that fell back to the derived CN-anchored requirement. That
+fall is allowed rather than blocked, because an anchored requirement that survives every rebuild
+still beats leaving the pin ad-hoc; what it must not be is silent, so the follow-up names the team
+id it could not read as the reason the re-grant is needed. The certificate we mint does **not** —
+its requirement
 is its own hash — so walking into it would void every grant on the machine. And a refusal is not
 always the certificate's fault: `errSecInternalComponent`, a keychain locked over SSH, a "Deny" on
 the key-access dialog. Each is transient, and each would otherwise demote the pin permanently —
@@ -2388,6 +2444,16 @@ says `trusted`, and ours never does. What signing needs is keychain ACL access, 
 `ZELLIJ_KEYCHAIN_PASSWORD` is the escape hatch for a run over SSH, where there is no dialog to
 answer.
 
+That rule has a consequence in the *discovery* step, and it is not obvious. `security find-identity
+-v -p codesigning` lists valid identities, and validity there is a **trust** decision — so a
+certificate we minted, which chains to nothing, is reported as `(CSSMERR_TP_NOT_TRUSTED)` and the
+listing ends `0 valid identities found` on a machine that holds it, holds its key, and signs with it
+without complaint. Seen on a real Mac. The answer is a second listing without `-v`, filtered to our
+own common name, and **not** `add-trusted-cert`: adding a trusted root would change what Gatekeeper
+accepts across the whole machine, need an administrator, and buy a grant nothing it does not already
+have. The filter matters too — an Apple certificate the keychain calls invalid is invalid for a
+reason, and taking it off that listing would put the ladder on a rung that cannot sign.
+
 The identifier is the constant `org.zellij.nkmk`. **Changing it voids every grant on every machine**,
 because it is part of the requirement macOS recorded — which is why it is a constant and not a
 setting.
@@ -2399,7 +2465,20 @@ signature that silently carries no timestamp looks exactly like one that was nev
 The round trip is a copy, a sign, two verifications and a rename. `codesign` writes in place and a
 running server holds the pin open, so an in-place sign fails `ETXTBSY` exactly when a session is up.
 The two verifications are two questions because they fail apart: a signature can verify while its
-requirement still names the code hash, which is a run that reported success and fixed nothing.
+requirement still names the code hash, which is a run that reported success and fixed nothing — and
+a requirement can read perfectly while the binary does not satisfy it, which is worse, because the
+first question is the one a text search answers and it says yes.
+
+**The verification runs `codesign --verify --strict --verbose=2`, and the verbosity is
+load-bearing.** Plain `codesign -v <path>` returned 0 on a pin that `codesign -v --verbose=2 <path>`
+rejected with `does not satisfy its designated Requirement` and exit 3: the designated-requirement
+check is what the second verbosity level adds. The message is matched as well as the exit status,
+because the exit status is the half already observed reporting success wrongly.
+
+**The same verification is run on a pin doctor did not sign**, before it is called healthy. Reading
+a requirement is not checking it: an anchored-looking pin has an identifier, an anchored text and no
+code hash anywhere whether or not the binary satisfies it, and a pin that fails verification is
+signed again rather than reported as `Already correct`.
 Anything that goes wrong leaves the working pin untouched, and a run that reached the bottom of the
 ladder reports a `Needs you` naming every rung that refused and what each one said — a machine that
 cannot sign is still a machine worth reporting on. The Xcode steps come with it only when the
@@ -2422,6 +2501,25 @@ holding both, from two teams, is rare enough that this is recorded rather than g
 After a signing, the follow-up is given in the order that makes it one pass: re-grant Full Disk
 Access, Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
 restart`, so the new server comes up already holding them.
+
+**What 0.45.0-nkmk.7 actually did on two real Macs, since the ledger should say.** It fixed the two
+faults it set out to fix and shipped three more, and every one of them was a rung no test machine
+had reached before. On the machine with an Apple Development certificate the rung signed — and the
+signature failed its own designated requirement, because the team id came off the identity's name;
+doctor did not verify what it had written, so the next run read the requirement's text, called the
+pin healthy and exited 0. It reported success, told the user to re-grant three permissions against a
+requirement the binary fails, and would never have signed again. On the machine with none, the
+minted rung still could not import: the algorithms were right and the empty passphrase was not, and
+because a bundle on disk was re-imported rather than re-minted, the code that fixed the algorithms
+never ran there at all.
+
+The lesson is narrower than "test more". **A signing flow is not proven by the rung the developer's
+machine happens to hold**, and each of the three had been sitting behind one: the requirement bug
+behind the Apple Development rung, the passphrase behind the minted one, the reuse behind a machine
+that had already failed once. The verification step is the general guard, because it does not care
+which rung produced the signature — and it is also the reason the first two were invisible: doctor
+asked whether the requirement *read* correctly, which is a question a broken signature answers
+yes to.
 
 ### A missing `TMPDIR` is an error, not a panic
 
