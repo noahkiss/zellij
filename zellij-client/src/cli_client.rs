@@ -82,10 +82,21 @@ pub fn start_cli_client(
                 );
             },
             action => {
+                let promised_a_pane = action_reports_a_new_pane(&action);
                 let lines = match individual_messages_client(&mut os_input, action, pane_id) {
                     ActionOutcome::Done(exit_status) => return exit_status,
                     ActionOutcome::Reported(lines) => lines,
                 };
+                // a verb that makes a pane answers with the pane it made, and the session writes
+                // that line only once a tab has taken the pane. No line means no pane, and the
+                // caller is about to address one - so this is a miss, said out loud, rather than a
+                // report of an id nothing answers to
+                if promised_a_pane && reported_pane(&lines).is_none() {
+                    eprintln!(
+                        "No pane was created: the session took the request and reported no pane."
+                    );
+                    return 2;
+                }
                 // the pane named itself when it was born; this is the name its creator asked for,
                 // applied before the report is printed so the report says the one the caller has
                 let lines = match chosen_handle.take() {
@@ -381,6 +392,32 @@ pub fn resolve_tab_target(
 /// close rather than for a status to match, and it is no less blocking for that.
 fn action_answers_with_its_own_report(action: &Action) -> bool {
     matches!(action, Action::NewBlockingPane { .. })
+}
+
+/// Whether this action's whole point is to make a pane, so that a report without one is a miss.
+///
+/// The pty is spawned before any tab has agreed to hold the pane, so "the action ran" and "the pane
+/// exists" are two different facts. The session reports the id only for the second, which leaves
+/// the client one thing to decide: whether an absent `pane_id:` line is an answer or a hole. For
+/// these verbs it is a hole, because the caller asked for a pane and has nothing to address.
+///
+/// `NewBlockingPane` is deliberately absent: it is answered by the command's exit status, not by an
+/// id, and it prints no `pane_id:` line even when it works. `NewTab` is absent for the same kind of
+/// reason - it is a tab that is asked for, and the pane inside it is a detail of the report.
+fn action_reports_a_new_pane(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewPane { .. }
+            | Action::NewTiledPane { .. }
+            | Action::NewFloatingPane { .. }
+            | Action::NewStackedPane { .. }
+            | Action::NewInPlacePane { .. }
+            | Action::NewTiledPluginPane { .. }
+            | Action::NewFloatingPluginPane { .. }
+            | Action::NewInPlacePluginPane { .. }
+            | Action::Run { .. }
+            | Action::EditFile { .. }
+    )
 }
 
 /// What came back from one action: the lines it wants printed, or the status the command ends on.
@@ -946,6 +983,45 @@ mod tests {
         assert_eq!(
             with_handle(vec!["tab_id: 4".to_owned()], "build"),
             vec!["tab_id: 4".to_owned(), "handle: build".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_verb_that_makes_a_pane_owes_the_caller_one() {
+        // the pair this rests on: these verbs answer with a pane, so a report without one is a
+        // miss and gets a non-zero exit instead of a printed id that reaches nothing
+        for action in [
+            Action::NewTiledPane {
+                direction: None,
+                command: None,
+                pane_name: None,
+                near_current_pane: false,
+                no_focus: false,
+                tab_id: None,
+                borderless: None,
+            },
+            Action::Run {
+                command: Default::default(),
+                near_current_pane: false,
+                no_focus: false,
+            },
+        ] {
+            assert!(
+                action_reports_a_new_pane(&action),
+                "{:?} makes a pane and was not held to reporting one",
+                action
+            );
+        }
+        // the negative control, and the reason the rule is a list rather than "anything that
+        // creates something": a blocking pane is answered by its command's exit status and prints
+        // no `pane_id:` line even when it worked
+        assert!(
+            !action_reports_a_new_pane(&blocking_pane(None)),
+            "a blocking pane was held to a report it never prints"
+        );
+        assert!(
+            !action_reports_a_new_pane(&Action::ClosePluginPane { pane_id: 3 }),
+            "a verb that makes no pane was held to reporting one"
         );
     }
 

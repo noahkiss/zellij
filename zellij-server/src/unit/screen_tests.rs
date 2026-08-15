@@ -14066,6 +14066,77 @@ pub fn closing_a_pane_that_is_not_there_reports_a_miss_and_no_report() {
 }
 
 #[test]
+pub fn are_floating_panes_visible_answers_on_stdout_either_way() {
+    // a question is answered, not failed: `false` is as much an answer as `true`, so both leave on
+    // stdout and neither becomes the error message the CLI turns into a non-zero exit
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    // the tab needs a floating pane for the surface to have anything to show, and the tab is named
+    // rather than left to the focus: a test client holds none
+    let mut floating_pane = FloatingPaneLayout::default();
+    floating_pane.name = Some("floating".to_owned());
+    let screen_thread = mock_screen.run(Some(TiledPaneLayout::default()), vec![floating_pane]);
+
+    let _ = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::HideFloatingPanes { tab_id: Some(0) },
+        client_id,
+    );
+    let hidden = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(0) },
+        client_id,
+    );
+    let _ = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::ShowFloatingPanes { tab_id: Some(0) },
+        client_id,
+    );
+    let shown = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(0) },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+
+    assert_eq!(hidden.error_message, None, "a `false` is not an error");
+    assert_eq!(hidden.stdout_lines, vec!["visible: false".to_string()]);
+    assert_eq!(shown.error_message, None);
+    assert_eq!(shown.stdout_lines, vec!["visible: true".to_string()]);
+}
+
+#[test]
+pub fn are_floating_panes_visible_for_a_tab_that_is_not_there_is_a_miss() {
+    // the answer is about a tab, so a tab nothing answers to has no answer - that IS an error, and
+    // stays one, which is what keeps the stdout answer above meaningful
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let mut mock_screen = MockScreen::new(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(TiledPaneLayout::default()), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::AreFloatingPanesVisible { tab_id: Some(999) },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(result.error_message.as_deref(), Some("Tab not found"));
+    assert!(
+        result.stdout_lines.is_empty(),
+        "there is no answer to print: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
 pub fn closing_a_tab_by_an_id_nothing_answers_to_is_a_miss() {
     let size = Size {
         cols: 121,
@@ -14621,6 +14692,44 @@ pub fn a_non_blocking_pane_answers_as_soon_as_it_is_made() {
     assert_eq!(
         result.exit_status, None,
         "a non-blocking pane answered with an exit status"
+    );
+}
+
+#[test]
+pub fn a_pane_no_tab_took_is_not_reported_as_made() {
+    // The pty is spawned before any tab has agreed to hold the pane, so the id in the instruction
+    // names a pty and not yet a pane. A tab that declines does it by dropping the pty rather than
+    // by failing, so the answer must be written after the placement and only for a pane that is
+    // really there - otherwise `new-pane` prints `pane_id:` and exits 0 for a pane that was never
+    // created, and the next command a script runs misses.
+    //
+    // A tab index nothing answers to is the deterministic refusal. In the wild it is an unsized
+    // tab on a session no client has attached to.
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    let new_pane_id = 2;
+
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(new_pane_id),
+        Some("sh".to_string()),
+        None, // hold_for_command
+        None, // invoked_with
+        NewPanePlacement::default(),
+        false, // start_suppressed
+        ClientTabIndexOrPaneId::TabIndex(99),
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+        false, // set_blocking
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a pane no tab took never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.affected_pane_id, None,
+        "the answer named a pane that no tab took"
     );
 }
 

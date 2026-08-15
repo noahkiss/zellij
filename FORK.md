@@ -76,15 +76,23 @@ you how to read the next.
   another.
 - **Where `--json` exists it carries the same information, structured.** JSON is the interface for
   programs; the default output is for a human or an agent reading a shell. The goal is `--json` on
-  every query and on every mutation that reports something. The queries have it — `ls`,
-  `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `current-tab-info`. The mutations do not
+  every query and on every mutation that reports something. Seven have it — `ls`, `list-panes`,
+  `list-tabs`, `list-tree`, `list-clients`, `list-events`, `current-tab-info`; `wait` and
+  `are-floating-panes-visible` do not, and the payload commands never will. The mutations do not
   yet, so for those this bullet is a direction rather than a promise you can write a script
   against.
 - **Results go to stdout, diagnostics go to stderr.** A command whose output you are capturing never
   mixes an explanation into it.
-- **Exit codes are `0` acted, `1` error, `2` miss.** A miss is a well-formed request about something
-  that is not there — a pane that no longer exists, a tab by a name nothing answers to. It is not a
-  failure, and it prints its sentence on stderr like one so that `set -e` scripts stop either way.
+- **Exit codes are `0` acted, `1` error, `2` the command changed nothing.** The `2` is one bucket
+  with several doors into it: a **miss** — a well-formed request about something that is not there,
+  a pane that no longer exists, a tab by a name nothing answers to; a **refusal** by one of the
+  three classes below; a **confirm** nothing could answer, or that you declined; a **wait** that
+  timed out; and a call clap would not accept in the first place. None of those is a failure, and
+  each prints its sentence on stderr like one so that `set -e` scripts stop either way. A `1` is
+  narrower: the call could not be carried out at all — a regex that does not compile, a handle a
+  live pane already holds, a target the command cannot address, text too large or not UTF-8, a
+  server that failed. **The sentence on stderr, not the exit code, says which door it came
+  through.**
 - **A payload command prints the payload and nothing else.** `dump-screen` writes screen content to
   stdout; it does not introduce it.
 
@@ -123,7 +131,7 @@ each one by name. A flag added tomorrow is in the map tomorrow, and cannot quiet
 The dump runs before the configuration is read, like `--dump-config` and `--dump-layout` beside it:
 what the CLI accepts does not depend on a config file, and a broken one must not take the map away.
 `zellij setup --json` now answers to `--check` or to `--dump-surface`; with neither it says which
-ones it takes, on stderr, and exits 1.
+ones it takes, on stderr, and exits 2 — a usage error, like the ones clap raises itself.
 
 ### `zellij action --help`
 
@@ -279,7 +287,10 @@ of what moved to get there.
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
-| `new-pane`, `new-tab`, `break-pane`, `launch-or-focus-plugin` | `pane_id:` / `tab_id:` / `handle:` instead of a bare id |
+| `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id. A pane no tab took is not reported at all: [the miss says so and exits 2](#a-pane-is-reported-only-once-a-tab-has-taken-it) |
+| `break-pane` | `tab_id:` — the tab it made. The pane it moved kept the id and handle it already had |
+| `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
+| `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
 | `query-tab-names` | gone. `list-tabs` answers it |
 
@@ -292,15 +303,18 @@ verbs are in three classes, and a new verb is put in one when it is written:
 
 | Class | What it means with no target | Verbs | Which of them confirm |
 |---|---|---|---|
-| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
-| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-tab`, the `break-pane` family, the `toggle-pane-*` family, `clear` | `clear` |
+| 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `toggle-pane-frames`, `toggle-pane-borderless`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
+| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `undo-rename-pane`, `undo-rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-pane-backwards`, `move-tab`, the `break-pane` family, `toggle-pane-embed-or-floating`, `toggle-pane-pinned`, `clear` | `clear` |
 | 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` | `close-pane`, `close-tab` |
 
 **Class 1 is additive**, and placement relative to wherever you are is the whole point of it. A
-script calling `new-pane` is asking for exactly that.
+script calling `new-pane` is asking for exactly that. A verb whose target clap already requires is
+class 1 too — `toggle-pane-borderless` cannot be called without one, so there is no absence left for
+a class to reason about.
 
 **Class 2 is the recoverable half.** Inside a pane, "focused" is the pane your hands are on and
-nothing changes. From a script it exits 1 and names the `--pane-id` or `--tab-id` that answers it.
+nothing changes. From a script it exits 2 — a refusal changes nothing — and names the `--pane-id`
+or `--tab-id` that answers it.
 `break-pane-right` and `break-pane-left` cannot name a target at all, so from outside they are
 refused outright, pointing at `break-pane --pane-id`.
 
@@ -330,7 +344,7 @@ and names `--yes`. A script must never meet a prompt it cannot answer: a command
 waiting for a keypress nobody is there to press is worse than either answer.
 
 **A refusal and a declined prompt both exit 2**, on stderr, because each is a well-formed request
-that changed nothing — which is what this fork's exit codes call a miss. `kill-all-sessions` and
+that changed nothing — which is [what a 2 means](#the-cli-output-convention). `kill-all-sessions` and
 `delete-all-sessions` answered a declined prompt with 1 before, and now answer it with 2 like the
 rest.
 
@@ -345,8 +359,9 @@ readable: it is the same table, read for what is missing from it.
 For `close-pane`, `close-tab` and `clear` the confirm runs after the guards the client can settle
 by itself — the targetless refusal and the cross-session one — so a call that was never going to be
 sent is never asked about. It runs **before** the server is reached, so a `--pane-id` that no live
-pane answers to is confirmed first and reported as a miss afterwards. Both exit 2, and the sentence
-on stderr is what tells them apart, which is the rule the whole `action` band already follows.
+pane answers to is confirmed first and reported as a miss afterwards. Both exit 2 — a refusal and a
+miss are two doors into the same bucket — and the sentence on stderr is what tells them apart,
+which is the rule the whole `action` band already follows.
 
 `close-pane` and `close-tab` keep their class-3 target requirement **and** gain the confirm, and
 both are wanted in a script: the target proves *what*, `--yes` proves the destruction is meant.
@@ -1264,6 +1279,47 @@ are placed successfully are unaffected and still return immediately.
 
 Nothing guesses a stack target. Picking some pane to stack under when the caller did not name one
 would put a confidently wrong answer where an error belongs.
+
+### A pane is reported only once a tab has taken it
+
+The `--stacked` refusal above closes one case of a general problem, and this closes the rest of it.
+Upstream reports a new pane **as soon as its pty spawns**, which is before any tab has agreed to
+hold it. A tab that declines does so by dropping the pty rather than by failing, so the CLI printed
+`pane_id:` and `handle:` and exited 0 for a pane that was never made, and the next command a script
+ran missed:
+
+```
+$ zellij -s S action break-pane --pane-id terminal_0 --no-focus
+tab_id: 1
+$ zellij -s S action new-pane --in-tab 1 --handle ghost1
+pane_id: terminal_1
+handle: ghost1                        # exit 0, and terminal_1 is in no `list-panes`
+$ zellij -s S action wait ghost1 --for exit
+No pane answers to 'ghost1'
+```
+
+The id is now written into the report **after** the placement, and only for a pane some tab really
+holds. A miss says so and exits 2:
+
+```
+$ zellij -s S action new-pane --in-tab 1 --handle ghost1
+No pane was created: the session took the request and reported no pane.
+```
+
+It is one rule in two halves, and both are needed. The **session** stops asserting an id it only
+asked for — `new-pane` in every placement, the in-place replacement, and a plugin pane. The
+**client** holds each pane-making verb to answering with a pane: no `pane_id:` line from a verb
+whose whole point is a pane means no pane, which is a miss rather than a silent success. Successful
+creations are untouched and still print the id and the handle.
+
+This is not a fix for one tab. An unsized tab is how it shows up — a tab no client has ever attached
+to has no size to place a pane in, and `break-pane` makes one on a detached session — but a
+targetless `new-pane` on such a session ghosted the same way, and so did `new-pane --plugin`. Any
+future route that declines a pane is reported honestly without knowing about this.
+
+The exit is **2**: the session changed nothing the caller can address, so it sits in the same
+bucket as every other miss (see [the CLI output convention](#the-cli-output-convention)). The stderr sentence says
+which door it came through.
 
 ### Session lifecycle: `zellij session up|down|restart`
 
@@ -2891,6 +2947,37 @@ until a tab is moved. `get_layout_metadata` iterated the map, so what it wrote w
 layout recreates tabs in the order it lists them. `query-tab-names` read the same map the same way,
 which is worse than it sounds: it is the command you would reach for to check the order, and it
 confirmed the wrong one. Both now sort by position.
+
+### A layout's pane count is the panes it produces
+
+A session serializes itself to `session-layout.kdl` every minute so a dead server can be
+resurrected, and `is_dirty` decides whether that tick has anything to write: it compares the panes
+the session has against the panes its layout describes.
+
+`Layout::pane_count` answered that second question wrong. A layout carries tabs AND a template,
+and the template is what a tab is expanded FROM - the parser fills it in even for a layout that
+declares its own tabs. Counting both added the template's panes on top of the tabs they had
+already built, so a real layout file reported more panes than any session it could produce, and
+every session grown from one was dirty from the moment it started. One layout in daily use claimed
+40 panes for the 36-pane session it built.
+
+The count now branches the way the spawn loop branches: tabs if the layout has tabs, the template
+if it has none. Swap layouts are alternative arrangements of panes that already exist, so they
+still add nothing.
+
+Two things follow from a session finally being able to be clean.
+
+**A clean session stops rewriting the cache.** That is the point. It also makes the rest of
+`is_dirty` reachable: the checks after the pane count - the commands panes are running, and whether
+the tab list still matches the layout - never ran for a layout with tabs, because the count
+returned first every time.
+
+**A session that returns to its base shape rewrites it once more.** Opening a pane and closing it
+again leaves the session clean and the file on disk diverged, and nothing would ever overwrite it -
+the next resurrection would hand back the pane that was closed. The pty thread keeps one bool for
+this: a tick writes if the session is dirty OR if the tick before it was. The same bool starts
+`true`, so a session that never diverges from its layout still writes its base shape once instead
+of never being resurrectable.
 
 ### A tab bar in a tab you are not looking at
 

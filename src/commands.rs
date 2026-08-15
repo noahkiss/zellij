@@ -61,7 +61,7 @@ pub(crate) use zellij_utils::sessions::list_sessions;
 /// wherever you meet them. `what` completes the sentence "`<verb>` <what>, and cannot be undone".
 ///
 /// A refusal and a declined prompt both exit 2: each is a well-formed request that changed
-/// nothing, which is what the fork's exit codes call a miss.
+/// nothing, which is what a 2 means - the same code the targetless guard and a miss use.
 pub(crate) fn confirm_or_exit(verb: &str, what: &str, yes: bool) {
     use std::io::IsTerminal;
     match zellij_utils::cli::confirmation_for(verb, what, yes, std::io::stdin().is_terminal()) {
@@ -931,9 +931,12 @@ fn attach_with_cli_client(
     let inside_the_session = envs::get_session_name()
         .map(|ambient| ambient == session_name)
         .unwrap_or(false);
+    // a refusal exits 2 like the confirm layer beside it: a well-formed request that changed
+    // nothing is what this fork's exit codes call a miss, and a guard that stops a call before it
+    // is sent has changed nothing
     if let Some(message) = zellij_utils::cli::missing_target(&cli_action, inside_the_session) {
         eprintln!("{}", message);
-        std::process::exit(1);
+        std::process::exit(2);
     }
     // a pane in another session cannot be named by a handle or a uuid from here, and guessing is
     // worse than refusing: the id it would resolve to belongs to a pane in this session
