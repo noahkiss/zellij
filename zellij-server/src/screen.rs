@@ -39,6 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::route::NotificationEnd;
 
 use log::{debug, warn};
+use zellij_utils::agent_detect::{self, PaneAgent};
 use zellij_utils::data::{
     ActionEvent, CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates,
     GetFocusedPaneInfoResponse, HostTerminalThemeMode, KeyWithModifier, LayoutInfo,
@@ -5386,12 +5387,17 @@ impl Screen {
             pane_info.is_selectable || show_all
         }
 
-        fn create_pane_list_entry(pane_info: PaneInfo, tab: &crate::tab::Tab) -> PaneListEntry {
+        fn create_pane_list_entry(
+            pane_info: PaneInfo,
+            tab: &crate::tab::Tab,
+            agent: Option<PaneAgent>,
+        ) -> PaneListEntry {
             PaneListEntry {
                 pane_info,
                 tab_id: tab.id,
                 tab_position: tab.position,
                 tab_name: tab.name.clone(),
+                agent,
             }
         }
 
@@ -5406,13 +5412,43 @@ impl Screen {
 
             for pane_info in pane_infos {
                 if should_include_pane(&pane_info, show_all) {
-                    pane_entries.push(create_pane_list_entry(pane_info, tab));
+                    let agent = self.agent_in_pane(&pane_info);
+                    pane_entries.push(create_pane_list_entry(pane_info, tab, agent));
                 }
             }
         }
 
         sort_panes_by_tab_and_type(&mut pane_entries);
         Ok(pane_entries)
+    }
+
+    /// The coding agent running in a pane, if one is.
+    ///
+    /// Both halves of the answer are already here: the pane's command arrived with the rest of its
+    /// process info, and the harness session-id variables were read by the pty tick - but only for
+    /// a pane whose command had already matched, so a pane running a shell costs one string
+    /// compare and nothing else. A plugin pane has no process and is never an agent.
+    fn agent_in_pane(&self, pane_info: &PaneInfo) -> Option<PaneAgent> {
+        if pane_info.is_plugin {
+            return None;
+        }
+        let process_info = self.pane_process_info.get(&pane_info.id);
+        let agent_env = process_info
+            .map(|process_info| &process_info.agent_env)
+            .cloned()
+            .unwrap_or_default();
+        // the live argv first: it is what the pane is running NOW, and it is the only one the pty
+        // tick also matched on, so it is the only one that can carry an identity
+        if let Some(command) = process_info.and_then(|info| info.command.as_deref()) {
+            if let Some(agent) = agent_detect::detect(command, &agent_env) {
+                return Some(agent);
+            }
+        }
+        // and the command the pane was STARTED with, for a pane the process table has not been
+        // asked about yet. A command pane is only probed once it produces output, so a harness
+        // that has not printed anything is invisible to the line above from the moment it is made
+        // until the moment it speaks
+        agent_detect::detect_command_line(pane_info.terminal_command.as_deref()?, &agent_env)
     }
 
     /// Gives a live pane the handle its creator chose for it.

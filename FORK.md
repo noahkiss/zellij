@@ -3497,6 +3497,55 @@ key in json.
 - Without the flag the output is byte for byte what it was, and in json the `ts` key is simply
   absent — added, like every key in the fork, never renamed or removed.
 
+### Which panes are running a coding agent (`list-agents`, and an `AGENT` column)
+
+```
+$ zellij action list-agents
+TAB_ID  TAB_NAME  PANE_ID  HANDLE       KIND    AGENT_ID  SOURCE       TITLE    COMMAND  CWD
+1       develop   3        sunny-otter  claude  9f3c1a2b  command+env  claude   claude   /home/u/src
+2       review    7        brisk-heron  codex   -         command      codex    codex    /home/u/src
+```
+
+"Send that to the develop agent" needs a way to turn a harness into a pane, and until now there was
+none: a caller had to read `list-panes`, guess which commands were agents, and read `/proc` itself
+for the identity. This makes it a query. `list-panes` gains an `AGENT` column carrying the harness
+name, `list-panes --json` gains an `agent` object on each entry, and `list-agents` is the same walk
+filtered to the panes that have one.
+
+**Detection is two-phase, and the split is why it is on by default.**
+
+- *Phase one costs nothing.* A pane's command is recorded for every terminal pane already,
+  configuration or not. Matching its basename against the harness table - `claude`, `opencode`,
+  `codex`, `pi` - is a string compare. So "which panes run an agent" needs no work from the
+  operating system at all.
+- *Phase two runs only for a pane phase one matched.* The harness's own session id lives in the
+  environment of the pane's processes, and that means walking the subtree - the same walk
+  `report_pane_env` does, on the same tick, through the same code. **A session with no agent pane in
+  it does not read the process table at all.**
+
+`SOURCE` says which phase answered: `command` when only the pane's command matched, `command+env`
+when an identity variable was found too. A reader that needs to know whether a missing `AGENT_ID`
+means "the harness does not export one" or "we never looked" reads that column rather than guessing.
+The identity variable names are best effort - a harness that renames its own is still detected, just
+without an id.
+
+**It is on the cheap surface, deliberately.** `agent` is a field on `PaneListEntry`, which is
+CLI-only, and **not** on `PaneInfo`: no protobuf tag, no plugin contract, nothing to carry through a
+rebase. `list-agents` adds no `Action` and nothing to the client/server contract either - it is
+answered by the client from one `list-panes --json`, the way `wait` is. The identity variables are
+kept in a server-internal field and never folded into `PaneInfo.pane_env`, because that map is
+published over the plugin API and the `report_pane_env` allowlist that governs it never asked for
+them.
+
+Turn it off with the top-level key, on a machine where reading a process's environment is unwanted:
+
+```kdl
+detect_agents false
+```
+
+Being top-level, it is ignored by a binary that predates it, so it can go into a shared config ahead
+of the upgrade.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

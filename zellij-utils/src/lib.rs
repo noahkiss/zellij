@@ -1,3 +1,4 @@
+pub mod agent_detect;
 pub mod capabilities;
 pub mod cli;
 pub mod cli_surface;

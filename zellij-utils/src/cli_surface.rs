@@ -35,6 +35,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "current-tab-info",
             "dump-layout",
             "dump-screen",
+            "list-agents",
             "list-clients",
             "list-events",
             "list-panes",
@@ -198,6 +199,11 @@ const OUTPUTS: &[OutputSpec] = &[
         keys: "",
     },
     OutputSpec {
+        command: "action list-agents",
+        shape: "table",
+        keys: crate::agent_detect::AGENT_TABLE_KEYS,
+    },
+    OutputSpec {
         command: "action list-clients",
         shape: "table",
         keys: "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY SIZE CURRENT",
@@ -211,7 +217,7 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action list-panes",
         shape: "table",
         keys: "TAB_ID TAB_POS TAB_NAME PANE_ID HANDLE TYPE TITLE COMMAND CWD FOCUSED FLOATING \
-               EXITED NOTE X Y ROWS COLS",
+               EXITED NOTE X Y ROWS COLS AGENT",
     },
     OutputSpec {
         command: "action list-tabs",
