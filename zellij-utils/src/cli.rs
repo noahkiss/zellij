@@ -2780,7 +2780,12 @@ pub enum TargetClass {
 
 /// The class a verb belongs to. Everything not named here is [`TargetClass::Anywhere`].
 ///
-/// A verb that takes no target at all is `Anywhere` by definition - there is nothing to leave out.
+/// A verb that takes no target at all is `Anywhere` by definition - there is nothing to leave out,
+/// and so is one whose target is required, like `toggle-pane-borderless`: clap has already refused
+/// the call this would be reasoning about.
+///
+/// A verb named `InsideOnly` or `AlwaysExplicit` here must also have an arm in [`missing_target`],
+/// or the class it is in says one thing and the command does another.
 pub fn target_class(action: &CliAction) -> TargetClass {
     match action {
         // destroys, or types into something that will run what it is told
@@ -2804,7 +2809,6 @@ pub fn target_class(action: &CliAction) -> TargetClass {
         | CliAction::BreakPane { .. }
         | CliAction::BreakPaneRight
         | CliAction::BreakPaneLeft
-        | CliAction::TogglePaneBorderless { .. }
         | CliAction::TogglePaneEmbedOrFloating { .. }
         | CliAction::TogglePanePinned { .. } => TargetClass::InsideOnly,
         _ => TargetClass::Anywhere,
@@ -2917,6 +2921,54 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
             "--pane-id",
             "list-panes",
             named(!pane_id.is_empty(), false),
+        ),
+        CliAction::Resize { pane_id, .. } => (
+            "resize",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::MovePane { pane_id, .. } => (
+            "move-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::MovePaneBackwards { pane_id, .. } => (
+            "move-pane-backwards",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::UndoRenamePane { pane_id, .. } => (
+            "undo-rename-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::TogglePaneEmbedOrFloating { pane_id, .. } => (
+            "toggle-pane-embed-or-floating",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::TogglePanePinned { pane_id, .. } => (
+            "toggle-pane-pinned",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::RenameTab { tab_id, .. } => (
+            "rename-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), false),
+        ),
+        CliAction::UndoRenameTab { tab_id, .. } => (
+            "undo-rename-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), false),
         ),
         // these two name no pane at all, by design - they are keybindings that happen to be
         // reachable from the CLI, so the way to aim them is to use the verb that can be aimed
@@ -3714,6 +3766,70 @@ mod tests {
         let targeted = parse_action(&["close-pane", "--pane-id", "terminal_1"]);
         assert!(missing_target(&targeted, false).is_none());
         assert!(missing_target(&targeted, true).is_none());
+    }
+
+    #[test]
+    fn every_verb_in_class_two_is_actually_refused_from_a_script() {
+        // the class table and the refusal are two lists that have to agree: a verb put in
+        // `InsideOnly` with no arm in `missing_target` is documented as refused from a script and
+        // is not, so `resize` from a cron job resized whichever pane somebody was looking at
+        for args in [
+            vec!["resize", "increase"],
+            vec!["move-pane"],
+            vec!["move-pane-backwards"],
+            vec!["undo-rename-pane"],
+            vec!["rename-tab", "logs"],
+            vec!["undo-rename-tab"],
+            vec!["toggle-pane-pinned"],
+            vec!["toggle-pane-embed-or-floating"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                target_class(&action),
+                TargetClass::InsideOnly,
+                "`{}` is a recoverable mutation",
+                args.join(" ")
+            );
+            assert!(
+                missing_target(&action, false).is_some(),
+                "`{}` is in a class that is refused from a script, and is not",
+                args.join(" ")
+            );
+            // the negative controls: inside the session "focused" is what the caller meant, and a
+            // named target is fine from anywhere
+            assert_eq!(
+                missing_target(&action, true),
+                None,
+                "`{}` means the focused thing from inside",
+                args.join(" ")
+            );
+        }
+        // a verb whose target is required is in no class: clap refused the call first
+        assert_eq!(
+            target_class(&parse_action(&[
+                "toggle-pane-borderless",
+                "--pane-id",
+                "terminal_1"
+            ])),
+            TargetClass::Anywhere
+        );
+    }
+
+    #[test]
+    fn a_class_two_verb_that_names_its_target_is_let_through() {
+        for args in [
+            vec!["resize", "increase", "--pane-id", "terminal_1"],
+            vec!["move-pane", "--pane-id", "sunny-otter"],
+            vec!["rename-tab", "logs", "--tab-id", "2"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                missing_target(&action, false),
+                None,
+                "`{}` names its target",
+                args.join(" ")
+            );
+        }
     }
 
     #[test]
