@@ -815,7 +815,7 @@ fn an_unchanged_process_info_map_is_not_reported_again() {
 /// A pty with nothing wired up, for testing state it keeps for itself.
 fn make_bare_pty() -> Pty {
     let bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
-    Pty::new(bus, false, None, None, None, None)
+    Pty::new(bus, false, None, None, None, None, None)
 }
 
 #[test]
