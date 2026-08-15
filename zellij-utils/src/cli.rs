@@ -1161,8 +1161,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
-        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
     },
@@ -1181,8 +1181,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
-        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
     },
@@ -1202,8 +1202,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
-        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
     },
@@ -1222,8 +1222,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
-        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
     },
@@ -1302,8 +1302,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
-        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
         /// Skip the confirmation. A script that means this says so here; without it, and with
@@ -1812,8 +1812,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
         /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
-        /// you name the pane your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
         /// Skip the confirmation. A script that means this says so here; without it, and with
@@ -1854,8 +1854,8 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
         /// Act on the focused tab, saying so. This verb never guesses a target, so this is how
-        /// you name the tab your hands are on. Only valid where a focus exists - from inside the
-        /// session, or with a client attached
+        /// you name the tab your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
         #[clap(long, visible_alias = "current", conflicts_with = "tab_id")]
         focused: bool,
         /// Skip the confirmation. A script that means this says so here; without it, and with
