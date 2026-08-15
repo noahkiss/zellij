@@ -1330,7 +1330,7 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     let mut input = std::fs::File::open(source)
         .map_err(|e| format!("could not read {}: {}", source.display(), e))?;
     // the same directory, or the rename would cross a filesystem and stop being a rename
-    let temporary = directory.join(format!(".zellij.pin.{}.tmp", std::process::id()));
+    let temporary = directory.join(format!("{}{}.tmp", pin_temp_prefix(), std::process::id()));
     if let Err(reason) = write_pin_temp(&mut input, &temporary) {
         let _ = std::fs::remove_file(&temporary);
         return Err(reason);
@@ -1585,11 +1585,110 @@ fn sha256_of_file(path: &Path) -> Option<String> {
 
 /// The directory the pinned copy lives in, for a target that may name no directory at all.
 #[cfg(unix)]
-fn pin_directory(target: &Path) -> PathBuf {
+pub fn pin_directory(target: &Path) -> PathBuf {
     match target.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+/// The name a half-finished refresh leaves behind in the pin directory.
+///
+/// Its own prefix, distinct from the signing flow's `.zellij.sign.`, so that sweeping one never
+/// removes the other. Both live in the pin's directory because a rename has to stay inside one
+/// filesystem.
+#[cfg(unix)]
+pub fn pin_temp_prefix() -> &'static str {
+    ".zellij.pin."
+}
+
+/// How long an abandoned pin temp has to have sat there before anything removes it.
+///
+/// An hour, which is far longer than the copy it belongs to could possibly take, and short enough
+/// that a `session doctor` run the day after a crash still finds it. The number is not load-bearing
+/// - the pid check below is what makes the sweep safe - it is the second belt.
+#[cfg(unix)]
+pub const PIN_TEMP_MINIMUM_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The abandoned temp copies in a pin directory: 40 MB each, and nothing else ever removes them.
+///
+/// A refresh writes `.zellij.pin.<pid>.tmp` and renames it. Killed with `SIGKILL` between the two -
+/// an OOM kill, a reboot, a power cut - it leaves the temp file behind for good, and the next
+/// refresh writes a new one under a new pid rather than reusing it.
+///
+/// **Two gates, and the pid one is the important one.** A temp file whose pid is still running
+/// belongs to a refresh that is still going, and removing it would make that refresh rename a name
+/// nothing holds. `kill(pid, 0)` answers that: `EPERM` counts as alive, because a pid this user may
+/// not signal is still a pid in use. The age gate is the second belt, for the window where a pid
+/// has been recycled onto some unrelated process, or a fresh temp is being written by a process
+/// that has not been observed yet.
+///
+/// **Deliberately not called from [`install_pinned_exe`].** That runs before anything takes a lock,
+/// on every `session up` and every interactive launch, so two of them overlap routinely - and a
+/// sweep there would be one refresh deleting another's temp file mid-copy. Sweeping belongs to
+/// `session doctor`, which the user runs on purpose, one at a time.
+#[cfg(unix)]
+pub fn stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Vec<PathBuf> {
+    let now = std::time::SystemTime::now();
+    let mut abandoned: Vec<PathBuf> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let Some(pid) = name
+                .strip_prefix(pin_temp_prefix())
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+            else {
+                return false;
+            };
+            // a name shaped like ours but not written by us is not ours to remove
+            let Ok(pid) = pid.parse::<i32>() else {
+                return false;
+            };
+            if process_is_running(pid) {
+                return false;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                return false;
+            };
+            metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= minimum_age)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    abandoned.sort();
+    abandoned
+}
+
+/// Remove what [`stale_pin_temps`] found, reporting only what actually went.
+#[cfg(unix)]
+pub fn sweep_stale_pin_temps(directory: &Path, minimum_age: std::time::Duration) -> Vec<PathBuf> {
+    stale_pin_temps(directory, minimum_age)
+        .into_iter()
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .collect()
+}
+
+/// Whether a pid is in use, asked the only way that is portable across unix.
+///
+/// Signal 0 is the "check, do not send" signal. `EPERM` means a process is there and belongs to
+/// somebody else, which for this purpose is the same answer as yes.
+#[cfg(unix)]
+fn process_is_running(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
 }
 
 /// Fill the temp copy, make it executable and get it ONTO THE DISK before it takes the pinned
@@ -2934,6 +3033,133 @@ mod tests {
         ];
         let set = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
         assert_eq!(set, 0, "could not put the mtime back");
+    }
+
+    /// A pid that is certainly not in use: spawned, waited for, and therefore reaped.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pid_that_has_finished() -> u32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("every unix has one");
+        let pid = child.id();
+        child.wait().expect("it exits at once");
+        pid
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn an_abandoned_temp(scratch: &ScratchDir, pid: u32, age: std::time::Duration) -> PathBuf {
+        let path = scratch.write(
+            &format!("{}{}.tmp", pin_temp_prefix(), pid),
+            &vec![0x7f; 512],
+        );
+        let when = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            - age;
+        set_modified_time(&path, when.as_secs() as i64, 0);
+        path
+    }
+
+    /// The file finding 3 is about: `SIGKILL` between the copy and the rename leaves 40 MB in the
+    /// pin directory, the next refresh writes a new one under a new pid, and nothing else ever
+    /// removes them.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn an_abandoned_temp_copy_is_swept_once_it_is_old_enough() {
+        let scratch = ScratchDir::new("pin-sweep");
+        let abandoned = an_abandoned_temp(
+            &scratch,
+            a_pid_that_has_finished(),
+            std::time::Duration::from_secs(2 * 60 * 60),
+        );
+
+        assert_eq!(
+            sweep_stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            vec![abandoned.clone()]
+        );
+        assert!(!abandoned.exists(), "it is still there");
+    }
+
+    /// The gate that makes the sweep safe. A temp file whose pid is alive belongs to a refresh
+    /// that is still copying into it, and removing it would leave that refresh renaming a name
+    /// nothing holds.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_temp_copy_whose_process_is_alive_is_never_swept() {
+        let scratch = ScratchDir::new("pin-sweep-live");
+        // this process, which is beyond argument the most alive pid available
+        let live = an_abandoned_temp(
+            &scratch,
+            std::process::id(),
+            std::time::Duration::from_secs(48 * 60 * 60),
+        );
+
+        assert!(process_is_running(std::process::id() as i32));
+        assert_eq!(
+            sweep_stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            Vec::<PathBuf>::new(),
+            "a refresh in flight had its temp file deleted under it"
+        );
+        assert!(live.exists());
+    }
+
+    /// The second belt: a pid can be recycled onto some unrelated process, and a temp written
+    /// moments ago by a process nothing has observed yet must survive that coincidence.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_temp_copy_younger_than_the_gate_is_left_alone() {
+        let scratch = ScratchDir::new("pin-sweep-young");
+        let fresh = an_abandoned_temp(
+            &scratch,
+            a_pid_that_has_finished(),
+            std::time::Duration::from_secs(60),
+        );
+
+        assert_eq!(
+            stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            Vec::<PathBuf>::new()
+        );
+        assert!(fresh.exists());
+    }
+
+    /// The pin directory holds the pin, its two stamps and the signing flow's own temp files. A
+    /// sweep that took any of those would be worse than the files it is there to remove.
+    ///
+    /// The signing temp is given THE SAME dead pid as the pin temp, deliberately. Any other pid
+    /// and the liveness gate would be what spares it, and the prefix - the thing that actually
+    /// keeps the two sweeps out of each other's files - would go untested.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn the_sweep_takes_nothing_that_is_not_a_pin_temp() {
+        let scratch = ScratchDir::new("pin-sweep-others");
+        let old = std::time::Duration::from_secs(48 * 60 * 60);
+        let finished = a_pid_that_has_finished();
+        let sign_temp = format!(".zellij.sign.{}.tmp", finished);
+        let bystanders = [
+            sign_temp.as_str(),
+            "zellij",
+            "zellij.source-sha256",
+            "zellij.source-key",
+            ".zellij.pin.not-a-pid.tmp",
+            ".zellij.pin.1",
+        ];
+        for name in bystanders {
+            let path = scratch.write(name, b"whatever");
+            let when = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                - old;
+            set_modified_time(&path, when.as_secs() as i64, 0);
+        }
+        let ours = an_abandoned_temp(&scratch, finished, old);
+
+        assert_eq!(
+            sweep_stale_pin_temps(&scratch.0, PIN_TEMP_MINIMUM_AGE),
+            vec![ours]
+        );
+        for name in bystanders {
+            assert!(scratch.0.join(name).exists(), "{} was swept", name);
+        }
     }
 
     /// The temp copy is flushed to the disk before anything renames it over the pinned path, and a

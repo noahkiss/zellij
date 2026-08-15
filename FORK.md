@@ -2177,14 +2177,36 @@ The two commands cannot describe one machine differently.
 **Everywhere**: which `zellij` a shell runs and whether it is this one; whether the config loads;
 the socket directory, and any server serving this name from another one or under another contract
 version; leftover wrapper scripts; the unit, its load state and its drift; one server and only one;
-whether a dead session's saved layout is holding the name; whether the running server is this build;
-the pin.
+whether a dead session's saved layout is holding the name; whether the running server is this build; the pin, and the temp copies an interrupted refresh left
+beside it.
 
 A leftover is narrow on purpose. A script in `~/bin` that merely calls zellij is a companion tool,
 not a fault, and a `zellij` there that resolves to this very binary is where zellij is installed —
 neither is reported. Two shapes are: a different build taking the name, and a script that sets
 `ZELLIJ_SOCK_DIR` before zellij can resolve it. Both are reported and never removed; the `rm` is
 printed for the user to run.
+
+**Doctor is what sweeps the abandoned pin temps.** A refresh writes `.zellij.pin.<pid>.tmp` and
+renames it. Killed between the two — an OOM kill, a reboot, a power cut — it leaves 40 MB behind
+for good, because the next refresh writes a new one under a new pid rather than reusing it. Nothing
+else on the machine knows what the file is.
+
+```
+Changed
+  pin       removed 2 abandoned temp copies in ~/.local/share/zellij/bin, holding 79.4 MB
+```
+
+Two gates, and the first is the one that matters. **A temp whose pid is still running is never
+touched**, because it belongs to a refresh that is still copying into it, and removing it would
+leave that refresh renaming a name nothing holds; `kill(pid, 0)` answers that, and `EPERM` counts
+as alive. **A temp younger than an hour is left alone** as a second belt, for a pid that has been
+recycled onto something unrelated. The `.zellij.sign.` temps are a separate prefix and a separate
+sweep, and neither takes the other's files.
+
+It is doctor's job and **not `install_pinned_exe`'s**. The install path runs before anything takes
+a lock, on every `session up` and every interactive launch, so two of them overlap routinely — and
+a sweep there would be one refresh deleting another's temp file mid-copy. Doctor is the pin path a
+person runs on purpose, one at a time.
 
 **Linux** adds what only systemd knows: whether the timer is armed — loaded and armed are different
 states, and a disarmed timer beside a healthy install is how a session stops coming back — and how
