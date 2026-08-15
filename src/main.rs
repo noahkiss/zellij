@@ -60,6 +60,7 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
+            handle,
         })) = opts.command
         {
             let cwd = cwd.or_else(|| std::env::current_dir().ok());
@@ -104,7 +105,7 @@ fn main() {
                 new_tab: None,
                 in_tab: None,
                 near: None,
-                handle: None,
+                handle,
                 near_current_pane,
                 no_focus,
                 borderless,
@@ -128,6 +129,7 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
+            handle,
         })) = opts.command
         {
             let cwd = None;
@@ -162,7 +164,7 @@ fn main() {
                 new_tab: None,
                 in_tab: None,
                 near: None,
-                handle: None,
+                handle,
                 near_current_pane: false,
                 no_focus,
                 borderless,
@@ -188,6 +190,7 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
+            handle,
         })) = opts.command
         {
             let mut file = file;
@@ -214,6 +217,7 @@ fn main() {
                 no_focus,
                 borderless,
                 tab_id,
+                handle,
             };
             commands::send_action_to_session(command_cli_action, opts.session, config);
             std::process::exit(0);

@@ -497,12 +497,27 @@ zellij action dump-screen --pane-id sunny-otter
 
 ```
 zellij action new-pane --handle build -- cargo watch
+zellij run --handle build -- cargo watch
+zellij edit --handle notes ~/notes.md
+zellij plugin --handle board -- file:/path/to.wasm
 ```
 ```kdl
 layout {
     pane handle="build" command="cargo" { args "watch" }
 }
 ```
+
+**Every command that reports the pane it made takes it**, on the same terms: `new-pane` and `edit`
+under `zellij action`, and the `run`, `edit` and `plugin` shorthands beside them. A caller should
+not have to know which verb made the pane to know whether it could have named it.
+
+`action launch-plugin` and `action launch-or-focus-plugin` are the exception, and the reason is
+worth writing down: **they print nothing at all.** A plugin's pane is built on the plugin thread
+after the action has already been answered, so nothing comes back carrying an id - and a chosen
+handle is applied to the pane the report names. The surface map used to promise `pane_id:` and
+`handle:` for both; it never printed either, and the promise has been removed rather than the
+reader being taught a report that never arrives. `zellij plugin` goes through the pane-creating
+path instead, reports what it made, and takes `--handle`.
 
 A generated handle is memorable but not predictable, and a script that wants to reach the pane it
 just made has to read the id out of the report and carry it. A chosen handle is the other way round:

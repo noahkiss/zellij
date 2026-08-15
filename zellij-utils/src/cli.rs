@@ -622,6 +622,18 @@ pub enum Sessions {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
+        /// The handle to give the pane, instead of the two-word one it would name itself:
+        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// error, and nothing is created
+        #[clap(
+            long,
+            value_parser = chosen_handle,
+            conflicts_with("blocking"),
+            conflicts_with("block_until_exit"),
+            conflicts_with("block_until_exit_success"),
+            conflicts_with("block_until_exit_failure")
+        )]
+        handle: Option<String>,
     },
     /// Load a plugin in a new pane
     ///
@@ -679,6 +691,11 @@ pub enum Sessions {
         /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
+        /// The handle to give the pane, instead of the two-word one it would name itself:
+        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// error, and nothing is created
+        #[clap(long, value_parser = chosen_handle)]
+        handle: Option<String>,
     },
     /// Open a file in a new pane running your $EDITOR
     ///
@@ -746,6 +763,11 @@ pub enum Sessions {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
+        /// The handle to give the pane, instead of the two-word one it would name itself:
+        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// error, and nothing is created
+        #[clap(long, value_parser = chosen_handle)]
+        handle: Option<String>,
     },
     /// Send data to one or more plugins, launch them if they are not running.
     #[clap(override_usage(
@@ -1667,6 +1689,11 @@ pub enum CliAction {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
+        /// The handle to give the pane, instead of the two-word one it would name itself:
+        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// error, and nothing is created
+        #[clap(long, value_parser = chosen_handle)]
+        handle: Option<String>,
     },
     /// Put every client of this session into an input mode
     SwitchMode {
@@ -2004,8 +2031,9 @@ pub enum CliAction {
     },
     /// Focus a plugin's pane if it is already running, otherwise open it
     ///
-    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`, for the pane it made or
-    /// the one it focused
+    /// Prints nothing: the plugin's pane is built on the plugin thread after this has been
+    /// answered, so there is no id to report. `list-panes` is how you find the pane afterwards,
+    /// and it is why this verb takes no `--handle`.
     LaunchOrFocusPlugin {
         /// Open it as a floating pane
         #[clap(short, long, value_parser)]
@@ -2036,7 +2064,8 @@ pub enum CliAction {
     },
     /// Open a plugin in a new pane, even if it is already running elsewhere
     ///
-    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`
+    /// Prints nothing - see `launch-or-focus-plugin`. `zellij plugin` makes a plugin pane through
+    /// the pane-creating path instead, and that one does report what it made.
     LaunchPlugin {
         /// Open it as a floating pane
         #[clap(short, long, value_parser)]
@@ -2492,7 +2521,7 @@ impl CliAction {
     /// the creation action, where nothing would look at it.
     pub fn take_chosen_handle(&mut self) -> Option<String> {
         match self {
-            CliAction::NewPane { handle, .. } => handle.take(),
+            CliAction::NewPane { handle, .. } | CliAction::Edit { handle, .. } => handle.take(),
             _ => None,
         }
     }
@@ -3234,6 +3263,86 @@ mod tests {
         assert_eq!(action.take_chosen_handle().as_deref(), Some("build"));
         // taken once: the client applies it, and it must not also travel with the action
         assert_eq!(action.take_chosen_handle(), None);
+    }
+
+    #[test]
+    fn every_command_that_makes_a_pane_can_be_told_what_to_call_it() {
+        // one address mechanism, on every surface that creates a pane - a caller should not have
+        // to know which verb made the pane to know whether it could have named it
+        for args in [
+            vec!["edit", "--handle", "notes", "/tmp/x"],
+            vec!["launch-plugin", "--handle", "board", "file:/tmp/x.wasm"],
+            vec![
+                "launch-or-focus-plugin",
+                "--handle",
+                "board",
+                "zellij:strider",
+            ],
+        ] {
+            let mut action = parse_action(&args);
+            assert_eq!(
+                action.take_chosen_handle().as_deref(),
+                Some(args[2]),
+                "`{}` did not carry its handle",
+                args.join(" ")
+            );
+            // taken once: the client applies it, and it must not also travel with the action
+            assert_eq!(action.take_chosen_handle(), None);
+        }
+    }
+
+    #[test]
+    fn the_top_level_creating_commands_take_a_handle_too() {
+        // `zellij run` and `zellij edit` are the shorthands a person actually types
+        let cli = parse_cli(
+            ["zellij", "run", "--handle", "build", "--", "cargo", "watch"]
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+        )
+        .expect("`zellij run --handle` parses");
+        match cli.command {
+            Some(Command::Sessions(Sessions::Run { handle, .. })) => {
+                assert_eq!(handle.as_deref(), Some("build"))
+            },
+            other => panic!("Expected Run, got {:?}", other),
+        }
+        let cli = parse_cli(
+            ["zellij", "edit", "--handle", "notes", "/tmp/x"]
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+        )
+        .expect("`zellij edit --handle` parses");
+        match cli.command {
+            Some(Command::Sessions(Sessions::Edit { handle, .. })) => {
+                assert_eq!(handle.as_deref(), Some("notes"))
+            },
+            other => panic!("Expected Edit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_handle_is_refused_on_the_new_surfaces_by_the_same_grammar() {
+        // the negative control, and the point of one parser: a name that reads like an id is
+        // refused wherever it is typed, not only on the verb it was first offered on
+        for args in [
+            vec!["edit", "--handle", "terminal_1", "/tmp/x"],
+            vec!["edit", "--handle", "7", "/tmp/x"],
+            vec!["launch-plugin", "--handle", "Board", "file:/tmp/x.wasm"],
+            vec![
+                "launch-or-focus-plugin",
+                "--handle",
+                "plugin-2",
+                "zellij:strider",
+            ],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
     }
 
     #[test]

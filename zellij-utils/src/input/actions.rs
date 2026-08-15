@@ -1459,6 +1459,8 @@ impl Action {
                 no_focus,
                 borderless,
                 tab_id,
+                // taken by the client before this, and applied once the pane exists
+                handle: _,
             } => {
                 let mut file = file;
                 let current_dir = get_current_dir();
@@ -4781,6 +4783,7 @@ mod tests {
             no_focus: false,
             borderless: None,
             tab_id: Some(4),
+            handle: None,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -4818,6 +4821,7 @@ mod tests {
             no_focus: false,
             borderless: None,
             tab_id: None,
+            handle: None,
         };
         let result = Action::actions_from_cli(
             cli_action,

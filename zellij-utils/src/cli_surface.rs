@@ -176,6 +176,11 @@ struct OutputSpec {
     keys: &'static str,
 }
 
+// `launch-plugin` and `launch-or-focus-plugin` are deliberately absent: they print nothing today.
+// The map used to promise `pane_id` and `handle` for both, and neither ever printed a line - the
+// plugin's pane is made on the plugin thread after the action has already been answered, so the
+// completion result carries no id to report. The printer is the authority, so the promise went
+// rather than the reader being taught a report that never arrives.
 const OUTPUTS: &[OutputSpec] = &[
     OutputSpec {
         command: "action current-tab-info",
@@ -241,16 +246,6 @@ const OUTPUTS: &[OutputSpec] = &[
     },
     OutputSpec {
         command: "action edit",
-        shape: "record",
-        keys: "pane_id handle",
-    },
-    OutputSpec {
-        command: "action launch-plugin",
-        shape: "record",
-        keys: "pane_id handle",
-    },
-    OutputSpec {
-        command: "action launch-or-focus-plugin",
         shape: "record",
         keys: "pane_id handle",
     },
