@@ -297,21 +297,28 @@ pub fn sign_temp_prefix() -> &'static str {
 /// A failed run leaves a 46 MB copy of zellij in the pin directory, and the next failed run leaves
 /// another. Nothing else ever removes them, so this is done first: sweeping AFTER a signing that
 /// might itself fail would be a sweep that never runs on the machines that need it.
+///
+/// **Gated on the pid in the name, and on age.** This once removed every `.zellij.sign.*.tmp` in
+/// the directory, which is the one thing a sweep must not do: the temp of a signing run happening
+/// RIGHT NOW is named the same way, and taking it leaves that run renaming a name nothing holds -
+/// and, on the copy path, `codesign` writing into a deleted inode. Both gates live with the pin's
+/// sweep, in [`stale_temps`](crate::session_lifecycle::stale_temps), so the two prefixes cannot
+/// drift apart on the question.
 pub fn sweep_stale_temps(directory: &Path) -> Vec<PathBuf> {
-    let mut swept: Vec<PathBuf> = std::fs::read_dir(directory)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(sign_temp_prefix()) && name.ends_with(".tmp"))
-        })
-        .filter(|path| std::fs::remove_file(path).is_ok())
-        .collect();
-    swept.sort();
-    swept
+    #[cfg(unix)]
+    {
+        crate::session_lifecycle::sweep_stale_temps(
+            directory,
+            sign_temp_prefix(),
+            crate::session_lifecycle::PIN_TEMP_MINIMUM_AGE,
+        )
+    }
+    // signing is a macOS flow and the gates are `kill(pid, 0)`. Nowhere else has anything to sweep.
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Vec::new()
+    }
 }
 
 /// What one pass over the pinned copy's signature came to.
@@ -1362,9 +1369,13 @@ Signature=adhoc
         let pin = directory.path().join("zellij");
         std::fs::write(&pin, b"a pretend 46 MB binary").unwrap();
         let pin_display = pin.display().to_string();
-        // a stale temp from a run that did not finish, which the sweep has to take
-        let stale = directory.path().join(".zellij.sign.999.tmp");
-        std::fs::write(&stale, b"leftover").unwrap();
+        // a stale temp from a run that did not finish, which the sweep has to take. Both gates
+        // have to be open for it: a pid nothing is using, and an mtime older than the age gate.
+        let stale = a_signing_temp(
+            directory.path(),
+            a_pid_that_has_finished(),
+            std::time::Duration::from_secs(48 * 60 * 60),
+        );
 
         let commander = RecordedCommander::new(&[
             (
@@ -1654,5 +1665,75 @@ Signature=adhoc
             "{:?}",
             commander.calls()
         );
+    }
+
+    /// A pid that is beyond argument finished: spawned, waited for, and reaped.
+    #[cfg(unix)]
+    fn a_pid_that_has_finished() -> u32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("every unix has one");
+        let pid = child.id();
+        child.wait().expect("it exits at once");
+        pid
+    }
+
+    /// A `.zellij.sign.<pid>.tmp` of a chosen age. `utimensat`, because `std::fs` cannot set an
+    /// mtime and the age gate cannot be tested without going back an hour.
+    #[cfg(unix)]
+    fn a_signing_temp(directory: &Path, pid: u32, age: std::time::Duration) -> PathBuf {
+        use std::ffi::CString;
+
+        let path = directory.join(format!("{}{}.tmp", sign_temp_prefix(), pid));
+        std::fs::write(&path, b"a pretend 46 MB copy").unwrap();
+        let when = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            - age;
+        let raw = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let stamp = libc::timespec {
+            tv_sec: when.as_secs() as i64,
+            tv_nsec: 0,
+        };
+        let times = [stamp, stamp];
+        let set = unsafe { libc::utimensat(libc::AT_FDCWD, raw.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(set, 0, "could not age the temp file");
+        path
+    }
+
+    /// The sweep took every `.zellij.sign.*.tmp` it found, with no gate of any kind - including
+    /// the one a signing run happening right now was about to `codesign` and rename.
+    ///
+    /// Four files, one for each answer the sweep has to get right. The pin temp is given THE SAME
+    /// dead pid as the swept file on purpose: any other pid and the liveness gate would be what
+    /// spares it, and the prefix - the thing that keeps the two sweeps out of each other's files -
+    /// would go untested.
+    #[test]
+    #[cfg(unix)]
+    fn a_signing_temp_is_swept_only_when_its_run_is_gone_and_it_is_old() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = std::time::Duration::from_secs(48 * 60 * 60);
+        let finished = a_pid_that_has_finished();
+
+        let abandoned = a_signing_temp(directory.path(), finished, old);
+        let in_flight = a_signing_temp(directory.path(), std::process::id(), old);
+        let young = a_signing_temp(
+            directory.path(),
+            a_pid_that_has_finished(),
+            std::time::Duration::from_secs(60),
+        );
+        let pin_temp = directory
+            .path()
+            .join(format!(".zellij.pin.{}.tmp", finished));
+        std::fs::write(&pin_temp, b"the pin's own temp").unwrap();
+
+        assert_eq!(sweep_stale_temps(directory.path()), vec![abandoned.clone()]);
+        assert!(!abandoned.exists(), "the abandoned copy is still there");
+        assert!(
+            in_flight.exists(),
+            "a signing run in flight had its temp deleted under it"
+        );
+        assert!(young.exists(), "a temp younger than the gate was taken");
+        assert!(pin_temp.exists(), "the pin's own temp was taken");
     }
 }

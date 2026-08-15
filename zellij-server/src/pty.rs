@@ -19,6 +19,7 @@ use std::{
     path::PathBuf,
 };
 use tokio::task::JoinHandle;
+use zellij_utils::agent_detect;
 use zellij_utils::{
     data::{
         CommandOrPlugin, Event, FloatingPaneCoordinates, GetPaneCwdResponse, GetPanePidResponse,
@@ -153,6 +154,7 @@ pub enum PtyInstruction {
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
         report_pane_env: Option<Vec<String>>,
+        detect_agents: Option<bool>,
     },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
@@ -215,6 +217,12 @@ impl From<&PtyInstruction> for PtyContext {
     }
 }
 
+/// Whether panes are checked for a coding agent when the configuration does not say.
+///
+/// On, because the check that decides whether to do any work at all is a string compare, and a
+/// session with no agent pane in it reads nothing.
+pub const DETECT_AGENTS_DEFAULT: bool = true;
+
 /// What the pty thread knows about the process it started in a terminal pane.
 ///
 /// Everything here comes out of the caches `update_and_report_cwds` refreshes once a second for
@@ -230,6 +238,14 @@ pub struct PaneProcessInfo {
     /// The variables `report_pane_env` allows, found in the pane's processes. Empty unless the
     /// configuration names some.
     pub env: BTreeMap<String, String>,
+    /// The session-id variables a coding harness exports, found in the pane's processes. Read only
+    /// for a pane whose own command already matched a harness, and only for the fixed names in
+    /// `agent_detect`.
+    ///
+    /// Kept apart from `env` deliberately. `env` is published on `PaneInfo` over the plugin API,
+    /// and these were never asked for by the `report_pane_env` allowlist that governs it; this map
+    /// goes no further than the CLI-only pane list.
+    pub agent_env: BTreeMap<String, String>,
 }
 
 pub(crate) struct Pty {
@@ -247,6 +263,11 @@ pub(crate) struct Pty {
     report_pane_env: Vec<String>,
     /// terminal_id -> the allowlisted variables last found in that pane's processes
     terminal_envs: HashMap<u32, BTreeMap<String, String>>,
+    /// Whether to work out which panes run a coding agent at all. `detect_agents`, default true.
+    detect_agents: bool,
+    /// terminal_id -> the harness session-id variables last found in that pane's processes. Only
+    /// panes whose command matched a harness appear here.
+    terminal_agent_envs: HashMap<u32, BTreeMap<String, String>>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -267,6 +288,13 @@ pub(crate) struct Pty {
     /// otherwise never write a cache at all and could not be resurrected. The first tick writes
     /// the base shape, and every clean tick after it is silent.
     pending_layout_serialization: bool,
+    /// The digest of the metadata at the last tick that serialized, so a tick can tell whether
+    /// anything it would write has changed. `None` until the first one.
+    ///
+    /// It is what keeps a clean session's cache honest: `pending_layout_serialization` above only
+    /// knows whether the session diverges from its layout, and a session can be clean and still
+    /// have renamed a pane, moved one, changed a cwd or pinned a floating pane.
+    last_serialized_layout_fingerprint: Option<u64>,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -838,7 +866,8 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::LogLayoutToHd(mut session_layout_metadata) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
-                if pty.should_serialize_layout(session_layout_metadata.is_dirty()) {
+                let fingerprint = session_layout_metadata.serialization_fingerprint();
+                if pty.should_serialize_layout(session_layout_metadata.is_dirty(), fingerprint) {
                     match session_serialization::serialize_session_layout(
                         session_layout_metadata.into(),
                     ) {
@@ -929,6 +958,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 post_command_discovery_hook,
                 resurrect_command_hints,
                 report_pane_env,
+                detect_agents,
                 client_id: _,
             } => {
                 pty.reconfigure(
@@ -936,6 +966,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                     post_command_discovery_hook,
                     resurrect_command_hints,
                     report_pane_env,
+                    detect_agents,
                 );
             },
             PtyInstruction::SendSigintToPaneId(pane_id) => {
@@ -995,6 +1026,7 @@ impl Pty {
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
         report_pane_env: Option<Vec<String>>,
+        detect_agents: Option<bool>,
     ) -> Self {
         Pty {
             active_panes: HashMap::new(),
@@ -1008,6 +1040,8 @@ impl Pty {
             resurrect_command_hints,
             report_pane_env: report_pane_env.unwrap_or_default(),
             terminal_envs: HashMap::new(),
+            detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
+            terminal_agent_envs: HashMap::new(),
             last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
             terminal_cwds: HashMap::new(),
@@ -1015,17 +1049,31 @@ impl Pty {
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
             pending_layout_serialization: true,
+            last_serialized_layout_fingerprint: None,
         }
     }
-    /// Whether this serialization tick writes the resurrection cache, given whether the session
-    /// has diverged from its layout.
+    /// Whether this serialization tick writes the resurrection cache.
     ///
-    /// A dirty tick always writes. So does the FIRST tick after a dirty one, even though that tick
-    /// is clean: the session has returned to its base shape and the cache still holds the diverged
-    /// one, and nothing would ever overwrite it. Every clean tick after that is silent.
-    fn should_serialize_layout(&mut self, is_dirty: bool) -> bool {
-        let should_serialize = is_dirty || self.pending_layout_serialization;
+    /// Three things make a tick write, and the third is the one that makes the cache trustworthy:
+    ///
+    /// 1. The session has diverged from the layout that built it (`is_dirty`).
+    /// 2. The tick before it had, even though this one has not: the session has returned to its
+    ///    base shape and the cache still holds the diverged one, so it has to be overwritten once.
+    /// 3. Anything that gets serialized has changed since the last write (`fingerprint`).
+    ///
+    /// Without (3) a session that is clean and stays clean never writes again, and every
+    /// serialized attribute `is_dirty` does not look at - a pane title, a cwd, geometry, pinning,
+    /// focus - is lost to the next resurrection. `is_dirty` cannot answer that question: it
+    /// compares the session against its base layout, and the cache is a copy of the session, not
+    /// of the layout.
+    ///
+    /// A clean, unchanging session still writes nothing, which is the whole point of (1) and (2):
+    /// its fingerprint is the one already on disk.
+    fn should_serialize_layout(&mut self, is_dirty: bool, fingerprint: u64) -> bool {
+        let fingerprint_changed = self.last_serialized_layout_fingerprint != Some(fingerprint);
+        let should_serialize = is_dirty || self.pending_layout_serialization || fingerprint_changed;
         self.pending_layout_serialization = is_dirty;
+        self.last_serialized_layout_fingerprint = Some(fingerprint);
         should_serialize
     }
     pub fn get_default_terminal(
@@ -2252,29 +2300,79 @@ impl Pty {
         self.report_pane_process_info();
     }
 
-    /// Read the allowlisted variables out of every pane's processes.
+    /// Read the allowlisted variables, and any coding agent's session id, out of the panes' processes.
     ///
-    /// Costs nothing unless `report_pane_env` names something: the whole pass returns immediately
-    /// on an empty allowlist, which is the default. When it is set, the process table is read once
-    /// for the tick rather than once per pane, because every pane asks it the same question.
+    /// Two readers share one walk of the process table, because both ask it the same question and
+    /// reading it twice a second would be silly.
     ///
-    /// The variable lives on a process the shell started, not on the shell, so this walks down
-    /// from the pane's own child - the same problem `resurrect_command_hints` solves, and the same
-    /// code solving it.
+    /// * `report_pane_env` is the configured allowlist. It costs nothing unless it names something,
+    ///   which by default it does not.
+    /// * Agent detection asks only about panes whose OWN command already matched a harness - which
+    ///   is a string compare against a cache this tick already filled, not a probe - and then only
+    ///   for the fixed session-id variable names in `agent_detect`. A session with no agent pane
+    ///   in it therefore reads nothing, and the process table is not touched at all.
+    ///
+    /// Either way the variable lives on a process the shell started, not on the shell, so this
+    /// walks down from the pane's own child - the same problem `resurrect_command_hints` solves,
+    /// and the same code solving it.
     fn refresh_pane_envs(&mut self) {
-        if self.report_pane_env.is_empty() {
+        let agent_panes: Vec<(u32, u32)> = if self.detect_agents {
+            self.id_to_child_pid
+                .iter()
+                .filter(|(terminal_id, _)| {
+                    self.reported_command_for(**terminal_id)
+                        .and_then(|command| {
+                            command
+                                .first()
+                                .and_then(|argv0| agent_detect::harness_for_command(argv0))
+                        })
+                        .is_some()
+                })
+                .map(|(terminal_id, child_pid)| (*terminal_id, *child_pid))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if self.report_pane_env.is_empty() && agent_panes.is_empty() {
             self.terminal_envs.clear();
+            self.terminal_agent_envs.clear();
             return;
         }
         let process_tree = ProcessTree::read();
-        let vars = self.report_pane_env.clone();
-        self.terminal_envs = self
-            .id_to_child_pid
-            .iter()
+        if self.report_pane_env.is_empty() {
+            self.terminal_envs.clear();
+        } else {
+            let vars = self.report_pane_env.clone();
+            self.terminal_envs = self
+                .id_to_child_pid
+                .iter()
+                .map(|(terminal_id, child_pid)| {
+                    (*terminal_id, process_tree.find_all_envs(*child_pid, &vars))
+                })
+                .collect();
+        }
+        let identity_vars = agent_detect::identity_env_names();
+        self.terminal_agent_envs = agent_panes
+            .into_iter()
             .map(|(terminal_id, child_pid)| {
-                (*terminal_id, process_tree.find_all_envs(*child_pid, &vars))
+                (
+                    terminal_id,
+                    process_tree.find_all_envs(child_pid, &identity_vars),
+                )
             })
             .collect();
+    }
+
+    /// The command this tick would report for a pane: its foreground process, or its shell.
+    ///
+    /// The one place that rule is written down, so agent detection and the report below cannot
+    /// disagree about what a pane is running.
+    fn reported_command_for(&self, terminal_id: u32) -> Option<&Vec<String>> {
+        self.terminal_foreground_cmds
+            .get(&terminal_id)
+            .filter(|cmd| !cmd.is_empty())
+            .or_else(|| self.terminal_cmds.get(&terminal_id))
+            .filter(|cmd| !cmd.is_empty())
     }
 
     /// Screen holds no pid, cwd or command of its own - it is told, from these caches, every tick.
@@ -2291,14 +2389,7 @@ impl Pty {
             .keys()
             .copied()
             .map(|terminal_id| {
-                let foreground = self
-                    .terminal_foreground_cmds
-                    .get(&terminal_id)
-                    .filter(|cmd| !cmd.is_empty());
-                let command = foreground
-                    .or_else(|| self.terminal_cmds.get(&terminal_id))
-                    .filter(|cmd| !cmd.is_empty())
-                    .cloned();
+                let command = self.reported_command_for(terminal_id).cloned();
                 (
                     terminal_id,
                     PaneProcessInfo {
@@ -2307,6 +2398,11 @@ impl Pty {
                         command,
                         env: self
                             .terminal_envs
+                            .get(&terminal_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        agent_env: self
+                            .terminal_agent_envs
                             .get(&terminal_id)
                             .cloned()
                             .unwrap_or_default(),
@@ -2447,11 +2543,13 @@ impl Pty {
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
         report_pane_env: Option<Vec<String>>,
+        detect_agents: Option<bool>,
     ) {
         self.default_editor = default_editor;
         self.post_command_discovery_hook = post_command_discovery_hook;
         self.resurrect_command_hints = resurrect_command_hints;
         self.report_pane_env = report_pane_env.unwrap_or_default();
+        self.detect_agents = detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT);
     }
 
     /// A shell told us its cwd directly, so we do not have to read it off the process.
