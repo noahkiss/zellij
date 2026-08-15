@@ -785,16 +785,23 @@ fn sign_down_the_ladder(
     if apple_offered {
         // this machine HAS a certificate, so the Xcode steps would send it after one it already
         // holds. What refuses a certificate it can see is usually the key, not the certificate.
-        findings.push(
-            exhausted
-                .note("nothing was signed with a different certificate: that would change the")
-                .note("requirement macOS recorded, and void every grant this path holds")
-                .note("a locked keychain or a denied key-access dialog refuses like this - over")
-                .note("SSH there is no dialog to answer, so set ZELLIJ_KEYCHAIN_PASSWORD or run")
-                .note("this from a terminal on the machine"),
-        );
-    } else {
-        findings.push(exhausted);
+        exhausted = exhausted
+            .note("nothing was signed with a different certificate: that would change the")
+            .note("requirement macOS recorded, and void every grant this path holds");
+    }
+    // The key, not the certificate, is what usually refuses - a keychain that will not release it,
+    // or a key-access dialog nobody was there to answer. Both remedies are given on EVERY
+    // exhausted ladder, including the rung we mint: a certificate doctor made itself is exactly
+    // the one whose key has never been approved.
+    exhausted = exhausted
+        .note("a locked keychain or an unanswered key-access dialog refuses like this")
+        .note(KEY_ACCESS_REMEDIES[0])
+        .note(KEY_ACCESS_REMEDIES[1])
+        .note(KEY_ACCESS_REMEDIES[2]);
+    findings.push(exhausted);
+    if !apple_offered {
+        // an Apple certificate is still a real alternative to one we minted, so the steps stay -
+        // but they come AFTER the key-access remedies, which are what usually applies.
         findings.push(xcode_steps(&pin.display().to_string()));
     }
     findings
@@ -848,7 +855,10 @@ pub struct SigningContext {
     pub signing_dir: SigningDir,
     /// The keychain to import into - the user's default, which is where `codesign` looks.
     pub keychain: String,
-    /// `ZELLIJ_KEYCHAIN_PASSWORD`, for a run over SSH where no dialog can be answered.
+    /// `ZELLIJ_KEYCHAIN_PASSWORD`, read from the environment when the user has set it and never
+    /// asked for. Not an SSH-only escape hatch: `security` prompts on the controlling terminal
+    /// wherever it runs, so a run with no password and no person watching stalls in a pane and
+    /// under launchd exactly as it does over SSH.
     pub keychain_password: Option<String>,
     /// Where to keep a second copy of the minted identity. zellij's own resolved config directory,
     /// so it lands wherever `ZELLIJ_CONFIG_DIR` or XDG says the user's config lives.
@@ -1361,7 +1371,14 @@ pub fn ensure_self_signed(
         import_bundle(commander, &bundle, keychain)?;
     }
 
-    allow_codesign_to_reach_the_key(commander, keychain, keychain_password)?;
+    // NOT `?`. The partition list is a convenience, not a precondition - see
+    // `allow_codesign_to_reach_the_key` - and stopping here was what left a machine with a
+    // certificate it had just imported and a pin it never signed.
+    findings.extend(allow_codesign_to_reach_the_key(
+        commander,
+        keychain,
+        keychain_password,
+    ));
     Ok(findings)
 }
 
@@ -1582,8 +1599,19 @@ fn import_bundle(commander: &dyn Commander, bundle: &Path, keychain: &str) -> Re
 
 /// Let `codesign` reach the key without a dialog.
 ///
-/// `set-key-partition-list` is not optional: without it every signing run raises a GUI prompt for
-/// the key's ACL, which is a prompt nobody can answer over SSH. NO TRUSTED ROOT IS ADDED anywhere
+/// `set-key-partition-list` is a CONVENIENCE and not a precondition, and treating it as one cost a
+/// release. Without it macOS asks for the key once per signature, through the standard key-access
+/// dialog, instead of never - which is worse but is not a failure, and `codesign` is what raises
+/// that dialog. So a refusal here returns a `Needs you` and the run goes on to sign.
+///
+/// **It can also be the step that hangs.** With no `-k`, `security` asks for the keychain password
+/// on the controlling terminal - not through the window server, and not on stdin - so at
+/// 0.45.0-nkmk.8 it blocked forever inside a graphical session with one line on the pane's
+/// terminal and an empty report. Every child doctor runs is now put in a session of its own, which
+/// leaves it nothing to prompt on; see `SystemCommander::run`. This step therefore fails fast
+/// rather than waiting, which is exactly why its failure has to be survivable.
+///
+/// NO TRUSTED ROOT IS ADDED anywhere
 /// here, deliberately - requirement evaluation does not consult trust unless the requirement says
 /// `trusted`, and ours never does. What signing needs is access to the key, which is exactly what
 /// this grants and nothing more. See [`find_identities`] for the other half of that argument, which
@@ -1592,7 +1620,7 @@ fn allow_codesign_to_reach_the_key(
     commander: &dyn Commander,
     keychain: &str,
     keychain_password: Option<&str>,
-) -> Result<(), String> {
+) -> Option<Finding> {
     let mut args = vec![
         String::from("set-key-partition-list"),
         String::from("-S"),
@@ -1600,27 +1628,46 @@ fn allow_codesign_to_reach_the_key(
         String::from("-s"),
     ];
     if let Some(password) = keychain_password {
-        // ZELLIJ_KEYCHAIN_PASSWORD, and only over SSH: with no window server there is no dialog to
-        // answer, so a run that would not prompt is a run that hangs. It goes in argv because
-        // `security` reads it nowhere else, which puts it in this machine's process table for the
-        // life of one command - the reason this is an escape hatch and not the default path.
+        // ZELLIJ_KEYCHAIN_PASSWORD, when the user has set it. It goes in argv because `security`
+        // reads it nowhere else, which puts it in this machine's process table for the life of one
+        // command - the reason this is an escape hatch and not the default path. It is never
+        // asked for: doctor prompts for nothing, anywhere.
         args.push(String::from("-k"));
         args.push(password.to_owned());
     }
     args.push(keychain.to_owned());
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = commander
-        .run("security", &borrowed, None)
-        .map_err(|reason| format!("could not run security: {}", reason))?;
-    if !output.success {
-        return Err(format!(
-            "could not let codesign reach the key: {}. Over SSH there is no dialog to answer; \
-             set ZELLIJ_KEYCHAIN_PASSWORD or run this from a terminal on the machine",
-            output.stderr.trim()
-        ));
-    }
-    Ok(())
+    let refusal = match commander.run("security", &borrowed, None) {
+        Ok(output) if output.success => return None,
+        Ok(output) => first_line(output.stderr.trim()).to_owned(),
+        Err(reason) => reason,
+    };
+    Some(
+        Finding::needs_you(
+            "signing",
+            format!("codesign may ask for the key: {}", refusal),
+        )
+        .note("without the partition list, macOS asks once per signature instead of never")
+        .note(KEY_ACCESS_REMEDIES[0])
+        .note(KEY_ACCESS_REMEDIES[1])
+        .note(KEY_ACCESS_REMEDIES[2]),
+    )
 }
+
+/// The two ways a person can give `codesign` the key, in the order worth trying them.
+///
+/// Written once because they belong to two findings that are reached separately: the partition
+/// list refusing (where they are a warning) and every rung refusing (where they are the answer).
+/// Neither of them is "let doctor ask you for your password" - doctor prompts for nothing. That is
+/// not a style choice: `security` prompts on the CONTROLLING TERMINAL, which a launchd job and a
+/// detached pane do not have and an SSH session cannot answer unattended, and a prompt nobody sees
+/// is a program that hangs. Every child doctor runs is put in its own session for that reason; see
+/// `SystemCommander::run`.
+const KEY_ACCESS_REMEDIES: [&str; 3] = [
+    "either run doctor from a terminal in the desktop session and click Always Allow",
+    "  on the key-access dialog macOS raises, once, for this certificate",
+    "or set ZELLIJ_KEYCHAIN_PASSWORD and run it again - doctor reads it, never asks",
+];
 
 #[cfg(test)]
 mod tests {
@@ -2263,6 +2310,164 @@ Signature=adhoc
         assert!(outcome.is_err(), "{:?}", outcome.map(|f| f.len()));
         assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
         assert!(dir.identity_bundle().exists(), "the bundle was moved aside");
+    }
+
+    /// The 0.45.0-nkmk.8 hang, at the level a unit test can reach it. `security
+    /// set-key-partition-list` with no `-k` blocked forever on a real Mac, and when it is made to
+    /// fail instead, the run must CONTINUE: the partition list only decides whether macOS asks for
+    /// the key once per signature or never, and stopping there left a machine with a certificate
+    /// it had just imported and a pin it never signed.
+    #[test]
+    fn a_partition_list_that_refuses_does_not_stop_the_signing() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            ("security import", recorded("1 identity imported.")),
+            (
+                "security set-key-partition-list",
+                recorded_failure(
+                    "SecKeychainItemSetAccessWithPassword: User interaction is not allowed.",
+                ),
+            ),
+        ]);
+        let findings = ensure_self_signed(&commander, &dir, "login.keychain-db", None)
+            .expect("a refused partition list stopped the run");
+
+        let warned = findings
+            .iter()
+            .find(|finding| finding.message.contains("codesign may ask for the key"))
+            .unwrap_or_else(|| panic!("{:?}", findings));
+        // both remedies, and neither of them is doctor prompting for anything
+        assert!(
+            warned
+                .notes
+                .iter()
+                .any(|note| note.contains("Always Allow")),
+            "{:?}",
+            warned.notes
+        );
+        assert!(
+            warned
+                .notes
+                .iter()
+                .any(|note| note.contains("ZELLIJ_KEYCHAIN_PASSWORD")),
+            "{:?}",
+            warned.notes
+        );
+    }
+
+    /// And when `codesign` then refuses too - no window server, or a denied dialog - the report
+    /// names both remedies rather than only the SSH one it used to.
+    #[test]
+    fn a_ladder_that_refuses_names_both_ways_to_give_codesign_the_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+            ("codesign -s ", recorded_failure("errSecInternalComponent")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        let exhausted = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("refused to sign"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("Always Allow")),
+            "{:?}",
+            exhausted.notes
+        );
+        assert!(
+            exhausted
+                .notes
+                .iter()
+                .any(|note| note.contains("ZELLIJ_KEYCHAIN_PASSWORD")),
+            "{:?}",
+            exhausted.notes
+        );
+    }
+
+    /// The machine that hung has its certificate IMPORTED already - the hang came after that - so
+    /// the next run must find it and sign, not mint a second one. `find-identity -v` still cannot
+    /// see it, because it is untrusted; the non-`-v` listing is what makes this work.
+    #[test]
+    fn a_machine_whose_import_already_succeeded_signs_rather_than_minting_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        // the bundle from the run that hung is still on disk, which is what a re-mint would take
+        let signing = scratch.path().join("signing");
+        std::fs::create_dir_all(&signing).unwrap();
+        std::fs::write(signing.join("id.p12"), b"the one certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            // untrusted, so `-v` reports nothing at all
+            (FIND_IDENTITY, recorded(NO_IDENTITIES)),
+            (
+                "security find-identity -p codesigning",
+                recorded(
+                    "  1) BBBB \"zellij self-signed code signing\" (CSSMERR_TP_NOT_TRUSTED)\n     \
+                     1 identities found\n",
+                ),
+            ),
+            ("codesign -s BBBB", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(SELF_SIGNED)),
+            ("codesign --verify ", recorded("")),
+        ]);
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        assert!(
+            !commander.called_with("openssl"),
+            "it minted again: {:?}",
+            commander.calls()
+        );
+        assert!(
+            !commander.called_with("security import"),
+            "{:?}",
+            commander.calls()
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::Changed
+                    && finding.message.contains("signed")),
+            "{:?}",
+            run.findings
+        );
     }
 
     /// The gate that b5bde6cb6's first cut got wrong. It asked `find-identity`, which the ONLY
