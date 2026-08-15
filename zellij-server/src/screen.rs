@@ -40,11 +40,12 @@ use crate::route::NotificationEnd;
 
 use log::{debug, warn};
 use zellij_utils::data::{
-    CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
-    HostTerminalThemeMode, KeyWithModifier, LayoutInfo, LayoutWithError, ListPanesResponse,
-    ListTabsResponse, NewPanePlacement, PaneContents, PaneInfo, PaneListEntry, PaneManifest,
-    PaneRenderReport, PaneScrollbackResponse, PaneTarget, PluginPermission, RegexHighlight, Resize,
-    ResizeStrategy, SessionInfo, Styling, TabInfo, ThemeHue, WebSharing,
+    ActionEvent, CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates,
+    GetFocusedPaneInfoResponse, HostTerminalThemeMode, KeyWithModifier, LayoutInfo,
+    LayoutWithError, ListPanesResponse, ListTabsResponse, NewPanePlacement, NoteColor,
+    PaneContents, PaneInfo, PaneListEntry, PaneManifest, PaneRenderReport, PaneScrollbackResponse,
+    PaneTarget, PluginPermission, RegexHighlight, Resize, ResizeStrategy, SessionInfo, Styling,
+    TabInfo, ThemeHue, WebSharing,
 };
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::actions::Action;
@@ -768,6 +769,32 @@ pub enum ScreenInstruction {
         target: PaneTarget,
         response_channel: crossbeam::channel::Sender<Option<PaneId>>,
     },
+    /// Gives a live pane the handle its creator chose. `Err` carries the sentence to print.
+    SetPaneHandle {
+        pane_id: PaneId,
+        handle: String,
+        response_channel: crossbeam::channel::Sender<Result<(), String>>,
+    },
+    /// Adds one thing that happened to the session's action ring.
+    ///
+    /// It is sent rather than asked: nothing waits for the ring, and an action that has already
+    /// happened must not be slowed down by being remembered.
+    RecordAction {
+        verb: String,
+        pane_id: Option<PaneId>,
+        tab_id: Option<usize>,
+        origin: String,
+    },
+    /// Reads the action ring back, oldest first.
+    ListEvents {
+        response_channel: crossbeam::channel::Sender<Vec<ActionEvent>>,
+    },
+    /// Leaves a short note on a pane's frame, or clears it with `None`.
+    SetPaneNote {
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
+        response_channel: crossbeam::channel::Sender<Result<Option<(String, NoteColor)>, String>>,
+    },
     ListTabs {
         client_id: ClientId,
         response_channel: crossbeam::channel::Sender<ListTabsResponse>,
@@ -1187,6 +1214,10 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ListClientsMetadata(..) => ScreenContext::ListClientsMetadata,
             ScreenInstruction::ListPanes { .. } => ScreenContext::ListPanes,
             ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
+            ScreenInstruction::SetPaneHandle { .. } => ScreenContext::SetPaneHandle,
+            ScreenInstruction::SetPaneNote { .. } => ScreenContext::SetPaneNote,
+            ScreenInstruction::RecordAction { .. } => ScreenContext::RecordAction,
+            ScreenInstruction::ListEvents { .. } => ScreenContext::ListEvents,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
@@ -1573,6 +1604,8 @@ pub(crate) struct Screen {
     web_clients_allowed: bool,
     web_sharing: WebSharing,
     current_pane_group: Rc<RefCell<PaneGroups>>,
+    /// fork addition: the last few hundred things that changed the session, and who changed them
+    action_events: VecDeque<ActionEvent>,
     advanced_mouse_actions: bool,
     osc133_command_selection: bool,
     word_separators: String,
@@ -1688,7 +1721,75 @@ const STARTUP_SENTINEL_TOKEN: u32 = 0;
 /// network-pathological cases ever see this fire.
 const SERVER_FORWARD_TIMEOUT_MS: u64 = 1000;
 
+/// How many entries the action ring holds before the oldest falls out.
+///
+/// Big enough to cover the working session somebody is asking about - "who moved the tab I was
+/// using" is a question about the last few minutes - and small enough that the ring is never a log
+/// file with a retention policy. Nothing is written to disk.
+pub(crate) const ACTION_RING_SIZE: usize = 256;
+
+/// Adds one event to a ring, collapsing a repeat and dropping the oldest once it is full.
+///
+/// A run of the same verb, on the same target, from the same origin - a held scroll key - becomes
+/// one entry with a count. Without that, the ring's whole capacity is one keypress and the tab
+/// move it exists to remember has already fallen out of it.
+pub(crate) fn push_action_event(ring: &mut VecDeque<ActionEvent>, event: ActionEvent) {
+    if let Some(last) = ring.back_mut() {
+        if last.verb == event.verb && last.origin == event.origin && last.target == event.target {
+            last.count += 1;
+            // the entry says when this last happened, which is the question a reader is asking
+            last.at = event.at;
+            return;
+        }
+    }
+    ring.push_back(event);
+    while ring.len() > ACTION_RING_SIZE {
+        ring.pop_front();
+    }
+}
+
+/// What `close-pane` answers when it is asked to close the focused pane and nothing is focused.
+///
+/// A detached session has no client holding the focus, so the request is well formed and its
+/// subject is not there - a miss, not an error, and certainly not a success. The CLI guard
+/// (`missing_target_from_outside_a_pane`) catches this from outside the session; from inside it,
+/// with `$ZELLIJ_SESSION_NAME` naming a session nobody is attached to, this is the only place that
+/// can tell.
+pub const NO_FOCUSED_PANE_TO_CLOSE: &str =
+    "`close-pane` has no focused pane to close: nothing is attached to this session. \
+     Pass --pane-id. `zellij action list-panes` lists them.";
+
+/// What a tab-creating command says when nothing is attached to the session.
+///
+/// A tab is built by applying a layout, and applying one needs a client to size it against. With
+/// nobody attached the tab is created empty, the caller is told a pane id for a pane that does not
+/// exist, and the whole tab is thrown away by the next client to attach. The refusal is the honest
+/// answer until a detached session can apply a layout on its own - the deep fix, which is a
+/// different piece of work.
+pub const TAB_CREATION_NEEDS_A_CLIENT: &str =
+    "Creating a tab needs a client attached to this session, and nothing is attached: the tab \
+     would be built empty and thrown away by the next client to attach. Run this from inside the \
+     session, or `zellij attach` first.";
+
+/// Whether a tab-creating instruction should be refused instead of answered.
+///
+/// Two things have to be true. It has to be a COMMAND - something is waiting for an answer, which
+/// is what `completion_tx` means - because the session's own startup builds tabs before any client
+/// has attached and must keep working. And nothing may be attached, because that is the case where
+/// the tab comes out empty.
+pub(crate) fn tab_creation_is_refused(a_command_asked: bool, a_client_is_attached: bool) -> bool {
+    a_command_asked && !a_client_is_attached
+}
+
 impl Screen {
+    /// Whether any client is attached to this session right now.
+    ///
+    /// A `zellij action` client does not count and never has: it connects, is answered, and goes.
+    /// This is about the clients a tab would be sized and drawn for.
+    pub fn has_attached_client(&self) -> bool {
+        !self.connected_clients.borrow().is_empty()
+    }
+
     /// Creates and returns a new [`Screen`].
     pub fn new(
         bus: Bus<ScreenInstruction>,
@@ -1791,6 +1892,7 @@ impl Screen {
             web_clients_allowed,
             web_sharing,
             current_pane_group: Rc::new(RefCell::new(current_pane_group)),
+            action_events: VecDeque::new(),
             currently_marking_pane_group: Rc::new(RefCell::new(HashMap::new())),
             advanced_mouse_actions,
             osc133_command_selection,
@@ -4601,14 +4703,11 @@ impl Screen {
                 }
             },
             Some(tab) => {
-                if tab.are_floating_panes_visible() {
-                    if let Some(c) = completion.as_mut() {
-                        c.set_stdout_message("true".to_string());
-                    }
-                } else {
-                    if let Some(c) = completion.as_mut() {
-                        c.set_error_message("false".to_string());
-                    }
+                // a question answers on stdout whichever way it comes out: `false` is the answer,
+                // not a failure to answer, so it does not travel as an error message and does not
+                // become the exit code an error message turns into
+                if let Some(c) = completion.as_mut() {
+                    c.set_stdout_message(format!("visible: {}", tab.are_floating_panes_visible()));
                 }
             },
         }
@@ -5314,6 +5413,109 @@ impl Screen {
 
         sort_panes_by_tab_and_type(&mut pane_entries);
         Ok(pane_entries)
+    }
+
+    /// Gives a live pane the handle its creator chose for it.
+    ///
+    /// The name has to be free among the session's live panes: a handle is an address, and an
+    /// address that reached two panes would be no address at all. A taken one is refused here
+    /// rather than rerolled the way a generated handle is - the caller asked for this name, and a
+    /// different one would answer a question nobody put.
+    ///
+    /// The pane's own handle counts as free for it: setting the name a pane already answers to
+    /// changes nothing and says so, rather than pushing the pane off its own address.
+    pub fn set_pane_handle(&mut self, pane_id: PaneId, handle: &str) -> Result<(), String> {
+        let pane = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(pane_id))
+            .ok_or_else(|| format!("No pane answers to '{}'", pane_id))?;
+        if pane.pane_handle() == handle {
+            return Ok(());
+        }
+        if crate::pane_handles::is_live(handle) {
+            return Err(format!(
+                "The handle '{}' is taken by another pane in this session. \
+                 Handles name one pane at a time; `zellij action list-panes` prints them.",
+                handle
+            ));
+        }
+        pane.set_pane_handle(handle);
+        Ok(())
+    }
+
+    /// Leaves a note on a pane, or clears it, and says what the pane now carries.
+    ///
+    /// `Ok(None)` is a cleared note. A pane nothing answers to is `Err`, which the caller turns
+    /// into the fork's miss.
+    pub fn set_pane_note(
+        &mut self,
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
+    ) -> Result<Option<(String, NoteColor)>, String> {
+        let pane = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(pane_id))
+            .ok_or_else(|| format!("No pane answers to '{}'", pane_id))?;
+        pane.set_pane_note(note.clone());
+        Ok(note)
+    }
+
+    /// Adds one thing that happened to the session's ring, naming what it touched.
+    ///
+    /// The names are resolved HERE rather than where the action was routed, because this is where
+    /// the panes and the tabs are - and because a handle is only true while the pane lives. What
+    /// goes in the ring is the name that was right at the time.
+    pub fn record_action(
+        &mut self,
+        verb: String,
+        pane_id: Option<PaneId>,
+        tab_id: Option<usize>,
+        origin: String,
+    ) {
+        let target = self.name_of_target(pane_id, tab_id);
+        push_action_event(
+            &mut self.action_events,
+            ActionEvent {
+                at: zellij_utils::cli::event_timestamp(std::time::SystemTime::now()),
+                verb,
+                target,
+                origin,
+                count: 1,
+            },
+        );
+    }
+
+    /// What an action touched, spelled the way the rest of the fork spells it.
+    ///
+    /// A pane wins over a tab when an action reports both: the pane is the more specific answer,
+    /// and its tab is one `list-tree` away.
+    fn name_of_target(&self, pane_id: Option<PaneId>, tab_id: Option<usize>) -> String {
+        if let Some(pane_id) = pane_id {
+            let handle = self
+                .tabs
+                .values()
+                .find_map(|tab| tab.get_pane_with_id(pane_id).map(|pane| pane.pane_handle()));
+            return match handle {
+                Some(handle) if !handle.is_empty() => format!("{} {}", pane_id, handle),
+                // the pane is already gone - `close-pane` is the obvious case - and the id is the
+                // whole of what can honestly be said about it
+                _ => pane_id.to_string(),
+            };
+        }
+        if let Some(tab_id) = tab_id {
+            return match self.tabs.get(&tab_id) {
+                Some(tab) => format!("tab_{} {}", tab_id, tab.name),
+                None => format!("tab_{}", tab_id),
+            };
+        }
+        "-".to_owned()
+    }
+
+    /// The ring, oldest first - the order it reads in.
+    pub fn collect_action_events(&self) -> Vec<ActionEvent> {
+        self.action_events.iter().cloned().collect()
     }
 
     /// Which pane, if any, a CLI target names.
@@ -6366,6 +6568,19 @@ impl Screen {
         }
     }
 
+    /// Whether a pane the session was asked to make is actually in a tab.
+    ///
+    /// A pane is asked for by an id that exists before the pane does: the pty is spawned first and
+    /// the tab is offered it afterwards. A tab may decline - it has no size until a client has
+    /// attached to it once, and some placements need a focused pane there is none of - and it
+    /// declines by dropping the pty, silently. So this is the only thing that separates "made" from
+    /// "asked for", and a report that names a pane has to pass through it first.
+    ///
+    /// Suppressed panes count: a pane opened in place of another is real and addressable, and the
+    /// pane it replaced is still there behind it.
+    pub fn pane_exists(&self, pane_id: &PaneId) -> bool {
+        self.tabs.values().any(|tab| tab.has_pane_with_pid(pane_id))
+    }
     pub fn focus_pane_with_id(
         &mut self,
         pane_id: PaneId,
@@ -8352,7 +8567,9 @@ pub(crate) fn screen_thread_main(
                 mut completion_tx,
                 set_blocking,
             ) => {
-                completion_tx.as_mut().map(|c| c.set_affected_pane_id(pid));
+                // the id is NOT reported here: at this point it names a pty, not a pane. Whether
+                // the pane exists is decided by the tab below, and the report is written after it
+                // - see the confirmation at the end of this arm.
 
                 // A stacked pane with no explicit target has to join some client's focused pane.
                 // With no client connected there is none, and the tab refuses the pane and closes
@@ -8375,7 +8592,13 @@ pub(crate) fn screen_thread_main(
                     }
                 }
 
-                let blocking_notification = if set_blocking { completion_tx } else { None };
+                // taken rather than moved, so the confirmation below still has the notification in
+                // the non-blocking case - a blocking pane answers with its exit status instead
+                let blocking_notification = if set_blocking {
+                    completion_tx.take()
+                } else {
+                    None
+                };
 
                 match client_or_tab_index {
                     ClientTabIndexOrPaneId::ClientId(client_id)
@@ -8515,6 +8738,19 @@ pub(crate) fn screen_thread_main(
                         }
                     },
                 };
+                // the pane is reported only if a tab took it. Every route above can decline - a
+                // tab no client has ever attached to has no size to place a pane in, and a
+                // placement can want a focused pane there is none of - and each of them declines
+                // by dropping the pty rather than by failing, so asking the tabs afterwards is
+                // what tells the two apart. Reporting the id from the request instead is how
+                // `new-pane` came to print a pane that was never made
+                if let Some(completion) = completion_tx.as_mut() {
+                    if screen.pane_exists(&pid) {
+                        completion.set_affected_pane_id(pid);
+                    } else {
+                        log::error!("No tab took the new pane {:?}, so it was not created", pid);
+                    }
+                }
                 if let Some(pending_events) = pending_events_waiting_for_pane.remove(&pid) {
                     for event in pending_events {
                         screen.bus.senders.send_to_screen(event).non_fatal();
@@ -8993,10 +9229,28 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 full,
                 pane_id,
-                completion_tx,
+                mut completion_tx,
                 cli_client_id,
                 ansi,
             ) => {
+                // a target no live pane answers to is a miss - the same one `close-pane` reports -
+                // rather than an empty dump, which reads as "this pane's screen is blank" and
+                // exits 0. Asked once here so that the file form and the stdout form agree
+                if let Some(pane_id) = pane_id {
+                    if !screen
+                        .tabs
+                        .values()
+                        .any(|tab| tab.has_pane_with_pid(&pane_id))
+                    {
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!(
+                                "No pane answers to '{}'",
+                                screen.pane_summary(pane_id)
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 match file {
                     Some(file_path) => {
                         // Write dump to file (existing behavior)
@@ -9156,6 +9410,33 @@ pub(crate) fn screen_thread_main(
                 response_channel,
             } => {
                 let _ = response_channel.send(screen.resolve_pane_target(&target));
+            },
+            ScreenInstruction::SetPaneHandle {
+                pane_id,
+                handle,
+                response_channel,
+            } => {
+                let _ = response_channel.send(screen.set_pane_handle(pane_id, &handle));
+                screen.render(None)?;
+            },
+            ScreenInstruction::RecordAction {
+                verb,
+                pane_id,
+                tab_id,
+                origin,
+            } => {
+                screen.record_action(verb, pane_id, tab_id, origin);
+            },
+            ScreenInstruction::ListEvents { response_channel } => {
+                let _ = response_channel.send(screen.collect_action_events());
+            },
+            ScreenInstruction::SetPaneNote {
+                pane_id,
+                note,
+                response_channel,
+            } => {
+                let _ = response_channel.send(screen.set_pane_note(pane_id, note));
+                screen.render(None)?;
             },
             ScreenInstruction::ListTabs {
                 client_id,
@@ -9515,17 +9796,25 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::CloseFocusedPane(client_id, mut completion_tx) => {
                 let old_pane_id = screen.get_active_pane_id(&client_id);
-                // the report is written before the close because the close consumes the channel.
-                // A close that refuses sets an error message, and an error outranks a report, so
-                // saying it early cannot make a failure look like a success
-                if let (Some(old_pane_id), Some(c)) = (old_pane_id, completion_tx.as_mut()) {
-                    c.set_stdout_message(format!("closed: {}", old_pane_id));
+                if let Some(old_pane_id) = old_pane_id {
+                    // the report is written before the close because the close consumes the
+                    // channel. A close that refuses sets an error message, and an error outranks a
+                    // report, so saying it early cannot make a failure look like a success
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_stdout_message(format!("closed: {}", old_pane_id));
+                    }
+                    active_tab_and_connected_client_id!(
+                        screen,
+                        client_id,
+                        |tab: &mut Tab, client_id: ClientId| tab.close_focused_pane(client_id, completion_tx), ?
+                    );
+                } else if let Some(c) = completion_tx.as_mut() {
+                    // nothing holds the focus, so there is nothing this command names. Saying so is
+                    // the whole job here: falling through would let the fallback close some other
+                    // client's pane, and saying nothing at all exits 0 on a session that still has
+                    // every pane it started with
+                    c.set_error_message(NO_FOCUSED_PANE_TO_CLOSE.to_owned());
                 }
-                active_tab_and_connected_client_id!(
-                    screen,
-                    client_id,
-                    |tab: &mut Tab, client_id: ClientId| tab.close_focused_pane(client_id, completion_tx), ?
-                );
                 let new_pane_id = screen.get_active_pane_id(&client_id);
                 if let (Some(old), Some(new)) = (old_pane_id, new_pane_id) {
                     screen.report_key_passthrough_state(client_id, old, new);
@@ -9781,6 +10070,16 @@ pub(crate) fn screen_thread_main(
                 (client_id, is_web_client),
                 completion_tx,
             ) => {
+                // a tab asked for by a command (`completion_tx` is the caller waiting for an
+                // answer) is refused when nothing is attached, rather than built empty. The
+                // session's own startup passes no completion and is untouched: it is building the
+                // tabs a client is about to attach to
+                if tab_creation_is_refused(completion_tx.is_some(), screen.has_attached_client()) {
+                    if let Some(mut c) = completion_tx {
+                        c.set_error_message(TAB_CREATION_NEEDS_A_CLIENT.to_owned());
+                    }
+                    continue;
+                }
                 let tab_index = screen.get_new_tab_id();
                 pending_tab_ids.insert(tab_index);
                 restore_reservation.extend(
@@ -9987,6 +10286,19 @@ pub(crate) fn screen_thread_main(
                 } else {
                     screen.active_tab_ids.keys().next().copied()
                 };
+                // `--create` on a session with nobody attached would make the same empty tab
+                // `new-tab` refuses to make; without it there is simply no focus to move
+                if client_id.is_none() {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(if create {
+                            TAB_CREATION_NEEDS_A_CLIENT.to_owned()
+                        } else {
+                            "`go-to-tab-name` has no client to move: nothing is attached to this \
+                             session."
+                                .to_owned()
+                        });
+                    }
+                }
                 if let Some(client_id) = client_id {
                     let is_web_client = screen
                         .connected_clients
@@ -10900,10 +11212,8 @@ pub(crate) fn screen_thread_main(
                 });
                 let run_plugin = Run::Plugin(run_plugin_or_alias);
 
-                // Set affected pane ID for CLI client output
-                if let Some(ref mut completion) = completion_tx {
-                    completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
-                }
+                // the id is reported at the end of this arm, once a tab has taken the pane - see
+                // the confirmation below
 
                 if should_be_in_place {
                     if let Some(pane_id_to_replace) = pane_id_to_replace {
@@ -10959,6 +11269,19 @@ pub(crate) fn screen_thread_main(
                     )?;
                 } else {
                     log::error!("Tab index not found: {:?}", tab_index);
+                }
+                // Set affected pane ID for CLI client output - only if a tab took the pane, so
+                // that a plugin no tab would have is a miss rather than a reported id
+                if let Some(ref mut completion) = completion_tx {
+                    let plugin_pane_id = PaneId::Plugin(plugin_id);
+                    if screen.pane_exists(&plugin_pane_id) {
+                        completion.set_affected_pane_id(plugin_pane_id);
+                    } else {
+                        log::error!(
+                            "No tab took the new plugin pane {:?}, so it was not created",
+                            plugin_pane_id
+                        );
+                    }
                 }
                 if let Some(loading_indication) = plugin_loading_message_cache.remove(&plugin_id) {
                     screen.update_plugin_loading_stage(plugin_id, loading_indication);
@@ -11488,9 +11811,6 @@ pub(crate) fn screen_thread_main(
                 client_id_tab_index_or_pane_id,
                 mut completion_tx,
             ) => {
-                completion_tx
-                    .as_mut()
-                    .map(|c| c.set_affected_pane_id(new_pane_id));
                 screen.replace_pane(
                     new_pane_id,
                     hold_for_command,
@@ -11499,6 +11819,19 @@ pub(crate) fn screen_thread_main(
                     close_replaced_pane,
                     client_id_tab_index_or_pane_id,
                 )?;
+                // reported after the replacement, and only if it happened - `replace_pane` logs
+                // and returns when it cannot find the pane to replace, and a report written before
+                // it names a pane that does not exist
+                if let Some(completion) = completion_tx.as_mut() {
+                    if screen.pane_exists(&new_pane_id) {
+                        completion.set_affected_pane_id(new_pane_id);
+                    } else {
+                        log::error!(
+                            "No tab took the new pane {:?}, so it was not created",
+                            new_pane_id
+                        );
+                    }
+                }
 
                 screen.log_and_report_session_state()?;
             },
@@ -12879,12 +13212,22 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::CloseFocusWithPaneId(pane_id, mut completion_tx) => {
+                let printed_id = screen.pane_summary(pane_id);
                 let all_tabs = screen.get_tabs_mut();
                 let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.close_pane_by_pane_id(pane_id, completion_tx.take())
-                            .non_fatal();
+                        // the report is written here and the channel is NOT handed on to the pane
+                        // being torn down. It used to ride along into the pty thread and drop
+                        // there, after that thread had already broadcast its unblock - so the
+                        // answer was assembled behind the message that ended the command
+                        if let Some(c) = completion_tx.as_mut() {
+                            // the id and not the handle: the pane is gone, and its handle is back
+                            // in circulation for the next pane to be given
+                            c.set_stdout_message(format!("closed: {}", pane_id));
+                        }
+                        drop(completion_tx.take());
+                        tab.close_pane_by_pane_id(pane_id, None).non_fatal();
                         found = true;
                         break;
                     }
@@ -12892,8 +13235,10 @@ pub(crate) fn screen_thread_main(
                 if !found {
                     log::error!("Pane with id {:?} not found", pane_id);
                     if let Some(c) = completion_tx.as_mut() {
-                        c.set_exit_status(1);
-                        c.set_error_message(format!("Pane with id {:?} not found", pane_id));
+                        // the miss sentence every pane target answers with, not a debug-formatted
+                        // id: `No pane answers to 'terminal_9'` is the same answer the resolver
+                        // gives for a handle nothing holds
+                        c.set_error_message(format!("No pane answers to '{}'", printed_id));
                     }
                 }
                 screen.render(None)?;

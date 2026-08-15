@@ -120,7 +120,7 @@ pub struct RgbColor {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Action {
-    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 160, 161, 162, 163, 164, 165, 166, 167, 168")]
+    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171")]
     pub action_type: ::core::option::Option<action::ActionType>,
 }
 /// Nested message and enum types in `Action`.
@@ -446,6 +446,12 @@ pub mod action {
         ResolvePaneTarget(super::ResolvePaneTargetAction),
         #[prost(message, tag="168")]
         ListTree(super::ListTreeAction),
+        #[prost(message, tag="169")]
+        SetPaneHandle(super::SetPaneHandleAction),
+        #[prost(message, tag="170")]
+        SetPaneNote(super::SetPaneNoteAction),
+        #[prost(message, tag="171")]
+        ListEvents(super::ListEventsAction),
     }
 }
 // Action message definitions (all 92 variants)
@@ -715,7 +721,33 @@ pub struct ResolvePaneTargetAction {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetPaneHandleAction {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+    #[prost(string, tag="2")]
+    pub handle: ::prost::alloc::string::String,
+}
+/// an absent note is the clear: the pane is left carrying nothing
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SetPaneNoteAction {
+    #[prost(message, optional, tag="1")]
+    pub pane_id: ::core::option::Option<PaneId>,
+    #[prost(string, optional, tag="2")]
+    pub note: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration="NoteColor", tag="3")]
+    pub color: i32,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListTreeAction {
+    #[prost(bool, tag="1")]
+    pub output_json: bool,
+}
+/// fork addition: the session's action ring
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListEventsAction {
     #[prost(bool, tag="1")]
     pub output_json: bool,
 }
@@ -1652,9 +1684,14 @@ pub struct TiledPaneLayout {
     pub pane_initial_contents: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="14")]
     pub default_fg: ::core::option::Option<::prost::alloc::string::String>,
-    /// NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
     #[prost(string, optional, tag="15")]
     pub default_bg: ::core::option::Option<::prost::alloc::string::String>,
+    /// fork addition: the handle a layout chose for this pane. `restored_from` is still absent on
+    /// purpose - that is provenance the server assigns - but a handle IS something a layout declares
+    ///
+    /// NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
+    #[prost(string, optional, tag="16")]
+    pub pane_handle: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1687,6 +1724,9 @@ pub struct FloatingPaneLayout {
     pub default_fg: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="14")]
     pub default_bg: ::core::option::Option<::prost::alloc::string::String>,
+    /// fork addition: see TiledPaneLayout.pane_handle
+    #[prost(string, optional, tag="15")]
+    pub pane_handle: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2209,6 +2249,9 @@ pub struct TogglePanePinnedByPaneIdAction {
 pub struct FocusPaneByPaneIdAction {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
+    /// the existence probe: resolve the pane and report it, but leave focus where it is
+    #[prost(bool, tag="2")]
+    pub no_focus: bool,
 }
 /// Tab-targeting action messages
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -2541,6 +2584,42 @@ impl AnsiCode {
             "BRIGHT_MAGENTA" => Some(Self::BrightMagenta),
             "BRIGHT_CYAN" => Some(Self::BrightCyan),
             "BRIGHT_WHITE" => Some(Self::BrightWhite),
+            _ => None,
+        }
+    }
+}
+/// fork addition: the short note drawn on a pane's frame, and what it means
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NoteColor {
+    Unspecified = 0,
+    Error = 1,
+    Warn = 2,
+    Ok = 3,
+    Info = 4,
+}
+impl NoteColor {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            NoteColor::Unspecified => "NOTE_COLOR_UNSPECIFIED",
+            NoteColor::Error => "NOTE_COLOR_ERROR",
+            NoteColor::Warn => "NOTE_COLOR_WARN",
+            NoteColor::Ok => "NOTE_COLOR_OK",
+            NoteColor::Info => "NOTE_COLOR_INFO",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NOTE_COLOR_UNSPECIFIED" => Some(Self::Unspecified),
+            "NOTE_COLOR_ERROR" => Some(Self::Error),
+            "NOTE_COLOR_WARN" => Some(Self::Warn),
+            "NOTE_COLOR_OK" => Some(Self::Ok),
+            "NOTE_COLOR_INFO" => Some(Self::Info),
             _ => None,
         }
     }

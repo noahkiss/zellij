@@ -2,13 +2,13 @@
 
 pub use super::command::{OpenFilePayload, RunCommandAction};
 use super::layout::{
-    FloatingPaneLayout, Layout, PluginAlias, RunPlugin, RunPluginLocation, RunPluginOrAlias,
-    SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
+    FloatingPaneLayout, Layout, PluginAlias, PluginUserConfiguration, RunPlugin, RunPluginLocation,
+    RunPluginOrAlias, SwapFloatingLayout, SwapTiledLayout, TabLayoutInfo, TiledPaneLayout,
 };
 use crate::cli::CliAction;
 use crate::data::{
-    CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
-    PaneId, PaneSignal, Resize, UnblockCondition,
+    CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, NoteColor,
+    OriginatingPlugin, PaneId, PaneSignal, Resize, UnblockCondition,
 };
 use crate::data::{FloatingPaneCoordinates, InputMode, PaneTarget};
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -555,6 +555,25 @@ pub enum Action {
     ResolvePaneTarget {
         target: String,
     },
+    /// Gives a pane the handle its creator chose for it.
+    ///
+    /// A pane names itself when it is born, and this is how a caller who had a name in mind says
+    /// so. The name must be free among the session's live panes: a handle is an address, and the
+    /// one thing an address may not do is reach two panes. A taken one is refused rather than
+    /// rerolled, because rerolling would hand back a name the caller did not ask for.
+    SetPaneHandle {
+        pane_id: PaneId,
+        handle: String,
+    },
+    /// Leaves a short note on a pane, or clears it with `None`.
+    ///
+    /// The note is live state - what is happening in the pane - rather than what the pane is, so
+    /// nothing serializes it. The server sets one itself on a command pane that failed and is
+    /// being held open.
+    SetPaneNote {
+        pane_id: PaneId,
+        note: Option<(String, NoteColor)>,
+    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
@@ -565,6 +584,10 @@ pub enum Action {
     },
     /// Every tab with its panes nested beneath it - the shape of the session in one answer.
     ListTree {
+        output_json: bool,
+    },
+    /// The session's action ring: what changed lately, and who changed it.
+    ListEvents {
         output_json: bool,
     },
     ListTabs {
@@ -693,6 +716,8 @@ pub enum Action {
     },
     FocusPaneByPaneId {
         pane_id: PaneId,
+        /// The existence probe: report the pane and leave the focus where it is
+        no_focus: bool,
     },
     // Tab-targeting CLI-only variants
     UndoRenameTabByTabId {
@@ -751,6 +776,36 @@ impl Action {
         }
     }
 
+    /// The plugin a `--plugin` names: a url this build can resolve, or an alias the config names.
+    ///
+    /// Shared by the two paths that open a plugin pane - one into the current tab, one into a tab
+    /// `--new-tab` is making - so a url that works for one works for the other.
+    fn run_plugin_or_alias(
+        plugin: String,
+        configuration: Option<PluginUserConfiguration>,
+        cwd: Option<PathBuf>,
+        alias_cwd: Option<PathBuf>,
+        current_dir: PathBuf,
+    ) -> RunPluginOrAlias {
+        match RunPluginLocation::parse(&plugin, cwd.clone()) {
+            Ok(location) => RunPluginOrAlias::RunPlugin(RunPlugin {
+                _allow_exec_host_cmd: false,
+                location,
+                configuration: configuration.unwrap_or_default(),
+                initial_cwd: cwd,
+            }),
+            Err(_) => {
+                let mut plugin_alias = PluginAlias::new(
+                    &plugin,
+                    &configuration.map(|c| c.inner().clone()),
+                    alias_cwd,
+                );
+                plugin_alias.set_caller_cwd_if_not_set(Some(current_dir));
+                RunPluginOrAlias::Alias(plugin_alias)
+            },
+        }
+    }
+
     /// Turns one CLI invocation into the actions that carry it out.
     ///
     /// `resolve_pane_target` turns a `--pane-id` string into a pane id. A handle or a uuid only
@@ -765,7 +820,13 @@ impl Action {
         resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
     ) -> Result<Vec<Action>, String> {
         match cli_action {
-            CliAction::Write { bytes, pane_id } => match pane_id {
+            CliAction::Write {
+                bytes,
+                pane_id,
+                // resolved by the guard before this: `--focused` means the same pane an
+                // absent target does, and only the refusal cared which was typed
+                focused: _,
+            } => match pane_id {
                 Some(pane_id_str) => {
                     let parsed_pane_id = resolve_pane_target(&pane_id_str);
                     match parsed_pane_id {
@@ -782,36 +843,56 @@ impl Action {
                     is_kitty_keyboard_protocol: false,
                 }]),
             },
-            CliAction::WriteChars { chars, pane_id } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
-                            chars,
-                            pane_id: parsed_pane_id,
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::WriteChars { chars }]),
+            // the text is optional on the command line because stdin can carry it; the CLI has
+            // already read it by the time the action is built, and an empty one never gets here
+            CliAction::WriteChars {
+                chars,
+                pane_id,
+                focused: _,
+            } => {
+                let chars = chars.unwrap_or_default();
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::WriteCharsToPaneId {
+                                chars,
+                                pane_id: parsed_pane_id,
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::WriteChars { chars }]),
+                }
             },
-            CliAction::Paste { chars, pane_id } => match pane_id {
-                Some(pane_id_str) => {
-                    let parsed_pane_id = resolve_pane_target(&pane_id_str);
-                    match parsed_pane_id {
-                        Ok(parsed_pane_id) => Ok(vec![Action::Paste {
-                            chars,
-                            pane_id: Some(parsed_pane_id),
-                        }]),
-                        Err(e) => Err(e),
-                    }
-                },
-                None => Ok(vec![Action::Paste {
-                    chars,
-                    pane_id: None,
-                }]),
+            CliAction::Paste {
+                chars,
+                pane_id,
+                focused: _,
+            } => {
+                let chars = chars.unwrap_or_default();
+                match pane_id {
+                    Some(pane_id_str) => {
+                        let parsed_pane_id = resolve_pane_target(&pane_id_str);
+                        match parsed_pane_id {
+                            Ok(parsed_pane_id) => Ok(vec![Action::Paste {
+                                chars,
+                                pane_id: Some(parsed_pane_id),
+                            }]),
+                            Err(e) => Err(e),
+                        }
+                    },
+                    None => Ok(vec![Action::Paste {
+                        chars,
+                        pane_id: None,
+                    }]),
+                }
             },
-            CliAction::SendKeys { keys, pane_id } => {
+            CliAction::SendKeys {
+                keys,
+                pane_id,
+                focused: _,
+            } => {
                 let mut actions = Vec::new();
 
                 for (index, key_str) in keys.iter().enumerate() {
@@ -872,9 +953,16 @@ impl Action {
             },
             CliAction::FocusNextPane => Ok(vec![Action::FocusNextPane]),
             CliAction::FocusPreviousPane => Ok(vec![Action::FocusPreviousPane]),
-            CliAction::FocusPaneId { pane_id } => {
-                let pane_id = resolve_pane_target(&pane_id)?;
-                Ok(vec![Action::FocusPaneByPaneId { pane_id }])
+            CliAction::FocusPaneId { pane_id, no_focus } => {
+                match resolve_pane_target(&pane_id) {
+                    Ok(pane_id) => Ok(vec![Action::FocusPaneByPaneId { pane_id, no_focus }]),
+                    // the probe answers "not there" with an empty stdout and exit 0, so a
+                    // well-formed target no pane answers to is not a miss for it - there is simply
+                    // nothing to report. A malformed one never gets here: the resolver exits 1 on
+                    // input that names no pane in any form
+                    Err(_) if no_focus => Ok(vec![]),
+                    Err(e) => Err(e),
+                }
             },
             CliAction::FocusLastPane => Ok(vec![Action::FocusLastPane]),
             CliAction::MoveFocus { direction } => Ok(vec![Action::MoveFocus { direction }]),
@@ -913,7 +1001,12 @@ impl Action {
                 },
                 (None, None) => Err("move-tab needs either a direction or --to-index".into()),
             },
-            CliAction::Clear { pane_id } => match pane_id {
+            CliAction::Clear {
+                pane_id,
+                // both resolved before this: `--focused` by the guard, `--yes` by the confirm
+                focused: _,
+                yes: _,
+            } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::ClearScreenByPaneId { pane_id }])
@@ -1062,11 +1155,44 @@ impl Action {
                 block_until_exit_failure,
                 block_until_exit,
                 unblock_condition,
+                new_tab,
                 near_current_pane,
                 no_focus,
                 borderless,
                 tab_id,
+                in_tab,
+                near,
+                handle,
             } => {
+                if handle.is_some() {
+                    // a chosen handle is given to the pane after it is made, by the client holding
+                    // the report. Reaching here means it would have been dropped in silence.
+                    return Err(
+                        "`--handle` is applied once the pane exists, and it was still on the request when the action was built."
+                            .to_owned(),
+                    );
+                }
+                if near.is_some() {
+                    // `--near` is resolved and carried by the client, which is what holds the
+                    // connection to the server. Reaching here means nobody did that, and the pane
+                    // would open beside whichever pane the server found instead.
+                    return Err(
+                        "`--near` names a pane the session has to identify, and it was not \
+                         resolved before the action was built."
+                            .to_owned(),
+                    );
+                }
+                if in_tab.is_some() {
+                    // `--in-tab` is a name or an id that only the session can turn into the
+                    // `--tab-id` this action carries, so the CLI resolves it before building the
+                    // action. Reaching here means a caller skipped that, and the pane would
+                    // quietly open in the wrong tab.
+                    return Err(
+                        "`--in-tab` names a tab the session has to identify, and it was not \
+                         resolved before the action was built."
+                            .to_owned(),
+                    );
+                }
                 let pane_id_to_replace = match pane_id {
                     Some(pane_id_str) => match resolve_pane_target(&pane_id_str) {
                         Ok(parsed_pane_id) => Some(parsed_pane_id),
@@ -1092,6 +1218,54 @@ impl Action {
                         None
                     }
                 });
+                if let Some(tab_name) = new_tab {
+                    // A tab arrives with a pane in it, so "run this in a tab of its own" is one
+                    // action rather than two: the command is handed to the new tab as its first
+                    // pane, and what comes back is `tab_id:` with the pane it made. The tab is
+                    // built from the session's own new-tab template like every other tab, which is
+                    // what keeps its status bars, and its panes, in the session's saved layout.
+                    if blocking {
+                        return Err(
+                            "`--blocking` waits for a pane to close and cannot say which \
+                                    pane in a new tab that is. Use --block-until-exit, or open \
+                                    the tab first."
+                                .to_owned(),
+                        );
+                    }
+                    let initial_panes = if let Some(plugin) = plugin {
+                        Some(vec![CommandOrPlugin::Plugin(Self::run_plugin_or_alias(
+                            plugin,
+                            configuration,
+                            cwd.clone(),
+                            alias_cwd,
+                            current_dir,
+                        ))])
+                    } else if !command.is_empty() {
+                        let mut command = command;
+                        let (command, args) = (PathBuf::from(command.remove(0)), command);
+                        Some(vec![CommandOrPlugin::Command(RunCommandAction {
+                            command,
+                            args,
+                            cwd: cwd.clone(),
+                            hold_on_close: !close_on_exit,
+                            hold_on_start: start_suspended,
+                            ..Default::default()
+                        })])
+                    } else {
+                        None
+                    };
+                    return Ok(vec![Action::NewTab {
+                        tiled_layout: None,
+                        floating_layouts: vec![],
+                        swap_tiled_layouts: None,
+                        swap_floating_layouts: None,
+                        tab_name,
+                        should_change_focus_to_new_tab: !no_focus,
+                        cwd,
+                        initial_panes,
+                        first_pane_unblock_condition: unblock_condition,
+                    }]);
+                }
                 if blocking || unblock_condition.is_some() {
                     // For blocking panes, we don't support plugins
                     if plugin.is_some() {
@@ -1148,26 +1322,13 @@ impl Action {
                         tab_id,
                     }])
                 } else if let Some(plugin) = plugin {
-                    let plugin = match RunPluginLocation::parse(&plugin, cwd.clone()) {
-                        Ok(location) => {
-                            let user_configuration = configuration.unwrap_or_default();
-                            RunPluginOrAlias::RunPlugin(RunPlugin {
-                                _allow_exec_host_cmd: false,
-                                location,
-                                configuration: user_configuration,
-                                initial_cwd: cwd.clone(),
-                            })
-                        },
-                        Err(_) => {
-                            let mut plugin_alias = PluginAlias::new(
-                                &plugin,
-                                &configuration.map(|c| c.inner().clone()),
-                                alias_cwd,
-                            );
-                            plugin_alias.set_caller_cwd_if_not_set(Some(current_dir));
-                            RunPluginOrAlias::Alias(plugin_alias)
-                        },
-                    };
+                    let plugin = Self::run_plugin_or_alias(
+                        plugin,
+                        configuration,
+                        cwd.clone(),
+                        alias_cwd,
+                        current_dir,
+                    );
                     if floating {
                         Ok(vec![Action::NewFloatingPluginPane {
                             plugin,
@@ -1321,6 +1482,8 @@ impl Action {
                 no_focus,
                 borderless,
                 tab_id,
+                // taken by the client before this, and applied once the pane exists
+                handle: _,
             } => {
                 let mut file = file;
                 let current_dir = get_current_dir();
@@ -1369,7 +1532,11 @@ impl Action {
             CliAction::AreFloatingPanesVisible { tab_id } => {
                 Ok(vec![Action::AreFloatingPanesVisible { tab_id }])
             },
-            CliAction::ClosePane { pane_id } => match pane_id {
+            CliAction::ClosePane {
+                pane_id,
+                focused: _,
+                yes: _,
+            } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = resolve_pane_target(&pane_id_str)?;
                     Ok(vec![Action::CloseFocusByPaneId { pane_id }])
@@ -1395,7 +1562,11 @@ impl Action {
             },
             CliAction::GoToNextTab => Ok(vec![Action::GoToNextTab]),
             CliAction::GoToPreviousTab => Ok(vec![Action::GoToPreviousTab]),
-            CliAction::CloseTab { tab_id } => match tab_id {
+            CliAction::CloseTab {
+                tab_id,
+                focused: _,
+                yes: _,
+            } => match tab_id {
                 Some(id) => Ok(vec![Action::CloseTabById { id: id as u64 }]),
                 None => Ok(vec![Action::CloseTab]),
             },
@@ -1955,6 +2126,7 @@ impl Action {
                 output_json: json,
             }]),
             CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
+            CliAction::ListEvents { json } => Ok(vec![Action::ListEvents { output_json: json }]),
             CliAction::ListTabs {
                 state,
                 dimensions,
@@ -2074,6 +2246,27 @@ impl Action {
             },
             CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
             CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
+            // `wait` is answered by the client, which holds the caller for as long as the wait
+            // lasts. It is intercepted before this, and reaching here means that interception was
+            // removed and the command would otherwise go quiet
+            CliAction::Wait { .. } => {
+                Err("`wait` is run by the client, not sent as an action".into())
+            },
+            CliAction::SetPaneNote {
+                pane_id,
+                note,
+                color,
+            } => {
+                let parsed_pane_id = resolve_pane_target(&pane_id)?;
+                Ok(vec![Action::SetPaneNote {
+                    pane_id: parsed_pane_id,
+                    // no text is the clear, and so is text that is only spaces: a note of blanks
+                    // would take room on the frame and say nothing
+                    note: note
+                        .filter(|note| !note.trim().is_empty())
+                        .map(|note| (note.trim().to_owned(), color)),
+                }])
+            },
             CliAction::SignalPane { pane_id, signal } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {
@@ -2144,8 +2337,12 @@ impl Action {
                 layout_dir,
                 cwd,
             } => {
+                // deliberately not `resolve_pane_target`: that resolver answers against the session
+                // this process is in, and this pane lives in `name`. See
+                // [`cli::cross_session_pane_target_needs_an_id`], which refuses the forms that
+                // would need the other session's registry before the call gets this far.
                 let pane_id = match pane_id {
-                    Some(stringified_pane_id) => match resolve_pane_target(&stringified_pane_id) {
+                    Some(stringified_pane_id) => match pane_ids_only(&stringified_pane_id) {
                         Ok(PaneId::Terminal(id)) => Some((id, false)),
                         Ok(PaneId::Plugin(id)) => Some((id, true)),
                         Err(e) => return Err(e),
@@ -2344,11 +2541,51 @@ mod tests {
     use crate::data::KeyModifier;
     use std::path::PathBuf;
 
+    fn note_from_cli(
+        note: Option<&str>,
+        color: crate::data::NoteColor,
+    ) -> Option<(String, crate::data::NoteColor)> {
+        let actions = Action::actions_from_cli(
+            CliAction::SetPaneNote {
+                pane_id: "7".to_string(),
+                note: note.map(|note| note.to_string()),
+                color,
+            },
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .expect("a well-formed note reaches an action");
+        match &actions[0] {
+            Action::SetPaneNote { note, .. } => note.clone(),
+            other => panic!("Expected SetPaneNote, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_note_with_no_text_clears_the_one_the_pane_had() {
+        use crate::data::NoteColor;
+        assert_eq!(
+            note_from_cli(Some("waiting on review"), NoteColor::Warn),
+            Some(("waiting on review".to_string(), NoteColor::Warn))
+        );
+        // no text is the clear, and so is text that is only spaces: a note of blanks would take
+        // room on the frame and say nothing
+        assert_eq!(note_from_cli(None, NoteColor::Info), None);
+        assert_eq!(note_from_cli(Some("   "), NoteColor::Error), None);
+        // the surrounding whitespace of a real note goes, and the note stays
+        assert_eq!(
+            note_from_cli(Some("  done  "), NoteColor::Ok),
+            Some(("done".to_string(), NoteColor::Ok))
+        );
+    }
+
     #[test]
     fn test_send_keys_single_key() {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Enter".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2381,6 +2618,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrl a".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2412,6 +2650,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrl a".to_string(), "F1".to_string(), "Enter".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2440,6 +2679,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrl-a".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2457,6 +2697,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["Ctrll a".to_string()],
             pane_id: None,
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2474,6 +2715,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["a".to_string()],
             pane_id: Some("terminal_1".to_string()),
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2498,6 +2740,7 @@ mod tests {
         let cli_action = CliAction::SendKeys {
             keys: vec!["a".to_string()],
             pane_id: Some("invalid_id".to_string()),
+            focused: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2965,6 +3208,8 @@ mod tests {
     fn test_clear_with_pane_id() {
         let cli_action = CliAction::Clear {
             pane_id: Some("terminal_14".to_string()),
+            focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -2985,7 +3230,11 @@ mod tests {
 
     #[test]
     fn test_clear_without_pane_id() {
-        let cli_action = CliAction::Clear { pane_id: None };
+        let cli_action = CliAction::Clear {
+            pane_id: None,
+            focused: false,
+            yes: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3159,6 +3408,8 @@ mod tests {
     fn test_close_pane_with_pane_id() {
         let cli_action = CliAction::ClosePane {
             pane_id: Some("terminal_18".to_string()),
+            focused: false,
+            yes: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3179,7 +3430,11 @@ mod tests {
 
     #[test]
     fn test_close_pane_without_pane_id() {
-        let cli_action = CliAction::ClosePane { pane_id: None };
+        let cli_action = CliAction::ClosePane {
+            pane_id: None,
+            focused: false,
+            yes: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3385,7 +3640,11 @@ mod tests {
     // 20. CloseTab
     #[test]
     fn test_close_tab_with_tab_id() {
-        let cli_action = CliAction::CloseTab { tab_id: Some(5) };
+        let cli_action = CliAction::CloseTab {
+            tab_id: Some(5),
+            focused: false,
+            yes: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3405,7 +3664,11 @@ mod tests {
 
     #[test]
     fn test_close_tab_without_tab_id() {
-        let cli_action = CliAction::CloseTab { tab_id: None };
+        let cli_action = CliAction::CloseTab {
+            tab_id: None,
+            focused: false,
+            yes: false,
+        };
         let result = Action::actions_from_cli(
             cli_action,
             Box::new(|| PathBuf::from("/tmp")),
@@ -3903,6 +4166,7 @@ mod tests {
     fn test_focus_pane_id() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "terminal_7".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3914,7 +4178,7 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::FocusPaneByPaneId { pane_id } => {
+            Action::FocusPaneByPaneId { pane_id, .. } => {
                 assert!(matches!(pane_id, PaneId::Terminal(7)));
             },
             _ => panic!("Expected FocusPaneByPaneId action"),
@@ -3922,9 +4186,71 @@ mod tests {
     }
 
     #[test]
+    fn go_to_pane_no_focus_is_a_probe() {
+        let cli_action = CliAction::FocusPaneId {
+            pane_id: "terminal_7".to_string(),
+            no_focus: true,
+        };
+        let actions = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::FocusPaneByPaneId { pane_id, no_focus } => {
+                assert!(matches!(pane_id, PaneId::Terminal(7)));
+                assert!(*no_focus, "the probe asked for the focus to move");
+            },
+            other => panic!("Expected FocusPaneByPaneId action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn go_to_pane_no_focus_says_nothing_about_a_pane_that_is_not_there() {
+        // the probe exits 0 either way, so a target no pane answers to leaves nothing to send
+        let cli_action = CliAction::FocusPaneId {
+            pane_id: "sunny-otter".to_string(),
+            no_focus: true,
+        };
+        let actions = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .unwrap();
+        assert!(
+            actions.is_empty(),
+            "the probe sent an action for a pane it could not resolve: {:?}",
+            actions
+        );
+    }
+
+    #[test]
+    fn go_to_pane_without_no_focus_still_refuses_a_pane_that_is_not_there() {
+        // the negative control: only the probe swallows an unresolvable target. The jump itself is
+        // still a miss, which is what exits 2
+        let cli_action = CliAction::FocusPaneId {
+            pane_id: "sunny-otter".to_string(),
+            no_focus: false,
+        };
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_focus_pane_id_bare_int() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "3".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3936,7 +4262,7 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::FocusPaneByPaneId { pane_id } => {
+            Action::FocusPaneByPaneId { pane_id, .. } => {
                 assert!(matches!(pane_id, PaneId::Terminal(3)));
             },
             _ => panic!("Expected FocusPaneByPaneId action"),
@@ -3947,6 +4273,7 @@ mod tests {
     fn test_focus_pane_id_plugin() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "plugin_2".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -3958,7 +4285,7 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::FocusPaneByPaneId { pane_id } => {
+            Action::FocusPaneByPaneId { pane_id, .. } => {
                 assert!(matches!(pane_id, PaneId::Plugin(2)));
             },
             _ => panic!("Expected FocusPaneByPaneId action"),
@@ -3969,6 +4296,7 @@ mod tests {
     fn test_focus_pane_id_malformed() {
         let cli_action = CliAction::FocusPaneId {
             pane_id: "invalid_id".to_string(),
+            no_focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -4154,6 +4482,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4203,6 +4535,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4252,6 +4588,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4303,6 +4643,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4346,6 +4690,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4395,6 +4743,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4444,6 +4796,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4485,6 +4841,7 @@ mod tests {
             no_focus: false,
             borderless: None,
             tab_id: Some(4),
+            handle: None,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -4522,6 +4879,7 @@ mod tests {
             no_focus: false,
             borderless: None,
             tab_id: None,
+            handle: None,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -4567,6 +4925,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4616,6 +4978,10 @@ mod tests {
             block_until_exit_failure: false,
             block_until_exit: false,
             unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4703,6 +5069,8 @@ mod pane_target_resolution_tests {
         let actions = Action::actions_from_cli(
             CliAction::ClosePane {
                 pane_id: Some("sunny-otter".to_owned()),
+                focused: false,
+                yes: false,
             },
             Box::new(|| PathBuf::from("/tmp")),
             None,
@@ -4728,6 +5096,8 @@ mod pane_target_resolution_tests {
         let err = Action::actions_from_cli(
             CliAction::ClosePane {
                 pane_id: Some("sunny-otter".to_owned()),
+                focused: false,
+                yes: false,
             },
             Box::new(|| PathBuf::from("/tmp")),
             None,

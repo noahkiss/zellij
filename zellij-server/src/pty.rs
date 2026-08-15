@@ -254,6 +254,19 @@ pub(crate) struct Pty {
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
     /// The last map `report_pane_process_info` sent, so an unchanged tick sends nothing.
     last_reported_process_info: HashMap<u32, PaneProcessInfo>,
+    /// Whether the next serialization tick must write the resurrection cache even though the
+    /// session is clean.
+    ///
+    /// A clean session does not write, so without this the cache on disk keeps whatever the last
+    /// dirty tick put there. A session that opens a pane and closes it again is clean and
+    /// diverged at once, and the next resurrection hands back the pane that was closed. Writing
+    /// once on the dirty -> clean transition makes the cache match the shape the session returned
+    /// to.
+    ///
+    /// It starts `true` for the same reason: a session that never diverges from its layout would
+    /// otherwise never write a cache at all and could not be resurrected. The first tick writes
+    /// the base shape, and every clean tick after it is silent.
+    pending_layout_serialization: bool,
 }
 
 pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
@@ -773,7 +786,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 let rendered = if output_json {
                     session_layout_metadata.list_clients_metadata_json(client_id)
                 } else {
-                    session_layout_metadata.list_clients_metadata()
+                    session_layout_metadata.list_clients_metadata(client_id)
                 };
                 pty.bus
                     .senders
@@ -825,7 +838,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::LogLayoutToHd(mut session_layout_metadata) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
-                if session_layout_metadata.is_dirty() {
+                if pty.should_serialize_layout(session_layout_metadata.is_dirty()) {
                     match session_serialization::serialize_session_layout(
                         session_layout_metadata.into(),
                     ) {
@@ -1001,7 +1014,19 @@ impl Pty {
             pane_activity_flags: HashMap::new(),
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
+            pending_layout_serialization: true,
         }
+    }
+    /// Whether this serialization tick writes the resurrection cache, given whether the session
+    /// has diverged from its layout.
+    ///
+    /// A dirty tick always writes. So does the FIRST tick after a dirty one, even though that tick
+    /// is clean: the session has returned to its base shape and the cache still holds the diverged
+    /// one, and nothing would ever overwrite it. Every clean tick after that is silent.
+    fn should_serialize_layout(&mut self, is_dirty: bool) -> bool {
+        let should_serialize = is_dirty || self.pending_layout_serialization;
+        self.pending_layout_serialization = is_dirty;
+        should_serialize
     }
     pub fn get_default_terminal(
         &self,
