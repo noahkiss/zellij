@@ -22,7 +22,7 @@ use zellij_utils::session_doctor::{Commander, DoctorMode, Finding, Report, Syste
 use zellij_utils::session_lifecycle::launchctl;
 use zellij_utils::session_service::{find_session_job, installed_launch_agents, launchd_label};
 use zellij_utils::session_signing::{
-    refresh_belongs_to_signing, sign_pin, SigningContext, SigningDir,
+    refresh_belongs_to_signing, sign_pin, signing_context, NO_HOME,
 };
 
 /// How long to wait for a pane to write its answer before giving up on it.
@@ -339,21 +339,10 @@ fn check_signature(
         // `check_pin` has already said that the pin is off, and everything below it is skipped
         return;
     };
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        report.push(Finding::needs_you(
-            "signing",
-            "no HOME, so there is nowhere to keep a signing certificate",
-        ));
+    let Some(context) = signing_context(commander, config_dir, deferred_refresh(pinned, mode))
+    else {
+        report.push(Finding::needs_you("signing", NO_HOME));
         return;
-    };
-    let context = SigningContext {
-        signing_dir: SigningDir::new(home.join("Library/Application Support/zellij/signing")),
-        keychain: default_keychain(commander),
-        // an environment variable holding a password is not a thing to want; it is the only way a
-        // run over SSH can answer the keychain's dialog, and a run that cannot answer it hangs
-        keychain_password: std::env::var("ZELLIJ_KEYCHAIN_PASSWORD").ok(),
-        refresh_from: deferred_refresh(pinned, mode),
-        backup_dir: config_dir,
     };
     report.extend(sign_pin(commander, pinned, mode, &context).findings);
 }
@@ -371,18 +360,4 @@ pub fn deferred_refresh(pinned: &Path, mode: DoctorMode) -> Option<PathBuf> {
         .as_deref()
         .is_some_and(|exe| zellij_utils::session_lifecycle::pin_needs_refresh(exe, pinned));
     refresh_belongs_to_signing(&SystemCommander, pinned, mode, current_exe, needs_refresh)
-}
-
-/// The keychain `codesign` will look in.
-///
-/// Asked rather than assumed: `login.keychain-db` is the answer on almost every machine and not on
-/// all of them, and importing into a keychain nothing searches is an import that reports success
-/// and leaves nothing able to sign.
-fn default_keychain(commander: &SystemCommander) -> String {
-    commander
-        .run("security", &["default-keychain", "-d", "user"], None)
-        .ok()
-        .map(|output| output.stdout.trim().trim_matches('"').to_owned())
-        .filter(|keychain| !keychain.is_empty())
-        .unwrap_or_else(|| String::from("login.keychain-db"))
 }

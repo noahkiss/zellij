@@ -55,6 +55,16 @@ pub(crate) fn session_doctor_command(
 /// usually stopped at the cause.
 fn examine(name: &str, exe: Option<PathBuf>, mode: DoctorMode, opts: &CliArgs) -> Report {
     let mut report = Report::new();
+    // Said before any check can write the pin. `--no-sign` is the case that matters: without it
+    // the pin's writer would sign an anchored pin this run was told to leave alone, and the run
+    // that is told not to sign must leave it BOTH unsigned and unreplaced - copying the new build
+    // over the signature is not the other option, it is the fault the guard exists to stop.
+    zellij_utils::session_signing::set_pin_signing_policy(
+        zellij_utils::session_signing::PinSigningPolicy {
+            allowed: mode.sign,
+            backup_dir: opts.config_dir.clone().or_else(find_default_config_dir),
+        },
+    );
     let extras = configured_extras(opts);
     let pinned = configured_pinned_exe(extras.as_ref());
 
@@ -720,6 +730,22 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
         Ok(PinOutcome::Installed(path)) => report.push(Finding::changed(
             "pin",
             format!("pinned this build at {}", path.display()),
+        )),
+        Ok(PinOutcome::Signed(path)) => report.push(
+            Finding::changed(
+                "pin",
+                format!("refreshed and signed the pinned copy at {}", path.display()),
+            )
+            .note("the running session keeps the old copy until it is restarted"),
+        ),
+        // the pin was left as it was, and the writer has already said why on stderr. A `Needs you`
+        // here would repeat it in a second voice; the signing check reports the state.
+        Ok(PinOutcome::Kept(path)) => report.push(Finding::needs_you(
+            "pin",
+            format!(
+                "{} still holds the previous build: its signature could not be replaced",
+                path.display()
+            ),
         )),
         Ok(PinOutcome::Refreshed(path)) => report.push(
             Finding::changed(
