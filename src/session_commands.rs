@@ -49,9 +49,10 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
         SessionLifecycleCli::Up {
             session_name,
             restore,
+            fresh,
         } => {
             let name = resolve_session_name(session_name, &opts, false);
-            process::exit(match up(&name, restore, &opts) {
+            process::exit(match up(&name, up_shape(fresh, restore), &opts) {
                 Ok(()) => 0,
                 Err(()) => 1,
             });
@@ -768,8 +769,85 @@ fn refuse_from_inside(name: &str) {
     }
 }
 
+/// What shape a `session up` is asked to build.
+///
+/// The three cases differ in more than which layout is read. Only `Snapshot` is a demand: it names
+/// a shape the caller chose, so failing to produce it is an error worth exiting on. `Resume` is a
+/// preference - come back as you were, if you can - and every one of its sources is allowed to be
+/// missing, because the caller of a bare `up` is usually the watchdog, which wants a session more
+/// than it wants a particular one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpShape {
+    /// Come back with the shape the session had, from whichever store still holds it.
+    Resume,
+    /// Come back from the layout, discarding the shape the session had.
+    Fresh,
+    /// Come back from this archived snapshot, by id or unique prefix.
+    Snapshot(String),
+}
+
+/// What the flags on `session up` mean. Clap refuses `--fresh` with `--restore`, so this never has
+/// to.
+fn up_shape(fresh: bool, restore: Option<String>) -> UpShape {
+    match (fresh, restore) {
+        (true, _) => UpShape::Fresh,
+        (false, Some(id)) => UpShape::Snapshot(id),
+        (false, None) => UpShape::Resume,
+    }
+}
+
+/// Whether a `Resume` has to reach for the archive.
+///
+/// The in-place cache is the fresher of the two stores and `attach` reads it by itself, so the
+/// archive is consulted only when that file is gone - which is exactly what `session down` and
+/// `delete-session` leave behind, and the whole of the gap this branch closes.
+fn resume_wants_archive(resume_enabled: bool, cache_exists: bool) -> bool {
+    resume_enabled && !cache_exists
+}
+
+/// Whether a plain `up` resumes at all. Default true; `session_up_resume false` goes back to
+/// coming up from the layout whenever the in-place cache is gone.
+fn resume_enabled(opts: &CliArgs) -> bool {
+    get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_up_resume)
+        .unwrap_or(true)
+}
+
+/// The snapshot a bare `up` should come back from, as `(id, age)`, or `None` for the layout.
+///
+/// The layout is parsed here rather than left to `attach`, because the two callers want opposite
+/// things from a snapshot that no longer parses. `--restore` names one and exits 2 when it cannot
+/// be read; a derived one was nobody's request, and turning a routine watchdog tick into a machine
+/// with no session is a worse answer than a fresh session and a warning.
+fn resume_archive_target(name: &str, opts: &CliArgs) -> Option<(String, String)> {
+    use zellij_utils::consts::session_layout_cache_file_name;
+    use zellij_utils::session_snapshot::snapshots_for_session;
+
+    if !resume_wants_archive(
+        resume_enabled(opts),
+        session_layout_cache_file_name(name).exists(),
+    ) {
+        return None;
+    }
+    // oldest first, so the newest is the one to pop
+    let snapshot = snapshots_for_session(&snapshot_settings(opts), name).pop()?;
+    let age = snapshot.saved_at_description();
+    match snapshot.layout() {
+        Ok(_) => Some((snapshot.id, age)),
+        Err(reason) => {
+            println!(
+                "      snapshot {} ({}) no longer parses, so it is left on disk and the session \
+                 comes up from the layout: {}",
+                snapshot.id, age, reason
+            );
+            None
+        },
+    }
+}
+
 /// Create the session if it is not there, then prove that it is.
-fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
+fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     // First, and on every `up` including the one that finds the session already healthy: an upgrade
     // reaches the pinned copy through this pass and no other, and the pass that returns early is
     // exactly the one an upgraded machine takes every minute.
@@ -786,21 +864,23 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
     let facts = SessionFacts::collect(name);
     let healthy = facts.assert_up().is_ok();
 
-    if healthy && restore.is_none() {
+    // Only a NAMED snapshot is a demand that a running session contradicts. A bare `up` that would
+    // have resumed is answered by the session that is already there, which is what it wanted, and a
+    // watchdog tick must not start exiting 2 for finding the session up.
+    let named_snapshot = matches!(shape, UpShape::Snapshot(_));
+    if healthy && !named_snapshot {
         println!("ok    session '{}' already running", name);
         // "already running" is exactly the answer that hides a superseded build: an `up` after an
         // upgrade reports success and leaves the old server serving the session.
         warn_if_server_build_differs(name);
         return Ok(());
     }
-    if healthy || facts.listed {
-        if restore.is_some() {
-            eprintln!(
-                "Session '{}' is running, so there is nothing to restore into.",
-                name
-            );
-            process::exit(2);
-        }
+    if (healthy || facts.listed) && named_snapshot {
+        eprintln!(
+            "Session '{}' is running, so there is nothing to restore into.",
+            name
+        );
+        process::exit(2);
     }
     // Building a second server for a name that already has one is how the invisible duplicates were
     // made in the first place. If something is already serving this name and the post-condition
@@ -896,6 +976,22 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         std::env::set_var("COLORTERM", colorterm);
     }
 
+    // Which shape this session is built from, decided once, here. `attach` resurrects from the
+    // in-place cache by itself, so `Resume` only has work to do when that file is gone.
+    let derived = match &shape {
+        UpShape::Resume => resume_archive_target(name, opts),
+        UpShape::Fresh | UpShape::Snapshot(_) => None,
+    };
+    let restore = match &shape {
+        UpShape::Snapshot(id) => Some(id.clone()),
+        UpShape::Fresh => None,
+        UpShape::Resume => derived.as_ref().map(|(id, _)| id.clone()),
+    };
+    // `--fresh` discards the in-place cache rather than merely ignoring it, which is what makes a
+    // layout edit apply. The archived snapshot is untouched, so the discarded shape is still
+    // reachable with `session up --restore`.
+    let no_resurrect = matches!(shape, UpShape::Fresh);
+
     let mut opts = opts.clone();
     opts.session = None;
     opts.command = Some(Command::Sessions(Sessions::Attach {
@@ -903,7 +999,7 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         create: true,
         create_background: true,
         force_run_commands: false,
-        no_resurrect: false,
+        no_resurrect,
         restore: restore.clone(),
         index: None,
         options: None,
@@ -922,8 +1018,10 @@ fn up(name: &str, restore: Option<String>, opts: &CliArgs) -> Result<(), ()> {
         return Err(());
     }
     println!("up    session '{}' in {}", name, facts.socket_dir.display());
-    if let Some(id) = restore {
-        println!("      restored from snapshot {}", id);
+    match (&derived, &restore) {
+        (Some((id, age)), _) => println!("      restored from snapshot {} (saved {})", id, age),
+        (None, Some(id)) => println!("      restored from snapshot {}", id),
+        (None, None) => {},
     }
     Ok(())
 }
@@ -1081,15 +1179,18 @@ fn drop_configured_env(opts: &CliArgs) {
 /// The pre-restart shape is what a restart is almost always for - the process is the thing being
 /// replaced, not the layout - so a snapshot is restored by default and `--fresh` is the deliberate
 /// exception, for picking up a layout edit. Clap refuses the two together, so this never has to.
-fn restart_restore_target(fresh: bool, restore: Option<String>) -> Option<String> {
+fn restart_restore_target(fresh: bool, restore: Option<String>) -> UpShape {
     if fresh {
-        None
+        // Load-bearing, and the reason this returns a shape rather than an `Option`: a plain `up`
+        // now resumes, so a `--fresh` restart that asked for "no snapshot" by passing `None` would
+        // be handed the newest one back. `Fresh` is the only way to the layout and stays that way.
+        UpShape::Fresh
     } else {
-        Some(restore.unwrap_or_else(|| "latest".to_owned()))
+        UpShape::Snapshot(restore.unwrap_or_else(|| "latest".to_owned()))
     }
 }
 
-fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArgs) -> ! {
+fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
     use zellij_utils::consts::ZELLIJ_STATE_DIR;
 
     let log_file = ZELLIJ_STATE_DIR.join("restart.log");
@@ -1157,7 +1258,7 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
         eprintln!("teardown failed; NOT recreating the session.");
         process::exit(1);
     }
-    process::exit(match up(name, restore, opts) {
+    process::exit(match up(name, shape, opts) {
         Ok(()) => 0,
         Err(()) => 1,
     });
@@ -1166,13 +1267,13 @@ fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArg
 /// Windows has no fork, and no process group to escape from: the caller's shell is not a pane shell
 /// the server is about to kill.
 #[cfg(not(unix))]
-fn restart(name: &str, restore: Option<String>, wait_timeout: u64, opts: &CliArgs) -> ! {
+fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
     drop_configured_env(opts);
     if down(name, wait_timeout, opts).is_err() {
         eprintln!("teardown failed; NOT recreating the session.");
         process::exit(1);
     }
-    process::exit(match up(name, restore, opts) {
+    process::exit(match up(name, shape, opts) {
         Ok(()) => 0,
         Err(()) => 1,
     });
@@ -1186,7 +1287,7 @@ mod tests {
     fn a_restart_comes_back_from_the_newest_snapshot() {
         assert_eq!(
             restart_restore_target(false, None),
-            Some("latest".to_owned())
+            UpShape::Snapshot("latest".to_owned())
         );
     }
 
@@ -1194,14 +1295,52 @@ mod tests {
     fn a_restart_can_be_told_which_snapshot() {
         assert_eq!(
             restart_restore_target(false, Some("abc123".to_owned())),
-            Some("abc123".to_owned())
+            UpShape::Snapshot("abc123".to_owned())
         );
     }
 
     #[test]
     fn a_fresh_restart_restores_nothing() {
-        // the negative control: --fresh is the only way back to the layout, and it stays that way
-        assert_eq!(restart_restore_target(true, None), None);
+        // the negative control: --fresh is the only way back to the layout, and it stays that way.
+        // `Fresh` rather than "no snapshot named" is the whole point of the enum - a bare `up`
+        // resumes, so "nothing named" would now mean "resume from the newest snapshot".
+        assert_eq!(restart_restore_target(true, None), UpShape::Fresh);
+    }
+
+    #[test]
+    fn a_bare_up_resumes() {
+        assert_eq!(up_shape(false, None), UpShape::Resume);
+    }
+
+    #[test]
+    fn a_fresh_up_comes_from_the_layout() {
+        assert_eq!(up_shape(true, None), UpShape::Fresh);
+    }
+
+    #[test]
+    fn an_up_can_be_told_which_snapshot() {
+        assert_eq!(
+            up_shape(false, Some("abc123".to_owned())),
+            UpShape::Snapshot("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_resume_leaves_an_in_place_shape_to_attach() {
+        // attach resurrects from the in-place cache by itself, and that file is fresher than any
+        // snapshot, so the archive is not consulted while it exists
+        assert!(!resume_wants_archive(true, true));
+    }
+
+    #[test]
+    fn a_resume_reaches_the_archive_once_the_in_place_shape_is_gone() {
+        // what `session down` and `delete-session` leave behind, and the gap this closes
+        assert!(resume_wants_archive(true, false));
+    }
+
+    #[test]
+    fn resuming_can_be_turned_off() {
+        assert!(!resume_wants_archive(false, false));
     }
     use zellij_utils::session_lifecycle::UP_LOCK_TIMEOUT;
 

@@ -1036,6 +1036,32 @@ pub fn start_server_impl(
         });
     }
 
+    // A SIGTERM is how a session ends on a reboot, a logout, and a `systemctl --user stop`, and
+    // without a handler it kills the server outright: the last periodic serialize can be a whole
+    // `serialization_interval` old, and no snapshot is archived at all. `KillSession` is exactly
+    // the graceful path - serialize once more, tell the clients, then archive on the way out - so
+    // this thread only has to ask for it. The shutdown that follows is the one `kill-session`
+    // already runs, so nothing new can hang here that could not hang there.
+    //
+    // `install_panic_hook` is false only for the in-process server the integration tests run, and
+    // that one must not take the test harness's signals.
+    #[cfg(unix)]
+    if install_panic_hook {
+        let to_server = to_server.clone();
+        let _ = thread::Builder::new()
+            .name("signal_listener".to_string())
+            .spawn(move || {
+                match signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM]) {
+                    Ok(mut signals) => {
+                        if signals.forever().next().is_some() {
+                            let _ = to_server.send(ServerInstruction::KillSession);
+                        }
+                    },
+                    Err(e) => log::error!("could not listen for SIGTERM: {}", e),
+                }
+            });
+    }
+
     let _ = thread::Builder::new()
         .name("server_listener".to_string())
         .spawn({
