@@ -99,7 +99,9 @@ pub const TOOLS: &[ToolSpec] = &[
         reports: &["action list-panes"],
         tips: "scope=agents narrows the same walk to the panes running claude, opencode, codex or \
                pi, each with the harness's own session id where it exports one. scope=sessions \
-               answers about the machine rather than about one session.",
+               answers about the machine rather than about one session. A `withheld` count above \
+               zero means the session keeps some panes to itself: they are not in this answer, no \
+               tool here will reach them, and there is nothing to ask for.",
         params: &[
             SESSION,
             ParamSpec {
