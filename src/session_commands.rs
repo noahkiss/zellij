@@ -211,6 +211,15 @@ fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
         PinOutcome::Refreshed(path) => {
             println!("      refreshed the pinned copy at {}", path.display())
         },
+        PinOutcome::Signed(path) => {
+            println!(
+                "      refreshed and signed the pinned copy at {}",
+                path.display()
+            )
+        },
+        // the pin was left alone because this run could not sign it, and the sink has already said
+        // so in full. A second line here would read as a second fault.
+        PinOutcome::Kept(_) => {},
         PinOutcome::UpToDate(_) => {},
     }
     Ok(())
@@ -228,10 +237,22 @@ fn pin_this_build_at(_pinned: &PathBuf) -> Result<(), String> {
 /// different file from the one the launcher execs - and refreshing that one would leave the running
 /// copy stale while reporting success.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>) {
+fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>, opts: &CliArgs) {
     let Some(configured) = configured_pinned_exe(extras) else {
         return;
     };
+    // The pin's writer signs for itself; what it cannot work out is where THIS run keeps its
+    // config, and doctor resolves that the same way - so both flows leave the certificate backup
+    // in one place.
+    zellij_utils::session_signing::set_pin_signing_policy(
+        zellij_utils::session_signing::PinSigningPolicy {
+            allowed: true,
+            backup_dir: opts
+                .config_dir
+                .clone()
+                .or_else(zellij_utils::home::find_default_config_dir),
+        },
+    );
     let installed = session_service::installed_session_exe(name);
     match session_service::pin_state(&configured, installed.as_deref()) {
         PinState::Recorded(path) | PinState::Unrecorded(path) => {
@@ -262,7 +283,7 @@ fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>) {
 /// Nowhere else has a launcher this build installs into, so there is no recorded path and nothing
 /// to keep current.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn assert_pinned_exe(_name: &str, _extras: Option<&SessionServiceOptions>) {}
+fn assert_pinned_exe(_name: &str, _extras: Option<&SessionServiceOptions>, _opts: &CliArgs) {}
 
 /// Write the unit and hand it to the init system.
 ///
@@ -851,7 +872,7 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     // First, and on every `up` including the one that finds the session already healthy: an upgrade
     // reaches the pinned copy through this pass and no other, and the pass that returns early is
     // exactly the one an upgraded machine takes every minute.
-    assert_pinned_exe(name, configured_extras(opts).as_ref());
+    assert_pinned_exe(name, configured_extras(opts).as_ref(), opts);
     // Same pass, same reason: a config edit does not reach a unit nobody rewrote, and the `up` that
     // returns early is exactly the one a machine with a stale unit takes every minute.
     warn_if_unit_drifted(name, opts);
