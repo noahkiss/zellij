@@ -146,16 +146,21 @@ pub fn argv(
     match tool {
         "zellij_overview" => match args.enumerated("scope", "panes").as_str() {
             "sessions" => Ok(vec!["ls".to_owned(), "--json".to_owned()]),
+            // `--report-withheld` on both walks: an agent that is told a list is complete when it
+            // is not will go looking for the missing pane, and the count is the only thing a
+            // withheld pane leaves behind
             "agents" => Ok(scoped(vec![
                 "action".to_owned(),
                 "list-agents".to_owned(),
                 "--json".to_owned(),
+                "--report-withheld".to_owned(),
             ])),
             "panes" => {
                 let mut rest = vec![
                     "action".to_owned(),
                     "list-panes".to_owned(),
                     "--json".to_owned(),
+                    "--report-withheld".to_owned(),
                 ];
                 if args.flag("include_hidden") {
                     rest.push("--all".to_owned());
@@ -472,7 +477,7 @@ mod tests {
     fn the_ambient_session_is_used_when_the_call_does_not_name_one() {
         assert_eq!(
             line("zellij_overview", json!({}), Some("work")),
-            "-s work action list-panes --json"
+            "-s work action list-panes --json --report-withheld"
         );
     }
 
@@ -480,7 +485,7 @@ mod tests {
     fn a_named_session_beats_the_ambient_one() {
         assert_eq!(
             line("zellij_overview", json!({"session": "other"}), Some("work")),
-            "-s other action list-panes --json"
+            "-s other action list-panes --json --report-withheld"
         );
     }
 
@@ -488,7 +493,7 @@ mod tests {
     fn a_call_with_no_session_anywhere_lets_the_cli_resolve_it() {
         assert_eq!(
             line("zellij_overview", json!({}), None),
-            "action list-panes --json"
+            "action list-panes --json --report-withheld"
         );
     }
 
@@ -496,7 +501,7 @@ mod tests {
     fn the_agent_scope_is_the_association_verb() {
         assert_eq!(
             line("zellij_overview", json!({"scope": "agents"}), Some("work")),
-            "-s work action list-agents --json"
+            "-s work action list-agents --json --report-withheld"
         );
     }
 

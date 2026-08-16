@@ -112,6 +112,31 @@ pub(crate) fn snapshot_settings(opts: &CliArgs) -> SnapshotSettings {
     SnapshotSettings::from_options(get_config_options_from_cli_args(opts).ok().as_ref())
 }
 
+/// `snapshot show` and `snapshot restore`, refused while a pane privacy policy is configured.
+///
+/// A snapshot is one layout document carrying every pane's cwd and command, and `show` prints it
+/// verbatim. There is no row to drop, so the choice is the whole document or none of it. `restore`
+/// goes with it because it rebuilds those panes, in those directories, in a session that is not
+/// covered by whatever made them private.
+///
+/// This is the one decision the filter makes outside the server, and it is not the same decision:
+/// the server asks WHICH panes, and this asks only WHETHER a policy exists. A snapshot is a file on
+/// disk with no session behind it to ask.
+fn refuse_if_pane_privacy_is_active(opts: &CliArgs) {
+    let configured = get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.pane_privacy)
+        .map(|pane_privacy| !pane_privacy.is_empty())
+        .unwrap_or(false);
+    let from_env = std::env::var(zellij_utils::pane_privacy::PANE_PRIVACY_FILE_ENV)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if configured || from_env {
+        eprintln!("{}", zellij_utils::pane_privacy::WITHHELD_SNAPSHOT_MESSAGE);
+        process::exit(2);
+    }
+}
+
 /// A session that exists under another client/server contract is invisible to this binary, and the
 /// bare "no session with that name" is misleading about why. Name the mismatch, and the way out.
 fn print_contract_mismatch_help(session_name: &str, config_options: Option<&Options>) {
@@ -177,6 +202,7 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
             list_snapshots_command(&settings, session.as_deref(), json);
         },
         SnapshotCli::Show { id } => {
+            refuse_if_pane_privacy_is_active(&opts);
             let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
             match std::fs::read_to_string(snapshot.layout_file()) {
                 Ok(raw) => print!("{}", raw),
@@ -187,6 +213,7 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
             }
         },
         SnapshotCli::Restore { id, session } => {
+            refuse_if_pane_privacy_is_active(&opts);
             let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
             let target_session_name = session.unwrap_or_else(|| snapshot.session_name.clone());
             // a restore is an attach that takes its layout from the archive, so it goes through the
@@ -972,7 +999,16 @@ fn attach_with_cli_client(
         timeout,
     } = &cli_action
     {
-        let pane = match resolve_pane_target(pane_id) {
+        // an id form needs no lookup to be understood, and is asked about anyway: the session is
+        // the only thing that can say whether a pane privacy policy withholds it, and a wait that
+        // skipped the question would poll a list the pane is not in and call that an exit
+        let pane = match zellij_client::cli_client::resolve_pane_target(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            pane_id,
+        ) {
             Ok(pane) => pane,
             Err(message) => {
                 eprintln!("{}", message);
@@ -1008,13 +1044,18 @@ fn attach_with_cli_client(
     // `list-agents` never becomes an action either. It is `list-panes` with a filter and a
     // different table, and doing that in the client is what keeps a whole verb off the
     // client/server contract
-    if let zellij_utils::cli::CliAction::ListAgents { json } = &cli_action {
+    if let zellij_utils::cli::CliAction::ListAgents {
+        json,
+        report_withheld,
+    } = &cli_action
+    {
         let exit_status = zellij_client::cli_client::start_list_agents_client(
             Box::new(get_os_input(
                 zellij_client::os_input_output::get_cli_client_os_input,
             )),
             session_name,
             *json,
+            *report_withheld,
         );
         std::process::exit(exit_status);
     }

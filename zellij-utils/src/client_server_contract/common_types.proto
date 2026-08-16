@@ -424,6 +424,8 @@ message ListPanesAction {
   bool show_geometry = 4;
   bool show_all = 5;
   bool output_json = 6;
+  // a new tag, so an older peer defaults it to false and answers with the bare array it always did
+  bool report_withheld = 7;
 }
 message ListTabsAction {
   bool show_state = 1;
