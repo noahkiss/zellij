@@ -1268,6 +1268,15 @@ pub enum PinOutcome {
     /// The pinned path already holds this build. The common case, and the reason the build is
     /// identified at all: copying 40 MB on every `session up` for nothing.
     UpToDate(PathBuf),
+    /// The pinned path held an anchored signature and a different build, and now holds this build
+    /// signed with the same certificate. Refreshing and signing were one transaction; see
+    /// [`refresh_pin_through_signing`](crate::session_signing::refresh_pin_through_signing).
+    Signed(PathBuf),
+    /// The pinned path holds an anchored signature and a DIFFERENT build, and it was left exactly
+    /// as it was because this run could not sign. The caller gets the path anyway: the previous
+    /// signed copy is a working server that still holds its macOS grants, and starting it beats
+    /// replacing it with a new build that holds none. The refusal has already been reported.
+    Kept(PathBuf),
 }
 
 impl PinOutcome {
@@ -1275,9 +1284,95 @@ impl PinOutcome {
         match self {
             PinOutcome::Installed(path)
             | PinOutcome::Refreshed(path)
-            | PinOutcome::UpToDate(path) => path,
+            | PinOutcome::UpToDate(path)
+            | PinOutcome::Signed(path)
+            | PinOutcome::Kept(path) => path,
         }
     }
+}
+
+/// What the pin's one writer decided to do about a pin it was about to overwrite.
+///
+/// Gated with the writer: `install_pinned_exe` is `cfg(unix)`, and a platform with no pin to write
+/// has nothing to decide.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum PinRefresh {
+    /// Nothing to protect: no signature, or an ad-hoc one that a rebuild voids anyway. The
+    /// ordinary copy proceeds.
+    Copy,
+    /// The signing transaction put this build at the pin's path and signed it. Nothing more to do,
+    /// and nothing to re-stamp - the transaction wrote the stamp itself.
+    Signed,
+    /// The pin carries a signature this run cannot replace, so it was not touched. The reason, for
+    /// the one line that says so.
+    Kept(String),
+}
+
+/// The decision, with the two facts it turns on supplied by the caller.
+///
+/// Pure and injectable so that the rule can be tested where the macOS ladder cannot run: an
+/// anchored pin is never overwritten, a signing run that works owns the refresh, and a signing run
+/// that refuses leaves the pin alone rather than falling through to the copy.
+#[cfg(unix)]
+fn decide_pin_refresh<A, S>(anchored: A, sign: S) -> PinRefresh
+where
+    A: FnOnce() -> bool,
+    S: FnOnce() -> Result<(), String>,
+{
+    if !anchored() {
+        return PinRefresh::Copy;
+    }
+    match sign() {
+        Ok(()) => PinRefresh::Signed,
+        Err(reason) => PinRefresh::Kept(reason),
+    }
+}
+
+/// Pins this process has already refused to refresh, so the refusal is said once.
+#[cfg(unix)]
+static PIN_REFUSALS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Ask the decision, and report a refusal ONCE per pin per process.
+///
+/// Once is the requirement, not a nicety. `zellij session up` asserts the pin and then launches a
+/// client, which resolves the server binary through the pin again - so a machine that cannot sign
+/// reaches this twice in one command. Saying it twice would read as two faults, and asking the
+/// keychain twice would mean two dialogs on a machine that is going to refuse either way.
+#[cfg(unix)]
+fn guard_anchored_pin(source: &Path, target: &Path) -> PinRefresh {
+    if pin_refusal_already_said(target) {
+        return PinRefresh::Kept(String::new());
+    }
+    let decision = decide_pin_refresh(
+        || crate::session_signing::pin_is_anchored(&crate::session_doctor::SystemCommander, target),
+        || crate::session_signing::refresh_pin_through_signing(source, target),
+    );
+    if let PinRefresh::Kept(reason) = &decision {
+        if let Ok(mut said) = PIN_REFUSALS.lock() {
+            said.push(target.to_path_buf());
+        }
+        say_the_pin_was_not_refreshed(reason);
+    }
+    decision
+}
+
+#[cfg(unix)]
+fn pin_refusal_already_said(target: &Path) -> bool {
+    PIN_REFUSALS
+        .lock()
+        .map(|said| said.iter().any(|pin| pin == target))
+        .unwrap_or(false)
+}
+
+/// The one line a machine that cannot sign is told, and the only place it is written.
+#[cfg(unix)]
+fn say_the_pin_was_not_refreshed(reason: &str) {
+    eprintln!("warning: the pin was NOT refreshed: {}", reason);
+    eprintln!("         the previously signed copy is still in place, on the previous build,");
+    eprintln!("         and that is the build this session starts. Every grant it holds is");
+    eprintln!("         intact. Run `zellij session doctor --fix` from a desktop terminal to");
+    eprintln!("         finish the upgrade.");
 }
 
 /// Put this build at `target`, if it is not there already.
@@ -1319,6 +1414,16 @@ impl PinOutcome {
 /// over itself AND rewrites the stamp to the signed copy's own hash. The next zellij run off
 /// `PATH` then reads its unchanged package binary as stale and copies it over the signature,
 /// taking every macOS grant with it. Nothing upstream of here can tell the two paths apart.
+///
+/// **THE ONE WRITER, and it never replaces an anchored signature without signing.** Every path
+/// that puts a build at the pin comes through here - `session up`, `session enable`, doctor's
+/// `--fix`, and `server_exe_for_interactive_launch` on every interactive launch - and the last of
+/// those is why the rule lives here rather than in a caller. It was added to ONE caller first,
+/// and the caller that had not been told copied an unsigned build over an Apple Development
+/// signature on the very next launch, while the other caller's refusal was still on the screen. A
+/// rule a caller can be written without is a rule that will be written without. So: an existing
+/// pin that carries an anchored signature is refreshed through the signing transaction or not at
+/// all, and a caller cannot ask for anything else, because there is no parameter to ask with.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
     if is_the_same_file(source, target) {
@@ -1336,6 +1441,17 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let refreshing = target.exists();
+    // THE guard, and it is here because here is the only place the pin is written. A pin that
+    // holds an anchored signature holds macOS grants with it, and a plain copy over it destroys
+    // both - so from this point the copy runs only once something has said there is nothing to
+    // lose. See `guard_anchored_pin`.
+    if refreshing {
+        match guard_anchored_pin(source, target) {
+            PinRefresh::Copy => {},
+            PinRefresh::Signed => return Ok(PinOutcome::Signed(target.to_path_buf())),
+            PinRefresh::Kept(_) => return Ok(PinOutcome::Kept(target.to_path_buf())),
+        }
+    }
     let directory = pin_directory(target);
     std::fs::create_dir_all(&directory).map_err(|e| pin_write_error(&directory, &e))?;
     let mut input = std::fs::File::open(source)
@@ -2163,6 +2279,55 @@ pub fn probe_protected_locations_now() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pin with nothing to protect is copied over, exactly as it always was. Ad-hoc and unsigned
+    /// pins land here: a rebuild voids what they carry anyway, so refusing to refresh one would
+    /// strand the machine on an old build to protect nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_pin_that_is_not_anchored_is_copied_over() {
+        let decision = decide_pin_refresh(
+            || false,
+            || panic!("the signing transaction was run for a pin with no signature to lose"),
+        );
+        assert_eq!(decision, PinRefresh::Copy);
+    }
+
+    /// An anchored pin is only ever replaced by the transaction that signs it, so a run that CAN
+    /// sign hands the whole refresh over - copy, sign and rename are one step, and nothing after
+    /// this writes the pin again.
+    #[cfg(unix)]
+    #[test]
+    fn an_anchored_pin_is_refreshed_through_the_signing_transaction() {
+        let decision = decide_pin_refresh(|| true, || Ok(()));
+        assert_eq!(decision, PinRefresh::Signed);
+    }
+
+    /// The case the guard exists for. A locked keychain refuses the key, and the answer is to
+    /// leave the signed pin exactly where it is and say so - NOT to fall through to the plain
+    /// copy, which is what voided an Apple Development signature on a real machine.
+    #[cfg(unix)]
+    #[test]
+    fn an_anchored_pin_that_cannot_be_signed_is_left_alone() {
+        let decision = decide_pin_refresh(|| true, || Err("the keychain is locked".to_owned()));
+        assert_eq!(
+            decision,
+            PinRefresh::Kept("the keychain is locked".to_owned())
+        );
+    }
+
+    /// A refusal is reported once per pin per process. `session up` asserts the pin and then
+    /// launches a client that resolves the server binary through the pin again, so the same
+    /// refusal is reached twice in one command.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_is_said_once_per_pin() {
+        let pin = PathBuf::from("/nowhere/a-pin-this-test-owns");
+        assert!(!pin_refusal_already_said(&pin));
+        PIN_REFUSALS.lock().unwrap().push(pin.clone());
+        assert!(pin_refusal_already_said(&pin));
+        assert!(!pin_refusal_already_said(Path::new("/nowhere/another-pin")));
+    }
 
     #[test]
     fn parses_a_server_line() {

@@ -196,6 +196,20 @@ pub fn configured_pinned_exe(extras: Option<&SessionServiceOptions>) -> Option<P
 /// that could not be brought up to date. That last one matters more than it looks - a pinned copy
 /// of a different build is a server that would not speak to its client, so the fallback is not a
 /// nicety, it is the only correct answer.
+///
+/// **The refresh is [`install_pinned_exe`](crate::session_lifecycle::install_pinned_exe)'s to
+/// decide, not this function's, and that is the whole point.** This is the second caller of the
+/// pin's writer, and it is the one that was forgotten when the "do not copy over a signature" rule
+/// was written into the OTHER caller: an interactive launch then replaced an Apple Development
+/// signature with an ad-hoc copy on the next keystroke, while the first caller's refusal was still
+/// on the screen. The rule now lives at the write, so this reads as an ordinary copy and cannot
+/// get it wrong.
+///
+/// One case is deliberate and worth naming: when the writer keeps a signed pin it could not
+/// refresh, the path returned holds the PREVIOUS build. This starts the older server on purpose -
+/// it keeps its macOS grants, and the socket is scoped by contract version rather than by version
+/// string, so a client one build ahead still speaks to it. A new build with no grants would be a
+/// session that cannot read the user's files until somebody clicks through a dialog.
 #[cfg(unix)]
 pub fn server_exe_for_interactive_launch(
     extras: Option<&SessionServiceOptions>,
