@@ -22,6 +22,7 @@ mod logging_pipe;
 mod mobile_web;
 pub mod nested_guest;
 mod pane_groups;
+pub mod pane_privacy;
 mod plugins;
 mod pty;
 mod pty_writer;
@@ -934,6 +935,25 @@ pub(crate) fn snapshot_settings() -> SnapshotSettings {
         .unwrap_or_else(SnapshotSettings::default)
 }
 
+/// The pane privacy policy this session answers with, compiled once when the first client
+/// connected and the config file was read.
+///
+/// A `OnceLock` rather than a field on the session, because `route.rs` is handed no configuration
+/// and threading one through every call site would put the decision in more than one place. The
+/// filter has exactly one evaluation point and this is how it stays that way.
+static PANE_PRIVACY: std::sync::OnceLock<pane_privacy::PanePrivacy> = std::sync::OnceLock::new();
+
+/// The policy, or `Off` before the config has been read.
+///
+/// `Off` is right for that window rather than fail-closed: nothing has been listed yet because no
+/// client has connected, and the first thing that happens after a client connects is that the real
+/// policy is set.
+static PANE_PRIVACY_OFF: pane_privacy::PanePrivacy = pane_privacy::PanePrivacy::Off;
+
+pub(crate) fn pane_privacy_policy() -> &'static pane_privacy::PanePrivacy {
+    PANE_PRIVACY.get().unwrap_or(&PANE_PRIVACY_OFF)
+}
+
 /// Archive any `session_info` folder left behind by a server that is no longer running.
 ///
 /// This is the SIGKILL and crash path: the periodic serializer's file survives, so it is promoted
@@ -1175,6 +1195,17 @@ pub fn start_server_impl(
                 let _ = SNAPSHOT_SETTINGS.set(SnapshotSettings::from_options(Some(
                     &runtime_config_options,
                 )));
+                // the policy is compiled once, here, and answered from `route.rs` for the life of
+                // the session. A second copy of the rule is a second chance to disagree with the
+                // first, and the way it would disagree is by showing a pane the other one hides
+                let pane_privacy = pane_privacy::PanePrivacy::from_options(&runtime_config_options);
+                if let Some(reason) = pane_privacy.broken_reason() {
+                    log::error!(
+                        "pane privacy policy is broken, so this session withholds every pane: {}",
+                        reason
+                    );
+                }
+                let _ = PANE_PRIVACY.set(pane_privacy);
                 promote_orphaned_session_info_folders(&session_name, &snapshot_settings());
 
                 set_terminal_title_format(TerminalTitleFormat::from_options(

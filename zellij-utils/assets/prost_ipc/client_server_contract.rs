@@ -766,6 +766,9 @@ pub struct ListPanesAction {
     pub show_all: bool,
     #[prost(bool, tag="6")]
     pub output_json: bool,
+    /// a new tag, so an older peer defaults it to false and answers with the bare array it always did
+    #[prost(bool, tag="7")]
+    pub report_withheld: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
