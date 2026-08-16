@@ -6133,6 +6133,7 @@ Config {
         session_aliases: None,
         session_restart_drop_env: None,
         session_service: None,
+        pane_privacy: None,
         resurrect_command_hints: None,
         report_pane_env: None,
         detect_agents: None,

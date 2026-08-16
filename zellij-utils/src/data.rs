@@ -2615,6 +2615,18 @@ pub struct PaneListEntry {
 
 pub type ListPanesResponse = Vec<PaneListEntry>;
 
+/// `list-panes --json --report-withheld`: the rows, and how many rows are not there.
+///
+/// The bare array stays the default answer because three parsers already read it. This envelope is
+/// what a caller asks for when it needs to tell a partial view from a complete one - which an agent
+/// does, and a person reading a table does not.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ListPanesEnvelope {
+    pub panes: Vec<PaneListEntry>,
+    /// Panes a pane privacy policy withheld. `0` when no policy is configured.
+    pub withheld: usize,
+}
+
 /// One pane that is running a coding agent: `zellij action list-agents`.
 ///
 /// A projection of [`PaneListEntry`] rather than a second walk of the session - the same pane
@@ -2649,6 +2661,16 @@ pub struct AgentListEntry {
 }
 
 pub type ListAgentsResponse = Vec<AgentListEntry>;
+
+/// `list-agents --json --report-withheld`: the agents, and how many PANES were withheld.
+///
+/// The count is of panes rather than of agents on purpose. A withheld pane is never looked at, so
+/// whether it was running an agent is not known here and guessing would be the leak.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ListAgentsEnvelope {
+    pub agents: Vec<AgentListEntry>,
+    pub withheld: usize,
+}
 pub type ListTabsResponse = Vec<TabInfo>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

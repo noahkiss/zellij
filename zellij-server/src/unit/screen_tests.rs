@@ -1083,16 +1083,32 @@ fn a_handle_no_pane_answers_to_resolves_to_nothing() {
 }
 
 #[test]
-fn an_id_target_needs_no_lookup() {
-    // "does this id name a live pane" is a different question, answered by the command that acts
+fn an_id_no_pane_answers_to_resolves_to_nothing_either() {
+    // an id used to be handed straight back without asking whether a pane held it. `wait` is the
+    // one caller that asks the server about an id form, and it then polled a list the pane was not
+    // in and read that as an exit - `waited_ms: 0` for a pane that never existed
     let size = Size {
         cols: 121,
         rows: 20,
     };
-    let screen = create_new_screen(size, true, true);
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    let live = pane_identities(&screen)
+        .first()
+        .map(|(_, _, id)| *id)
+        .expect("expected a pane in the new tab");
     assert_eq!(
-        screen.resolve_pane_target(&PaneTarget::Id(ZellijUtilsPaneId::Terminal(9))),
-        Some(PaneId::Terminal(9))
+        screen.resolve_pane_target(&PaneTarget::Id(ZellijUtilsPaneId::Terminal(live))),
+        Some(PaneId::Terminal(live))
+    );
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Id(ZellijUtilsPaneId::Terminal(9999))),
+        None
+    );
+    assert_eq!(
+        screen.resolve_pane_target(&PaneTarget::Id(ZellijUtilsPaneId::Plugin(9999))),
+        None
     );
 }
 

@@ -470,6 +470,7 @@ fn test_client_messages() {
                 detect_agents: None,
                 session_up_resume: None,
                 session_service: None,
+                pane_privacy: None,
                 resurrect_command_hints: None,
                 default_floating_size: None,
                 simplified_ui: Some(true),

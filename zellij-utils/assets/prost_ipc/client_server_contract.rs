@@ -433,8 +433,6 @@ pub mod action {
         SelectCommandAtScrollPosition(super::SelectCommandAtScrollPositionAction),
         #[prost(message, tag="151")]
         CopyLastCommandOutput(super::CopyLastCommandOutputAction),
-        #[prost(message, tag="172")]
-        MoveTabToIndex(super::MoveTabToIndexAction),
         /// fork additions start at 160, leaving room below for upstream
         #[prost(message, tag="160")]
         SignalPane(super::SignalPaneAction),
@@ -460,6 +458,8 @@ pub mod action {
         SetPaneNote(super::SetPaneNoteAction),
         #[prost(message, tag="171")]
         ListEvents(super::ListEventsAction),
+        #[prost(message, tag="172")]
+        MoveTabToIndex(super::MoveTabToIndexAction),
     }
 }
 // Action message definitions (all 92 variants)
@@ -790,6 +790,9 @@ pub struct ListPanesAction {
     pub show_all: bool,
     #[prost(bool, tag="6")]
     pub output_json: bool,
+    /// a new tag, so an older peer defaults it to false and answers with the bare array it always did
+    #[prost(bool, tag="7")]
+    pub report_withheld: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

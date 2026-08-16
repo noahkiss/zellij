@@ -5935,7 +5935,21 @@ impl Screen {
     /// naming one should reach it rather than silently miss.
     pub fn resolve_pane_target(&self, target: &PaneTarget) -> Option<PaneId> {
         let matches: Box<dyn Fn(&PaneInfo) -> bool> = match target {
-            PaneTarget::Id(pane_id) => return Some((*pane_id).into()),
+            // an id nothing answers to is a miss like a handle nothing holds. It used to be handed
+            // straight back, and `wait` - the one caller that asks the server about an id form -
+            // then polled a list the pane was not in and read that as an exit: `waited_ms: 0` and
+            // `exit_status: -` for a pane that never existed. The pane list is what `wait` polls,
+            // so resolving against it is the same question asked once instead of forever
+            PaneTarget::Id(pane_id) => {
+                let wanted: PaneId = (*pane_id).into();
+                let (is_plugin, id) = match wanted {
+                    PaneId::Plugin(id) => (true, id),
+                    PaneId::Terminal(id) => (false, id),
+                };
+                Box::new(move |pane_info: &PaneInfo| {
+                    pane_info.is_plugin == is_plugin && pane_info.id == id
+                })
+            },
             PaneTarget::Handle(handle) => {
                 let handle = handle.clone();
                 Box::new(move |pane_info| pane_info.handle == handle)
