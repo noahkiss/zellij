@@ -506,18 +506,185 @@ pub fn refresh_belongs_to_signing(
         return None;
     }
     let current_exe = current_exe?;
-    let described = commander
-        .run(
-            "codesign",
-            &["-d", "--verbose=2", "-r-", &pinned.display().to_string()],
-            None,
-        )
-        .ok()?;
+    pin_is_anchored(commander, pinned).then_some(current_exe)
+}
+
+/// Whether the pin carries an ANCHORED signature: one whose designated requirement names a
+/// certificate rather than the pin's own code hash, and therefore one a macOS grant survives a
+/// rebuild through.
+///
+/// **One predicate, asked by both sides of the pin.** The step that decides whose refresh it is
+/// asks it, and so does [`install_pinned_exe`](crate::session_lifecycle::install_pinned_exe),
+/// which must never copy over an answer of `true`. Two questions phrased two ways would eventually
+/// give two answers, and the disagreement would be a destroyed signature.
+///
+/// `false` for an ad-hoc or unsigned pin - neither holds a grant a rebuild could take away - and
+/// `false` wherever `codesign` cannot be run at all, which is every platform but macOS.
+pub fn pin_is_anchored(commander: &dyn Commander, pinned: &Path) -> bool {
+    let Ok(described) = commander.run(
+        "codesign",
+        &["-d", "--verbose=2", "-r-", &pinned.display().to_string()],
+        None,
+    ) else {
+        return false;
+    };
     matches!(
         read_signature(&described.combined()),
         PinSignature::Anchored { .. }
     )
-    .then_some(current_exe)
+}
+
+/// What this run may do to a signature, and where it keeps the certificate.
+///
+/// Two facts the pin's writer cannot be handed by its callers. `install_pinned_exe` is reached
+/// from a client launch, from `session up` and from doctor, and only the last of those has ever
+/// seen a `--no-sign` flag or a `--config-dir`; adding parameters to the sink would put the
+/// decision back in the hands of the callers, which is the fault this whole path exists to close.
+/// So the run states its policy once, and the sink reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinSigningPolicy {
+    /// `false` only for `zellij session doctor --no-sign`. The sink then leaves an anchored pin
+    /// alone rather than signing over it - refusing to act is what `--no-sign` asks for, and
+    /// copying the new build over the signature is not the other option, it is the fault.
+    pub allowed: bool,
+    /// Where a second copy of the signing certificate is kept, which is the config directory this
+    /// run resolved. Doctor and `session up` pass the one they were given, so both flows put the
+    /// backup in the same place.
+    pub backup_dir: Option<PathBuf>,
+}
+
+impl Default for PinSigningPolicy {
+    fn default() -> Self {
+        PinSigningPolicy {
+            allowed: true,
+            backup_dir: crate::home::find_default_config_dir(),
+        }
+    }
+}
+
+static PIN_SIGNING_POLICY: std::sync::Mutex<Option<PinSigningPolicy>> = std::sync::Mutex::new(None);
+
+/// State what this run may do to a signature, before anything can write the pin.
+pub fn set_pin_signing_policy(policy: PinSigningPolicy) {
+    if let Ok(mut held) = PIN_SIGNING_POLICY.lock() {
+        *held = Some(policy);
+    }
+}
+
+/// The policy this run set, or the ordinary one: signing allowed, certificate backed up beside the
+/// config. A process that never states a policy is a plain `zellij` launch, and that is exactly
+/// the caller that must keep signing the pin.
+pub fn pin_signing_policy() -> PinSigningPolicy {
+    PIN_SIGNING_POLICY
+        .lock()
+        .ok()
+        .and_then(|held| held.clone())
+        .unwrap_or_default()
+}
+
+/// The three paths [`sign_pin`] cannot work out for itself: where our own certificate is kept,
+/// which keychain to put it in, and where to leave a second copy of it.
+///
+/// Built here rather than at each call site so that every door into the transaction reaches for the
+/// same identity in the same keychain - two flows reaching for two identities would be two
+/// signatures, and the second would void the grants the first earned.
+pub fn signing_context(
+    commander: &dyn Commander,
+    config_dir: Option<PathBuf>,
+    refresh_from: Option<PathBuf>,
+) -> Option<SigningContext> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(SigningContext {
+        signing_dir: SigningDir::new(home.join("Library/Application Support/zellij/signing")),
+        keychain: default_keychain(commander),
+        // an environment variable holding a password is not a thing to want; it is the only way a
+        // run over SSH can answer the keychain's dialog, and a run that cannot answer it hangs
+        keychain_password: std::env::var("ZELLIJ_KEYCHAIN_PASSWORD").ok(),
+        refresh_from,
+        backup_dir: config_dir,
+    })
+}
+
+/// What a run with no `HOME` is told, wherever it is asked to sign.
+pub const NO_HOME: &str = "no HOME, so there is nowhere to keep a signing certificate";
+
+/// The keychain `codesign` will look in.
+///
+/// Asked rather than assumed: `login.keychain-db` is the answer on almost every machine and not on
+/// all of them, and importing into a keychain nothing searches is an import that reports success
+/// and leaves nothing able to sign.
+fn default_keychain(commander: &dyn Commander) -> String {
+    commander
+        .run("security", &["default-keychain", "-d", "user"], None)
+        .ok()
+        .map(|output| output.stdout.trim().trim_matches('"').to_owned())
+        .filter(|keychain| !keychain.is_empty())
+        .unwrap_or_else(|| String::from("login.keychain-db"))
+}
+
+/// Put `source` at the pin's path AND sign it, as one transaction.
+///
+/// The only way an anchored pin is ever replaced. `codesign` writes into a temp beside the pin,
+/// the temp is verified twice, and only then is it `rename(2)`d over the pin - so a run that
+/// cannot sign leaves the previous signed pin exactly where it was, on the previous build, with
+/// every grant it holds intact. That is worth more than the new build: an older server that can
+/// still read the user's files beats a newer one whose Full Disk Access can only be given back
+/// through a GUI dialog at the machine.
+///
+/// `Err` is the refusal reason, quoted from the rung the ladder stopped on.
+///
+/// Gated with the pin itself: `install_pinned_exe` and `pin_needs_refresh` are `cfg(unix)`, and a
+/// platform with no pinned copy has no signature on it to protect.
+#[cfg(unix)]
+pub fn refresh_pin_through_signing(source: &Path, pinned: &Path) -> Result<(), String> {
+    let policy = pin_signing_policy();
+    if !policy.allowed {
+        return Err("this run was told not to sign (`--no-sign`)".to_owned());
+    }
+    let mode = DoctorMode {
+        fix: true,
+        sign: true,
+        dry_run: false,
+    };
+    let commander = crate::session_doctor::SystemCommander;
+    // no HOME and a signed pin to protect: refusing is the answer, because falling through to the
+    // plain copy is exactly the fault this exists to stop
+    let Some(context) = signing_context(
+        &commander,
+        policy.backup_dir.clone(),
+        Some(source.to_path_buf()),
+    ) else {
+        return Err(NO_HOME.to_owned());
+    };
+    let run = sign_pin(&commander, pinned, mode, &context);
+    // asked of the disk rather than read out of the findings: what matters is whether the new
+    // build is at the path, and that is a fact the transaction leaves behind either way
+    if crate::session_lifecycle::pin_needs_refresh(source, pinned) {
+        Err(refusal_from(&run.findings))
+    } else {
+        Ok(())
+    }
+}
+
+/// The reason the signing transaction gave, in one line.
+///
+/// The first finding that is not "already correct", message and notes joined - the ladder reports
+/// the rung it stopped on, and quoting it beats inventing a summary that will not match what
+/// `zellij session doctor` says a moment later.
+pub fn refusal_from(findings: &[Finding]) -> String {
+    findings
+        .iter()
+        .find(|finding| finding.status == crate::session_doctor::Status::NeedsYou)
+        .or_else(|| findings.last())
+        .map(|finding| {
+            let mut said = finding.message.clone();
+            for note in &finding.notes {
+                said.push_str("; ");
+                said.push_str(note.trim());
+            }
+            said
+        })
+        .unwrap_or_else(|| "the signing step said nothing".to_owned())
 }
 
 /// What one pass over the pinned copy's signature came to.
@@ -3768,5 +3935,32 @@ Signature=adhoc
         );
         assert!(young.exists(), "a temp younger than the gate was taken");
         assert!(pin_temp.exists(), "the pin's own temp was taken");
+    }
+
+    /// The line `session up` prints when the transaction refused has to be the transaction's own
+    /// reason. A summary written here would drift from what `session doctor` says a minute later,
+    /// and the two disagreeing is worse than either being terse.
+    #[test]
+    fn a_refusal_quotes_the_rung_the_ladder_stopped_on() {
+        let findings = vec![
+            Finding::ok("signing", "the certificate is in the keychain"),
+            Finding::needs_you("signing", "the keychain would not release the key")
+                .note("the pin was NOT refreshed: the new build could not be signed, so the")
+                .note("previously signed copy is still in place, on the previous build"),
+        ];
+        let said = refusal_from(&findings);
+        assert!(said.starts_with("the keychain would not release the key"));
+        assert!(said.contains("the pin was NOT refreshed"));
+    }
+
+    /// A run where nothing needed a person still has to say something: the caller only reaches
+    /// this when the pin did not move, so silence there would be a warning with no reason in it.
+    #[test]
+    fn a_refusal_with_nothing_needing_a_person_still_says_something() {
+        assert_eq!(
+            refusal_from(&[Finding::ok("signing", "left alone")]),
+            "left alone"
+        );
+        assert_eq!(refusal_from(&[]), "the signing step said nothing");
     }
 }
