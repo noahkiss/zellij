@@ -31,9 +31,7 @@ use zellij_utils::{
         command::TerminalAction,
     },
     ipc::{ClientToServerMsg, ExitReason, IpcReceiverWithContext, IpcRecvError, ServerToClientMsg},
-    pane_privacy::{
-        WITHHELD_CWD_MESSAGE, WITHHELD_LAYOUT_MESSAGE, WITHHELD_PANE_MESSAGE, WITHHELD_TAB_MESSAGE,
-    },
+    pane_privacy::WITHHELD_LAYOUT_MESSAGE,
 };
 
 use crate::ClientId;
@@ -262,7 +260,7 @@ fn new_pane_routing(
 }
 
 pub(crate) fn route_action(
-    action: Action,
+    mut action: Action,
     client_id: ClientId,
     cli_client_id: Option<ClientId>,
     pane_id: Option<PaneId>,
@@ -302,10 +300,17 @@ pub(crate) fn route_action(
 
     // The pane privacy filter, at its one evaluation point. Every CLI verb arrives here, so a
     // refusal here is a refusal on every path - the MCP server included, because it runs the CLI.
-    // A refusal says only that the call was refused: naming the pattern, the directory or even
-    // whether the target exists would hand back the thing being withheld.
+    //
+    // A refusal is the answer the same command gives when the target is not there, to the byte. A
+    // withheld directory is dropped from the request rather than refused, because a directory that
+    // does not exist is dropped too. Saying "withheld" instead would turn every one of these into
+    // a yes/no oracle on an arbitrary string, and a loop over that oracle recovers the pattern
+    // list itself.
+    strip_withheld_cwds(&mut action);
     if let Some(refusal) = pane_privacy_refusal(&action, &senders) {
-        send_error_to_client(cli_client_id, os_input.as_ref(), &refusal);
+        if let PrivacyRefusal::Miss(message) = refusal {
+            send_error_to_client(cli_client_id, os_input.as_ref(), &message);
+        }
         return Ok((should_break, None));
     }
 
@@ -1826,12 +1831,14 @@ pub(crate) fn route_action(
                         let pane_id: ZellijUtilsPaneId = pane_id.into();
                         // every `--pane-id` verb resolves its target here before it acts, `wait`
                         // included - so this one refusal is what keeps a wait on a withheld pane
-                        // from polling a list the pane is not in and calling that an exit
+                        // from polling a list the pane is not in and calling that an exit. The
+                        // refusal is the miss sentence, spelled with the caller's own target, so
+                        // a withheld pane and a pane that was never there answer the same way
                         if withholds_pane(&senders, pane_id) {
                             send_error_to_client(
                                 cli_client_id,
                                 os_input.as_ref(),
-                                WITHHELD_PANE_MESSAGE,
+                                &format!("No pane answers to '{}'", target),
                             );
                         } else {
                             send_output_to_client(
@@ -2573,22 +2580,136 @@ fn ring_verb(action_name: &str) -> String {
 /// Not every action is in here. One that names nothing - and one whose target is spelled in a way
 /// nobody has needed the ring to read yet - records a `-`, which is honest: the ring says what was
 /// touched when that is known and does not invent it when it is not.
+/// How a privacy refusal answers: exactly as the action answers when its target is not there.
+///
+/// Most actions report a miss with a sentence and exit 2. `rename-tab` by position reports one by
+/// doing nothing at all, so a refusal there has to do nothing at all too - a sentence where the
+/// ordinary miss is silent is as good a tell as the word "withheld".
+enum PrivacyRefusal {
+    Miss(String),
+    Silent,
+}
+
+/// How this action answers a pane target no live pane holds.
+///
+/// `Screen` spells it two ways and stays silent for a third, so a refusal has to be whichever one
+/// this action would itself have given. The common one is the debug-formatted id; the handful that
+/// answer in the resolver's sentence are listed, and they are the ones a person types most.
+///
+/// The `No pane answers to` form prints `screen.pane_summary`, which is the id followed by the
+/// handle - but only for a pane that is there. For one that is not, it is the bare id, and that is
+/// the form a refusal has to use whether or not the withheld pane holds a handle.
+fn pane_miss_refusal(action: &Action, pane_id: ZellijUtilsPaneId) -> PrivacyRefusal {
+    use Action::*;
+    match action {
+        // `set-pane-borderless` on a pane that is not there says nothing and exits 0
+        SetPaneBorderless { .. } => PrivacyRefusal::Silent,
+        DumpScreen { .. }
+        | FocusPaneByPaneId { .. }
+        | FocusTerminalPaneWithId { .. }
+        | FocusPluginPaneWithId { .. }
+        | TogglePaneBorderless { .. }
+        | EditScrollbackByPaneId { .. }
+        | CloseFocusByPaneId { .. }
+        | SetPaneHandle { .. } => {
+            let printed_id = match pane_id {
+                ZellijUtilsPaneId::Terminal(id) => format!("terminal_{}", id),
+                ZellijUtilsPaneId::Plugin(id) => format!("plugin_{}", id),
+            };
+            PrivacyRefusal::Miss(format!("No pane answers to '{}'", printed_id))
+        },
+        _ => {
+            let debug_id = match pane_id {
+                ZellijUtilsPaneId::Terminal(id) => format!("Terminal({})", id),
+                ZellijUtilsPaneId::Plugin(id) => format!("Plugin({})", id),
+            };
+            PrivacyRefusal::Miss(format!("Pane with id {} not found", debug_id))
+        },
+    }
+}
+
+/// How this action answers a tab target no tab holds.
+///
+/// There is no one sentence: `Screen` spells the miss three ways and stays silent for a fourth,
+/// and a refusal has to be whichever one this action would have given. Any action not listed here
+/// reached the guard through a tab target the filter does not raise.
+fn tab_miss_refusal(action: &Action, tab_target: usize) -> PrivacyRefusal {
+    use Action::*;
+    match action {
+        // a position, not an id, and printed as the caller typed it
+        GoToTab { index } => PrivacyRefusal::Miss(format!("No tab at position {}", index)),
+        // the rename that takes a position answers a miss by logging and moving on
+        RenameTab { .. } => PrivacyRefusal::Silent,
+        BreakPanesToTabWithId { .. } | MoveTabToIndex { .. } => {
+            PrivacyRefusal::Miss(format!("Tab with id {} not found", tab_target))
+        },
+        _ => PrivacyRefusal::Miss(format!("No tab with id {}", tab_target)),
+    }
+}
+
+/// Drops the directories the policy withholds out of the request, leaving the rest of it alone.
+///
+/// Not a refusal, because refusing would answer a question about the policy. zellij already
+/// ignores a `--cwd` it cannot use: a directory that does not exist costs the caller nothing, the
+/// pane is made anyway, and `list-panes` reports it in the server's own cwd. A withheld directory
+/// is treated as exactly that kind of directory, so `--cwd` is a yes/no oracle on no string at all.
+fn strip_withheld_cwds(action: &mut Action) {
+    let policy = pane_privacy_policy();
+    if !policy.is_active() {
+        return;
+    }
+    strip_cwds_matching(action, &|cwd| policy.withholds_cwd(cwd));
+}
+
+/// The half of [`strip_withheld_cwds`] that knows which fields carry a directory.
+///
+/// Split out from the policy lookup so a test can say which directories are withheld without a
+/// session behind it: the global policy is set once per server process and never in a test.
+fn strip_cwds_matching(action: &mut Action, withholds: &dyn Fn(&std::path::Path) -> bool) {
+    use Action::*;
+    let strip = |cwd: &mut Option<std::path::PathBuf>| {
+        if cwd.as_ref().is_some_and(|cwd| withholds(cwd)) {
+            *cwd = None;
+        }
+    };
+    let strip_command = |command: &mut Option<zellij_utils::input::command::RunCommandAction>| {
+        if let Some(command) = command.as_mut() {
+            strip(&mut command.cwd);
+        }
+    };
+    match action {
+        NewFloatingPane { command, .. }
+        | NewTiledPane { command, .. }
+        | NewInPlacePane { command, .. }
+        | NewStackedPane { command, .. }
+        | NewBlockingPane { command, .. } => strip_command(command),
+        Run { command, .. } => strip(&mut command.cwd),
+        NewTab {
+            cwd, initial_panes, ..
+        } => {
+            strip(cwd);
+            if let Some(initial_panes) = initial_panes {
+                for pane in initial_panes.iter_mut() {
+                    if let CommandOrPlugin::Command(run_command) = pane {
+                        strip(&mut run_command.cwd);
+                    }
+                }
+            }
+        },
+        SwitchSession { cwd, .. } => strip(cwd),
+        _ => {},
+    }
+}
+
 /// Why this action is refused by the pane privacy filter, if it is.
 ///
-/// Two questions, in the order that costs least. A requested directory is a string the caller
-/// supplied and needs no lookup. A pane or a tab target needs the pane list, which is one round
-/// trip to `Screen` - paid only when a policy is active AND the action names something.
-fn pane_privacy_refusal(action: &Action, senders: &ThreadSenders) -> Option<String> {
+/// A pane or a tab target needs the pane list, which is one round trip to `Screen` - paid only
+/// when a policy is active AND the action names something. The requested directories were dealt
+/// with before this, by [`strip_withheld_cwds`], and are not a refusal at all.
+fn pane_privacy_refusal(action: &Action, senders: &ThreadSenders) -> Option<PrivacyRefusal> {
     let policy = pane_privacy_policy();
     if !policy.is_active() {
         return None;
-    }
-    // without this an agent that cannot see a private pane opens its own shell in the private
-    // directory and reads it there instead
-    for cwd in requested_cwds(action) {
-        if policy.withholds_cwd(&cwd) {
-            return Some(WITHHELD_CWD_MESSAGE.to_owned());
-        }
     }
     let (pane_target, tab_target) = privacy_target_of(action);
     if pane_target.is_none() && tab_target.is_none() {
@@ -2602,7 +2723,7 @@ fn pane_privacy_refusal(action: &Action, senders: &ThreadSenders) -> Option<Stri
             ZellijUtilsPaneId::Plugin(id) => (true, id),
         };
         if verdicts.withholds_pane(is_plugin, id) {
-            return Some(WITHHELD_PANE_MESSAGE.to_owned());
+            return Some(pane_miss_refusal(action, pane_id));
         }
     }
     if let Some(tab_target) = tab_target {
@@ -2614,7 +2735,7 @@ fn pane_privacy_refusal(action: &Action, senders: &ThreadSenders) -> Option<Stri
                 && verdicts.withholds_tab(entry.tab_id)
         });
         if matches_target {
-            return Some(WITHHELD_TAB_MESSAGE.to_owned());
+            return Some(tab_miss_refusal(action, tab_target));
         }
     }
     None
@@ -2638,6 +2759,14 @@ fn privacy_target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usiz
         ClosePluginPane { pane_id }
         | FocusPluginPaneWithId { pane_id, .. }
         | RenamePluginPane { pane_id, .. } => (Some(ZellijUtilsPaneId::Plugin(*pane_id)), None),
+        // `go-to-tab-id` reaches a tab by the one number `list-tabs` no longer prints for a
+        // withheld tab. Left out, it answers a caller that guesses the number, which is the same
+        // probe by another verb
+        GoToTabById { id } => (None, Some(*id as usize)),
+        // `go-to-tab` counts display positions from 1, and every other tab target here is a
+        // 0-based id or position. Taken raw it compares 1 against position 0 and lets the caller
+        // straight into the first withheld tab
+        GoToTab { index } => (None, Some(index.saturating_sub(1) as usize)),
         SwitchSession { pane_id, .. } => (
             pane_id.map(|(id, is_plugin)| {
                 if is_plugin {
@@ -2690,52 +2819,6 @@ fn withhold_tabs(senders: &ThreadSenders, tab_infos: Vec<TabInfo>) -> Vec<TabInf
         .into_iter()
         .filter(|tab| !withheld_positions.contains(&tab.position))
         .collect()
-}
-
-/// The directories an action asks a new pane, tab or command to start in.
-fn requested_cwds(action: &Action) -> Vec<std::path::PathBuf> {
-    use Action::*;
-    let mut cwds = Vec::new();
-    let mut push_command = |command: &Option<zellij_utils::input::command::RunCommandAction>| {
-        if let Some(cwd) = command.as_ref().and_then(|command| command.cwd.clone()) {
-            cwds.push(cwd);
-        }
-    };
-    match action {
-        NewFloatingPane { command, .. }
-        | NewTiledPane { command, .. }
-        | NewInPlacePane { command, .. }
-        | NewStackedPane { command, .. }
-        | NewBlockingPane { command, .. } => push_command(command),
-        Run { command, .. } => {
-            if let Some(cwd) = command.cwd.clone() {
-                cwds.push(cwd);
-            }
-        },
-        NewTab {
-            cwd, initial_panes, ..
-        } => {
-            if let Some(cwd) = cwd.clone() {
-                cwds.push(cwd);
-            }
-            if let Some(initial_panes) = initial_panes {
-                for pane in initial_panes {
-                    if let CommandOrPlugin::Command(run_command) = pane {
-                        if let Some(cwd) = run_command.cwd.clone() {
-                            cwds.push(cwd);
-                        }
-                    }
-                }
-            }
-        },
-        SwitchSession { cwd, .. } => {
-            if let Some(cwd) = cwd.clone() {
-                cwds.push(cwd);
-            }
-        },
-        _ => {},
-    }
-    cwds
 }
 
 fn target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usize>) {
@@ -4355,36 +4438,141 @@ mod tests {
         assert_eq!(privacy_target_of(&Action::ToggleTab), (None, None));
     }
 
-    /// The directories an action asks for, which need no session lookup to judge.
+    /// A withheld directory leaves the request as a request with no directory in it.
+    ///
+    /// That is the whole of the fix for the `--cwd` oracle: the caller gets the answer zellij
+    /// already gives for a directory it cannot use, whatever string was passed.
     #[test]
-    fn requested_cwds_reads_the_directory_off_every_form_that_carries_one() {
+    fn a_withheld_cwd_is_dropped_and_every_other_cwd_is_left_alone() {
         use zellij_utils::input::command::RunCommandAction;
         let command = |cwd: &str| RunCommandAction {
             command: std::path::PathBuf::from("/bin/sh"),
             cwd: Some(std::path::PathBuf::from(cwd)),
             ..Default::default()
         };
+        let withholds = |cwd: &std::path::Path| cwd.starts_with("/invented/private");
+
+        let mut tiled = Action::NewTiledPane {
+            direction: None,
+            command: Some(command("/invented/private/one")),
+            pane_name: None,
+            near_current_pane: false,
+            no_focus: false,
+            borderless: None,
+            tab_id: None,
+        };
+        strip_cwds_matching(&mut tiled, &withholds);
+        match &tiled {
+            Action::NewTiledPane { command, .. } => {
+                assert_eq!(command.as_ref().unwrap().cwd, None);
+            },
+            other => panic!("the action itself changed: {:?}", other),
+        }
+
+        let mut run = Action::Run {
+            command: command("/invented/public/two"),
+            near_current_pane: false,
+            no_focus: false,
+        };
+        strip_cwds_matching(&mut run, &withholds);
+        match &run {
+            Action::Run { command, .. } => assert_eq!(
+                command.cwd,
+                Some(std::path::PathBuf::from("/invented/public/two"))
+            ),
+            other => panic!("the action itself changed: {:?}", other),
+        }
+
+        let mut new_tab = Action::NewTab {
+            tiled_layout: None,
+            floating_layouts: vec![],
+            swap_tiled_layouts: None,
+            swap_floating_layouts: None,
+            tab_name: None,
+            should_change_focus_to_new_tab: true,
+            cwd: Some(std::path::PathBuf::from("/invented/private/three")),
+            initial_panes: None,
+            first_pane_unblock_condition: None,
+        };
+        strip_cwds_matching(&mut new_tab, &withholds);
+        match &new_tab {
+            Action::NewTab { cwd, .. } => assert_eq!(cwd, &None),
+            other => panic!("the action itself changed: {:?}", other),
+        }
+
+        // an action that carries no directory is untouched, policy or none
+        let mut toggle = Action::ToggleTab;
+        strip_cwds_matching(&mut toggle, &withholds);
+        assert_eq!(toggle, Action::ToggleTab);
+    }
+
+    /// A refusal has to be the answer this action gives a target nothing holds, spelling included.
+    #[test]
+    fn a_privacy_refusal_is_spelled_like_the_miss_it_imitates() {
+        let pane_miss = |action: &Action, pane_id| match pane_miss_refusal(action, pane_id) {
+            PrivacyRefusal::Miss(message) => message,
+            PrivacyRefusal::Silent => "<silent>".to_owned(),
+        };
         assert_eq!(
-            requested_cwds(&Action::NewTiledPane {
-                direction: None,
-                command: Some(command("/invented/one")),
-                pane_name: None,
-                near_current_pane: false,
-                no_focus: false,
-                borderless: None,
-                tab_id: None,
-            }),
-            vec![std::path::PathBuf::from("/invented/one")]
+            pane_miss(
+                &Action::DumpScreen {
+                    file_path: None,
+                    include_scrollback: false,
+                    pane_id: Some(ZellijUtilsPaneId::Terminal(7)),
+                    ansi: false,
+                },
+                ZellijUtilsPaneId::Terminal(7)
+            ),
+            "No pane answers to 'terminal_7'"
         );
         assert_eq!(
-            requested_cwds(&Action::Run {
-                command: command("/invented/two"),
-                near_current_pane: false,
-                no_focus: false,
-            }),
-            vec![std::path::PathBuf::from("/invented/two")]
+            pane_miss(
+                &Action::ScrollUpByPaneId {
+                    pane_id: ZellijUtilsPaneId::Terminal(7),
+                },
+                ZellijUtilsPaneId::Terminal(7)
+            ),
+            "Pane with id Terminal(7) not found"
         );
-        assert!(requested_cwds(&Action::ToggleTab).is_empty());
+        assert_eq!(
+            pane_miss(
+                &Action::SetPaneBorderless {
+                    pane_id: ZellijUtilsPaneId::Plugin(2),
+                    borderless: true,
+                },
+                ZellijUtilsPaneId::Plugin(2)
+            ),
+            "<silent>"
+        );
+        let miss = |action: &Action, tab: usize| match tab_miss_refusal(action, tab) {
+            PrivacyRefusal::Miss(message) => message,
+            PrivacyRefusal::Silent => "<silent>".to_owned(),
+        };
+        assert_eq!(
+            miss(&Action::GoToTab { index: 3 }, 3),
+            "No tab at position 3"
+        );
+        assert_eq!(miss(&Action::CloseTabById { id: 4 }, 4), "No tab with id 4");
+        assert_eq!(
+            miss(
+                &Action::MoveTabToIndex {
+                    id: Some(5),
+                    index: 1
+                },
+                5
+            ),
+            "Tab with id 5 not found"
+        );
+        assert_eq!(
+            miss(
+                &Action::RenameTab {
+                    tab_index: 2,
+                    name: vec![],
+                },
+                2
+            ),
+            "<silent>"
+        );
     }
 
     #[test]

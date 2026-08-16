@@ -30,7 +30,6 @@ use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Map, Value};
 use zellij_utils::consts::VERSION;
-use zellij_utils::pane_privacy::WITHHELD_MARKER;
 
 /// What a client is told this server is, before it asks for anything.
 const INSTRUCTIONS: &str = "\
@@ -95,26 +94,18 @@ impl ZellijMcp {
             // exit 2 is the fork's "well-formed request about something that is not there". It is
             // the reason a create tool can be honest: a pane that was not made says so, and there
             // is no id here to invent
-            // a pane privacy policy refuses with exit 2, which is otherwise the fork's "not
-            // there". They are different answers and a caller acts differently on each: a miss is
-            // worth retrying with another target, a refusal never is
-            let withheld = [&outcome.stderr, &outcome.stdout]
-                .iter()
-                .any(|said| said.contains(WITHHELD_MARKER));
+            //
+            // A pane privacy policy has no reason of its own here. It answers as the miss answers,
+            // to the byte, so that a caller cannot tell a withheld pane from one that was never
+            // there - a `withheld` reason would be the oracle the whole filter exists to deny.
+            // `zellij_overview` still carries the aggregate count, which is where a caller learns
+            // that its view is partial.
             structured.insert(
                 "reason".to_owned(),
-                json!(if withheld {
-                    "withheld"
-                } else if outcome.is_miss() {
-                    "miss"
-                } else {
-                    "error"
-                }),
+                json!(if outcome.is_miss() { "miss" } else { "error" }),
             );
             let said = first_words(&outcome.stderr, &outcome.stdout);
-            let message = if withheld {
-                said
-            } else if outcome.is_miss() {
+            let message = if outcome.is_miss() {
                 format!("Nothing matched: {}", said)
             } else {
                 said

@@ -4135,7 +4135,7 @@ It pairs with `session up` resuming by default: the reboot now leaves a current 
 Some work is nobody's business but the person at the terminal's. A session can be told which panes
 those are, and the panes then stop existing as far as the command surface is concerned: their rows
 are gone from `list-panes`, `list-tabs`, `list-tree` and `list-agents`, and any command that names
-one is refused.
+one answers exactly as it answers for a pane that was never there.
 
 ```kdl
 pane_privacy {
@@ -4181,21 +4181,59 @@ time.
 | `list-panes --json` | still a bare array — `--report-withheld` switches it to `{"panes": [...], "withheld": n}` |
 | `list-agents` | the same, over the same walk; `--report-withheld` gives `{"agents": [...], "withheld": n}` |
 | `list-tabs` | withheld tabs dropped |
-| `dump-screen`, `wait`, `send-keys`, `write-chars`, `paste`, `close-pane`, `move-pane`, `stack-panes`, `break-pane`, `rename-pane`, and every other `--pane-id` verb | refused, exit 2 |
-| a verb naming a withheld tab | refused, exit 2 |
-| `new-pane --cwd`, `new-tab --cwd`, `run --cwd` under a matching directory | refused, exit 2 |
+| `dump-screen`, `wait`, `send-keys`, `write-chars`, `paste`, `close-pane`, `move-pane`, `stack-panes`, `break-pane`, `rename-pane`, and every other `--pane-id` verb | `No pane answers to '<target>'`, exit 2 — the unknown-pane answer |
+| a verb naming a withheld tab | that verb's own no-such-tab answer |
+| `new-pane --cwd`, `new-tab --cwd`, `run --cwd` under a matching directory | the directory is dropped and the command succeeds, as it does for a directory that does not exist |
 | `dump-layout`, `snapshot show`, `snapshot restore` | refused whole while any policy is active |
 | `snapshot list`, `ls` | unchanged |
 
-`new-pane --cwd DIR` with **no command** is not refused, and does not need to be: upstream drops
-the directory when there is no command to run in it, so the pane opens in the calling pane's cwd
-rather than in `DIR`. The forms that carry a directory to the server - `new-pane --cwd DIR --
-CMD`, `new-tab --cwd DIR`, `run --cwd DIR -- CMD` - are the ones refused, and are the ones that
-could have opened a shell inside the private tree.
+`new-pane --cwd DIR` with **no command** never reached the server with a directory in the first
+place: upstream drops the directory when there is no command to run in it, so the pane opens in the
+calling pane's cwd. The forms that do carry one — `new-pane --cwd DIR -- CMD`, `new-tab --cwd DIR`,
+`run --cwd DIR -- CMD` — are the ones the policy strips.
 
-A refusal says only that the call was refused. It never names the pattern, the directory, or
-whether the target exists — a refusal that distinguished "withheld" from "no such pane" would be a
-probe.
+**A refusal is the ordinary miss, byte for byte.** That is the guarantee, and it is stronger than
+"the message says nothing": a message that said "withheld" would be a yes/no oracle on whatever
+string the caller chose to pass, and because patterns are unanchored substrings, a loop over that
+oracle recovers the pattern list itself — the one thing the filter exists to hide. So:
+
+- a withheld pane id, handle or uuid gets `No pane answers to '<target>'` and exit 2, the same
+  sentence and the same exit code an id nothing holds gets;
+- a withheld tab gets whichever no-such-tab answer that verb already gives — `No tab with id 3`,
+  `No tab at position 3`, `Tab with id 3 not found`, or, for `rename-tab` by position, the silent
+  no-op that verb answers a miss with;
+- a `--cwd` the policy withholds is **dropped from the request** rather than refused. zellij
+  already ignores a directory it cannot use: a `--cwd` that does not exist makes the pane anyway,
+  in the server's own cwd, and `list-panes` reports it there. A withheld directory is treated as
+  that kind of directory, so the answer does not depend on whether the path matched.
+
+The one thing that still admits a policy is running is the aggregate `withheld: n` count on
+`--report-withheld` and in the MCP's `zellij_overview`. That is deliberate: a caller is entitled to
+know its view is partial. It is a count and never a name, so it says how much is missing and
+nothing about what. `dump-layout`, `snapshot show` and `snapshot restore` keep a plain refusal —
+they are whole documents with no per-target answer to imitate, so there is no oracle to build out
+of them, and their message names no pattern and no path.
+
+Three things the filter does not make indistinguishable, and all three are tab-shaped — the space of
+guesses there is the small integers, `list-tabs` has already said which tabs are missing, and none
+of them leaks a pattern:
+
+- `move-tab --tab-id N --to-index M` reports its ordinary miss with exit 1; the refusal is exit 2.
+- `go-to-tab-id N` **with no client attached** does nothing at all for a tab that is not there, so
+  the refusal speaks where the miss is silent. Attached, the two agree.
+- `go-to-tab-name` is not covered: a caller that guesses the *name* of a withheld tab reaches it.
+
+Each pane verb, by contrast, is matched exactly, and there are two sentences to match:
+`dump-screen`, `close-pane`, `focus-pane-id`, `toggle-pane-borderless` and `edit-scrollback` answer
+`No pane answers to 'terminal_9'`; everything else answers `Pane with id Terminal(9) not found`;
+`set-pane-borderless` says nothing at all. `pane_miss_refusal` in `route.rs` holds that mapping, and
+an E2E over 25 verbs is what found it — the two sentences are not interchangeable.
+
+`wait` was the one verb with no miss to imitate. An id form used to resolve to itself without
+anyone asking whether a pane held it, so `wait terminal_99 --for exit` on a pane that never existed
+returned `waited_ms: 0` and exit 0. `Screen::resolve_pane_target` now resolves an id against the
+pane list, like a handle, so an unknown id and a withheld one both answer
+`No pane answers to '<target>'` at exit 2.
 
 `list-panes --json` keeps the bare array because three parsers already read it: the `wait` poll,
 `list-agents`, and the MCP server. A caller that needs to tell a partial answer from a complete one
@@ -4214,9 +4252,12 @@ Two points carry it:
   before it acts. One refusal there covers all of them, `wait` included — which matters more than
   it looks. `wait --for exit` polls `list-panes` and reads a pane that is not in the list as gone,
   so a silently filtered pane would have been reported as `exit_status: -`: a wrong answer, not a
-  refusal. `wait` now asks the server to resolve even an id form, which it used to short-circuit.
-- **A guard at the top of `route_action`**, over the existing `target_of` plus the directories an
-  action asks for. It catches anything that reached the server with a pane or tab already resolved.
+  refusal. `wait` now asks the server to resolve even an id form, which it used to short-circuit,
+  and a withheld pane gets the same `No pane answers to '<target>'` an unknown one gets.
+- **A guard at the top of `route_action`**, over `privacy_target_of`. It catches anything that
+  reached the server with a pane or tab already resolved, and answers with that action's own miss.
+  A withheld `--cwd` is handled just before it, by `strip_withheld_cwds`, which edits the request
+  rather than refusing it.
 
 `snapshot show` and `snapshot restore` are the one decision outside the server, and it is a
 different decision: a snapshot is a file on disk with no session behind it to ask, so the only
@@ -4235,7 +4276,7 @@ rejects `(?i)` outright, and the failure is a runtime parse error rather than a 
 #### Failing closed
 
 A `patterns_file` that cannot be read, or a pattern that does not compile, makes the policy
-**broken**: every pane is withheld and every targeted call is refused, with the reason in the
+**broken**: every pane is withheld and every targeted call answers as a miss, with the reason in the
 session log. A privacy filter that fails open is a filter that silently is not there.
 
 #### What it does not cover

@@ -3,8 +3,18 @@
 //! A session can be told that some panes are nobody's business but the person at the terminal's.
 //! The panes are named by regular expressions over the fields the pane list already carries, and a
 //! pane that matches is *withheld*: its row is dropped from `list-panes`, and every command that
-//! names it is refused. Withholding is not redaction - a withheld pane leaves a count behind and
-//! nothing else, because a redacted row still says where the private work is.
+//! names it answers as if it were not there. Withholding is not redaction - a withheld pane leaves
+//! a count behind and nothing else, because a redacted row still says where the private work is.
+//!
+//! **A refusal is the ordinary miss, byte for byte.** A command that names a withheld pane gets
+//! `No pane answers to '<target>'`, the same sentence and the same exit code an unknown pane id
+//! gets; a withheld tab gets that action's own no-such-tab answer; a `--cwd` the policy withholds
+//! is dropped from the request, which is exactly what zellij already does with a directory that
+//! does not exist. A refusal that said "withheld" would be a yes/no oracle on any string the
+//! caller cared to try, and a loop over that oracle recovers the pattern list - the one thing the
+//! filter exists to hide. The aggregate `withheld: n` count on `--report-withheld` is the only
+//! output that admits a policy is running, and it is deliberate: a caller is entitled to know its
+//! view is partial without being told what is missing.
 //!
 //! **This module holds plain data and nothing else.** No regex, no file read, no environment. That
 //! is not tidiness, it is the wasm gate: `kdl/mod.rs` parses the `pane_privacy` block and is built
@@ -23,26 +33,6 @@ use std::path::PathBuf;
 /// A pane privacy policy is a property of the machine more often than of the config: the same
 /// `config.kdl` is shared across machines, and which directories are private is not.
 pub const PANE_PRIVACY_FILE_ENV: &str = "ZELLIJ_PANE_PRIVACY_FILE";
-
-/// The phrase every refusal carries, and the only thing a refusal has in common with the policy.
-///
-/// A refusal must say that the call was refused and nothing else - not the pattern that matched,
-/// not the directory it matched, not even whether the target exists. This phrase is what a caller
-/// can key on to tell "withheld" apart from "not there", and it is exported rather than written
-/// out at each site so that the `zellij mcp` server matches on the same text the server sends.
-pub const WITHHELD_MARKER: &str = "withheld by this session's pane privacy policy";
-
-/// What a call naming a withheld pane is told.
-pub const WITHHELD_PANE_MESSAGE: &str =
-    "That pane is withheld by this session's pane privacy policy.";
-
-/// What a call naming a withheld tab is told.
-pub const WITHHELD_TAB_MESSAGE: &str =
-    "That tab is withheld by this session's pane privacy policy.";
-
-/// What a call asking to open a pane in a withheld directory is told.
-pub const WITHHELD_CWD_MESSAGE: &str =
-    "That directory is withheld by this session's pane privacy policy.";
 
 /// What `snapshot show` and `snapshot restore` are told while a policy is active.
 ///
