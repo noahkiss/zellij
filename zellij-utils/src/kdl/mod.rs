@@ -19,6 +19,7 @@ use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermiss
 use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
+use crate::pane_privacy::{MatchField, OnUnknownCwd, PanePrivacyOptions, TabRule};
 use crate::resurrect_command_hints::{ResurrectCommandHint, ResurrectCommandHints};
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
@@ -3020,6 +3021,10 @@ impl Options {
             Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
             None => None,
         };
+        let pane_privacy = match kdl_options.get("pane_privacy") {
+            Some(kdl_pane_privacy) => Some(Self::pane_privacy_from_kdl(kdl_pane_privacy)?),
+            None => None,
+        };
         let resurrect_command_hints = match kdl_options.get("resurrect_command_hints") {
             Some(kdl_hints) => Some(Self::resurrect_command_hints_from_kdl(kdl_hints)?),
             None => None,
@@ -3214,6 +3219,7 @@ impl Options {
             detect_agents,
             session_up_resume,
             session_service,
+            pane_privacy,
             resurrect_command_hints,
             default_floating_size,
             styled_underlines,
@@ -3756,6 +3762,146 @@ impl Options {
             }
         }
         node.set_children(entries);
+        Some(node)
+    }
+    /// The `pane_privacy` block: which panes this session keeps to itself.
+    ///
+    /// ```kdl
+    /// pane_privacy {
+    ///     patterns_file "/path/to/private-paths.txt"
+    ///     pattern "some-regex"
+    ///     match_fields "cwd" "command"
+    ///     on_unknown_cwd "withhold"
+    ///     tab_rule "any"
+    /// }
+    /// ```
+    ///
+    /// A TOP-LEVEL block, so a binary that predates the feature ignores the whole thing instead of
+    /// failing to parse the config. Its own children are strict: an unknown one is an error, which
+    /// is the point - a privacy setting that was silently dropped is worse than one that refuses.
+    ///
+    /// Nothing here compiles a pattern or reads a file. This function is built for wasm along with
+    /// the rest of the config parser, and the matcher is not.
+    fn pane_privacy_from_kdl(
+        kdl_pane_privacy: &KdlNode,
+    ) -> Result<PanePrivacyOptions, ConfigError> {
+        let mut pane_privacy = PanePrivacyOptions::default();
+        for entry in kdl_children_nodes_or_error!(kdl_pane_privacy, "empty pane_privacy block") {
+            let entry_name = kdl_name!(entry);
+            match entry_name {
+                "patterns_file" => {
+                    let path = kdl_first_entry_as_string!(entry).ok_or_else(|| {
+                        ConfigError::new_kdl_error(
+                            "patterns_file takes a path".into(),
+                            entry.span().offset(),
+                            entry.span().len(),
+                        )
+                    })?;
+                    pane_privacy.patterns_file = Some(PathBuf::from(path));
+                },
+                "pattern" => {
+                    for pattern in kdl_string_arguments!(entry) {
+                        pane_privacy.patterns.push(pattern.to_owned());
+                    }
+                },
+                "match_fields" => {
+                    let mut fields = Vec::new();
+                    for field in kdl_string_arguments!(entry) {
+                        let field = MatchField::from_name(field).ok_or_else(|| {
+                            ConfigError::new_kdl_error(
+                                format!(
+                                    "Unknown pane_privacy match field: {:?} (expected cwd, \
+                                     command, title or tab_name)",
+                                    field
+                                ),
+                                entry.span().offset(),
+                                entry.span().len(),
+                            )
+                        })?;
+                        if !fields.contains(&field) {
+                            fields.push(field);
+                        }
+                    }
+                    pane_privacy.match_fields = Some(fields);
+                },
+                "on_unknown_cwd" => {
+                    let value = kdl_first_entry_as_string!(entry).unwrap_or("");
+                    pane_privacy.on_unknown_cwd =
+                        Some(OnUnknownCwd::from_name(value).ok_or_else(|| {
+                            ConfigError::new_kdl_error(
+                                format!(
+                                    "Unknown pane_privacy on_unknown_cwd: {:?} (expected withhold \
+                                     or allow)",
+                                    value
+                                ),
+                                entry.span().offset(),
+                                entry.span().len(),
+                            )
+                        })?);
+                },
+                "tab_rule" => {
+                    let value = kdl_first_entry_as_string!(entry).unwrap_or("");
+                    pane_privacy.tab_rule = Some(TabRule::from_name(value).ok_or_else(|| {
+                        ConfigError::new_kdl_error(
+                            format!(
+                                "Unknown pane_privacy tab_rule: {:?} (expected any or all)",
+                                value
+                            ),
+                            entry.span().offset(),
+                            entry.span().len(),
+                        )
+                    })?);
+                },
+                other => {
+                    return Err(ConfigError::new_kdl_error(
+                        format!(
+                            "Unknown pane_privacy entry: {:?} (expected patterns_file, pattern, \
+                             match_fields, on_unknown_cwd or tab_rule)",
+                            other
+                        ),
+                        entry.span().offset(),
+                        entry.span().len(),
+                    ))
+                },
+            }
+        }
+        Ok(pane_privacy)
+    }
+    fn pane_privacy_to_kdl(&self) -> Option<KdlNode> {
+        let pane_privacy = self.pane_privacy.as_ref()?;
+        if pane_privacy == &PanePrivacyOptions::default() {
+            return None;
+        }
+        let mut node = KdlNode::new("pane_privacy");
+        let mut children = KdlDocument::new();
+        if let Some(patterns_file) = &pane_privacy.patterns_file {
+            let mut patterns_file_node = KdlNode::new("patterns_file");
+            patterns_file_node.push(KdlValue::String(patterns_file.display().to_string()));
+            children.nodes_mut().push(patterns_file_node);
+        }
+        for pattern in &pane_privacy.patterns {
+            let mut pattern_node = KdlNode::new("pattern");
+            pattern_node.push(KdlValue::String(pattern.to_owned()));
+            children.nodes_mut().push(pattern_node);
+        }
+        if let Some(match_fields) = &pane_privacy.match_fields {
+            let mut match_fields_node = KdlNode::new("match_fields");
+            for field in match_fields {
+                match_fields_node.push(KdlValue::String(field.name().to_owned()));
+            }
+            children.nodes_mut().push(match_fields_node);
+        }
+        if let Some(on_unknown_cwd) = &pane_privacy.on_unknown_cwd {
+            let mut on_unknown_cwd_node = KdlNode::new("on_unknown_cwd");
+            on_unknown_cwd_node.push(KdlValue::String(on_unknown_cwd.name().to_owned()));
+            children.nodes_mut().push(on_unknown_cwd_node);
+        }
+        if let Some(tab_rule) = &pane_privacy.tab_rule {
+            let mut tab_rule_node = KdlNode::new("tab_rule");
+            tab_rule_node.push(KdlValue::String(tab_rule.name().to_owned()));
+            children.nodes_mut().push(tab_rule_node);
+        }
+        node.set_children(children);
         Some(node)
     }
     /// The `session_service` block: extra directives for the unit `zellij session enable` writes.
@@ -5391,6 +5537,9 @@ impl Options {
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
+        }
+        if let Some(pane_privacy) = self.pane_privacy_to_kdl() {
+            nodes.push(pane_privacy);
         }
         if let Some(resurrect_command_hints) = self.resurrect_command_hints_to_kdl() {
             nodes.push(resurrect_command_hints);
@@ -9242,6 +9391,97 @@ fn default_floating_size_rejects_bad_values() {
             bad
         );
     }
+}
+
+#[test]
+fn pane_privacy_config_parsing() {
+    let config_with_pane_privacy = r#"
+        pane_privacy {
+            patterns_file "/invented/patterns.txt"
+            pattern "pretend-private"
+            pattern "another-one"
+            match_fields "cwd" "title"
+            on_unknown_cwd "allow"
+            tab_rule "all"
+        }
+    "#;
+    let config = Config::from_kdl(config_with_pane_privacy, None).unwrap();
+    let pane_privacy = config.options.pane_privacy.clone().unwrap();
+    assert_eq!(
+        pane_privacy.patterns_file,
+        Some(PathBuf::from("/invented/patterns.txt"))
+    );
+    assert_eq!(
+        pane_privacy.patterns,
+        vec!["pretend-private".to_owned(), "another-one".to_owned()]
+    );
+    assert_eq!(
+        pane_privacy.match_fields,
+        Some(vec![MatchField::Cwd, MatchField::Title])
+    );
+    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Allow));
+    assert_eq!(pane_privacy.tab_rule, Some(TabRule::All));
+    assert!(!pane_privacy.is_empty());
+}
+
+#[test]
+fn pane_privacy_defaults_when_the_block_names_only_a_pattern() {
+    let config = Config::from_kdl(
+        r#"
+        pane_privacy {
+            pattern "pretend-private"
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let pane_privacy = config.options.pane_privacy.clone().unwrap();
+    assert_eq!(pane_privacy.patterns_file, None);
+    assert_eq!(pane_privacy.match_fields, None);
+    assert_eq!(pane_privacy.on_unknown_cwd, None);
+    assert_eq!(pane_privacy.tab_rule, None);
+}
+
+#[test]
+fn no_pane_privacy_block_is_no_policy() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.pane_privacy, None);
+}
+
+#[test]
+fn pane_privacy_rejects_entries_it_does_not_know() {
+    for bad in [
+        "pane_privacy {\n patterns_files \"/invented/patterns.txt\"\n}",
+        "pane_privacy {\n match_fields \"cwd\" \"hostname\"\n}",
+        "pane_privacy {\n on_unknown_cwd \"maybe\"\n}",
+        "pane_privacy {\n tab_rule \"some\"\n}",
+        "pane_privacy {\n patterns_file\n}",
+        // no block at all: the entry is a bare node with no children, which is not a policy
+        "pane_privacy",
+    ] {
+        assert!(
+            Config::from_kdl(bad, None).is_err(),
+            "expected {:?} to be rejected",
+            bad
+        );
+    }
+}
+
+#[test]
+fn pane_privacy_round_trips_through_kdl() {
+    let written = r#"
+        pane_privacy {
+            patterns_file "/invented/patterns.txt"
+            pattern "pretend-private"
+            match_fields "cwd" "command" "tab_name"
+            on_unknown_cwd "withhold"
+            tab_rule "any"
+        }
+    "#;
+    let config = Config::from_kdl(written, None).unwrap();
+    let serialized = config.to_string(false);
+    let read_back = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(read_back.options.pane_privacy, config.options.pane_privacy);
 }
 
 #[test]

@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 
 use crate::global_async_runtime::get_tokio_runtime;
+use crate::pane_privacy_policy;
 use crate::thread_bus::ThreadSenders;
 use crate::{
     os_input_output::ServerOsApi,
@@ -18,9 +19,9 @@ use uuid::Uuid;
 use zellij_utils::{
     channels::SenderWithContext,
     data::{
-        ActionEvent, BareKey, ConnectToSession, Direction, Event, InputMode, KeyModifier,
-        ListPanesResponse, ListTabsResponse, NewPanePlacement, NoteColor,
-        PaneId as ZellijUtilsPaneId, PaneListEntry, PaneTarget, ResizeStrategy, TabInfo,
+        ActionEvent, BareKey, CommandOrPlugin, ConnectToSession, Direction, Event, InputMode,
+        KeyModifier, ListPanesEnvelope, ListPanesResponse, ListTabsResponse, NewPanePlacement,
+        NoteColor, PaneId as ZellijUtilsPaneId, PaneListEntry, PaneTarget, ResizeStrategy, TabInfo,
         UnblockCondition,
     },
     envs,
@@ -30,6 +31,9 @@ use zellij_utils::{
         command::TerminalAction,
     },
     ipc::{ClientToServerMsg, ExitReason, IpcReceiverWithContext, IpcRecvError, ServerToClientMsg},
+    pane_privacy::{
+        WITHHELD_CWD_MESSAGE, WITHHELD_LAYOUT_MESSAGE, WITHHELD_PANE_MESSAGE, WITHHELD_TAB_MESSAGE,
+    },
 };
 
 use crate::ClientId;
@@ -296,6 +300,15 @@ pub(crate) fn route_action(
 
     let mut wait_forever = false;
 
+    // The pane privacy filter, at its one evaluation point. Every CLI verb arrives here, so a
+    // refusal here is a refusal on every path - the MCP server included, because it runs the CLI.
+    // A refusal says only that the call was refused: naming the pattern, the directory or even
+    // whether the target exists would hand back the thing being withheld.
+    if let Some(refusal) = pane_privacy_refusal(&action, &senders) {
+        send_error_to_client(cli_client_id, os_input.as_ref(), &refusal);
+        return Ok((should_break, None));
+    }
+
     match action {
         Action::ToggleTab => {
             senders
@@ -556,6 +569,12 @@ pub(crate) fn route_action(
                 .with_context(err_context)?;
         },
         Action::DumpLayout => {
+            // one document carrying every pane's cwd and command, with no row to drop. Like
+            // `snapshot show`, it is refused whole while a policy is active
+            if pane_privacy_policy().is_active() {
+                send_error_to_client(cli_client_id, os_input.as_ref(), WITHHELD_LAYOUT_MESSAGE);
+                return Ok((should_break, None));
+            }
             let default_shell = match default_shell {
                 Some(TerminalAction::RunCommand(run_command)) => Some(run_command.command),
                 _ => None,
@@ -1805,11 +1824,22 @@ pub(crate) fn route_action(
                 {
                     Some(Some(pane_id)) => {
                         let pane_id: ZellijUtilsPaneId = pane_id.into();
-                        send_output_to_client(
-                            cli_client_id,
-                            os_input.as_ref(),
-                            vec![format!("pane_id: {}", pane_id)],
-                        );
+                        // every `--pane-id` verb resolves its target here before it acts, `wait`
+                        // included - so this one refusal is what keeps a wait on a withheld pane
+                        // from polling a list the pane is not in and calling that an exit
+                        if withholds_pane(&senders, pane_id) {
+                            send_error_to_client(
+                                cli_client_id,
+                                os_input.as_ref(),
+                                WITHHELD_PANE_MESSAGE,
+                            );
+                        } else {
+                            send_output_to_client(
+                                cli_client_id,
+                                os_input.as_ref(),
+                                vec![format!("pane_id: {}", pane_id)],
+                            );
+                        }
                     },
                     // a target that names no live pane is a miss, not an error: exit 2, per the
                     // convention the rest of the query surface already follows
@@ -1884,19 +1914,27 @@ pub(crate) fn route_action(
             show_geometry: _,
             show_all,
             output_json,
+            report_withheld,
         } => {
             let maybe_panes =
                 request_panes_from_screen(&senders, show_all).with_context(err_context)?;
 
             if let Some(pane_entries) = maybe_panes {
+                let (pane_entries, withheld) = pane_privacy_policy().filter(pane_entries);
                 let output_lines = if output_json {
-                    format_panes_as_json(&pane_entries)
+                    format_panes_as_json(&pane_entries, withheld, report_withheld)
                 } else {
                     // every column, every time: the flags that used to gate them stay accepted so
                     // that a script asking for one is not an error, but asking is now a no-op.
                     // `--all` keeps the one meaning the columns never shared with it - which ROWS
                     // the table has, non-selectable panes included
-                    format_panes_table(&pane_entries, true, true, true, true)
+                    let mut lines = format_panes_table(&pane_entries, true, true, true, true);
+                    // a table is read by a person, and a person seeing a short table needs to be
+                    // told it is short. The count is the whole of what a withheld pane leaves
+                    if withheld > 0 {
+                        lines.push(format!("withheld: {}", withheld));
+                    }
+                    lines
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -1917,6 +1955,9 @@ pub(crate) fn route_action(
                 request_tabs_from_screen(&senders, client_id).with_context(err_context)?;
 
             if let Some(tab_infos) = maybe_tabs {
+                // a tab name can say what the work is on its own, so a withheld tab loses its row
+                // here as well as its panes in `list-panes`
+                let tab_infos = withhold_tabs(&senders, tab_infos);
                 let output_lines = if output_json {
                     format_tabs_as_json(&tab_infos)
                 } else {
@@ -1941,6 +1982,8 @@ pub(crate) fn route_action(
 
             match (maybe_tabs, maybe_panes) {
                 (Some(tab_infos), Some(pane_entries)) => {
+                    let tab_infos = withhold_tabs(&senders, tab_infos);
+                    let (pane_entries, _withheld) = pane_privacy_policy().filter(pane_entries);
                     let output_lines = if output_json {
                         format_tree_as_json(&tab_infos, &pane_entries)
                     } else {
@@ -2530,6 +2573,171 @@ fn ring_verb(action_name: &str) -> String {
 /// Not every action is in here. One that names nothing - and one whose target is spelled in a way
 /// nobody has needed the ring to read yet - records a `-`, which is honest: the ring says what was
 /// touched when that is known and does not invent it when it is not.
+/// Why this action is refused by the pane privacy filter, if it is.
+///
+/// Two questions, in the order that costs least. A requested directory is a string the caller
+/// supplied and needs no lookup. A pane or a tab target needs the pane list, which is one round
+/// trip to `Screen` - paid only when a policy is active AND the action names something.
+fn pane_privacy_refusal(action: &Action, senders: &ThreadSenders) -> Option<String> {
+    let policy = pane_privacy_policy();
+    if !policy.is_active() {
+        return None;
+    }
+    // without this an agent that cannot see a private pane opens its own shell in the private
+    // directory and reads it there instead
+    for cwd in requested_cwds(action) {
+        if policy.withholds_cwd(&cwd) {
+            return Some(WITHHELD_CWD_MESSAGE.to_owned());
+        }
+    }
+    let (pane_target, tab_target) = privacy_target_of(action);
+    if pane_target.is_none() && tab_target.is_none() {
+        return None;
+    }
+    let entries = request_panes_from_screen(senders, true).ok().flatten()?;
+    let verdicts = policy.verdicts(&entries);
+    if let Some(pane_id) = pane_target {
+        let (is_plugin, id) = match pane_id {
+            ZellijUtilsPaneId::Terminal(id) => (false, id),
+            ZellijUtilsPaneId::Plugin(id) => (true, id),
+        };
+        if verdicts.withholds_pane(is_plugin, id) {
+            return Some(WITHHELD_PANE_MESSAGE.to_owned());
+        }
+    }
+    if let Some(tab_target) = tab_target {
+        // `target_of` gives a stable tab id for some actions and a position for others, and which
+        // one it is cannot be told from the number. Both are checked: over-refusing is the safe
+        // direction for a filter, and under-refusing is the leak
+        let matches_target = entries.iter().any(|entry| {
+            (entry.tab_id == tab_target || entry.tab_position == tab_target)
+                && verdicts.withholds_tab(entry.tab_id)
+        });
+        if matches_target {
+            return Some(WITHHELD_TAB_MESSAGE.to_owned());
+        }
+    }
+    None
+}
+
+/// The pane and tab this action would touch, for the privacy filter.
+///
+/// [`target_of`] answers the same question for the action ring, and its list is the actions whose
+/// id is worth reporting. That is a different list from the actions that reach a pane: it leaves
+/// out `DumpScreen`, the id-and-kind pairs `CloseTerminalPane`/`ClosePluginPane` and their focus
+/// and rename siblings, and `SetPaneHandle`. Every one of those names a pane and would otherwise
+/// go unchecked - and `DumpScreen` is the one that returns the screen.
+fn privacy_target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usize>) {
+    use Action::*;
+    match action {
+        DumpScreen { pane_id, .. } => (*pane_id, None),
+        SetPaneHandle { pane_id, .. } => (Some(*pane_id), None),
+        CloseTerminalPane { pane_id }
+        | FocusTerminalPaneWithId { pane_id, .. }
+        | RenameTerminalPane { pane_id, .. } => (Some(ZellijUtilsPaneId::Terminal(*pane_id)), None),
+        ClosePluginPane { pane_id }
+        | FocusPluginPaneWithId { pane_id, .. }
+        | RenamePluginPane { pane_id, .. } => (Some(ZellijUtilsPaneId::Plugin(*pane_id)), None),
+        SwitchSession { pane_id, .. } => (
+            pane_id.map(|(id, is_plugin)| {
+                if is_plugin {
+                    ZellijUtilsPaneId::Plugin(id)
+                } else {
+                    ZellijUtilsPaneId::Terminal(id)
+                }
+            }),
+            None,
+        ),
+        other => target_of(other),
+    }
+}
+
+/// Whether one already-resolved pane is withheld.
+fn withholds_pane(senders: &ThreadSenders, pane_id: ZellijUtilsPaneId) -> bool {
+    let policy = pane_privacy_policy();
+    if !policy.is_active() {
+        return false;
+    }
+    let entries = match request_panes_from_screen(senders, true).ok().flatten() {
+        Some(entries) => entries,
+        // fail closed: a session that cannot say which panes it has cannot say this one is public
+        None => return true,
+    };
+    let (is_plugin, id) = match pane_id {
+        ZellijUtilsPaneId::Terminal(id) => (false, id),
+        ZellijUtilsPaneId::Plugin(id) => (true, id),
+    };
+    policy.verdicts(&entries).withholds_pane(is_plugin, id)
+}
+
+/// The tabs a caller may see.
+fn withhold_tabs(senders: &ThreadSenders, tab_infos: Vec<TabInfo>) -> Vec<TabInfo> {
+    let policy = pane_privacy_policy();
+    if !policy.is_active() {
+        return tab_infos;
+    }
+    let entries = match request_panes_from_screen(senders, true).ok().flatten() {
+        Some(entries) => entries,
+        None => return Vec::new(),
+    };
+    let verdicts = policy.verdicts(&entries);
+    let withheld_positions: HashSet<usize> = entries
+        .iter()
+        .filter(|entry| verdicts.withholds_tab(entry.tab_id))
+        .map(|entry| entry.tab_position)
+        .collect();
+    tab_infos
+        .into_iter()
+        .filter(|tab| !withheld_positions.contains(&tab.position))
+        .collect()
+}
+
+/// The directories an action asks a new pane, tab or command to start in.
+fn requested_cwds(action: &Action) -> Vec<std::path::PathBuf> {
+    use Action::*;
+    let mut cwds = Vec::new();
+    let mut push_command = |command: &Option<zellij_utils::input::command::RunCommandAction>| {
+        if let Some(cwd) = command.as_ref().and_then(|command| command.cwd.clone()) {
+            cwds.push(cwd);
+        }
+    };
+    match action {
+        NewFloatingPane { command, .. }
+        | NewTiledPane { command, .. }
+        | NewInPlacePane { command, .. }
+        | NewStackedPane { command, .. }
+        | NewBlockingPane { command, .. } => push_command(command),
+        Run { command, .. } => {
+            if let Some(cwd) = command.cwd.clone() {
+                cwds.push(cwd);
+            }
+        },
+        NewTab {
+            cwd, initial_panes, ..
+        } => {
+            if let Some(cwd) = cwd.clone() {
+                cwds.push(cwd);
+            }
+            if let Some(initial_panes) = initial_panes {
+                for pane in initial_panes {
+                    if let CommandOrPlugin::Command(run_command) = pane {
+                        if let Some(cwd) = run_command.cwd.clone() {
+                            cwds.push(cwd);
+                        }
+                    }
+                }
+            }
+        },
+        SwitchSession { cwd, .. } => {
+            if let Some(cwd) = cwd.clone() {
+                cwds.push(cwd);
+            }
+        },
+        _ => {},
+    }
+    cwds
+}
+
 fn target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usize>) {
     use Action::*;
     match action {
@@ -2676,7 +2884,10 @@ fn id_report_lines(result: &ActionCompletionResult, id_keys: &IdReportKeys) -> V
 /// reader is about to type one of these into `--pane-id`, and the handle is the form they want.
 fn available_pane_targets(senders: &ThreadSenders) -> Result<Vec<String>> {
     let mut lines = vec!["No pane given. Pass --pane-id with one of:".to_string()];
-    let panes = match request_panes_from_screen(senders, false)? {
+    let panes = match request_panes_from_screen(senders, false)?.map(|panes| {
+        // the list of panes that COULD have been asked for must not name one that could not
+        pane_privacy_policy().filter(panes).0
+    }) {
         Some(panes) => panes,
         None => {
             lines.push("  (the session did not answer in time)".to_string());
@@ -3639,7 +3850,28 @@ fn request_current_tab_info_from_screen(
     }
 }
 
-fn format_panes_as_json(pane_entries: &[PaneListEntry]) -> Vec<String> {
+/// The pane list as JSON: a bare array, or an envelope when the caller asked for the count.
+///
+/// The bare array is the default and stays the default. Three parsers already read it - the `wait`
+/// poll, `list-agents`, and the MCP server - and a shape that changed under them would be a bigger
+/// break than the filter is a feature. A caller that needs to tell a partial view from a complete
+/// one asks for the envelope by name.
+fn format_panes_as_json(
+    pane_entries: &[PaneListEntry],
+    withheld: usize,
+    report_withheld: bool,
+) -> Vec<String> {
+    if report_withheld {
+        let envelope = ListPanesEnvelope {
+            panes: pane_entries.to_vec(),
+            withheld,
+        };
+        return vec![serde_json::to_string_pretty(&envelope).unwrap_or_else(|_| {
+            // an envelope that cannot be written must not fall back to the bare array: a caller
+            // that asked for the count would read the array as a complete answer
+            "{\"panes\": [], \"withheld\": 0}".to_string()
+        })];
+    }
     vec![serde_json::to_string_pretty(pane_entries).unwrap_or_else(|_| "[]".to_string())]
 }
 
@@ -4053,6 +4285,107 @@ fn send_output_to_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `dump-screen --pane-id` returns the screen, and `target_of` does not list it. An E2E found
+    /// that gap after the guard was written, which is what this test is here to stop repeating.
+    #[test]
+    fn the_privacy_guard_sees_the_pane_targets_the_action_ring_does_not() {
+        let cases: Vec<(Action, ZellijUtilsPaneId)> = vec![
+            (
+                Action::DumpScreen {
+                    file_path: None,
+                    include_scrollback: false,
+                    pane_id: Some(ZellijUtilsPaneId::Terminal(7)),
+                    ansi: false,
+                },
+                ZellijUtilsPaneId::Terminal(7),
+            ),
+            (
+                Action::CloseTerminalPane { pane_id: 7 },
+                ZellijUtilsPaneId::Terminal(7),
+            ),
+            (
+                Action::ClosePluginPane { pane_id: 7 },
+                ZellijUtilsPaneId::Plugin(7),
+            ),
+            (
+                Action::RenameTerminalPane {
+                    pane_id: 7,
+                    name: Vec::new(),
+                },
+                ZellijUtilsPaneId::Terminal(7),
+            ),
+            (
+                Action::FocusPluginPaneWithId {
+                    pane_id: 7,
+                    should_float_if_hidden: false,
+                    should_be_in_place_if_hidden: false,
+                },
+                ZellijUtilsPaneId::Plugin(7),
+            ),
+            (
+                Action::SetPaneHandle {
+                    pane_id: ZellijUtilsPaneId::Terminal(7),
+                    handle: "some-handle".to_owned(),
+                },
+                ZellijUtilsPaneId::Terminal(7),
+            ),
+        ];
+        for (action, expected) in cases {
+            assert_eq!(
+                privacy_target_of(&action).0,
+                Some(expected),
+                "{:?} names a pane the privacy guard has to see",
+                action
+            );
+        }
+    }
+
+    /// The verbs `target_of` already covers still reach the guard through it.
+    #[test]
+    fn the_privacy_guard_falls_through_to_the_action_ring_targets() {
+        let action = Action::WriteCharsToPaneId {
+            chars: "hello".to_owned(),
+            pane_id: ZellijUtilsPaneId::Terminal(3),
+        };
+        assert_eq!(
+            privacy_target_of(&action).0,
+            Some(ZellijUtilsPaneId::Terminal(3))
+        );
+        assert_eq!(privacy_target_of(&Action::ToggleTab), (None, None));
+    }
+
+    /// The directories an action asks for, which need no session lookup to judge.
+    #[test]
+    fn requested_cwds_reads_the_directory_off_every_form_that_carries_one() {
+        use zellij_utils::input::command::RunCommandAction;
+        let command = |cwd: &str| RunCommandAction {
+            command: std::path::PathBuf::from("/bin/sh"),
+            cwd: Some(std::path::PathBuf::from(cwd)),
+            ..Default::default()
+        };
+        assert_eq!(
+            requested_cwds(&Action::NewTiledPane {
+                direction: None,
+                command: Some(command("/invented/one")),
+                pane_name: None,
+                near_current_pane: false,
+                no_focus: false,
+                borderless: None,
+                tab_id: None,
+            }),
+            vec![std::path::PathBuf::from("/invented/one")]
+        );
+        assert_eq!(
+            requested_cwds(&Action::Run {
+                command: command("/invented/two"),
+                near_current_pane: false,
+                no_focus: false,
+            }),
+            vec![std::path::PathBuf::from("/invented/two")]
+        );
+        assert!(requested_cwds(&Action::ToggleTab).is_empty());
+    }
 
     #[test]
     fn test_notification_end_sets_affected_tab_id() {

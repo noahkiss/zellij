@@ -581,6 +581,9 @@ pub enum Action {
         show_geometry: bool,
         show_all: bool,
         output_json: bool,
+        /// Answer with an envelope carrying the count of panes a pane privacy policy withheld,
+        /// rather than the bare array. Opt-in because three parsers depend on the bare array.
+        report_withheld: bool,
     },
     /// Every tab with its panes nested beneath it - the shape of the session in one answer.
     ListTree {
@@ -2117,6 +2120,7 @@ impl Action {
                 geometry,
                 all,
                 json,
+                report_withheld,
             } => Ok(vec![Action::ListPanes {
                 show_tab: tab,
                 show_command: command,
@@ -2124,6 +2128,7 @@ impl Action {
                 show_geometry: geometry,
                 show_all: all,
                 output_json: json,
+                report_withheld,
             }]),
             CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
             CliAction::ListEvents { json } => Ok(vec![Action::ListEvents { output_json: json }]),

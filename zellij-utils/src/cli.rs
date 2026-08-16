@@ -2284,6 +2284,12 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// Output as JSON
         #[clap(short, long, value_parser)]
         json: bool,
+
+        /// With --json, answer with {"panes": [...], "withheld": n} instead of the bare array, so
+        /// that a caller can tell a partial view from a complete one. Without a pane privacy
+        /// policy the count is always 0
+        #[clap(long, value_parser)]
+        report_withheld: bool,
     },
     /// List all tabs with their information
     ///
@@ -2335,6 +2341,10 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// Output as JSON
         #[clap(short, long, value_parser)]
         json: bool,
+
+        /// With --json, answer with {"agents": [...], "withheld": n} instead of the bare array
+        #[clap(long, value_parser)]
+        report_withheld: bool,
     },
     /// Get information about the currently active tab
     ///

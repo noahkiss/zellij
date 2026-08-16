@@ -30,6 +30,7 @@ use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Map, Value};
 use zellij_utils::consts::VERSION;
+use zellij_utils::pane_privacy::WITHHELD_MARKER;
 
 /// What a client is told this server is, before it asks for anything.
 const INSTRUCTIONS: &str = "\
@@ -94,12 +95,26 @@ impl ZellijMcp {
             // exit 2 is the fork's "well-formed request about something that is not there". It is
             // the reason a create tool can be honest: a pane that was not made says so, and there
             // is no id here to invent
+            // a pane privacy policy refuses with exit 2, which is otherwise the fork's "not
+            // there". They are different answers and a caller acts differently on each: a miss is
+            // worth retrying with another target, a refusal never is
+            let withheld = [&outcome.stderr, &outcome.stdout]
+                .iter()
+                .any(|said| said.contains(WITHHELD_MARKER));
             structured.insert(
                 "reason".to_owned(),
-                json!(if outcome.is_miss() { "miss" } else { "error" }),
+                json!(if withheld {
+                    "withheld"
+                } else if outcome.is_miss() {
+                    "miss"
+                } else {
+                    "error"
+                }),
             );
             let said = first_words(&outcome.stderr, &outcome.stdout);
-            let message = if outcome.is_miss() {
+            let message = if withheld {
+                said
+            } else if outcome.is_miss() {
                 format!("Nothing matched: {}", said)
             } else {
                 said

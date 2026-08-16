@@ -4130,6 +4130,125 @@ harness's process, and a test runner's signals are not its to answer.
 It pairs with `session up` resuming by default: the reboot now leaves a current snapshot, and the
 `up` that follows it finds one.
 
+### `pane_privacy`: panes the session keeps to itself
+
+Some work is nobody's business but the person at the terminal's. A session can be told which panes
+those are, and the panes then stop existing as far as the command surface is concerned: their rows
+are gone from `list-panes`, `list-tabs`, `list-tree` and `list-agents`, and any command that names
+one is refused.
+
+```kdl
+pane_privacy {
+    patterns_file "/path/to/private-paths.txt"
+    pattern "some-extra-regex"
+    match_fields "cwd" "command"
+    on_unknown_cwd "withhold"
+    tab_rule "any"
+}
+```
+
+Every entry is optional. `patterns_file` names a file of one extended regular expression per line,
+`#` comments and blank lines ignored. `pattern` is the same thing written inline, and repeats. The
+environment variable `ZELLIJ_PANE_PRIVACY_FILE` overrides `patterns_file`, because which
+directories are private is a fact about a machine and one `config.kdl` is shared across several.
+
+Patterns are matched case-insensitively and are **not anchored**: a bare fragment matches anywhere
+in the value, which is what makes an existing list of private paths usable as-is. With no file, no
+pattern and no environment variable there is no policy, and the whole feature costs one
+`is_active()` per call.
+
+`match_fields` chooses which columns of a pane row a pattern is tried against — `cwd`, `command`,
+`title`, `tab_name`. The default is `cwd command`, where a private path lands on its own; a title
+and a tab name are the user's own text and are opt-in. `on_unknown_cwd` decides a terminal pane
+whose cwd is not known yet — `pane_cwd` is empty for about a second after a pane is created, and
+`withhold` (the default) closes that window. A plugin pane has no cwd by construction and is never
+withheld for lacking one. `tab_rule` decides how a tab inherits its panes' verdict: `any` (the
+default) withholds the whole tab when one pane matches, because a tab is the unit of work and its
+name alone can say what the work is.
+
+**Withholding is not redaction.** A withheld row is dropped, and the only thing left behind is a
+count. A redacted row still says where the private work is.
+
+Being top-level, the block is ignored by a binary that predates it, so it can go into a shared
+config ahead of the upgrade. Its own children are strict, so it cannot be rolled out one key at a
+time.
+
+#### What it does to each command
+
+| Command | With a policy in force |
+|---|---|
+| `list-panes`, `list-tree` | withheld rows dropped; the table gains a `withheld: n` footer |
+| `list-panes --json` | still a bare array — `--report-withheld` switches it to `{"panes": [...], "withheld": n}` |
+| `list-agents` | the same, over the same walk; `--report-withheld` gives `{"agents": [...], "withheld": n}` |
+| `list-tabs` | withheld tabs dropped |
+| `dump-screen`, `wait`, `send-keys`, `write-chars`, `paste`, `close-pane`, `move-pane`, `stack-panes`, `break-pane`, `rename-pane`, and every other `--pane-id` verb | refused, exit 2 |
+| a verb naming a withheld tab | refused, exit 2 |
+| `new-pane --cwd`, `new-tab --cwd`, `run --cwd` under a matching directory | refused, exit 2 |
+| `dump-layout`, `snapshot show`, `snapshot restore` | refused whole while any policy is active |
+| `snapshot list`, `ls` | unchanged |
+
+`new-pane --cwd DIR` with **no command** is not refused, and does not need to be: upstream drops
+the directory when there is no command to run in it, so the pane opens in the calling pane's cwd
+rather than in `DIR`. The forms that carry a directory to the server - `new-pane --cwd DIR --
+CMD`, `new-tab --cwd DIR`, `run --cwd DIR -- CMD` - are the ones refused, and are the ones that
+could have opened a shell inside the private tree.
+
+A refusal says only that the call was refused. It never names the pattern, the directory, or
+whether the target exists — a refusal that distinguished "withheld" from "no such pane" would be a
+probe.
+
+`list-panes --json` keeps the bare array because three parsers already read it: the `wait` poll,
+`list-agents`, and the MCP server. A caller that needs to tell a partial answer from a complete one
+asks for the envelope by name.
+
+#### Where the decision is made, and why there is only one
+
+**The server decides, in `route.rs`.** That is where every CLI verb arrives, so it is also where
+the `zellij mcp` server arrives — every MCP tool runs this binary's CLI in a child process. The
+filter therefore covers an agent holding the MCP tools and an agent holding a shell, without being
+written twice. There is no flag to turn it off for one call.
+
+Two points carry it:
+
+- **`Action::ResolvePaneTarget`.** Every `--pane-id` verb resolves its target through the server
+  before it acts. One refusal there covers all of them, `wait` included — which matters more than
+  it looks. `wait --for exit` polls `list-panes` and reads a pane that is not in the list as gone,
+  so a silently filtered pane would have been reported as `exit_status: -`: a wrong answer, not a
+  refusal. `wait` now asks the server to resolve even an id form, which it used to short-circuit.
+- **A guard at the top of `route_action`**, over the existing `target_of` plus the directories an
+  action asks for. It catches anything that reached the server with a pane or tab already resolved.
+
+`snapshot show` and `snapshot restore` are the one decision outside the server, and it is a
+different decision: a snapshot is a file on disk with no session behind it to ask, so the only
+question is whether a policy exists at all.
+
+#### The wasm split
+
+`zellij-utils/src/pane_privacy.rs` holds the settings and nothing else — no regex, no file read, no
+environment. It is parsed by `kdl/mod.rs`, which builds for `wasm32-wasip1` along with every default
+plugin. The matcher lives in `zellij-server/src/pane_privacy.rs`, which never builds for wasm and
+already had `regex`. This is the same shape as `session_service`, for the same reason.
+
+One workspace dependency changed: `regex` gained the `unicode-case` feature. Without it the crate
+rejects `(?i)` outright, and the failure is a runtime parse error rather than a build error.
+
+#### Failing closed
+
+A `patterns_file` that cannot be read, or a pattern that does not compile, makes the policy
+**broken**: every pane is withheld and every targeted call is refused, with the reason in the
+session log. A privacy filter that fails open is a filter that silently is not there.
+
+#### What it does not cover
+
+**The plugin API.** A plugin subscribed to `Event::PaneUpdate` receives every pane, withheld ones
+included. The filter sits in the CLI's route handlers, and the plugin event path does not pass
+through them. That is the right boundary for what this is for - a plugin is code the user installed,
+and the status bar has to know the panes exist to draw them - but it is not a sandbox, and a plugin
+is not a place to put something the policy is meant to hide from.
+
+**An attached client.** Anyone looking at the terminal sees the panes. The filter is about what the
+command surface answers, not about what is on screen.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
