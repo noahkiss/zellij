@@ -2533,11 +2533,35 @@ disagreement in the "skip" direction would drop the refresh with nothing reporti
 already **ad-hoc** is refreshed first as before: it holds no grant a rebuild could keep, so pinning
 the new build is worth more than protecting a signature that was never load-bearing.
 
-**Known gap: `session up` still refreshes the pin on its own.** `install_pinned_exe` does a plain
-copy → rename with no signing step, so an upgrade whose first command is `session up` — rather than
-`session doctor` — puts an ad-hoc pin in place exactly as the old doctor did, and the grants go with
-it until doctor is next run. Recorded rather than fixed here; the fix belongs with `session up` and
-is not a signing change.
+**`session up` refreshes the pin through the same transaction.** It used to do the plain
+`install_pinned_exe` copy → rename with no signing step, so an upgrade whose first command was
+`session up` — rather than `session doctor` — put an ad-hoc pin in place exactly as the old doctor
+did, and the grants went with it. That is the one path an upgraded machine actually takes: the
+watchdog runs `session up` every minute, so it wins the race with any shell.
+
+`assert_pinned_exe` now asks `refresh_belongs_to_signing` first — the same question doctor asks, so
+the two cannot disagree about whose refresh it is — and when the answer is yes it runs the signing
+transaction instead of the copy. Three outcomes:
+
+| What the pin is | What `session up` does |
+|---|---|
+| current, or ad-hoc | the plain copy, unchanged |
+| anchored and stale, signing works | refreshed and signed as one transaction |
+| anchored and stale, signing refuses | **nothing is written**; the previous signed pin starts |
+
+The third row is the point. A locked keychain is every unattended launchd run, and there the session
+comes up on the PREVIOUS build with its grants intact, and says so in the signing step's own words
+— quoted rather than summarised, so the line matches what `zellij session doctor` says next. An
+older build that can still read the files beats a newer one whose grants can only be given back
+through a GUI dialog.
+
+The cost is that a machine stuck in the third row runs the signing ladder on every watchdog tick and
+warns every minute. That is deliberate: the state ends the moment somebody runs
+`zellij session doctor --fix` at the machine, and a warning nobody sees is how the old fault lasted
+two releases.
+
+On Linux and anywhere without a signing context, nothing changes: `refresh_belongs_to_signing` never
+defers, and the copy runs as it always did.
 
 **Known limitation: the rename is not coordinated with `session up`.** Signing is copy → sign →
 verify → `rename`, and `install_pinned_exe` does its own copy → rename. A `session up` that lands a
