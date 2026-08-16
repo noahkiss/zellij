@@ -146,19 +146,48 @@ fn session_lifecycle_from(args: &[&str]) -> SessionLifecycleCli {
 }
 
 #[test]
-fn session_up_comes_up_fresh_unless_a_restore_is_asked_for() {
-    // the distinction the flag exists for: no --restore means the layout, which is what makes a
-    // layout edit apply
+fn session_up_resumes_unless_told_otherwise() {
+    // the default a bare `up` carries: neither flag, which the command reads as "come back as you
+    // were, from whichever store still holds the shape"
     match session_lifecycle_from(&["zellij", "session", "up", "work"]) {
         SessionLifecycleCli::Up {
             session_name,
             restore,
+            fresh,
         } => {
             assert_eq!(session_name.as_deref(), Some("work"));
+            assert_eq!(restore, None);
+            assert!(!fresh);
+        },
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_up_fresh_is_how_a_layout_edit_applies() {
+    match session_lifecycle_from(&["zellij", "session", "up", "work", "--fresh"]) {
+        SessionLifecycleCli::Up { fresh, restore, .. } => {
+            assert!(fresh);
             assert_eq!(restore, None);
         },
         other => panic!("Expected `up`, got {:?}", other),
     }
+}
+
+#[test]
+fn session_up_refuses_fresh_together_with_restore() {
+    // the two say opposite things about the same session, so clap rejects the pair rather than
+    // leaving `up` to pick a winner
+    assert!(parse_cli(&[
+        "zellij",
+        "session",
+        "up",
+        "work",
+        "--fresh",
+        "--restore",
+        "abc123"
+    ])
+    .is_err());
 }
 
 #[test]

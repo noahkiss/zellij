@@ -425,6 +425,17 @@ pub struct Options {
     #[serde(default)]
     pub detect_agents: Option<bool>,
 
+    /// Whether a plain `zellij session up` comes back with the shape the session had. Default:
+    /// true. `up` already resurrects from the in-place cache that a crash leaves behind; this is
+    /// what makes it reach the archived snapshot as well, which is the only copy left after a
+    /// `session down` or a `delete-session`. Set it false to go back to coming up from the layout
+    /// whenever the in-place cache is gone. `--fresh` does the same for one invocation.
+    /// config.kdl only - it is read by the command that creates the session, which is all it
+    /// affects.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_up_resume: Option<bool>,
+
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
     #[clap(skip)]
@@ -690,6 +701,7 @@ impl Options {
             .clone()
             .or_else(|| self.report_pane_env.clone());
         let detect_agents = other.detect_agents.or(self.detect_agents);
+        let session_up_resume = other.session_up_resume.or(self.session_up_resume);
         let default_floating_size = other
             .default_floating_size
             .clone()
@@ -784,6 +796,7 @@ impl Options {
             resurrect_command_hints,
             report_pane_env,
             detect_agents,
+            session_up_resume,
             default_floating_size,
             styled_underlines,
             serialization_interval,
@@ -898,6 +911,7 @@ impl Options {
             .clone()
             .or_else(|| self.report_pane_env.clone());
         let detect_agents = other.detect_agents.or(self.detect_agents);
+        let session_up_resume = other.session_up_resume.or(self.session_up_resume);
         let default_floating_size = other
             .default_floating_size
             .clone()
@@ -992,6 +1006,7 @@ impl Options {
             resurrect_command_hints,
             report_pane_env,
             detect_agents,
+            session_up_resume,
             default_floating_size,
             styled_underlines,
             serialization_interval,
