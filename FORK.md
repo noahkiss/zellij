@@ -18,6 +18,10 @@ That pours a prebuilt binary from the fork's GitHub releases (glibc linux x86_64
 Anywhere else — musl, linux arm64, intel macs — use `noahkiss/tap/zellij-nkmk-source`, which is
 the same version built from the tag tarball.
 
+The tap carries a third formula, `zellij-nkmk-rc`. It exists to prove a patch before it lands and
+points at whatever candidate is being tested — see [Releasing](#releasing). Do not install it
+unless you are the one proving the patch.
+
 It installs a binary named `zellij`, so it conflicts with the `zellij` formula. Unlink that first:
 
 ```
@@ -4106,6 +4110,28 @@ targets — `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` — and attach
 creating the release if it does not exist. Nothing else is published: no musl, no linux arm64, no
 intel mac, no Windows.
 
+A patch is proved as a **release candidate** before it lands. On its branch, bump the version it is
+heading for, then tag `v<version>-rc.1` and push the tag. The pipeline runs exactly as below, with
+two differences: the GitHub release is marked `--prerelease`, and the tap bump rewrites
+`zellij-nkmk-rc` instead of `zellij-nkmk`. So the candidate can be installed on a real Mac while
+every machine keeps running the last final release:
+
+```
+brew update && brew unlink zellij-nkmk
+brew install noahkiss/tap/zellij-nkmk-rc
+zellij --version
+```
+
+and, when the proof is done:
+
+```
+brew uninstall zellij-nkmk-rc && brew link zellij-nkmk
+```
+
+`-rc.2`, `-rc.3` follow the same way. The version the binary reports has no `-rc.N` in it — the
+suffix lives on the tag, not in `Cargo.toml` — which is why the tap strips it before checking an
+install. Once the candidate holds up, squash-merge the branch and cut the final tag from main:
+
 1. Land the patches, bump the workspace version in `Cargo.toml` (and the `zellij-client` /
    `zellij-server` pins), `cargo build --release` once so `Cargo.lock` is current, commit.
 2. `git push origin main`, wait for the **`Rust`** workflow to go green — it builds the plugins
@@ -4114,16 +4140,23 @@ intel mac, no Windows.
 3. Watch the run: `gh run watch -R noahkiss/zellij $(gh run list -R noahkiss/zellij --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')`.
 4. The tap bump runs itself. The `bump-tap` job dispatches `bump-zellij.yml` in
    `noahkiss/homebrew-tap` once `finalize` has published the release, then waits for it. That
-   workflow rewrites both formulae from the release's `.sha256` assets and proves them with a real
-   `brew install` on macOS and Linux before it commits. No sha is transcribed by hand.
+   workflow rewrites the formulae from the release's `.sha256` assets and proves them with a real
+   `brew install` on macOS and Linux before it commits. No sha is transcribed by hand. Which
+   formula it rewrites comes from the tag: `zellij-nkmk-rc` for a `-rc.` tag, `zellij-nkmk`
+   otherwise. The tap re-derives the same rule and refuses a dispatch that disagrees.
 
    The dispatch needs `HOMEBREW_TAP_TOKEN` — a PAT with `workflow` scope on the tap, because this
    repo's `GITHUB_TOKEN` cannot dispatch another repo. Without it the job prints this fallback and
    passes, so a release never fails for want of the token:
 
    ```
-   gh workflow run bump-zellij.yml -R noahkiss/homebrew-tap -f tag=v<version>
+   gh workflow run bump-zellij.yml -R noahkiss/homebrew-tap -f tag=v<version> -f formula=zellij-nkmk
    ```
+
+5. Update the docs that live **outside** this repo. The operator's skill files record the current
+   version and the install steps, and nothing in CI compares them against the tag — a stale one
+   fails silently, describing the previous release while reporting success. They are part of the
+   release, not tooling around it.
 
 A pour of the prebuilt formula reinstalls in about 2 seconds. If a test install takes minutes
 instead, it fell through to a source build because `brew` read a **stale local tap clone** — run

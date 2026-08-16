@@ -53,6 +53,35 @@ the ignore: run `git status` before you commit and confirm no private note is st
   `changelogs/v<version>.md` in the same breath, and updating any out-of-repo notes that record the
   current version — the operator's tooling docs go stale silently and nothing in CI catches it.
 
+## Branch, RC, squash-merge, rebase
+
+One patch, one branch, one commit on main. The branch is where the work is messy; main keeps the
+patch ledger readable, because the rebase onto a newer upstream tag replays it commit by commit.
+
+1. **Branch per patch.** Never commit a patch to main directly.
+2. **Prove it with a release candidate, on the branch.** Tag `v<version>-rc.1`, `-rc.2`, … and push
+   the tag. `release.yml` builds and publishes an RC exactly like a final tag, with two differences:
+   the GitHub release is marked `--prerelease`, and the tap bump rewrites the separate
+   `zellij-nkmk-rc` formula. A Mac proof agent then installs the candidate without disturbing the
+   formula every machine runs:
+
+   ```
+   brew update && brew unlink zellij-nkmk
+   brew install noahkiss/tap/zellij-nkmk-rc
+   # ... prove the patch ...
+   brew uninstall zellij-nkmk-rc && brew link zellij-nkmk
+   ```
+
+   An RC tag carries a suffix the binary does not: the branch bumps `Cargo.toml` to the final
+   version, so `zellij --version` prints `0.45.0-nkmk.12` under a `v0.45.0-nkmk.12-rc.1` tag. Both
+   the tap's install check and the rc formula's test block strip `-rc.N` before comparing.
+3. **Land by squash-merge**, so one ledger entry is one commit. `FORK.md` is updated in that commit,
+   not in a follow-up.
+4. **Tag the final release from main** — `v<version>`, no suffix. It bumps `zellij-nkmk` as before.
+   RC tags are proof, never install targets; nothing outside the rc formula points at one.
+5. **Rebase onto a newer upstream tag** with `git rebase --onto <new-base> <old-base> main`, then
+   record the new base in `FORK.md`.
+
 ## Build and test
 
 ```
@@ -84,8 +113,10 @@ Whole-binary builds are the expensive ones, because they pull in `zellij-server`
 `wasmtime`. Prefer `cargo check` and a `-p <crate>` test while iterating, and keep the full
 `cargo build --release` for the end.
 
-CI also runs `cargo xtask build` and `cargo xtask test` on Linux, macOS and Windows, plus a
-`--no-web` test pass. A change behind a feature flag still has to compile without it.
+CI also runs `cargo xtask build` and `cargo xtask test` on Linux and macOS, plus a `--no-web` test
+pass. A change behind a feature flag still has to compile without it. **There is no Windows job**,
+and Windows is not a shipped target — the release builds `x86_64-unknown-linux-gnu` and
+`aarch64-apple-darwin` and nothing else. Do not spend effort on a Windows-only failure.
 
 **A change to `zellij-utils` must also build for wasm, and nothing here checks that for you.**
 
@@ -108,9 +139,9 @@ parses its config block and is built for wasm — so the reference crossed the g
 could be rebuilt from then until `fa6bb9bc6`.
 
 **CI caught it immediately. Nobody looked.** The `Rust` workflow builds plugins from source via
-`cargo xtask build`, so every run from nkmk.7 on failed with this exact error on ubuntu, macOS,
-Windows and the `--no-web` pass — seven jobs red for two releases while the `Release` workflow, which
-ships prebuilt assets, stayed green and made it look fine. So:
+`cargo xtask build`, so every run from nkmk.7 on failed with this exact error on ubuntu, on macOS
+and in the `--no-web` pass — most of the workflow red for two releases while the `Release` workflow,
+which ships prebuilt assets, stayed green and made it look fine. So:
 
 ```
 gh run list -R <fork> --limit 10 --json workflowName,conclusion,headBranch
