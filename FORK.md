@@ -4111,6 +4111,25 @@ The cost of the new default is that a `down` followed by an `up` a fortnight lat
 fortnight-old shape. That is the requested semantic — the shape is what the archive is for — and it
 is why the output names the snapshot and how old it is rather than restoring quietly.
 
+### The server serializes and archives on SIGTERM
+
+A session used to die badly on the ordinary ways a machine ends one. `systemctl --user stop`, a
+logout and a reboot all send the server SIGTERM, and the server had no handler for it: the process
+went at once, so the newest shape on disk was whatever the periodic serializer last wrote — up to a
+whole `serialization_interval` old, 60 seconds by default — and **no snapshot was archived at all**.
+The one moment a person most wants the shape back is the reboot, and it was the one path that cut
+nothing.
+
+The server now listens for SIGTERM on its own thread and sends itself `ServerInstruction::KillSession`,
+which is the same graceful path `zellij kill-session` has always taken: serialize once more, tell
+every client, then archive on the way out. Nothing new can hang in it that could not hang there.
+
+The thread is not started for the in-process server the integration tests run — that one shares the
+harness's process, and a test runner's signals are not its to answer.
+
+It pairs with `session up` resuming by default: the reboot now leaves a current snapshot, and the
+`up` that follows it finds one.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
