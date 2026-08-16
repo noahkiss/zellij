@@ -3,6 +3,13 @@ name: Release
 # Fork release pipeline. Builds only the targets this fork is installed on
 # (glibc linux x86_64, macOS arm64 and x86_64) and publishes the bare `zellij`
 # binary as a tarball for the homebrew tap to pour.
+#
+# A RELEASE CANDIDATE is any tag carrying `-rc.` — `v0.45.0-nkmk.12-rc.1`, pushed
+# from the patch branch rather than from main. It builds and publishes exactly
+# like a final tag, with two differences: the GitHub release is marked
+# `--prerelease`, and the tap bump rewrites the SEPARATE `zellij-nkmk-rc` formula
+# instead of `zellij-nkmk`. So proving a patch on a real Mac never touches the
+# formula every machine installs from.
 
 on:
   push:
@@ -37,7 +44,13 @@ jobs:
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
-          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "" --draft
+          # Marked here as well as in `finalize`, so a draft that never gets
+          # published is already labelled for anyone who looks at it.
+          args=(--title "$tag" --notes "" --draft)
+          case "$tag" in
+            *-rc.*) args+=(--prerelease) ;;
+          esac
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" "${args[@]}"
 
   build:
     needs: create-release
@@ -126,7 +139,13 @@ jobs:
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
-          gh release edit "$tag" --draft=false
+          # Set explicitly in both directions: a rebuild of an existing tag must
+          # not inherit whatever the release was marked as last time.
+          case "$tag" in
+            *-rc.*) prerelease=true ;;
+            *)      prerelease=false ;;
+          esac
+          gh release edit "$tag" --draft=false --prerelease="$prerelease"
 
   # The last manual step in a release: firing the tap's bump. It runs after
   # `finalize`, never beside it — the tap asserts every asset is attached before
@@ -157,9 +176,18 @@ jobs:
           fi
           echo "tap_repo=${TAP_REPO}" >> "$GITHUB_OUTPUT"
 
+          # Which formula this tag owns. The tap re-derives the same rule from the
+          # tag and refuses a mismatch, so a hand-run dispatch that forgets the
+          # input fails instead of pointing `zellij-nkmk` at a candidate.
+          case "$tag" in
+            *-rc.*) formula='zellij-nkmk-rc' ;;
+            *)      formula='zellij-nkmk' ;;
+          esac
+          echo "bumping ${formula}"
+
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::notice::HOMEBREW_TAP_TOKEN not set - bump the tap by hand:"
-            echo "  gh workflow run bump-zellij.yml -R ${TAP_REPO} -f tag=${tag}"
+            echo "  gh workflow run bump-zellij.yml -R ${TAP_REPO} -f tag=${tag} -f formula=${formula}"
             echo "dispatched=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -171,7 +199,7 @@ jobs:
 
           for attempt in 1 2 3 4 5 6; do
             if gh workflow run bump-zellij.yml -R "$TAP_REPO" \
-                 -f tag="$tag" -f request_id="$request_id"; then
+                 -f tag="$tag" -f formula="$formula" -f request_id="$request_id"; then
               echo "dispatched ${request_id}"
               echo "dispatched=true" >> "$GITHUB_OUTPUT"
               exit 0
