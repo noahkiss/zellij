@@ -211,6 +211,15 @@ fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
         PinOutcome::Refreshed(path) => {
             println!("      refreshed the pinned copy at {}", path.display())
         },
+        PinOutcome::Signed(path) => {
+            println!(
+                "      refreshed and signed the pinned copy at {}",
+                path.display()
+            )
+        },
+        // the pin was left alone because this run could not sign it, and the sink has already said
+        // so in full. A second line here would read as a second fault.
+        PinOutcome::Kept(_) => {},
         PinOutcome::UpToDate(_) => {},
     }
     Ok(())
@@ -219,46 +228,6 @@ fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
 #[cfg(not(unix))]
 fn pin_this_build_at(_pinned: &PathBuf) -> Result<(), String> {
     Ok(())
-}
-
-/// Refresh a SIGNED pin through the signing transaction instead of copying over it.
-///
-/// `true` when this owned the refresh - worked or refused - and the plain copy must not run. The
-/// refusal is the case that matters: it leaves the PREVIOUS signed pin exactly where it was and
-/// says so, because a launcher-run session on an older build that still holds its macOS grants is
-/// worth more than a new build whose grants can only be given back through a GUI dialog.
-#[cfg(target_os = "macos")]
-fn refresh_signed_pin(pinned: &PathBuf, config_dir: Option<PathBuf>) -> bool {
-    match crate::session_doctor_macos::refresh_pin_through_signing(pinned, config_dir) {
-        None => false,
-        Some(Ok(())) => {
-            println!(
-                "      refreshed and signed the pinned copy at {}",
-                pinned.display()
-            );
-            true
-        },
-        Some(Err(reason)) => {
-            eprintln!("warning: the pin was NOT refreshed: {}", reason);
-            eprintln!(
-                "         the previously signed copy is still in place, on the previous build,"
-            );
-            eprintln!(
-                "         and that is the build this session starts. Every grant it holds is"
-            );
-            eprintln!(
-                "         intact. Run `zellij session doctor --fix` from a desktop terminal to"
-            );
-            eprintln!("         finish the upgrade.");
-            true
-        },
-    }
-}
-
-/// Nowhere but macOS records a grant against a signature, so nowhere else has a pin worth signing.
-#[cfg(not(target_os = "macos"))]
-fn refresh_signed_pin(_pinned: &PathBuf, _config_dir: Option<PathBuf>) -> bool {
-    false
 }
 
 /// Keep the pinned copy current, on the path the INSTALLED UNIT records.
@@ -272,17 +241,21 @@ fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>, opts: &
     let Some(configured) = configured_pinned_exe(extras) else {
         return;
     };
-    // the same resolution doctor makes, so both flows keep their certificate backup in one place
-    let config_dir = opts
-        .config_dir
-        .clone()
-        .or_else(zellij_utils::home::find_default_config_dir);
+    // The pin's writer signs for itself; what it cannot work out is where THIS run keeps its
+    // config, and doctor resolves that the same way - so both flows leave the certificate backup
+    // in one place.
+    zellij_utils::session_signing::set_pin_signing_policy(
+        zellij_utils::session_signing::PinSigningPolicy {
+            allowed: true,
+            backup_dir: opts
+                .config_dir
+                .clone()
+                .or_else(zellij_utils::home::find_default_config_dir),
+        },
+    );
     let installed = session_service::installed_session_exe(name);
     match session_service::pin_state(&configured, installed.as_deref()) {
         PinState::Recorded(path) | PinState::Unrecorded(path) => {
-            if refresh_signed_pin(&path, config_dir) {
-                return;
-            }
             if let Err(reason) = pin_this_build_at(&path) {
                 eprintln!("warning: {}", reason);
             }

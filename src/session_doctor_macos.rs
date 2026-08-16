@@ -18,13 +18,11 @@
 use std::path::{Path, PathBuf};
 
 use zellij_utils::consts::ZELLIJ_TMP_DIR;
-use zellij_utils::session_doctor::{
-    Commander, DoctorMode, Finding, Report, Status, SystemCommander,
-};
+use zellij_utils::session_doctor::{Commander, DoctorMode, Finding, Report, SystemCommander};
 use zellij_utils::session_lifecycle::launchctl;
 use zellij_utils::session_service::{find_session_job, installed_launch_agents, launchd_label};
 use zellij_utils::session_signing::{
-    refresh_belongs_to_signing, sign_pin, SigningContext, SigningDir,
+    refresh_belongs_to_signing, sign_pin, signing_context, NO_HOME,
 };
 
 /// How long to wait for a pane to write its answer before giving up on it.
@@ -349,95 +347,6 @@ fn check_signature(
     report.extend(sign_pin(commander, pinned, mode, &context).findings);
 }
 
-/// What a run with no `HOME` is told, wherever it is asked to sign.
-const NO_HOME: &str = "no HOME, so there is nowhere to keep a signing certificate";
-
-/// The three paths `session_signing` cannot work out for itself.
-///
-/// Built here rather than at each call site so that `session up` signs with the same certificate,
-/// in the same keychain, that doctor does - two flows reaching for two identities would be two
-/// signatures, and the second would void the grants the first earned.
-fn signing_context(
-    commander: &SystemCommander,
-    config_dir: Option<PathBuf>,
-    refresh_from: Option<PathBuf>,
-) -> Option<SigningContext> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    Some(SigningContext {
-        signing_dir: SigningDir::new(home.join("Library/Application Support/zellij/signing")),
-        keychain: default_keychain(commander),
-        // an environment variable holding a password is not a thing to want; it is the only way a
-        // run over SSH can answer the keychain's dialog, and a run that cannot answer it hangs
-        keychain_password: std::env::var("ZELLIJ_KEYCHAIN_PASSWORD").ok(),
-        refresh_from,
-        backup_dir: config_dir,
-    })
-}
-
-/// Refresh the pin through the signing transaction, for a caller that is not doctor.
-///
-/// `session up` pins the running build on every pass, and the copy it made had no signing step in
-/// it: it replaced a SIGNED pin with an unsigned one and took every macOS grant on that path with
-/// it, repairable only through a GUI dialog. The transaction that refreshes and signs as one step
-/// already existed and only doctor could reach it. This is the other door into it.
-///
-/// Three answers, and the middle one is the point:
-///
-/// - `None` - the ordinary copy still owns this refresh. The pin is already current, or it is
-///   ad-hoc and holds no grant a failed signing run could destroy. Nothing changes for those.
-/// - `Some(Ok(()))` - the new build is at the pin's path and signed, in one transaction.
-/// - `Some(Err(reason))` - the transaction refused, most often a keychain that will not release
-///   the key to an unattended run. The PREVIOUS signed pin is still at the path, byte for byte,
-///   and the caller starts that. An older build that keeps its grants beats a new one that loses
-///   them and can only be repaired at the machine.
-pub(crate) fn refresh_pin_through_signing(
-    pinned: &Path,
-    config_dir: Option<PathBuf>,
-) -> Option<Result<(), String>> {
-    let mode = DoctorMode {
-        fix: true,
-        sign: true,
-        dry_run: false,
-    };
-    // the same question doctor asks, so the two agree about whose refresh this is
-    let source = deferred_refresh(pinned, mode)?;
-    let commander = SystemCommander;
-    // no HOME and a signed pin to protect: refusing is the answer, because falling through to the
-    // plain copy is exactly the fault this exists to stop
-    let Some(context) = signing_context(&commander, config_dir, Some(source.clone())) else {
-        return Some(Err(NO_HOME.to_owned()));
-    };
-    let run = sign_pin(&commander, pinned, mode, &context);
-    // asked of the disk rather than read out of the findings: what matters is whether the new
-    // build is at the path, and that is a fact the transaction leaves behind either way
-    if zellij_utils::session_lifecycle::pin_needs_refresh(&source, pinned) {
-        Some(Err(refusal_from(&run.findings)))
-    } else {
-        Some(Ok(()))
-    }
-}
-
-/// The reason the signing transaction gave, in one line.
-///
-/// The first finding that is not "already correct", message and notes joined - the ladder reports
-/// the rung it stopped on, and quoting it beats inventing a summary that will not match what
-/// `zellij session doctor` says a moment later.
-fn refusal_from(findings: &[Finding]) -> String {
-    findings
-        .iter()
-        .find(|finding| finding.status == Status::NeedsYou)
-        .or_else(|| findings.last())
-        .map(|finding| {
-            let mut said = finding.message.clone();
-            for note in &finding.notes {
-                said.push_str("; ");
-                said.push_str(note.trim());
-            }
-            said
-        })
-        .unwrap_or_else(|| "the signing step said nothing".to_owned())
-}
-
 /// The build this run must put at the pin's path, when the refresh belongs to the signing
 /// transaction rather than to the step before it.
 ///
@@ -451,50 +360,4 @@ pub fn deferred_refresh(pinned: &Path, mode: DoctorMode) -> Option<PathBuf> {
         .as_deref()
         .is_some_and(|exe| zellij_utils::session_lifecycle::pin_needs_refresh(exe, pinned));
     refresh_belongs_to_signing(&SystemCommander, pinned, mode, current_exe, needs_refresh)
-}
-
-/// The keychain `codesign` will look in.
-///
-/// Asked rather than assumed: `login.keychain-db` is the answer on almost every machine and not on
-/// all of them, and importing into a keychain nothing searches is an import that reports success
-/// and leaves nothing able to sign.
-fn default_keychain(commander: &SystemCommander) -> String {
-    commander
-        .run("security", &["default-keychain", "-d", "user"], None)
-        .ok()
-        .map(|output| output.stdout.trim().trim_matches('"').to_owned())
-        .filter(|keychain| !keychain.is_empty())
-        .unwrap_or_else(|| String::from("login.keychain-db"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The line `session up` prints when the transaction refused has to be the transaction's own
-    /// reason. A summary written here would drift from what `session doctor` says a minute later,
-    /// and the two disagreeing is worse than either being terse.
-    #[test]
-    fn a_refusal_quotes_the_rung_the_ladder_stopped_on() {
-        let findings = vec![
-            Finding::ok("signing", "the certificate is in the keychain"),
-            Finding::needs_you("signing", "the keychain would not release the key")
-                .note("the pin was NOT refreshed: the new build could not be signed, so the")
-                .note("previously signed copy is still in place, on the previous build"),
-        ];
-        let said = refusal_from(&findings);
-        assert!(said.starts_with("the keychain would not release the key"));
-        assert!(said.contains("the pin was NOT refreshed"));
-    }
-
-    /// A run where nothing needed a person still has to say something: the caller only reaches
-    /// this when the pin did not move, so silence there would be a warning with no reason in it.
-    #[test]
-    fn a_refusal_with_nothing_needing_a_person_still_says_something() {
-        assert_eq!(
-            refusal_from(&[Finding::ok("signing", "left alone")]),
-            "left alone"
-        );
-        assert_eq!(refusal_from(&[]), "the signing step said nothing");
-    }
 }

@@ -2533,35 +2533,55 @@ disagreement in the "skip" direction would drop the refresh with nothing reporti
 already **ad-hoc** is refreshed first as before: it holds no grant a rebuild could keep, so pinning
 the new build is worth more than protecting a signature that was never load-bearing.
 
-**`session up` refreshes the pin through the same transaction.** It used to do the plain
-`install_pinned_exe` copy → rename with no signing step, so an upgrade whose first command was
-`session up` — rather than `session doctor` — put an ad-hoc pin in place exactly as the old doctor
-did, and the grants went with it. That is the one path an upgraded machine actually takes: the
-watchdog runs `session up` every minute, so it wins the race with any shell.
+**One writer, and it never replaces an anchored signature without signing.** The pin used to be
+written by the plain `install_pinned_exe` copy → rename with no signing step, so an upgrade whose
+first command was `session up` — rather than `session doctor` — put an ad-hoc pin in place exactly
+as the old doctor did, and the grants went with it. That is the one path an upgraded machine
+actually takes: the watchdog runs `session up` every minute, so it wins the race with any shell.
 
-`assert_pinned_exe` now asks `refresh_belongs_to_signing` first — the same question doctor asks, so
-the two cannot disagree about whose refresh it is — and when the answer is yes it runs the signing
-transaction instead of the copy. Three outcomes:
+The rule was first written into `assert_pinned_exe`, the caller `session up` goes through. **There
+is a second caller**, and it is the one that runs on every interactive launch:
+`server_exe_for_interactive_launch` (`zellij-utils/src/session_service.rs`) resolves the server
+binary for `start_client`, and it called the copy directly. On a real machine the refusal from the
+first caller printed, and the second caller then overwrote the Apple Development signature with an
+ad-hoc copy of the new build in the same command.
 
-| What the pin is | What `session up` does |
+So the rule lives at the write. `install_pinned_exe` asks `pin_is_anchored` — the same predicate
+`refresh_belongs_to_signing` asks, so the two cannot disagree — the moment it knows it is about to
+overwrite an existing pin, and there is no parameter with which a caller can ask for anything else:
+
+| What the pin is | What ANY caller gets |
 |---|---|
-| current, or ad-hoc | the plain copy, unchanged |
-| anchored and stale, signing works | refreshed and signed as one transaction |
-| anchored and stale, signing refuses | **nothing is written**; the previous signed pin starts |
+| current, or ad-hoc, or unsigned | the plain copy, unchanged |
+| anchored and stale, signing works | refreshed and signed as one transaction (`PinOutcome::Signed`) |
+| anchored and stale, signing refuses | **nothing is written**; the existing pin's path is returned (`PinOutcome::Kept`) |
 
 The third row is the point. A locked keychain is every unattended launchd run, and there the session
 comes up on the PREVIOUS build with its grants intact, and says so in the signing step's own words
 — quoted rather than summarised, so the line matches what `zellij session doctor` says next. An
 older build that can still read the files beats a newer one whose grants can only be given back
-through a GUI dialog.
+through a GUI dialog. The socket is scoped by contract version rather than by version string, so a
+client one build ahead still speaks to that server.
+
+The refusal is said ONCE per pin per process, by the writer. `session up` asserts the pin and then
+launches a client that resolves the server binary through the pin again, so the same refusal is
+reached twice in one command; the second call answers from the first one's decision and never asks
+the keychain again.
+
+What the writer cannot work out for itself is stated once per run instead of passed as a parameter,
+which would put the decision back in the callers' hands: `PinSigningPolicy` carries whether this run
+may sign at all (`false` only for `session doctor --no-sign`) and which config directory holds the
+certificate backup. A run that states no policy — a plain `zellij` launch — signs, which is exactly
+the caller that must. `--no-sign` now leaves an anchored pin BOTH unsigned and unreplaced; it used
+to fall through to the copy and destroy the signature.
 
 The cost is that a machine stuck in the third row runs the signing ladder on every watchdog tick and
 warns every minute. That is deliberate: the state ends the moment somebody runs
 `zellij session doctor --fix` at the machine, and a warning nobody sees is how the old fault lasted
 two releases.
 
-On Linux and anywhere without a signing context, nothing changes: `refresh_belongs_to_signing` never
-defers, and the copy runs as it always did.
+On Linux and anywhere without a signing context, nothing changes: `codesign` cannot answer, no pin
+reads as anchored, and the copy runs as it always did.
 
 **Known limitation: the rename is not coordinated with `session up`.** Signing is copy → sign →
 verify → `rename`, and `install_pinned_exe` does its own copy → rename. A `session up` that lands a
