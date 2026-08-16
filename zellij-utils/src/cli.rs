@@ -847,10 +847,9 @@ pub enum SessionLifecycleCli {
         #[clap(value_parser)]
         session_name: Option<String>,
 
-        /// Build the session from an archived snapshot instead of from the layout. Takes a
-        /// snapshot id (a unique prefix is enough) and defaults to the newest snapshot for this
-        /// session name. Without it the session comes up FRESH from the layout, which is what
-        /// makes a layout edit apply
+        /// Build the session from a NAMED archived snapshot. Takes a snapshot id (a unique prefix
+        /// is enough) and defaults to the newest snapshot for this session name. Without it the
+        /// session still comes back with the shape it had - see --fresh for the layout
         #[clap(
             long,
             value_name = "ID",
@@ -860,6 +859,11 @@ pub enum SessionLifecycleCli {
             default_missing_value("latest")
         )]
         restore: Option<String>,
+
+        /// Build the session from the default layout, discarding the shape it had. This is how a
+        /// layout edit is applied, and the only way past the resume that is otherwise the default
+        #[clap(long, conflicts_with("restore"))]
+        fresh: bool,
     },
 
     /// Remove the session, archiving a snapshot of its shape first, then assert that it is gone

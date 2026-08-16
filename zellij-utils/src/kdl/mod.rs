@@ -3072,6 +3072,9 @@ impl Options {
         };
         let detect_agents =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "detect_agents").map(|(v, _)| v);
+        let session_up_resume =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "session_up_resume")
+                .map(|(v, _)| v);
         let styled_underlines =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "styled_underlines")
                 .map(|(v, _)| v);
@@ -3252,6 +3255,7 @@ impl Options {
             session_restart_drop_env,
             report_pane_env,
             detect_agents,
+            session_up_resume,
             session_service,
             resurrect_command_hints,
             default_floating_size,
@@ -3668,6 +3672,14 @@ impl Options {
         let detect_agents = self.detect_agents?;
         let mut node = KdlNode::new("detect_agents");
         node.push(KdlValue::Bool(detect_agents));
+        Some(node)
+    }
+
+    /// The `session_up_resume` node: whether a plain `session up` reaches the snapshot archive.
+    fn session_up_resume_to_kdl(&self) -> Option<KdlNode> {
+        let session_up_resume = self.session_up_resume?;
+        let mut node = KdlNode::new("session_up_resume");
+        node.push(KdlValue::Bool(session_up_resume));
         Some(node)
     }
     fn session_restart_drop_env_to_kdl(&self) -> Option<KdlNode> {
@@ -5509,6 +5521,9 @@ impl Options {
         }
         if let Some(detect_agents) = self.detect_agents_to_kdl() {
             nodes.push(detect_agents);
+        }
+        if let Some(session_up_resume) = self.session_up_resume_to_kdl() {
+            nodes.push(session_up_resume);
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
@@ -9298,6 +9313,21 @@ fn session_restart_drop_env_config_parsing() {
     let serialized = config.to_string(false);
     let deserialized = Config::from_kdl(&serialized, None).unwrap();
     assert_eq!(deserialized.options, config.options);
+}
+
+#[test]
+fn session_up_resume_config_parsing() {
+    let config_contents = r#"
+        session_up_resume false
+    "#;
+    let config = Config::from_kdl(config_contents, None).unwrap();
+    assert_eq!(config.options.session_up_resume, Some(false));
+}
+
+#[test]
+fn session_up_resume_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.session_up_resume, None);
 }
 
 #[test]
