@@ -1372,7 +1372,7 @@ The same preflight is made by `--in-tab` and by `--near`, and `zellij run`, `zel
 ### Session lifecycle: `zellij session up|down|restart`
 
 ```
-zellij session up      [NAME] [--restore [ID]]
+zellij session up      [NAME] [--fresh | --restore [ID]]
 zellij session down    [NAME] [--wait-timeout SECS]
 zellij session restart [NAME] [--fresh | --restore ID]
 ```
@@ -4057,6 +4057,59 @@ crates, no HTTP stack, and nothing on any wasm plugin crate.
 
 Two rows were added to the surface map while wiring this up: `snapshot list` and `snapshot show`
 print a table and a payload respectively, and the map had been claiming they printed nothing.
+
+### `session up` comes back with the shape the session had
+
+```
+zellij session up      [NAME] [--fresh | --restore [ID]]
+session_up_resume true   # config.kdl, top level, default true
+```
+
+A bare `session up` used to mean two different things depending on a file nobody looks at. `up`
+ends in `attach --create`, and `attach` resurrects a dead name from the in-place cache
+(`session_info/<name>/session-layout.kdl`) by itself — so a crash, a SIGKILL and a reboot already
+came back with the previous panes. `session down` and `delete-session` **remove** that file after
+archiving a snapshot of it, so the same command after a `down` built the session from the layout
+instead. The archive held the shape and nothing but an explicit `--restore` ever read it.
+
+That gap is not a rare one, because the watchdog runs `session up` every minute: a `session down`
+followed by a minute of doing something else came back as a default layout, and the shape was still
+sitting in the archive.
+
+`up` now resolves one of three sources, in this order:
+
+| What is on disk | What `up` builds from |
+|---|---|
+| the in-place cache | that (unchanged — `attach` does it) |
+| no cache, a snapshot for this name | the **newest snapshot**, named with its age in the output |
+| neither | the layout (unchanged) |
+
+`--fresh` is the way to the layout, and it discards the in-place cache rather than ignoring it, the
+same as `attach --no-resurrect`. The archived snapshot survives that, so a shape thrown away by
+`--fresh` is still reachable with `session up --restore`.
+
+The three states are an enum (`Resume`, `Fresh`, `Snapshot(id)`), and that is load-bearing rather
+than tidy. `session restart --fresh` used to say "come back from no snapshot" by passing `None`,
+which under a resuming default is now indistinguishable from "come back from whatever you find".
+The enum is what keeps `restart --fresh` on the layout.
+
+Two behaviours follow from the difference between a shape somebody **named** and a shape `up`
+**derived**:
+
+- `--restore` into a running session still exits 2 — there is nothing to restore into. A bare `up`
+  that finds the session running reports "already running" as it always did, and does not start
+  exiting 2 at the watchdog once a minute.
+- A snapshot that no longer parses fails the command when it was named (`attach --restore` exits 2
+  rather than starting something the caller did not ask for), and only **warns** when `up` picked
+  it. A watchdog tick that leaves the machine with no session at all is a worse answer than a
+  session from the layout and a line saying why. The unreadable snapshot is left on disk.
+
+`session_up_resume false` in `config.kdl` goes back to the old behaviour. It is top level, so a
+binary that predates it ignores it rather than failing the whole config.
+
+The cost of the new default is that a `down` followed by an `up` a fortnight later rebuilds a
+fortnight-old shape. That is the requested semantic — the shape is what the archive is for — and it
+is why the output names the snapshot and how old it is rather than restoring quietly.
 
 ## Assessed and deliberately not built
 
