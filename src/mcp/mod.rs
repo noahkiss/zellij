@@ -94,6 +94,12 @@ impl ZellijMcp {
             // exit 2 is the fork's "well-formed request about something that is not there". It is
             // the reason a create tool can be honest: a pane that was not made says so, and there
             // is no id here to invent
+            //
+            // A pane privacy policy has no reason of its own here. It answers as the miss answers,
+            // to the byte, so that a caller cannot tell a withheld pane from one that was never
+            // there - a `withheld` reason would be the oracle the whole filter exists to deny.
+            // `zellij_overview` still carries the aggregate count, which is where a caller learns
+            // that its view is partial.
             structured.insert(
                 "reason".to_owned(),
                 json!(if outcome.is_miss() { "miss" } else { "error" }),

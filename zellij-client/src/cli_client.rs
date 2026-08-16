@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zellij_utils::{
     agent_detect,
     cli::{SubscribeCli, SubscribeFormat},
-    data::{PaneId, PaneListEntry},
+    data::{ListAgentsEnvelope, ListPanesEnvelope, PaneId, PaneListEntry},
     errors::prelude::*,
     input::actions::Action,
     ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
@@ -709,6 +709,7 @@ pub fn start_list_agents_client(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     output_json: bool,
+    report_withheld: bool,
 ) -> i32 {
     let lines = match ask(
         os_input,
@@ -720,6 +721,9 @@ pub fn start_list_agents_client(
             show_geometry: false,
             show_all: false,
             output_json: true,
+            // always asked for, whatever the caller wants printed: the count is how this command
+            // knows its own answer is partial
+            report_withheld: true,
         },
         "the panes of this session",
     ) {
@@ -729,8 +733,8 @@ pub fn start_list_agents_client(
             return 1;
         },
     };
-    let panes: Vec<PaneListEntry> = match serde_json::from_str(&lines.join("\n")) {
-        Ok(panes) => panes,
+    let envelope: ListPanesEnvelope = match serde_json::from_str(&lines.join("\n")) {
+        Ok(envelope) => envelope,
         // a session that answered with something other than a pane list is a bug rather than a
         // miss, so it is an error and says what it could not read
         Err(e) => {
@@ -741,9 +745,15 @@ pub fn start_list_agents_client(
             return 1;
         },
     };
-    let agents = agent_detect::agents_from_pane_list(panes);
+    let withheld = envelope.withheld;
+    let agents = agent_detect::agents_from_pane_list(envelope.panes);
     if output_json {
-        match serde_json::to_string_pretty(&agents) {
+        let json = if report_withheld {
+            serde_json::to_string_pretty(&ListAgentsEnvelope { agents, withheld })
+        } else {
+            serde_json::to_string_pretty(&agents)
+        };
+        match json {
             Ok(json) => println!("{}", json),
             Err(e) => {
                 eprintln!("Could not write the agent list as JSON: {}", e);
@@ -753,6 +763,11 @@ pub fn start_list_agents_client(
     } else {
         for line in agent_detect::agent_table(&agents) {
             println!("{}", line);
+        }
+        // the walk this answer is filtered from was itself partial, and a reader looking for an
+        // agent that is not listed should know that before they go looking for the bug
+        if withheld > 0 {
+            println!("withheld: {}", withheld);
         }
     }
     0
@@ -782,6 +797,9 @@ fn wait_for_exit(
                 show_geometry: false,
                 show_all: true,
                 output_json: true,
+                // a wait is about ONE pane, and a withheld pane is refused when the target is
+                // resolved, before the wait starts. The envelope would only be unwrapped again
+                report_withheld: false,
             },
             &pane.to_string(),
         )
