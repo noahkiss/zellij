@@ -1,3 +1,8 @@
+> **This is a personal fork.** It is upstream zellij v0.44.3 plus a small patch queue
+> (plugin hot-reload, declarative plugin permissions, session-lifecycle fixes). See
+> [FORK.md](FORK.md) for what changed and how to install it. Issues and pull requests are not
+> accepted here — please use [zellij-org/zellij](https://github.com/zellij-org/zellij).
+
 <h1 align="center">
   <br>
   <img src="https://raw.githubusercontent.com/zellij-org/zellij/main/assets/logo.png" alt="logo" width="200">
