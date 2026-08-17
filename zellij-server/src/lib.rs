@@ -998,6 +998,23 @@ fn promote_orphaned_session_info_folders(own_session_name: &str, settings: &Snap
 }
 
 pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
+    // The listener below unlinks whatever sits at this path before it binds, which is right for a
+    // socket a dead server left behind and catastrophic for one a live server is still holding:
+    // the old server keeps running, keeps its panes, and becomes unreachable by any client,
+    // because a unix socket cannot be given its pathname back. Nothing upstream of here is
+    // guaranteed to have checked -- the client's check is a liveness probe, and a busy server can
+    // fail one -- so the last thing that can still refuse, does.
+    #[cfg(unix)]
+    if zellij_utils::consts::ipc_connect(&socket_path).is_ok() {
+        let message = format!(
+            "refusing to start: a server is already listening on {}",
+            socket_path.display()
+        );
+        log::error!("{}", message);
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
+
     info!("Starting Zellij server!");
 
     #[cfg(unix)]
