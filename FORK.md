@@ -3621,6 +3621,29 @@ geometry writes the same size back and the shell hears nothing. A stack that gen
 while the pane was collapsed (a column resize, a moved stack) is picked up on the way out of the
 header, as one legitimate resize.
 
+**The grid half of that sentence was not true at first, and the gap corrupted panes.** Taking
+the pty out of the layout pass was not enough, because the grid is resized by a different route:
+every `set_content_offset` and every `set_geom` calls `TerminalPane::reflow_lines`, which resizes the
+grid to whatever the current geometry and offset imply. A collapsed member was handed two offsets in
+one pass — the upstream branch first, which reserves no title row for a member that is not flexible
+and so implies one content row over a one-row geometry, and the fork's clamp second, which implies
+zero. Only the second is a no-op, because `Grid::change_size` returns early on zero rows. The first
+one really squashed the grid to a single row.
+
+So the pane's program was told it still had N rows, kept drawing N rows, and drew them into a grid
+one row tall. Every absolute cursor move past row 1 scrolled instead of overwriting, and each redraw
+was shredded into the scrollback. Re-expanding grew the grid back and left it holding the tail of one
+frame above the head of the next — a torn pane full of characters from two different redraws, which
+scrolling up and back down appeared to repair because it pulled whole rows back out of the
+scrollback. Reproduced against a real client at 200×50 on 0.45.0-nkmk.12: a collapsed member's grid
+held one line while 45 sat in its scrollback, and re-expanding showed two frames at once.
+
+`reflow_lines` is the single point every one of those routes passes through, so that is where the
+invariant is stated: a collapsed stack member's grid is frozen, by the same
+`is_collapsed_stack_member` predicate that frees its pty. Guarding the layout pass instead would only
+have covered the offsets, and left `set_geom` — which reflows at the moment the geometry becomes one
+row — to squash the grid on its own.
+
 `PaneGeom::is_collapsed_stack_member` names the state — stacked, fixed, one row — and the branch sits
 at the single point every layout pass goes through, so no caller has to remember it and every frame
 style is covered by construction, `full` included: it now skips the resize outright instead of
@@ -3631,6 +3654,18 @@ Two tests in `tab_integration_tests.rs`, both driving a real stack through the m
 runs a series of focus moves in each of the four frame styles and holds that every member is given
 exactly one size, never a one-row size; the other holds the other side, that a tab resized while a
 member was collapsed reaches that member when it is focused.
+
+One integration snapshot moved with the fix, and the direction is the point:
+`disabling_stacked_pane_list_restores_the_classic_stack` recorded a collapsed member wearing a
+`[ SCROLL: 0/1 ]` badge on its title row. That badge was the bug — the member's one line of content
+had been pushed into its scrollback by the squash. A collapsed member now has nothing in scrollback
+and no badge.
+
+`collapsed_stack_member_keeps_its_grid`, in `terminal_pane_tests.rs`, holds the grid half. It writes
+19 lines into a 20-row stack member, collapses it, and replays both of the offsets a layout pass
+applies to a collapsed member, in order — the intermediate one included, since that is the one that
+squashed the grid. It then asserts the grid's rows, columns and contents survive the collapse and the
+re-expansion. Replaying only the clamped offset passes with or without the guard, and tests nothing.
 
 ### Two bars ship in the binary (`slim-tab-bar`, `slim-keybinds`)
 

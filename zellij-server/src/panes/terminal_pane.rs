@@ -1510,6 +1510,19 @@ impl TerminalPane {
         }
     }
     fn reflow_lines(&mut self) {
+        // Fork addition: a collapsed stack member is one row of title with no content area, and
+        // `TiledPanes::set_pane_frames` deliberately leaves its pty at the size the pane had while
+        // expanded. Its grid has to stay there too, or the two disagree: the program keeps drawing
+        // full-height frames into a one-row grid, every absolute cursor move scrolls instead of
+        // overwriting, and each redraw is shredded into the scrollback - which is the "corrupted
+        // pane, fixed by scrolling up and back down" the collapsed-member patch was meant to end.
+        //
+        // This is the one place the invariant can be stated. `set_geom`, `set_geom_override`,
+        // `set_content_offset` and the push/pull helpers all resize the grid through here, and
+        // each of them is reached with the collapsed geometry at some point.
+        if self.current_geom().is_collapsed_stack_member() {
+            return;
+        }
         let rows = self.get_content_rows();
         let cols = self.get_content_columns();
         self.grid.force_change_size(rows, cols);
