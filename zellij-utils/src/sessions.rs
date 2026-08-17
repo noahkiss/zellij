@@ -302,6 +302,57 @@ fn socket_answers(stream: interprocess::local_socket::Stream) -> bool {
     }
 }
 
+/// Whether a server is bound to this session's socket, without asking it anything.
+///
+/// [`assert_socket`] is the listing question: it wants a server that answers, and a server that
+/// accepts the connection but does not reply is reported as absent. That is the right answer for a
+/// listing and the wrong one for a *destructive* decision, because creating a session of the same
+/// name unlinks that socket and takes the name -- orphaning a server whose panes are still running,
+/// with nothing left that can reach it.
+///
+/// So this asks the smaller question that cannot go wrong: is the accept queue there. A successful
+/// connect means a live process is listening, whatever it goes on to say.
+#[cfg(unix)]
+pub fn socket_is_occupied(name: &str) -> bool {
+    socket_path_is_occupied(&ZELLIJ_SOCK_DIR.join(name))
+}
+
+/// [`socket_is_occupied`] for a path, so the answer can be tested without a global socket
+/// directory.
+#[cfg(unix)]
+pub fn socket_path_is_occupied(path: &std::path::Path) -> bool {
+    crate::consts::ipc_connect(path).is_ok()
+}
+
+/// Windows has no socket file to bind over; the marker file plus a pid check is the whole answer.
+#[cfg(not(unix))]
+pub fn socket_is_occupied(name: &str) -> bool {
+    assert_socket(name)
+}
+
+/// Refuse, loudly, to do something that would take the name of a session a server still holds.
+///
+/// Says what it found and what to do about it, and never falls through: the caller's next move
+/// would destroy the session it is describing.
+pub fn refuse_to_replace_live_session(name: &str, what: &str) -> ! {
+    eprintln!(
+        "{}: a server is already listening for session '{}'.",
+        what, name
+    );
+    eprintln!("  socket: {}", ZELLIJ_SOCK_DIR.join(name).display());
+    eprintln!(
+        "  It did not answer the liveness probe, so it is not in `zellij ls` -- but it is there,"
+    );
+    eprintln!("  and creating a session by this name would unlink its socket and orphan it: its");
+    eprintln!("  panes would keep running with nothing able to reach them.");
+    eprintln!(
+        "  Try `zellij attach {}` to reach it, or `zellij session restart {}` to replace it",
+        name, name
+    );
+    eprintln!("  deliberately. Pick another name to start something new.");
+    process::exit(1);
+}
+
 /// [`assert_socket`] for a socket outside `ZELLIJ_SOCK_DIR`, without the stale-socket cleanup.
 #[cfg(unix)]
 fn probe_socket(path: &std::path::Path) -> bool {
@@ -1077,6 +1128,13 @@ pub fn assert_session_ne(name: &str) {
         process::exit(1);
     }
 
+    // `session_exists` is a listing question and a listing can be wrong in the one direction that
+    // costs a session here: a server that is bound but does not answer reads as absent, and the
+    // create that follows would unlink its socket. Ask the smaller question first.
+    if socket_is_occupied(name) && !session_exists(name).unwrap_or(false) {
+        refuse_to_replace_live_session(name, "session create");
+    }
+
     match session_exists(name) {
         Ok(result) if !result => {
             let resurrectable_sessions = get_resurrectable_session_names();
@@ -1396,6 +1454,35 @@ const NOUNS: &[&'static str] = &[
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(unix)]
+    fn socket_path_is_occupied_sees_a_bound_listener() {
+        use crate::consts::ipc_bind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live");
+        let _listener = ipc_bind(&path).unwrap();
+        assert!(
+            super::socket_path_is_occupied(&path),
+            "a bound listener must read as occupied even before it answers anything"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn socket_path_is_occupied_is_false_without_a_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !super::socket_path_is_occupied(&dir.path().join("absent")),
+            "a path with no socket is not occupied"
+        );
+        let stale = dir.path().join("stale");
+        std::fs::write(&stale, b"not a socket").unwrap();
+        assert!(
+            !super::socket_path_is_occupied(&stale),
+            "a regular file left at the socket path is not a live server"
+        );
+    }
+
     use super::*;
     use crate::data::{PaneInfo, PaneManifest, TabInfo};
 
