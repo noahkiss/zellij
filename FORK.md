@@ -1,7 +1,7 @@
 # zellij (noahkiss fork)
 
 A personal fork of [zellij](https://github.com/zellij-org/zellij), rebased onto upstream `main` at
-commit **f42ca3c79** (upstream workspace version **0.45.0**), carrying a curated patch set aimed at
+commit **98a083707** (upstream workspace version **0.45.0**), carrying a curated patch set aimed at
 the plugin development loop and a few session-lifecycle papercuts.
 
 **This fork is not accepting issues or pull requests, and none of these patches have been submitted
@@ -4360,9 +4360,21 @@ command surface answers, not about what is on screen.
 ## Working on this fork
 
 `upstream` points at `zellij-org/zellij`. Each patch is its own commit on top of the recorded
-upstream base, currently `f42ca3c79` on upstream `main`. Moving to a newer base is
-`git fetch upstream && git rebase --onto upstream/main f42ca3c79`, then recording the new base
-here. The two config-surface patches (the watcher and the permission grants) share plumbing and
+upstream base, currently `98a083707` on upstream `main`. Moving to a newer base is
+`git fetch upstream && git rebase --onto upstream/main 98a083707`, then recording the new base
+here.
+
+The base moved from `f42ca3c79` to `98a083707` and took six upstream commits: an opt-in for reading
+the terminal's paste buffer, off by default (`98a083707`); a `copy_command` process that is no
+longer killed while it still owns the selection (`a9db5664b`); scroll position that survives leaving
+scroll mode (`c428ae93b`); a spelling fix in the session name list (`dc6d8209e`); scrollback that is
+no longer truncated when a pane joins a stack in list mode (`6343be42c`); and the missing
+`NestedListItem` colour helpers in the plugin API (`30c9d2fcb`). Three of them met a patch here.
+Upstream's new paste-buffer option and this fork's `default_floating_size` both extend the
+`Reconfigure` instruction, so both fields are carried. Upstream added a private `pane_exists` to
+`Screen` whose body is identical to the one the CLI patches already made public, so the private copy
+is dropped. And upstream's new scroll-mode test snapshot is re-recorded, because a pane frame here
+also carries the pane's two-word handle. The two config-surface patches (the watcher and the permission grants) share plumbing and
 land as one commit.
 
 ```
