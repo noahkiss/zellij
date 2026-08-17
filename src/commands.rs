@@ -15,9 +15,9 @@ use zellij_utils::sessions::{
     discard_resurrection_snapshot, generate_unique_session_name, get_active_session,
     get_resurrectable_sessions, get_sessions, get_sessions_sorted_by_mtime,
     kill_session as kill_session_impl, match_session_name, print_sessions,
-    print_sessions_with_index, resurrection_layout, session_exists,
-    session_in_other_contract_versions, session_listing_error_message, validate_session_name,
-    ActiveSession, KillWait, SessionNameMatch,
+    print_sessions_with_index, refuse_to_replace_live_session, resurrection_layout, session_exists,
+    session_in_other_contract_versions, session_listing_error_message, socket_is_occupied,
+    validate_session_name, ActiveSession, KillWait, SessionNameMatch,
 };
 
 use zellij_utils::consts::session_layout_cache_file_name;
@@ -1210,6 +1210,12 @@ fn attach_with_session_name(
     match &session_name {
         Some(session) if create => match session_exists(session) {
             Ok(true) => ClientInfo::Attach(session_name.unwrap(), config_options),
+            // `--create` turns "I could not see it" into "make one", and the make unlinks the
+            // socket it could not see. A server that is bound but did not answer the probe is a
+            // live session, so refuse rather than take its name away from it.
+            Ok(false) if socket_is_occupied(session) => {
+                refuse_to_replace_live_session(session, "attach --create")
+            },
             Ok(false) => ClientInfo::New(session_name.unwrap(), None, None),
             Err(kind) => {
                 eprintln!("{}", session_listing_error_message(kind));
@@ -1423,6 +1429,17 @@ pub(crate) fn start_client(opts: CliArgs) {
                         .as_ref()
                         .and_then(|s| session_exists(&s).ok())
                         .unwrap_or(false);
+                    // Every branch below that creates -- a fresh session, a resurrection, a
+                    // snapshot restore -- starts a server on this name's socket, and starting one
+                    // unlinks whatever is bound there. `session_exists` is a liveness probe and a
+                    // bound server can fail one, so ask the smaller question before any of them.
+                    if (create || should_create_detached) && !session_exists {
+                        if let Some(name) = session_name.as_ref() {
+                            if socket_is_occupied(name) {
+                                refuse_to_replace_live_session(name, "attach --create");
+                            }
+                        }
+                    }
                     // --restore is the counterpart to --no-resurrect: three explicit behaviours for
                     // a dead name - resurrect from the in-place file (default), start clean
                     // (--no-resurrect), or rebuild from a chosen snapshot
