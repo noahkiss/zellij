@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use zellij_utils::{
     data::{Palette, Style},
-    pane_size::{Offset, PaneGeom, SizeInPixels},
+    pane_size::{Dimension, Offset, PaneGeom, SizeInPixels},
     position::Position,
 };
 
@@ -1204,4 +1204,109 @@ fn a_restored_pane_never_ends_up_at_a_handle_a_live_pane_holds() {
         "a restore put two live panes at one address"
     );
     assert!(!restoring.pane_handle().is_empty());
+}
+
+#[test]
+pub fn collapsed_stack_member_keeps_its_grid() {
+    // A stack member that is collapsed to its title row keeps its pty at the size it had while
+    // expanded, so its grid has to keep that size too. If the grid is reflowed down to the
+    // one-row collapsed geometry, the program in the pane goes on drawing full-height frames
+    // into a one-row grid and every redraw is scrolled into the scrollback instead of
+    // overwriting the screen.
+    let mut expanded = PaneGeom::default();
+    expanded.cols.set_inner(80);
+    expanded.rows.set_inner(20);
+    expanded.stacked = Some(0);
+
+    let pid = 1;
+    let style = Style::default();
+    let sixel_image_store = Rc::new(RefCell::new(SixelImageStore::default()));
+    let terminal_emulator_colors = Rc::new(RefCell::new(Palette::default()));
+    let terminal_emulator_color_codes = Rc::new(RefCell::new(HashMap::new()));
+    let debug = false;
+    let arrow_fonts = true;
+    let styled_underlines = true;
+    let osc8_hyperlinks = true;
+    let explicitly_disable_kitty_keyboard_protocol = false;
+    let mut terminal_pane = TerminalPane::new(
+        pid,
+        expanded,
+        style,
+        0,
+        String::new(),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        sixel_image_store,
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        terminal_emulator_colors,
+        terminal_emulator_color_codes,
+        None,
+        None,
+        debug,
+        arrow_fonts,
+        styled_underlines,
+        osc8_hyperlinks,
+        explicitly_disable_kitty_keyboard_protocol,
+        None,
+    );
+
+    // one row of the stack goes to the member's title, as it does in the titles frame styles
+    terminal_pane.set_content_offset(Offset::shift_right_top_and_bottom(0, 1, 0));
+
+    let mut content = String::new();
+    for line in 0..19 {
+        write!(&mut content, "line {:02}\n\r", line).unwrap();
+    }
+    terminal_pane.handle_pty_bytes(content.into_bytes());
+
+    let expanded_rows = terminal_pane.grid.height;
+    let expanded_cols = terminal_pane.grid.width;
+    let expanded_screen = terminal_pane.dump_screen(false, None);
+    assert_eq!(expanded_rows, 19, "19 content rows under a 1 row title");
+    assert!(
+        expanded_screen.contains("line 18"),
+        "the pane drew its last line before collapsing"
+    );
+
+    // collapse it: a fixed single row, which is what a stack gives a member it is not showing
+    let mut collapsed = expanded;
+    collapsed.rows = Dimension::fixed(1);
+    assert!(
+        collapsed.is_collapsed_stack_member(),
+        "the test collapses the pane the way a stack does"
+    );
+    terminal_pane.set_geom(collapsed);
+    // Replay what `TiledPanes::set_pane_frames` does to a collapsed member under a titles frame
+    // style, in order. A fixed-height member is not flexible, so the upstream branch reserves no
+    // title row for it and hands it an offset with `top: 0` - one content row over a one row
+    // geometry. The fork then clamps `top` to 1 so the member has no content rows at all and its
+    // pty is left alone. It is the first of those two offsets that used to squash the grid.
+    terminal_pane.set_content_offset(Offset::default());
+    terminal_pane.set_content_offset(Offset::shift_right_top_and_bottom(0, 1, 0));
+
+    assert_eq!(
+        terminal_pane.grid.height, expanded_rows,
+        "a collapsed member keeps its grid rows"
+    );
+    assert_eq!(
+        terminal_pane.grid.width, expanded_cols,
+        "a collapsed member keeps its grid columns"
+    );
+    assert_eq!(
+        terminal_pane.dump_screen(false, None),
+        expanded_screen,
+        "a collapsed member keeps its grid contents"
+    );
+
+    // ... and re-expanding to the same geometry gets the same screen back
+    terminal_pane.set_geom(expanded);
+    terminal_pane.set_content_offset(Offset::shift_right_top_and_bottom(0, 1, 0));
+
+    assert_eq!(terminal_pane.grid.height, expanded_rows);
+    assert_eq!(terminal_pane.grid.width, expanded_cols);
+    assert_eq!(
+        terminal_pane.dump_screen(false, None),
+        expanded_screen,
+        "re-expanding a collapsed member gets its screen back"
+    );
 }
