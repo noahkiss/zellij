@@ -82,6 +82,20 @@ patch ledger readable, because the rebase onto a newer upstream tag replays it c
 5. **Rebase onto a newer upstream tag** with `git rebase --onto <new-base> <old-base> main`, then
    record the new base in `FORK.md`.
 
+**Upstream strategy — the operating rule.** The fork is a patch series on top of an upstream
+**tag**, and it stays one. Move the base by rebasing, one patch commit at a time, and name the new
+base in `FORK.md`. Between tags, take a single upstream commit only when we want that fix now:
+cherry-pick it with the subject `chore(upstream): <original subject> (<sha>)`, and expect it to drop
+out as empty at the next rebase. Never merge upstream into main, and never let the base become
+"some upstream main commit plus picks" without naming that commit in `FORK.md`. Rebasing onto
+upstream `main` between tags is allowed when it is small — it is still a named base.
+
+**Reordered history does not bisect.** A logically grouped series (one commit per ledger entry,
+reordered) cannot keep every intermediate compiling — a file lands with its group, and a definition
+can sit in a group placed after one of its callers. That is accepted: the tip and the last commit
+of each release build, the middle may not. The last chronological, bisectable series is kept at
+`backup/main-pre-squash-2026-08-16`; when a bug needs `git bisect`, bisect there.
+
 ## Build and test
 
 ```
