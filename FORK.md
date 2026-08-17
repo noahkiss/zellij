@@ -4400,6 +4400,42 @@ it fails. Only a socket with something alive behind it is protected.
 The refusal names the socket, says why the session is not in `zellij ls`, and points at
 `zellij attach` to reach it or `zellij session restart` to replace it deliberately.
 
+### OSC 8 hyperlinks are terminated with BEL, not ST
+
+A hyperlink zellij draws now ends with BEL (`\x07`) instead of the 7-bit string terminator
+(`ESC \`). `TERMINATOR` in `zellij-server/src/panes/link_handler.rs` is the one place that decides
+it, and both the link start and the link end read it.
+
+The reason is mosh. `mosh-server` up to and including 1.4.0 does not parse OSC at all: its
+terminal emulator hands the whole sequence to an unknown-escape path, and that path clears the
+pending-wrap flag as a side effect (mobile-shell/mosh#687). Pending-wrap is what remembers that the
+cursor has written the last column and must wrap before the next character, so clearing it discards
+the cell waiting there. That mechanism is real: a synthetic byte stream fed through mosh 1.4.0
+reproduces the lost cell, and BEL in place of ST prevents it. Zellij emits an OSC 8 link *end* at
+the start of essentially every rendered row, so it emitted the trigger byte constantly.
+
+**This patch is hygiene, not a proven fix.** Zellij's own render path was never shown to hit the
+mechanism. Zellij writes each row as a chunk that begins with an absolute cursor move, and that
+move clears mosh's pending-wrap flag before any OSC 8 terminator in the chunk can. So the trigger
+byte is gone, but no observed symptom is known to depend on it. In particular this does not explain
+the missing characters seen down the right edge over mosh in the field; that evidence still points
+at the terminal's font shaper, not at the terminator.
+
+Nothing is lost by the change. BEL is the older of the two OSC terminators, every terminal this fork
+targets accepts it, and the terminals that prefer ST accept BEL as well — zellij already ends its
+own window-title OSC with BEL. `osc8_hyperlinks true`, which is the default, stays usable
+everywhere it was before.
+
+The two unit tests in `link_handler.rs` build their expected strings from `TERMINATOR`, so they
+follow the constant rather than pinning the old bytes. Proved end to end as well: a pty client
+attached to a scratch session captured 174 OSC 8 sequences, all BEL-terminated and none
+ST-terminated, with the only remaining `ESC \` in the stream belonging to the OSC 10/11 colour
+queries and a kitty graphics probe.
+
+Deliberately unchanged: `zellij-utils/src/setup.rs` still writes ST-terminated links. That is the
+`zellij setup --check` report, printed by the CLI to its own stdout rather than drawn through a
+pane, so it is not on the path that loses the cell.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
