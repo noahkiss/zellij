@@ -4369,6 +4369,37 @@ is not a place to put something the policy is meant to hide from.
 **An attached client.** Anyone looking at the terminal sees the panes. The filter is about what the
 command surface answers, not about what is on screen.
 
+### Creating a session never takes a live server's socket
+
+`zellij attach --create` on a session that is running created a **second** session on top of it, and
+the first one survived the experience only as a process nobody could reach. This is not theoretical:
+it happened on 2026-08-16 to a session with 10 tabs and 41 panes.
+
+The mechanism is a liveness probe that answers the wrong question for a destructive decision.
+`session_exists` -> `get_sessions` -> `assert_socket` connects to the socket, sends `ConnStatus` and
+waits for `Connected`; a server that **accepts the connection but does not complete that exchange**
+is reported as absent. For a listing that is a defensible answer. For `--create` it is fatal, because
+the create that follows binds the same path, and `ipc_bind` is preceded by an unconditional
+`remove_file`. The old server keeps running, keeps its panes and keeps its listening socket -- but a
+unix socket cannot be given its pathname back, so nothing can ever reach it again. The session is
+gone while every one of its processes is still alive.
+
+So the fork asks a smaller question before any create: **is anything bound**. A bare `connect()`
+that succeeds means a live process is listening, whatever it goes on to say, and that is enough to
+refuse. `sessions::socket_is_occupied` is that question, and it now guards three places:
+
+- **`attach --create`** and its siblings, before the branch that resurrects or restores as well as
+  the one that starts fresh -- all three start a server on that socket.
+- **`zellij --session <name>`** (`assert_session_ne`), the plain create.
+- **`start_server`**, the last thing that can still refuse. The client's check can be raced or
+  bypassed; the bind cannot.
+
+A stale socket a dead server left behind still gets cleaned up and replaced, because `connect()` to
+it fails. Only a socket with something alive behind it is protected.
+
+The refusal names the socket, says why the session is not in `zellij ls`, and points at
+`zellij attach` to reach it or `zellij session restart` to replace it deliberately.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
