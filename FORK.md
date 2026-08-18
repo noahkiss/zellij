@@ -1498,11 +1498,17 @@ permanently, and a connection over SSH runs in the `Background` domain — so co
 before the launchd agent has run leaves a session that can never reach those resources, with
 nothing reporting it.
 
-So on macOS, when the current domain is not `Aqua` and the session does not exist, `up` asks
-launchd to start the job in the graphical domain rather than creating the session itself, then
-waits for the socket and asserts as usual. With no job installed it creates the session and warns
+So on macOS, when the session does not exist and a loaded launch agent for it exists, `up` asks
+launchd to start that job rather than creating the session itself, then waits for the socket and
+asserts as usual. With no job installed and no graphical domain it creates the session and warns
 that GUI-gated access will be unavailable for the life of the server. With no graphical session at
 all it says so instead of quietly creating a crippled one. Linux has no analogue and is unaffected.
+
+**A shell that is already in the `Aqua` domain hands the work to launchd too**, which it did not
+until [`session up` always creates the session through the launch
+agent](#session-up-always-creates-the-session-through-the-launch-agent). The domain is only half of
+what creating a server settles; the other half is which executable macOS holds responsible for it,
+and that one a graphical shell gets wrong.
 
 ### The installed job is found by what it runs, not by what it is called
 
@@ -1965,8 +1971,12 @@ session_service {
 }
 ```
 
-The block also carries [`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe), which is not a directive:
-it decides which binary the unit names rather than what the unit contains.
+The block also carries two entries that are not directives, because each decides something about
+how the install is USED rather than what the unit contains:
+[`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe), which decides which binary the unit names, and
+`restart_via_launchd`, which decides whether a graphical `session up` defers to the agent at all —
+see [`session up` always creates the session through the launch
+agent](#session-up-always-creates-the-session-through-the-launch-agent).
 
 A generated unit cannot know the local facts. systemd's answer is a drop-in directory, which is a
 poor answer for the tool that generated the unit: the drop-in is invisible to it, so `status`
@@ -2928,6 +2938,11 @@ in a directory that was fine yesterday.
 
 This is a cost the fork itself introduced. Before session creation moved into a launcher, the
 responsible process was the terminal emulator, which had held its grants for years.
+
+The pinned copy is the answer to the versioned path, and it only works if the pin is what starts
+the server — see [`session up` always creates the session through the launch
+agent](#session-up-always-creates-the-session-through-the-launch-agent), which is what makes that
+true for a `restart` typed at a terminal.
 
 `start_server` now opens each protected location once, so macOS decides while the user is still
 looking at the upgrade:
@@ -4435,6 +4450,129 @@ queries and a kitty graphics probe.
 Deliberately unchanged: `zellij-utils/src/setup.rs` still writes ST-terminated links. That is the
 `zellij setup --check` report, printed by the CLI to its own stdout rather than drawn through a
 pane, so it is not on the path that loses the cell.
+
+### `session up` always creates the session through the launch agent
+
+On macOS, `zellij session up` and `zellij session restart` now ask launchd to start the installed
+launch agent whenever one is loaded — including when they are typed at a terminal, which is to say
+from inside the `Aqua` domain. Until now the graphical domain was treated as settling the question,
+so a `restart` typed in a pane spawned the new server itself and never went near the agent.
+
+The domain it got that way was right. What was wrong is the other thing creating a server settles:
+which executable macOS holds **responsible** for it. A server spawned by the client is attributed
+to the client's binary, and under Homebrew that is a versioned Cellar path — `.../Cellar/
+zellij-nkmk/0.45.0-nkmk.13/bin/zellij` — which is a different path after every upgrade. TCC decides
+about Desktop, Documents and Downloads at server start, against the responsible path, so the Full
+Disk Access grant made against the pinned copy at `~/Library/Application Support/zellij/bin/zellij`
+was never consulted and the prompts came back at every upgrade. The launch agent already runs the
+pin. Routing creation through it keeps every server on one path, for ever.
+
+The job runs `zellij session up <name>` itself, so it has to know not to hand the work back. Two
+signals answer that:
+
+- **`XPC_SERVICE_NAME`**, which launchd sets in the job's own environment to the job's label. This
+  is the whole guard on every ordinary machine, and **nothing about the plist changes for it** —
+  confirmed by reading it out of `launchctl print` on a Mac whose agent was written two releases
+  ago. An earlier version of this patch added a `ZELLIJ_SESSION_SERVICE_JOB` key to the generated
+  plist to carry the same fact; it worked, and it cost every Mac a `zellij session enable` before
+  the guard could see anything. launchd's own variable costs nothing.
+- **`launchctl print gui/<uid>/<label>`**, whose `pid` is compared with this process's and with its
+  parent's. The fallback, for an agent that reaches zellij through a wrapper script — there the
+  variable belongs to the wrapper's environment and may not reach us.
+
+The environment test is an **equality against the label, never a presence check**. An ordinary
+process carries `XPC_SERVICE_NAME=0` rather than nothing, so a presence check would call every
+caller the job and nothing would ever kickstart again.
+
+`getppid() == 1` is deliberately **not** one of them. `session restart` daemonizes before it does
+any of this, so a restart typed at a terminal has a parent of 1 as well, and reading that as "I am
+the job" would stop the exact command this entry is about.
+
+Handing the work over hands the up-lock over with it. `up` holds `lock_up(name)` across its check
+and its creation, and `restart` holds it across its `down` and its `up` — both right for as long as
+this process is the creator, and both exactly wrong the moment launchd becomes one. The kickstarted
+job's own `session up` waits for that lock while this process waits for the session that job was
+going to create; nothing on either side can see that it is waiting for itself. It ends with the
+30-second wait running out, `restart` reporting a post-condition failure, and the session appearing
+anyway once the lock is finally released. So the `Kickstart` branch calls
+`session_lifecycle::hand_over_up_lock` before it waits, which releases the `flock` and drops this
+thread's record of it while the `UpLock` values up the stack stay alive as handles over nothing.
+
+Unchanged: a plist that is on disk but **not loaded** is still not a job to defer to, and `up`
+creates the session itself — now with one line saying so and naming `session enable`. A graphical
+shell on a machine with no agent at all still creates the session itself with no warning, because
+nothing is missing there. `session down` does not unload the agent, so a `restart` always has a
+loaded job to kickstart.
+
+There is an off switch, in the block the unit is generated from:
+
+```kdl
+session_service {
+    restart_via_launchd false
+}
+```
+
+It turns off **that one paragraph** and nothing else: a graphical shell goes back to creating the
+session in place, because the domain there was always right. The non-graphical branch is the older
+guard against a session created in a domain it can never leave, and the config does not get to
+disable it. Default is on, which is the load-bearing half — the machines this matters for are the
+ones whose config nobody has touched, and a key they must add to get the fix would reach none of
+them. It exists because this path runs at login and at every watchdog tick on a machine nobody is
+watching, and a Mac that cannot start its session is a bad place to need a new release.
+
+It is a key **nested inside a block that parses its own children**, so it cannot be rolled out
+ahead of the binary — an older build fails the whole config on it, not just the block. Ship the
+binary first; the key is only ever needed after.
+
+Operator-visible, on upgrading each Mac and with **no `session enable` re-run and no plist change**:
+`zjr` goes through launchd rather than spawning a server from the Cellar path, and the TCC prompts
+stop coming back at every `brew upgrade`.
+
+### The pin is not stale against itself
+
+`pin_needs_refresh` — the question `session doctor` and its dry run ask, and the one
+`refresh_pin_through_signing` acts on — lacked the same-file guard that `install_pinned_exe` has
+had all along. Doctor run FROM the pinned copy, which is the ordinary case once the pin directory
+is on `PATH`, was therefore told to refresh the pin with itself: it copied the file over itself,
+re-signed it, and stamped it with its own hash. The next run from the package path read a stamp
+naming the wrong source, called the pin stale, and copied back over the signature just made. The
+two alternated for ever, and each half of the cycle threw away the grants the other half's
+signature had earned.
+
+The writer always answered this correctly, which is exactly what hid it: `install_pinned_exe`
+refused while the question said yes, so only the callers that act on the *question* saw it.
+`pin_needs_refresh` now asks `is_the_same_file` first, in the same order the writer does — which is
+the property that function's doc comment already claimed.
+
+### Doctor sets aside a signing bundle that is not its own
+
+`zellij session doctor --sign` re-imports `signing/id.p12` rather than minting a second
+certificate, because the certificate's hash **is** the requirement every grant on the machine
+records. That rule is right and stays. What was missing is that a clean import proves the file was
+readable and proves nothing about whose certificate came out of it.
+
+A `signing/` directory written by an older `zellij-mac-setup` holds a certificate under its own
+common name. It imports without complaint, so nothing mints; the ladder still finds no
+`zellij self-signed code signing` identity; and doctor falls through to the Xcode steps with "no
+signing certificate for &lt;pin&gt;" — on every run, for ever, on a machine it could repair in one
+pass. `refresh_pin_through_signing` fails with it, so the pin stays on the superseded build after
+an upgrade and the grants keep pointing at a binary nobody runs.
+
+So `ensure_self_signed` now asks the keychain again after a **successful** import. If our
+certificate is still not on offer the bundle is set aside as `id.p12.foreign-<timestamp>` — kept,
+never deleted, exactly as an unreadable one is — and a new certificate is minted. The set-aside name
+says which fault it was: `.broken-` is a bundle Apple could not read, `.foreign-` is one that read
+perfectly and was not ours.
+
+Minting means the grants for the pinned copy have to be made once more, which the finding says. It
+is the only way out: doctor cannot sign with a certificate whose private key it does not control the
+naming of, and the alternative is the deadlock above.
+
+The report also names the impostor. When the ladder is empty and the keychain holds a
+zellij-titled certificate that is not ours, doctor prints its name and hash beside the "no signing
+certificate" line, so the reader is told they have the wrong certificate rather than none — the
+version of this that sent a real machine off to Xcode over a certificate that was never going to
+work.
 
 ## Assessed and deliberately not built
 

@@ -292,9 +292,13 @@ thread_local! {
     /// Nothing is persisted, which is the point - a `restart` that dies mid-hold takes the table
     /// with it, and the kernel releases the `flock` on the way out. Staleness is therefore not a
     /// state anyone has to clean up.
+    ///
+    /// The descriptor is recorded beside the count so that the hold can be given up from a nested
+    /// frame - see [`hand_over_up_lock`] - which the outermost `UpLock` alone could not do.
     #[cfg(unix)]
-    static HELD_UP_LOCKS: std::cell::RefCell<std::collections::HashMap<PathBuf, usize>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static HELD_UP_LOCKS: std::cell::RefCell<
+        std::collections::HashMap<PathBuf, (usize, std::os::unix::io::RawFd)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 #[cfg(unix)]
@@ -304,7 +308,7 @@ impl Drop for UpLock {
             let mut held = held.borrow_mut();
             match held.get_mut(&self.path) {
                 // an inner holder went away; the outermost one still holds the flock
-                Some(holders) if *holders > 1 => *holders -= 1,
+                Some((holders, _)) if *holders > 1 => *holders -= 1,
                 _ => {
                     held.remove(&self.path);
                 },
@@ -343,6 +347,64 @@ pub fn lock_up(name: &str) -> Option<UpLock> {
     lock_up_at(up_lock_path(name), name)
 }
 
+/// Give the up-lock for `name` up NOW, because another process is about to do the creating.
+///
+/// The lock exists to keep two creators apart, and it is held across the whole of a `session up` -
+/// across the whole of a `restart`, in fact, its `down` and its `up` together. Both of those are
+/// right for as long as this process is the one that creates the session. The moment it hands
+/// creation to launchd they are exactly wrong: the kickstarted job runs `session up`, that `up`
+/// waits for this very lock, and this process is meanwhile waiting for the session that job was
+/// going to create. Nothing here can see that it is waiting for itself. It ends with the wait
+/// running out, `restart` reporting a post-condition failure, and the session appearing half a
+/// minute later once the lock is finally released - a restart that says it failed and did not.
+///
+/// So the `flock` is released and this thread's record of it dropped, while the `UpLock` values
+/// themselves stay alive up the stack. They become handles over nothing, which is what they should
+/// be: releasing an already-released lock on drop does nothing, and the thing they were guarding
+/// belongs to another process now.
+#[cfg(unix)]
+pub fn hand_over_up_lock(name: &str) {
+    hand_over_up_lock_at(up_lock_path(name));
+}
+
+/// Whether the up-lock for `name` is free, asked on a descriptor of its own.
+///
+/// An `flock` belongs to an open file description rather than to a process, so a fresh handle
+/// contends with a hold this process already has exactly as another process would. That is the
+/// question a kickstarted launch agent asks, and the only way to ask it from this side without
+/// being answered by our own re-entrancy.
+#[cfg(unix)]
+pub fn up_lock_is_free(name: &str) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .open(up_lock_path(name))
+    else {
+        // no lock file is no lock
+        return true;
+    };
+    // SAFETY: the descriptor is owned by `file`, which outlives both calls
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if taken {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    taken
+}
+
+/// [`hand_over_up_lock`], with the lock file named rather than derived, for the same reason
+/// [`lock_up_at`] exists.
+#[cfg(unix)]
+fn hand_over_up_lock_at(path: PathBuf) {
+    HELD_UP_LOCKS.with(|held| {
+        if let Some((_, fd)) = held.borrow_mut().remove(&path) {
+            // SAFETY: the descriptor is owned by an `UpLock` further up this thread's stack, which
+            // cannot have been dropped while a frame below it is running
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
+    });
+}
+
 /// [`lock_up`], with the lock file named rather than derived, so it can be exercised off a real
 /// socket directory.
 #[cfg(unix)]
@@ -350,7 +412,7 @@ fn lock_up_at(path: PathBuf, name: &str) -> Option<UpLock> {
     use std::os::unix::io::AsRawFd;
 
     let already_held = HELD_UP_LOCKS.with(|held| match held.borrow_mut().get_mut(&path) {
-        Some(holders) => {
+        Some((holders, _)) => {
             *holders += 1;
             true
         },
@@ -385,7 +447,10 @@ fn lock_up_at(path: PathBuf, name: &str) -> Option<UpLock> {
         // SAFETY: the descriptor is owned by `file`, which outlives this call
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             // recorded before the caller can nest: the entry is what makes the next one re-enter
-            HELD_UP_LOCKS.with(|held| held.borrow_mut().insert(path.clone(), 1));
+            HELD_UP_LOCKS.with(|held| {
+                held.borrow_mut()
+                    .insert(path.clone(), (1, file.as_raw_fd()))
+            });
             return Some(UpLock {
                 file: Some(file),
                 path,
@@ -525,20 +590,57 @@ pub enum GuiDomainAction {
 }
 
 /// Decide from what the machine says: the domain this process is in, whether a graphical session
-/// exists at all, the label of an installed job for this session if there is one, and whether the
-/// session is already there.
+/// exists at all, the label of a LOADED job for this session if there is one, whether the session
+/// is already there, and whether this process is that job.
+///
+/// **Being in the graphical session is not a reason to create the session here.** It was, until it
+/// turned out to answer a second question wrongly. The domain is only half of what creating a
+/// server decides; the other half is which executable macOS holds RESPONSIBLE for what the server
+/// then does. A server spawned as a child of the client is attributed to the client's binary, and
+/// a Homebrew binary lives at a versioned Cellar path that changes at every upgrade - so the Full
+/// Disk Access grant made yesterday names a path today's build is not, and the user is asked
+/// again. The launch agent runs the pinned copy, whose path never changes, which is the whole
+/// reason the pin exists. So when there is a job to defer to, defer to it from the graphical
+/// session too, and keep every server on one responsible path.
+///
+/// `via_launchd` is the config's say over that one paragraph - `session_service {
+/// restart_via_launchd false }` - and over nothing else here. It is an escape hatch for a machine
+/// whose agent will not start, not a preference: every other branch is the older guard against a
+/// session created in a domain it can never leave, which the config does not get to turn off.
+///
+/// `running_as_job` is what stops that from being infinite. The job's own `session up` reaches
+/// this function in the Aqua domain with its own label installed, and without the flag it would
+/// ask launchd to start the job it IS - see [`running_as_launchd_job`].
 pub fn gui_domain_action(
     manager_name: Option<&str>,
     gui_domain_available: bool,
     installed_job: Option<&str>,
     session_exists: bool,
+    running_as_job: bool,
+    via_launchd: bool,
 ) -> GuiDomainAction {
     // an existing session already has a domain, and `up` is not going to replace it over this
     if session_exists {
         return GuiDomainAction::Proceed;
     }
-    if manager_name == Some(GUI_MANAGER_NAME) {
+    // the job cannot defer to itself, and this is the ONLY thing standing between it and a loop
+    if running_as_job {
         return GuiDomainAction::Proceed;
+    }
+    if manager_name == Some(GUI_MANAGER_NAME) {
+        // `restart_via_launchd false` turns exactly this off and nothing else: the domain here is
+        // already the right one, so creating the session in place is a worse answer rather than a
+        // wrong one. The non-graphical branch below is the older guard against a permanently
+        // crippled session and is not the config's to disable.
+        if !via_launchd {
+            return GuiDomainAction::Proceed;
+        }
+        // already graphical, so a job is an improvement rather than a necessity: with none, this
+        // process creates the session in the right domain and nothing is lost but the pinned path
+        return match installed_job {
+            Some(label) => GuiDomainAction::Kickstart(label.to_owned()),
+            None => GuiDomainAction::Proceed,
+        };
     }
     if !gui_domain_available {
         return GuiDomainAction::NoGuiSession;
@@ -603,13 +705,82 @@ pub mod launchctl {
         }
     }
 
-    fn print_succeeds(target: &str) -> bool {
-        Command::new("launchctl")
+    /// What `launchctl print` says about a target, or `None` when it will not say.
+    pub fn print(target: &str) -> Option<String> {
+        let output = Command::new("launchctl")
             .args(["print", target])
             .output()
-            .map(|output| output.status.success())
-            .unwrap_or(false)
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     }
+
+    fn print_succeeds(target: &str) -> bool {
+        print(target).is_some()
+    }
+}
+
+/// The pid `launchctl print` reports for a job, if it is running one.
+///
+/// Its output is an indented `key = value` block, and the line wanted is `pid = 1234`. Matched on
+/// the whole key so that `ppid` - which is on the neighbouring line and would satisfy a substring
+/// test - is not read as this one.
+pub fn job_pid(printed: &str) -> Option<u32> {
+    printed.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "pid").then(|| value.trim().parse().ok())?
+    })
+}
+
+/// What launchd puts in a job's environment to name the job it is running.
+///
+/// **launchd's, not ours.** An earlier version of this guard added a `ZELLIJ_SESSION_SERVICE_JOB`
+/// key to the generated plist to carry the same fact, which worked and cost every machine a
+/// `session enable` to rewrite its agent before the guard could see anything. Reading launchd's
+/// own variable needs no plist change at all, so the guard works on the agents that are already
+/// installed - confirmed on a real Mac against an agent written two releases ago.
+const LAUNCHD_JOB_ENV: &str = "XPC_SERVICE_NAME";
+
+/// Whether the environment alone says this process is the launch agent job for `label`.
+///
+/// Pure, so the comparison can be exercised without a launchd. An ordinary process has this set to
+/// `0` rather than unset, which is why the test is an equality against the label and never a
+/// presence check.
+pub fn env_says_launchd_job(xpc_service_name: Option<&str>, label: &str) -> bool {
+    xpc_service_name == Some(label)
+}
+
+/// Whether THIS process is the launch agent job for `label`, and so must not ask launchd to start
+/// it.
+///
+/// Two signals. [`LAUNCHD_JOB_ENV`] is the first and answers on every machine, installed agents
+/// included, with no subprocess: launchd sets it in the job's environment and nothing else on the
+/// system sets it to our label.
+///
+/// launchd is then asked directly, as a fallback for an agent that reaches zellij through a
+/// wrapper script - where the variable belongs to the wrapper's environment and may not survive
+/// into ours. The pid it reports for the job is compared with this process's and with its
+/// parent's. **`getppid() == 1` is NOT one of the signals**, tempting as it looks: `session
+/// restart` daemonizes before it does any of this work, so a restart typed at a terminal has a
+/// parent of 1 too, and reading that as "I am the job" would stop the very command this patch
+/// exists to fix from ever kickstarting.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub fn running_as_launchd_job(label: &str) -> bool {
+    if env_says_launchd_job(std::env::var(LAUNCHD_JOB_ENV).ok().as_deref(), label) {
+        return true;
+    }
+    let Some(printed) = launchctl::print(&format!("{}/{}", launchctl::gui_domain(), label)) else {
+        return false;
+    };
+    let Some(pid) = job_pid(&printed) else {
+        return false;
+    };
+    let ours = std::process::id();
+    // SAFETY: getppid cannot fail and touches nothing
+    let parent = unsafe { libc::getppid() } as u32;
+    pid == ours || pid == parent
 }
 
 /// Arrange for the session to be created in the graphical session, or say why it will not be.
@@ -618,7 +789,11 @@ pub mod launchctl {
 /// than create it itself.
 /// Compiled under `cfg(test)` on every unix for the same reason [`launchctl`] is.
 #[cfg(any(target_os = "macos", all(unix, test)))]
-pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<bool, String> {
+pub fn ensure_gui_session_domain(
+    session: &str,
+    session_exists: bool,
+    via_launchd: bool,
+) -> Result<bool, String> {
     use crate::session_service::{find_session_job, installed_launch_agents, SessionJob};
 
     let derived = crate::session_service::launchd_label(session);
@@ -644,11 +819,30 @@ pub fn ensure_gui_session_domain(session: &str, session_exists: bool) -> Result<
         .map(|job| job.name.clone())
         .filter(|label| launchctl::job_is_installed(label))
         .or_else(|| launchctl::job_is_installed(&derived).then(|| derived.clone()));
+    // A plist that is on disk and not loaded is the case that would otherwise be silent: nothing
+    // is broken, the session is created here and works, and the pinned path the agent exists to
+    // keep is quietly not the one macOS will remember. One line, and only when there is something
+    // to say.
+    if label.is_none() {
+        if let Some(job) = found.job() {
+            println!(
+                "      the launch agent '{}' is on disk but not loaded, so '{}' is created here \
+                 instead; `zellij session enable {}` loads it",
+                job.name, session, session
+            );
+        }
+    }
+    let running_as_job = label
+        .as_deref()
+        .map(running_as_launchd_job)
+        .unwrap_or(false);
     let action = gui_domain_action(
         launchctl::manager_name().as_deref(),
         launchctl::gui_domain_exists(),
         label.as_deref(),
         session_exists,
+        running_as_job,
+        via_launchd,
     );
     match action {
         GuiDomainAction::Proceed => Ok(false),
@@ -1538,12 +1732,24 @@ pub fn flush_pin_directory(_directory: &Path) {}
 
 /// Whether [`install_pinned_exe`] would write, asked without writing.
 ///
-/// The same two questions that function asks, in the same order, so that a dry run reports the
+/// The same questions that function asks, in the same order, so that a dry run reports the
 /// decision the real run makes rather than a guess at it. A dry run whose answer is derived some
 /// other way is a dry run that eventually disagrees with the fix, and then it is worse than no dry
 /// run at all.
+///
+/// The same-file question is the FIRST of them, and it was missing here while
+/// [`install_pinned_exe`] had it - which is a disagreement with real consequences rather than a
+/// tidiness point. Doctor run from the pin itself (its directory is on `PATH`, which is the point
+/// of pinning) asks this, is told the pin is stale against itself, copies the file over itself,
+/// re-signs it, and stamps it with its OWN hash. The next run from the package path then sees a
+/// stamp naming the wrong source, calls the pin stale, and copies back over the signature just
+/// made. The two alternate for ever, re-signing on every pass, and each cycle throws away the
+/// grants the last signature earned.
 #[cfg(unix)]
 pub fn pin_needs_refresh(source: &Path, target: &Path) -> bool {
+    if is_the_same_file(source, target) {
+        return false;
+    }
     !target.exists() || pin_is_stale(source, target, sha256_of_file(source).as_deref())
 }
 
@@ -2632,19 +2838,164 @@ mod tests {
         assert!(DownOutcome::judge(deleted(false, true), Ok(())).is_failure());
     }
 
+    /// A terminal in the graphical session used to create the session itself, and the domain it
+    /// got was right. What was wrong was the RESPONSIBLE executable: the server it spawns is
+    /// attributed to the binary that spawned it, which under Homebrew is a versioned Cellar path
+    /// that moves at every upgrade, so the grant made against the pinned copy is never consulted
+    /// and the user is prompted again after each one. The agent runs the pin, so it gets the work.
     #[test]
-    fn a_graphical_shell_creates_the_session_itself() {
+    fn a_graphical_shell_hands_the_work_to_the_job_so_the_pin_stays_responsible() {
         assert_eq!(
-            gui_domain_action(Some(GUI_MANAGER_NAME), true, Some("a.label"), false),
+            gui_domain_action(
+                Some(GUI_MANAGER_NAME),
+                true,
+                Some("a.label"),
+                false,
+                false,
+                true
+            ),
+            GuiDomainAction::Kickstart("a.label".to_owned())
+        );
+    }
+
+    /// With no job there is nothing to hand it to, and being graphical already means creating it
+    /// here costs only the pinned path. It is NOT `ProceedWithoutGui`: nothing is missing.
+    #[test]
+    fn a_graphical_shell_with_no_job_still_creates_the_session_itself() {
+        assert_eq!(
+            gui_domain_action(Some(GUI_MANAGER_NAME), true, None, false, false, true),
             GuiDomainAction::Proceed
         );
+    }
+
+    /// The recursion guard, and the one assertion standing between this patch and a fork bomb of
+    /// kickstarts. The job's own `session up` sees precisely the graphical case above.
+    #[test]
+    fn the_job_itself_never_asks_launchd_to_start_the_job() {
+        assert_eq!(
+            gui_domain_action(
+                Some(GUI_MANAGER_NAME),
+                true,
+                Some("a.label"),
+                false,
+                true,
+                true
+            ),
+            GuiDomainAction::Proceed
+        );
+        // and not from a non-graphical domain either, which is where a `KeepAlive` restart of the
+        // job lands if the plist ever grows one
+        assert_eq!(
+            gui_domain_action(Some("Background"), true, Some("a.label"), false, true, true),
+            GuiDomainAction::Proceed
+        );
+    }
+
+    /// The escape hatch, and the shape of what it may and may not turn off. A machine whose agent
+    /// will not start needs a way back to creating the session in place without waiting for a
+    /// release; it does not get a way to create one in a domain it can never leave.
+    #[test]
+    fn restart_via_launchd_false_only_gives_the_graphical_shell_its_old_answer_back() {
+        assert_eq!(
+            gui_domain_action(
+                Some(GUI_MANAGER_NAME),
+                true,
+                Some("a.label"),
+                false,
+                false,
+                false
+            ),
+            GuiDomainAction::Proceed
+        );
+        // the non-graphical guard is older than the key and is not the config's to disable: a
+        // session created from here would be crippled for its whole life
+        assert_eq!(
+            gui_domain_action(
+                Some("Background"),
+                true,
+                Some("a.label"),
+                false,
+                false,
+                false
+            ),
+            GuiDomainAction::Kickstart("a.label".to_owned())
+        );
+        assert_eq!(
+            gui_domain_action(
+                Some("Background"),
+                false,
+                Some("a.label"),
+                false,
+                false,
+                false
+            ),
+            GuiDomainAction::NoGuiSession
+        );
+    }
+
+    /// The primary signal, and the reason no plist has to be rewritten for the guard to work:
+    /// launchd sets this itself. Confirmed on a real Mac against an agent two releases old.
+    #[test]
+    fn launchd_names_the_job_in_the_environment_it_gives_it() {
+        let label = "dev.zellij.session.go-for-flight";
+        assert!(env_says_launchd_job(Some(label), label));
+
+        // what a process that is NOT a job carries. `0` is the trap: a presence check would read
+        // it as "I am the job" and nothing would ever kickstart again
+        assert!(!env_says_launchd_job(Some("0"), label));
+        assert!(!env_says_launchd_job(None, label));
+        // another zellij agent's job is not this one, and a prefix is not a match
+        assert!(!env_says_launchd_job(
+            Some("dev.zellij.session.other"),
+            label
+        ));
+        assert!(!env_says_launchd_job(Some("dev.zellij.session"), label));
+    }
+
+    /// The fallback, for an agent that reaches zellij through a wrapper script - where the variable
+    /// above belongs to the wrapper and may not reach us.
+    ///
+    /// The block is the real one, from `launchctl print gui/501/dev.zellij.session.go-for-flight`
+    /// on the mini, with the paths made generic. The `pid` line is the documented shape a running
+    /// job adds to it; that machine's job was idle when it was captured.
+    #[test]
+    fn the_job_pid_is_read_off_launchctl_print_and_is_not_the_parent_pid() {
+        let printed = "\
+dev.zellij.session.go-for-flight = {
+	active count = 1
+	path = /Users/someone/Library/LaunchAgents/dev.zellij.session.go-for-flight.plist
+	state = running
+	program = /Users/someone/Library/Application Support/zellij/bin/zellij
+	arguments = {
+		/Users/someone/Library/Application Support/zellij/bin/zellij
+		session
+		up
+		go-for-flight
+	}
+	runs = 3936
+	last exit code = 0
+	ppid = 1
+	pid = 47213
+	environment = {
+		XPC_SERVICE_NAME => dev.zellij.session.go-for-flight
+	}
+}
+";
+        assert_eq!(job_pid(printed), Some(47213));
+        // an idle job reports `state = not running` and no pid at all, which is the state the mini
+        // was actually in - inventing one there would make every caller the job
+        assert_eq!(
+            job_pid("dev.zellij.session.x = {\n\tstate = not running\n\truns = 3936\n}\n"),
+            None
+        );
+        assert_eq!(job_pid(""), None);
     }
 
     #[test]
     fn a_session_that_already_exists_settles_the_question() {
         // its domain was decided when it was created and `up` is not going to replace it
         assert_eq!(
-            gui_domain_action(Some("Background"), true, Some("a.label"), true),
+            gui_domain_action(Some("Background"), true, Some("a.label"), true, false, true),
             GuiDomainAction::Proceed
         );
     }
@@ -2652,7 +3003,14 @@ mod tests {
     #[test]
     fn a_non_graphical_shell_defers_to_the_installed_job() {
         assert_eq!(
-            gui_domain_action(Some("Background"), true, Some("a.label"), false),
+            gui_domain_action(
+                Some("Background"),
+                true,
+                Some("a.label"),
+                false,
+                false,
+                true
+            ),
             GuiDomainAction::Kickstart("a.label".to_owned())
         );
     }
@@ -2661,7 +3019,7 @@ mod tests {
     fn without_a_job_the_session_is_created_anyway_and_said_so() {
         // no job to defer to, and no session at all is worse than a session without GUI access
         assert_eq!(
-            gui_domain_action(Some("Background"), true, None, false),
+            gui_domain_action(Some("Background"), true, None, false, false, true),
             GuiDomainAction::ProceedWithoutGui
         );
     }
@@ -2669,12 +3027,19 @@ mod tests {
     #[test]
     fn with_nobody_logged_in_graphically_there_is_nothing_to_create_it_in() {
         assert_eq!(
-            gui_domain_action(Some("Background"), false, Some("a.label"), false),
+            gui_domain_action(
+                Some("Background"),
+                false,
+                Some("a.label"),
+                false,
+                false,
+                true
+            ),
             GuiDomainAction::NoGuiSession
         );
         // and an unknown domain is not treated as the graphical one
         assert_eq!(
-            gui_domain_action(None, false, None, false),
+            gui_domain_action(None, false, None, false, false, true),
             GuiDomainAction::NoGuiSession
         );
     }
@@ -3068,6 +3433,40 @@ mod tests {
             pin_needs_refresh(&source, &target),
             "a stamp naming another source is a pin from another source"
         );
+    }
+
+    /// The pin is not stale against itself, and saying it is starts a loop that never settles.
+    ///
+    /// Doctor run FROM the pin - which is the ordinary case once the pin directory is on `PATH` -
+    /// used to be told to refresh it, so it copied the file over itself, re-signed it, and stamped
+    /// it with its own hash. The next run from the package path then read a stamp naming the wrong
+    /// source, called the pin stale, and copied back over the signature. Each half of that cycle
+    /// throws away the grants the other half's signature earned.
+    ///
+    /// `install_pinned_exe` has always answered this correctly, which is what made the
+    /// disagreement invisible: the writer refused while the question said yes, so only the callers
+    /// that ACT on the question - doctor's report, `refresh_belongs_to_signing` - saw it.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pin_asked_about_itself_is_never_stale() {
+        let scratch = ScratchDir::new("pin-self");
+        let target = scratch.write("pinned", &elf_with_build_id(&[0xcd; 20], 4096));
+
+        // no stamp at all, which is what a pin doctor has never refreshed looks like, and what
+        // `pin_is_stale` reads as "made from something else"
+        assert!(!pin_source_stamp(&target).exists());
+        assert!(
+            !pin_needs_refresh(&target, &target),
+            "the pin was called stale against itself"
+        );
+        // and a stamp naming somebody else does not change it either: the file IS the source
+        std::fs::write(pin_source_stamp(&target), "a hash of some other build\n").unwrap();
+        assert!(!pin_needs_refresh(&target, &target));
+        // the writer agreed all along; this is the assertion the two now share
+        assert!(matches!(
+            install_pinned_exe(&target, &target),
+            Ok(PinOutcome::UpToDate(_))
+        ));
     }
 
     #[test]
@@ -3704,6 +4103,43 @@ mod tests {
 
         drop(outer);
         assert!(lock_is_free(&path), "the outermost drop left the lock held");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Handing creation to launchd hands the lock over with it. The job launchd starts runs
+    /// `session up` and waits for this lock; a caller that kept holding it while waiting for the
+    /// session would be waiting for itself, and `restart` would report a failure it caused.
+    ///
+    /// Written as `restart` shapes it - an outer hold with a nested one inside - because that is
+    /// the case a lone `UpLock::drop` cannot answer: the nested frame cannot drop its caller's
+    /// handle.
+    #[test]
+    #[cfg(unix)]
+    fn handing_the_work_to_launchd_gives_the_lock_up_from_a_nested_frame() {
+        let dir = lock_scratch("handover");
+        let path = dir.join(".work.up.lock");
+
+        let outer = lock_up_at(path.clone(), "work").expect("the lock is free");
+        let inner = lock_up_at(path.clone(), "work").expect("re-entered rather than waited");
+        assert!(!lock_is_free(&path));
+
+        hand_over_up_lock_at(path.clone());
+        assert!(
+            lock_is_free(&path),
+            "the job launchd just started would wait for this"
+        );
+
+        // both handles are still alive and become handles over nothing. Dropping them must not
+        // panic, and must not release a lock the other process now holds either.
+        drop(inner);
+        drop(outer);
+        let after = lock_up_at(path.clone(), "work").expect("the lock is free");
+        assert!(
+            after.file.is_some(),
+            "re-entered a hold that had been handed over"
+        );
+        drop(after);
+        assert!(lock_is_free(&path));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

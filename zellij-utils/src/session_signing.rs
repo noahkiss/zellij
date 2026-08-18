@@ -357,6 +357,62 @@ pub fn rung_ladder(identities: &[Identity]) -> Vec<Rung> {
     ladder
 }
 
+/// What a keychain calls a certificate that is about zellij without being doctor's.
+///
+/// Matched loosely and on purpose. The point is not to recognise one particular common name - the
+/// setup scripts that wrote these chose their own - but to notice that the keychain holds
+/// something a reader will mistake for ours while the report says there is nothing.
+const FOREIGN_HINT: &str = "zellij";
+
+/// Identities that name zellij and are not the certificate doctor mints.
+///
+/// This is the difference between a report that reads as a machine with no certificate and one
+/// that reads as a machine with the WRONG certificate, and only the second is actionable. A
+/// keychain holding `zellij-nkmk local signing` while doctor says "no signing certificate" is the
+/// case that sent a real machine round the Xcode steps it did not need.
+pub fn foreign_zellij_identities(identities: &[Identity]) -> Vec<&Identity> {
+    identities
+        .iter()
+        .filter(|identity| {
+            let name = identity.name.to_lowercase();
+            name.contains(FOREIGN_HINT) && !identity.name.contains(SELF_SIGNED_COMMON_NAME)
+        })
+        .collect()
+}
+
+/// What re-importing an existing `signing/id.p12` turned out to have done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReimportVerdict {
+    /// The keychain now offers the certificate doctor mints, so the bundle was ours and every
+    /// grant recorded against it still holds. Nothing more to do.
+    Ours,
+    /// The import reported success and our certificate is STILL not on offer, so whatever the
+    /// bundle holds is not the certificate the ladder looks for. Naming what the keychain does
+    /// offer, when it offers something zellij-ish, because that is the sentence that explains the
+    /// otherwise mysterious report.
+    NotOurs { foreign: Vec<String> },
+}
+
+/// Decide from the identities the keychain offers AFTER an `id.p12` was imported.
+///
+/// Pure, and asked of a fresh listing rather than of the import's own exit status: `security
+/// import` succeeds on any readable bundle, whoever minted it, so its success says the FILE was
+/// good and says nothing about whose certificate came out of it.
+pub fn judge_reimport(identities: &[Identity]) -> ReimportVerdict {
+    if identities
+        .iter()
+        .any(|identity| identity.name.contains(SELF_SIGNED_COMMON_NAME))
+    {
+        return ReimportVerdict::Ours;
+    }
+    ReimportVerdict::NotOurs {
+        foreign: foreign_zellij_identities(identities)
+            .into_iter()
+            .map(|identity| identity.name.clone())
+            .collect(),
+    }
+}
+
 /// The requirement to write into the signature, when the default one would not do.
 ///
 /// Only Apple Development needs this. `codesign` derives that certificate's designated requirement
@@ -822,7 +878,32 @@ pub fn sign_pin(
         return SigningRun { findings };
     }
 
-    let mut ladder = rung_ladder(&find_identities(commander));
+    let identities = find_identities(commander);
+    let mut ladder = rung_ladder(&identities);
+
+    // Said before anything else this function decides, and said whether or not the run goes on to
+    // repair itself. "No signing certificate" on a machine whose keychain visibly holds a
+    // zellij-named one reads as a doctor that cannot see, and a reader who believes the report
+    // goes off to Xcode over a certificate that was never the right one.
+    if ladder.is_empty() {
+        let foreign = foreign_zellij_identities(&identities);
+        if !foreign.is_empty() {
+            let mut finding = Finding::ok(
+                "signing",
+                format!(
+                    "the keychain holds a zellij-named certificate that is not '{}'",
+                    SELF_SIGNED_COMMON_NAME
+                ),
+            );
+            for identity in foreign {
+                finding = finding.note(format!("'{}' ({})", identity.name, identity.hash));
+            }
+            findings.push(finding.note(
+                "an older setup script minted it under its own name; doctor cannot sign with it \
+                 and mints its own",
+            ));
+        }
+    }
 
     // A run that is not acting stops here and says which rung it would have taken - including the
     // one that does not exist yet. Falling through to the Xcode steps would have a dry run report
@@ -1682,26 +1763,66 @@ pub fn ensure_self_signed(
                 bundle.display()
             ),
         ));
-        if let Err(reason) = import_bundle(commander, &bundle, keychain) {
-            if !unreadable_bundle(&reason) || keychain_holds_our_certificate(commander, keychain) {
-                // NOT the proven case, or a keychain that has held this certificate before. Either
-                // way a second certificate fixes nothing and costs every grant.
-                return Err(reason);
-            }
-            let aside = set_aside(&bundle)?;
-            findings.push(
-                Finding::changed(
-                    "signing",
-                    format!(
-                        "{} could not be imported, so it was set aside",
-                        aside.display()
-                    ),
-                )
-                .note(reason)
-                .note("the keychain has never held it, so nothing on this machine was signed")
-                .note("with it and no grant names it - a new one costs nothing here"),
-            );
-            mint = true;
+        match import_bundle(commander, &bundle, keychain) {
+            Err(reason) => {
+                if !unreadable_bundle(&reason)
+                    || keychain_holds_our_certificate(commander, keychain)
+                {
+                    // NOT the proven case, or a keychain that has held this certificate before.
+                    // Either way a second certificate fixes nothing and costs every grant.
+                    return Err(reason);
+                }
+                let aside = set_aside(&bundle, ASIDE_UNREADABLE)?;
+                findings.push(
+                    Finding::changed(
+                        "signing",
+                        format!(
+                            "{} could not be imported, so it was set aside",
+                            aside.display()
+                        ),
+                    )
+                    .note(reason)
+                    .note("the keychain has never held it, so nothing on this machine was signed")
+                    .note("with it and no grant names it - a new one costs nothing here"),
+                );
+                mint = true;
+            },
+            // An import that REPORTED success is not an import that put OUR certificate where the
+            // ladder looks for it, and the difference is the second way a bundle strands a machine.
+            // A `signing/id.p12` written by an older setup script carries a certificate under its
+            // own common name: it imports perfectly, so nothing above mints, and the rung that
+            // looks for `SELF_SIGNED_COMMON_NAME` is still empty on the next pass - every pass,
+            // for as long as the file is there. Asking the keychain again is the only way to tell
+            // the two apart, because the import itself cannot.
+            Ok(()) => {
+                if let ReimportVerdict::NotOurs { foreign } =
+                    judge_reimport(&find_identities(commander))
+                {
+                    let aside = set_aside(&bundle, ASIDE_FOREIGN)?;
+                    let mut finding = Finding::changed(
+                        "signing",
+                        format!(
+                            "{} imported, but it is not doctor's certificate, so it was set aside",
+                            aside.display()
+                        ),
+                    )
+                    .note(format!(
+                        "after importing it the keychain still offers no '{}' identity",
+                        SELF_SIGNED_COMMON_NAME
+                    ));
+                    for name in foreign {
+                        finding = finding.note(format!(
+                            "it does offer '{}', which is somebody else's certificate to us",
+                            name
+                        ));
+                    }
+                    findings.push(finding.note(
+                        "a certificate of our own is minted below; the grants for the pinned copy \
+                         must be made once more",
+                    ));
+                    mint = true;
+                }
+            },
         }
     }
     if mint {
@@ -1762,18 +1883,26 @@ fn keychain_holds_our_certificate(commander: &dyn Commander, keychain: &str) -> 
     )
 }
 
+/// What a set-aside bundle turned out to be, written into its new name.
+///
+/// Two very different faults reach [`set_aside`] and the file is the evidence for whichever one it
+/// was, so the name says which: `broken` is a bundle Apple could not read at all, `foreign` is one
+/// that read perfectly and held a certificate that was not ours.
+const ASIDE_UNREADABLE: &str = "broken";
+const ASIDE_FOREIGN: &str = "foreign";
+
 /// Move a bundle out of the way, keeping it rather than removing it.
 ///
 /// A private key is never deleted here even when it is useless, because "useless" is this code's
 /// reading of an import failure and the file is the only copy of something that cannot be made
 /// again. The timestamp keeps a second failure from overwriting the first one's evidence.
-fn set_aside(bundle: &Path) -> Result<PathBuf, String> {
+fn set_aside(bundle: &Path, why: &str) -> Result<PathBuf, String> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
         .unwrap_or(0);
     let mut target = bundle.as_os_str().to_owned();
-    target.push(format!(".broken-{}", stamp));
+    target.push(format!(".{}-{}", why, stamp));
     let target = PathBuf::from(target);
     std::fs::rename(bundle, &target).map_err(|error| {
         format!(
@@ -2074,6 +2203,13 @@ Signature=adhoc
 
     const NO_IDENTITIES: &str = "     0 valid identities found\n";
 
+    /// What an older `zellij-mac-setup` left behind: a certificate that is plainly about zellij and
+    /// is not the one the ladder looks for.
+    const FOREIGN_OURS: &str = "\
+  1) 1122334455667788990011223344556677889900 \"zellij-nkmk local signing\"
+     1 valid identities found
+";
+
     const FIND_IDENTITY: &str = "security find-identity -v -p codesigning";
 
     /// A context over a scratch directory, so a test drives the same code the Mac runs without
@@ -2163,6 +2299,51 @@ Signature=adhoc
     #[test]
     fn a_keychain_with_nothing_in_it_offers_no_rung_rather_than_an_ad_hoc_one() {
         assert_eq!(choose_rung(&parse_identities(NO_IDENTITIES)), None);
+    }
+
+    /// The deadlock this half of the patch exists for, decided on a listing rather than a keychain.
+    /// A bundle that imports cleanly and leaves the ladder empty is not ours, however well it
+    /// imported - and every previous run read the clean import as proof it was.
+    #[test]
+    fn a_reimport_is_judged_by_what_the_keychain_offers_and_not_by_the_import() {
+        assert_eq!(
+            judge_reimport(&parse_identities(ONLY_OURS)),
+            ReimportVerdict::Ours
+        );
+        // an Apple certificate is not ours either: the self-signed rung is the one the bundle was
+        // supposed to fill, and a Developer ID standing beside it fills a different one
+        assert_eq!(
+            judge_reimport(&parse_identities(TWO_IDENTITIES)),
+            ReimportVerdict::NotOurs {
+                foreign: Vec::new()
+            }
+        );
+        assert_eq!(
+            judge_reimport(&parse_identities(FOREIGN_OURS)),
+            ReimportVerdict::NotOurs {
+                foreign: vec![String::from("zellij-nkmk local signing")]
+            }
+        );
+        assert_eq!(
+            judge_reimport(&parse_identities(NO_IDENTITIES)),
+            ReimportVerdict::NotOurs {
+                foreign: Vec::new()
+            }
+        );
+    }
+
+    /// Naming the certificate that is there is the whole difference between a report a reader can
+    /// act on and one that reads as doctor failing to look.
+    #[test]
+    fn a_zellij_named_certificate_that_is_not_ours_is_named_rather_than_ignored() {
+        let listed = parse_identities(FOREIGN_OURS);
+        let foreign = foreign_zellij_identities(&listed);
+        assert_eq!(foreign.len(), 1);
+        assert_eq!(foreign[0].name, "zellij-nkmk local signing");
+        // ours is never foreign to itself, and neither is an Apple certificate that says nothing
+        // about zellij
+        assert!(foreign_zellij_identities(&parse_identities(ONLY_OURS)).is_empty());
+        assert!(foreign_zellij_identities(&parse_identities(TWO_IDENTITIES)).is_empty());
     }
 
     #[test]
@@ -2537,6 +2718,9 @@ Signature=adhoc
         std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
         let commander = RecordedCommander::new(&[
             ("security import", recorded("")),
+            // the keychain offers our certificate after the import, which is what makes this a
+            // bundle that IS ours - see `judge_reimport`
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
             ("security set-key-partition-list", recorded("")),
         ]);
         ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap();
@@ -2601,6 +2785,83 @@ Signature=adhoc
         assert_eq!(
             std::fs::read(directory.path().join(&aside[0])).unwrap(),
             b"a bundle apple cannot read".to_vec()
+        );
+    }
+
+    /// The second way a bundle stranded a machine, and the one a clean import HID. A `signing/`
+    /// directory written by an older setup script holds a certificate under its own common name:
+    /// it imports without complaint, so nothing minted, and the rung that looks for ours stayed
+    /// empty on every run afterwards - doctor reporting "no signing certificate" for ever on a
+    /// machine it could repair in one pass.
+    #[test]
+    fn a_bundle_that_imports_without_being_ours_is_set_aside_and_minted_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"somebody else's certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            // the import itself is fine, which is exactly the trap
+            ("security import", recorded("")),
+            // and the keychain still offers no certificate of ours afterwards
+            (FIND_IDENTITY, recorded(FOREIGN_OURS)),
+            (
+                "security find-identity -p codesigning",
+                recorded(FOREIGN_OURS),
+            ),
+            ("openssl req", recorded("")),
+            ("openssl pkcs12", recorded("")),
+            ("security set-key-partition-list", recorded("")),
+        ]);
+        // as in the test above, the run still ends in an error because `openssl` is recorded and
+        // writes no key. What is pinned here is that it REACHED the mint.
+        let outcome = ensure_self_signed(&commander, &dir, "login.keychain-db", None);
+        assert!(outcome.is_err(), "{:?}", outcome.map(|f| f.len()));
+        assert!(
+            commander.called_with("openssl req"),
+            "{:?}",
+            commander.calls()
+        );
+
+        let aside: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".foreign-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{:?}", aside);
+        // kept and not deleted, for the same reason the unreadable one is: it is somebody's only
+        // copy of a private key, and "not ours" is this code's reading rather than a fact
+        assert_eq!(
+            std::fs::read(directory.path().join(&aside[0])).unwrap(),
+            b"somebody else's certificate".to_vec()
+        );
+    }
+
+    /// The guard on the guard. A bundle that IS ours must survive the extra question untouched -
+    /// re-asking the keychain is a check, not a licence to mint a second certificate.
+    #[test]
+    fn a_bundle_that_imports_as_ours_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+        std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            ("security import", recorded("")),
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
+        ]);
+        let findings = ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap();
+        assert!(
+            !commander.called_with("openssl req"),
+            "{:?}",
+            commander.calls()
+        );
+        assert!(dir.identity_bundle().exists(), "the bundle was moved");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("re-importing it")),
+            "{:?}",
+            findings
         );
     }
 
@@ -3630,6 +3891,9 @@ Signature=adhoc
 
         let commander = RecordedCommander::new(&[
             ("security import", recorded("")),
+            // the keychain offers our certificate after the import, which is what makes this a
+            // bundle that IS ours - see `judge_reimport`
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
             ("security set-key-partition-list", recorded("")),
         ]);
         let findings = ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap();
@@ -3655,6 +3919,9 @@ Signature=adhoc
         std::fs::write(dir.identity_bundle(), b"the one certificate").unwrap();
         let commander = RecordedCommander::new(&[
             ("security import", recorded("")),
+            // the keychain offers our certificate after the import, which is what makes this a
+            // bundle that IS ours - see `judge_reimport`
+            (FIND_IDENTITY, recorded(ONLY_OURS)),
             ("security set-key-partition-list", recorded("")),
         ]);
         ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap();

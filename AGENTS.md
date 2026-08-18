@@ -313,7 +313,7 @@ that fails the WHOLE config, not just the block.** `session_service` is the know
 
 ```
 × Failed to parse Zellij configuration
-╰── Unknown session_service entry: "managed_session" (expected systemd, launchd or pin_exe)
+╰── Unknown session_service entry: "managed_session" (expected systemd, launchd, pin_exe or restart_via_launchd)
 ```
 
 So a key nested inside such a block CANNOT be rolled out ahead of the binary — it has to ship with
