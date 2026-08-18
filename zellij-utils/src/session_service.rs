@@ -176,6 +176,14 @@ pub fn configured_pinned_exe(extras: Option<&SessionServiceOptions>) -> Option<P
     }
 }
 
+/// [`SessionServiceOptions::restart_via_launchd`] for a caller that may have no `session_service`
+/// block at all, which is the ordinary case.
+pub fn configured_restart_via_launchd(extras: Option<&SessionServiceOptions>) -> bool {
+    extras
+        .map(|extras| extras.restart_via_launchd())
+        .unwrap_or(true)
+}
+
 /// The binary an interactive launch should start the SERVER from, when `pin_exe` asks for one.
 ///
 /// `pin_exe` was built for the generated service unit, and for a while that was the only thing it
@@ -929,6 +937,20 @@ pub struct SessionServiceOptions {
     /// named before.
     #[serde(default)]
     pub pin_exe: Option<PinnedExe>,
+    /// Whether `session up` hands session creation to the installed launch agent when it is
+    /// already in the graphical session. Unset is on.
+    ///
+    /// An escape hatch rather than a preference. Deferring to the agent is what keeps the pinned
+    /// copy the responsible process for every server, and so what keeps a macOS grant working
+    /// across an upgrade - see `session_lifecycle::gui_domain_action`. It is here because that
+    /// path runs on a machine nobody is watching, at login and at every watchdog tick, and a
+    /// machine that cannot start its session is not a machine to debug over SSH with no config
+    /// key. `false` restores the older behaviour: create the session here, since the domain is
+    /// already right.
+    ///
+    /// macOS only. Nothing outside it consults this.
+    #[serde(default)]
+    pub restart_via_launchd: Option<bool>,
 }
 
 /// Literal directive lines, per section of the generated `.service` file.
@@ -1017,6 +1039,7 @@ impl SessionServiceOptions {
             && self.systemd.install.is_empty()
             && self.launchd.is_empty()
             && self.pin_exe.is_none()
+            && self.restart_via_launchd.is_none()
     }
 
     /// Whether anything here is written INTO a unit. `pin_exe` is in this block but is not one of
@@ -1034,6 +1057,15 @@ impl SessionServiceOptions {
     /// pin, so the caller is to report that it could not be honoured.
     pub fn pinned_exe(&self) -> Option<Result<PathBuf, String>> {
         self.pin_exe.as_ref().map(|pin| pin.path())
+    }
+
+    /// Whether a graphical `session up` defers to the launch agent. On unless turned off.
+    ///
+    /// Default-on is the load-bearing half: the machines this matters for are the ones whose
+    /// config nobody has touched, and a key they have to add to get the fix would leave every one
+    /// of them on the broken path.
+    pub fn restart_via_launchd(&self) -> bool {
+        self.restart_via_launchd.unwrap_or(true)
     }
 
     /// Add a literal directive line to one section of the generated service file.
