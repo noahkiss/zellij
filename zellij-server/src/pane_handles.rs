@@ -7,6 +7,12 @@
 //! Claims are RAII: a pane owns a [`HeldHandle`], and closing the pane frees the name for reuse.
 //! Uniqueness is over LIVE panes only, deliberately. A handle is an address, and an address that
 //! could never be reissued would drain the word lists over a long-lived session.
+//!
+//! A freshly generated handle also reserves both its words: no two live panes share an adjective
+//! or share a noun, even across different handles. That is `shares_a_word`, not the exact-match
+//! `is_spoken_for` a caller asking about one specific name still gets. A chosen or restored handle
+//! is exempt - it is taken verbatim by [`HeldHandle::claim`] - so the reservation is a property of
+//! generation, not of the registry as a whole.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -129,6 +135,30 @@ fn is_spoken_for(registry: &HashMap<String, Claim>, candidate: &str) -> bool {
     registry.contains_key(candidate)
 }
 
+/// A handle's words, for reservation purposes: every dash-separated segment except a purely
+/// numeric one.
+///
+/// The numeric segment is a suffix fallback (`sunny-otter-2`) rather than a word, and does not
+/// belong to either generated position - keeping it out of the reserved set is what lets the
+/// suffix mechanism reuse an already-reserved pair when it has to.
+fn handle_words(handle: &str) -> impl Iterator<Item = &str> {
+    handle
+        .split('-')
+        .filter(|segment| !segment.is_empty() && !segment.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether `candidate` shares a word - an adjective or a noun - with any name in `registry`.
+///
+/// This is the collision predicate `generate_handle` draws against: no two live panes may share
+/// either word of their handle, held or reserved alike. It replaces plain exact-match uniqueness,
+/// which is still what [`is_spoken_for`] gives a caller that wants to know about one specific name.
+fn shares_a_word(registry: &HashMap<String, Claim>, candidate: &str) -> bool {
+    let candidate_words: Vec<&str> = handle_words(candidate).collect();
+    registry
+        .keys()
+        .any(|live| handle_words(live).any(|word| candidate_words.contains(&word)))
+}
+
 /// Whether a live pane already answers to `handle`.
 ///
 /// A reserved name counts as taken: a pane is coming back under it, and handing it to somebody else
@@ -142,10 +172,10 @@ pub fn is_live(handle: &str) -> bool {
 pub struct HeldHandle(String);
 
 impl HeldHandle {
-    /// Takes a handle no live pane answers to and no pending layout has reserved.
+    /// Takes a handle that shares no word with a pane that is live or a layout has reserved.
     pub fn claim_new() -> Self {
         let mut registry = registry();
-        let handle = draw_handle(|candidate| is_spoken_for(&registry, candidate));
+        let handle = draw_handle(|candidate| shares_a_word(&registry, candidate));
         registry.insert(handle.clone(), Claim::Held);
         HeldHandle(handle)
     }
@@ -244,6 +274,61 @@ mod tests {
         let count = names.len();
         names.dedup();
         assert_eq!(names.len(), count, "a handle was handed out twice");
+    }
+
+    #[test]
+    fn two_live_panes_never_share_a_word() {
+        // reservation is stricter than exact-match uniqueness: not only is the whole handle
+        // unique, neither of its two words repeats across any other live pane's handle
+        let held: Vec<HeldHandle> = (0..200).map(|_| HeldHandle::claim_new()).collect();
+        let mut adjectives: Vec<&str> = Vec::new();
+        let mut nouns: Vec<&str> = Vec::new();
+        for handle in &held {
+            let (adjective, noun) = handle.as_str().split_once('-').expect("two words");
+            adjectives.push(adjective);
+            nouns.push(noun);
+        }
+        adjectives.sort_unstable();
+        let adjective_count = adjectives.len();
+        adjectives.dedup();
+        assert_eq!(adjectives.len(), adjective_count, "an adjective was reused");
+        nouns.sort_unstable();
+        let noun_count = nouns.len();
+        nouns.dedup();
+        assert_eq!(nouns.len(), noun_count, "a noun was reused");
+    }
+
+    #[test]
+    fn handle_words_ignores_a_numeric_suffix_segment() {
+        let words: Vec<&str> = handle_words("sunny-otter-2").collect();
+        assert_eq!(words, vec!["sunny", "otter"]);
+    }
+
+    #[test]
+    fn shares_a_word_catches_a_collision_on_either_position() {
+        let mut registry = HashMap::new();
+        registry.insert("sunny-otter".to_owned(), Claim::Held);
+        assert!(
+            shares_a_word(&registry, "sunny-badger"),
+            "adjective collision missed"
+        );
+        assert!(
+            shares_a_word(&registry, "brave-otter"),
+            "noun collision missed"
+        );
+        assert!(!shares_a_word(&registry, "brave-badger"), "false collision");
+    }
+
+    #[test]
+    fn shares_a_word_sees_the_real_words_behind_a_suffix_fallback() {
+        // the numeric segment of a suffixed handle is not a word, but the two real words behind
+        // it are still reserved - that is what stops a suffix fallback from quietly freeing them
+        let mut registry = HashMap::new();
+        registry.insert("sunny-otter-2".to_owned(), Claim::Held);
+        assert!(
+            shares_a_word(&registry, "sunny-badger"),
+            "the numeric suffix should not hide the real words"
+        );
     }
 
     #[test]
