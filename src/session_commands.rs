@@ -919,8 +919,16 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     // pane, so `up` from a shell that is not in the graphical session hands that decision to
     // launchd rather than making it here. See `zellij_utils::session_lifecycle`.
     #[cfg(target_os = "macos")]
-    match zellij_utils::session_lifecycle::ensure_gui_session_domain(name, facts.listed) {
+    match zellij_utils::session_lifecycle::ensure_gui_session_domain(
+        name,
+        facts.listed,
+        session_service::configured_restart_via_launchd(configured_extras(opts).as_ref()),
+    ) {
         Ok(true) => {
+            // launchd is the creator now, and the job it just started runs `session up` - which
+            // takes this same lock. Held any longer, this process waits for a session that is
+            // waiting for this process. See `session_lifecycle::hand_over_up_lock`.
+            zellij_utils::session_lifecycle::hand_over_up_lock(name);
             let facts = wait_for_server(name);
             if let Err(reason) = facts.assert_up() {
                 eprintln!("session up: post-condition FAILED - {}", reason);
@@ -1399,6 +1407,49 @@ mod tests {
             longest_down + SERVER_APPEARANCE_TIMEOUT,
             UP_LOCK_TIMEOUT
         );
+    }
+
+    /// The arithmetic above holds only while the thing being waited for is not itself waiting for
+    /// this lock, and a kickstarted launch agent is exactly that. It runs `zellij session up
+    /// <name>` in ANOTHER process, whose `lock_up` cannot re-enter this one - re-entrancy is
+    /// per thread - so it blocks on the `flock` for `UP_LOCK_TIMEOUT` while this side spends
+    /// `SERVER_APPEARANCE_TIMEOUT` waiting for the session it would have created. The inequality
+    /// that makes a slow restart safe is what guarantees the deadlock here: the caller always
+    /// gives up first, reports `post-condition FAILED`, exits non-zero, and the session appears
+    /// moments later anyway.
+    ///
+    /// So the `Ok(true)` arm hands the lock over before it waits. Asserted through the derived
+    /// path rather than a scratch one, because the two processes only meet if `up_lock_path` gives
+    /// them the same file.
+    #[test]
+    #[cfg(unix)]
+    fn handing_the_session_to_launchd_releases_the_lock_the_job_needs() {
+        use zellij_utils::session_lifecycle::{
+            hand_over_up_lock, lock_up, up_lock_is_free, up_lock_path,
+        };
+
+        let name = format!("zj-handover-{}", std::process::id());
+
+        // the shape `restart` makes: its own hold, with the inner `up`'s inside it
+        let restart_lock = lock_up(&name).expect("the lock is free");
+        let up_lock = lock_up(&name).expect("re-entered rather than waited");
+        assert!(
+            !up_lock_is_free(&name),
+            "nothing was holding it to begin with"
+        );
+
+        hand_over_up_lock(&name);
+        // what the kickstarted job's own `lock_up` finds, asked on its own descriptor - which is
+        // how another process asks it
+        assert!(
+            up_lock_is_free(&name),
+            "the job launchd just started would block here for {:?}",
+            UP_LOCK_TIMEOUT
+        );
+
+        drop(up_lock);
+        drop(restart_lock);
+        let _ = std::fs::remove_file(up_lock_path(&name));
     }
 
     /// launchd was measured at 15 to 20 seconds on the fleet's Macs, and a `session up` that

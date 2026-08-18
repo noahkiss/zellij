@@ -3970,6 +3970,17 @@ impl Options {
                 "pin_exe" => {
                     session_service.pin_exe = pin_exe_from_kdl(init_system)?;
                 },
+                // like `pin_exe`, not an init system but a property of how the install is used
+                "restart_via_launchd" => {
+                    session_service.restart_via_launchd =
+                        Some(kdl_first_entry_as_bool!(init_system).ok_or_else(|| {
+                            ConfigError::new_kdl_error(
+                                "restart_via_launchd takes true or false".to_owned(),
+                                init_system.span().offset(),
+                                init_system.span().len(),
+                            )
+                        })?);
+                },
                 "systemd" => {
                     for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
                     {
@@ -4011,8 +4022,8 @@ impl Options {
                 other => {
                     return Err(ConfigError::new_kdl_error(
                         format!(
-                            "Unknown session_service entry: {:?} (expected systemd, launchd or \
-                             pin_exe)",
+                            "Unknown session_service entry: {:?} (expected systemd, launchd, \
+                             pin_exe or restart_via_launchd)",
                             other
                         ),
                         init_system.span().offset(),
@@ -4043,6 +4054,12 @@ impl Options {
                 init_systems.nodes_mut().push(pin);
             },
             None => {},
+        }
+
+        if let Some(via_launchd) = session_service.restart_via_launchd {
+            let mut node = KdlNode::new("restart_via_launchd");
+            node.push(KdlValue::Bool(via_launchd));
+            init_systems.nodes_mut().push(node);
         }
 
         let sections = [
@@ -9921,6 +9938,86 @@ fn pin_exe_refuses_a_value_that_is_neither() {
     )
     .unwrap_err();
     assert!(format!("{:?}", error).contains("pin_exe"));
+}
+
+/// The escape hatch for `session up` deferring to the launch agent. Default-on is the half worth
+/// asserting: a machine whose config nobody has touched must get the deferral, or the fix reaches
+/// only the machines that were edited.
+#[test]
+fn restart_via_launchd_is_on_unless_the_config_turns_it_off() {
+    use crate::session_service::configured_restart_via_launchd;
+
+    let unset = Config::from_kdl("", None).unwrap();
+    assert!(configured_restart_via_launchd(
+        unset.options.session_service.as_ref()
+    ));
+
+    let off = Config::from_kdl(
+        "session_service {
+    restart_via_launchd false
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        off.options
+            .session_service
+            .clone()
+            .unwrap()
+            .restart_via_launchd,
+        Some(false)
+    );
+    assert!(!configured_restart_via_launchd(
+        off.options.session_service.as_ref()
+    ));
+    // and it survives being written out and read back, like every other key in this block
+    assert_eq!(
+        Config::from_kdl(&off.to_string(false), None)
+            .unwrap()
+            .options,
+        off.options
+    );
+
+    let on = Config::from_kdl(
+        "session_service {
+    restart_via_launchd true
+}",
+        None,
+    )
+    .unwrap();
+    assert!(configured_restart_via_launchd(
+        on.options.session_service.as_ref()
+    ));
+}
+
+/// The `session_service` block parses its OWN children, so an unknown one fails the whole config
+/// rather than being ignored the way an unknown top-level key is. That is what makes this key
+/// unrollable ahead of the binary, and the error has to name what it does accept.
+#[test]
+fn session_service_names_restart_via_launchd_among_what_it_accepts() {
+    let error = Config::from_kdl(
+        "session_service {
+    restart_when_i_say_so true
+}",
+        None,
+    )
+    .unwrap_err();
+    let error = format!("{:?}", error);
+    assert!(error.contains("restart_via_launchd"), "{}", error);
+
+    // and it takes a bool, not a word
+    let error = Config::from_kdl(
+        "session_service {
+    restart_via_launchd \"sometimes\"
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("restart_via_launchd"),
+        "{:?}",
+        error
+    );
 }
 
 #[test]
