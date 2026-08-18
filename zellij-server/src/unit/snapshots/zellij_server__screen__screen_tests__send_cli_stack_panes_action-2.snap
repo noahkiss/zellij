@@ -2,9 +2,9 @@
 source: zellij-server/src/./unit/screen_tests.rs
 expression: "format!(\"{}\", snapshot)"
 ---
-00 (C): ┌ Pane #1 ─────┐┌ Pane #2 ───────────────────────── active-ant ┐┌ Pane #5 ─────┐
-01 (C): │              │┌ Pane #3 ────────────────────────── alert-ant ┐│              │
-02 (C): │              │┌ Pane #4 ────────────────────────── alive-ant ┐│              │
+00 (C): ┌ Pane #1 ─────┐┌ Pane #2 ─────────────────────── apt-anteater ┐┌ Pane #5 ─────┐
+01 (C): │              │┌ Pane #3 ─────────────────────── big-antelope ┐│              │
+02 (C): │              │┌ Pane #4 ─────────────────────── coy-backpack ┐│              │
 03 (C): │              ││                                              ││              │
 04 (C): │              ││                                              ││              │
 05 (C): │              ││                                              ││              │

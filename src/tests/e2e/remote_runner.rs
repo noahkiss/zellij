@@ -44,6 +44,12 @@ fn setup_remote_environment(channel: &mut ssh2::Channel, win_size: Size) {
         .unwrap();
     channel.shell().unwrap();
     channel.write_all(b"export PS1=\"$ \"\n").unwrap();
+    // Draw pane handles in a fixed, sequential order instead of at random, so the frame's
+    // handle text is stable across runs and can be checked into a snapshot. See
+    // zellij-server/src/pane_handles.rs for what this variable does and why it exists.
+    channel
+        .write_all(b"export ZELLIJ_SEQUENTIAL_PANE_HANDLES=1\n")
+        .unwrap();
     channel.flush().unwrap();
 }
 

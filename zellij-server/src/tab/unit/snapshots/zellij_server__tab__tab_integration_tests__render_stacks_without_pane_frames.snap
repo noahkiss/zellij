@@ -2,9 +2,9 @@
 source: zellij-server/src/tab/./unit/tab_integration_tests.rs
 expression: snapshot
 ---
-00 (C): ─────────────────────── Pane #1 ───────── [ able-ant ]┼────────────────── Pane #7  [ artistic-ant ] 
-01 (C): ─────────────────────── Pane #9 ──────── [ aware-ant ]┤                                             
-02 (C): ────────────────────── Pane #10 ───────── [ bold-ant ]┤                                             
+00 (C): ─────────────────────── Pane #1 ───── [ ace-aardvark ]┼────────────────── Pane #7  [ fit-birdcage ] 
+01 (C): ─────────────────────── Pane #9 ───── [ hip-bullfrog ]┤                                             
+02 (C): ────────────────────── Pane #10 ───── [ hot-campfire ]┤                                             
 03 (C):                                                       │                                             
 04 (C):                                                       │                                             
 05 (C):                                                       │                                             
@@ -20,10 +20,10 @@ expression: snapshot
 15 (C):                                                       │                                             
 16 (C):                                                       │                                             
 17 (C):                                                       │                                             
-18 (C):                                                       ├────────────────── Pane #8 ─── [ awake-ant ] 
+18 (C):                                                       ├────────────────── Pane #8  [ fun-bluebird ] 
 19 (C): ─────────────────────────────────────────────────┬────┴─────────────────────────────────────────────
-20 (C): ───────────────────── Pane #2 ──── [ active-ant ]┼───────────────────── Pane #4 ───── [ alive-ant ] 
-21 (C): ───────────────────── Pane #3 ───── [ alert-ant ]┼───────────────────── Pane #5 ──── [ amused-ant ] 
+20 (C): ───────────────────── Pane #2 ── [ apt-anteater ]┼───────────────────── Pane #4 ── [ coy-backpack ] 
+21 (C): ───────────────────── Pane #3 ── [ big-antelope ]┼───────────────────── Pane #5 ── [ dry-backyard ] 
 22 (C):                                                  │                                                  
 23 (C):                                                  │                                                  
 24 (C):                                                  │                                                  
@@ -41,4 +41,4 @@ expression: snapshot
 36 (C):                                                  │                                                  
 37 (C):                                                  │                                                  
 38 (C):                                                  │                                                  
-39 (C):                                                  ├───────────────────── Pane #6 ───── [ ample-ant ]
+39 (C):                                                  ├───────────────────── Pane #6 ── [ fab-barnacle ]

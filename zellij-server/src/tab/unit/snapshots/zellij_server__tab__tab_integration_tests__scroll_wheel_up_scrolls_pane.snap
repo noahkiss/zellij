@@ -2,7 +2,7 @@
 source: zellij-server/src/tab/./unit/tab_integration_tests.rs
 expression: "format!(\"{}\", snapshot_after)"
 ---
-00 (C): ┌ Pane #1 ──────────────────────────────────────────────────────────────────────────────────── SCROLL:  3/33 | able-ant ┐
+00 (C): ┌ Pane #1 ──────────────────────────────────────────────────────────────────────────────── SCROLL:  3/33 | ace-aardvark ┐
 01 (C): │Line 30                                                                                                                │
 02 (C): │Line 31                                                                                                                │
 03 (C): │Line 32                                                                                                                │

@@ -7,6 +7,7 @@ Some(
         "my tab name",
         None,
         false,
+        false,
         Some(
             1,
         ),
@@ -18,7 +19,7 @@ Some(
                 affected_pane_id: None,
                 affected_tab_id: None,
                 error_message: None,
-                stdout_message: None,
+                stdout_lines: [],
             },
         ),
     ),

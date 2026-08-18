@@ -2,14 +2,14 @@
 source: zellij-server/src/tab/./unit/tab_integration_tests.rs
 expression: snapshot
 ---
-00 (C): ┌ Pane #1 ───────────────────────────────────────────────────────────────────────────────────── SCROLL:  0/7 | able-ant ┐
+00 (C): ┌ Pane #1 ───────────────────────────────────────────────────────────────────────────────── SCROLL:  0/7 | ace-aardvark ┐
 01 (C): │ixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixe                                                        │
 02 (C): │ixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixe                                                        │
 03 (C): │ixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixe                                                        │
 04 (C): │ixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixe                                                        │
 05 (C): │ixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixe                                                        │
 06 (C): │ixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixelSixe                                                        │
-07 (C): │ixelSixelSixelSixelSixelSixelSixe┌ Pane #2 ─────────────────────────── active-ant | PIN [ ] ┐                          │
+07 (C): │ixelSixelSixelSixelSixelSixelSixe┌ Pane #2 ───────────────────────── apt-anteater | PIN [ ] ┐                          │
 08 (C): │ixelSixelSixelSixelSixelSixelSixe│                                                          │                          │
 09 (C): │ixelSixelSixelSixelSixelSixelSixe│                                                          │                          │
 10 (C): │ixelSixelSixelSixelSixelSixelSixe│                                                          │                          │
