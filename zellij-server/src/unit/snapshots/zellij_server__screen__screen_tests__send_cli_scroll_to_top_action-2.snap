@@ -2,7 +2,7 @@
 source: zellij-server/src/./unit/screen_tests.rs
 expression: "format!(\"{}\", snapshot)"
 ---
-00 (C): ┌ Pane #1 ─── SCROLL:  0/13 | able-ant ┐┌ Pane #2 ───────────────── active-ant ┐
+00 (C): ┌ Pane #1 ────────────── SCROLL:  0/13 ┐┌ Pane #2 ─────────────── apt-anteater ┐
 01 (C): │fill pane up with something 13        ││                                      │
 02 (C): │fill pane up with something 14        ││                                      │
 03 (C): │fill pane up with something 15        ││                                      │
