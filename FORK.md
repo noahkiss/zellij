@@ -656,6 +656,18 @@ both frame styles — the full frame and the one-line row that `pane_frame_style
 - A floating pane is the one exception to "rightmost": its pin checkbox is a click target found by
   counting back from the right edge, so the pin keeps that edge and the handle sits to its left.
 
+#### Testing
+
+A random handle drawn in the frame makes a rendered-screen snapshot a coin toss, so the e2e harness
+(`src/tests/e2e/remote_runner.rs`, `setup_remote_environment`) exports
+`ZELLIJ_SEQUENTIAL_PANE_HANDLES=1` into the ssh shell it drives, asking every zellij server it starts
+for in-order handles instead of random ones (see `names_in_order` in
+`zellij-server/src/pane_handles.rs`). The `quit_and_resurrect_session` and `resize_terminal_window`
+e2e snapshots, and 72 `zellij-server` plugin-system snapshots that had gone stale for unrelated
+reasons (the `GoToTabName` instruction's `no_focus` field; the `stdout_message` →
+`stdout_lines` rename), track that fork output. Those plugin tests are `#[ignore]`d and run only
+in the End to End workflow, so a red workflow hides new drift — check it after every push.
+
 ### Making a tab needs somebody attached
 
 ```
