@@ -42,7 +42,10 @@ pub fn start_cli_client(
         sock_dir
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    os_input.connect_to_server(&*zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", e);
+        return 1;
+    }
     let pane_id = anchor_pane.or_else(|| {
         os_input
             .env_variable("ZELLIJ_PANE_ID")
@@ -284,7 +287,7 @@ fn ask(
         sock_dir
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    os_input.connect_to_server(&*zellij_ipc_pipe);
+    os_input.connect_to_server(&*zellij_ipc_pipe)?;
     os_input.send_to_server(ClientToServerMsg::Action {
         action,
         terminal_id: None,
@@ -848,7 +851,9 @@ fn wait_on_renders(
     deadline: Option<Instant>,
 ) -> Result<Option<String>, WaitMiss> {
     let zellij_ipc_pipe = socket_for(session_name).map_err(WaitMiss::Failed)?;
-    os_input.connect_to_server(&zellij_ipc_pipe);
+    os_input
+        .connect_to_server(&zellij_ipc_pipe)
+        .map_err(WaitMiss::Failed)?;
     os_input.send_to_server(ClientToServerMsg::SubscribeToPaneRenders {
         pane_ids: vec![pane],
         scrollback: None,
@@ -956,7 +961,10 @@ pub fn start_subscribe_client(
         sock_dir
     };
     crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    os_input.connect_to_server(&*zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", e);
+        process::exit(1);
+    }
 
     // Parse pane IDs
     let pane_ids: Vec<PaneId> = subscribe_cli

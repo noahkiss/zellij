@@ -3421,7 +3421,9 @@ impl ClientOsApi for MockClientOsApi {
         _resize_receiver: Option<std::sync::mpsc::Receiver<()>>,
     ) {
     }
-    fn connect_to_server(&self, _path: &std::path::Path) {}
+    fn connect_to_server(&self, _path: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
     fn load_palette(&self) -> Palette {
         Palette::default()
     }
