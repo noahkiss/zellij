@@ -47,7 +47,9 @@ pub fn build(sh: &Shell, flags: flags::Build) -> anyhow::Result<()> {
             if flags.release {
                 build_plugins_release_into_assets(sh, &plugin_members)?;
             } else {
-                let mut base_cmd = cmd!(sh, "{cargo} build --target wasm32-wasip1");
+                let remap = wasm_path_remap_config();
+                let mut base_cmd =
+                    cmd!(sh, "{cargo} build --target wasm32-wasip1 --config {remap}");
                 for member in &plugin_members {
                     base_cmd = base_cmd.args(["-p", plugin_name_of(member)?]);
                 }
@@ -196,7 +198,11 @@ fn build_plugins_release_into_assets(
     plugin_members: &[&WorkspaceMember],
 ) -> anyhow::Result<()> {
     let cargo = crate::cargo()?;
-    let mut base_cmd = cmd!(sh, "{cargo} build --target wasm32-wasip1 --release");
+    let remap = wasm_path_remap_config();
+    let mut base_cmd = cmd!(
+        sh,
+        "{cargo} build --target wasm32-wasip1 --release --config {remap}"
+    );
     for member in plugin_members {
         let plugin_name = plugin_name_of(member)?;
         base_cmd = base_cmd.args(["-p", plugin_name]);
@@ -207,6 +213,53 @@ fn build_plugins_release_into_assets(
         move_plugin_to_assets(sh, plugin_name_of(member)?)?;
     }
     Ok(())
+}
+
+/// A cargo `--config` argument that strips machine-specific absolute paths from the plugins.
+///
+/// The built `.wasm` files are checked in under `zellij-utils/assets/plugins/`, and rustc bakes an
+/// absolute path into them for every `panic!` location and every `include!`d file. Without a remap
+/// those paths publish whoever built the assets: their home directory, their cargo registry, and
+/// where they keep the checkout.
+///
+/// Scoped to the wasm target so it never disturbs the host flags — a linker or a `-C` setting a
+/// machine configures for its native triple still applies. Cargo appends this to any
+/// `target.wasm32-wasip1.rustflags` a config file already sets rather than replacing them.
+fn wasm_path_remap_config() -> String {
+    // Generic first, specific last: rustc applies the last prefix that matches.
+    let mut prefixes: Vec<(PathBuf, &str)> = Vec::new();
+    if let Some(home) = home_dir() {
+        prefixes.push((home, "~"));
+    }
+    if let Some(cargo_home) = cargo_home() {
+        prefixes.push((cargo_home, "/cargo"));
+    }
+    prefixes.push((crate::project_root(), "/zellij"));
+
+    let flags = prefixes
+        .into_iter()
+        .map(|(from, to)| toml_string(&format!("--remap-path-prefix={}={}", from.display(), to)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("target.wasm32-wasip1.rustflags=[{flags}]")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+}
+
+fn cargo_home() -> Option<PathBuf> {
+    match std::env::var_os("CARGO_HOME") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => home_dir().map(|home| home.join(".cargo")),
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn plugin_name_of(member: &WorkspaceMember) -> anyhow::Result<&'static str> {
