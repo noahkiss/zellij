@@ -586,6 +586,33 @@ zellij action dump-screen --pane-id sunny-otter
 - **Where you see it**: the `HANDLE` column of `list-panes`, the `handle:` key of every creation
   command, the `list-tree` outline, both halves of a `go-to-pane` report, and the pane frame.
 
+#### Fixed width, and no shared words
+
+A generated handle's two words always sum to 11 letters — `ace-aardvark`, `coy-backpack` — so every
+generated handle is the same 12-character width on the frame, and the title beside it does not creep
+sideways from one pane to the next. `zellij-utils/src/pane_handle.rs` builds this as a filtered pair
+space, lazily and once: every `(adjective, noun)` index pair whose word lengths add to 11, over the
+504 adjectives and 594 nouns vendored in `zellij-utils/src/vendored/petname/mod.rs` — 58,057 pairs.
+`random_handle` draws from it uniformly; `nth_handle` and `handle_space_size` enumerate the same
+space in the same fixed order, so the deterministic testing handles below still hold, and each still
+wraps past the end of the (now smaller, filtered) space rather than panicking.
+
+No two live panes share a word, not just a whole handle. `zellij-server/src/pane_handles.rs` builds
+the reserved-word set from every live and reserved handle's dash-separated segments, dropping a
+purely numeric one — the `-2` of a suffix fallback is not a word — and a fresh draw is refused if
+either of its words is already in that set (`shares_a_word`, replacing the old exact-match
+`is_spoken_for` for generation). A restored or chosen handle is exempt from this check — it is taken
+verbatim by `HeldHandle::claim` — so reservation is a property of *generation*, not of the registry
+as a whole. One consequence worth knowing: since each generated pane spends one adjective and one
+noun, a session can hold at most 504 word-reservation-generated panes at once (the shorter of the two
+lists) before every adjective is spoken for and generation falls to the suffix ladder below.
+
+`generate_handle` tries three rungs before it gives up on the fixed-width space: up to 32 random
+draws against the caller's predicate, then a deterministic sweep of the whole pair space starting at
+a random offset (so an unlucky run of rerolls still finds a free pair, in bounded time), and only if
+every pair in the space is refused does it fall back to the pre-existing numeric suffix — `-2`,
+`-3` and so on — so generation always returns something.
+
 #### Choosing a handle
 
 ```
@@ -667,6 +694,15 @@ e2e snapshots, and 72 `zellij-server` plugin-system snapshots that had gone stal
 reasons (the `GoToTabName` instruction's `no_focus` field; the `stdout_message` →
 `stdout_lines` rename), track that fork output. Those plugin tests are `#[ignore]`d and run only
 in the End to End workflow, so a red workflow hides new drift — check it after every push.
+
+Fixing every generated handle's width to 11 letters (above) moved which pairs `nth_handle` produces,
+so it moved the deterministic output every one of those `ZELLIJ_SEQUENTIAL_PANE_HANDLES` snapshots
+was pinned to. 275 `zellij-server` snapshots refreshed with the new sequence — the local
+`tab_integration_tests` and `screen_tests` unit-test golden frames, mostly. The 150 `#[ignore]`d
+plugin-system snapshots did not need it: none of them render a pane frame or otherwise embed handle
+text. The `quit_and_resurrect_session` and `resize_terminal_window` e2e snapshots almost certainly do
+need it too, since they cross a real frame render, but this box has no `musl-gcc` to build the e2e
+binary that would prove it — confirm and refresh them in CI before relying on that pair.
 
 ### Making a tab needs somebody attached
 
