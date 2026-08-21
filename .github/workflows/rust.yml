@@ -15,9 +15,27 @@ name: Rust
 # Consequence for the release pipeline: a docs-only push produces NO run, so
 # "push, wait for Rust green, then tag" has nothing to wait for. The version bump
 # touches Cargo.toml and always runs, so gate the tag on that push's run.
+#
+# Topic branches run too. The flow in AGENTS.md is "branch per patch, prove it with
+# an RC tag from the branch, then squash-merge" - so the branch is where a patch has
+# to go green, and before this the only way to get a run on one was a manual
+# workflow_dispatch. The branch list is the conventional-commit scopes this fork uses
+# for branch names, enumerated rather than `'**'` so that `backup/*` snapshots and
+# `rebase/*` scratch branches do not each burn a full matrix.
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'feat/**'
+      - 'fix/**'
+      - 'ci/**'
+      - 'chore/**'
+      - 'docs/**'
+      - 'perf/**'
+      - 'refactor/**'
+      - 'style/**'
+      - 'test/**'
+      - 'rc/**'
     paths-ignore:
       - '**.md'
       - 'LICENSE.md'
@@ -34,6 +52,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+# A superseded push cancels its stale run. This matters more now that every topic
+# branch triggers: without it, a branch pushed three times in a minute holds three
+# full matrices. Same group shape as e2e.yml.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:

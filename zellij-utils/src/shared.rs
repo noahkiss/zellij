@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use std::{iter, str::from_utf8};
 
 use crate::data::{Palette, PaletteColor, PaletteSource, ThemeHue};
@@ -88,21 +88,38 @@ pub const DEFAULT_TERMINAL_TITLE_TEMPLATE: &str = "{session} | {pane}";
 
 /// The terminal title format of the session running in this process.
 ///
-/// Set once the first client has connected and the config file has been read, because that is the
-/// earliest point at which it is known. Panes read it while rendering, which is far away from any
-/// place that still has the config in hand.
-static TERMINAL_TITLE_FORMAT: OnceLock<TerminalTitleFormat> = OnceLock::new();
+/// First set when the first client connects and the config file has been read, and set again on
+/// every live reload. Panes read it while rendering, which is far away from any place that still
+/// has the config in hand - hence a global rather than a value threaded through the render path.
+///
+/// **A `RwLock` and not a `OnceLock`.** It was the latter, so `terminal_title_template` and
+/// `session_aliases` were whatever the config said when the session started and a `zellij setup
+/// --check`-clean edit to either of them did nothing until the session was recreated. Every other
+/// live-reloadable option reaches the panes through `ScreenInstruction::Reconfigure`; this one has
+/// no per-client home to travel in, so the reload writes it here instead.
+static TERMINAL_TITLE_FORMAT: RwLock<Option<TerminalTitleFormat>> = RwLock::new(None);
 
-/// Fix the terminal title format for the rest of this process. Later calls do nothing.
+/// Use this format for the titles drawn from now on. Called at session start and on every reload.
 pub fn set_terminal_title_format(terminal_title_format: TerminalTitleFormat) {
-    let _ = TERMINAL_TITLE_FORMAT.set(terminal_title_format);
+    if let Ok(mut format) = TERMINAL_TITLE_FORMAT.write() {
+        *format = Some(terminal_title_format);
+    }
 }
 
-fn terminal_title_format() -> &'static TerminalTitleFormat {
+/// Render with the session's format, or with the historical one when there is not one yet.
+///
+/// A poisoned lock takes the same fallback rather than propagating the panic: a terminal title is
+/// cosmetic, and `{session} | {pane}` is a better outcome than taking a pane's render down with it.
+fn with_terminal_title_format<R>(render: impl FnOnce(&TerminalTitleFormat) -> R) -> R {
     static DEFAULT_TERMINAL_TITLE_FORMAT: OnceLock<TerminalTitleFormat> = OnceLock::new();
-    TERMINAL_TITLE_FORMAT
-        .get()
-        .unwrap_or_else(|| DEFAULT_TERMINAL_TITLE_FORMAT.get_or_init(TerminalTitleFormat::default))
+    let default = || DEFAULT_TERMINAL_TITLE_FORMAT.get_or_init(TerminalTitleFormat::default);
+    match TERMINAL_TITLE_FORMAT.read() {
+        Ok(format) => match format.as_ref() {
+            Some(format) => render(format),
+            None => render(default()),
+        },
+        Err(_) => render(default()),
+    }
 }
 
 /// The placeholders a terminal title template can contain.
@@ -279,14 +296,11 @@ fn resolve_hostname() -> Option<String> {
 }
 
 pub fn make_terminal_title(pane_title: &str) -> String {
-    format!(
-        "\u{1b}]0;{}\u{07}",
-        terminal_title_format().render(
-            get_session_name().ok().as_deref(),
-            short_hostname(),
-            pane_title
-        )
-    )
+    let session_name = get_session_name().ok();
+    let rendered = with_terminal_title_format(|format| {
+        format.render(session_name.as_deref(), short_hostname(), pane_title)
+    });
+    format!("\u{1b}]0;{}\u{07}", rendered)
 }
 
 // Colors
@@ -460,6 +474,33 @@ mod terminal_title_tests {
             .iter()
             .map(|(session_name, alias)| (session_name.to_string(), alias.to_string()))
             .collect()
+    }
+
+    /// The whole of the live-reload fix, and the only test here that touches the process global:
+    /// setting the format a second time has to take, because a `OnceLock` silently dropped it and
+    /// left a config edit doing nothing until the session was recreated. Both halves are asserted
+    /// in one test so that no other test in this binary can observe the global mid-change.
+    #[test]
+    fn the_terminal_title_format_can_be_set_more_than_once() {
+        assert!(
+            with_terminal_title_format(|format| format == &TerminalTitleFormat::default()),
+            "nothing else in this binary may have set the format before this test"
+        );
+
+        set_terminal_title_format(TerminalTitleFormat::new(Some("first {pane}"), aliases(&[])));
+        assert_eq!(
+            with_terminal_title_format(|format| format.render(None, "example-host", "vim")),
+            "first vim"
+        );
+
+        set_terminal_title_format(TerminalTitleFormat::new(
+            Some("second {pane}"),
+            aliases(&[]),
+        ));
+        assert_eq!(
+            with_terminal_title_format(|format| format.render(None, "example-host", "vim")),
+            "second vim"
+        );
     }
 
     #[test]
