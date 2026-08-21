@@ -1841,9 +1841,20 @@ session_service {
 ```
 
 `%t` is systemd's `$XDG_RUNTIME_DIR`, which is where a user-level agent unit conventionally puts its
-socket. There is no launchd equivalent yet: `EnvironmentVariables` is a key the generator owns, and
-a bare `SSH_AUTH_SOCK` under `launchd { keys { ... } }` would be a top-level plist key, which
+socket. The launchd equivalent is the
+[`env` block](#the-launchd-env-block-an-environment-variable-a-launch-agent-can-actually-read),
+not `launchd { keys { ... } }`: a bare `SSH_AUTH_SOCK` there would be a top-level plist key, which
 launchd ignores in silence.
+
+```kdl
+session_service {
+    launchd {
+        env {
+            SSH_AUTH_SOCK "/private/tmp/com.apple.launchd.XXXX/Listeners"
+        }
+    }
+}
+```
 
 ### A warning when `copy_command` has no display to talk to
 
@@ -5467,6 +5478,58 @@ leaves `[Version]:` alone.
 built 2026-08-21`. A `build.rs` was the alternative and is worse: `zellij-utils` has none, it
 compiles for wasm, and stamping a date there would make the checked-in plugin assets differ on
 every rebuild.
+
+||||||| f632d561f
+### The launchd `env` block: an environment variable a launch agent can actually read
+
+The systemd side has always been able to say this. An `Environment=` line is a directive like any
+other, so `session_service { systemd { service "Environment=SSH_AUTH_SOCK=…" } }` works and is
+documented above. The launchd side could not, and the failure was silent: `launchd { keys { … } }`
+writes TOP-LEVEL plist keys, launchd has no top-level key named after an environment variable, and
+so `keys { SSH_AUTH_SOCK "…" }` parsed, generated, installed, loaded, and did nothing at all.
+
+```kdl
+session_service {
+    launchd {
+        env {
+            SSH_AUTH_SOCK "/private/tmp/com.apple.launchd.XXXX/Listeners"
+            HOMEBREW_PREFIX "/opt/homebrew"
+        }
+    }
+}
+```
+
+Entries go into the plist's `EnvironmentVariables` dictionary, in the order the config gives them,
+after the three the generator writes itself.
+
+**A separate block rather than a rule inside `keys`.** Guessing which of the extras is an
+environment variable is not a guess the generator can make: `ProcessType` and `PATH` look alike, the
+only difference is what launchd does with them, and being wrong in either direction writes a plist
+that is accepted and ignored. So the config states which it means, and the two blocks sit beside
+each other under `launchd`.
+
+**Values are strings, not `PlistValue`s.** That dictionary holds strings; an array there is not a
+shape launchd understands, so the type refuses it at the parser instead of letting it reach a file.
+
+**TERM, PATH and XDG_STATE_HOME resolve in three steps**: the `env` block, then a name put through
+the `keys` hatch, then the generator's built-in default. `env` wins because it names the dictionary
+launchd actually reads, which is the more specific of the two statements — the same argument that
+makes `StartInterval` beat [`watchdog_interval_secs`](#watchdog_interval_secs-one-key-retimes-the-watchdog-on-both-platforms).
+Whichever half loses is still TAKEN OUT of the extras, so the variable is written exactly once and
+never also as a top-level key. A repeated name inside one `env` block is the later one, for the same
+reason: a dictionary with one key twice is not a plist, and a config file is read top to bottom.
+
+`TMPDIR` and `ZELLIJ_SOCKET_DIR` are refused here as they are in `keys`. A new route to the two
+names the whole design forbids would be the one way this patch could do real harm.
+
+Unset, the generated plist is byte-identical to what it was — asserted by comparing the output
+against a default block. `session status` lists the entries as `env NAME = value`, prefixed because
+they are not plist keys and a listing that showed them the same way would say they were.
+
+Nested key, so the usual rule applies with no exceptions: the `launchd` block parses its own
+children, and an older build fails the **whole** config on `env`, not just the block. It cannot be
+seeded into a shared config ahead of the binary; it ships with the code that accepts it, and every
+machine takes the binary first.
 
 ## Assessed and deliberately not built
 
