@@ -680,14 +680,30 @@ fn create_plugin_thread_with_background_jobs_receiver(
 }
 
 lazy_static! {
-    static ref PLUGIN_FIXTURE: String = format!(
-        // to populate this file, make sure to run the build-e2e CI job
-        // (or compile the fixture plugin and copy the resulting .wasm blob to the below location)
-        "{}/../target/e2e-data/plugins/fixture-plugin-for-tests.wasm",
-        std::env::var_os("CARGO_MANIFEST_DIR")
-            .unwrap()
-            .to_string_lossy()
-    );
+    // `CARGO_TARGET_DIR` when set, else `../target` beside this crate - the same rule
+    // `xtask::target_dir()` uses to decide where `cargo xtask ci e2e --build` writes the fixture,
+    // so the two agree without either naming the other's default.
+    static ref PLUGIN_FIXTURE: String = {
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../target")
+            });
+        let fixture = target_dir
+            .join("e2e-data")
+            .join("plugins")
+            .join("fixture-plugin-for-tests.wasm");
+        // A missing fixture used to reach `wasmtime::Module::from_file` inside the plugin thread,
+        // which fails silently there while the test thread blocks forever on a channel recv that
+        // nothing was ever going to send to - a hang (futex, 0% CPU), not a failure. Panicking here,
+        // before any thread is spawned, turns that into an immediate, readable test failure.
+        assert!(
+            fixture.is_file(),
+            "e2e fixture plugin not found at {}. Run `cargo xtask ci e2e --build` to build it.",
+            fixture.display()
+        );
+        fixture.to_string_lossy().into_owned()
+    };
 }
 
 #[test]
