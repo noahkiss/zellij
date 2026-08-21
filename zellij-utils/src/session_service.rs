@@ -184,6 +184,14 @@ pub fn configured_restart_via_launchd(extras: Option<&SessionServiceOptions>) ->
         .unwrap_or(true)
 }
 
+/// [`SessionServiceOptions::managed_session`] for a caller that may have no `session_service` block
+/// at all, which is the ordinary case and the one that must change nothing.
+pub fn configured_managed_session(extras: Option<&SessionServiceOptions>) -> bool {
+    extras
+        .map(|extras| extras.managed_session())
+        .unwrap_or(false)
+}
+
 /// The binary an interactive launch should start the SERVER from, when `pin_exe` asks for one.
 ///
 /// `pin_exe` was built for the generated service unit, and for a while that was the only thing it
@@ -979,6 +987,21 @@ pub struct SessionServiceOptions {
     /// macOS only. Nothing outside it consults this.
     #[serde(default)]
     pub restart_via_launchd: Option<bool>,
+    /// Whether the init system OWNS the session named by `session_name`. Unset is off, and off is
+    /// the whole feature: no unit is written that was not asked for, and every command creates a
+    /// session exactly as it did before.
+    ///
+    /// Set, it makes the unit unconditional. The unit for `session_name` is installed and kept
+    /// current by the commands that would otherwise have needed `session enable` typed first, and
+    /// every path that would CREATE that session hands the creation to the unit instead of building
+    /// a server here. The point is that one process - the one the init system starts, from the
+    /// pinned copy, in the right session domain - is the only thing that ever makes the session, so
+    /// what that session can reach does not depend on which terminal happened to start it.
+    ///
+    /// It is a single switch and not a per-name list because it reads the name that is already
+    /// there: `session_name`. Nothing else is managed, so `zellij -s scratch` is untouched by this.
+    #[serde(default)]
+    pub managed_session: Option<bool>,
 }
 
 /// Literal directive lines, per section of the generated `.service` file.
@@ -1068,6 +1091,7 @@ impl SessionServiceOptions {
             && self.launchd.is_empty()
             && self.pin_exe.is_none()
             && self.restart_via_launchd.is_none()
+            && self.managed_session.is_none()
     }
 
     /// Whether anything here is written INTO a unit. `pin_exe` is in this block but is not one of
@@ -1094,6 +1118,16 @@ impl SessionServiceOptions {
     /// of them on the broken path.
     pub fn restart_via_launchd(&self) -> bool {
         self.restart_via_launchd.unwrap_or(true)
+    }
+
+    /// Whether the init system owns `session_name`. Off unless turned on.
+    ///
+    /// Default-OFF, which is the opposite of [`restart_via_launchd`](Self::restart_via_launchd) and
+    /// deliberately so: that key changes how an already-installed unit is used, this one decides
+    /// whether a unit is installed at all. A default-on version would write a launch agent on every
+    /// machine that has never asked for one.
+    pub fn managed_session(&self) -> bool {
+        self.managed_session.unwrap_or(false)
     }
 
     /// Add a literal directive line to one section of the generated service file.
@@ -2663,6 +2697,15 @@ pub mod systemctl {
 
     pub fn disable_now(unit: &str) -> Result<(), String> {
         run(&["disable", "--now", unit]).map(|_| ())
+    }
+
+    /// Run the unit now, without touching whether it is enabled at login.
+    ///
+    /// It BLOCKS until the unit has finished activating, which for the generated `Type=oneshot`
+    /// service means until the `session up` it runs has returned - so a caller that asked for the
+    /// session has it by the time this does.
+    pub fn start(unit: &str) -> Result<(), String> {
+        run(&["start", unit]).map(|_| ())
     }
 
     /// What systemd calls the unit's install state - "enabled", "disabled", "not-found". It exits
