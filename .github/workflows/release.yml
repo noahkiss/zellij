@@ -99,10 +99,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # ZELLIJ_BUILD_DATE is what `zellij --version` reports as the build date. It is deliberately
+      # set here and nowhere else: a local `cargo build` leaves it unset and stays reproducible.
       - name: Build
         env:
           OPENSSL_NO_VENDOR: '1'
-        run: cargo build --release --locked --bin zellij --target ${{ matrix.target }}
+        run: |
+          export ZELLIJ_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          cargo build --release --locked --bin zellij --target ${{ matrix.target }}
 
       - name: Package
         run: |

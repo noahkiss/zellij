@@ -53,7 +53,7 @@ fn validate_session(name: &str) -> Result<String, String> {
 
 #[derive(Parser, Default, Debug, Clone, Serialize, Deserialize)]
 #[clap(
-    version,
+    version = crate::consts::version_long(),
     name = "zellij",
     about = "A terminal workspace with batteries included",
     long_about = "A terminal workspace with batteries included.
@@ -3142,6 +3142,27 @@ mod tests {
             Some(Command::Action(action)) => *action,
             other => panic!("Expected Action, got {:?}", other),
         }
+    }
+
+    /// `--version` and `-V` share one string in clap, so rendering it once covers both.
+    #[test]
+    fn the_rendered_version_leads_with_the_bare_version_then_names_the_base() {
+        use clap::CommandFactory;
+        // Building the command tree needs the big stack for the same reason parsing does.
+        let rendered = on_big_stack(|| CliArgs::command().render_version());
+        let mut lines = rendered.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("zellij {}", crate::consts::VERSION),
+            "the first line is what scripts parse and must not grow a suffix"
+        );
+        let base_line = lines.next().unwrap();
+        assert!(
+            base_line.contains(crate::consts::UPSTREAM_BASE_TAG)
+                && base_line.contains(crate::consts::UPSTREAM_BASE_COMMIT),
+            "expected the upstream base on the second line, got {:?}",
+            base_line
+        );
     }
 
     fn action_parse_fails(args: &[&str]) -> bool {
