@@ -98,9 +98,10 @@ available_layouts {
     layout2 source="built-in"
     layout3 source="file"
 }
+plugins {
+}
 tab_history {
 }
 pane_history {
 }
 creation_time 300
-

@@ -12,9 +12,10 @@ web_clients_allowed false
 web_client_count 0
 available_layouts {
 }
+plugins {
+}
 tab_history {
 }
 pane_history {
 }
 creation_time 0
-

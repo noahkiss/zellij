@@ -5148,6 +5148,37 @@ twice over: it is a one-second animation, and it is the same field the multi-sel
 so a durable mark stored there would be wiped by unrelated UI and suppressed for as long as the
 pane sits in a selection group.
 
+### `SessionInfo.plugins` says which plugins a session is running
+
+The field has been on `SessionInfo` all along, it has a protobuf tag, and both conversions were
+written. It was empty in every answer anyone could get to. Two independent gaps did it, and each one
+alone was enough:
+
+- **Nothing joined the two halves before the file was written.** Screen builds the session's
+  metadata and has no idea which plugins run, so it left the map empty and said the wasm thread
+  would fill it in. The wasm thread does report the list — to the background job that writes
+  `session-metadata.kdl` — and the writer read the metadata and the plugin list out of two
+  variables without ever putting them together. They are joined now at write time rather than when
+  either half arrives, because the two are reported independently and only the freshest of each
+  belongs in the file.
+- **The KDL codec dropped the field outright**, with a comment saying so. So even a correct map went
+  to disk as nothing.
+
+What that cost: a session could be told its own plugins, by a patch-up applied in memory after the
+read, and every *other* session on the machine came back claiming to run none. So the
+`Event::SessionUpdate` a plugin subscribes to, which carries every session on the machine, was
+right about exactly one of them.
+`zellij ls` reads the same metadata and does not go through that patch-up at all, so what it read
+held no plugins for any session, its own included.
+
+The wire format is `plugins { plugin id=0 location="zellij:tab-bar" { configuration { … } } }`, and
+a plugin with no configuration writes no `configuration` block. **Metadata written by an earlier
+build has no `plugins` node and reads back as a session running none**, rather than as a parse
+failure — the file on disk outlives the binary that wrote it, and a machine mid-upgrade has both.
+
+Nothing about the plugin contract changed: the field, its tag and both `TryFrom` implementations
+were already there, so this is a field that starts arriving populated rather than a new one.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
@@ -5170,6 +5201,10 @@ pane sits in a selection group.
   what its CLI command prints.
 - **Unwatching a plugin's `.wasm` when it unloads.** Watches accumulate for the life of the
   session; a change to a no-longer-loaded plugin resolves to no running instances and does nothing.
+- **A plugin column on `zellij ls --json`.** The metadata `ls` reads now carries each session's
+  plugins, but `SessionListEntry` does not, so nothing is printed. Three parsers read that array
+  and the question `ls` answers is which sessions exist, not what runs inside one — the detail is
+  on `SessionInfo`, where a caller that wants it already is.
 
 ## Working on this fork
 
