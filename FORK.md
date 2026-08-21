@@ -4645,6 +4645,20 @@ is `session up`'s own wait for a server it just spawned, backs off up to 1.5s ov
 is unrelated to this path — a slow `launchd` start (15-20s, measured) never reaches
 `connect_to_server` until `wait_for_server` has already decided the server is up.
 
+### A plugin pinning a pane did not tell anyone it had
+
+`PluginCommand::SetFloatingPanePinned` reaches the same `Screen::set_floating_pane_pinned` the
+CLI's `set-pane-pinned` action does, but its `ScreenInstruction` handler stopped at the mutation -
+no render, no `log_and_report_session_state`. `set-pane-pinned` and its two CLI neighbours,
+`set-pane-floating` and `set-sync-tab`, all end the same handler with `screen.render(None)?;
+screen.log_and_report_session_state()?;`; this one was missing both. `PaneInfo.is_pinned` stayed
+wrong for every subscriber - `list-panes --json`, `subscribe`, a plugin's own pane manifest - until
+some unrelated change touched the session and dragged a report along with it. A test already in the
+tree, `pane_info_reports_a_pinned_floating_pane`, worked around exactly this: it sent a `RenamePane`
+right after the pin, whose only job was to be a change that *does* report, so the pin's effect would
+show up in the pane manifest the test then inspected. The workaround is gone now that pinning
+reports on its own.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
