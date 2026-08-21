@@ -391,7 +391,11 @@ fn disable(name: &str) -> Result<(), ()> {
             );
             Err(())
         },
-        Ok(DisableOutcome::Disabled { removed, remaining }) => {
+        Ok(DisableOutcome::Disabled {
+            removed,
+            remaining,
+            unload_error,
+        }) => {
             for path in removed {
                 println!("      removed {}", path.display());
             }
@@ -408,17 +412,31 @@ fn disable(name: &str) -> Result<(), ()> {
                     job.path.display()
                 );
             }
+            // Two ways this is a partial result rather than a success, and both leave the session
+            // able to come back. Reported after the removals, because the removals happened.
+            let mut clean = true;
+            if let Some(reason) = &unload_error {
+                eprintln!(
+                    "session disable: the files are removed, but the init system did not accept \
+                     every\n                 command: {}",
+                    reason
+                );
+                clean = false;
+            }
             // Removing our own unit while another launcher still starts the session is a partial
-            // result, not a success: the session keeps coming back, from something this command
-            // has just made harder to find. Same reasoning as the NotOurs arm above.
-            if remaining.is_empty() {
-                Ok(())
-            } else {
+            // result too: the session keeps coming back, from something this command has just made
+            // harder to find. Same reasoning as the NotOurs arm above.
+            if !remaining.is_empty() {
                 eprintln!(
                     "session disable: '{}' is still launched by a job zellij did not write; \
                      remove that job by hand to stop it",
                     name
                 );
+                clean = false;
+            }
+            if clean {
+                Ok(())
+            } else {
                 Err(())
             }
         },
@@ -1094,6 +1112,16 @@ fn wait_for_server(name: &str) -> SessionFacts {
 /// `delete-session`: the name asked about is down, which is the state that was asked for. Only a
 /// name something is still serving fails.
 fn down(name: &str, wait_timeout: u64, opts: &CliArgs) -> Result<(), ()> {
+    // The same lock `up` and `restart` take, and for the same reason from the other side: without
+    // it a teardown races the watchdog tick it is meant to be serialised against. Either the
+    // teardown kills the server a tick has just created - and the tick reports a post-condition
+    // failure on a healthy machine - or the tick's `up` puts the session straight back after this
+    // has printed `removed`, and the teardown silently did not stick.
+    //
+    // Held across the whole function, so the check and the removal are one step. A `restart` that
+    // already holds it re-enters rather than waiting; see `session_lifecycle::lock_up`.
+    let _down_lock = lock_up(name);
+
     let facts = SessionFacts::collect(name);
     if facts.assert_down().is_ok() && !facts.listed {
         println!(
@@ -1449,6 +1477,40 @@ mod tests {
 
         drop(up_lock);
         drop(restart_lock);
+        let _ = std::fs::remove_file(up_lock_path(&name));
+    }
+
+    /// `down` now takes the up-lock too, and a `restart` calls `down` while already holding it.
+    ///
+    /// So the nested acquisition has to RE-ENTER. A second `flock` would wait `UP_LOCK_TIMEOUT`
+    /// for a hold this very thread owns and then go ahead unlocked, which is the two-servers race
+    /// the lock exists to close - a restart would deadlock against itself for a minute and a half
+    /// and then run without the protection.
+    #[test]
+    #[cfg(unix)]
+    fn a_down_nested_inside_a_restart_re_enters_the_lock_rather_than_waiting() {
+        use zellij_utils::session_lifecycle::{lock_up, up_lock_is_free, up_lock_path};
+
+        let name = format!("zj-downlock-{}", std::process::id());
+        let restart_lock = lock_up(&name).expect("the lock is free");
+
+        let started = std::time::Instant::now();
+        let down_lock = lock_up(&name).expect("re-entered rather than waited");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the nested `down` waited {:?} for a lock this thread already holds",
+            started.elapsed()
+        );
+
+        // the outer hold survives the inner drop, or `restart`'s `up` would run unlocked
+        drop(down_lock);
+        assert!(
+            !up_lock_is_free(&name),
+            "`down` finishing released the lock `restart` still needs"
+        );
+
+        drop(restart_lock);
+        assert!(up_lock_is_free(&name), "the outermost hold never let go");
         let _ = std::fs::remove_file(up_lock_path(&name));
     }
 

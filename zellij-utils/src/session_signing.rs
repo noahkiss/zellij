@@ -939,9 +939,19 @@ pub fn sign_pin(
                 findings.extend(back_up_identity(context));
                 ladder = rung_ladder(&find_identities(commander));
             },
-            Err(reason) => {
+            Err(failure) => {
+                // What it managed before it failed, first: a mint that happened is a file that
+                // now exists, and a report that omits it sends the reader to Xcode over the one
+                // certificate this machine can ever have.
+                findings.extend(failure.findings);
+                if failure.minted {
+                    // The certificate exists even though the import did not, it is the machine's
+                    // only one, and it cannot be minted again without voiding every grant. The
+                    // second copy matters MORE here than on the path that succeeded.
+                    findings.extend(back_up_identity(context));
+                }
                 findings.push(
-                    Finding::needs_you("signing", reason)
+                    Finding::needs_you("signing", failure.reason)
                         .note("nothing was signed; the pinned copy is untouched"),
                 );
                 findings.push(xcode_steps(&pin_display));
@@ -1741,13 +1751,58 @@ impl SigningDir {
 /// imported was never signed with, so no grant on the machine names it and replacing it costs
 /// nothing. A bundle whose certificate IS in the keychain is a different story entirely, and an
 /// import that fails then is reported rather than answered with a second certificate.
+/// What [`ensure_self_signed`] got to before it failed.
+///
+/// A `String` was not enough, and the gap it left was the worst kind. `?` on the import AFTER a
+/// successful mint threw away the whole findings list - the "minted a certificate of our own" line
+/// with it - so the report said "no signing certificate" and pointed at Xcode for a machine that
+/// had just made the one certificate it can ever have. `back_up_identity` runs only on the caller's
+/// `Ok` arm, so it had no second copy either: one file, one path, unmentioned.
+#[derive(Debug)]
+pub struct SelfSignedFailure {
+    /// What it did manage. A mint that happened is not undone by an import that did not, and the
+    /// reader has to be told about a file that now exists.
+    pub findings: Vec<Finding>,
+    /// Whether a certificate was minted on this run. It cannot be minted again without voiding
+    /// every grant on the machine, so it needs its second copy whatever else went wrong.
+    pub minted: bool,
+    pub reason: String,
+}
+
 pub fn ensure_self_signed(
     commander: &dyn Commander,
     dir: &SigningDir,
     keychain: &str,
     keychain_password: Option<&str>,
-) -> Result<Vec<Finding>, String> {
+) -> Result<Vec<Finding>, SelfSignedFailure> {
     let mut findings = Vec::new();
+    let mut minted = false;
+    match ensure_self_signed_steps(commander, dir, keychain, &mut findings, &mut minted) {
+        Ok(()) => {
+            // The partition list is NOT run here. It belongs to signing, not to minting: a machine
+            // that minted last month signs today without coming through this function at all, and
+            // the ACL it needs is granted per keychain and not per certificate.
+            // `sign_down_the_ladder` runs it before every signature made with our own certificate.
+            let _ = keychain_password;
+            Ok(findings)
+        },
+        Err(reason) => Err(SelfSignedFailure {
+            findings,
+            minted,
+            reason,
+        }),
+    }
+}
+
+/// The steps themselves, so every one of them can stay a `?` while the findings made along the way
+/// survive a failure. See [`SelfSignedFailure`].
+fn ensure_self_signed_steps(
+    commander: &dyn Commander,
+    dir: &SigningDir,
+    keychain: &str,
+    findings: &mut Vec<Finding>,
+    minted: &mut bool,
+) -> Result<(), String> {
     std::fs::create_dir_all(&dir.root)
         .map_err(|e| format!("could not create {}: {}", dir.root.display(), e))?;
     restrict(&dir.root, 0o700)
@@ -1826,7 +1881,13 @@ pub fn ensure_self_signed(
         }
     }
     if mint {
-        mint_self_signed(commander, dir)?;
+        let outcome = mint_self_signed(commander, dir);
+        // The flag is the FILE, not the command's exit code, and it is read before the `?`. A
+        // bundle that exists is the machine's only certificate whatever else went wrong, and the
+        // caller backs it up on the strength of this - so a mint that died before writing anything
+        // must not claim there is something to keep.
+        *minted = bundle.exists();
+        outcome?;
         findings.push(
             Finding::changed(
                 "signing",
@@ -1839,13 +1900,7 @@ pub fn ensure_self_signed(
         );
         import_bundle(commander, &bundle, keychain)?;
     }
-
-    // The partition list is NOT run here. It belongs to signing, not to minting: a machine that
-    // minted last month signs today without coming through this function at all, and the ACL it
-    // needs is granted per keychain and not per certificate. `sign_down_the_ladder` runs it before
-    // every signature made with our own certificate - see there.
-    let _ = keychain_password;
-    Ok(findings)
+    Ok(())
 }
 
 /// Whether an import failure is the one that a new certificate actually answers.
@@ -2099,6 +2154,13 @@ fn allow_codesign_to_reach_the_key(
         String::from("set-key-partition-list"),
         String::from("-S"),
         String::from("apple-tool:,apple:,codesign:"),
+        // Scoped to OUR key by label, which is the friendly name `openssl pkcs12 -name` wrote into
+        // the bundle. `-s` on its own selects EVERY signing key in the named keychain - the login
+        // keychain - so this rewrote the partition list of an Apple Development key sitting beside
+        // ours, and Xcode began raising key-access dialogs on builds that used to be silent. The
+        // `Rung::SelfSigned` guard at the call site scopes WHEN this runs, never what it touches.
+        String::from("-l"),
+        String::from(SELF_SIGNED_COMMON_NAME),
         String::from("-s"),
     ];
     if let Some(password) = keychain_password {
@@ -2767,11 +2829,21 @@ Signature=adhoc
         // key for the mint to lock down - and that is fine. What this test pins is that the run
         // reached the mint at all, which is what nkmk.7 never did.
         let outcome = ensure_self_signed(&commander, &dir, "login.keychain-db", None);
-        assert!(outcome.is_err(), "{:?}", outcome.map(|f| f.len()));
         assert!(
             commander.called_with("openssl req"),
             "{:?}",
             commander.calls()
+        );
+        // and the work done before the failure comes out with it: a bundle that has been renamed
+        // away is a change to the machine, and a report that omits it describes another one
+        let failure = outcome.expect_err("the mint writes no key for the lockdown to find");
+        assert!(
+            failure
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("set aside")),
+            "{:?}",
+            failure.findings
         );
 
         let aside: Vec<_> = std::fs::read_dir(directory.path())
@@ -2835,6 +2907,68 @@ Signature=adhoc
             std::fs::read(directory.path().join(&aside[0])).unwrap(),
             b"somebody else's certificate".to_vec()
         );
+    }
+
+    /// A mint that succeeds and an import that does not - a locked keychain, an SSH session with
+    /// no dialog to answer. The certificate now exists, it is the machine's only one, and it can
+    /// never be minted again without voiding every grant.
+    ///
+    /// `?` on the import used to throw away the whole findings list, the "minted a certificate of
+    /// our own" line included, so the report said "no signing certificate" and sent the reader to
+    /// Xcode - and `back_up_identity`, which the caller runs only on the `Ok` arm, never ran. One
+    /// file, one path, unmentioned.
+    #[test]
+    fn a_minted_certificate_survives_an_import_that_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+
+        let commander = RecordedCommander::new(&[
+            ("openssl req", recorded("")),
+            ("openssl pkcs12", recorded("")),
+            (
+                "security import",
+                recorded_failure(
+                    "security: SecKeychainItemImport: User interaction is not allowed.",
+                ),
+            ),
+        ])
+        .creating("openssl req", dir.private_key())
+        .creating("openssl pkcs12", dir.identity_bundle());
+
+        let failure = ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap_err();
+
+        assert!(dir.identity_bundle().exists(), "the mint wrote nothing");
+        assert!(
+            failure.minted,
+            "the caller backs the certificate up on this flag: {:?}",
+            failure
+        );
+        assert!(
+            failure
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("minted a certificate of our own")),
+            "the mint must be reported even though the import failed: {:?}",
+            failure.findings
+        );
+    }
+
+    /// The other half of that flag: it names a FILE, not a command that was attempted. A mint that
+    /// died before writing the bundle has nothing to back up, and claiming otherwise would print a
+    /// `Needs you` about copying a file that is not there.
+    #[test]
+    fn a_mint_that_wrote_nothing_does_not_claim_a_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = SigningDir::new(directory.path().to_path_buf());
+
+        let commander = RecordedCommander::new(&[(
+            "openssl req",
+            recorded_failure("openssl: no such configuration"),
+        )]);
+
+        let failure = ensure_self_signed(&commander, &dir, "login.keychain-db", None).unwrap_err();
+        assert!(!dir.identity_bundle().exists());
+        assert!(!failure.minted, "{:?}", failure);
     }
 
     /// The guard on the guard. A bundle that IS ours must survive the extra question untouched -
@@ -4056,6 +4190,39 @@ Signature=adhoc
             ("codesign -d --verbose=2 -r- ", recorded(SELF_SIGNED)),
             ("codesign --verify ", recorded("")),
         ])
+    }
+
+    /// The ACL grant has to name OUR key. `-s` selects every private key in the named keychain
+    /// that can sign, and the keychain named is the user's login one - so an Apple Development key
+    /// sitting beside ours had its partition list rewritten too, and Xcode started raising
+    /// key-access dialogs on builds that used to be silent.
+    #[test]
+    fn the_key_acl_grant_names_our_own_key_and_not_every_signing_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = signing_with_our_own(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        let grant = commander
+            .calls()
+            .into_iter()
+            .find(|call| call.contains("set-key-partition-list"))
+            .unwrap_or_else(|| panic!("the key ACL was never granted: {:?}", commander.calls()));
+        assert!(
+            grant.contains(&format!("-l {}", SELF_SIGNED_COMMON_NAME)),
+            "the grant is not scoped to our key: {}",
+            grant
+        );
     }
 
     /// The certificate is minted once and signed with for years, so granting the key ACL only on

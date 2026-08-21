@@ -161,12 +161,12 @@ fn check_from_inside_a_pane(report: &mut Report, name: &str, session_is_up: bool
         );
         return;
     }
-    let Some(answer) = run_pane_probe(name) else {
-        report.push(
-            Finding::needs_you("probe", "the pane probe did not answer in time")
-                .note("the session domain and Full Disk Access could not be checked"),
-        );
-        return;
+    let answer = match run_pane_probe(name) {
+        Ok(answer) => answer,
+        Err(failure) => {
+            report.push(probe_failure_finding(failure));
+            return;
+        },
     };
 
     match answer.manager.as_deref() {
@@ -215,6 +215,56 @@ struct PaneAnswer {
     full_disk_access: Option<bool>,
 }
 
+/// How many lines of the client's stderr to quote. Enough for a message and its context, few
+/// enough that one failed check does not become the report.
+const PROBE_STDERR_LINES: usize = 6;
+
+/// The one finding a failed probe produces, in the words of the failure that happened.
+///
+/// All three end the same way - the domain and Full Disk Access went unchecked - because that is
+/// the consequence for the reader whatever the cause. What differs is whether they are told to look
+/// at a stuck session or at a client that refused.
+fn probe_failure_finding(failure: ProbeFailure) -> Finding {
+    let unchecked = "the session domain and Full Disk Access could not be checked";
+    match failure {
+        ProbeFailure::TimedOut => {
+            Finding::needs_you("probe", "the pane probe did not answer in time")
+                .note("the pane was opened, so the server may be wedged")
+                .note(unchecked)
+        },
+        ProbeFailure::ClientFailed { status, stderr } => {
+            let mut finding = Finding::needs_you(
+                "probe",
+                format!("the pane probe could not be opened ({})", status),
+            );
+            for line in stderr.lines().take(PROBE_STDERR_LINES) {
+                finding = finding.note(line.trim_end().to_owned());
+            }
+            finding.note(unchecked)
+        },
+        ProbeFailure::CouldNotSpawn(reason) => {
+            Finding::needs_you("probe", "the pane probe could not be started")
+                .note(reason)
+                .note(unchecked)
+        },
+    }
+}
+
+/// Why no pane answered.
+///
+/// Two states, and telling them apart is the point. The deadline exists for a wedged server; a
+/// client that fails at once - the wrong socket directory, which is the very fault `check_tmpdir`
+/// reports beside this, or a refused `run` - used to be charged the same five seconds and reported
+/// with the same words, its own explanation already sent to `/dev/null`.
+enum ProbeFailure {
+    /// The client was still going, or the pane never wrote, until the deadline.
+    TimedOut,
+    /// The client exited non-zero. `stderr` is its own account of why.
+    ClientFailed { status: String, stderr: String },
+    /// The client could not be started at all.
+    CouldNotSpawn(String),
+}
+
 /// Open a floating pane that writes two lines to a file and closes itself.
 ///
 /// The file rather than the pane's screen, because reading a pane back means dumping and parsing a
@@ -226,7 +276,16 @@ struct PaneAnswer {
 /// [`Commander`]: that trait runs a command to completion, and a client talking to a wedged server
 /// never completes. A machine whose session is stuck is exactly the machine somebody runs doctor
 /// on, so the deadline below has to cover the client as well as its answer.
-fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
+///
+/// It is asked for its exit code all the same, in the loop rather than after the deadline, and its
+/// stderr is kept rather than discarded. A client that FAILS says so in a moment; waiting five
+/// seconds and then reporting "did not answer in time" spends the time and throws away the reason,
+/// and reads exactly like the wedged server the deadline is for.
+///
+/// A client that SUCCEEDS is not the answer. `zellij run` returns as soon as the pane is created,
+/// long before the pane's shell has written anything, so a zero exit is one more reason to keep
+/// waiting and only a non-zero one ends the wait early.
+fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
     let answer_file = ZELLIJ_TMP_DIR.join(format!("doctor-probe-{}", std::process::id()));
     let _ = std::fs::remove_file(&answer_file);
     let answer_path = answer_file.display().to_string();
@@ -250,7 +309,8 @@ fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
         shell_quote(&answer_path)
     );
 
-    let zellij = std::env::current_exe().ok()?;
+    let zellij = std::env::current_exe()
+        .map_err(|e| ProbeFailure::CouldNotSpawn(format!("cannot find this binary: {}", e)))?;
     let mut client = std::process::Command::new(&zellij)
         .args([
             "--session",
@@ -267,11 +327,13 @@ fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        // kept rather than nulled: on the failing path it is the only account of why
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .ok()?;
+        .map_err(|e| ProbeFailure::CouldNotSpawn(e.to_string()))?;
 
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let mut client_is_gone = false;
     loop {
         if let Ok(written) = std::fs::read_to_string(&answer_file) {
             // the trailing newline is what says the line is finished. The pane writes its two
@@ -280,16 +342,43 @@ fn run_pane_probe(name: &str) -> Option<PaneAnswer> {
             if written.contains("fda=") && written.ends_with('\n') {
                 let _ = std::fs::remove_file(&answer_file);
                 reap(&mut client);
-                return Some(parse_pane_answer(&written));
+                return Ok(parse_pane_answer(&written));
+            }
+        }
+        // Asked once. A zero exit only means the pane was created, so the wait goes on; a non-zero
+        // one means no pane will ever write, and there is nothing left to wait for.
+        if !client_is_gone {
+            if let Ok(Some(status)) = client.try_wait() {
+                client_is_gone = true;
+                if !status.success() {
+                    let _ = std::fs::remove_file(&answer_file);
+                    return Err(ProbeFailure::ClientFailed {
+                        status: status.to_string(),
+                        stderr: drain_stderr(&mut client),
+                    });
+                }
             }
         }
         if std::time::Instant::now() >= deadline {
             let _ = std::fs::remove_file(&answer_file);
             reap(&mut client);
-            return None;
+            return Err(ProbeFailure::TimedOut);
         }
         std::thread::sleep(PROBE_POLL);
     }
+}
+
+/// Everything the exited client wrote to stderr, trimmed. Empty when it wrote nothing.
+fn drain_stderr(client: &mut std::process::Child) -> String {
+    use std::io::Read;
+
+    let Some(mut stderr) = client.stderr.take() else {
+        return String::new();
+    };
+    let mut written = String::new();
+    let _ = stderr.read_to_string(&mut written);
+    let _ = client.wait();
+    written.trim().to_owned()
 }
 
 /// Take the client down if it is still up, and collect it either way.
