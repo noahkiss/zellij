@@ -2711,11 +2711,19 @@ two releases.
 On Linux and anywhere without a signing context, nothing changes: `codesign` cannot answer, no pin
 reads as anchored, and the copy runs as it always did.
 
-**Known limitation: the rename is not coordinated with `session up`.** Signing is copy → sign →
-verify → `rename`, and `install_pinned_exe` does its own copy → rename. A `session up` that lands a
-newer pin while doctor is mid-run can be clobbered by doctor's signed copy of the older one. It is
-pre-existing and unlikely — the two are typed seconds apart at worst — and the recovery is to run
-`zellij session doctor --fix` again, which sees the stale pin and replaces it.
+**The rename is still not coordinated with `session up`, but it no longer loses quietly.** Signing
+is copy → sign → verify → `rename`, and `install_pinned_exe` does its own copy → rename. A
+`session up` that lands a newer pin while doctor is mid-run used to be undone by doctor's signed
+copy of the older one, and a rename over a file says nothing about what was there, so the machine
+went back a build in silence.
+
+The pin's length and mtime are now read before the copy and compared immediately before the rename.
+A pin that was replaced underneath — or removed, or created where there was none — makes the run
+discard its signed temp and refuse, naming `zellij session doctor --fix` as the way to finish.
+Deliberately a comparison and not a lock: ordering two renames into one directory would need a lock
+that both commands take, and that is new machinery with new ways to wedge, for a race that needs the
+two commands typed seconds apart. What is bought is that the silent half is gone — the run that
+would have clobbered says so, and the recovery is the same one command it always was.
 
 **Known limitation: the same-team assumption is not enforced.** Falling from a Developer ID to an
 Apple Development certificate keeps the requirement only while both carry the same team, and the
@@ -4067,6 +4075,41 @@ parse.
 prints `[]` on stdout and keeps the existing exit status 1 and the existing note on stderr, so
 nothing but the array ever reaches stdout.
 
+#### Which binary each session is actually on
+
+A server keeps the binary it started with, so a fleet drifts: upgrade every machine and the
+sessions that were already up stay where they were. [A warning when the running session is a
+different build](#a-warning-when-the-running-session-is-a-different-build) tells one person about
+one session at the moment they touch it. It does not answer "which of these sessions is on which
+build", which is the question a script asks.
+
+`--json` entries for a **live** session now carry that:
+
+* `server_exe` — the executable the server is running, read out of the OS by pid.
+* `server_build_id` — hex of what the linker stamped in: the Mach-O `LC_UUID`, the GNU build-id.
+  **This, not the path, is what names a build.** A pinned copy and the binary it was copied from are
+  two files holding one program, and this is the only field where they agree.
+* `server_build` — `same`, `different` or `unknown` against the binary running the command.
+  `unknown` is an answer, not a failure: `compare_builds` reports it rather than guess.
+* `server_exe_replaced` — present only when it is true, and only Linux can say so: an upgrade wrote
+  over the running file in place.
+
+All four are absent for a dead session, and for a live one whose server the platform will not answer
+about or which has two servers for its name. Omitted rather than null, like the metadata fields
+beside them, so a consumer that sees `server_exe` can trust it.
+
+**Nothing here crosses a contract**, which is the whole design. The answer is read from the OS on
+the side that runs `ls`, by the same `server_executable` the stale-build warning uses — no
+`SessionInfo` field, no protobuf tag, no client/server message. The decision not to put a version on
+the plugin API stands; this never asks the session anything.
+
+**There is no version string, and that is deliberate.** A version can only be had by running the
+binary, and `ls` is a listing. Spawning every server's executable to ask it turns a read of the
+socket directory into an execution of whatever those paths point at, and it hangs for as long as one
+of them sits on a mount that has gone away. The build id is cheaper — a few kilobytes off the front
+of the file, never the 40 MB — and it is the better answer to the question being asked, since two
+builds of one version have different build ids and one version string could not tell them apart.
+
 ### `list-clients --json`
 
 ```
@@ -5209,6 +5252,112 @@ Proved by running it both ways on one tree: with the fallback, `start-or-reload-
 session with zero clients reloads the plugin; with the fallback alone removed, the same command on
 the same session never reaches the loader.
 
+### A keychain that will not answer is not a keychain with nothing in it
+
+`find_identities` read `security find-identity` and returned a list. Both ways that command can fail
+came back as an empty one. The `Err` arm — the command not running at all — was mapped to
+`Vec::new()` outright, and the `Ok` arm never looked at `success`, which is where the real failure
+lands: the `Commander` contract reserves `Err` for a program that could not be started, so a
+`security` that ran and refused is `Ok` with `success: false` and an empty stdout. That parses to
+the same empty list a machine with no certificates at all produces.
+
+The consequence is the one thing on this path that cannot be undone. An empty list means an empty
+ladder, an empty ladder means the self-signed rung, and the self-signed rung mints. A Mac whose
+login keychain was locked or wedged — `User interaction is not allowed` — was therefore told it had
+no Apple certificate, and doctor would mint one over the identity it already held.
+
+`find_identities` now returns `Result<Vec<Identity>, String>`, and each of its three callers says
+what it does with an unanswered question. `sign_pin` stops before the ladder with a `Needs you`
+quoting `security`'s own refusal, saying in as many words that this is not the same as holding no
+certificate and that nothing was minted or signed. The re-listing after a mint falls back to an
+empty ladder, which is the Xcode-steps `Needs you` — the right place for a keychain that went away
+mid-run. And `judge_reimport` refuses to judge: an unanswered listing reads as `NotOurs`, which
+would have set aside the bundle that had just imported perfectly well, so a failure to ask now
+leaves the file where it is and says so.
+
+### A dry run's "would sign" is a repair, not a reassurance
+
+`session doctor --dry-run` reaching a rung it could sign with filed the finding as `Already
+correct`. The branch is only reached because the pin's signature is wrong — unsigned, ad-hoc, or
+naming a code hash — so the line read as reassurance about the single thing that was broken. An
+ad-hoc pin reported "would sign &lt;pin&gt; with an Apple Development certificate" under the heading
+for what needs nothing done to it.
+
+It is a `Changed` now, which is what that status is for: doctor's own definition is "acted, and the
+thing is now right — also what a dry run records for a fix it would have made". The exit code does
+not move, because a dry run of work doctor does by itself is not waiting on a person. This is
+already what the sibling branch does for the certificate it would mint; the two now agree.
+
+### The restart log stopped eating the front of its own warnings
+
+`session restart` daemonizes and points both of the detached process's streams at
+`restart.log`. It opened the file twice: stdout through `File::create` and stderr with
+`append(true)`. Only one of those follows the end of the file. A `File::create` descriptor carries
+an offset of its own, starting at zero, so the two cursors diverged the moment the streams were
+used in anything but strict alternation — stderr's line landed at EOF, and stdout's next write went
+down at its own lower offset, on top of the front of it.
+
+Deterministic, cosmetic, and it ate exactly the part of a warning that said what the warning was
+about: `warning: the pin was NOT refreshed: Security: SecKeychainUnlock…` reached the log as
+`ecurity: SecKeychainUnlock…`, which reads as noise rather than as a pin that did not refresh.
+
+Both handles are append-mode now, so each write seeks to the end as part of the write and the two
+streams interleave by line. Truncating for the new generation is its own step rather than a side
+effect of `create`. `open_restart_log` exists so this is a testable function rather than four lines
+inside a `-> !`: the regression test writes the fleet's own warning on stderr and a shorter line on
+stdout, and fails against the old shape with the fleet's own truncated output.
+
+### The title template and the snapshot settings follow a live reload
+
+`terminal_title_template`, `session_aliases` and the `snapshot_*` settings were read once, when the
+first client connected, and never again. Editing any of them and reloading — the thing every other
+option here responds to — did nothing until the session was recreated, which is the one action a
+person adjusting snapshot retention is least likely to want.
+
+Both are process globals, and for a reason: a pane reads the title format while it renders, and the
+snapshot settings are read on the way out, after the session data has been dropped. Neither has a
+per-client home to travel in, which is why they never rode `ScreenInstruction::Reconfigure` with
+`bell_clear_delay_ms` and the rest. The fault was the container rather than the placement — a
+`OnceLock`, whose setter silently drops every write after the first.
+
+Both are `RwLock`s now, and both are rewritten from `propagate_configuration_changes`, which is the
+single point all three reload paths funnel through. They are taken from the first config of the
+change set and are therefore the same for every client, which is exactly what they already were.
+
+### A stable name on PATH counts under any spelling
+
+`resolve_service_exe` writes the steadiest path it can find into a generated unit, and a name on
+PATH beats the versioned file it points at because the versioned one is what the next upgrade
+deletes. It looked for that name by probing `<dir>/<the running binary's own file name>`, which is
+right for as long as the build being installed is the one `zellij` on PATH leads to.
+
+Two builds on one machine is the case that breaks. With a stock `zellij` linked, `<dir>/zellij` is
+somebody else's file, the probe fails, and the unit is written with this build's versioned path —
+while this build's own stable name sat on the same PATH the whole time under another spelling. The
+warning fired, so it was never silent; it was just wrong about there being nothing better.
+
+A failed same-name probe is now followed by a scan of the same directories for any entry that
+resolves to this binary, in PATH order and then alphabetically so the generated unit is
+byte-identical from one run to the next. The scan is only paid for in the case that used to give
+the wrong answer, and a directory holding nothing that leads here still ends at the honest
+`Resolved` that warns.
+
+### A close verb resolves its target before it asks
+
+`close-pane --pane-id terminal_99` on a terminal asked whether to close the pane, waited for the
+answer, and only then reported that no pane answers to `terminal_99`. The prompt is put by the
+client and the pane list belongs to the server, so the question came first and the answer to it came
+last.
+
+The target is now resolved against the session before the prompt, and a miss exits 2 without asking
+anything. An id form is looked up like a handle or a uuid: it needs nothing from the server to be
+*understood*, which is a different question from whether a pane answers to it — the same distinction
+`wait` already makes for the same reason.
+
+`close-tab` is left as it was. Its `--tab-id` is a stable id rather than a name to resolve, and
+answering it means a different query against a different list, for no change in what the prompt is
+about.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
@@ -5276,6 +5425,15 @@ targets — `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` — and attach
 `zellij-nkmk-<version>-<target>.tar.gz` (the bare binary) plus a `.sha256` to that tag's release,
 creating the release if it does not exist. Nothing else is published: no musl, no linux arm64, no
 intel mac, no Windows.
+
+**`Rust` runs on the branch, not only on main.** Its push trigger lists the conventional-commit
+prefixes this fork names branches after — `feat/`, `fix/`, `ci/`, `chore/`, `docs/`, `perf/`,
+`refactor/`, `style/`, `test/`, `rc/` — so a patch goes green where it is written rather than after
+it lands, which is what "prove it on the branch" needs. The list is enumerated rather than `**` so
+that `backup/` snapshots and `rebase/` scratch branches do not each burn a full matrix, and a
+`rust-${{ github.ref }}` concurrency group cancels a superseded push. `e2e.yml` is deliberately not
+on that list — it builds a binary and drives it through a docker terminal, and it is the slowest
+thing here — but it now has a `workflow_dispatch`, so it can be aimed at a branch on demand.
 
 A patch is proved as a **release candidate** before it lands. On its branch, bump the version it is
 heading for, then tag `v<version>-rc.1` and push the tag. The pipeline runs exactly as below, with

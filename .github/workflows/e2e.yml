@@ -17,6 +17,11 @@ on:
       - 'LICENSE.md'
       - 'docs/**'
       - 'assets/**.md'
+  # Deliberately not on every topic branch, unlike rust.yml: this job builds a
+  # binary and drives it through a docker terminal, and it is the slowest thing
+  # here. Run it against a branch on demand, by dispatching this workflow with
+  # that branch selected.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

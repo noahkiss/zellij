@@ -139,7 +139,18 @@ cargo check -p session-manager --target wasm32-wasip1   # or any default plugin
 ```
 
 (`cargo xtask build --plugins-only` catches the same class and is what CI actually runs — use it
-when you want the real artifacts, the check when you want speed.)
+when you want a real wasm build, the check when you want speed.)
+
+**To refresh the checked-in assets, that command needs `--release`:**
+
+```
+cargo xtask build --plugins-only --release
+```
+
+Only the release path copies the built `.wasm` files into `zellij-utils/assets/plugins/`
+(`xtask/src/build.rs`, `build_plugins_release_into_assets`). Without `--release` the plugins are
+built to `target/wasm32-wasip1/debug` and the checked-in assets are left exactly as they were — so
+a plugin change "builds" and still is not in the binary.
 
 The default plugins are wasm crates that depend on `zellij-utils`, and their `.wasm` artifacts are
 **checked in prebuilt** under `zellij-utils/assets/plugins/`. Every *local* build — `cargo check`,
@@ -197,6 +208,17 @@ by hand, so those three work on every platform. **`XDG_CACHE_HOME` does not.** T
 the `directories` crate, which honours the XDG variables on Linux and ignores them on macOS — so on
 macOS the cache stays in the user's real one and only the session name keeps a test apart from live
 state.
+
+**So never run `delete-all-sessions` on macOS, scratch environment or not.** It does not read the
+session list you set up. `delete_all_sessions` (`src/commands.rs:410`) takes its targets from
+`scan_session_list_default_dirs` and `get_resurrectable_sessions`, both of which walk
+`ZELLIJ_CACHE_DIR` — a `directories` crate path that ignores `XDG_CACHE_HOME` on macOS. The scratch
+export moves nothing, so the command enumerates and deletes the real user's serialized sessions, and
+`--force` kills the live ones with them. Delete scratch sessions by name instead:
+
+```sh
+zellij delete-session <throwaway-name> --force --yes
+```
 
 Then kill the sessions and confirm the servers are gone when you finish.
 
