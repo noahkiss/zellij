@@ -4659,6 +4659,28 @@ right after the pin, whose only job was to be a change that *does* report, so th
 show up in the pane manifest the test then inspected. The workaround is gone now that pinning
 reports on its own.
 
+### A failed remote plugin download parked every later reload of it
+
+Loading a plugin from a `Remote` location downloads it before the loader ever runs, on a path
+separate from every other way a plugin can fail to start. Every one of those others reaches
+`execute_plugin_load`, whose closure always finishes by sending `ApplyCachedEvents` - the only
+thing that takes a `plugin_id` out of `loading_plugins`, whether the load succeeded or not. A
+failed download `return`ed before that closure was ever entered, so its `plugin_id` never left.
+
+`loading_plugins` is also what `plugin_is_currently_being_loaded` answers from, and `reload_plugin`
+asks that question before doing anything else: told a location is still loading, it queues the
+reload in `pending_plugin_reloads` and returns - and nothing was ever going to drain that queue,
+because the drain also lives in `apply_cached_events`. A remote plugin that failed to download once
+was stuck refusing every reload for the rest of the session, silently: no error, no retry, just a
+location that stopped answering to `zellij action start-or-reload-plugin`.
+
+The download-failure branch now sends `ApplyCachedEvents` itself before returning, matching what
+every other failure path already does further down. A new test,
+`a_failed_remote_download_does_not_park_later_reloads`, proves it end to end against a loopback
+connection refusal - no real network, no e2e fixture needed, since the failure happens before
+wasmtime is ever reached: a `Reload` sent after the failed `Load` should start a second,
+distinctly-id'd attempt at the same location, and does now.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

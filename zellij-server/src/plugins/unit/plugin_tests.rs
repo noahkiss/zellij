@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{plugins::PluginInstruction, pty::PtyInstruction};
 
-use zellij_utils::channels::{self, ChannelWithContext, Receiver};
+use zellij_utils::channels::{self, ChannelWithContext, Receiver, RecvTimeoutError};
 
 macro_rules! log_actions_in_thread {
     ( $arc_mutex_log:expr, $exit_event:path, $receiver:expr, $exit_after_count:expr ) => {
@@ -677,6 +677,105 @@ fn create_plugin_thread_with_background_jobs_receiver(
         screen_receiver,
         Box::new(teardown),
     )
+}
+
+#[test]
+pub fn a_failed_remote_download_does_not_park_later_reloads() {
+    // A download failure used to `return` before ever sending `ApplyCachedEvents`, so the
+    // plugin_id it created never left `loading_plugins` - and `reload_plugin` refuses to do
+    // anything for a location it believes is "currently loading", forever. This does not need the
+    // e2e fixture: the download fails before wasmtime is ever reached, so it also does not need
+    // `#[ignore]`. It does not need real network either - port 1 on loopback refuses instantly.
+    let (plugin_thread_sender, screen_receiver, teardown) = create_plugin_thread(None, None);
+    let client_id = 1;
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let run_plugin = RunPluginOrAlias::RunPlugin(RunPlugin {
+        location: RunPluginLocation::Remote("http://127.0.0.1:1/nope.wasm".to_owned()),
+        configuration: Default::default(),
+        ..Default::default()
+    });
+
+    // `ScreenInstruction::Exit` is a unit variant, and both capture macros in this file only match
+    // a tuple or struct exit event - so this listens directly, bounded by wall-clock time rather
+    // than an event count, which also means a regression that goes back to parking forever fails
+    // this test instead of hanging it.
+    let received_screen_instructions = Arc::new(Mutex::new(vec![]));
+    let screen_thread = {
+        let log = received_screen_instructions.clone();
+        std::thread::Builder::new()
+            .name("plugin_download_loop_test_screen_listener".to_string())
+            .spawn(move || loop {
+                match screen_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok((event, _err_ctx)) => {
+                        let is_exit = matches!(event, ScreenInstruction::Exit);
+                        log.lock().unwrap().push(event);
+                        if is_exit {
+                            break;
+                        }
+                    },
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            })
+            .unwrap()
+    };
+
+    let _ = plugin_thread_sender.send(PluginInstruction::AddClient(client_id));
+    let _ = plugin_thread_sender.send(PluginInstruction::Load(
+        Some(false),
+        false,
+        false,
+        None,
+        run_plugin.clone(),
+        Some(1),
+        None,
+        client_id,
+        size,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+    // the download is a loopback connection refusal, near-instant, but still async
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // before the fix this is a silent no-op: `reload_plugin` sees the first attempt's location as
+    // still "loading" and only queues it in `pending_plugin_reloads`, which nothing ever drains
+    // because `ApplyCachedEvents` - the only thing that drains it - was also never sent
+    let _ = plugin_thread_sender.send(PluginInstruction::Reload(
+        Some(false),
+        None,
+        run_plugin,
+        1,
+        size,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    teardown();
+    screen_thread.join().unwrap();
+
+    let plugin_ids_that_attempted_to_load: std::collections::HashSet<u32> =
+        received_screen_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|i| match i {
+                ScreenInstruction::UpdatePluginLoadingStage(plugin_id, _) => Some(*plugin_id),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        plugin_ids_that_attempted_to_load.len(),
+        2,
+        "the reload should have started a second, distinct load attempt for the same location \
+         instead of being silently parked behind the first one's failure: {:?}",
+        plugin_ids_that_attempted_to_load
+    );
 }
 
 lazy_static! {
