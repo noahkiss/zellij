@@ -7,7 +7,7 @@ use std::{path::PathBuf, process, time::Duration};
 use isahc::{config::RedirectPolicy, prelude::*, HttpClient, Request};
 
 use zellij_client::{
-    os_input_output::get_client_os_input, start_client as start_client_impl, ClientInfo,
+    os_input_output::get_client_os_input, start_client as start_client_upstream, ClientInfo,
 };
 
 use zellij_utils::sessions::{
@@ -1318,6 +1318,73 @@ fn session_name_in_opts(opts: &CliArgs) -> Option<String> {
         Some(Command::Sessions(Sessions::Attach { session_name, .. })) => session_name.clone(),
         _ => None,
     }
+}
+
+/// Whether this create is one the init system can make instead, and which name it would make.
+///
+/// Only a CREATE, and only one whose shape the unit would build identically. An attach joins a
+/// server somebody else already made, so there is nothing left to decide about it.
+///
+/// `Resurrect` is the case worth spelling out, because leaving it out would have made the whole
+/// feature almost never fire: a managed session is created after a reboot or a crash, and by then
+/// there is a resurrection cache for it, so the ordinary create of a managed session IS a
+/// `Resurrect`. `zellij session up` resumes from that same in-place cache, so handing it over
+/// builds the same session. A `--restore <id>` names a snapshot instead, which is a request the
+/// unit was not given and could not honour - it keeps its shape and is built here.
+fn create_the_unit_could_make(info: &ClientInfo) -> Option<&str> {
+    match info {
+        ClientInfo::New(name, _, _) => Some(name),
+        ClientInfo::Resurrect(name, layout, _, _)
+            if *layout == session_layout_cache_file_name(name) =>
+        {
+            Some(name)
+        },
+        _ => None,
+    }
+}
+
+/// Every client goes through here, which is what makes it the place to take a managed session out
+/// of this process's hands.
+///
+/// It shadows [`zellij_client::start_client`] on purpose. The alternative was the same two lines at
+/// each of the six calls, and a seventh call added later that quietly did not have them - which is
+/// the exact shape of the bug this patch exists to fix, where the guards were real and one caller
+/// short.
+#[allow(clippy::too_many_arguments)]
+fn start_client_impl(
+    os_input: Box<dyn zellij_client::os_input_output::ClientOsApi>,
+    cli_args: CliArgs,
+    config: Config,
+    config_options: Options,
+    info: ClientInfo,
+    tab_position_to_focus: Option<usize>,
+    pane_id_to_focus: Option<(u32, bool)>,
+    is_a_reconnect: bool,
+    start_detached_and_exit: bool,
+) -> Option<ConnectToSession> {
+    let info = match create_the_unit_could_make(&info) {
+        Some(name) if crate::session_commands::create_through_the_unit(name, &cli_args) => {
+            // A background create asked for the session to exist, and it does. Going on to
+            // `start_server_detached` would build a SECOND server for a name that already has one,
+            // which is how the invisible duplicates were made in the first place.
+            if start_detached_and_exit {
+                return None;
+            }
+            ClientInfo::Attach(name.to_owned(), config_options.clone())
+        },
+        _ => info,
+    };
+    start_client_upstream(
+        os_input,
+        cli_args,
+        config,
+        config_options,
+        info,
+        tab_position_to_focus,
+        pane_id_to_focus,
+        is_a_reconnect,
+        start_detached_and_exit,
+    )
 }
 
 pub(crate) fn start_client(opts: CliArgs) {

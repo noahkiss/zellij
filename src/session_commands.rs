@@ -95,7 +95,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
         },
         SessionLifecycleCli::Disable { session_name } => {
             let name = resolve_session_name(session_name, &opts, false);
-            process::exit(match disable(&name) {
+            process::exit(match disable(&name, &opts) {
                 Ok(()) => 0,
                 Err(()) => 1,
             });
@@ -159,6 +159,26 @@ pub(crate) fn configured_extras(opts: &CliArgs) -> Option<SessionServiceOptions>
     get_config_options_from_cli_args(opts)
         .ok()
         .and_then(|options| options.session_service)
+}
+
+/// The `session_name` the CONFIG states, which is the name `managed_session` is about.
+///
+/// Deliberately not [`resolve_session_name`], which answers "which session does this command mean"
+/// and prefers the one it was typed in. The question here is the other one: which name has this
+/// machine handed to its init system, whatever the caller happens to be asking about.
+pub(crate) fn configured_session_name(opts: &CliArgs) -> Option<String> {
+    get_config_options_from_cli_args(opts)
+        .ok()
+        .and_then(|options| options.session_name)
+}
+
+/// Whether this command is about the session the init system owns.
+pub(crate) fn session_is_managed(name: &str, opts: &CliArgs) -> bool {
+    zellij_utils::session_lifecycle::is_managed_session_name(
+        session_service::configured_managed_session(configured_extras(opts).as_ref()),
+        configured_session_name(opts).as_deref(),
+        name,
+    )
 }
 
 /// Put this build at the pinned path for a command that is about to name that path in a unit.
@@ -354,8 +374,20 @@ fn print_unit_dir_disagreement() {
 }
 
 /// Unload the unit, then remove it.
-fn disable(name: &str) -> Result<(), ()> {
+fn disable(name: &str, opts: &CliArgs) -> Result<(), ()> {
     let kind = native_service_kind()?;
+    // `managed_session` makes the unit unconditional, so removing it here removes it until the next
+    // thing that wants the session writes it again. Said before the removal rather than after,
+    // because it is the difference between this command doing what was asked and this command
+    // looking like it did.
+    if session_is_managed(name, opts) {
+        println!(
+            "      `session_service {{ managed_session true }}` is set for '{}', so the next \n      \
+             `zellij session up` or `zellij -s {}` installs the unit again. Remove that key to \n      \
+             make this stick.",
+            name, name
+        );
+    }
     match session_service::disable(kind, name) {
         Ok(DisableOutcome::NotInstalled) => {
             println!(
@@ -641,6 +673,124 @@ fn warn_if_unit_drifted(name: &str, opts: &CliArgs) {
     });
 }
 
+/// Install or refresh the unit for a MANAGED session, so that nobody has to remember
+/// `zellij session enable`.
+///
+/// `managed_session` means the init system owns the name, and a thing that is owned is not
+/// something a person has to opt into once per machine and then keep in step by hand. So the
+/// command that is about to NEED the unit is the command that writes it: `session enable` stops
+/// being the step that turns the feature on and becomes "do it now", which is what it was always
+/// doing anyway.
+///
+/// Two things it will not do. It never touches a name the config did not name, and it never runs
+/// inside the unit - `session enable` STARTS what it installs, and a process the init system
+/// started asking the init system to start it is the deadlock this guard exists for.
+///
+/// `session disable` still removes it. With the key set the next create puts it back, which is what
+/// "unconditional" means; removing the key is how a removal is made to stick, and `disable` says so.
+pub(crate) fn manage_the_unit(name: &str, opts: &CliArgs) {
+    static MANAGED: std::sync::Once = std::sync::Once::new();
+    MANAGED.call_once(|| {
+        if !session_is_managed(name, opts)
+            || zellij_utils::session_lifecycle::running_as_the_unit(name)
+        {
+            return;
+        }
+        let Some(kind) = session_service::native_service_kind() else {
+            return;
+        };
+        let extras = configured_extras(opts);
+        let pinned = configured_pinned_exe(extras.as_ref());
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+        let exe = resolve_service_exe(None, pinned, &current_exe, &path_dirs());
+        let reason = match session_service::unit_drift(kind, exe.path(), name, extras.as_ref()) {
+            Ok(UnitDrift::NotInstalled) => "it has no unit",
+            Ok(UnitDrift::Drifted { .. }) => "its unit is not what this config would write",
+            // Current, or a machine that could not be asked - either way there is nothing to write
+            _ => return,
+        };
+        println!(
+            "      `managed_session` is set and {}, so it is installed now",
+            reason
+        );
+        let _ = enable(name, None, false, opts);
+    });
+}
+
+/// Set while `session up` is the one creating the session.
+///
+/// `up` drives the same client path [`create_through_the_unit`] hooks into, and it has ALREADY
+/// asked the init system its question by the time it gets there. Without this the client path would
+/// ask a second time and report the answer twice, and on the arm where the init system says yes it
+/// would hand `up` an attach where `up` wanted a detached create.
+static UP_IS_THE_CREATOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hand the creation of a MANAGED session to the init system, and wait for what it makes.
+///
+/// `true` means the session is up and the caller is to attach to it rather than build a server.
+///
+/// This is the second caller the guards were written for and never got. Which macOS session domain
+/// a server is created in, and which executable macOS holds responsible for it, are both decided
+/// once by whoever creates the session - so a session created by typing `zellij` in a terminal is a
+/// session the launch agent can never take back, however many times the watchdog runs afterwards.
+/// [`zellij_utils::session_lifecycle::ensure_gui_session_domain`] already knew all of that and was
+/// reachable only from `session up`.
+///
+/// **Every failure falls back to creating the session here, loudly.** A machine that cannot start
+/// its session is not a machine to debug over SSH, and the fault this prevents is a session with
+/// fewer capabilities than it should have - not a session that does not exist. `session up` is
+/// stricter, and can be: nobody is waiting at a terminal for it.
+pub(crate) fn create_through_the_unit(name: &str, opts: &CliArgs) -> bool {
+    if UP_IS_THE_CREATOR.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    if !session_is_managed(name, opts) {
+        return false;
+    }
+    // the unit has to exist before it can be asked for anything
+    manage_the_unit(name, opts);
+    if zellij_utils::session_lifecycle::running_as_the_unit(name) {
+        return false;
+    }
+
+    #[cfg(target_os = "macos")]
+    let asked = zellij_utils::session_lifecycle::ensure_gui_session_domain(
+        name,
+        false,
+        session_service::configured_restart_via_launchd(configured_extras(opts).as_ref()),
+    );
+    #[cfg(target_os = "linux")]
+    let asked = zellij_utils::session_lifecycle::ensure_systemd_unit_session(name);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let asked: Result<bool, String> = Ok(false);
+
+    match asked {
+        Ok(true) => {},
+        // nothing loaded to defer to; the caller creates it, as it always did
+        Ok(false) => return false,
+        Err(reason) => {
+            eprintln!(
+                "warning: '{}' is managed by the init system, which could not be asked to create \n         \
+                 it, so it is created here instead: {}",
+                name, reason
+            );
+            return false;
+        },
+    }
+
+    let facts = wait_for_server(name);
+    if facts.assert_up().is_ok() {
+        println!("up    session '{}' was created by the init system", name);
+        return true;
+    }
+    eprintln!(
+        "warning: the init system was asked for '{}' and it has not appeared, so it is created \n         \
+         here instead. `zellij session doctor {}` says what the unit is doing.",
+        name, name
+    );
+    false
+}
+
 /// What the config's `pin_exe` and the installed unit say between them, and whether they agree.
 ///
 /// Reported even though nothing is broken, because the disagreement is invisible from every other
@@ -892,7 +1042,11 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     // exactly the one an upgraded machine takes every minute.
     assert_pinned_exe(name, configured_extras(opts).as_ref(), opts);
     // Same pass, same reason: a config edit does not reach a unit nobody rewrote, and the `up` that
-    // returns early is exactly the one a machine with a stale unit takes every minute.
+    // returns early is exactly the one a machine with a stale unit takes every minute. When the
+    // session is MANAGED the drift is fixed rather than reported, and this runs BEFORE the lock
+    // below: `session enable` starts what it installs, and the unit it starts runs this same
+    // command, which would then be waiting for a lock this process is holding.
+    manage_the_unit(name, opts);
     warn_if_unit_drifted(name, opts);
 
     // Held for the rest of this function, which is what makes `up` idempotent under concurrency:
@@ -965,6 +1119,40 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
             eprintln!("session up: {}", reason);
             return Err(());
         },
+    }
+
+    // The Linux half of the same decision, and it only applies to a MANAGED session: on macOS the
+    // domain a server is created in is a fact about the server that nothing can change afterwards,
+    // so that guard runs whatever the config says; here there is no such fact, and the only reason
+    // to prefer the unit is that the config asked for the unit to own the name.
+    //
+    // `ensure_systemd_unit_session` refuses when this process IS the unit, which is what stops the
+    // service's own `session up` from asking systemd to start the service it is.
+    #[cfg(target_os = "linux")]
+    if session_is_managed(name, opts) {
+        match zellij_utils::session_lifecycle::ensure_systemd_unit_session(name) {
+            Ok(true) => {
+                // the unit runs this same command and takes this same lock
+                zellij_utils::session_lifecycle::hand_over_up_lock(name);
+                let facts = wait_for_server(name);
+                if let Err(reason) = facts.assert_up() {
+                    eprintln!("session up: post-condition FAILED - {}", reason);
+                    facts.print_diagnostics();
+                    return Err(());
+                }
+                println!(
+                    "up    session '{}' in {} (started by systemd)",
+                    name,
+                    facts.socket_dir.display()
+                );
+                return Ok(());
+            },
+            Ok(false) => {},
+            Err(reason) => {
+                eprintln!("session up: {}", reason);
+                return Err(());
+            },
+        }
     }
 
     // Everything from here to `start_client` is the environment the new session is built with, and
@@ -1056,7 +1244,11 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
         ca_cert: None,
         insecure: false,
     }));
+    // Both arms above have already had their answer from the init system, so the client path this
+    // drives must not ask it again. See `UP_IS_THE_CREATOR`.
+    UP_IS_THE_CREATOR.store(true, std::sync::atomic::Ordering::SeqCst);
     start_client(opts);
+    UP_IS_THE_CREATOR.store(false, std::sync::atomic::Ordering::SeqCst);
 
     let facts = wait_for_server(name);
     if let Err(reason) = facts.assert_up() {
