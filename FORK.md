@@ -5531,6 +5531,41 @@ children, and an older build fails the **whole** config on `env`, not just the b
 seeded into a shared config ahead of the binary; it ships with the code that accepts it, and every
 machine takes the binary first.
 
+### The checked-in plugin assets no longer name the machine that built them
+
+The fifteen `.wasm` files under `zellij-utils/assets/plugins/` are committed, and rustc bakes an
+absolute path into each one for every `panic!` location and every `include!`d file. So the assets
+published whoever last built them. Every file in the tracked tree carried the builder's home
+directory, their cargo registry, and the directory they keep the checkout in.
+
+`cargo xtask build --plugins-only --release` now passes three `--remap-path-prefix` flags to the
+plugin build, derived from the environment rather than written down:
+
+| From | To | What it covers |
+|---|---|---|
+| `$HOME` | `~` | anything else under the home directory |
+| `$CARGO_HOME`, else `$HOME/.cargo` | `/cargo` | the registry sources, which are most of them |
+| the project root | `/zellij` | the generated prost files, `include!`d by absolute path |
+
+Afterwards the only absolute paths left are rustc's own `/rustc/<hash>/` and `/rust/`, which upstream
+already remaps for the same reason. Workspace sources were never affected: cargo runs from the
+workspace root and records those relative.
+
+**Order is the part that is easy to get wrong.** rustc applies the LAST prefix that matches, not the
+first, so the list runs generic to specific. Reversed, `$HOME` would swallow the other two and the
+registry would read `~/.cargo/registry/…`.
+
+**Scoped to the wasm target, through `--config`, not `RUSTFLAGS`.** A bare `RUSTFLAGS` replaces the
+config-file flags for every target, which on a machine that configures a linker for its native
+triple silently drops it. `--config target.wasm32-wasip1.rustflags=[…]` touches one triple, and
+cargo APPENDS it to whatever a config file already set there rather than replacing it — which is
+also why the appended-last flags win the precedence rule above. The debug plugin build takes the
+same flags, so the two paths cannot drift.
+
+Nothing about this is machine-specific, so CI runs it too and the runner's paths get remapped as
+well. A rebuild is byte-identical: recompiling all fifteen plugins from touched sources reproduces
+the committed assets exactly.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
