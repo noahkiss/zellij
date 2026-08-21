@@ -3982,6 +3982,33 @@ impl Options {
                             )
                         })?);
                 },
+                // like `pin_exe`, not an init system but a property of the install, and the one
+                // entry here that means the same thing on both of them: how often the watchdog
+                // re-runs `session up`
+                "watchdog_interval_secs" => {
+                    let seconds = kdl_first_entry_as_i64!(init_system).ok_or_else(|| {
+                        ConfigError::new_kdl_error(
+                            "watchdog_interval_secs takes a whole number of seconds".to_owned(),
+                            init_system.span().offset(),
+                            init_system.span().len(),
+                        )
+                    })?;
+                    // Zero is the one an operator reaches for meaning "off", and it is not that:
+                    // `OnUnitActiveSec=0` re-runs the service as fast as systemd can start it.
+                    if seconds < 1 {
+                        return Err(ConfigError::new_kdl_error(
+                            format!(
+                                "watchdog_interval_secs is {} seconds; it must be at least 1 \
+                                 (remove the key for the default, or `session disable` to stop the \
+                                 watchdog)",
+                                seconds
+                            ),
+                            init_system.span().offset(),
+                            init_system.span().len(),
+                        ));
+                    }
+                    session_service.watchdog_interval_secs = Some(seconds as u64);
+                },
                 // like `pin_exe`, not an init system but a property of how the install is used
                 "restart_via_launchd" => {
                     session_service.restart_via_launchd =
@@ -4035,7 +4062,8 @@ impl Options {
                     return Err(ConfigError::new_kdl_error(
                         format!(
                             "Unknown session_service entry: {:?} (expected systemd, launchd, \
-                             pin_exe, managed_session or restart_via_launchd)",
+                             pin_exe, managed_session, restart_via_launchd or \
+                             watchdog_interval_secs)",
                             other
                         ),
                         init_system.span().offset(),
@@ -4071,6 +4099,12 @@ impl Options {
         if let Some(managed) = session_service.managed_session {
             let mut node = KdlNode::new("managed_session");
             node.push(KdlValue::Bool(managed));
+            init_systems.nodes_mut().push(node);
+        }
+
+        if let Some(seconds) = session_service.watchdog_interval_secs {
+            let mut node = KdlNode::new("watchdog_interval_secs");
+            node.push(KdlValue::Base10(seconds as i64));
             init_systems.nodes_mut().push(node);
         }
 
@@ -10236,6 +10270,125 @@ fn managed_session_takes_a_bool_and_is_named_among_what_the_block_accepts() {
         "{:?}",
         error
     );
+}
+
+/// How often the watchdog re-checks, in seconds, on whichever platform generated the unit. The
+/// default is the half worth asserting: a config that has never mentioned this key must leave both
+/// generators writing exactly what they wrote before.
+#[test]
+fn watchdog_interval_secs_is_the_generators_own_unless_the_config_retimes_it() {
+    let unset = Config::from_kdl("", None).unwrap();
+    assert!(unset.options.session_service.is_none());
+    // the accessor is what both generators read, and unset means the built-in minute
+    assert_eq!(
+        SessionServiceOptions::default().watchdog_interval_secs(),
+        60
+    );
+
+    // a `session_service` block that says other things still leaves the interval alone
+    let other_keys = Config::from_kdl(
+        "session_service {
+    managed_session true
+}",
+        None,
+    )
+    .unwrap();
+    let other_keys = other_keys.options.session_service.clone().unwrap();
+    assert_eq!(other_keys.watchdog_interval_secs, None);
+    assert_eq!(other_keys.watchdog_interval_secs(), 60);
+
+    let retimed = Config::from_kdl(
+        "session_service {
+    watchdog_interval_secs 15
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        retimed
+            .options
+            .session_service
+            .clone()
+            .unwrap()
+            .watchdog_interval_secs,
+        Some(15)
+    );
+    // and it survives being written out and read back, like every other key in this block
+    assert_eq!(
+        Config::from_kdl(&retimed.to_string(false), None)
+            .unwrap()
+            .options,
+        retimed.options
+    );
+    // the key alone is a block worth writing, so a config carrying only this does not round-trip
+    // to nothing
+    assert!(retimed.to_string(false).contains("watchdog_interval_secs"));
+}
+
+/// `watchdog_interval_secs` is a nested key, so an old binary rejects it and fails the WHOLE config
+/// - the reason it ships in the same patch as the behaviour rather than being seeded ahead of it.
+/// What this build owes in return is an error that names the key when the VALUE is wrong.
+#[test]
+fn watchdog_interval_secs_takes_whole_seconds_and_is_named_among_what_the_block_accepts() {
+    let error = Config::from_kdl(
+        "session_service {
+    watchdog_interval 15
+}",
+        None,
+    )
+    .unwrap_err();
+    let error = format!("{:?}", error);
+    assert!(error.contains("watchdog_interval_secs"), "{}", error);
+
+    // a word is not a number of seconds
+    let error = Config::from_kdl(
+        "session_service {
+    watchdog_interval_secs \"often\"
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("watchdog_interval_secs"),
+        "{:?}",
+        error
+    );
+
+    // nor is a fraction of one: systemd and launchd both read this as whole seconds
+    let error = Config::from_kdl(
+        "session_service {
+    watchdog_interval_secs 1.5
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("watchdog_interval_secs"),
+        "{:?}",
+        error
+    );
+
+    // zero reads as "turn the watchdog off" and does the opposite - it asks for a re-check as fast
+    // as the init system can start one - so it is refused rather than honoured
+    let error = Config::from_kdl(
+        "session_service {
+    watchdog_interval_secs 0
+}",
+        None,
+    )
+    .unwrap_err();
+    let error = format!("{:?}", error);
+    assert!(error.contains("watchdog_interval_secs"), "{}", error);
+    assert!(error.contains("at least 1"), "{}", error);
+
+    let error = Config::from_kdl(
+        "session_service {
+    watchdog_interval_secs -15
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(format!("{:?}", error).contains("at least 1"), "{:?}", error);
 }
 
 /// The `session_service` block parses its OWN children, so an unknown one fails the whole config
