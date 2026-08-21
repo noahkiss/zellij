@@ -1380,6 +1380,12 @@ pub(crate) fn start_client(opts: CliArgs) {
             insecure,
         })) = opts.command.clone()
         {
+            // `attach`'s own positional wins when given - `zellij -s foo attach bar` means bar.
+            // But the top-level `-s`/`--session` already names which session every other verb
+            // here targets (`send_action_to_session`, `subscribe_to_session`), so `attach` on its
+            // own dropped it silently: `zellij -s myname attach -c` ignored `-s` entirely and, with
+            // no active session to fall back to, generated a fresh random name instead.
+            let session_name = session_name.or_else(|| opts.session.clone());
             if let Some(remote_session_url) = session_name.as_ref().and_then(|s| {
                 if s.starts_with("http://") || s.starts_with("https://") {
                     Some(s)
