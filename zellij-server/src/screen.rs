@@ -13112,6 +13112,8 @@ pub(crate) fn screen_thread_main(
                                 // waiting for it
             ) => {
                 screen.toggle_pane_pinned(client_id);
+                screen.render(None)?;
+                screen.log_and_report_session_state()?;
             },
             ScreenInstruction::SetPaneFullscreen(pane_id, fullscreen, client_id, completion_tx) => {
                 let mut completion_tx = completion_tx;
@@ -13988,6 +13990,8 @@ pub(crate) fn screen_thread_main(
                         c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
+                screen.render(None)?;
+                screen.log_and_report_session_state()?;
             },
             // Tab-targeting CLI handlers
             ScreenInstruction::UndoRenameTabWithTabId(tab_id, mut _completion_tx) => {
