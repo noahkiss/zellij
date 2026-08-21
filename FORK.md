@@ -4799,8 +4799,16 @@ The download-failure branch now sends `ApplyCachedEvents` itself before returnin
 every other failure path already does further down. A new test,
 `a_failed_remote_download_does_not_park_later_reloads`, proves it end to end against a loopback
 connection refusal - no real network, no e2e fixture needed, since the failure happens before
-wasmtime is ever reached: a `Reload` sent after the failed `Load` should start a second,
-distinctly-id'd attempt at the same location, and does now.
+wasmtime is ever reached: a `Reload` sent after the failed `Load` should start a second attempt at
+the same location, and does now.
+
+That second attempt reuses the failed pane's plugin id rather than taking a new one, because
+[reloading a pane whose plugin never loaded](#reloading-a-pane-whose-plugin-never-loaded) recovers
+the pane in place instead of letting the caller fall through to spawning a stray one beside it. The
+two patches were written apart and met here: the test asserts a
+`StartPluginLoadingIndication` for the failed pane's own id, which `reload_plugin_with_id` sends
+only after every refusal check has passed, so it still fails the moment this `ApplyCachedEvents`
+is taken back out.
 
 ### `-s` reaches `attach` too, not just the no-subcommand form
 

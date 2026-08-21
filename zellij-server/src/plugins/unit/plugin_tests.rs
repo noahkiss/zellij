@@ -769,12 +769,41 @@ pub fn a_failed_remote_download_does_not_park_later_reloads() {
                 _ => None,
             })
             .collect();
-    assert_eq!(
-        plugin_ids_that_attempted_to_load.len(),
-        2,
-        "the reload should have started a second, distinct load attempt for the same location \
-         instead of being silently parked behind the first one's failure: {:?}",
-        plugin_ids_that_attempted_to_load
+
+    // The reload's second attempt is a `StartPluginLoadingIndication` for the SAME plugin id, not
+    // a new id: `reload_plugin` finds the failed pane through the failure record and recovers it in
+    // place, rather than falling through to spawning a stray second pane beside it. That
+    // instruction is sent from `reload_plugin_with_id` only after every refusal check has passed,
+    // so seeing it is what proves the reload ran at all.
+    //
+    // Without the fix the location is still in `loading_plugins`, `reload_plugin` returns at its
+    // "currently being loaded" guard having only queued the reload in `pending_plugin_reloads`,
+    // nothing ever drains that queue, and this instruction never arrives.
+    let failed_plugin_id = *plugin_ids_that_attempted_to_load
+        .iter()
+        .next()
+        .expect("the first load should have reported its download failure");
+    let started_a_second_attempt = received_screen_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|i| {
+            matches!(
+                i,
+                ScreenInstruction::StartPluginLoadingIndication(plugin_id, _)
+                    if *plugin_id == failed_plugin_id
+            )
+        });
+    assert!(
+        started_a_second_attempt,
+        "the reload should have started a second load attempt for the failed pane instead of \
+         being silently parked behind the first one's failure; screen only saw: {:?}",
+        received_screen_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|i| format!("{:?}", i).chars().take(48).collect::<String>())
+            .collect::<Vec<_>>()
     );
 }
 
