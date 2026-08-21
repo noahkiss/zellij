@@ -14509,12 +14509,6 @@ pub fn pane_info_reports_a_pinned_floating_pane() {
             PaneId::Terminal(3),
             true,
         ));
-    // pinning reports no session state of its own, so ask for one with a change that does
-    let _ = mock_screen.to_screen.send(ScreenInstruction::RenamePane(
-        PaneId::Terminal(0),
-        "report the session".as_bytes().to_vec(),
-        None,
-    ));
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     mock_screen.teardown(vec![plugin_thread, screen_thread]);
