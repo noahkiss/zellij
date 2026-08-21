@@ -5416,7 +5416,8 @@ paired timer does, and a comment saying 60 beside a timer saying 15 is how the n
 the wrong number.
 
 **macOS**: it becomes the DEFAULT for `StartInterval`, not an override of it. Resolution order is
-an explicit `launchd { keys { StartInterval N } }`, then this key, then the built-in 60. The extra
+an explicit `launchd { keys { StartInterval N } }`, then this key, then the built-in default
+(15 since nkmk.17). The extra
 wins because it names launchd's own spelling and therefore one platform, which is the more specific
 of the two statements; the key is the fleet-wide default it falls back to. The key is still taken
 out of the extras and written once, so the plist is a plist.
