@@ -3930,6 +3930,18 @@ impl Options {
                 "pin_exe" => {
                     session_service.pin_exe = pin_exe_from_kdl(init_system)?;
                 },
+                // like `pin_exe`, not an init system but a property of the install: whether there is
+                // to be a unit for `session_name` at all, without anyone typing `session enable`
+                "managed_session" => {
+                    session_service.managed_session =
+                        Some(kdl_first_entry_as_bool!(init_system).ok_or_else(|| {
+                            ConfigError::new_kdl_error(
+                                "managed_session takes true or false".to_owned(),
+                                init_system.span().offset(),
+                                init_system.span().len(),
+                            )
+                        })?);
+                },
                 // like `pin_exe`, not an init system but a property of how the install is used
                 "restart_via_launchd" => {
                     session_service.restart_via_launchd =
@@ -3983,7 +3995,7 @@ impl Options {
                     return Err(ConfigError::new_kdl_error(
                         format!(
                             "Unknown session_service entry: {:?} (expected systemd, launchd, \
-                             pin_exe or restart_via_launchd)",
+                             pin_exe, managed_session or restart_via_launchd)",
                             other
                         ),
                         init_system.span().offset(),
@@ -4014,6 +4026,12 @@ impl Options {
                 init_systems.nodes_mut().push(pin);
             },
             None => {},
+        }
+
+        if let Some(managed) = session_service.managed_session {
+            let mut node = KdlNode::new("managed_session");
+            node.push(KdlValue::Bool(managed));
+            init_systems.nodes_mut().push(node);
         }
 
         if let Some(via_launchd) = session_service.restart_via_launchd {
@@ -9826,6 +9844,93 @@ fn restart_via_launchd_is_on_unless_the_config_turns_it_off() {
     assert!(configured_restart_via_launchd(
         on.options.session_service.as_ref()
     ));
+}
+
+/// The switch that hands `session_name` to the init system. Default-OFF is the half worth
+/// asserting, and it is the opposite of the key above: a machine whose config nobody has touched
+/// must not have a unit written for it.
+#[test]
+fn managed_session_is_off_unless_the_config_turns_it_on() {
+    use crate::session_service::configured_managed_session;
+
+    let unset = Config::from_kdl("", None).unwrap();
+    assert!(!configured_managed_session(
+        unset.options.session_service.as_ref()
+    ));
+
+    // a `session_service` block that says other things still leaves it off
+    let other_keys = Config::from_kdl(
+        "session_service {
+    restart_via_launchd false
+}",
+        None,
+    )
+    .unwrap();
+    assert!(!configured_managed_session(
+        other_keys.options.session_service.as_ref()
+    ));
+
+    let on = Config::from_kdl(
+        "session_service {
+    managed_session true
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        on.options.session_service.clone().unwrap().managed_session,
+        Some(true)
+    );
+    assert!(configured_managed_session(
+        on.options.session_service.as_ref()
+    ));
+    // and it survives being written out and read back, like every other key in this block
+    assert_eq!(
+        Config::from_kdl(&on.to_string(false), None)
+            .unwrap()
+            .options,
+        on.options
+    );
+
+    let off = Config::from_kdl(
+        "session_service {
+    managed_session false
+}",
+        None,
+    )
+    .unwrap();
+    assert!(!configured_managed_session(
+        off.options.session_service.as_ref()
+    ));
+}
+
+/// `managed_session` is a nested key, so an old binary rejects it and fails the WHOLE config - the
+/// reason it ships in the same patch as the behaviour rather than being seeded ahead of it. What
+/// this build owes in return is an error that names the key when the VALUE is wrong.
+#[test]
+fn managed_session_takes_a_bool_and_is_named_among_what_the_block_accepts() {
+    let error = Config::from_kdl(
+        "session_service {
+    manage_my_session true
+}",
+        None,
+    )
+    .unwrap_err();
+    let error = format!("{:?}", error);
+    assert!(error.contains("managed_session"), "{}", error);
+
+    let error = Config::from_kdl(
+        "session_service {
+    managed_session \"yes\"
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("managed_session"),
+        "{:?}",
+        error
+    );
 }
 
 /// The `session_service` block parses its OWN children, so an unknown one fails the whole config

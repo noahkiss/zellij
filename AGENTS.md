@@ -318,8 +318,11 @@ that fails the WHOLE config, not just the block.** `session_service` is the know
 
 ```
 × Failed to parse Zellij configuration
-╰── Unknown session_service entry: "managed_session" (expected systemd, launchd, pin_exe or restart_via_launchd)
+╰── Unknown session_service entry: "manage_my_session" (expected systemd, launchd, pin_exe, managed_session or restart_via_launchd)
 ```
+
+(`managed_session` was the key that taught this lesson, in 2026-08. It has since shipped, so it is
+no longer an example of an unknown one — the rule it proved is unchanged.)
 
 So a key nested inside such a block CANNOT be rolled out ahead of the binary — it has to ship with
 the code that accepts it. Do not generalise a top-level probe to a nested key: test the key you
