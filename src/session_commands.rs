@@ -1579,15 +1579,11 @@ mod tests {
 
         let warning = "warning: the pin was NOT refreshed: Security: SecKeychainUnlock failed";
         writeln!(stderr, "{}", warning).unwrap();
-        writeln!(stdout, "tearing down go-for-flight").unwrap();
+        writeln!(stdout, "tearing down mysession").unwrap();
 
         let written = std::fs::read_to_string(&log_file).unwrap();
         assert!(written.contains(warning), "{:?}", written);
-        assert!(
-            written.contains("tearing down go-for-flight"),
-            "{:?}",
-            written
-        );
+        assert!(written.contains("tearing down mysession"), "{:?}", written);
     }
 
     /// A restart keeps one generation, so the handles must start an empty file rather than append
