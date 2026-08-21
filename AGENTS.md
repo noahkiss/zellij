@@ -5,9 +5,10 @@ changes and how to install and release it. This file says *how to work in it*.
 
 ## What this repo is
 
-A permanent personal fork of [zellij](https://github.com/zellij-org/zellij), based on the `v0.44.3`
-tag. **Upstreaming is not a goal.** No patch here has been sent upstream, and the repo takes no
-issues or pull requests.
+A permanent personal fork of [zellij](https://github.com/zellij-org/zellij), carried as a patch
+series on an upstream base. The base moves; do not record it here. FORK.md's opening lines name
+the current one. **Upstreaming is not a goal.** No patch here has been sent upstream, and the repo
+takes no issues or pull requests.
 
 A patch is judged by its value to a real consumer of this build — a person at a terminal, or a
 program that drives zellij over the CLI. It is not judged by whether upstream would accept it. That
