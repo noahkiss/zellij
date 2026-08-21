@@ -30,7 +30,9 @@ use zellij_utils::pane_size::{Size, SizeInPixels};
 use zellij_utils::position::Position;
 
 use crate::pty_writer::PtyWriteInstruction;
+use crate::ui::loading_indication::LoadingIndication;
 use zellij_utils::channels::{self, ChannelWithContext, SenderWithContext};
+use zellij_utils::data::NoteColor;
 
 use crate::os_input_output::AsyncReader;
 use std::cell::RefCell;
@@ -16590,5 +16592,78 @@ fn stack_list_focus_leaves_the_stack_before_it_wraps() {
         tab.stack_list_id_of_member(&focused_after).is_none(),
         "focus left the stack list for the pane above it instead of wrapping, got: {:?}",
         focused_after
+    );
+}
+
+/// A plugin that failed leaves a mark that outlives the moment it failed.
+///
+/// The frame flash the server had for this (`AddRedPaneFrameColorOverride`) is a one-second
+/// animation and it is shared with the multi-select highlight, so it is neither durable nor the
+/// pane's own. The note is: it stays until the next load attempt, it is drawn on the frame, and
+/// `list-panes` reads it off `PaneInfo` - which is what the assertion here goes through, rather
+/// than the pane's private field, because the point of the mark is that something outside the
+/// server can see it.
+#[test]
+fn a_plugin_pane_whose_plugin_failed_is_marked() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    // the tab needs a plugin sender to build a plugin pane at all, which this factory wires and the
+    // plain one does not
+    let mut tab = create_new_tab_with_swap_layouts(
+        size,
+        ModeInfo::default(),
+        (vec![], vec![]),
+        None,
+        true,
+        true,
+    );
+    let plugin_pane_id = PaneId::Plugin(1);
+    tab.new_pane(
+        plugin_pane_id,
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+
+    let note_of_plugin_pane = |tab: &Tab| {
+        tab.pane_infos()
+            .into_iter()
+            .find(|pane_info| pane_info.is_plugin && pane_info.id == 1)
+            .map(|pane_info| (pane_info.note, pane_info.note_color))
+            .expect("the plugin pane is in the tab")
+    };
+
+    assert_eq!(
+        note_of_plugin_pane(&tab).0,
+        "",
+        "a plugin pane that has not failed carries no note"
+    );
+
+    let mut loading_indication = LoadingIndication::new("test-plugin".to_owned());
+    loading_indication
+        .indicate_loading_error("Failed to resolve plugin: file:/gone.wasm".to_owned());
+    tab.update_plugin_loading_stage(1, loading_indication);
+
+    assert_eq!(
+        note_of_plugin_pane(&tab),
+        ("plugin failed".to_owned(), NoteColor::Error),
+        "a plugin that failed to load marks its pane, in the colour that means failure"
+    );
+
+    // the next attempt owns the pane from the moment it starts: the mark describes the attempt that
+    // ended, exactly as a re-run command pane drops its `exit 7`
+    tab.start_plugin_loading_indication(1, LoadingIndication::new("test-plugin".to_owned()));
+    assert_eq!(
+        note_of_plugin_pane(&tab).0,
+        "",
+        "starting another load attempt clears the mark the previous one left"
     );
 }
