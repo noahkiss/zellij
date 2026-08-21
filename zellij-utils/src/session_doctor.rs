@@ -676,7 +676,7 @@ mod tests {
         assert!(!answer.success);
     }
 
-    /// Recorded from `systemctl --user show zellij-go-for-flight.service` on a healthy machine.
+    /// Recorded from `systemctl --user show zellij-session-mysession.service` on a healthy machine.
     const HEALTHY_SHOW: &str = "\
 Result=success
 ActiveState=inactive
