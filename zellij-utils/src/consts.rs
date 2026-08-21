@@ -14,6 +14,44 @@ pub const ZELLIJ_CONFIG_FILE_ENV: &str = "ZELLIJ_CONFIG_FILE";
 pub const ZELLIJ_CONFIG_DIR_ENV: &str = "ZELLIJ_CONFIG_DIR";
 pub const ZELLIJ_LAYOUT_DIR_ENV: &str = "ZELLIJ_LAYOUT_DIR";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The upstream tag this fork is a patch series on top of.
+///
+/// A rebase onto a newer upstream tag must update this and [`UPSTREAM_BASE_COMMIT`] - see FORK.md.
+/// It is spelled literally rather than derived from git, so a build from a tarball or a shallow
+/// checkout reports the same answer as a build from a full clone.
+pub const UPSTREAM_BASE_TAG: &str = "v0.45.0";
+
+/// The commit [`UPSTREAM_BASE_TAG`] points at, abbreviated. `v0.45.0` is an annotated tag, so this
+/// is `git rev-parse --short 'v0.45.0^{commit}'` - `--short v0.45.0` gives the tag object instead.
+pub const UPSTREAM_BASE_COMMIT: &str = "13e1c25a2";
+
+/// The day this binary was built, if whoever built it said so.
+///
+/// Unset in an ordinary `cargo build`, which keeps a local rebuild byte-identical; the release
+/// workflow sets it, so a shipped artifact carries a date.
+pub const BUILD_DATE: Option<&str> = option_env!("ZELLIJ_BUILD_DATE");
+
+/// The version, plus the upstream base it was cut from, for `zellij --version`.
+///
+/// The FIRST LINE IS THE VERSION AND NOTHING ELSE, because scripts read it. `zellij-mac-setup`
+/// takes the last whitespace-separated field of `zellij --version | head -1`, so anything appended
+/// to that line would be read as the version number. The base goes on a second line, where a
+/// `head -1` reader never sees it.
+pub fn version_long() -> &'static str {
+    static VERSION_LONG: OnceLock<String> = OnceLock::new();
+    VERSION_LONG.get_or_init(|| match BUILD_DATE {
+        Some(date) => format!(
+            "{}\nupstream {} @ {}, built {}",
+            VERSION, UPSTREAM_BASE_TAG, UPSTREAM_BASE_COMMIT, date
+        ),
+        None => format!(
+            "{}\nupstream {} @ {}",
+            VERSION, UPSTREAM_BASE_TAG, UPSTREAM_BASE_COMMIT
+        ),
+    })
+}
+
 pub const DEFAULT_SCROLL_BUFFER_SIZE: usize = 10_000;
 pub static SCROLL_BUFFER_SIZE: OnceLock<usize> = OnceLock::new();
 pub static DEBUG_MODE: OnceLock<bool> = OnceLock::new();
@@ -449,5 +487,46 @@ mod not_unix {
     /// candidate is the one in use.
     pub fn socket_dir_candidates() -> Vec<PathBuf> {
         vec![ZELLIJ_SOCK_DIR.clone()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `zellij-mac-setup` reads the version as the last whitespace-separated field of
+    /// `zellij --version | head -1`, and feeds it to a numeric comparison. Anything appended to
+    /// that line is read as the version number instead, and the comparison then refuses to run.
+    #[test]
+    fn the_first_line_of_the_long_version_is_the_version_and_nothing_else() {
+        let first_line = version_long().lines().next().unwrap();
+        assert_eq!(first_line, VERSION);
+        assert_eq!(first_line.rsplit(' ').next().unwrap(), VERSION);
+    }
+
+    #[test]
+    fn the_long_version_names_the_upstream_base_it_was_cut_from() {
+        let base_line = version_long().lines().nth(1).unwrap();
+        assert!(
+            base_line.contains(UPSTREAM_BASE_TAG),
+            "expected the base tag in {:?}",
+            base_line
+        );
+        assert!(
+            base_line.contains(UPSTREAM_BASE_COMMIT),
+            "expected the base commit in {:?}",
+            base_line
+        );
+    }
+
+    /// The tag is a tag and the commit is an abbreviated sha, so a rebase that updates one and
+    /// forgets the other is caught here rather than in a release note.
+    #[test]
+    fn the_base_tag_and_commit_are_spelled_the_way_git_spells_them() {
+        assert!(UPSTREAM_BASE_TAG.starts_with('v'));
+        assert!(UPSTREAM_BASE_COMMIT.len() >= 7);
+        assert!(UPSTREAM_BASE_COMMIT
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }

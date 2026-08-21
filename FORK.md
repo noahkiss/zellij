@@ -5429,6 +5429,45 @@ children, and an older build fails the **whole** config on `watchdog_interval_se
 block. It cannot be seeded into a shared config ahead of the binary; it ships with the code that
 accepts it, and every machine takes the binary first.
 
+### `--version` says which upstream base it was cut from
+
+The version string names the fork counter and nothing else, so `0.45.0-nkmk.16` answers *which
+fork build* and leaves *which upstream* to whoever remembers. That is the question asked when a
+bug might be upstream's, and the answer used to live only here, in prose.
+
+```
+$ zellij --version
+zellij 0.45.0-nkmk.16
+upstream v0.45.0 @ 13e1c25a2
+```
+
+**The base is two literal consts, not a `git describe`.** `UPSTREAM_BASE_TAG` and
+`UPSTREAM_BASE_COMMIT` sit beside `VERSION` in `consts.rs`. Deriving them at build time would make
+the answer depend on the checkout — a tarball, a shallow clone and a full clone would each report
+something different, and none of them would be wrong in a way the build could detect. A literal is
+the same answer everywhere, at the price of one line in the rebase runbook.
+
+**It is a second line, and that is the whole safety argument.** `zellij-mac-setup` reads the
+version as the last whitespace-separated field of `zellij --version | head -1` and feeds it to a
+numeric comparison. A parenthetical appended to the first line would be read as the version number,
+the comparison would decide the script predates the binary, and the script would refuse to run on
+every Mac. So the first line stays byte-identical to what it has always been, and everything new
+goes below it, where a `head -1` reader never sees it. A test asserts exactly that, naming the
+script.
+
+Nothing else that reads a version changes. `VersionInfo::from_version_string` is fed the `VERSION`
+const, not the printed string, so `setup --check --json`, the capabilities document and `ls --json`
+are untouched; the tap formulas match a substring; `session doctor` compares build identities and
+has never parsed `--version`. `setup --check` gains an `[Upstream base]:` line of its own and
+leaves `[Version]:` alone.
+
+**The build date is opt-in.** `option_env!("ZELLIJ_BUILD_DATE")`, unset in an ordinary
+`cargo build`, so a local rebuild stays byte-reproducible and the line reads `upstream v0.45.0 @
+13e1c25a2`. The release workflow exports the day it builds, so a shipped artifact reads `…,
+built 2026-08-21`. A `build.rs` was the alternative and is worse: `zellij-utils` has none, it
+compiles for wasm, and stamping a date there would make the checked-in plugin assets differ on
+every rebuild.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
@@ -5462,6 +5501,11 @@ accepts it, and every machine takes the binary first.
 upstream base, currently the **`v0.45.0`** tag. Moving to a newer base is
 `git fetch upstream --tags && git rebase --onto <new-tag> v0.45.0`, then recording the new base
 here.
+
+**A moved base is also two consts.** `UPSTREAM_BASE_TAG` and `UPSTREAM_BASE_COMMIT` in
+`zellij-utils/src/consts.rs` are what `zellij --version` prints, and nothing derives them — update
+both in the rebase commit. The commit is `git rev-parse --short '<new-tag>^{commit}'`; upstream
+tags are annotated, so `--short <new-tag>` gives the tag object instead and is the wrong answer.
 
 The base moved from `98a083707` (an upstream `main` commit) to the **`v0.45.0`** tag and took twelve
 upstream commits. Five of them met a patch here.
