@@ -904,7 +904,7 @@ pub fn ensure_gui_session_domain(
 /// line is managed only when it IS that name.
 ///
 /// Matched whole, never as a prefix or a pattern. `zellij -s scratch` on a machine whose
-/// `go-for-flight` is managed has to keep working exactly as it did, and a looser test would have
+/// `mysession` is managed has to keep working exactly as it did, and a looser test would have
 /// this writing a launch agent for every throwaway name somebody types.
 pub fn is_managed_session_name(managed: bool, configured: Option<&str>, session: &str) -> bool {
     managed && configured == Some(session)
@@ -946,8 +946,8 @@ pub fn managed_create_action(
 /// `hierarchy:controllers:path` lines and the path ends in the unit name for anything the user
 /// manager started - `0::/user.slice/user-1000.slice/user@1000.service/app.slice/some.service`.
 ///
-/// The test is on a whole path SEGMENT, not a substring: a unit called `zellij-session-go.service`
-/// must not answer for `zellij-session-go-for-flight.service`, and a substring test would say it
+/// The test is on a whole path SEGMENT, not a substring: a unit called `zellij-session-my.service`
+/// must not answer for `zellij-session-mysession.service`, and a substring test would say it
 /// does.
 pub fn cgroup_says_systemd_unit(cgroup: &str, unit: &str) -> bool {
     cgroup.lines().any(|line| {
@@ -3098,7 +3098,7 @@ mod tests {
     /// launchd sets this itself. Confirmed on a real Mac against an agent two releases old.
     #[test]
     fn launchd_names_the_job_in_the_environment_it_gives_it() {
-        let label = "dev.zellij.session.go-for-flight";
+        let label = "dev.zellij.session.mysession";
         assert!(env_says_launchd_job(Some(label), label));
 
         // what a process that is NOT a job carries. `0` is the trap: a presence check would read
@@ -3116,35 +3116,35 @@ mod tests {
     /// The fallback, for an agent that reaches zellij through a wrapper script - where the variable
     /// above belongs to the wrapper and may not reach us.
     ///
-    /// The block is the real one, from `launchctl print gui/501/dev.zellij.session.go-for-flight`
-    /// on the mini, with the paths made generic. The `pid` line is the documented shape a running
-    /// job adds to it; that machine's job was idle when it was captured.
+    /// The block is the real one, from `launchctl print gui/501/dev.zellij.session.mysession` on a
+    /// Mac, with the paths made generic. The `pid` line is the documented shape a running job adds
+    /// to it; that machine's job was idle when it was captured.
     #[test]
     fn the_job_pid_is_read_off_launchctl_print_and_is_not_the_parent_pid() {
         let printed = "\
-dev.zellij.session.go-for-flight = {
+dev.zellij.session.mysession = {
 	active count = 1
-	path = /Users/someone/Library/LaunchAgents/dev.zellij.session.go-for-flight.plist
+	path = /Users/someone/Library/LaunchAgents/dev.zellij.session.mysession.plist
 	state = running
 	program = /Users/someone/Library/Application Support/zellij/bin/zellij
 	arguments = {
 		/Users/someone/Library/Application Support/zellij/bin/zellij
 		session
 		up
-		go-for-flight
+		mysession
 	}
 	runs = 3936
 	last exit code = 0
 	ppid = 1
 	pid = 47213
 	environment = {
-		XPC_SERVICE_NAME => dev.zellij.session.go-for-flight
+		XPC_SERVICE_NAME => dev.zellij.session.mysession
 	}
 }
 ";
         assert_eq!(job_pid(printed), Some(47213));
-        // an idle job reports `state = not running` and no pid at all, which is the state the mini
-        // was actually in - inventing one there would make every caller the job
+        // an idle job reports `state = not running` and no pid at all, which is the state that
+        // machine was actually in - inventing one there would make every caller the job
         assert_eq!(
             job_pid("dev.zellij.session.x = {\n\tstate = not running\n\truns = 3936\n}\n"),
             None
@@ -4465,25 +4465,21 @@ dev.zellij.session.go-for-flight = {
     fn only_the_configured_session_name_is_managed() {
         assert!(is_managed_session_name(
             true,
-            Some("go-for-flight"),
-            "go-for-flight"
+            Some("mysession"),
+            "mysession"
         ));
         // the ad-hoc session on the same machine, which must be untouched
-        assert!(!is_managed_session_name(
-            true,
-            Some("go-for-flight"),
-            "scratch"
-        ));
+        assert!(!is_managed_session_name(true, Some("mysession"), "scratch"));
         // a prefix of the managed name is a DIFFERENT name, not a match
-        assert!(!is_managed_session_name(true, Some("go-for-flight"), "go"));
+        assert!(!is_managed_session_name(true, Some("mysession"), "my"));
         // the key off is the whole feature off
         assert!(!is_managed_session_name(
             false,
-            Some("go-for-flight"),
-            "go-for-flight"
+            Some("mysession"),
+            "mysession"
         ));
         // and no `session_name` in the config means there is nothing for the key to refer to
-        assert!(!is_managed_session_name(true, None, "go-for-flight"));
+        assert!(!is_managed_session_name(true, None, "mysession"));
     }
 
     /// Three conditions, and every one of them is a veto. The last is the recursion guard.
@@ -4514,19 +4510,19 @@ dev.zellij.session.go-for-flight = {
     #[test]
     fn a_cgroup_names_the_unit_it_is_in_and_not_a_neighbour() {
         let inside = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
-                      zellij-session-go-for-flight.service\n";
+                      zellij-session-mysession.service\n";
         assert!(cgroup_says_systemd_unit(
             inside,
-            "zellij-session-go-for-flight.service"
+            "zellij-session-mysession.service"
         ));
         assert!(!cgroup_says_systemd_unit(
             inside,
-            "zellij-session-go.service"
+            "zellij-session-my.service"
         ));
         // a login shell is in the session scope, not in any unit of ours
         assert!(!cgroup_says_systemd_unit(
             "0::/user.slice/user-1000.slice/session-3.scope\n",
-            "zellij-session-go-for-flight.service"
+            "zellij-session-mysession.service"
         ));
         // cgroup v1 writes several lines, and the unit may be named on only one of them
         let v1 = "12:pids:/user.slice/user-1000.slice/session-3.scope\n\

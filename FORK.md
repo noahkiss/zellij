@@ -5154,7 +5154,7 @@ the `session up` it runs has finished. The guard there reads `/proc/self/cgroup`
 environment variable, for the same reason the macOS one reads launchd's own `XPC_SERVICE_NAME`: it
 is the init system's record of what it started, so it answers on units that are already installed
 and costs no change to a generated file. It compares a whole path **segment**, so
-`zellij-session-go.service` cannot answer for `zellij-session-go-for-flight.service`.
+`zellij-session-my.service` cannot answer for `zellij-session-mysession.service`.
 
 The interception is one function shadowing the `zellij_client::start_client` import, rather than
 two lines repeated at each of the six client call sites — a seventh call added later that quietly

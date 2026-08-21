@@ -2793,7 +2793,7 @@ Signature=adhoc
         };
         let same = "designated => identifier \"org.zellij.nkmk\" and anchor apple generic";
 
-        // The mini's case, and the whole of finding 3: a pin re-signed with the certificate it
+        // The observed case, and the whole of finding 3: a pin re-signed with the certificate it
         // already carried. Nothing to re-grant, and saying otherwise sent a user to System
         // Settings to redo three permissions that were already right.
         assert_eq!(requirement_changed(&anchored(same), same), None);
