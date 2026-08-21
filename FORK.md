@@ -4681,6 +4681,19 @@ connection refusal - no real network, no e2e fixture needed, since the failure h
 wasmtime is ever reached: a `Reload` sent after the failed `Load` should start a second,
 distinctly-id'd attempt at the same location, and does now.
 
+### `-s` reaches `attach` too, not just the no-subcommand form
+
+The top-level `--session`/`-s` already named which session `zellij action` and `zellij subscribe`
+target - both take it as their `requested_session_name`. `zellij attach` never read it: it has its
+own positional `session_name`, and the dispatch used that field alone, `opts.session` unconsulted.
+`zellij -s myname attach -c` therefore ignored `-s`, found no active session to attach `create`'s
+fallback to, and minted a fresh random name instead - `-s` looked accepted (clap does not reject an
+unused global flag) and silently did nothing.
+
+`attach`'s own positional still wins when both are given - `zellij -s foo attach bar` means `bar`,
+the more specific of the two - but now falls back to `-s` when it is empty, the same way `action`
+and `subscribe` already do.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
