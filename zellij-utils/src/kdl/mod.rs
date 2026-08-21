@@ -10328,10 +10328,10 @@ fn managed_session_takes_a_bool_and_is_named_among_what_the_block_accepts() {
 fn watchdog_interval_secs_is_the_generators_own_unless_the_config_retimes_it() {
     let unset = Config::from_kdl("", None).unwrap();
     assert!(unset.options.session_service.is_none());
-    // the accessor is what both generators read, and unset means the built-in minute
+    // the accessor is what both generators read, and unset means the built-in default
     assert_eq!(
         SessionServiceOptions::default().watchdog_interval_secs(),
-        60
+        15
     );
 
     // a `session_service` block that says other things still leaves the interval alone
@@ -10344,7 +10344,7 @@ fn watchdog_interval_secs_is_the_generators_own_unless_the_config_retimes_it() {
     .unwrap();
     let other_keys = other_keys.options.session_service.clone().unwrap();
     assert_eq!(other_keys.watchdog_interval_secs, None);
-    assert_eq!(other_keys.watchdog_interval_secs(), 60);
+    assert_eq!(other_keys.watchdog_interval_secs(), 15);
 
     let retimed = Config::from_kdl(
         "session_service {

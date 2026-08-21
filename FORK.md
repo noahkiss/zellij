@@ -5566,6 +5566,20 @@ Nothing about this is machine-specific, so CI runs it too and the runner's paths
 well. A rebuild is byte-identical: recompiling all fifteen plugins from touched sources reproduces
 the committed assets exactly.
 
+### The watchdog ticks every fifteen seconds
+
+`CHECK_INTERVAL_SECS` drops from 60 to 15, so a session that dies comes back within fifteen
+seconds instead of a minute, on both platforms at once — the systemd timer's `OnBootSec=`/
+`OnUnitActiveSec=` and the plist's `StartInterval` all read the same constant.
+
+Measured before changing: a pass over a healthy session costs 0.16–0.17 s, so at fifteen seconds
+the watchdog spends about one percent of its interval working, and the up-lock it takes is held
+for that sliver. `watchdog_interval_secs` still overrides in either direction.
+
+A machine that installed its units under the old default shows the timer as drifted in
+`session status` until `session enable` is re-run there. That is the drift check doing its job:
+the installed file says 60, the generator now says 15.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

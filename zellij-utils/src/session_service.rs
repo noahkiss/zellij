@@ -1464,7 +1464,7 @@ fn xml_escape(text: &str) -> String {
 ///
 /// The default rather than the rule: `watchdog_interval_secs` in the `session_service` block
 /// replaces it, on both platforms at once.
-const CHECK_INTERVAL_SECS: u64 = 60;
+const CHECK_INTERVAL_SECS: u64 = 15;
 
 /// [`SessionServiceOptions::watchdog_interval_secs`] for a generator that may have no
 /// `session_service` block at all, which is the ordinary case and the one that must keep writing
@@ -4293,7 +4293,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         assert!(unit.contains("session up \"work\"\n\n[Install]"));
         assert!(unit.ends_with("WantedBy=default.target\n"));
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
-        assert!(plist.contains("<integer>60</integer>\n</dict>\n</plist>\n"));
+        assert!(plist.contains("<integer>15</integer>\n</dict>\n</plist>\n"));
     }
 
     #[test]
