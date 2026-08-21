@@ -1000,6 +1000,15 @@ pub struct SessionServiceOptions {
     pub systemd: SystemdDirectives,
     #[serde(default)]
     pub launchd: Vec<LaunchdKey>,
+    /// Environment variables to put in the generated plist's `EnvironmentVariables` dictionary.
+    ///
+    /// The systemd side has always been able to say this - an `Environment=` line is a directive
+    /// like any other, and `session_service { systemd { service "Environment=SSH_AUTH_SOCK=..." } }`
+    /// works. launchd had no equivalent: the `keys` block writes TOP-LEVEL plist keys, and launchd
+    /// has none named after an environment variable, so the same fact written there was accepted,
+    /// generated, installed and then ignored.
+    #[serde(default)]
+    pub launchd_env: Vec<LaunchdEnvVar>,
     /// Keep a copy of the binary at a fixed path and point the unit at it. Unset is off, and off is
     /// the whole feature: nothing is copied, nothing is reported, and the unit names whatever it
     /// named before.
@@ -1069,6 +1078,18 @@ pub struct LaunchdKey {
     pub value: PlistValue,
 }
 
+/// One entry of the generated plist's `EnvironmentVariables` dictionary.
+///
+/// Separate from [`LaunchdKey`] because it is not a plist key and cannot be one: launchd has no
+/// top-level key by any environment variable's name, so a name put through the `keys` hatch lands
+/// where launchd never reads it. The value is a `String` and not a [`PlistValue`] for the same
+/// reason - that dictionary holds strings, and an array there is not a thing launchd understands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchdEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
 /// Every shape a plist value takes, because a generated plist has to carry every shape a
 /// hand-written one did.
 ///
@@ -1136,6 +1157,7 @@ impl SessionServiceOptions {
             && self.systemd.service.is_empty()
             && self.systemd.install.is_empty()
             && self.launchd.is_empty()
+            && self.launchd_env.is_empty()
             && self.pin_exe.is_none()
             && self.restart_via_launchd.is_none()
             && self.managed_session.is_none()
@@ -1148,7 +1170,8 @@ impl SessionServiceOptions {
         !(self.systemd.unit.is_empty()
             && self.systemd.service.is_empty()
             && self.systemd.install.is_empty()
-            && self.launchd.is_empty())
+            && self.launchd.is_empty()
+            && self.launchd_env.is_empty())
     }
 
     /// Where this config says the binary is to be pinned, or nothing when it does not say.
@@ -1253,6 +1276,38 @@ impl SessionServiceOptions {
         self.launchd.push(LaunchdKey {
             name: name.to_owned(),
             value,
+        });
+        Ok(())
+    }
+
+    /// Add an entry to the generated plist's `EnvironmentVariables` dictionary.
+    ///
+    /// A repeated name REPLACES the earlier one rather than being refused. A dictionary with the
+    /// same key twice is not a plist, so one of the two has to go; a config file is read top to
+    /// bottom, so the later line is the one the person writing it meant.
+    pub fn add_launchd_env(&mut self, name: &str, value: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("an environment variable needs a name".to_owned());
+        }
+        // launchd reads this dictionary as `NAME=value` pairs; a name carrying either character
+        // produces a variable nothing can refer to, and the file still installs.
+        if name.contains('=') || name.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "'{}' is not an environment variable name (no '=' and no spaces)",
+                name
+            ));
+        }
+        if let Some(forbidden) = forbidden_env_name(name) {
+            return Err(format!(
+                "'{}' names {}, which would build a session no terminal can see - the binary \
+                 resolves that itself",
+                name, forbidden
+            ));
+        }
+        self.launchd_env.retain(|entry| entry.name != name);
+        self.launchd_env.push(LaunchdEnvVar {
+            name: name.to_owned(),
+            value: value.to_owned(),
         });
         Ok(())
     }
@@ -1768,6 +1823,24 @@ fn take_default_value(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<PlistVal
     given
 }
 
+/// Take one environment variable out of the configured `env` block.
+///
+/// Removed whether or not it is used, for the same reason [`take_default_value`] removes a key: an
+/// entry left behind would be written into the dictionary a second time.
+fn take_env_value(env: &mut Vec<LaunchdEnvVar>, name: &str) -> Option<String> {
+    let mut given = None;
+    env.retain(|entry| {
+        if entry.name != name {
+            return true;
+        }
+        if given.is_none() {
+            given = Some(entry.value.clone());
+        }
+        false
+    });
+    given
+}
+
 /// A configured integer where the generator has an integer default.
 fn take_default_integer(keys: &mut Vec<LaunchdKey>, name: &str) -> Option<i64> {
     match take_default_value(keys, name)? {
@@ -1819,19 +1892,31 @@ fn launchd_plist(
     extras: Option<&SessionServiceOptions>,
     state_home: Option<&Path>,
 ) -> String {
-    let extras = extras.cloned().unwrap_or_default();
+    let mut extras = extras.cloned().unwrap_or_default();
     // Read before `launchd` is moved out below, and kept as the default `StartInterval` rather than
     // applied here: the launchd extras name launchd's own key and are the more specific of the two.
     let configured_interval = extras.watchdog_interval_secs();
+    // The `env` block, whose entries go into EnvironmentVariables and nowhere else. It is read
+    // FIRST for each of the three names below, because it says what the value is in the dictionary
+    // launchd actually reads, while a name put through `keys` says it in the one place launchd
+    // does not - the hatch is kept working, but it is the less specific of the two statements.
+    let mut env = std::mem::take(&mut extras.launchd_env);
     // Every one of these is a value the generator owns a DEFAULT for rather than a part of the
     // plist it owns outright, so a config entry naming one replaces the value instead of being
     // refused. TERM and PATH are environment variables, not plist keys - launchd has no top-level
     // key by either name - so a configured one is routed into EnvironmentVariables, where it means
     // something. The rest are real plist keys and are written where they belong.
     let mut keys = extras.launchd;
-    let term = take_default_key(&mut keys, "TERM")
+    // Both halves are taken unconditionally, even when the `env` block has already answered: a key
+    // left in the extras would be written a second time, at the top level, where launchd ignores it.
+    let keyed_term = take_default_key(&mut keys, "TERM");
+    let term = take_env_value(&mut env, "TERM")
+        .or(keyed_term)
         .unwrap_or_else(|| crate::shared::DEFAULT_TERM.to_owned());
-    let path = take_default_key(&mut keys, "PATH").unwrap_or_else(|| service_path(exe));
+    let keyed_path = take_default_key(&mut keys, "PATH");
+    let path = take_env_value(&mut env, "PATH")
+        .or(keyed_path)
+        .unwrap_or_else(|| service_path(exe));
     let working_directory =
         take_default_key(&mut keys, "WorkingDirectory").unwrap_or_else(launchd_working_directory);
     let (default_out, default_err) = launchd_log_paths(session);
@@ -1849,7 +1934,9 @@ fn launchd_plist(
         take_default_integer(&mut keys, "StartInterval").unwrap_or(configured_interval as i64);
     // Not a plist key either: it goes inside EnvironmentVariables like TERM and PATH, and unlike
     // them it is absent altogether when this machine has no absolute one to record.
-    let state_home = take_default_key(&mut keys, "XDG_STATE_HOME")
+    let keyed_state_home = take_default_key(&mut keys, "XDG_STATE_HOME");
+    let state_home = take_env_value(&mut env, "XDG_STATE_HOME")
+        .or(keyed_state_home)
         .or_else(|| state_home.map(|home| home.display().to_string()))
         .map(|value| {
             format!(
@@ -1858,6 +1945,18 @@ fn launchd_plist(
             )
         })
         .unwrap_or_default();
+    // Whatever the `env` block named that the generator has no opinion about, in the order the
+    // config gave them. The three above have been taken out, so nothing here repeats a key.
+    let extra_env = env
+        .iter()
+        .map(|entry| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>\n",
+                xml_escape(&entry.name),
+                xml_escape(&entry.value)
+            )
+        })
+        .collect::<String>();
     format!(
         "\
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -1920,6 +2019,12 @@ fn launchd_plist(
   the generator's outright, because those three are what the unit IS. TERM, PATH and XDG_STATE_HOME
   are replaced inside this dictionary, where they mean something, because launchd has no top-level
   key by any of those names.
+
+  Anything else this dictionary carries came from the `env` block of the config's `session_service`
+  launchd section, which is how a config names an environment variable here. The `keys` block
+  beside it writes TOP-LEVEL plist keys, and launchd has none named after an environment variable -
+  so a name written there and not here is installed and then ignored. Where both name the same
+  variable, `env` wins, and the variable is written once.
 -->
 <plist version=\"1.0\">
 <dict>
@@ -1940,7 +2045,7 @@ fn launchd_plist(
         <string>{path}</string>
         <key>TERM</key>
         <string>{term}</string>
-{state_home}    </dict>
+{state_home}{extra_env}    </dict>
     <key>WorkingDirectory</key>
     <string>{working_directory}</string>
     <key>StandardOutPath</key>
@@ -1963,6 +2068,7 @@ fn launchd_plist(
         term = xml_escape(&term),
         path = xml_escape(&path),
         state_home = state_home,
+        extra_env = extra_env,
         working_directory = xml_escape(&working_directory),
         out_path = xml_escape(&out_path),
         err_path = xml_escape(&err_path),
@@ -4523,6 +4629,127 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         // key by that name
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(!plist.contains("    <key>TERM</key>\n    <string>"));
+    }
+
+    /// The gap this closes. systemd could always say `Environment=SSH_AUTH_SOCK=...`; launchd's only
+    /// hatch wrote TOP-LEVEL plist keys, and launchd has none named after an environment variable,
+    /// so the same fact was accepted, generated, installed and then ignored.
+    #[test]
+    fn an_env_entry_lands_in_environment_variables_and_nowhere_else() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_launchd_env("SSH_AUTH_SOCK", "/private/tmp/agent/Listeners")
+            .unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
+
+        assert_eq!(plist.matches("<key>SSH_AUTH_SOCK</key>").count(), 1);
+        assert!(
+            plist.contains(
+                "<key>SSH_AUTH_SOCK</key>\n        <string>/private/tmp/agent/Listeners</string>"
+            ),
+            "in {}",
+            plist
+        );
+        // eight spaces of indent is inside the dictionary; four would be a top-level key
+        assert!(
+            !plist.contains("    <key>SSH_AUTH_SOCK</key>\n    <string>"),
+            "in {}",
+            plist
+        );
+    }
+
+    /// The generator's own three are DEFAULTS here as everywhere else in this block: a machine that
+    /// needs another TERM says so, and the variable is still written once.
+    #[test]
+    fn an_env_entry_replaces_the_generators_default_rather_than_joining_it() {
+        let mut extras = SessionServiceOptions::default();
+        extras.add_launchd_env("TERM", "screen-256color").unwrap();
+        extras.add_launchd_env("PATH", "/my/bin").unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
+
+        assert_eq!(plist.matches("<key>TERM</key>").count(), 1);
+        assert_eq!(plist.matches("<key>PATH</key>").count(), 1);
+        assert!(plist.contains("<key>TERM</key>\n        <string>screen-256color</string>"));
+        assert!(plist.contains("<key>PATH</key>\n        <string>/my/bin</string>"));
+    }
+
+    /// `env` names the dictionary launchd actually reads; `keys` names the one place it does not.
+    /// So `env` is the more specific statement and wins - and the losing half is still taken out of
+    /// the extras, or the variable would appear a second time at the top level.
+    #[test]
+    fn an_env_entry_beats_the_same_name_put_through_the_keys_hatch() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_launchd_key("TERM", PlistValue::String("screen-256color".to_owned()))
+            .unwrap();
+        extras.add_launchd_env("TERM", "xterm-256color").unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
+
+        assert_eq!(plist.matches("<key>TERM</key>").count(), 1);
+        assert!(plist.contains("<key>TERM</key>\n        <string>xterm-256color</string>"));
+        assert!(!plist.contains("screen-256color"), "in {}", plist);
+    }
+
+    /// A dictionary with one key twice is not a plist, so a repeated name cannot simply be appended.
+    /// A config file is read top to bottom, so the later line is the one that was meant.
+    #[test]
+    fn a_repeated_env_name_is_the_later_one_and_is_written_once() {
+        let mut extras = SessionServiceOptions::default();
+        extras.add_launchd_env("LANG", "C").unwrap();
+        extras.add_launchd_env("LANG", "en_US.UTF-8").unwrap();
+        assert_eq!(extras.launchd_env.len(), 1);
+
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
+        assert_eq!(plist.matches("<key>LANG</key>").count(), 1);
+        assert!(plist.contains("<key>LANG</key>\n        <string>en_US.UTF-8</string>"));
+    }
+
+    /// The `keys` block already refuses these, and the new route must not become the way around it.
+    #[test]
+    fn the_env_block_refuses_the_names_no_unit_may_pin() {
+        for name in FORBIDDEN_ENV_NAMES {
+            let mut extras = SessionServiceOptions::default();
+            let error = extras.add_launchd_env(name, "/somewhere").unwrap_err();
+            assert!(error.contains(name), "{}", error);
+            assert!(extras.launchd_env.is_empty());
+        }
+    }
+
+    /// launchd reads this dictionary as name/value pairs, so a name carrying an `=` or a space
+    /// produces a variable nothing can refer to - and the plist still installs, so nothing later
+    /// says anything about it.
+    #[test]
+    fn the_env_block_refuses_a_name_that_is_not_one() {
+        let mut extras = SessionServiceOptions::default();
+        assert!(extras.add_launchd_env("", "value").is_err());
+        assert!(extras.add_launchd_env("SSH_AUTH_SOCK=x", "value").is_err());
+        assert!(extras.add_launchd_env("TWO WORDS", "value").is_err());
+        assert!(extras.launchd_env.is_empty());
+    }
+
+    /// The whole point of a default: a config that has never heard of this block writes the file it
+    /// wrote before, byte for byte.
+    #[test]
+    fn an_unset_env_block_writes_the_plist_it_always_wrote() {
+        let extras = SessionServiceOptions::default();
+        assert_eq!(
+            service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None),
+            service_unit(ServiceKind::Launchd, &exe(), "work", None, None)
+        );
+        assert!(extras.is_empty());
+        assert!(!extras.has_unit_extras());
+    }
+
+    /// `has_unit_extras` decides whether a machine is told its unit carries local additions. An
+    /// `env` block is one, and a block that answered `false` here would go unmentioned.
+    #[test]
+    fn an_env_block_counts_as_a_unit_extra() {
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_launchd_env("SSH_AUTH_SOCK", "/private/tmp/x")
+            .unwrap();
+        assert!(extras.has_unit_extras());
+        assert!(!extras.is_empty());
     }
 
     #[test]
