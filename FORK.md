@@ -5580,6 +5580,13 @@ A machine that installed its units under the old default shows the timer as drif
 `session status` until `session enable` is re-run there. That is the drift check doing its job:
 the installed file says 60, the generator now says 15.
 
+### The tab bar ignores the wheel
+
+`slim-tab-bar` used to move one tab per wheel notch, so a trackpad flick over the bar walked the
+tab strip. The scroll arms are gone: switching tabs is deliberate only — a click on the tab, or a
+keybind. The stock `tab-bar` and `compact-bar` keep their upstream behaviour; only the fork's own
+bar changed.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

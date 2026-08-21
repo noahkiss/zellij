@@ -391,22 +391,6 @@ impl SlimBar {
         }
     }
 
-    /// Wheel over the bar moves one tab, matching zellij's own compact-bar: up is the next
-    /// tab, down the previous, and both stop at the ends rather than wrapping.
-    fn scroll(&self, up: bool) {
-        let Some(active) = self.active_tab() else {
-            return;
-        };
-        let target = if up {
-            (active + 1).min(self.tabs.len())
-        } else {
-            active.saturating_sub(1).max(1)
-        };
-        if target != active {
-            switch_tab_to(target as u32);
-        }
-    }
-
     /// Blank fill in the line background, so the bar is one continuous strip.
     fn spacer(&self, width: usize, colors: &Styling) -> Segment {
         let bg = colors.text_unselected.background;
@@ -548,10 +532,10 @@ impl ZellijPlugin for SlimBar {
             // Never returns true: switching tabs produces its own TabUpdate, and repainting
             // here as well would draw the old active tab for one frame.
             Event::Mouse(mouse) => {
+                // A wheel over the bar is ignored on purpose: a trackpad flick used to walk
+                // the tab strip, so switching is deliberate only - a click or a keybind.
                 match mouse {
                     Mouse::LeftClick(_, col) => self.click(col),
-                    Mouse::ScrollUp(_) => self.scroll(true),
-                    Mouse::ScrollDown(_) => self.scroll(false),
                     _ => {},
                 }
                 false
