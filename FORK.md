@@ -251,8 +251,45 @@ a plain pane where the plugin had been.
 
 The fork remembers what a plugin that failed to load was asked to run, for as long as its pane
 lives. The error is logged once, the pane keeps the loading-error state it already shows, and the
-plugin stays in the serialized layout. Reloading that pane does not bring the plugin back once the
-file returns; restoring the layout does, because the layout still names it.
+plugin stays in the serialized layout. [Reloading that pane brings the plugin back once the file
+returns](#reloading-a-pane-whose-plugin-never-loaded).
+
+### Reloading a pane whose plugin never loaded
+
+```
+$ zellij action start-or-reload-plugin file:/tmp/p.wasm   # the pane says ERROR IN PLUGIN
+```
+
+The loop this is for is: a plugin fails to load, you fix the file, you reload the pane. It bailed,
+twice over, and the only way back was restoring the layout — which throws the session's shape away
+to fix one pane.
+
+Both halves read the `plugin_map`, and a pane whose plugin never loaded is in no plugin map:
+
+- **The pane could not be found.** `reload_plugin` looks a location up in the map, misses, and the
+  caller falls through to *starting* the plugin — a stray second pane beside the broken one, which
+  is still broken.
+- **The pane could not be reloaded.** `reload_plugin_with_id` reads the plugin's config, size, tab
+  index and cwd off the RUNNING instance. A pane that has none bails at the first of them.
+
+So the fork answers both from outside the map. The failure record that already remembers what a
+failed pane was meant to run is now also searched by location, so the reload finds the broken pane
+instead of spawning a stray one. And a **pane placement** — size, tab index, cwd — is recorded when
+a load is started, kept current by resizes, and dropped when the pane closes, so a pane with no
+running instance can still say where it is. A running instance is asked first in every case, because
+it is the current answer; the placement answers only for a pane that has none.
+
+The config is the half that makes recovery actually recover: it is rebuilt from the `RunPlugin` with
+`PluginConfig::from_run_plugin`, which **re-resolves the location** — so the file that has since
+come back is the one the reload loads.
+
+Verified end to end: a layout naming a `file:` plugin that is not there leaves a pane showing
+`ERROR IN PLUGIN`; copying a real `.wasm` to that path and running `start-or-reload-plugin` brings
+that same pane up running the plugin, at the pane's own size, with no second pane made.
+
+**A reload still needs a client attached** — `reload_plugin_with_id` bails with "No connected
+clients" — and that is untouched here, because it is not about failed panes: a reload of a perfectly
+healthy plugin bails in the same place. It is why this loop does not work on a detached session.
 
 ### `dump-screen` works on plugin panes
 
