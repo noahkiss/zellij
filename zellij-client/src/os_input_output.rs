@@ -26,6 +26,10 @@ use zellij_utils::{
 };
 
 const SIGWINCH_CB_THROTTLE_DURATION: time::Duration = time::Duration::from_millis(50);
+/// How long a CLI client retries connecting to a session's socket before giving up on it. Distinct
+/// from `SERVER_APPEARANCE_TIMEOUT` in `src/session_commands.rs`, which is `session up`'s own wait
+/// for a server it just asked to spawn.
+const CONNECT_TO_SERVER_TIMEOUT: time::Duration = time::Duration::from_secs(5);
 
 pub(crate) const ENABLE_MOUSE_SUPPORT: &str =
     "\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1003h\u{1b}[?1015h\u{1b}[?1006h";
@@ -136,7 +140,11 @@ pub trait ClientOsApi: Send + Sync + std::fmt::Debug {
         resize_receiver: Option<std::sync::mpsc::Receiver<()>>,
     );
     /// Establish a connection with the server socket.
-    fn connect_to_server(&self, path: &Path);
+    ///
+    /// Retries for a bounded time, because the socket may not exist yet if the caller just asked
+    /// the server to spawn (see `spawn_server`). `Err` means the deadline passed without a
+    /// connection — the session's server is not there, or is not answering.
+    fn connect_to_server(&self, path: &Path) -> Result<(), String>;
     fn spawn_server(&self, socket_path: &Path, debug: bool) -> Result<(), std::io::Error> {
         crate::spawn_server(socket_path, debug)
     }
@@ -281,22 +289,36 @@ impl ClientOsApi for ClientOsInputOutput {
             }
         }
     }
-    fn connect_to_server(&self, path: &Path) {
-        let socket;
-        loop {
+    fn connect_to_server(&self, path: &Path) -> Result<(), String> {
+        // Bounded, unlike the poll `session up` runs while a server it just spawned is still
+        // binding its socket (`wait_for_server` in `src/session_commands.rs`) — that one waits up
+        // to 10s and backs off, and hands off to this only once the server is expected to already
+        // be listening. This loop is the CLI-client connect path: a session that answers to no
+        // server at all (crashed, never started, socket left behind) used to retry every 50ms
+        // forever, so every verb against a down session hung instead of failing.
+        let deadline = time::Instant::now() + CONNECT_TO_SERVER_TIMEOUT;
+        let socket = loop {
             match zellij_utils::consts::ipc_connect(path) {
-                Ok(sock) => {
-                    socket = sock;
-                    break;
-                },
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(sock) => break sock,
+                Err(e) => {
+                    if time::Instant::now() >= deadline {
+                        let session_name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown");
+                        return Err(format!(
+                            "session '{}' is not running (or its server is unreachable): {}",
+                            session_name, e
+                        ));
+                    }
+                    thread::sleep(time::Duration::from_millis(50));
                 },
             }
-        }
+        };
         let (sender, receiver) = setup_ipc(socket, path);
         *self.send_instructions_to_server.lock().unwrap() = Some(sender);
         *self.receive_instructions_from_server.lock().unwrap() = Some(receiver);
+        Ok(())
     }
     fn load_palette(&self) -> Palette {
         // this was removed because termbg doesn't release stdin in certain scenarios (we know of

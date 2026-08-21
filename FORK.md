@@ -4622,6 +4622,29 @@ certificate" line, so the reader is told they have the wrong certificate rather 
 version of this that sent a real machine off to Xcode over a certificate that was never going to
 work.
 
+### `connect_to_server` gives up on a session that answers to no server
+
+The CLI client's socket connect retried every 50ms forever. That is the right answer while a
+server it just asked to spawn is still binding its socket, and the wrong one for a session that
+answers to no server at all — a crashed process, a socket file left behind, a name that was never
+going to come up. Every verb against that session hung instead of failing: `action`, `subscribe`,
+`attach`, all of them, because they all go through the same trait method.
+
+`connect_to_server` now gives up after five seconds and returns `Err("session '<name>' is not
+running (or its server is unreachable): <io error>")`, naming the session from the socket path's
+own file name. Each of the CLI entry points reports that message on stderr and exits non-zero —
+`start_cli_client` returns `1` (a server that failed to answer is the narrower failure class, not a
+miss), `ask` and `wait_on_renders` fold it into the `Result` they already return, and
+`start_subscribe_client` prints and calls `process::exit(1)` like its neighbouring failures do. The
+web client's per-connection `spawn_session_if_needed` logs the error instead of propagating it —
+`send_to_server` already tolerates an unconnected client by dropping the message and warning, so a
+failed connect there costs one browser tab its session rather than the process.
+
+This is a different timeout from `SERVER_APPEARANCE_TIMEOUT` in `src/session_commands.rs`: that one
+is `session up`'s own wait for a server it just spawned, backs off up to 1.5s over ten seconds, and
+is unrelated to this path — a slow `launchd` start (15-20s, measured) never reaches
+`connect_to_server` until `wait_for_server` has already decided the server is up.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
