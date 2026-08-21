@@ -210,18 +210,23 @@ under a home directory or a per-session temporary directory.
 A **fully detached** session — one no client has ever attached to — behaves differently, and this is
 where automated tests usually go wrong:
 
-- **Geometry is real, but sized for nobody.** The layout pass does run. `pane_x`, `pane_y`,
+- **Geometry is real, but sized for the terminal that is not there.** The layout pass does run, for
+  the session's own tabs and for every tab a command makes afterwards. `pane_x`, `pane_y`,
   `pane_rows`, `pane_columns` and the stack fields are self-consistent, and tiled panes do not
-  overlap. They are computed against a default 50×50 viewport instead of a real terminal, so the
-  numbers are right relative to each other and wrong relative to the screen a client will bring.
-  Verified on 0.45.0-nkmk.6: two tiled panes at `x=0` and `x=25`, 25 columns each, in a 48-row
-  viewport; a stacked pair carried `stack_id=0` with `index_in_stack` 0 and 1.
+  overlap. The viewport is the session's own size: a **50×50 default** for a session started
+  detached, or **the size of the last client to leave** for one that has been attached to. So the
+  numbers are right relative to each other, and right relative to the screen a client will bring
+  only if that client brings the same terminal back. Verified on 0.45.0-nkmk.6: two tiled panes at
+  `x=0` and `x=25`, 25 columns each, in a 48-row viewport; a stacked pair carried `stack_id=0` with
+  `index_in_stack` 0 and 1.
 - **A stack has no anchor.** `new-pane --stacked` has no focused pane to stack under, so it needs an
   explicit target: `ZELLIJ_PANE_ID=<id> zellij -s <name> action new-pane --stacked
   --near-current-pane`. Without one it fails loudly with a non-zero exit.
 - **A focus-dependent verb refuses; it does not guess.** With no client attached there is no focused
-  tab or pane, so `move-tab` without `--tab-id`, `focus-next-pane` and `new-tab` each print what is
-  missing, exit 2, and change nothing. Pass an explicit target, or attach first.
+  tab or pane, so `move-tab` without `--tab-id`, `focus-next-pane` and a bare `go-to-tab-name` each
+  print what is missing, exit 2, and change nothing. Pass an explicit target, or attach first.
+  **Creating is not focus-dependent**: `new-tab`, `new-tab --layout`, `new-pane --new-tab` and
+  `go-to-tab-name --create` all work here and make a real tab.
 
 `dump-screen` reads fresh content, but it is a focus-dependent verb too: pass `--pane-id` and it
 returns the grid for a pane in a non-focused tab of a detached session, because the grid is

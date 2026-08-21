@@ -704,30 +704,59 @@ text. The `quit_and_resurrect_session` and `resize_terminal_window` e2e snapshot
 need it too, since they cross a real frame render, but this box has no `musl-gcc` to build the e2e
 binary that would prove it — confirm and refresh them in CI before relying on that pair.
 
-### Making a tab needs somebody attached
+### Making a tab does not need somebody attached
 
 ```
 $ zellij -s build-box action new-tab --name logs
-Creating a tab needs a client attached to this session, and nothing is attached: the tab would be
-built empty and thrown away by the next client to attach. Run this from inside the session, or
-`zellij attach` first.
-$ echo $?
-2
+tab_id: 1
+pane_id: terminal_1
+handle: chief-thrush
 ```
 
-A tab is built by applying a layout, and applying one needs a client to size it against. On a
-session nobody is attached to, the whole tab-creating family — `new-tab`, `new-tab --layout`,
-`new-pane --new-tab`, `go-to-tab-name --create` — used to make an **empty** tab, report a
-`pane_id:` for a pane that never existed, and have the tab thrown away by the next client to
-attach. A script got a success and an id, and nothing was there.
+A tab is built by applying a layout, and a layout needs a size to be laid out in. On a session
+nobody is attached to there was no size at all, so the whole tab-creating family — `new-tab`,
+`new-tab --layout`, `new-pane --new-tab`, `go-to-tab-name --create` — made an **empty** tab,
+reported a `pane_id:` for a pane that never existed, and had the tab thrown away by the next client
+to attach. A script got a success and an id, and nothing was there. For two releases they refused
+instead, honestly, with exit 2.
 
-They now refuse, with exit 2 and that sentence, and create nothing. This is a refusal rather than a
-fix: a detached session applying its own layouts is the real answer and is a separate piece of
-work. Until then the honest report is worth more than a pane id that names nothing.
+**The size was the whole of it.** Applying a layout never needed a client: the layout applier reads
+the tab's own viewport, and the client id it is handed picks which pane ends up focused and nothing
+else. What it needed was a number, and the only numbers the session had were in `client_sizes`,
+which is keyed by client — so the last client to detach took the session's only size with it,
+every tab built afterwards came out 0×0, and a 0×0 tab holds no panes.
 
-The session's own startup is untouched — it builds its tabs before any client attaches, and that
-path is exactly what tells the two cases apart: a command has a caller waiting for an answer, and
-startup has none.
+So the session keeps a size of its own. It starts as the size the session was started with — a
+detached start passes a static 50×50 — and thereafter tracks the last real client, so a detached
+session lays out against the terminal it last had rather than against nothing. A tab made this way
+holds its panes, survives an attach, and is resized to the terminal that turns up:
+
+```
+$ zellij -s build-box action new-tab --layout two.kdl --name split   # nothing attached
+$ zellij -s build-box action list-panes
+4  4  split  terminal_4  artistic-skylark  ...  0   0  40  80
+4  4  split  terminal_5  relaxed-bobcat    ...  80  0  40  80
+```
+
+Tabs that already exist were never affected and still are not: a tab keeps its size when the last
+client leaves, because the resize pass has no client to resize it for and does nothing.
+
+**`go-to-tab-name` is the one place the two halves part company.** Making the tab no longer needs a
+client; moving the focus still does, and a detached session has no focused tab to move. So
+`--create` is answered — it makes the tab, or reports the id of the one already there — and the
+vacuous focus move is passed over. A bare `go-to-tab-name`, which is *only* a focus move, has
+nothing left to do and says so with exit 2. `--no-focus` is the probe form and answers with the
+tab's id either way.
+
+```
+$ zellij -s build-box action go-to-tab-name logs
+`go-to-tab-name` has no client to move: nothing is attached to this session.
+$ zellij -s build-box action go-to-tab-name --no-focus logs
+id: 1
+```
+
+The session's own startup is untouched: it built its tabs against that same session size before any
+client attached, and always did.
 
 ### Pane notes
 
@@ -1384,10 +1413,14 @@ asked for — `new-pane` in every placement, the in-place replacement, and a plu
 whose whole point is a pane means no pane, which is a miss rather than a silent success. Successful
 creations are untouched and still print the id and the handle.
 
-This is not a fix for one tab. An unsized tab is how it shows up — a tab no client has ever attached
-to has no size to place a pane in, and `break-pane` makes one on a detached session — but a
+This is not a fix for one tab. An unsized tab is how it showed up — a tab no client had ever
+attached to had no size to place a pane in, and `break-pane` makes one on a detached session — but a
 targetless `new-pane` on such a session ghosted the same way, and so did `new-pane --plugin`. Any
 future route that declines a pane is reported honestly without knowing about this.
+
+The unsized tab itself is gone — [a detached session sizes its own
+tabs](#making-a-tab-does-not-need-somebody-attached) — so that door no longer produces a miss. The
+guard is what makes the next one safe, and it stays.
 
 The exit is **2**: the session changed nothing the caller can address, so it sits in the same
 bucket as every other miss (see [the CLI output convention](#the-cli-output-convention)). The stderr sentence says
