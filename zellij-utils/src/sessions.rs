@@ -874,6 +874,77 @@ pub struct SessionListEntry {
     pub tab_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_count: Option<usize>,
+    /// The executable the session's server is actually running, read out of the OS by pid.
+    ///
+    /// Absent for a dead session, which has no server, and for a live one whose pid the platform
+    /// will not answer about or which has two servers for its name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_exe: Option<String>,
+    /// The build identity of that executable, hex: the Mach-O `LC_UUID` on macOS, the GNU build-id
+    /// on Linux. **This, and not the path, is what says which BUILD a session is on** - a pinned
+    /// copy and the binary it was copied from are two files holding one program, and they agree
+    /// here and nowhere else. Absent when the toolchain stamped none, or the file could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_build_id: Option<String>,
+    /// Whether that build is the one running this command: `same`, `different`, or `unknown`.
+    ///
+    /// `unknown` is a real answer and not a failure - see `compare_builds`, which reports it rather
+    /// than guess, because a wrong "different" sends someone to restart a session that was fine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_build: Option<String>,
+    /// The file the server started from is no longer at its path: an upgrade wrote over it in
+    /// place. Only Linux can say so, and only then is the field there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_exe_replaced: Option<bool>,
+}
+
+/// What `ls --json` reports about the binary behind one live session.
+///
+/// **Nothing here crosses a contract.** The answer is read from the OS by pid, on the side that
+/// runs `ls`, exactly as the stale-build warning already does - no `SessionInfo` field, no
+/// protobuf tag, no client/server message. FORK.md declined putting a version on the plugin API
+/// for a warning, and this stays inside that decision by never asking the session anything.
+///
+/// **There is no version string, deliberately.** A version would have to come from running the
+/// binary, and `ls` is a listing: spawning every server's executable to ask it its version turns a
+/// read of the socket directory into an execution of whatever those paths point at, and it hangs
+/// as long as one of them is on a mount that has gone away. The build id is both cheaper - a few
+/// kilobytes off the front of the file, never the 40 MB - and a better answer to the question that
+/// is actually being asked, because two builds of one version have different build ids and one
+/// version string could not tell them apart.
+fn server_identity_fields(name: &str, is_dead: bool) -> ServerIdentityFields {
+    if is_dead {
+        return ServerIdentityFields::default();
+    }
+    let Some(theirs) = crate::session_lifecycle::server_executable(name) else {
+        return ServerIdentityFields::default();
+    };
+    let ours = crate::session_lifecycle::own_executable();
+    ServerIdentityFields {
+        server_exe: Some(theirs.path.display().to_string()),
+        server_build_id: theirs.build_id.as_ref().map(|id| {
+            id.iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<String>()
+        }),
+        server_build: Some(
+            match crate::session_lifecycle::compare_builds(ours.as_ref(), Some(&theirs)) {
+                crate::session_lifecycle::BuildMatch::Same => "same",
+                crate::session_lifecycle::BuildMatch::Different => "different",
+                crate::session_lifecycle::BuildMatch::Unknown => "unknown",
+            }
+            .to_owned(),
+        ),
+        server_exe_replaced: theirs.replaced.then_some(true),
+    }
+}
+
+#[derive(Default)]
+struct ServerIdentityFields {
+    server_exe: Option<String>,
+    server_build_id: Option<String>,
+    server_build: Option<String>,
+    server_exe_replaced: Option<bool>,
 }
 
 /// Build the `ls --json` listing from the session names and the metadata each live session wrote.
@@ -897,6 +968,7 @@ pub fn session_list_entries(
         .into_iter()
         .map(|(name, timestamp, is_dead)| {
             let info = live_session_states.get(&name);
+            let server = server_identity_fields(&name, is_dead);
             SessionListEntry {
                 created_seconds_ago: timestamp.as_secs(),
                 is_current: name == current_session,
@@ -906,6 +978,10 @@ pub fn session_list_entries(
                 web_clients_allowed: info.map(|i| i.web_clients_allowed),
                 tab_count: info.map(|i| i.tabs.len()),
                 pane_count: info.map(|i| i.panes.panes.values().map(|p| p.len()).sum()),
+                server_exe: server.server_exe,
+                server_build_id: server.server_build_id,
+                server_build: server.server_build,
+                server_exe_replaced: server.server_exe_replaced,
                 name,
             }
         })
@@ -1536,9 +1612,76 @@ mod tests {
         assert!(!entries[0].is_current);
         assert_eq!(entries[0].connected_clients, None);
         assert_eq!(entries[0].tab_count, None);
-        // the absent fields are absent from the JSON too, not null
+        // a dead session has no server, so it is never asked about one - and the server fields go
+        // the way of the metadata fields: absent from the JSON rather than null
+        assert_eq!(entries[0].server_exe, None);
+        assert_eq!(entries[0].server_build, None);
         let rendered = serde_json::to_string(&entries[0]).expect("TEST");
         assert!(!rendered.contains("connected_clients"), "{}", rendered);
+        assert!(!rendered.contains("server_"), "{}", rendered);
+    }
+
+    /// A live session nothing is actually serving - which is every session in these tests, and any
+    /// session on a platform that will not answer about a pid. The fields are omitted rather than
+    /// filled with a guess, so a consumer that sees `server_exe` can trust it.
+    #[test]
+    fn a_session_whose_server_cannot_be_identified_carries_no_server_fields() {
+        let mut states = BTreeMap::new();
+        states.insert("unserved".to_string(), live(1, 1, 1));
+        let entries = session_list_entries(
+            vec![("unserved".to_string(), Duration::from_secs(10), false)],
+            "",
+            &states,
+            false,
+        );
+        assert_eq!(entries[0].server_exe, None);
+        assert_eq!(entries[0].server_build_id, None);
+        assert_eq!(entries[0].server_build, None);
+        assert_eq!(entries[0].server_exe_replaced, None);
+        // the metadata fields are still there, so this is the server lookup coming back empty and
+        // not the whole entry being empty
+        assert_eq!(entries[0].connected_clients, Some(1));
+        let rendered = serde_json::to_string(&entries[0]).expect("TEST");
+        assert!(!rendered.contains("server_"), "{}", rendered);
+    }
+
+    /// The three verdicts are the strings a consumer matches on, and `unknown` is one of them - it
+    /// is what `compare_builds` reports rather than guess, so it must not read as a missing field.
+    #[test]
+    fn the_server_build_verdict_serializes_as_a_word() {
+        let entry = SessionListEntry {
+            name: "s".to_owned(),
+            created_seconds_ago: 1,
+            is_current: false,
+            is_dead: false,
+            connected_clients: None,
+            web_client_count: None,
+            web_clients_allowed: None,
+            tab_count: None,
+            pane_count: None,
+            server_exe: Some("/opt/zellij/bin/zellij".to_owned()),
+            server_build_id: Some("aabbcc".to_owned()),
+            server_build: Some("unknown".to_owned()),
+            server_exe_replaced: None,
+        };
+        let rendered = serde_json::to_string(&entry).expect("TEST");
+        assert!(
+            rendered.contains(r#""server_exe":"/opt/zellij/bin/zellij""#),
+            "{}",
+            rendered
+        );
+        assert!(
+            rendered.contains(r#""server_build_id":"aabbcc""#),
+            "{}",
+            rendered
+        );
+        assert!(
+            rendered.contains(r#""server_build":"unknown""#),
+            "{}",
+            rendered
+        );
+        // not replaced means the field is not there at all, rather than `false`
+        assert!(!rendered.contains("server_exe_replaced"), "{}", rendered);
     }
 
     #[test]

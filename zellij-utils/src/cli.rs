@@ -3060,6 +3060,32 @@ fn named(has_target: bool, focused: bool) -> Named {
     }
 }
 
+/// The pane a confirming verb was aimed at, when it names one.
+///
+/// The prompt is put by the client and a pane's existence is known only to the server, so
+/// `close-pane --pane-id terminal_99` on a TTY asked "close it?" and reported the miss afterwards -
+/// the question put first and answered last. This is what lets the caller resolve the target
+/// against the session BEFORE it prompts, so a target nothing answers to is a miss rather than a
+/// question about a pane that is not there.
+///
+/// `close-tab` is not here. Its `--tab-id` is a stable id rather than a name to look up, and the
+/// verbs that resolve one do it against a `list-tabs` answer - a different query from this one, for
+/// no change in what the prompt is about. `--focused` is not here either: it names no pane, and the
+/// session that holds the focus is the only thing that could resolve it.
+pub fn pane_target_to_confirm(action: &CliAction) -> Option<&str> {
+    match action {
+        CliAction::ClosePane {
+            pane_id: Some(pane_id),
+            ..
+        }
+        | CliAction::Clear {
+            pane_id: Some(pane_id),
+            ..
+        } => Some(pane_id),
+        _ => None,
+    }
+}
+
 /// Whether `switch-session --pane-id` was handed a target only the other session could resolve.
 ///
 /// A handle or a uuid names a pane against one session's live panes, and the only registry this
@@ -3656,6 +3682,33 @@ mod tests {
             },
             other => panic!("expected a refusal, got {:?}", other),
         }
+    }
+
+    /// Every confirming verb that names a pane hands one back, so the caller can ask the session
+    /// about it before it asks the user about it. An id form is included on purpose: it needs no
+    /// lookup to be understood, which is not the same as a pane answering to it.
+    #[test]
+    fn a_confirming_verb_gives_up_the_pane_it_would_ask_about() {
+        let target = |args: &[&str]| pane_target_to_confirm(&parse_action(args)).map(str::to_owned);
+        for named in ["terminal_99", "7", "sunny-otter"] {
+            assert_eq!(
+                target(&["close-pane", "--pane-id", named]).as_deref(),
+                Some(named)
+            );
+            assert_eq!(
+                target(&["clear", "--pane-id", named]).as_deref(),
+                Some(named)
+            );
+        }
+        // nothing to look up: `--focused` names no pane, `close-tab` names no pane at all, and a
+        // verb that does not confirm never reaches this
+        assert_eq!(target(&["close-pane", "--focused"]), None);
+        assert_eq!(target(&["clear", "--focused"]), None);
+        assert_eq!(target(&["close-tab", "--tab-id", "2"]), None);
+        assert_eq!(
+            target(&["rename-pane", "x", "--pane-id", "terminal_1"]),
+            None
+        );
     }
 
     #[test]

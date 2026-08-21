@@ -878,7 +878,25 @@ pub fn sign_pin(
         return SigningRun { findings };
     }
 
-    let identities = find_identities(commander);
+    // A keychain that did not answer is not a keychain with nothing in it. Stop here rather than
+    // fall down the ladder to the rung that mints: minting is the one step that cannot be taken
+    // back, and taking it because the question went unanswered is how a machine with a real Apple
+    // certificate ends up signed by ours.
+    let identities = match find_identities(commander) {
+        Ok(identities) => identities,
+        Err(reason) => {
+            findings.push(
+                Finding::needs_you(
+                    "signing",
+                    "the keychain could not be asked which certificates it holds",
+                )
+                .note(reason)
+                .note("this is not the same as holding none, so nothing was minted or signed")
+                .note("unlock the login keychain and run `zellij session doctor --fix` again"),
+            );
+            return SigningRun { findings };
+        },
+    };
     let mut ladder = rung_ladder(&identities);
 
     // Said before anything else this function decides, and said whether or not the run goes on to
@@ -937,7 +955,10 @@ pub fn sign_pin(
             Ok(minted) => {
                 findings.extend(minted);
                 findings.extend(back_up_identity(context));
-                ladder = rung_ladder(&find_identities(commander));
+                // The mint has already happened, so a keychain that stops answering now leaves
+                // an empty ladder and the Xcode steps below - a `Needs you` a person reads,
+                // which is the right place for a machine whose keychain went away mid-run.
+                ladder = rung_ladder(&find_identities(commander).unwrap_or_default());
             },
             Err(failure) => {
                 // What it managed before it failed, first: a mint that happened is a file that
@@ -983,8 +1004,15 @@ pub fn sign_pin(
         return SigningRun { findings };
     }
 
+    // `Changed`, not `AlreadyCorrect`. This branch is only reached because the pin's signature is
+    // wrong - unsigned, ad-hoc, or naming a code hash - so "would sign it with an Apple
+    // Development certificate" is a repair the run is withholding, not a state that is fine.
+    // Filed under `Already correct` it read as reassurance about the very thing that was broken
+    // (rc.2 Mac proof). This is what `Status::Changed` is for, and it is what the sibling branch
+    // above already does for the certificate it would mint - so a dry run still exits zero,
+    // because nothing here is waiting on a person.
     if !mode.fix {
-        findings.push(Finding::ok(
+        findings.push(Finding::changed(
             "signing",
             mode.describe(&format!(
                 "sign {} with {}",
@@ -1232,20 +1260,36 @@ pub struct SigningContext {
 /// The untrusted listing is filtered to OUR certificate by name. An Apple certificate that the
 /// keychain calls invalid is invalid for a reason - expired, revoked, no key - and taking it off
 /// this list would put the ladder on a rung that cannot sign.
-fn find_identities(commander: &dyn Commander) -> Vec<Identity> {
-    let mut identities = match commander.run(
-        "security",
-        &["find-identity", "-v", "-p", "codesigning"],
-        None,
-    ) {
-        Ok(output) => parse_identities(&output.stdout),
-        Err(_) => Vec::new(),
-    };
+///
+/// **`Err` is "the keychain did not answer", and it is not the same as an empty list.** A keychain
+/// that is locked, wedged, or held by another process makes `security` exit non-zero having written
+/// nothing to stdout - which parses to exactly the empty list a machine with no certificates at all
+/// produces. Folded together, doctor read a wedged query as "no Apple certificate", took the
+/// self-signed rung, and would mint a certificate on a machine that had a real identity the whole
+/// time (found on the 0.45.0-nkmk.13 rc.1 Mac proof). Only the first listing decides this: the
+/// second is already best-effort and exists solely to find our own certificate.
+fn find_identities(commander: &dyn Commander) -> Result<Vec<Identity>, String> {
+    let listed = commander
+        .run(
+            "security",
+            &["find-identity", "-v", "-p", "codesigning"],
+            None,
+        )
+        .map_err(|reason| format!("`security find-identity` could not be run: {}", reason))?;
+    if !listed.success {
+        let reason = listed.stderr.trim();
+        return Err(if reason.is_empty() {
+            String::from("`security find-identity` failed without saying why")
+        } else {
+            format!("`security find-identity` failed: {}", reason)
+        });
+    }
+    let mut identities = parse_identities(&listed.stdout);
     if identities
         .iter()
         .any(|identity| identity.name.contains(SELF_SIGNED_COMMON_NAME))
     {
-        return identities;
+        return Ok(identities);
     }
     if let Ok(output) = commander.run("security", &["find-identity", "-p", "codesigning"], None) {
         identities.extend(
@@ -1254,7 +1298,7 @@ fn find_identities(commander: &dyn Commander) -> Vec<Identity> {
                 .find(|identity| identity.name.contains(SELF_SIGNED_COMMON_NAME)),
         );
     }
-    identities
+    Ok(identities)
 }
 
 /// Keep a second copy of the minted identity where the user's other zellij files are.
@@ -1336,6 +1380,29 @@ struct SignAttempt {
 /// It reports rather than decides: a refusal comes back as a `refusal` for the caller to weigh
 /// against the rungs below, because whether a refusal is the end of the run depends on what else
 /// the keychain holds - which is [`sign_down_the_ladder`]'s question, not this one's.
+/// Enough of a file to notice it being replaced: its length and when it was last written.
+///
+/// `None` for a pin that is not there, which is a real state - the first signing on a machine
+/// signs a copy of a build that has no pin yet.
+fn pin_identity(pin: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(pin).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+/// Whether the pin is still the file this signing run decided about.
+///
+/// Deliberately a comparison and not a lock. Two renames into the same directory cannot be ordered
+/// from here without a lock both `session up` and doctor would have to take, and the failure this
+/// guards is rare enough (the two commands typed seconds apart) that a lock on the pin path would
+/// be new machinery carrying new ways to wedge. Comparing is enough to stop the silent half of the
+/// fault: a run that would clobber a newer pin stops and says so instead.
+///
+/// A pin that cannot be `stat`ed now, having been readable before, counts as changed. So does one
+/// that appeared where there was none.
+fn pin_unchanged_since(pin: &Path, before: &Option<(u64, std::time::SystemTime)>) -> bool {
+    pin_identity(pin) == *before
+}
+
 fn perform_signing(
     commander: &dyn Commander,
     pin: &Path,
@@ -1362,6 +1429,10 @@ fn perform_signing(
             ),
         ));
     }
+
+    // What the pin looked like before the copy, so the rename at the end of this function can
+    // check that it is still the file this run decided about. See `pin_unchanged_since`.
+    let pin_before = pin_identity(pin);
 
     let temporary = directory.join(format!("{}{}.tmp", sign_temp_prefix(), std::process::id()));
     let temporary_display = temporary.display().to_string();
@@ -1440,6 +1511,23 @@ fn perform_signing(
         return SignAttempt {
             findings,
             refusal: Some(reason),
+            fatal: true,
+        };
+    }
+    // The last thing before the only irreversible step. `install_pinned_exe` writes the pin by
+    // its own copy-then-rename, so a `session up` landing a newer build while this run was signing
+    // would be undone here - the signed copy of the OLDER build renamed over it, silently. Nothing
+    // coordinates the two renames, and this does not pretend to: it declines to be the one that
+    // wins by accident, and names the command that puts it right.
+    if !pin_unchanged_since(pin, &pin_before) {
+        let _ = std::fs::remove_file(&temporary);
+        return SignAttempt {
+            findings,
+            refusal: Some(format!(
+                "{} was replaced while it was being signed, so the signed copy was discarded \
+                 rather than written over the newer one - run `zellij session doctor --fix` again",
+                pin_display
+            )),
             fatal: true,
         };
     }
@@ -1850,9 +1938,14 @@ fn ensure_self_signed_steps(
             // for as long as the file is there. Asking the keychain again is the only way to tell
             // the two apart, because the import itself cannot.
             Ok(()) => {
-                if let ReimportVerdict::NotOurs { foreign } =
-                    judge_reimport(&find_identities(commander))
-                {
+                // A keychain that does not answer must not decide this. The verdict is read off a
+                // listing, and an unanswered listing is empty - which reads as `NotOurs` and would
+                // set aside the bundle that had just imported perfectly well. So a failure to ask
+                // is a refusal to judge: leave the bundle where it is and say so.
+                let listed = find_identities(commander).map_err(|reason| {
+                    format!("{}, so the imported bundle was left where it is", reason)
+                })?;
+                if let ReimportVerdict::NotOurs { foreign } = judge_reimport(&listed) {
                     let aside = set_aside(&bundle, ASIDE_FOREIGN)?;
                     let mut finding = Finding::changed(
                         "signing",
@@ -3542,7 +3635,7 @@ Signature=adhoc
                 ),
             ),
         ]);
-        let identities = find_identities(&commander);
+        let identities = find_identities(&commander).unwrap();
         assert_eq!(identities.len(), 1, "{:?}", identities);
         assert_eq!(identities[0].name, SELF_SIGNED_COMMON_NAME);
         assert_eq!(identities[0].hash, "BBBB");
@@ -3572,7 +3665,57 @@ Signature=adhoc
                 ),
             ),
         ]);
-        assert!(find_identities(&commander).is_empty());
+        assert!(find_identities(&commander).unwrap().is_empty());
+    }
+
+    /// A keychain that cannot answer is not a keychain with nothing in it. `security` exits
+    /// non-zero having written nothing to stdout when the login keychain is locked or wedged, and
+    /// that parses to the same empty list a machine with no certificates produces. Doctor used to
+    /// read it as "no Apple certificate" and mint one.
+    #[test]
+    fn a_keychain_that_will_not_answer_is_not_a_keychain_with_no_certificates() {
+        let commander = RecordedCommander::new(&[(
+            FIND_IDENTITY,
+            recorded_failure(
+                "security: SecKeychainCopySearchList: User interaction is not allowed.",
+            ),
+        )]);
+        let listing = find_identities(&commander);
+        let reason = listing.expect_err("a failed query must not read as an empty keychain");
+        assert!(
+            reason.contains("User interaction is not allowed"),
+            "{}",
+            reason
+        );
+    }
+
+    /// The whole point of telling the two apart: the run stops instead of minting, says a person
+    /// has to unlock the keychain, and touches neither `openssl` nor `codesign -s`.
+    #[test]
+    fn a_wedged_keychain_stops_the_run_instead_of_minting() {
+        let commander = RecordedCommander::new(&[
+            ("codesign -d --verbose=2 -r- /tmp/pin", recorded(AD_HOC)),
+            (
+                FIND_IDENTITY,
+                recorded_failure("security: User interaction is not allowed."),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            Path::new("/tmp/pin"),
+            DoctorMode::default(),
+            &context(scratch.path()),
+        );
+        let last = run.findings.last().unwrap();
+        assert_eq!(last.status, Status::NeedsYou);
+        assert!(last.message.contains("could not be asked"), "{:?}", last);
+        assert!(!commander.called_with("openssl"), "{:?}", commander.calls());
+        assert!(
+            !commander.called_with("codesign -s "),
+            "{:?}",
+            commander.calls()
+        );
     }
 
     /// `-legacy` is what lets OpenSSL 3 write those algorithms and it is what LibreSSL refuses to
@@ -3852,11 +3995,57 @@ Signature=adhoc
             "{:?}",
             run.findings[0]
         );
+        // A repair the run is withholding, not a state that is fine. The pin reaching this branch
+        // is ad-hoc; filing it under `Already correct` reassured a reader about the one thing that
+        // was broken.
+        assert_eq!(run.findings[0].status, Status::Changed);
         assert!(
             !commander.called_with("codesign -s "),
             "{:?}",
             commander.calls()
         );
+    }
+
+    #[test]
+    /// The check that keeps a signing run from being the one that wins by accident. `session up`
+    /// writes the pin by its own copy-then-rename, so a newer build landing while doctor was
+    /// signing would be undone by doctor's rename of the older one - silently, because a rename
+    /// over a file reports nothing about what was there.
+    #[test]
+    fn a_pin_replaced_while_it_was_being_signed_is_noticed() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the build doctor decided about").unwrap();
+
+        let before = pin_identity(&pin);
+        assert!(before.is_some(), "the pin is there to begin with");
+        assert!(
+            pin_unchanged_since(&pin, &before),
+            "an untouched pin is unchanged"
+        );
+
+        // `session up` lands a newer build over it
+        std::fs::write(&pin, b"a newer build, landed by session up").unwrap();
+        assert!(!pin_unchanged_since(&pin, &before));
+
+        // and a pin that has gone counts as changed rather than as "nothing to compare"
+        std::fs::remove_file(&pin).unwrap();
+        assert!(!pin_unchanged_since(&pin, &before));
+    }
+
+    /// The other direction, which is the ordinary first signing on a machine: there was no pin, so
+    /// there is nothing to be replaced, and one appearing underneath is still a change.
+    #[test]
+    fn a_pin_that_appears_under_a_signing_run_is_a_change_too() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+
+        let before = pin_identity(&pin);
+        assert_eq!(before, None, "there is no pin yet");
+        assert!(pin_unchanged_since(&pin, &before));
+
+        std::fs::write(&pin, b"somebody else got there first").unwrap();
+        assert!(!pin_unchanged_since(&pin, &before));
     }
 
     #[test]

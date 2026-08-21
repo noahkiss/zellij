@@ -1006,6 +1006,23 @@ fn attach_with_cli_client(
     // what cannot be undone is confirmed last of the guards and before anything is sent: a call
     // that was never going to reach a pane should not ask about closing one
     if let Some((verb, what, yes)) = zellij_utils::cli::confirmation_needed(&cli_action) {
+        // and the target is looked up FIRST, which is the whole of that sentence. The prompt is
+        // ours and the pane list is the server's, so without this `close-pane --pane-id
+        // terminal_99` asked whether to close a pane that does not exist and reported the miss
+        // after the answer. An id form is asked about like any other here - it needs no lookup to
+        // be UNDERSTOOD, which is a different question from whether a pane answers to it
+        if let Some(target) = zellij_utils::cli::pane_target_to_confirm(&cli_action) {
+            if let Err(message) = zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                target,
+            ) {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            }
+        }
         confirm_or_exit(verb, what, yes);
     }
     // `wait` never becomes an action the server runs. It is a question asked over and over, or a
