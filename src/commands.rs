@@ -25,7 +25,7 @@ use zellij_utils::consts::{CLIENT_SERVER_CONTRACT_VERSION, VERSION};
 use zellij_utils::session_snapshot::{
     archive_session_info, archive_session_info_folder, importable_folders, is_already_archived,
     legacy_session_info_dirs, list_snapshots, prune_all, remove_snapshot, resolve_snapshot,
-    unimported_legacy_layout_count, Snapshot, SnapshotReason, SnapshotSettings,
+    unimported_legacy_layout_count, ArchiveOutcome, Snapshot, SnapshotReason, SnapshotSettings,
 };
 
 #[cfg(feature = "web_server_capability")]
@@ -275,6 +275,16 @@ fn import_snapshots_command(
     dry_run: bool,
     prune_source: bool,
 ) {
+    // Refuse before the loop rather than per folder. With archiving off, every folder would be
+    // reported as already archived and --prune-source would then delete a source nothing kept.
+    if !settings.enabled() {
+        eprintln!(
+            "Archiving is off (`session_snapshot_limit 0`), so there is nowhere to import to.\n\
+             Set a non-zero `session_snapshot_limit` and run this again. Nothing was read, written\n\
+             or removed."
+        );
+        process::exit(2);
+    }
     let dirs = match from {
         Some(from) => vec![from],
         None => legacy_session_info_dirs(),
@@ -300,33 +310,43 @@ fn import_snapshots_command(
             }
             continue;
         }
-        match archive_session_info_folder(
+        let outcome = match archive_session_info_folder(
             &folder.path,
             &folder.session_name,
             SnapshotReason::Imported,
             settings,
             Some(folder.from.clone()),
         ) {
-            Ok(Some(snapshot)) => {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!("failed to import {}: {}", folder.path.display(), e);
+                continue;
+            },
+        };
+        match &outcome {
+            ArchiveOutcome::Archived(snapshot) => {
                 println!(
                     "imported {} ({}) as {}",
                     folder.session_name, folder.from, snapshot.id
                 );
                 imported += 1;
             },
-            Ok(None) => {
+            ArchiveOutcome::AlreadyArchived => {
                 println!(
                     "skipped  {} ({}) - already in the archive",
                     folder.session_name, folder.from
                 );
                 skipped += 1;
             },
-            Err(e) => {
-                eprintln!("failed to import {}: {}", folder.path.display(), e);
-                continue;
-            },
+            // Unreachable through this command - the disabled case exits above, and
+            // importable_folders only yields folders that hold a layout. Said honestly anyway,
+            // because the source is NOT in the archive here and must not be pruned.
+            ArchiveOutcome::Disabled | ArchiveOutcome::NothingToArchive => eprintln!(
+                "skipped  {} ({}) - nothing was archived",
+                folder.session_name, folder.from
+            ),
         }
-        if prune_source {
+        if prune_source && outcome.source_is_archived() {
             if let Err(e) = std::fs::remove_dir_all(&folder.path) {
                 eprintln!("failed to remove {}: {}", folder.path.display(), e);
             }
@@ -1165,8 +1185,20 @@ fn attach_with_cli_client(
             if should_archive {
                 match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)
                 {
-                    Ok(Some(snapshot)) => println!("Archived snapshot {}", snapshot.id),
-                    Ok(None) => println!("Nothing new to archive."),
+                    Ok(ArchiveOutcome::Archived(snapshot)) => {
+                        println!("Archived snapshot {}", snapshot.id)
+                    },
+                    Ok(ArchiveOutcome::AlreadyArchived) => println!("Nothing new to archive."),
+                    Ok(ArchiveOutcome::Disabled) => {
+                        eprintln!(
+                            "Archiving is off (`session_snapshot_limit 0`); nothing was archived."
+                        );
+                        std::process::exit(2);
+                    },
+                    Ok(ArchiveOutcome::NothingToArchive) => {
+                        eprintln!("There is no serialized layout for this session to archive.");
+                        std::process::exit(2);
+                    },
                     Err(e) => {
                         eprintln!("Failed to archive the session: {}", e);
                         std::process::exit(2);
@@ -1272,6 +1304,21 @@ fn attach_with_session_name(
     }
 }
 
+/// The session this invocation names, where it names one.
+///
+/// Two spellings, because `session up` uses the second: it clears `opts.session` and puts the name
+/// in the `Attach` command it hands to `start_client`. `None` is a session with no name yet, which
+/// has no launcher installed for it and so nothing to disagree with.
+fn session_name_in_opts(opts: &CliArgs) -> Option<String> {
+    if let Some(session) = opts.session.clone() {
+        return Some(session);
+    }
+    match &opts.command {
+        Some(Command::Sessions(Sessions::Attach { session_name, .. })) => session_name.clone(),
+        _ => None,
+    }
+}
+
 pub(crate) fn start_client(opts: CliArgs) {
     let (
         config,
@@ -1300,6 +1347,7 @@ pub(crate) fn start_client(opts: CliArgs) {
     zellij_client::record_pinned_server_exe(
         zellij_utils::session_service::server_exe_for_interactive_launch(
             config_options.session_service.as_ref(),
+            session_name_in_opts(&opts).as_deref(),
         ),
     );
 

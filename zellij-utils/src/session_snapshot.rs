@@ -221,6 +221,41 @@ impl SnapshotMeta {
     }
 }
 
+/// What an archiving attempt actually did.
+///
+/// The three no-snapshot cases are separate on purpose. A caller that deletes the source once it
+/// is safely archived - `snapshot import --prune-source` - must not act on `Disabled`, where
+/// nothing was read and nothing was written.
+#[derive(Debug, Clone)]
+pub enum ArchiveOutcome {
+    /// A new snapshot was written.
+    Archived(Snapshot),
+    /// The archive already holds this exact shape for this session name.
+    AlreadyArchived,
+    /// Archiving is off (`session_snapshot_limit 0`). The source was not even read.
+    Disabled,
+    /// The folder holds no layout, so there is nothing a restore could use.
+    NothingToArchive,
+}
+
+impl ArchiveOutcome {
+    /// The snapshot that was written, if one was.
+    pub fn into_snapshot(self) -> Option<Snapshot> {
+        match self {
+            ArchiveOutcome::Archived(snapshot) => Some(snapshot),
+            _ => None,
+        }
+    }
+    /// Whether the source folder is now safely in the archive - either because this call put it
+    /// there, or because an earlier one did. The only condition under which pruning it is safe.
+    pub fn source_is_archived(&self) -> bool {
+        matches!(
+            self,
+            ArchiveOutcome::Archived(_) | ArchiveOutcome::AlreadyArchived
+        )
+    }
+}
+
 /// One archived snapshot on disk.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -364,15 +399,14 @@ fn count_tabs_and_panes(session_info_folder: &Path, session_name: &str) -> (usiz
 
 /// Copy a session's live `session_info` folder into the archive.
 ///
-/// Returns `Ok(None)` when there was nothing to archive (no folder, no layout in it, archiving
-/// turned off) or when the newest snapshot for this session already holds the identical shape -
-/// shutdown and `delete-session` both fire on the same teardown, and one copy of that shape is
-/// enough.
+/// The [`ArchiveOutcome`] says which of the no-snapshot cases applied: archiving turned off, no
+/// layout to archive, or a newest snapshot that already holds the identical shape - shutdown and
+/// `delete-session` both fire on the same teardown, and one copy of that shape is enough.
 pub fn archive_session_info(
     session_name: &str,
     reason: SnapshotReason,
     settings: &SnapshotSettings,
-) -> Result<Option<Snapshot>, String> {
+) -> Result<ArchiveOutcome, String> {
     let source = session_info_folder_for_session(session_name);
     archive_session_info_folder(&source, session_name, reason, settings, None)
 }
@@ -385,12 +419,12 @@ pub fn archive_session_info_folder(
     reason: SnapshotReason,
     settings: &SnapshotSettings,
     imported_from: Option<String>,
-) -> Result<Option<Snapshot>, String> {
+) -> Result<ArchiveOutcome, String> {
     if !settings.enabled() {
-        return Ok(None);
+        return Ok(ArchiveOutcome::Disabled);
     }
     if !source.join(SNAPSHOT_LAYOUT_FILE_NAME).exists() {
-        return Ok(None);
+        return Ok(ArchiveOutcome::NothingToArchive);
     }
     let hash = hash_directory_contents(source)
         .map_err(|e| format!("failed to read {}: {}", source.display(), e))?;
@@ -405,7 +439,7 @@ pub fn archive_session_info_folder(
             .map_or(false, |newest| newest.id.ends_with(&hash))
     };
     if already_archived {
-        return Ok(None);
+        return Ok(ArchiveOutcome::AlreadyArchived);
     }
 
     let (tabs, panes) = count_tabs_and_panes(source, session_name);
@@ -431,7 +465,7 @@ pub fn archive_session_info_folder(
 
     prune_session(settings, session_name, settings.limit);
 
-    Ok(Some(Snapshot {
+    Ok(ArchiveOutcome::Archived(Snapshot {
         id,
         session_name: session_name.to_owned(),
         path: destination,
@@ -908,6 +942,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .into_snapshot()
         .expect("a snapshot should have been written");
 
         assert!(snapshot.path.join(SNAPSHOT_LAYOUT_FILE_NAME).exists());
@@ -925,7 +960,7 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join(SNAPSHOT_METADATA_FILE_NAME), "").unwrap();
 
-        let snapshot = archive_session_info_folder(
+        let outcome = archive_session_info_folder(
             &source,
             "a-session",
             SnapshotReason::Manual,
@@ -933,7 +968,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(snapshot.is_none());
+        assert!(matches!(outcome, ArchiveOutcome::NothingToArchive));
+        assert!(
+            !outcome.source_is_archived(),
+            "a folder that was not archived must never be pruned"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -944,7 +983,7 @@ mod tests {
         let source = root.join("session_info").join("a-session");
         write_session_info_folder(&source, "layout {\n    tab\n}\n");
 
-        let snapshot = archive_session_info_folder(
+        let outcome = archive_session_info_folder(
             &source,
             "a-session",
             SnapshotReason::Manual,
@@ -952,7 +991,46 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(snapshot.is_none());
+        // The distinction that keeps `snapshot import --prune-source` from deleting every source
+        // folder when archiving is off: this is NOT the "already in the archive" answer.
+        assert!(matches!(outcome, ArchiveOutcome::Disabled));
+        assert!(
+            !outcome.source_is_archived(),
+            "nothing was archived, so the source must not be pruned"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_an_archived_source_may_be_pruned() {
+        let (settings, root) = temp_settings("prunable");
+        let source = root.join("session_info").join("a-session");
+        write_session_info_folder(&source, "layout {\n    tab\n}\n");
+
+        let first = archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Imported,
+            &settings,
+            Some("session_info".to_owned()),
+        )
+        .unwrap();
+        assert!(matches!(first, ArchiveOutcome::Archived(_)));
+        assert!(first.source_is_archived());
+
+        let second = archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Imported,
+            &settings,
+            Some("session_info".to_owned()),
+        )
+        .unwrap();
+        assert!(matches!(second, ArchiveOutcome::AlreadyArchived));
+        assert!(
+            second.source_is_archived(),
+            "a re-import is the one no-snapshot case where pruning is safe"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -970,6 +1048,7 @@ mod tests {
             None
         )
         .unwrap()
+        .into_snapshot()
         .is_some());
         assert!(
             archive_session_info_folder(
@@ -980,6 +1059,7 @@ mod tests {
                 None
             )
             .unwrap()
+            .into_snapshot()
             .is_none(),
             "the teardown pair should leave one snapshot, not two"
         );
@@ -995,6 +1075,7 @@ mod tests {
                 None
             )
             .unwrap()
+            .into_snapshot()
             .is_some(),
             "a changed shape is a new snapshot"
         );
@@ -1017,6 +1098,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .into_snapshot()
             .unwrap();
             ids.push(snapshot.id);
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1068,6 +1150,7 @@ mod tests {
             Some(folder.from.clone())
         )
         .unwrap()
+        .into_snapshot()
         .is_some());
         assert!(is_already_archived(&settings, &folder));
         assert!(archive_session_info_folder(
@@ -1078,6 +1161,7 @@ mod tests {
             Some(folder.from.clone())
         )
         .unwrap()
+        .into_snapshot()
         .is_none());
         assert_eq!(snapshots_for_session(&settings, "a-session").len(), 1);
         let _ = std::fs::remove_dir_all(&root);
@@ -1099,6 +1183,7 @@ mod tests {
                     None,
                 )
                 .unwrap()
+                .into_snapshot()
                 .unwrap()
                 .id,
             );
@@ -1150,6 +1235,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .into_snapshot()
         .expect("a snapshot should have been written");
 
         let infos = snapshot_infos(&settings);
@@ -1199,6 +1285,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .into_snapshot()
         .unwrap();
 
         let infos = snapshot_infos(&settings);
@@ -1223,6 +1310,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .into_snapshot()
         .unwrap();
         // break the archived copy, leaving the sidecar intact
         std::fs::write(snapshot.layout_file(), "this is not a layout {{{").unwrap();
@@ -1253,6 +1341,7 @@ mod tests {
             None,
         )
         .unwrap()
+        .into_snapshot()
         .unwrap();
         std::fs::remove_file(snapshot.layout_file()).unwrap();
 
@@ -1277,6 +1366,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .into_snapshot()
             .unwrap();
             std::thread::sleep(std::time::Duration::from_millis(2));
         }

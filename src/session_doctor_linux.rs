@@ -79,7 +79,8 @@ fn check_last_start(report: &mut Report, service: &str) {
             "--user",
             "show",
             service,
-            "--property=Result,ExecMainStatus",
+            // LoadState, because systemd answers Result=success for a unit it has never heard of
+            "--property=Result,ExecMainStatus,LoadState",
         ],
         None,
     ) else {
@@ -89,6 +90,18 @@ fn check_last_start(report: &mut Report, service: &str) {
         ));
         return;
     };
+    // A systemctl that RAN and failed is `Ok` with an empty stdout, and an empty property map reads
+    // as "has not run yet" - which states as fact something this could not establish. The ordinary
+    // way to get here is a context with no user bus: a bare SSH login, or a container.
+    if !shown.success {
+        report.push(
+            Finding::needs_you("start", "could not ask systemd about the last run")
+                .note(shown.stderr.trim().to_owned())
+                .note("there may be no user manager to ask, which is ordinary in a container")
+                .note("or over a bare SSH login - and there the session has no watchdog either"),
+        );
+        return;
+    }
     let properties = parse_show_properties(&shown.stdout);
     match last_start_result(&properties) {
         StartResult::Success => {
@@ -97,6 +110,15 @@ fn check_last_start(report: &mut Report, service: &str) {
         StartResult::Unknown => report.push(Finding::ok(
             "start",
             format!("{} has not run yet, so there is nothing to judge", service),
+        )),
+        // Not a fault of its own: what installs the unit is `session enable`, and the checks that
+        // report on the install say so already. This one simply has no run to judge.
+        StartResult::NotLoaded { load_state } => report.push(Finding::ok(
+            "start",
+            format!(
+                "systemd has no loaded {} ({}), so there is no run to judge",
+                service, load_state
+            ),
         )),
         StartResult::Failed {
             result,

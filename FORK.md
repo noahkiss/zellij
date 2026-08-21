@@ -4694,6 +4694,293 @@ unused global flag) and silently did nothing.
 the more specific of the two - but now falls back to `-s` when it is empty, the same way `action`
 and `subscribe` already do.
 
+### `snapshot import --prune-source` prunes only what it archived
+
+Archiving answered three different questions with the same word. `archive_session_info_folder`
+returned `Ok(None)` for "the archive already holds this exact shape", for "this folder has no
+layout", and for "archiving is switched off" — and one of those three is the only one where the
+source folder is safe to delete.
+
+`snapshot import --prune-source` read all three as the first. With `session_snapshot_limit 0` it
+printed `skipped <name> - already in the archive` for every legacy `session_info` folder it found,
+which was false, and then removed each one. Nothing had been archived, and nothing was left. The
+same conflation made `save-session --archive` report `Nothing new to archive.` on a machine where
+archiving was simply off.
+
+The return type now says which case it is. `ArchiveOutcome` has an `Archived` variant carrying the
+snapshot, `AlreadyArchived`, `Disabled` and `NothingToArchive`, and `source_is_archived()` answers
+the one question a pruning caller actually has — is this folder in the archive now, whether or not
+this call is what put it there. Only `Archived` and `AlreadyArchived` say yes, so the prune is
+guarded by the fact rather than by the absence of a snapshot.
+
+`snapshot import` also refuses up front when archiving is off, before it walks anything, rather
+than reporting per folder on work it was never going to do. It exits 2 and names the setting. The
+dry run refuses with it, which is the point: `--dry-run` used to promise imports that a real run
+would not have made either. `save-session --archive` grew the same distinction and exits 2 instead
+of claiming there was nothing new.
+
+The four fire-and-forget callers in the server and in `delete-session` are unchanged; they only
+ever looked at the `Err`.
+
+### The recorded `XDG_STATE_HOME` is read back, not re-derived
+
+A generated unit records the `XDG_STATE_HOME` of the shell that enabled it, because the snapshot
+archive and `restart.log` both hang off it and a launcher has none. That much was right. What was
+wrong is that *every* later comparison regenerated the unit from **its own** environment and then
+compared bytes — so the answer depended on who asked.
+
+`zellij session status work` from a context that exports no `XDG_STATE_HOME` — cron, a systemd
+timer, `ssh host zellij session status work` — regenerated a unit with no state-home line, reported
+drift on a perfectly good install, and exited 1. `session up` printed the same warning at every
+watchdog tick. Both told the reader to run `session enable`, and doing so from that same shell
+rewrote the unit *without* the state root: from then on the launcher's `up --restore latest` read a
+different archive from the one a `down` typed in a pane writes. The session comes back from the
+layout instead of the shape that was saved, and nothing fails.
+
+The state root is now treated exactly as the binary path already is, and for the reason `PinState`
+gives: **the recorded value is the one the launcher actually uses, and this process's environment is
+not the one that installed it.** `state_home_for_unit` reads the value out of the unit that keeps
+the session up — found by behaviour, so a job installed under another name answers too — and falls
+back to the environment only when nothing is recorded. `service_files` resolves it once, so writing
+a unit and comparing against one see the same value.
+
+Generation no longer reads the environment at all: `service_unit` takes the state root as an
+argument. That also makes the generators pure, which is what lets the round trip be tested — a unit
+regenerated from the value parsed back out of it is byte-identical, and the same unit regenerated
+from an empty environment is not.
+
+Moving the state root is now a `session disable` followed by an `enable` from a shell that exports
+the new one. A plain `enable` keeps what is recorded, which is the safe direction: the failure this
+replaces was an `enable` silently dropping it.
+
+`zellij setup --generate-service` prints the same thing `enable` would install, so it reads the
+recorded value too.
+
+### `session disable` can finish over a half-install
+
+`disable` unloads the job and then removes the files, in that order and for a good reason. What it
+did not survive is a machine where only one of the two systemd files is there.
+
+`systemctl --user disable --now <unit>` **fails** for a unit that does not exist — `Failed to
+disable unit: … does not exist`, exit 1 — and `disable` returned on that failure before it removed
+anything. A service written before the paired timer existed, an `enable` that died between its two
+`fs::write` calls, or a file deleted by hand was enough: the surviving unit stayed installed and
+enabled, and every retry did exactly the same. `session disable` could not reach a clean state
+without an `rm` by hand, and nothing said which file to remove.
+
+Two changes, and each is needed on its own.
+
+The init system is now asked to let go of only the files that are **on disk**. A half-install is a
+real state rather than an error, and the half that is missing needs no disabling. Nothing on disk at
+all still sends the whole list, because a job can be loaded from a file somebody has since deleted —
+and that job is precisely the one worth booting out.
+
+Removal then proceeds **even when the unload did not**. A unit that refuses to disable for some
+other reason, or a `daemon-reload` that fails, no longer stops the files being removed. What went
+wrong is carried out with the outcome as `DisableOutcome::Disabled { unload_error, .. }` rather than
+returned in place of it: the files are gone either way, and a caller told only "it failed" would
+report a machine that is not the one in front of it. `session disable` prints the removals, then the
+problem, and exits non-zero — the same shape it already used for a foreign job it left alone.
+
+### Doctor stops reporting on a systemd it never reached
+
+Two findings in the Linux doctor's start check, both of them the same fault: an answer that reads as
+a fact this code never established.
+
+**`Result=success` is what systemd says about a unit it has never heard of.** Verified on a Linux
+box: `systemctl --user show zellij-session-nosuch-xyz.service --property=Result,ExecMainStatus,\
+LoadState` prints `Result=success`, `ExecMainStatus=0`, `LoadState=not-found`, and exits 0. So on a
+machine with nothing installed, doctor filed "the last run of the unit succeeded" under **Already
+correct** — the one line a reader would take as proof the launcher works. `last_start_result` now
+consults `LoadState` first and returns `StartResult::NotLoaded`, keeping systemd's own word for it
+(`not-found`, `masked`), and the report says there is no run to judge. A caller that does not ask
+for `LoadState` is unaffected.
+
+**A `systemctl` that ran and failed was read as one that had nothing to report.** `Err` from the
+commander means only that there is no `systemctl` to run; a `systemctl` that ran and exited 1 comes
+back `Ok` with `success: false` and an empty stdout, and `shown.success` was never looked at. An
+empty property map then read as `Unknown`, and doctor stated that the unit had never run. The
+ordinary way to reach it is a context with no user bus — a bare SSH login, a container — which is
+exactly where the timer check already reports "no answer from systemd". One report contradicted
+itself about the same machine. The start check now reports the same thing, with systemd's stderr
+under it.
+
+### `session down` takes the up-lock it shares with the watchdog
+
+`up` holds the up-lock across its check and its creation, and `restart` holds it across both halves.
+A bare `down` took nothing, so the one command that removes a session raced the one thing that
+puts it back.
+
+Both orderings misreport. With the watchdog's tick inside `start_client` when the operator types
+`down`, the teardown kills the server the tick has just created and the tick prints `post-condition
+FAILED` with diagnostics about a machine that is fine. The other way round, `down` prints `removed`
+and the tick's in-flight `up` puts the session straight back — the teardown silently did not stick,
+and the exit code says it did.
+
+`down` now takes `lock_up(name)` for the whole of its body, so the check and the removal are one
+step against the same lock every other lifecycle verb uses. A `restart` calls `down` while already
+holding it, which is why the lock's re-entrancy within a thread is load-bearing rather than a
+convenience — a second `flock` there would wait ninety seconds for a hold this thread owns and then
+proceed unlocked, which is the two-servers race the lock exists to close. That is now asserted.
+
+### A pin the launcher does not run is inert everywhere, not only in the message
+
+`session up` reports a pin the installed launcher does not run as inert, in as many words: *"Nothing
+was copied: what `session up` keeps current is the binary the launcher actually runs."* That is
+`PinState::Mismatch`, and the ordinary way to reach it is turning `pin_exe` on after
+`session enable`, so the unit still names `/opt/homebrew/bin/zellij`.
+
+`server_exe_for_interactive_launch` never asked. It took the CONFIGURED pin and called
+`install_pinned_exe` unconditionally — so one `zellij session up work` printed that warning and then,
+in the same process, copied 40 MB to the pin and served the session from it. The operator was told
+the pin was doing nothing while it was the only thing running, and `session up` and `session status`
+described the same machine differently.
+
+It now asks. The function takes the session name, reads what the installed launcher runs the way
+`pin_state` already does, and returns `None` on a mismatch — the server then starts from the binary
+the user typed, which is what the warning describes. A launcher that runs the pin, and a machine
+with no launcher at all, are both unchanged: the pin is still the right path there, and a session
+with no name yet has no launcher to disagree with.
+
+The name comes from the invocation, in the two spellings that carry one: `opts.session`, and the
+`Attach` command `session up` builds — it clears `opts.session` and puts the name there, which is
+exactly the path the finding was about.
+
+### `session enable` makes the launchd log directory even when it changes nothing else
+
+launchd opens the paths a plist names and runs neither the job nor a directory-creating step when it
+cannot, so `enable` has always created the log directory. It created it after the already-enabled
+short-circuit, which is the one path where it matters most.
+
+The plist can be byte-identical and the job still held while the directory has gone — a cleanup
+script, a relocated state root, a volume that did not mount. `zellij session enable work` printed
+"already enabled" and created nothing; at the next login the job did not run, and the one command
+the reader is told to run had told them everything was fine.
+
+The `create_dir_all` now happens before that return, in one place (`ensure_launchd_log_dir`) rather
+than inline at the end. It is idempotent, so the ordinary `enable` pays a `stat` for it.
+`EnableOutcome::AlreadyEnabled` therefore no longer means "touched nothing" in the strictest sense,
+and its doc says so.
+
+### The pane probe reports what the client said instead of charging five seconds for it
+
+The macOS doctor opens a floating pane that writes two answers to a file, and waits up to five
+seconds for them. The wait was the only thing it did: the client's stderr went to `/dev/null`, and
+its exit code was asked for once, in `reap`, after the deadline had already passed.
+
+So a client that failed **at once** — the wrong socket directory, which is the very fault
+`check_tmpdir` reports two lines above, or a refused `run`, or a permission error — cost the full
+five seconds and came back as `Needs you: probe  the pane probe did not answer in time`, with the
+reason already discarded. It was a Needs-you hiding a real error, and indistinguishable from the
+wedged server the deadline exists for.
+
+The loop now asks `try_wait()` on every pass and keeps stderr. The distinction that makes this work
+is that a client which **succeeds** is not an answer: `zellij run` returns as soon as the pane is
+created, long before its shell has written anything, so a zero exit is a reason to keep waiting and
+only a non-zero one ends the wait. `run_pane_probe` returns a `ProbeFailure` rather than `None` —
+timed out, the client failed with its status and up to six lines of its own stderr, or it could not
+be started at all — and the report says which.
+
+Verified by compiling it: the module is `#[cfg(target_os = "macos")]` and this fork's Linux box
+cannot cross-compile the tree (a vendored C dependency), so it was type-checked by ungating the
+module and its two macOS-only imports for one `cargo check` and then putting the gates back. The
+behaviour itself is still worth a run on a Mac.
+
+### A certificate that was minted is reported and backed up, whatever the import did
+
+`ensure_self_signed` mints once in the life of a machine, and the certificate it makes cannot be
+made again: its hash **is** the requirement every grant on the machine records. The import that
+follows the mint was a `?`.
+
+So on a machine with no Apple certificate, with `doctor --fix` run over SSH, `openssl` minted
+perfectly and `security import` failed on a locked keychain — and the `?` threw away the whole
+findings list, the "minted a certificate of our own" line with it. The report said "no signing
+certificate" and pointed at Xcode. `back_up_identity` runs on the caller's `Ok` arm, so there was no
+second copy either. The machine's one and only certificate existed at a single path, unmentioned,
+one `rm -rf` from being lost for good.
+
+`ensure_self_signed` now fails with a `SelfSignedFailure` instead of a bare `String`: the findings
+it had already made, a `minted` flag, and the reason. The caller reports the findings first, backs
+the identity up when something was minted, and only then says what went wrong.
+
+The flag names the **file**, not the command. It is read from `bundle.exists()` before the `?`, so a
+mint that died before writing anything does not send the caller off to copy a file that is not
+there — which would print a `Needs you` about a certificate that does not exist.
+
+Testing this needed one new thing: `RecordedCommander::creating`, which lets a scripted command
+create a file the way the real one does. Without it a test could drive a mint as far as its first
+failure and never past it, because the recorded `openssl` writes no key for the lockdown step to
+find. Opt-in, so every existing commander still touches nothing.
+
+### The process scan asks `ps` not to truncate
+
+`running_servers` ran `ps -eo pid=,command=`. BSD `ps` — which is macOS's — sizes its output from
+`COLUMNS` or a `TIOCGWINSZ` and cuts every line to it; only `-ww` makes the width unlimited.
+
+A server's argv is `/opt/homebrew/bin/zellij --server /var/folders/xx/…/T/zellij-501/
+zellij-<contract>/<name>`, well past eighty columns, and the socket path is the **last** field. A
+cut line therefore does not merely lose detail: `parse_server_processes` reads a truncated socket,
+`servers_for_session` finds nothing for a healthy session, `session status` prints `running no`, and
+the guard that refuses to create a second server for a name stops guarding.
+
+`-ww` is accepted by procps and by BSD `ps` alike. The argv is now a named constant that the test
+runs, so a platform whose `ps` rejects it fails the suite rather than the field.
+
+Whether Apple's `ps` truncates for a piped, non-tty run was never established — Rust's
+`Command::output()` pipes both streams, and which branch Apple's `ps` takes there is unverified.
+The flag costs nothing either way, so this is a fix made without waiting for the measurement.
+
+### The systemd generator quotes what it writes
+
+`ExecStart=` and `Environment=` are both split into space-separated words, and the generator quoted
+neither. One space in a path broke both at once.
+
+With `pin_exe "/home/u/My Tools/zellij"` — or a `--exe` with a space, or a `$HOME` with one —
+`ExecStart=/home/u/My Tools/zellij session up work` execs `/home/u/My`, which is the visible half.
+The other half is worse because it does not fail: `Environment=PATH=/home/u/My Tools:/usr/local/bin:…`
+is read as a list of `NAME=VALUE` words, so systemd sets `PATH=/home/u/My`, logs *"Ignoring invalid
+environment assignment"* for the rest, and the session comes up with a one-entry PATH that does not
+exist. Every layout `command`, `zellij run --` and `copy_command` then fails with "command not
+found" beside an interactive pane that works — the exact symptom the PATH default was added to end.
+
+Both are now quoted, and unconditionally rather than only when a space is present, so the bytes do
+not depend on what a path happens to contain. `\` and `"` are escaped, because inside systemd's
+double quotes those are the two characters that mean something. The reader side already coped:
+`word_spans` takes quotes off, so `installed_session_exe` and the scan for a launcher under another
+name answer the same as before — asserted.
+
+Proved against real systemd rather than argued. `systemd-analyze verify` on a generated unit with a
+spaced exe passes clean; the same unit with the quotes stripped produces
+`Invalid environment assignment, ignoring: tools:/usr/local/bin:…` and
+`Command /tmp/…/my is not executable`.
+
+**Every installed unit's bytes change**, so the first `session status` or `session up` after
+upgrading reports drift and asks for a `session enable`. That is the intended path and it is a
+one-time cost.
+
+### The key ACL grant names our own key
+
+`security set-key-partition-list -S apple-tool:,apple:,codesign: -s <keychain>` was passed no match
+term. `-s` selects every private key in the named keychain that can sign, and the keychain named is
+the user's **login** keychain — so this rewrote the partition list of every signing key on the
+machine, not ours.
+
+The `Rung::SelfSigned` guard at the call site scopes **when** the command runs, never what it
+touches, and the module's own comment two lines above it says that re-writing a key we did not
+create is not doctor's business. A Mac holding an Apple Development key whose certificate the ladder
+refused falls to the self-signed rung, so this is not a hypothetical arrangement: doctor replaced
+the partition list on the Xcode-managed key, and Xcode began raising key-access dialogs on builds
+that used to be silent.
+
+`-l <the certificate's common name>` now scopes it, matching the friendly name `openssl pkcs12
+-name` writes into the bundle, with `-s` kept beside it so the match is narrower than either alone.
+
+**The flag is the part still worth confirming on a Mac.** If the label does not match, the command
+grants nothing rather than the wrong thing, and doctor's existing handling covers that exactly:
+this step is a convenience, a refusal is a `Needs you` saying "codesign may ask for the key", and
+the run goes on to sign. Losing the convenience is a worse outcome than before for us and a better
+one for everybody else's keys, which is why the change lands without waiting for the measurement.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

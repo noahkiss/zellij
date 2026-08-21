@@ -218,13 +218,41 @@ pub fn configured_restart_via_launchd(extras: Option<&SessionServiceOptions>) ->
 /// it keeps its macOS grants, and the socket is scoped by contract version rather than by version
 /// string, so a client one build ahead still speaks to it. A new build with no grants would be a
 /// session that cannot read the user's files until somebody clicks through a dialog.
+/// Whether an interactive launch may serve the session from the configured pin.
+///
+/// It may not when the installed launcher runs something else. That is [`PinState::Mismatch`], and
+/// it is the state `session up` reports as "Nothing was copied" - a pin nothing has been pointed at
+/// yet. Serving from it anyway puts the two creators of one session on two different paths, which
+/// is the churn `pin_exe` exists to end, and makes the message that has just been printed false.
+///
+/// A launcher that runs the pin, and no launcher at all, both leave the pin the right answer.
+fn pin_applies_to_interactive_launch(pinned: &Path, installed_exe: Option<&str>) -> bool {
+    !matches!(pin_state(pinned, installed_exe), PinState::Mismatch { .. })
+}
+
+/// A pin the installed launcher does not run is INERT, and `session` names which launcher to ask.
+/// `session up` already says so in as many words - "Nothing was copied: what `session up` keeps
+/// current is the binary the launcher actually runs" - and this used to copy 40 MB to that pin and
+/// serve the session from it on the very next line, in the same process. The operator was told the
+/// pin was doing nothing while it was the thing running, and `session up` and `session status`
+/// described the machine differently. `None` for the session - a brand-new auto-named one - has no
+/// launcher to disagree with, so the pin applies as before.
 #[cfg(unix)]
 pub fn server_exe_for_interactive_launch(
     extras: Option<&SessionServiceOptions>,
+    session: Option<&str>,
 ) -> Option<PathBuf> {
     use crate::session_lifecycle::install_pinned_exe;
 
     let pinned = configured_pinned_exe(extras)?;
+    #[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+    if let Some(session) = session {
+        if !pin_applies_to_interactive_launch(&pinned, installed_session_exe(session).as_deref()) {
+            return None;
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", all(unix, test))))]
+    let _ = session;
     let current_exe = std::env::current_exe().ok()?;
     if same_exe_path(&current_exe, &pinned) {
         return None;
@@ -1200,10 +1228,11 @@ pub fn service_unit(
     exe: &Path,
     session: &str,
     extras: Option<&SessionServiceOptions>,
+    state_home: Option<&Path>,
 ) -> String {
     match kind {
-        ServiceKind::Systemd => systemd_unit(exe, session, extras),
-        ServiceKind::Launchd => launchd_plist(exe, session, extras),
+        ServiceKind::Systemd => systemd_unit(exe, session, extras, state_home),
+        ServiceKind::Launchd => launchd_plist(exe, session, extras, state_home),
     }
 }
 
@@ -1317,12 +1346,34 @@ fn sets_env_var(directives: &[String], name: &str) -> bool {
     })
 }
 
-/// One `Environment=NAME=value` line, or nothing when the config has already written one.
+/// One word of a unit file, quoted the way systemd reads one.
+///
+/// **Nothing here was quoted, and a single space broke the unit in two places at once.** systemd
+/// splits `ExecStart=` and `Environment=` into space-separated words, so with `pin_exe
+/// "/home/u/My Tools/zellij"` - or a `--exe` with a space, or a `$HOME` with one -
+/// `ExecStart=/home/u/My Tools/zellij session up work` execs `/home/u/My`, and
+/// `Environment=PATH=/home/u/My Tools/zellij:/usr/local/bin:...` is read as a list of `NAME=VALUE`
+/// words: systemd sets `PATH=/home/u/My`, logs "Ignoring invalid environment assignment" for the
+/// rest, and the session comes up with a one-entry PATH that does not exist. Every layout
+/// `command`, `zellij run --` and `copy_command` then fails with "command not found" beside an
+/// interactive pane that works - which is the exact symptom the PATH default was added to end.
+///
+/// Quoted unconditionally rather than only when a space is present, so the bytes do not depend on
+/// what the path happens to contain. `\` and `"` are escaped, because inside systemd's double
+/// quotes they are the two characters that mean something.
+fn unit_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// One `Environment="NAME=value"` line, or nothing when the config has already written one.
 fn env_default(directives: &[String], name: &str, value: &str) -> String {
     if sets_env_var(directives, name) {
         String::new()
     } else {
-        format!("Environment={}={}\n", name, value)
+        format!(
+            "Environment={}\n",
+            unit_quote(&format!("{}={}", name, value))
+        )
     }
 }
 
@@ -1373,6 +1424,74 @@ pub fn recorded_state_home() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
+/// The `XDG_STATE_HOME` a unit ALREADY ON DISK records, read back out of it.
+///
+/// Pure, over the file's own bytes, so it is the same answer from any process.
+pub fn state_home_in_unit(kind: ServiceKind, contents: &str) -> Option<String> {
+    match kind {
+        ServiceKind::Systemd => contents.lines().find_map(|line| {
+            // `Environment=XDG_STATE_HOME=<path>`, with or without the quotes systemd accepts
+            let assignment = line.trim().strip_prefix("Environment=")?.trim();
+            let assignment = assignment
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or(assignment);
+            Some(assignment.strip_prefix("XDG_STATE_HOME=")?.to_owned())
+        }),
+        ServiceKind::Launchd => {
+            let after_key = contents.split("<key>XDG_STATE_HOME</key>").nth(1)?;
+            let value = after_key
+                .split("<string>")
+                .nth(1)?
+                .split("</string>")
+                .next()?;
+            Some(xml_unescape(value))
+        },
+    }
+}
+
+/// The state root a unit generated NOW should carry: what the installed one already records, and
+/// only failing that, this environment's.
+///
+/// The recorded value wins for the reason [`pin_state`] gives about the binary path - it is what
+/// the launcher actually uses, and this process's environment is not the one that installed it. Any
+/// process may generate a unit to compare against (`session status`, `session up`'s drift warning,
+/// `session doctor`), and a shell that exports no `XDG_STATE_HOME` used to regenerate a unit
+/// without the line and report drift on a correct install. Following that report's advice then
+/// rewrote the unit without the state root, after which the launcher's `up --restore latest` read a
+/// different archive from the one a `down` in a pane writes.
+///
+/// So the recording is made once, by the first `enable`, and re-read from then on. To move it,
+/// `session disable` and enable again from a shell that exports the new one.
+pub fn state_home_for_unit(kind: ServiceKind, session: &str) -> Option<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+    {
+        if let Some(installed) = installed_session_state_home(kind, session) {
+            return Some(installed);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", all(unix, test))))]
+    let _ = (kind, session);
+    recorded_state_home()
+}
+
+/// The `XDG_STATE_HOME` recorded by whatever unit currently keeps `session` up.
+///
+/// Found by behaviour like every other lookup of this session's job, so a unit installed under a
+/// name this build did not choose still answers.
+#[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
+fn installed_session_state_home(kind: ServiceKind, session: &str) -> Option<PathBuf> {
+    let (extension, derived) = match kind {
+        ServiceKind::Systemd => ("service", systemd_service_name(session)),
+        ServiceKind::Launchd => ("plist", launchd_label(session)),
+    };
+    let jobs = installed_jobs(kind, extension);
+    let job = find_session_job(&jobs, session, &derived).job()?;
+    let contents = std::fs::read_to_string(&job.path).ok()?;
+    let path = PathBuf::from(state_home_in_unit(kind, &contents)?);
+    path.is_absolute().then_some(path)
+}
+
 /// The `Environment=XDG_STATE_HOME=` line of a generated unit, with the comment that explains it,
 /// or nothing at all.
 ///
@@ -1401,14 +1520,18 @@ fn state_home_directive(service_directives: &[String], state_home: Option<&Path>
     )
 }
 
-fn systemd_unit(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
+fn systemd_unit(
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+    state_home: Option<&Path>,
+) -> String {
     let extras = extras.cloned().unwrap_or_default();
     // Defaults, not decisions: a config that sets its own TERM or PATH replaces these lines rather
     // than adding a second assignment of the same variable.
     let term = env_default(&extras.systemd.service, "TERM", crate::shared::DEFAULT_TERM);
     let path = env_default(&extras.systemd.service, "PATH", &service_path(exe));
-    let state_home =
-        state_home_directive(&extras.systemd.service, recorded_state_home().as_deref());
+    let state_home = state_home_directive(&extras.systemd.service, state_home);
     format!(
         "\
 # zellij session '{session}' - write to ~/.config/systemd/user/{unit}
@@ -1447,13 +1570,14 @@ KillMode=process
 # the session - a pane shell fixing its own PATH from the rc chain does not fix that. A unit is
 # started with none. The first entry is where the binary below was found; setting PATH in the
 # config's `session_service` block replaces this line.
-{path}{state_home}ExecStart={exe} session up {session}
+{path}{state_home}ExecStart={quoted_exe} session up {quoted_session}
 {service_extra}
 [Install]
 WantedBy=default.target
 {install_extra}",
         session = session,
-        exe = exe.display(),
+        quoted_exe = unit_quote(&exe.display().to_string()),
+        quoted_session = unit_quote(session),
         interval = CHECK_INTERVAL_SECS,
         term = term,
         path = path,
@@ -1585,7 +1709,12 @@ fn launchd_working_directory() -> String {
         .unwrap_or_else(|| "/".to_owned())
 }
 
-fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOptions>) -> String {
+fn launchd_plist(
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+    state_home: Option<&Path>,
+) -> String {
     let extras = extras.cloned().unwrap_or_default();
     // Every one of these is a value the generator owns a DEFAULT for rather than a part of the
     // plist it owns outright, so a config entry naming one replaces the value instead of being
@@ -1614,7 +1743,7 @@ fn launchd_plist(exe: &Path, session: &str, extras: Option<&SessionServiceOption
     // Not a plist key either: it goes inside EnvironmentVariables like TERM and PATH, and unlike
     // them it is absent altogether when this machine has no absolute one to record.
     let state_home = take_default_key(&mut keys, "XDG_STATE_HOME")
-        .or_else(|| recorded_state_home().map(|home| home.display().to_string()))
+        .or_else(|| state_home.map(|home| home.display().to_string()))
         .map(|value| {
             format!(
                 "        <key>XDG_STATE_HOME</key>\n        <string>{}</string>\n",
@@ -1878,6 +2007,10 @@ pub fn service_files(
     extras: Option<&SessionServiceOptions>,
 ) -> Result<Vec<ServiceFile>, String> {
     let dir = service_dir(kind)?;
+    // Resolved once, here, so that WRITING a unit and COMPARING against one both see the same
+    // state root - and so that neither depends on whether the calling shell exports one.
+    let state_home = state_home_for_unit(kind, session);
+    let state_home = state_home.as_deref();
     Ok(match kind {
         ServiceKind::Systemd => {
             let unit = systemd_service_name(session);
@@ -1886,7 +2019,7 @@ pub fn service_files(
                 ServiceFile {
                     role: "service",
                     path: dir.join(&unit),
-                    contents: service_unit(kind, exe, session, extras),
+                    contents: service_unit(kind, exe, session, extras, state_home),
                     unit,
                 },
                 ServiceFile {
@@ -1903,7 +2036,7 @@ pub fn service_files(
             vec![ServiceFile {
                 role: "agent",
                 path: dir.join(&file),
-                contents: service_unit(kind, exe, session, extras),
+                contents: service_unit(kind, exe, session, extras, state_home),
                 unit: label,
             }]
         },
@@ -1915,6 +2048,10 @@ pub fn service_files(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnableOutcome {
     /// Every file was already what this build writes, and the init system already had the job.
+    ///
+    /// Not quite "touched nothing": the launchd log directory is ensured on this path too, because
+    /// its absence stops the job running while leaving the plist byte-identical. See
+    /// [`ensure_launchd_log_dir`].
     AlreadyEnabled,
     Enabled {
         written: Vec<PathBuf>,
@@ -1937,6 +2074,13 @@ pub enum DisableOutcome {
         /// Jobs under another name that this command did NOT touch. Removal is scoped to exactly
         /// what `enable` wrote; a job written by hand is somebody else's file.
         remaining: Vec<InstalledJob>,
+        /// What the init system would not accept - a unit that refused to disable, or a
+        /// `daemon-reload` that failed - on a run whose files were removed all the same.
+        ///
+        /// Carried WITH the outcome rather than returned instead of it. The files are gone either
+        /// way, and a caller told only "it failed" would report a machine that is not the one it
+        /// is looking at. `None` is a clean disable.
+        unload_error: Option<String>,
     },
 }
 
@@ -2085,6 +2229,9 @@ pub fn enable(
         }
     }
     let files = service_files(kind, exe, session, extras)?;
+    // Before the short-circuit below, and that placement is the whole of it - see
+    // `ensure_launchd_log_dir`.
+    ensure_launchd_log_dir(kind, session)?;
     let up_to_date = files.iter().all(|file| file.is_current());
     if up_to_date && job_is_loaded(kind, &files) {
         return Ok(EnableOutcome::AlreadyEnabled);
@@ -2095,26 +2242,41 @@ pub fn enable(
         if file.is_current() {
             continue;
         }
-        if let Some(parent) = file.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
-        }
+        ensure_dir(file.path.parent())?;
         std::fs::write(&file.path, &file.contents)
             .map_err(|e| format!("could not write {}: {}", file.path.display(), e))?;
         written.push(file.path.clone());
     }
-    // launchd opens the paths the plist names and creates neither the directory above them nor the
-    // job when it cannot: a log directory that does not exist yet would stop the session coming up
-    // at all, which is a poor trade for a log.
-    if kind == ServiceKind::Launchd {
-        let (out, _) = launchd_log_paths(session);
-        if let Some(dir) = out.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
-        }
-    }
     load_job(&files)?;
     Ok(EnableOutcome::Enabled { written, beside })
+}
+
+/// Make sure launchd can open the log paths the plist names.
+///
+/// launchd opens them itself and creates neither the directory above them nor the job when it
+/// cannot, so a missing log directory stops the session coming up at all - a poor trade for a log.
+///
+/// Called BEFORE the already-enabled short-circuit, and that placement is the point. The plist can
+/// be byte-identical and the job still held while the directory has gone: a cleanup script, a
+/// relocated state root, a volume that did not mount. `zellij session enable work` used to print
+/// "already enabled" and create nothing, so at the next login the job did not run and the one
+/// command the user is told to run said everything was fine.
+///
+/// Idempotent, so running it on every `enable` costs a `stat` on the ordinary path.
+fn ensure_launchd_log_dir(kind: ServiceKind, session: &str) -> Result<(), String> {
+    if kind != ServiceKind::Launchd {
+        return Ok(());
+    }
+    let (out, _) = launchd_log_paths(session);
+    ensure_dir(out.parent())
+}
+
+/// `create_dir_all` over an optional parent, naming the directory in the error.
+fn ensure_dir(dir: Option<&Path>) -> Result<(), String> {
+    let Some(dir) = dir else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {}", dir.display(), e))
 }
 
 /// Unload the job, then remove the files - in that order.
@@ -2139,7 +2301,11 @@ pub fn disable(kind: ServiceKind, session: &str) -> Result<DisableOutcome, Strin
         return Ok(nothing_of_ours_to_remove(foreign));
     }
 
-    unload_job(&files)?;
+    let unloaded = unload_job(&files_to_unload(&files));
+    // Removal proceeds even when the unload did not, and that is the whole of this: giving up here
+    // left the surviving unit installed AND enabled, and every retry did exactly the same, so
+    // `disable` could never reach a clean state without an `rm` by hand. The failure is reported
+    // with the outcome instead of in place of it.
     let mut removed = Vec::new();
     for file in &files {
         match std::fs::remove_file(&file.path) {
@@ -2149,11 +2315,30 @@ pub fn disable(kind: ServiceKind, session: &str) -> Result<DisableOutcome, Strin
         }
     }
     // systemd keeps a removed unit in its state until it is told to look again
-    reload_after_removal()?;
+    let reloaded = reload_after_removal();
     Ok(DisableOutcome::Disabled {
         removed,
         remaining: foreign,
+        unload_error: collect_failures([unloaded, reloaded].into_iter()).err(),
     })
+}
+
+/// The files `disable` asks the init system to let go of.
+///
+/// Only the ones that are ON DISK, because `systemctl --user disable --now <unit>` fails for a unit
+/// that does not exist - `Failed to disable unit: ... does not exist`, exit 1 - and a half-install
+/// is a real state: an `enable` that died between its two writes, a service written before the
+/// paired timer existed, a file removed by hand.
+///
+/// Nothing on disk at all still gets the whole list, because a job can be loaded from a file
+/// somebody has since deleted, and that job is exactly the one worth booting out.
+fn files_to_unload(files: &[ServiceFile]) -> Vec<ServiceFile> {
+    let on_disk: Vec<ServiceFile> = files.iter().filter(|file| file.exists()).cloned().collect();
+    if on_disk.is_empty() {
+        files.to_vec()
+    } else {
+        on_disk
+    }
 }
 
 /// Report the install without changing it.
@@ -2369,7 +2554,9 @@ fn load_job(files: &[ServiceFile]) -> Result<(), String> {
 ///
 /// A partial install is the fault worth avoiding here; stopping at the first failure is what
 /// produces one.
-#[cfg(target_os = "linux")]
+///
+/// Ungated on purpose: `disable` calls it on every platform, and gating a helper that an ungated
+/// caller reaches is the asymmetry that stops `zellij-utils` building for wasm.
 fn collect_failures(results: impl Iterator<Item = Result<(), String>>) -> Result<(), String> {
     let failures: Vec<String> = results.filter_map(Result::err).collect();
     if failures.is_empty() {
@@ -2700,7 +2887,7 @@ mod tests {
                 .add_launchd_key(name, value)
                 .unwrap_or_else(|e| panic!("{} should be configurable: {}", name, e));
         }
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         for expected in [
             "<key>LimitLoadToSessionType</key>\n    <string>Background</string>",
             "<key>RunAtLoad</key>\n    <false/>",
@@ -2730,7 +2917,7 @@ mod tests {
 
     #[test]
     fn the_scheduling_keys_keep_their_defaults_when_nothing_configures_them() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(plist.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(plist.contains(&format!(
@@ -2751,7 +2938,7 @@ mod tests {
                 ]),
             )
             .unwrap();
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         assert!(
             plist.contains(
                 "    <key>WatchPaths</key>\n    <array>\n        <string>/one</string>\n        \
@@ -2771,7 +2958,7 @@ mod tests {
                 PlistValue::Dict(vec![("SuccessfulExit".to_owned(), PlistValue::Bool(false))]),
             )
             .unwrap();
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         assert!(
             plist.contains(
                 "    <key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        \
@@ -2791,7 +2978,7 @@ mod tests {
                 PlistValue::Array(vec![PlistValue::String("<one & two>".to_owned())]),
             )
             .unwrap();
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         assert!(
             plist.contains("<string>&lt;one &amp; two&gt;</string>"),
             "{}",
@@ -2817,7 +3004,7 @@ mod tests {
     fn an_absolute_state_home_is_written_into_the_unit() {
         let directive = state_home_directive(&[], Some(Path::new("/home/u/.state")));
         assert!(
-            directive.ends_with("Environment=XDG_STATE_HOME=/home/u/.state\n"),
+            directive.ends_with("Environment=\"XDG_STATE_HOME=/home/u/.state\"\n"),
             "{}",
             directive
         );
@@ -2836,6 +3023,143 @@ mod tests {
         assert_eq!(
             state_home_directive(&configured, Some(Path::new("/home/u/.state"))),
             ""
+        );
+    }
+
+    #[test]
+    fn the_log_directory_is_made_where_it_is_missing_and_left_where_it_is_not() {
+        let root = std::env::temp_dir().join(format!("zj-logdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("state").join("zellij").join("logs");
+
+        ensure_dir(Some(&nested)).unwrap();
+        assert!(nested.is_dir());
+        // idempotent, so running it on every `enable` - including the one that changes nothing
+        // else - costs a stat rather than an error
+        ensure_dir(Some(&nested)).unwrap();
+        assert!(nested.is_dir());
+        ensure_dir(None).unwrap();
+
+        // systemd writes to the journal, so there is no directory for this to make
+        ensure_launchd_log_dir(ServiceKind::Systemd, "work").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_half_installed_pair_is_unloaded_by_the_half_that_is_there() {
+        let root = std::env::temp_dir().join(format!("zj-unload-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = |role: &'static str, name: &str| ServiceFile {
+            role,
+            unit: name.to_owned(),
+            path: root.join(name),
+            contents: String::new(),
+        };
+        let service = file("service", "zellij-session-work.service");
+        let timer = file("timer", "zellij-session-work.timer");
+        std::fs::write(&service.path, "[Service]\n").unwrap();
+
+        // `systemctl --user disable --now <unit>` fails for a unit that does not exist, and the
+        // failure used to abort `disable` before it removed anything - so the service stayed
+        // installed and enabled, and every retry did the same
+        let files = vec![service.clone(), timer.clone()];
+        assert_eq!(
+            files_to_unload(&files)
+                .iter()
+                .map(|file| file.unit.clone())
+                .collect::<Vec<_>>(),
+            vec!["zellij-session-work.service".to_owned()]
+        );
+
+        // nothing on disk is the other real state: a job loaded from a file since deleted, which
+        // is exactly the one worth booting out
+        std::fs::remove_file(&service.path).unwrap();
+        assert_eq!(files_to_unload(&files).len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// systemd splits `ExecStart=` and `Environment=` into space-separated words, so one space in
+    /// a path used to break both at once: `ExecStart=/opt/my tools/zellij ...` execs `/opt/my`,
+    /// and `Environment=PATH=/opt/my tools:...` sets `PATH=/opt/my` and discards the rest as
+    /// "invalid environment assignment" - after which every layout `command`, `zellij run --` and
+    /// `copy_command` fails with "command not found" beside an interactive pane that works.
+    #[test]
+    fn a_space_in_the_path_does_not_split_the_unit_into_two_words() {
+        let spaced = Path::new("/opt/my tools/zellij");
+        let unit = service_unit(ServiceKind::Systemd, spaced, "my session", None, None);
+
+        assert!(
+            unit.contains("ExecStart=\"/opt/my tools/zellij\" session up \"my session\"\n"),
+            "{}",
+            unit
+        );
+        assert!(
+            unit.contains(&format!("Environment=\"PATH={}\"\n", service_path(spaced))),
+            "{}",
+            unit
+        );
+
+        // and the unit still reads back as the job it is - `word_spans` takes the quotes off, so
+        // `installed_session_exe` and the "is a launcher already installed" scan still answer
+        let exec = parse_unit_exec_start(&unit).expect("an ExecStart to read");
+        assert_eq!(session_up_exe(&exec), Some("/opt/my tools/zellij"));
+        assert_eq!(session_up_target(&exec), Some("my session"));
+    }
+
+    #[test]
+    fn a_recorded_state_home_is_read_back_out_of_the_unit_it_was_written_into() {
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let recorded = PathBuf::from("/home/u/.local/state");
+            let unit = service_unit(kind, &exe(), "work", None, Some(&recorded));
+            let read_back = state_home_in_unit(kind, &unit);
+            assert_eq!(read_back.as_deref(), Some("/home/u/.local/state"));
+            // the whole point of reading it back: regenerating from the RECORDED value is
+            // byte-identical, so drift cannot fire in a process that exports nothing
+            assert_eq!(
+                service_unit(
+                    kind,
+                    &exe(),
+                    "work",
+                    None,
+                    read_back.map(PathBuf::from).as_deref()
+                ),
+                unit
+            );
+            // and regenerating from an empty environment, which is what used to happen, does not
+            assert_ne!(service_unit(kind, &exe(), "work", None, None), unit);
+        }
+    }
+
+    #[test]
+    fn a_unit_recording_no_state_home_reads_back_as_none() {
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let unit = service_unit(kind, &exe(), "work", None, None);
+            assert_eq!(state_home_in_unit(kind, &unit), None);
+        }
+    }
+
+    #[test]
+    fn a_quoted_environment_line_is_read_back_without_its_quotes() {
+        // systemd accepts `Environment="NAME=value"`, so a hand-edited unit - or one written by a
+        // build that quotes what it emits - has to read back the same as an unquoted one
+        assert_eq!(
+            state_home_in_unit(
+                ServiceKind::Systemd,
+                "[Service]\nEnvironment=\"XDG_STATE_HOME=/home/u/.state\"\n"
+            )
+            .as_deref(),
+            Some("/home/u/.state")
+        );
+    }
+
+    #[test]
+    fn a_state_home_needing_xml_escaping_round_trips_through_the_plist() {
+        let recorded = PathBuf::from("/home/a&b/.state");
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, Some(&recorded));
+        assert!(plist.contains("<string>/home/a&amp;b/.state</string>"));
+        assert_eq!(
+            state_home_in_unit(ServiceKind::Launchd, &plist).as_deref(),
+            Some("/home/a&b/.state")
         );
     }
 
@@ -2911,9 +3235,31 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn no_pin_means_an_interactive_launch_starts_the_server_it_already_is() {
-        assert_eq!(server_exe_for_interactive_launch(None), None);
+        assert_eq!(server_exe_for_interactive_launch(None, None), None);
         let options = SessionServiceOptions::default();
-        assert_eq!(server_exe_for_interactive_launch(Some(&options)), None);
+        assert_eq!(
+            server_exe_for_interactive_launch(Some(&options), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pin_the_launcher_does_not_run_is_inert_for_an_interactive_launch_too() {
+        let pinned = Path::new("/Users/u/Library/Application Support/zellij/bin/zellij");
+
+        // `pin_exe` turned on after `session enable`, so the unit still names the package path.
+        // `session up` prints "Nothing was copied" for this and used to copy 40 MB to the pin and
+        // serve the session from it on the next line, in the same process.
+        assert!(!pin_applies_to_interactive_launch(
+            pinned,
+            Some("/opt/homebrew/bin/zellij")
+        ));
+
+        // the launcher runs the pin: it is the path with the grants, and the right one to serve
+        assert!(pin_applies_to_interactive_launch(pinned, pinned.to_str()));
+
+        // no launcher installed at all - nothing to disagree with, so the pin applies as before
+        assert!(pin_applies_to_interactive_launch(pinned, None));
     }
 
     #[test]
@@ -2923,7 +3269,10 @@ mod tests {
         // truncate the binary that is running
         let mut options = SessionServiceOptions::default();
         options.pin_exe = Some(PinnedExe::At(std::env::current_exe().unwrap()));
-        assert_eq!(server_exe_for_interactive_launch(Some(&options)), None);
+        assert_eq!(
+            server_exe_for_interactive_launch(Some(&options), None),
+            None
+        );
     }
 
     #[test]
@@ -3043,7 +3392,7 @@ mod tests {
     #[test]
     fn each_session_has_its_own_launchd_job() {
         assert_eq!(launchd_label("work"), "dev.zellij.session.work");
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(plist.contains(&format!(
             "<key>Label</key>\n    <string>{}</string>",
             launchd_label("work")
@@ -3056,7 +3405,7 @@ mod tests {
     fn each_session_has_its_own_systemd_units() {
         assert_eq!(systemd_service_name("work"), "zellij-session-work.service");
         assert_eq!(systemd_timer_name("work"), "zellij-session-work.timer");
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
         // the install line has to name the file the installer writes, or a hand install lands
         // somewhere `zellij session status` never looks
         assert!(unit.contains("systemctl --user enable --now zellij-session-work.service"));
@@ -3068,7 +3417,7 @@ mod tests {
     #[test]
     fn the_linux_timer_re_checks_as_often_as_the_plist_does() {
         let timer = systemd_timer("work");
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(timer.contains(&format!("OnUnitActiveSec={}", CHECK_INTERVAL_SECS)));
         assert!(timer.contains("Unit=zellij-session-work.service"));
         assert!(plist.contains(&format!(
@@ -3413,12 +3762,12 @@ mod tests {
     /// theoretical.
     #[test]
     fn the_generated_units_are_read_back_as_the_jobs_they_are() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras()));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras()), None);
         let (label, arguments) = parse_launch_agent(&plist).unwrap();
         assert_eq!(label, launchd_label("work"));
         assert_eq!(session_up_target(&arguments), Some("work"));
 
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras()));
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras()), None);
         let arguments = parse_unit_exec_start(&unit).unwrap();
         assert_eq!(arguments[0], exe().display().to_string());
         assert_eq!(session_up_target(&arguments), Some("work"));
@@ -3575,31 +3924,31 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         let empty = SessionServiceOptions::default();
         for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
             assert_eq!(
-                service_unit(kind, &exe(), "work", None),
-                service_unit(kind, &exe(), "work", Some(&empty))
+                service_unit(kind, &exe(), "work", None, None),
+                service_unit(kind, &exe(), "work", Some(&empty), None)
             );
         }
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
         assert!(unit.contains("After=default.target\n\n[Service]"));
-        assert!(unit.contains("session up work\n\n[Install]"));
+        assert!(unit.contains("session up \"work\"\n\n[Install]"));
         assert!(unit.ends_with("WantedBy=default.target\n"));
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(plist.contains("<integer>60</integer>\n</dict>\n</plist>\n"));
     }
 
     #[test]
     fn systemd_extras_are_appended_to_the_section_they_name() {
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras()));
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras()), None);
         assert!(unit.contains(
             "After=default.target\nAfter=network.target\nBefore=some-other.service\n\n[Service]"
         ));
-        assert!(unit.contains("session up work\nNice=-5\n\n[Install]"));
+        assert!(unit.contains("session up \"work\"\nNice=-5\n\n[Install]"));
         assert!(unit.ends_with("WantedBy=default.target\nWantedBy=graphical-session.target\n"));
     }
 
     #[test]
     fn launchd_extras_become_plist_keys_of_their_own_type() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras()));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras()), None);
         assert!(plist.contains("    <key>ProcessType</key>\n    <string>Interactive</string>\n"));
         assert!(plist.contains("    <key>Nice</key>\n    <integer>5</integer>\n"));
         assert!(plist.contains("    <key>AbandonProcessGroup</key>\n    <true/>\n"));
@@ -3615,7 +3964,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         extras
             .add_launchd_key("ProcessType", PlistValue::String("<one & two>".to_owned()))
             .unwrap();
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         assert!(plist.contains("<string>&lt;one &amp; two&gt;</string>"));
     }
 
@@ -3729,14 +4078,14 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
 
     #[test]
     fn the_systemd_unit_calls_session_up() {
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
-        assert!(unit.contains("ExecStart=/usr/local/bin/zellij session up work"));
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/zellij\" session up \"work\""));
         assert!(unit.contains("[Install]"));
     }
 
     #[test]
     fn the_launchd_plist_passes_the_session_as_its_own_argument() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(plist.contains("<string>up</string>\n        <string>work</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
     }
@@ -3746,7 +4095,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// on. Without these keys a session that never came back after login left no evidence anywhere.
     #[test]
     fn the_launchd_plist_says_where_the_job_s_output_goes() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         let (out, err) = launchd_log_paths("work");
         assert!(plist.contains(&format!(
             "<key>StandardOutPath</key>\n    <string>{}</string>",
@@ -3766,7 +4115,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// this generator says anything about it.
     #[test]
     fn the_launchd_plist_starts_the_session_in_the_home_directory() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         let home = directories::BaseDirs::new().unwrap();
         assert!(plist.contains(&format!(
             "<key>WorkingDirectory</key>\n    <string>{}</string>",
@@ -3781,10 +4130,10 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// PATH and the unit pinned none at all.
     #[test]
     fn both_generators_give_the_server_a_path() {
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         let expected = service_path(&exe());
-        assert!(unit.contains(&format!("Environment=PATH={}\n", expected)));
+        assert!(unit.contains(&format!("Environment=\"PATH={}\"\n", expected)));
         assert!(plist.contains(&format!(
             "<key>PATH</key>\n        <string>{}</string>",
             expected
@@ -3822,11 +4171,11 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
                 .unwrap();
         }
 
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras));
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras), None);
         assert_eq!(unit.matches("Environment=PATH=").count(), 1);
         assert!(unit.contains("Environment=PATH=/my/bin"));
 
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         for (key, value) in [
             ("PATH", "/my/bin"),
             ("WorkingDirectory", "/my/home"),
@@ -3851,7 +4200,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// interactive attach, which is the thing it exists to beat.
     #[test]
     fn the_launchd_plist_loads_into_the_graphical_login_session() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(plist.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
     }
 
@@ -3859,7 +4208,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// rest of the machine cannot see.
     #[test]
     fn the_systemd_unit_does_not_kill_the_session_it_started() {
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
         // The default control-group kill mode reaps the daemonized server when this oneshot
         // deactivates, so the session it just created dies seconds after appearing.
         assert!(
@@ -3869,7 +4218,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     }
     #[test]
     fn the_launchd_plist_does_not_throttle_the_session() {
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         // ProcessType Background asks launchd to deprioritize CPU and I/O. Panes inherit the
         // server's QoS, so it would throttle every build and long-running job in the session.
         // Omitting the key leaves launchd's Standard default, which is what an interactive
@@ -3883,12 +4232,12 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// spawns - so without this every pane of a session the unit created comes up with TERM=dumb.
     #[test]
     fn every_generated_unit_sets_a_term() {
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None);
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
         assert!(unit.contains(&format!(
-            "Environment=TERM={}\n",
+            "Environment=\"TERM={}\"\n",
             crate::shared::DEFAULT_TERM
         )));
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None);
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(plist.contains(&format!(
             "<key>TERM</key>\n        <string>{}</string>",
             crate::shared::DEFAULT_TERM
@@ -3909,11 +4258,11 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
             .add_launchd_key("TERM", PlistValue::String("screen-256color".to_owned()))
             .unwrap();
 
-        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras));
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras), None);
         assert_eq!(unit.matches("Environment=TERM=").count(), 1);
         assert!(unit.contains("Environment=TERM=screen-256color"));
 
-        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
         assert_eq!(plist.matches("<key>TERM</key>").count(), 1);
         assert!(plist.contains("<key>TERM</key>\n        <string>screen-256color</string>"));
         // and inside EnvironmentVariables, where it means something - launchd has no top-level
@@ -3927,11 +4276,11 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         let units = [
             (
                 "systemd",
-                service_unit(ServiceKind::Systemd, &exe(), "work", None),
+                service_unit(ServiceKind::Systemd, &exe(), "work", None, None),
             ),
             (
                 "launchd",
-                service_unit(ServiceKind::Launchd, &exe(), "work", None),
+                service_unit(ServiceKind::Launchd, &exe(), "work", None, None),
             ),
             ("timer", systemd_timer("work")),
         ];
