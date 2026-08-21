@@ -111,11 +111,23 @@ impl VersionInfo {
     /// `base` is always the part before the first `-`, so an upstream pre-release still reports the
     /// version it is a pre-release of. A suffix that is not `<name>.<number>` leaves `fork` and
     /// `fork_counter` unset - an upstream build has no fork counter to compare.
+    ///
+    /// A release candidate is built with `-rc.<n>` appended to the whole thing, and reports the
+    /// fork counter it is a candidate FOR: `version` keeps the candidate number, `fork_counter`
+    /// does not. The alternative reads `nkmk.17-rc` as the fork name.
     pub fn from_version_string(version: &str) -> Self {
         let (base, suffix) = match version.split_once('-') {
             Some((base, suffix)) => (base, Some(suffix)),
             None => (version, None),
         };
+        let suffix = suffix.map(|suffix| match suffix.rsplit_once("-rc.") {
+            Some((fork, candidate))
+                if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                fork
+            },
+            _ => suffix,
+        });
         let fork_parts =
             suffix
                 .and_then(|suffix| suffix.rsplit_once('.'))
@@ -174,6 +186,28 @@ mod tests {
     #[test]
     fn an_upstream_version_has_no_fork_parts() {
         let parsed = VersionInfo::from_version_string("0.45.0");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork, None);
+        assert_eq!(parsed.fork_counter, None);
+    }
+
+    #[test]
+    fn a_release_candidate_reports_the_counter_it_is_a_candidate_for() {
+        let parsed = VersionInfo::from_version_string("0.45.0-nkmk.17-rc.1");
+        assert_eq!(parsed.base, "0.45.0");
+        assert_eq!(parsed.fork.as_deref(), Some("nkmk"));
+        assert_eq!(parsed.fork_counter, Some(17));
+        assert_eq!(
+            parsed.version, "0.45.0-nkmk.17-rc.1",
+            "the whole string still says which candidate this is"
+        );
+    }
+
+    /// `-rc.` marks a candidate only when a number follows it, so the rule cannot eat the end of a
+    /// suffix that merely looks like one.
+    #[test]
+    fn an_rc_marker_without_a_number_is_left_where_it_is() {
+        let parsed = VersionInfo::from_version_string("0.45.0-nkmk.17-rc.beta");
         assert_eq!(parsed.base, "0.45.0");
         assert_eq!(parsed.fork, None);
         assert_eq!(parsed.fork_counter, None);

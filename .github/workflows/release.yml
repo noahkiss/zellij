@@ -6,10 +6,11 @@ name: Release
 #
 # A RELEASE CANDIDATE is any tag carrying `-rc.` — `v0.45.0-nkmk.12-rc.1`, pushed
 # from the patch branch rather than from main. It builds and publishes exactly
-# like a final tag, with two differences: the GitHub release is marked
-# `--prerelease`, and the tap bump rewrites the SEPARATE `zellij-nkmk-rc` formula
-# instead of `zellij-nkmk`. So proving a patch on a real Mac never touches the
-# formula every machine installs from.
+# like a final tag, with three differences: the workspace version is patched to
+# the tag before building, so the binary reports the candidate it is; the GitHub
+# release is marked `--prerelease`; and the tap bump rewrites the SEPARATE
+# `zellij-nkmk-rc` formula instead of `zellij-nkmk`. So proving a patch on a real
+# Mac never touches the formula every machine installs from.
 
 on:
   push:
@@ -78,6 +79,46 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
+
+      # A candidate has to SAY it is a candidate. The tag is cut from a branch
+      # whose manifests already read the version it is heading for, so `-rc.N`
+      # lives on the tag and nowhere else unless it is baked in here — and the
+      # artifact for `v0.45.0-nkmk.17-rc.1` then reports `0.45.0-nkmk.17`,
+      # indistinguishable from a final release it has not become.
+      #
+      # The three files a `chore: bump version` commit touches, for the same
+      # reason it touches them: the two manifests carry the workspace version
+      # and the path-dependency pins, and `--locked` below reads `Cargo.lock`.
+      # A candidate is the only build that patches its own checkout; a final tag
+      # builds what main says, untouched.
+      - name: Bake the candidate version
+        if: contains(env.RELEASE_TAG, '-rc.')
+        run: |
+          set -euo pipefail
+          current="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          [ -n "$current" ] || { echo "::error::no workspace version in Cargo.toml"; exit 1; }
+
+          # The tag has to be a candidate FOR the version the branch is bumped
+          # to. A tag cut before the bump would otherwise silently rewrite every
+          # pin to a version no crate here claims.
+          case "$RELEASE_VERSION" in
+            "${current}"-rc.*) : ;;
+            *) echo "::error::${RELEASE_TAG} is not a candidate for ${current}"; exit 1 ;;
+          esac
+
+          # `sed -i` is spelled differently on the two runners; a temp file is
+          # not. The pattern is a literal version string, so its dots are
+          # escaped rather than left to match anything.
+          pattern="$(printf '%s' "$current" | sed 's/[][\.^$*|]/\\&/g')"
+          for f in Cargo.toml zellij-integration-tests/Cargo.toml Cargo.lock; do
+            sed "s|${pattern}|${RELEASE_VERSION}|g" "$f" > "${f}.rc"
+            mv "${f}.rc" "$f"
+            grep -q -F "$RELEASE_VERSION" "$f" \
+              || { echo "::error::${RELEASE_VERSION} did not reach ${f}"; exit 1; }
+          done
+          grep -qx "version = \"${RELEASE_VERSION}\"" Cargo.toml \
+            || { echo "::error::the workspace version was not rewritten"; exit 1; }
+          echo "building ${current} as ${RELEASE_VERSION}"
 
       - name: Install build dependencies (linux)
         if: runner.os == 'Linux'
