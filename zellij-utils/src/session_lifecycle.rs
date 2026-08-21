@@ -65,12 +65,23 @@ pub fn parse_server_processes(ps_output: &str) -> Vec<ServerProcess> {
 /// `ps` rather than `/proc`, because this has to answer the same question on the BSDs and on macOS.
 /// Sockets are not consulted at all: the point of the scan is to find servers this environment
 /// cannot reach, and an unreachable server has no socket here to be found by.
+/// What the scan asks `ps` for.
+///
+/// **`-ww` is load-bearing.** BSD `ps` - which is macOS's - sizes its output from `COLUMNS` or a
+/// `TIOCGWINSZ`, and truncates every line to it; only `-ww` makes the width unlimited. A server's
+/// argv is `/opt/homebrew/bin/zellij --server /var/folders/xx/.../T/zellij-501/zellij-<contract>/
+/// <name>`, well past eighty columns, and the socket path is the LAST field - so a cut line makes
+/// `parse_server_processes` read a truncated socket, `servers_for_session` return nothing for a
+/// healthy session, `session status` print `running no`, and the guard that refuses to create a
+/// second server for a name stop guarding.
+///
+/// Accepted by procps and by BSD `ps` alike, which the test below asserts by running it.
+#[cfg(unix)]
+const PS_ARGS: &[&str] = &["-ww", "-eo", "pid=,command="];
+
 #[cfg(unix)]
 pub fn running_servers() -> Vec<ServerProcess> {
-    let output = match std::process::Command::new("ps")
-        .args(["-eo", "pid=,command="])
-        .output()
-    {
+    let output = match std::process::Command::new("ps").args(PS_ARGS).output() {
         Ok(output) => output,
         Err(e) => {
             log::debug!("Could not list processes: {}", e);
@@ -2533,6 +2544,27 @@ mod tests {
         PIN_REFUSALS.lock().unwrap().push(pin.clone());
         assert!(pin_refusal_already_said(&pin));
         assert!(!pin_refusal_already_said(Path::new("/nowhere/another-pin")));
+    }
+
+    /// The scan's argv has to be one BOTH `ps` implementations accept, and there is no way to know
+    /// that except by running it. `-ww` is the flag that stops BSD `ps` cutting each line to the
+    /// terminal width; a cut line loses the socket path, which is the last field, and a healthy
+    /// session then looks like no session at all.
+    #[test]
+    #[cfg(unix)]
+    fn the_process_scan_asks_ps_for_untruncated_lines() {
+        assert_eq!(PS_ARGS[0], "-ww");
+        let output = std::process::Command::new("ps")
+            .args(PS_ARGS)
+            .output()
+            .expect("ps is on every unix this builds for");
+        assert!(
+            output.status.success(),
+            "this platform's ps rejected {:?}: {}",
+            PS_ARGS,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty(), "ps listed no processes at all");
     }
 
     #[test]

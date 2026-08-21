@@ -376,6 +376,7 @@ pub struct RecordedCommander {
     answers: HashMap<String, CommandOutput>,
     fallback: CommandOutput,
     calls: Mutex<Vec<String>>,
+    creates: Vec<(String, std::path::PathBuf)>,
 }
 
 impl RecordedCommander {
@@ -394,7 +395,19 @@ impl RecordedCommander {
                 stderr: String::from("not recorded"),
             },
             calls: Mutex::new(Vec::new()),
+            creates: Vec::new(),
         }
+    }
+
+    /// Have a scripted command also CREATE a file, the way the real one would.
+    ///
+    /// `openssl` writes a key and a bundle, and the code that goes on to lock those files down
+    /// cannot be reached by a script that only returns text - so a test could drive a mint up to
+    /// its failure and never past it. Opt-in, so every commander that does not ask for this still
+    /// touches nothing.
+    pub fn creating(mut self, needle: &str, path: std::path::PathBuf) -> Self {
+        self.creates.push((needle.to_owned(), path));
+        self
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -424,6 +437,11 @@ impl Commander for RecordedCommander {
             .collect::<Vec<_>>()
             .join(" ");
         self.calls.lock().unwrap().push(line.clone());
+        for (needle, path) in &self.creates {
+            if line.contains(needle.as_str()) {
+                let _ = std::fs::write(path, b"");
+            }
+        }
         Ok(self
             .answers
             .get(&line)
@@ -466,6 +484,9 @@ pub enum StartResult {
     },
     /// Nothing to judge: the unit has never run, or systemd was not there to ask.
     Unknown,
+    /// systemd has no definition to judge a run by. `load_state` is its own word - `not-found` for
+    /// a unit that was never installed, `masked` for one that cannot start at all.
+    NotLoaded { load_state: String },
 }
 
 /// Read the last run out of `systemctl show`.
@@ -474,7 +495,21 @@ pub enum StartResult {
 /// failed and exited is `inactive` in exactly the same way as one that has never run at all. The
 /// exit status comes along because "exit-code" without the code sends the reader back to the
 /// journal for the one number they needed.
+///
+/// `LoadState` is consulted FIRST, and it has to be: systemd answers `Result=success` and
+/// `ExecMainStatus=0` for a unit it has never heard of, exit 0. Verified -
+/// `systemctl --user show zellij-session-nosuch-xyz.service` prints exactly that beside
+/// `LoadState=not-found`. Without this, a machine with nothing installed had "the last run of the
+/// unit succeeded" filed under **Already correct**. A caller that does not ask for `LoadState` gets
+/// the older behaviour rather than a wrong one.
 pub fn last_start_result(properties: &HashMap<String, String>) -> StartResult {
+    if let Some(load_state) = properties.get("LoadState") {
+        if load_state != "loaded" {
+            return StartResult::NotLoaded {
+                load_state: load_state.to_owned(),
+            };
+        }
+    }
     let Some(result) = properties.get("Result") else {
         return StartResult::Unknown;
     };
@@ -660,10 +695,59 @@ NRestarts=0
 Environment=PATH=/usr/bin:/bin
 ";
 
+    /// Recorded from `systemctl --user show <a name nothing installed>.service`, which exits 0.
+    const MISSING_SHOW: &str = "\
+Result=success
+ExecMainStatus=0
+LoadState=not-found
+ActiveState=inactive
+";
+
     #[test]
     fn a_healthy_unit_reports_success() {
         let properties = parse_show_properties(HEALTHY_SHOW);
         assert_eq!(last_start_result(&properties), StartResult::Success);
+    }
+
+    #[test]
+    fn a_unit_systemd_never_heard_of_is_not_a_successful_run() {
+        // systemd answers Result=success and exit 0 for a name nothing installed, so a report that
+        // reads only Result files "the launcher ran fine" for a machine with no launcher
+        let properties = parse_show_properties(MISSING_SHOW);
+        assert_eq!(
+            properties.get("Result").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            last_start_result(&properties),
+            StartResult::NotLoaded {
+                load_state: String::from("not-found")
+            }
+        );
+    }
+
+    #[test]
+    fn a_masked_unit_keeps_systemds_own_word_for_it() {
+        let properties = parse_show_properties("Result=success\nLoadState=masked\n");
+        assert_eq!(
+            last_start_result(&properties),
+            StartResult::NotLoaded {
+                load_state: String::from("masked")
+            }
+        );
+    }
+
+    #[test]
+    fn a_loaded_unit_is_still_judged_by_its_result() {
+        let properties =
+            parse_show_properties("Result=exit-code\nExecMainStatus=1\nLoadState=loaded\n");
+        assert_eq!(
+            last_start_result(&properties),
+            StartResult::Failed {
+                result: String::from("exit-code"),
+                exit_status: Some(String::from("1")),
+            }
+        );
     }
 
     #[test]
