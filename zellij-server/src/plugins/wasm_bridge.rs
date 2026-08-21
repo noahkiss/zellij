@@ -678,8 +678,19 @@ impl WasmBridge {
         // everything that can refuse the reload is checked before any pending state is created:
         // a bail after the fact orphans the cached-events entry and the loading_plugins entry,
         // which starves the still-running instance and wedges later reloads for this location
-        let Some(first_client_id) = self.get_first_client_id() else {
-            log::error!("No connected clients, cannot reload plugin.");
+        // fork addition: a connected client is preferred, as everywhere else that picks one. But a
+        // detached session has none, and a plugin running in one is not thereby unreloadable - the
+        // id is only the key its instance sits under in the plugin map, and the instance already
+        // has one. Asking the map for it means the reload replaces that entry rather than adding a
+        // second beside it, which is what any freshly invented id would have done
+        let Some(first_client_id) = self
+            .get_first_client_id()
+            .or_else(|| self.client_id_of_running_plugin(plugin_id))
+        else {
+            log::error!(
+                "No client to reload plugin {} for, and it is not running.",
+                plugin_id
+            );
             return Ok(());
         };
         // fork addition: all four of these used to be read off the RUNNING instance and nowhere
@@ -2126,6 +2137,20 @@ impl WasmBridge {
             .iter()
             .next()
             .copied()
+    }
+    /// fork addition: the client this plugin's instance is keyed under in the plugin map.
+    ///
+    /// Not a connected client, necessarily - a session everybody has detached from keeps the id of
+    /// whoever loaded the plugin, and that id is what addresses the instance. See
+    /// `reload_plugin_with_id`, which needs one and can be called with nobody attached.
+    fn client_id_of_running_plugin(&self, plugin_id: PluginId) -> Option<ClientId> {
+        self.plugin_map
+            .lock()
+            .unwrap()
+            .all_plugin_ids()
+            .into_iter()
+            .find(|(p_id, _client_id)| *p_id == plugin_id)
+            .map(|(_p_id, client_id)| client_id)
     }
     pub fn update_available_layouts(
         &mut self,
