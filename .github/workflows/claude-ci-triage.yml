@@ -1,0 +1,140 @@
+#
+# One-time setup beyond the secret:
+#   gh label create claude-triage --description "Opened by the CI triage agent" --color BFD4F2
+# The prompt tells Claude to create the label if it is missing, but making it by
+# hand keeps the first run tidy.
+#
+# workflow_run fires from the DEFAULT branch's copy of this file, whatever branch
+# failed. So this file only takes effect once it is on main.
+
+name: Claude CI triage
+
+on:
+  workflow_run:
+    workflows: ["Rust", "End to End tests", "Release"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  triage:
+    # Only failures, and never a failure on a branch this workflow itself created —
+    # that is the loop guard. A null head_branch makes startsWith false, so a run
+    # with no branch still gets triaged rather than silently skipped.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      !startsWith(github.event.workflow_run.head_branch, 'claude/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: claude-triage
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+
+    steps:
+      - name: Check out the commit that failed
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Triage the failure
+        uses: anthropics/claude-code-action@v1
+        env:
+          # Job-level env does not reach a composite action's steps, so the gh
+          # token is set on this step. Pushes made with GITHUB_TOKEN do not
+          # start new workflow runs, which backs up the head_branch loop guard.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: '--allowed-tools "Bash(gh:*),Bash(git:*),Bash(cargo:*),Read,Grep,Glob,Edit,Write" --max-turns 40'
+          prompt: |
+            A CI run just failed in this repository. Diagnose it, then either
+            propose a fix as a pull request or write up what you found as an
+            issue. Do exactly one of those two things.
+
+            The failed run:
+
+            - workflow: ${{ github.event.workflow_run.name }}
+            - run id: ${{ github.event.workflow_run.id }}
+            - run url: ${{ github.event.workflow_run.html_url }}
+            - head branch: ${{ github.event.workflow_run.head_branch }}
+            - head sha: ${{ github.event.workflow_run.head_sha }}
+            - repository: ${{ github.repository }}
+
+            That head sha is checked out for you already.
+
+            Step 1 — read the failure.
+
+                gh run view ${{ github.event.workflow_run.id }} --repo ${{ github.repository }} --log-failed
+
+            Read enough of it to name the actual error, not the step that
+            reported it. `gh run view <id> --repo <repo> --json jobs` tells you
+            which job died if the log is long.
+
+            Step 2 — understand this repository before you touch it. It is a
+            personal fork of zellij carrying a patch series. Read AGENTS.md and
+            FORK.md. Two traps live there and cause most red runs:
+
+            - `zellij-utils` must also compile for wasm. The plugin crates are
+              checked in prebuilt, so a local build stays green while
+              `cargo xtask build` in CI fails. If the error is a wasm one, the
+              fix is almost always that an ungated module referenced something
+              behind `#[cfg(not(target_family = "wasm"))]`.
+            - There is no Windows job and Windows is not a shipped target. Do
+              not spend effort on a Windows-only failure.
+
+            Step 3 — decide, honestly.
+
+            CONFIDENT — you can name the cause and the fix is small and local:
+
+                git switch -c claude/fix-${{ github.event.workflow_run.id }}
+                # make the fix
+                git commit -m "fix(<scope>): <what>"
+                git push -u origin claude/fix-${{ github.event.workflow_run.id }}
+                gh pr create \
+                  --base ${{ github.event.workflow_run.head_branch }} \
+                  --title "[triage] <what the fix does>" \
+                  --label claude-triage \
+                  --body "<the diagnosis, the fix, and how you know>"
+
+            Follow this repo's conventions: conventional commit subjects scoped
+            to the area, `cargo fmt` before committing, no AI or agent
+            attribution footer in the commit or the PR body — ever. If
+            `--label claude-triage` fails because the label does not exist,
+            create it with `gh label create claude-triage` and retry once.
+
+            NOT CONFIDENT — the cause is unclear, the fix is large, it spans the
+            patch series, or it looks like flake:
+
+                gh issue list --repo ${{ github.repository }} --state open --search "CI failure triage"
+
+            If an open issue already covers this failure, add a comment with the
+            new run and what you learned. Otherwise:
+
+                gh issue create \
+                  --title "CI failure triage: ${{ github.event.workflow_run.name }} on ${{ github.event.workflow_run.head_branch }}" \
+                  --label claude-triage \
+                  --body "<diagnosis, the run url, the error, what you ruled out, what you would try next>"
+
+            Saying "I could not work this out" in an issue is a good outcome. A
+            speculative PR is not.
+
+            Hard rules — these are not negotiable:
+
+            - NEVER push to `main`, and never to a branch matching `rc/*`. Your
+              only branch is `claude/fix-${{ github.event.workflow_run.id }}`.
+            - NEVER edit anything under `.github/workflows/`. If the workflow
+              itself is the bug, open an issue saying so.
+            - NEVER create or move a git tag. Tags cut releases here.
+            - NEVER force-push, and never rewrite history.
+            - Do not bump the version in `Cargo.toml`. That is its own commit,
+              made when a release is cut.
+            - ONE pull request or ONE issue for this run. Not both, not several.
