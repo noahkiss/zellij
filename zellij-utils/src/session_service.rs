@@ -1034,6 +1034,21 @@ pub struct SessionServiceOptions {
     /// there: `session_name`. Nothing else is managed, so `zellij -s scratch` is untouched by this.
     #[serde(default)]
     pub managed_session: Option<bool>,
+    /// How often the watchdog re-runs `session up`, in seconds. Unset is
+    /// [`CHECK_INTERVAL_SECS`].
+    ///
+    /// One key for both platforms because the two watchdogs are meant to tick together - the
+    /// systemd timer exists so that Linux matches what `StartInterval` already gave macOS, and a
+    /// pair of keys would let them drift apart in a config that reads as if it had set the
+    /// interval. On Linux it is `OnBootSec=` and `OnUnitActiveSec=` in the generated timer; on
+    /// macOS it is the DEFAULT for the plist's `StartInterval`, so an explicit `StartInterval` in
+    /// the launchd extras still wins - that key names launchd's own spelling and is the more
+    /// specific of the two.
+    ///
+    /// Seconds, and a bare integer, because that is what launchd's key means and what systemd
+    /// reads a unitless time span as. Nothing here writes a systemd time span like `15min`.
+    #[serde(default)]
+    pub watchdog_interval_secs: Option<u64>,
 }
 
 /// Literal directive lines, per section of the generated `.service` file.
@@ -1124,6 +1139,7 @@ impl SessionServiceOptions {
             && self.pin_exe.is_none()
             && self.restart_via_launchd.is_none()
             && self.managed_session.is_none()
+            && self.watchdog_interval_secs.is_none()
     }
 
     /// Whether anything here is written INTO a unit. `pin_exe` is in this block but is not one of
@@ -1160,6 +1176,12 @@ impl SessionServiceOptions {
     /// machine that has never asked for one.
     pub fn managed_session(&self) -> bool {
         self.managed_session.unwrap_or(false)
+    }
+
+    /// How often the watchdog re-checks the session, in seconds. Unset is the generator's own
+    /// interval, so a config that says nothing produces the file it produced before.
+    pub fn watchdog_interval_secs(&self) -> u64 {
+        self.watchdog_interval_secs.unwrap_or(CHECK_INTERVAL_SECS)
     }
 
     /// Add a literal directive line to one section of the generated service file.
@@ -1384,7 +1406,19 @@ fn xml_escape(text: &str) -> String {
 
 /// How often the scheduler re-runs `session up`. The command is idempotent, so a pass over a
 /// healthy session is a no-op and a pass over a missing one restores it.
+///
+/// The default rather than the rule: `watchdog_interval_secs` in the `session_service` block
+/// replaces it, on both platforms at once.
 const CHECK_INTERVAL_SECS: u64 = 60;
+
+/// [`SessionServiceOptions::watchdog_interval_secs`] for a generator that may have no
+/// `session_service` block at all, which is the ordinary case and the one that must keep writing
+/// the file it wrote before.
+fn configured_check_interval(extras: Option<&SessionServiceOptions>) -> u64 {
+    extras
+        .map(|extras| extras.watchdog_interval_secs())
+        .unwrap_or(CHECK_INTERVAL_SECS)
+}
 
 /// The launchd session type an agent for a graphical login belongs to.
 ///
@@ -1644,7 +1678,7 @@ WantedBy=default.target
         session = session,
         quoted_exe = unit_quote(&exe.display().to_string()),
         quoted_session = unit_quote(session),
-        interval = CHECK_INTERVAL_SECS,
+        interval = extras.watchdog_interval_secs(),
         term = term,
         path = path,
         state_home = state_home,
@@ -1662,7 +1696,11 @@ WantedBy=default.target
 /// two platforms would not behave the same: a session that died at 3am would come back at the next
 /// login on Linux and within a minute on macOS. The service is enabled as well as the timer, so the
 /// session is created at login and re-checked on the interval, which is what the plist does.
-fn systemd_timer(session: &str) -> String {
+///
+/// It takes the whole `session_service` block for one value out of it, `watchdog_interval_secs`.
+/// Nothing else in the config reaches this file: the `systemd` sub-block writes directives into the
+/// SERVICE, and there is deliberately no `timer` section to write into this one.
+fn systemd_timer(session: &str, extras: Option<&SessionServiceOptions>) -> String {
     format!(
         "\
 # Watchdog for {unit} - write to ~/.config/systemd/user/{timer}
@@ -1682,7 +1720,7 @@ Unit={unit}
 WantedBy=timers.target
 ",
         session = session,
-        interval = CHECK_INTERVAL_SECS,
+        interval = configured_check_interval(extras),
         unit = systemd_service_name(session),
         timer = systemd_timer_name(session),
     )
@@ -1782,6 +1820,9 @@ fn launchd_plist(
     state_home: Option<&Path>,
 ) -> String {
     let extras = extras.cloned().unwrap_or_default();
+    // Read before `launchd` is moved out below, and kept as the default `StartInterval` rather than
+    // applied here: the launchd extras name launchd's own key and are the more specific of the two.
+    let configured_interval = extras.watchdog_interval_secs();
     // Every one of these is a value the generator owns a DEFAULT for rather than a part of the
     // plist it owns outright, so a config entry naming one replaces the value instead of being
     // refused. TERM and PATH are environment variables, not plist keys - launchd has no top-level
@@ -1805,7 +1846,7 @@ fn launchd_plist(
         .unwrap_or_else(|| GUI_SESSION_TYPE.to_owned());
     let run_at_load = take_default_bool(&mut keys, "RunAtLoad").unwrap_or(true);
     let interval =
-        take_default_integer(&mut keys, "StartInterval").unwrap_or(CHECK_INTERVAL_SECS as i64);
+        take_default_integer(&mut keys, "StartInterval").unwrap_or(configured_interval as i64);
     // Not a plist key either: it goes inside EnvironmentVariables like TERM and PATH, and unlike
     // them it is absent altogether when this machine has no absolute one to record.
     let state_home = take_default_key(&mut keys, "XDG_STATE_HOME")
@@ -2091,7 +2132,7 @@ pub fn service_files(
                 ServiceFile {
                     role: "timer",
                     path: dir.join(&timer),
-                    contents: systemd_timer(session),
+                    contents: systemd_timer(session, extras),
                     unit: timer,
                 },
             ]
@@ -3532,7 +3573,7 @@ mod tests {
     /// exactly the case the unit exists for.
     #[test]
     fn the_linux_timer_re_checks_as_often_as_the_plist_does() {
-        let timer = systemd_timer("work");
+        let timer = systemd_timer("work", None);
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
         assert!(timer.contains(&format!("OnUnitActiveSec={}", CHECK_INTERVAL_SECS)));
         assert!(timer.contains("Unit=zellij-session-work.service"));
@@ -3540,6 +3581,103 @@ mod tests {
             "<key>StartInterval</key>\n    <integer>{}</integer>",
             CHECK_INTERVAL_SECS
         )));
+    }
+
+    /// One key, both platforms. It is the same sentence as the test above, said about a configured
+    /// interval rather than the built-in one: whatever the two watchdogs tick at, they tick
+    /// together.
+    #[test]
+    fn the_configured_interval_retimes_both_watchdogs() {
+        let extras = SessionServiceOptions {
+            watchdog_interval_secs: Some(15),
+            ..Default::default()
+        };
+        let timer = systemd_timer("work", Some(&extras));
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
+        // both, because the boot pass and the steady-state pass are the same check
+        assert!(timer.contains("OnBootSec=15"), "in {}", timer);
+        assert!(timer.contains("OnUnitActiveSec=15"), "in {}", timer);
+        assert!(
+            plist.contains("<key>StartInterval</key>\n    <integer>15</integer>"),
+            "in {}",
+            plist
+        );
+        assert_eq!(plist.matches("<key>StartInterval</key>").count(), 1);
+    }
+
+    /// The service file only TALKS about the interval, in the comment that tells a reader what the
+    /// paired timer does. It is asserted anyway: a comment that says 60 beside a timer that says 15
+    /// is how the next person learns the wrong number.
+    #[test]
+    fn the_service_comment_quotes_the_interval_its_timer_uses() {
+        let extras = SessionServiceOptions {
+            watchdog_interval_secs: Some(15),
+            ..Default::default()
+        };
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras), None);
+        assert!(
+            unit.contains("re-runs the same command every 15s"),
+            "in {}",
+            unit
+        );
+    }
+
+    /// `StartInterval` is launchd's own spelling of this and names one platform, so it is the more
+    /// specific of the two and wins. The neutral key is the default it falls back to.
+    #[test]
+    fn an_explicit_start_interval_beats_the_neutral_key() {
+        let mut extras = SessionServiceOptions {
+            watchdog_interval_secs: Some(15),
+            ..Default::default()
+        };
+        extras
+            .add_launchd_key("StartInterval", PlistValue::Integer(300))
+            .unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None);
+        assert!(
+            plist.contains("<key>StartInterval</key>\n    <integer>300</integer>"),
+            "in {}",
+            plist
+        );
+        assert_eq!(plist.matches("<key>StartInterval</key>").count(), 1);
+        // and it is a macOS key, so it says nothing about the Linux timer
+        assert!(systemd_timer("work", Some(&extras)).contains("OnUnitActiveSec=15"));
+    }
+
+    /// The whole point of the default: a config that has never heard of this key writes the file it
+    /// wrote before.
+    #[test]
+    fn an_unset_interval_writes_the_files_it_always_wrote() {
+        let extras = SessionServiceOptions::default();
+        assert_eq!(
+            systemd_timer("work", Some(&extras)),
+            systemd_timer("work", None)
+        );
+        assert_eq!(
+            service_unit(ServiceKind::Systemd, &exe(), "work", Some(&extras), None),
+            service_unit(ServiceKind::Systemd, &exe(), "work", None, None)
+        );
+        assert_eq!(
+            service_unit(ServiceKind::Launchd, &exe(), "work", Some(&extras), None),
+            service_unit(ServiceKind::Launchd, &exe(), "work", None, None)
+        );
+        assert!(extras.is_empty());
+    }
+
+    /// `enable` writes what `status` compares against, so the timer the installer produces has to be
+    /// the configured one - otherwise a machine reports drift against a file it just wrote.
+    #[test]
+    fn the_installed_timer_carries_the_configured_interval() {
+        let extras = SessionServiceOptions {
+            watchdog_interval_secs: Some(15),
+            ..Default::default()
+        };
+        let files = service_files(ServiceKind::Systemd, &exe(), "work", Some(&extras)).unwrap();
+        let timer = files
+            .iter()
+            .find(|file| file.role == "timer")
+            .expect("a systemd install has a timer");
+        assert!(timer.contents.contains("OnUnitActiveSec=15"));
     }
 
     #[test]
@@ -4398,7 +4536,7 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
                 "launchd",
                 service_unit(ServiceKind::Launchd, &exe(), "work", None, None),
             ),
-            ("timer", systemd_timer("work")),
+            ("timer", systemd_timer("work", None)),
         ];
         for (kind, unit) in units {
             for line in unit.lines().filter(|l| !l.trim_start().starts_with('#')) {
