@@ -407,6 +407,19 @@ impl WasmBridge {
                                         e,
                                         Some(client_id),
                                     );
+                                    // Every other failure path reaches `execute_plugin_load`,
+                                    // whose closure always ends by sending this - it's what takes
+                                    // `plugin_id` out of `loading_plugins`. Bailing here before
+                                    // that closure ever runs left it there forever: parked as
+                                    // "currently loading" (see `plugin_is_currently_being_loaded`)
+                                    // for the rest of the session, so this location could never be
+                                    // reloaded again.
+                                    let _ = senders.send_to_plugin(
+                                        PluginInstruction::ApplyCachedEvents {
+                                            plugin_ids: vec![plugin_id],
+                                            done_receiving_permissions: false,
+                                        },
+                                    );
                                     return;
                                 },
                             }
