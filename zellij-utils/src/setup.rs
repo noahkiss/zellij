@@ -775,8 +775,8 @@ impl Setup {
         config_options: &Options,
     ) {
         use crate::session_service::{
-            configured_pinned_exe, path_dirs, resolve_service_exe, service_unit, ServiceExe,
-            ServiceKind,
+            configured_pinned_exe, path_dirs, resolve_service_exe, service_unit,
+            state_home_for_unit, ServiceExe, ServiceKind,
         };
 
         let Some(kind) = ServiceKind::from_name(init) else {
@@ -815,11 +815,15 @@ impl Setup {
         let mut out = std::io::stdout();
         // the same generator `zellij session enable` uses, so what is printed here is what would
         // be installed - including whatever `session_service` in the config adds
+        // the state root an already-installed unit records, so what is printed is what `session
+        // enable` would install rather than what this shell's environment happens to resolve
+        let state_home = state_home_for_unit(kind, &session);
         let unit = service_unit(
             kind,
             exe.path(),
             &session,
             config_options.session_service.as_ref(),
+            state_home.as_deref(),
         );
         let _ = out.write_all(unit.as_bytes());
     }
