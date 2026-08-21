@@ -4772,6 +4772,14 @@ right after the pin, whose only job was to be a change that *does* report, so th
 show up in the pane manifest the test then inspected. The workaround is gone now that pinning
 reports on its own.
 
+The two **toggles** were missing the same two lines and now have them:
+`TogglePanePinned`, which is the keybinding's route, and `TogglePanePinnedWithPaneId`, which is
+`zellij action toggle-pane-pinned --pane-id`. Both mutated pin state and stopped, so a toggled pin
+was as invisible to a subscriber as a plugin-set one was. No test workaround stood on these — the
+only tests that reach them are a `MockScreen` smoke test that asserts nothing about the report and a
+`Tab`-level unit test below the handler — so unlike the plugin path there was nothing to delete as
+proof.
+
 ### A failed remote plugin download parked every later reload of it
 
 Loading a plugin from a `Remote` location downloads it before the loader ever runs, on a path
