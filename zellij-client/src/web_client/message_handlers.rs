@@ -334,7 +334,9 @@ mod tests {
             _resize_receiver: Option<std::sync::mpsc::Receiver<()>>,
         ) {
         }
-        fn connect_to_server(&self, _path: &Path) {}
+        fn connect_to_server(&self, _path: &Path) -> Result<(), String> {
+            Ok(())
+        }
         fn load_palette(&self) -> Palette {
             Palette::default()
         }

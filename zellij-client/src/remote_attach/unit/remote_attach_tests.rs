@@ -418,7 +418,9 @@ impl crate::os_input_output::ClientOsApi for MockClientOsApi {
     ) {
     }
 
-    fn connect_to_server(&self, _path: &std::path::Path) {}
+    fn connect_to_server(&self, _path: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
 
     fn load_palette(&self) -> zellij_utils::data::Palette {
         zellij_utils::shared::default_palette()

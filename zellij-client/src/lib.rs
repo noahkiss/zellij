@@ -1210,7 +1210,9 @@ pub fn start_client(
         },
     };
 
-    os_input.connect_to_server(&*ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*ipc_pipe) {
+        exit_after_startup_error(Some(terminal_teardown), e);
+    }
     os_input.send_to_server(first_msg);
 
     let mut command_is_executing = CommandIsExecuting::new();
@@ -1797,7 +1799,9 @@ pub fn start_server_detached(
         },
     };
 
-    os_input.connect_to_server(&*ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*ipc_pipe) {
+        exit_after_startup_error(None, e);
+    }
     os_input.send_to_server(first_msg);
 }
 
