@@ -5119,6 +5119,35 @@ Verified against `0.45.0-nkmk.15`, which answers `Unknown session_service entry:
 and refuses the file. It cannot be seeded into a shared config ahead of the binary; it ships with
 the code that accepts it.
 
+### A plugin that failed says so afterwards
+
+A command pane that fails is marked `error:exit 7` and stays marked. A plugin pane that fails was
+not marked at all. It printed `ERROR IN PLUGIN` into its own body and flashed its frame red for a
+second, and neither of those is a mark: the body text goes the moment anything is drawn over it,
+the flash is gone before anyone reading a session back could see it, and nothing outside the server
+could read either. A session with a broken plugin looked, to `list-panes`, exactly like a session
+without one.
+
+It gets the same note the failed command pane gets — `error:plugin failed`, on the frame and in
+`list-panes`, `list-tree` and `PaneInfo`. The wording says the kind of failure rather than the
+error itself, because the loader's error is a formatted chain several lines long and a note is one
+short line; the pane's body still carries the whole of it.
+
+- **A runtime panic is marked too**, not only a load that never started. A crash is reported
+  through the same path a failed load is, so a plugin that came up and later died carries the mark
+  as well.
+- **The mark belongs to the attempt that ended.** It is cleared when the next load attempt starts,
+  which is where a re-run command pane drops its `exit 7`, and not when one succeeds — so a reload
+  that fails again re-marks the pane a moment later, and a reload that hangs leaves no stale claim
+  of failure standing.
+- Clearing on a reload takes a note somebody set by hand on that pane with it. That is what
+  re-running a command pane does to its note, and the two behaving differently would be worse.
+
+The frame's red flash (`AddRedPaneFrameColorOverride`) was the obvious hook and is the wrong one
+twice over: it is a one-second animation, and it is the same field the multi-select highlight uses,
+so a durable mark stored there would be wiped by unrelated UI and suppressed for as long as the
+pane sits in a selection group.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

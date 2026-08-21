@@ -38,6 +38,13 @@ use zellij_utils::{
     shared::make_terminal_title,
 };
 
+/// fork addition: the note the server leaves on a plugin pane whose plugin failed.
+///
+/// The counterpart of the `exit 7` a failed command pane gets. It says the kind of failure rather
+/// than the error itself: the loader's error is a formatted chain several lines long, and a note is
+/// one short line on a pane frame. The pane's body still carries the full text.
+const PLUGIN_FAILURE_NOTE: &str = "plugin failed";
+
 macro_rules! style {
     ($fg:expr) => {
         ansi_term::Style::new().fg(match $fg {
@@ -836,12 +843,24 @@ impl Pane for PluginPane {
         self.handle_plugin_bytes_for_all_clients(
             self.loading_indication.to_string().as_bytes().to_vec(),
         );
+        // fork addition: a plugin that failed leaves its own note, exactly as a command pane that
+        // exited non-zero does. The pane's body says ERROR IN PLUGIN, but that text goes the moment
+        // anything else is drawn over it and nothing outside the server could read it at all - the
+        // note is the durable mark, and `list-panes` prints it. It covers a runtime panic too: a
+        // crash is reported through this same path
+        if self.loading_indication.is_error() {
+            self.set_pane_note(Some((PLUGIN_FAILURE_NOTE.to_owned(), NoteColor::Error)));
+        }
     }
     fn start_loading_indication(&mut self, loading_indication: LoadingIndication) {
         self.loading_indication.merge(loading_indication);
         self.handle_plugin_bytes_for_all_clients(
             self.loading_indication.to_string().as_bytes().to_vec(),
         );
+        // see `TerminalPane::rerun`: the mark describes the attempt that ended, and this is a new
+        // one. Clearing it here rather than on success means a reload that fails again re-marks the
+        // pane a moment later, and a reload that hangs leaves no stale claim of failure
+        self.set_pane_note(None);
     }
     fn progress_animation_offset(&mut self) {
         if self.loading_indication.ended {
