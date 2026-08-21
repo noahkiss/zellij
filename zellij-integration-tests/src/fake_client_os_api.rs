@@ -197,23 +197,26 @@ impl ClientOsApi for FakeClientOsApi {
             }
         }
     }
-    fn connect_to_server(&self, path: &Path) {
-        let socket;
-        loop {
+    fn connect_to_server(&self, path: &Path) -> Result<(), String> {
+        // A generous bound, not the production 5s: this fake spawns a real server subprocess and
+        // waits for its socket the same way, but a loaded test box can be slower to schedule it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let socket = loop {
             match zellij_utils::consts::ipc_connect(path) {
-                Ok(sock) => {
-                    socket = sock;
-                    break;
-                },
-                Err(_) => {
+                Ok(sock) => break sock,
+                Err(e) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!("test server never appeared at {:?}: {}", path, e));
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 },
             }
-        }
+        };
         let ipc_sender = IpcSenderWithContext::new(socket);
         let ipc_receiver = ipc_sender.get_receiver();
         *self.send_instructions_to_server.lock().unwrap() = Some(ipc_sender);
         *self.receive_instructions_from_server.lock().unwrap() = Some(ipc_receiver);
+        Ok(())
     }
     fn spawn_server(&self, socket_path: &Path, _debug: bool) -> Result<(), std::io::Error> {
         if let Some(server_spawner) = self.server_spawner.lock().unwrap().take() {
