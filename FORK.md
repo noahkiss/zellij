@@ -2175,6 +2175,10 @@ generated for you. A watchdog interval is a local fact, and this block is now th
 local fact has into the file. A test asserts that every key the hand-written agents carried is
 expressible, and that each lands in the plist exactly once.
 
+`StartInterval` later grew a platform-neutral sibling, `watchdog_interval_secs`, which sets the
+same interval on both init systems at once; this hatch still wins over it on macOS, and the entry
+for that key says why.
+
 ### A pinned copy of the binary (`pin_exe`)
 
 ```kdl
@@ -5373,6 +5377,57 @@ anything. An id form is looked up like a handle or a uuid: it needs nothing from
 `close-tab` is left as it was. Its `--tab-id` is a stable id rather than a name to resolve, and
 answering it means a different query against a different list, for no change in what the prompt is
 about.
+
+### `watchdog_interval_secs`: one key retimes the watchdog on both platforms
+
+macOS could already be retimed and Linux could not. `StartInterval` is a plist key, so it went
+through the `launchd { keys { … } }` hatch like any other; the systemd timer's `OnBootSec=` and
+`OnUnitActiveSec=` were written from a constant, and the `systemd` sub-block has no `timer` section
+to reach them through — deliberately, since everything in that block writes into the *service*.
+So the one file the interval actually lives in on Linux was the one file the config could not
+touch.
+
+```kdl
+session_service {
+    watchdog_interval_secs 15
+}
+```
+
+Seconds, a whole number, at least 1. It is one neutral key rather than a pair because the two
+watchdogs are meant to tick together — the systemd timer exists so that Linux matches what
+`StartInterval` already gave macOS, and two keys would let a config drift the platforms apart while
+reading as if it had set *the* interval. Seconds and a bare integer because that is what launchd's
+key means and what systemd reads a unitless time span as; nothing here writes `15min`.
+
+**Linux**: both `OnBootSec=` and `OnUnitActiveSec=`, since the boot pass and the steady-state pass
+are the same check. The service file's own comment quotes the same number — it explains what the
+paired timer does, and a comment saying 60 beside a timer saying 15 is how the next person learns
+the wrong number.
+
+**macOS**: it becomes the DEFAULT for `StartInterval`, not an override of it. Resolution order is
+an explicit `launchd { keys { StartInterval N } }`, then this key, then the built-in 60. The extra
+wins because it names launchd's own spelling and therefore one platform, which is the more specific
+of the two statements; the key is the fleet-wide default it falls back to. The key is still taken
+out of the extras and written once, so the plist is a plist.
+
+Unset, every generated file is byte-identical to what it was — asserted by comparing the output of
+all three generators against a default block.
+
+**A changed interval is drift, not an upgrade.** Nothing rewrites a unit because a config file
+changed: `session status` compares the installed files against what this build would generate, and
+the timer is one of the files `service_files` yields, so a machine whose config now says 15 reports
+the timer as drifted until `session enable` is re-run there. That is per machine, and it is the
+same shape as every other key in this block.
+
+`zellij setup --dump-service` still prints the service or the plist and never the timer, which is
+left exactly as it was. The consequence is worth knowing rather than fixing: on macOS the dump
+shows the interval, because `StartInterval` is a key on the job itself, while on Linux it appears
+only in the comment line — the file that carries it is not the file that command dumps.
+
+Nested key, so the usual rule applies with no exceptions: `session_service` parses its own
+children, and an older build fails the **whole** config on `watchdog_interval_secs`, not just the
+block. It cannot be seeded into a shared config ahead of the binary; it ships with the code that
+accepts it, and every machine takes the binary first.
 
 ## Assessed and deliberately not built
 
