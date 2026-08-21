@@ -287,9 +287,9 @@ Verified end to end: a layout naming a `file:` plugin that is not there leaves a
 `ERROR IN PLUGIN`; copying a real `.wasm` to that path and running `start-or-reload-plugin` brings
 that same pane up running the plugin, at the pane's own size, with no second pane made.
 
-**A reload still needs a client attached** — `reload_plugin_with_id` bails with "No connected
-clients" — and that is untouched here, because it is not about failed panes: a reload of a perfectly
-healthy plugin bails in the same place. It is why this loop does not work on a detached session.
+This loop needed a client attached when it was written, because `reload_plugin_with_id` bailed with
+"No connected clients" for a healthy plugin as much as for a failed one. It does not any more — see
+[a plugin reloads in a session nobody is attached to](#a-plugin-reloads-in-a-session-nobody-is-attached-to).
 
 ### `dump-screen` works on plugin panes
 
@@ -5178,6 +5178,36 @@ failure — the file on disk outlives the binary that wrote it, and a machine mi
 
 Nothing about the plugin contract changed: the field, its tag and both `TryFrom` implementations
 were already there, so this is a field that starts arriving populated rather than a new one.
+
+### A plugin reloads in a session nobody is attached to
+
+```
+$ zellij -s build action start-or-reload-plugin file:/tmp/p.wasm   # no client attached
+```
+
+`reload_plugin_with_id` asked for a connected client and gave up when there was none —
+`No connected clients, cannot reload plugin`. So the reload worked from inside a session and not
+from outside one, which is backwards: a detached session is exactly where a plugin is edited and
+reloaded without a terminal in the way, and every other `zellij action` verb that does not need a
+focus reaches one.
+
+Nothing about the reload needs a client to be *attached*. The id is the key the plugin's instance
+sits under in the plugin map, nothing more, and the instance already has one — whoever loaded the
+plugin, still recorded there after everybody detached. So a connected client is preferred, as
+everywhere else that picks one, and the map answers when there is none.
+
+Asking the map rather than inventing an id is the whole of the correctness argument: a load inserts
+at `(plugin_id, client_id)`, so a fresh id would have left a second instance beside the one it was
+meant to replace.
+
+- A plugin that is not in the map has no id to fall back to and still declines, which is right —
+  there is nothing there to reload.
+- Nothing else changes for an attached session: the connected client is still preferred, and the
+  clone-for-other-clients pass sees the same empty list it always saw when nobody is attached.
+
+Proved by running it both ways on one tree: with the fallback, `start-or-reload-plugin` against a
+session with zero clients reloads the plugin; with the fallback alone removed, the same command on
+the same session never reaches the loader.
 
 ## Assessed and deliberately not built
 
