@@ -1,7 +1,7 @@
 # zellij (noahkiss fork)
 
-A personal fork of [zellij](https://github.com/zellij-org/zellij), rebased onto upstream `main` at
-commit **98a083707** (upstream workspace version **0.45.0**), carrying a curated patch set aimed at
+A personal fork of [zellij](https://github.com/zellij-org/zellij), rebased onto the upstream
+**`v0.45.0`** tag (upstream workspace version **0.45.0**), carrying a curated patch set aimed at
 the plugin development loop and a few session-lifecycle papercuts.
 
 **This fork is not accepting issues or pull requests, and none of these patches have been submitted
@@ -954,7 +954,7 @@ form, which swaps the tab with its neighbour, this shifts the tabs in between �
 position 0 to 3 gives `1,2,3,0`, not a 0↔3 swap. An index past the last tab is clamped to the last
 position rather than rejected, so a drag past the end lands the tab at the end.
 
-This adds an `Action` and therefore a message to the client/server contract (tag 148), without
+This adds an `Action` and therefore a message to the client/server contract (tag 172), without
 bumping the contract version: a fork client talking to a stock server of the same contract simply
 gets nothing for this one action, and every other action keeps working.
 
@@ -3339,10 +3339,10 @@ the answer as a third configuration key, `zellij_exe_stable`, through the same l
 
 **`<c>` copies the path.** Nothing in the about pane could be selected with the mouse, so the one
 value on it a user has to act on had to be retyped by hand. `<c>` on the main screen copies the
-stable path, or the running one where there is no stable path, and the help line says so — the key's
-columns are computed from the line it is appended to rather than counted out, so a reworded help
-line cannot leave the colour pointing at the wrong characters. Built-in plugins are granted every
-permission, so `WriteToClipboard` costs no prompt.
+stable path, or the running one where there is no stable path, and the help line says so. Upstream
+builds that line by appending to a string and colouring each key by substring, so the hint is one
+more `push_str` and the colour cannot land on the wrong characters. Built-in plugins are granted
+every permission, so `WriteToClipboard` costs no prompt.
 
 ### The session manager's client list actually lists clients
 
@@ -5459,22 +5459,35 @@ accepts it, and every machine takes the binary first.
 ## Working on this fork
 
 `upstream` points at `zellij-org/zellij`. Each patch is its own commit on top of the recorded
-upstream base, currently `98a083707` on upstream `main`. Moving to a newer base is
-`git fetch upstream && git rebase --onto upstream/main 98a083707`, then recording the new base
+upstream base, currently the **`v0.45.0`** tag. Moving to a newer base is
+`git fetch upstream --tags && git rebase --onto <new-tag> v0.45.0`, then recording the new base
 here.
 
-The base moved from `f42ca3c79` to `98a083707` and took six upstream commits: an opt-in for reading
-the terminal's paste buffer, off by default (`98a083707`); a `copy_command` process that is no
-longer killed while it still owns the selection (`a9db5664b`); scroll position that survives leaving
-scroll mode (`c428ae93b`); a spelling fix in the session name list (`dc6d8209e`); scrollback that is
-no longer truncated when a pane joins a stack in list mode (`6343be42c`); and the missing
-`NestedListItem` colour helpers in the plugin API (`30c9d2fcb`). Three of them met a patch here.
-Upstream's new paste-buffer option and this fork's `default_floating_size` both extend the
-`Reconfigure` instruction, so both fields are carried. Upstream added a private `pane_exists` to
-`Screen` whose body is identical to the one the CLI patches already made public, so the private copy
-is dropped. And upstream's new scroll-mode test snapshot is re-recorded, because a pane frame here
-also carries the pane's two-word handle. The two config-surface patches (the watcher and the permission grants) share plumbing and
-land as one commit.
+The base moved from `98a083707` (an upstream `main` commit) to the **`v0.45.0`** tag and took twelve
+upstream commits. Five of them met a patch here.
+
+Upstream now puts tabs in order of actual position when it serializes a session (`85cc8b1fe`,
+#5224) — the identical fix this fork carried, so the fork's copy is dropped and upstream's is what
+runs. Upstream also grew its own `IpcReceiveError { Disconnected, Undecodable }` and a
+`try_recv_client_msg` returning `Result`, which is the fork's `IpcRecvError { Disconnected,
+Malformed }` under other names; the fork's enum, its route-thread arm and its socket test are
+dropped in favour of upstream's, whose test covers strictly more.
+
+Upstream took client/server contract Action tags **148-151** for the scrollback-prompt actions. The
+fork's `move_tab_to_index` was on 148 — its one tag outside the fork-reserved block — and moves to
+**172**, next to the rest of the fork's actions at 160-171. No other tag changed, and the contract
+version is unchanged.
+
+Upstream's new scroll-mode test snapshot is re-recorded, for the same reason it was at the last
+rebase: a pane frame here also carries the pane's fixed-width handle, so the scroll indicator sits
+further left than an upstream frame puts it.
+
+Upstream reworked the about plugin (`18cb94e1c`, `4156b5023`): a keybinding-migration feature with
+its own `<u>`/`<y>`/`<n>` keys, `main_screen()` and `main_screen_builder()` helpers, and help lines
+assembled as a string and coloured by substring instead of by hardcoded column ranges. The fork's
+server-binary paragraph and `<c>` copy key are threaded through the reworked functions as one more
+parameter; the fork's two helpers that computed where `<c>` landed are deleted, because the
+substring colouring makes that arithmetic unnecessary.
 
 ```
 cargo build --release
