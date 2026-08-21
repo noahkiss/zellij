@@ -295,6 +295,7 @@ pub(crate) fn background_jobs_main(
         let current_session_name = current_session_name.clone();
         let current_session_info = current_session_info.clone();
         let current_session_layout = current_session_layout.clone();
+        let current_session_plugin_list = current_session_plugin_list.clone();
         runtime.spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(
                 SESSION_METADATA_WRITE_INTERVAL_MS,
@@ -306,7 +307,14 @@ pub(crate) fn background_jobs_main(
                 if name.is_empty() {
                     continue;
                 }
-                let info = current_session_info.lock().unwrap().clone();
+                let mut info = current_session_info.lock().unwrap().clone();
+                // fork addition: Screen builds the rest of this and has no idea which plugins run -
+                // it leaves the map empty and says the wasm thread fills it in. The wasm thread
+                // reports the list HERE, and nothing joined the two before the file was written, so
+                // the metadata every other session reads said this one ran no plugins at all.
+                // Joined at write time rather than when either half arrives, because the two are
+                // reported independently and only the freshest of each belongs in the file
+                info.populate_plugin_list(current_session_plugin_list.lock().unwrap().clone());
                 let layout = current_session_layout.lock().unwrap().clone();
                 write_session_state_to_disk(name, info, layout);
             }
