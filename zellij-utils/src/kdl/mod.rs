@@ -4038,23 +4038,59 @@ impl Options {
                     }
                 },
                 "launchd" => {
-                    for keys in kdl_children_nodes_or_error!(init_system, "empty launchd block") {
-                        if kdl_name!(keys) != "keys" {
-                            return Err(ConfigError::new_kdl_error(
-                                format!(
-                                    "Unknown launchd option: {:?} (expected a `keys` block)",
-                                    kdl_name!(keys)
-                                ),
-                                keys.span().offset(),
-                                keys.span().len(),
-                            ));
-                        }
-                        for key in kdl_children_nodes_or_error!(keys, "empty keys block") {
-                            let name = kdl_name!(key);
-                            let value = plist_value_from_kdl(key)?;
-                            session_service.add_launchd_key(name, value).map_err(|e| {
-                                ConfigError::new_kdl_error(e, key.span().offset(), key.span().len())
-                            })?;
+                    for block in kdl_children_nodes_or_error!(init_system, "empty launchd block") {
+                        match kdl_name!(block) {
+                            "keys" => {
+                                for key in kdl_children_nodes_or_error!(block, "empty keys block") {
+                                    let name = kdl_name!(key);
+                                    let value = plist_value_from_kdl(key)?;
+                                    session_service.add_launchd_key(name, value).map_err(|e| {
+                                        ConfigError::new_kdl_error(
+                                            e,
+                                            key.span().offset(),
+                                            key.span().len(),
+                                        )
+                                    })?;
+                                }
+                            },
+                            // The environment the job runs in, which is not the same thing as a
+                            // plist key: these go inside EnvironmentVariables, and a name written
+                            // in `keys` instead lands where launchd never looks.
+                            "env" => {
+                                for entry in kdl_children_nodes_or_error!(block, "empty env block")
+                                {
+                                    let name = kdl_name!(entry);
+                                    let value =
+                                        kdl_first_entry_as_string!(entry).ok_or_else(|| {
+                                            ConfigError::new_kdl_error(
+                                                format!(
+                                                    "{} takes a string value, quoted",
+                                                    kdl_name!(entry)
+                                                ),
+                                                entry.span().offset(),
+                                                entry.span().len(),
+                                            )
+                                        })?;
+                                    session_service.add_launchd_env(name, value).map_err(|e| {
+                                        ConfigError::new_kdl_error(
+                                            e,
+                                            entry.span().offset(),
+                                            entry.span().len(),
+                                        )
+                                    })?;
+                                }
+                            },
+                            other => {
+                                return Err(ConfigError::new_kdl_error(
+                                    format!(
+                                        "Unknown launchd option: {:?} (expected a `keys` or `env` \
+                                         block)",
+                                        other
+                                    ),
+                                    block.span().offset(),
+                                    block.span().len(),
+                                ))
+                            },
                         }
                     }
                 },
@@ -4136,16 +4172,29 @@ impl Options {
             init_systems.nodes_mut().push(systemd_node);
         }
 
-        if !session_service.launchd.is_empty() {
-            let mut keys = KdlDocument::new();
-            for key in &session_service.launchd {
-                keys.nodes_mut()
-                    .push(plist_value_to_kdl(&key.name, &key.value));
-            }
-            let mut keys_node = KdlNode::new("keys");
-            keys_node.set_children(keys);
+        if !session_service.launchd.is_empty() || !session_service.launchd_env.is_empty() {
             let mut launchd = KdlDocument::new();
-            launchd.nodes_mut().push(keys_node);
+            if !session_service.launchd.is_empty() {
+                let mut keys = KdlDocument::new();
+                for key in &session_service.launchd {
+                    keys.nodes_mut()
+                        .push(plist_value_to_kdl(&key.name, &key.value));
+                }
+                let mut keys_node = KdlNode::new("keys");
+                keys_node.set_children(keys);
+                launchd.nodes_mut().push(keys_node);
+            }
+            if !session_service.launchd_env.is_empty() {
+                let mut env = KdlDocument::new();
+                for entry in &session_service.launchd_env {
+                    let mut node = KdlNode::new(entry.name.as_str());
+                    node.push(KdlValue::String(entry.value.clone()));
+                    env.nodes_mut().push(node);
+                }
+                let mut env_node = KdlNode::new("env");
+                env_node.set_children(env);
+                launchd.nodes_mut().push(env_node);
+            }
             let mut launchd_node = KdlNode::new("launchd");
             launchd_node.set_children(launchd);
             init_systems.nodes_mut().push(launchd_node);
@@ -10389,6 +10438,129 @@ fn watchdog_interval_secs_takes_whole_seconds_and_is_named_among_what_the_block_
     )
     .unwrap_err();
     assert!(format!("{:?}", error).contains("at least 1"), "{:?}", error);
+}
+
+/// The `env` block: the launchd side of what `systemd { service "Environment=..." }` already said.
+/// It has to survive being written out and read back, like every other entry in this block.
+#[test]
+fn a_launchd_env_block_round_trips_through_the_config() {
+    let config = Config::from_kdl(
+        "session_service {
+    launchd {
+        env {
+            SSH_AUTH_SOCK \"/private/tmp/agent/Listeners\"
+            HOMEBREW_PREFIX \"/opt/homebrew\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let parsed = config.options.session_service.clone().unwrap();
+    assert_eq!(
+        parsed
+            .launchd_env
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("SSH_AUTH_SOCK", "/private/tmp/agent/Listeners"),
+            ("HOMEBREW_PREFIX", "/opt/homebrew"),
+        ],
+        "the config's order is the order the dictionary is written in"
+    );
+    // the block alone is worth writing, so a config carrying only this does not round-trip to
+    // nothing
+    assert!(config.to_string(false).contains("env"));
+    assert_eq!(
+        Config::from_kdl(&config.to_string(false), None)
+            .unwrap()
+            .options,
+        config.options
+    );
+
+    // and it sits beside the older hatch rather than replacing it
+    let both = Config::from_kdl(
+        "session_service {
+    launchd {
+        keys {
+            ProcessType \"Interactive\"
+        }
+        env {
+            SSH_AUTH_SOCK \"/private/tmp/agent/Listeners\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let parsed = both.options.session_service.clone().unwrap();
+    assert_eq!(parsed.launchd.len(), 1);
+    assert_eq!(parsed.launchd_env.len(), 1);
+    assert_eq!(
+        Config::from_kdl(&both.to_string(false), None)
+            .unwrap()
+            .options,
+        both.options
+    );
+}
+
+/// A nested block parses its own children, so a misspelling fails the WHOLE config rather than
+/// being ignored - which is what makes this unrollable ahead of the binary. What this build owes in
+/// return is an error naming what the block does accept, and one naming the entry when the value is
+/// wrong.
+#[test]
+fn the_launchd_block_names_env_among_what_it_accepts() {
+    let error = Config::from_kdl(
+        "session_service {
+    launchd {
+        environment {
+            SSH_AUTH_SOCK \"/private/tmp/agent/Listeners\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap_err();
+    let error = format!("{:?}", error);
+    assert!(error.contains("env"), "{}", error);
+    assert!(error.contains("keys"), "{}", error);
+
+    // an environment variable is a string, and a bare word is not one
+    let error = Config::from_kdl(
+        "session_service {
+    launchd {
+        env {
+            SSH_AUTH_SOCK true
+        }
+    }
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("SSH_AUTH_SOCK"),
+        "{:?}",
+        error
+    );
+
+    // the names no unit may pin are refused here as well as in `keys`
+    let error = Config::from_kdl(
+        "session_service {
+    launchd {
+        env {
+            ZELLIJ_SOCKET_DIR \"/tmp/mine\"
+        }
+    }
+}",
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{:?}", error).contains("ZELLIJ_SOCKET_DIR"),
+        "{:?}",
+        error
+    );
 }
 
 /// The `session_service` block parses its OWN children, so an unknown one fails the whole config

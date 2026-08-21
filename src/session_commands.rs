@@ -901,6 +901,12 @@ fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOpti
                     plist_value_summary(&key.value)
                 );
             }
+            // Prefixed, because these are not plist keys: they go inside EnvironmentVariables, and
+            // a listing that showed them the same way would read as a claim that launchd has a
+            // top-level key by that name.
+            for entry in &extras.launchd_env {
+                println!("config    env {} = {}", entry.name, entry.value);
+            }
         },
     }
 }
