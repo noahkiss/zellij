@@ -1607,6 +1607,14 @@ pub(crate) struct Screen {
     /// The indices of this [`Screen`]'s active [`Tab`]s.
     active_tab_ids: BTreeMap<ClientId, usize>,
     client_sizes: HashMap<ClientId, Size>,
+    /// fork addition: the size a new tab is laid out against when nobody is attached.
+    ///
+    /// `client_sizes` is keyed by client and `remove_client` deletes the entry, so the last client
+    /// to detach used to take the session's only size with it and every tab made afterwards came
+    /// out 0x0 - which holds no panes. This is seeded from the size the session was started with
+    /// and then tracks the last real client, so a detached session lays out against the terminal it
+    /// last had rather than against nothing.
+    size_with_no_client: Size,
     /// The terminal device each client is attached to, for the session's client list
     client_ttys: HashMap<ClientId, String>,
     /// What the server is currently telling every client about the session, carried to the bars
@@ -1819,37 +1827,15 @@ pub const NO_FOCUSED_PANE_TO_CLOSE: &str =
     "`close-pane` has no focused pane to close: nothing is attached to this session. \
      Pass --pane-id. `zellij action list-panes` lists them.";
 
-/// What a tab-creating command says when nothing is attached to the session.
+/// What `go-to-tab-name` says when it has only a focus move left to do and nothing is attached.
 ///
-/// A tab is built by applying a layout, and applying one needs a client to size it against. With
-/// nobody attached the tab is created empty, the caller is told a pane id for a pane that does not
-/// exist, and the whole tab is thrown away by the next client to attach. The refusal is the honest
-/// answer until a detached session can apply a layout on its own - the deep fix, which is a
-/// different piece of work.
-pub const TAB_CREATION_NEEDS_A_CLIENT: &str =
-    "Creating a tab needs a client attached to this session, and nothing is attached: the tab \
-     would be built empty and thrown away by the next client to attach. Run this from inside the \
-     session, or `zellij attach` first.";
-
-/// Whether a tab-creating instruction should be refused instead of answered.
-///
-/// Two things have to be true. It has to be a COMMAND - something is waiting for an answer, which
-/// is what `completion_tx` means - because the session's own startup builds tabs before any client
-/// has attached and must keep working. And nothing may be attached, because that is the case where
-/// the tab comes out empty.
-pub(crate) fn tab_creation_is_refused(a_command_asked: bool, a_client_is_attached: bool) -> bool {
-    a_command_asked && !a_client_is_attached
-}
+/// Making the tab no longer needs a client - a detached session sizes one against itself - so
+/// `--create` is answered. Moving the focus is the half that cannot be done, because a detached
+/// session has no focused tab for the command to move.
+pub const NO_CLIENT_TO_MOVE_TO_A_TAB: &str =
+    "`go-to-tab-name` has no client to move: nothing is attached to this session.";
 
 impl Screen {
-    /// Whether any client is attached to this session right now.
-    ///
-    /// A `zellij action` client does not count and never has: it connects, is answered, and goes.
-    /// This is about the clients a tab would be sized and drawn for.
-    pub fn has_attached_client(&self) -> bool {
-        !self.connected_clients.borrow().is_empty()
-    }
-
     /// Creates and returns a new [`Screen`].
     pub fn new(
         bus: Bus<ScreenInstruction>,
@@ -1916,6 +1902,7 @@ impl Screen {
             connected_clients: Rc::new(RefCell::new(HashMap::new())),
             active_tab_ids: BTreeMap::new(),
             client_sizes: HashMap::new(),
+            size_with_no_client: client_attributes.size,
             client_ttys: HashMap::new(),
             session_warnings: vec![],
             global_last_active_tab_id: 0,
@@ -2496,6 +2483,11 @@ impl Screen {
 
     pub fn set_client_size(&mut self, client_id: ClientId, size: Size) {
         self.client_sizes.insert(client_id, size);
+        // fork addition: remember it for when this client goes. A zero size is not a terminal
+        // anyone is looking at, and adopting one would put the session back where it started
+        if size.rows > 0 && size.cols > 0 {
+            self.size_with_no_client = size;
+        }
     }
 
     /// Re-ask the session-wide questions and, when an answer changed, hand every bar the new set.
@@ -2558,7 +2550,9 @@ impl Screen {
                     .and_then(|client_id| self.client_sizes.get(&client_id).copied())
             })
             .or_else(|| self.client_sizes.values().next().copied())
-            .unwrap_or_default()
+            // fork addition: nobody is attached, so fall back to the size the session last had
+            // rather than to `Size::default()`, which is 0x0 and holds no panes
+            .unwrap_or(self.size_with_no_client)
     }
 
     fn size_of_tab_of_client(&self, client_id: ClientId) -> Size {
@@ -10646,16 +10640,6 @@ pub(crate) fn screen_thread_main(
                 (client_id, is_web_client),
                 completion_tx,
             ) => {
-                // a tab asked for by a command (`completion_tx` is the caller waiting for an
-                // answer) is refused when nothing is attached, rather than built empty. The
-                // session's own startup passes no completion and is untouched: it is building the
-                // tabs a client is about to attach to
-                if tab_creation_is_refused(completion_tx.is_some(), screen.has_attached_client()) {
-                    if let Some(mut c) = completion_tx {
-                        c.set_error_message(TAB_CREATION_NEEDS_A_CLIENT.to_owned());
-                    }
-                    continue;
-                }
                 let tab_index = screen.get_new_tab_id();
                 pending_tab_ids.insert(tab_index);
                 restore_reservation.extend(
@@ -10858,6 +10842,7 @@ pub(crate) fn screen_thread_main(
                     screen.default_layout.swap_tiled_layouts.clone(),
                     screen.default_layout.swap_floating_layouts.clone(),
                 );
+                let asking_client_id = client_id;
                 let client_id = if client_id.is_none() {
                     None
                 } else if screen
@@ -10868,17 +10853,60 @@ pub(crate) fn screen_thread_main(
                 } else {
                     screen.active_tab_ids.keys().next().copied()
                 };
-                // `--create` on a session with nobody attached would make the same empty tab
-                // `new-tab` refuses to make; without it there is simply no focus to move
+                // fork addition: with nobody attached, the two halves of this command part company.
+                // `--create` no longer needs a client - a tab is sized against the session now -
+                // and the focus move has nothing to move, because a detached session has no focused
+                // tab at all. So the create is done and the vacuous focus move is passed over; a
+                // bare `go-to-tab-name`, which is only a focus move, has nothing left to do and
+                // says so
                 if client_id.is_none() {
-                    if let Some(c) = completion_tx.as_mut() {
-                        c.set_error_message(if create {
-                            TAB_CREATION_NEEDS_A_CLIENT.to_owned()
-                        } else {
-                            "`go-to-tab-name` has no client to move: nothing is attached to this \
-                             session."
-                                .to_owned()
-                        });
+                    let existing_tab_id = screen
+                        .tabs
+                        .values()
+                        .find(|t| t.name == tab_name)
+                        .map(|t| t.id);
+                    match (existing_tab_id, create) {
+                        (Some(existing_tab_id), _) => {
+                            completion_tx
+                                .as_mut()
+                                .map(|c| c.set_affected_tab_id(existing_tab_id));
+                            if !create && !no_focus {
+                                if let Some(c) = completion_tx.as_mut() {
+                                    c.set_error_message(NO_CLIENT_TO_MOVE_TO_A_TAB.to_owned());
+                                }
+                            }
+                        },
+                        (None, true) => {
+                            let tab_index = screen.get_new_tab_id();
+                            screen.new_tab(tab_index, swap_layouts, Some(tab_name), None)?;
+                            screen
+                                .bus
+                                .senders
+                                .send_to_plugin(PluginInstruction::NewTab(
+                                    None,
+                                    default_shell,
+                                    None,
+                                    vec![],
+                                    tab_index,
+                                    None,  // initial_panes
+                                    false, // block_on_first_terminal
+                                    false, // nothing is attached, so no focus to change
+                                    // whoever asked, attached or not: `route.rs` always names a
+                                    // client, and the layout applier needs an id to place under
+                                    (asking_client_id.unwrap_or_default(), false),
+                                    completion_tx,
+                                ))?;
+                            continue; // so we don't get to the completion signalling below
+                        },
+                        (None, false) => {
+                            if let Some(c) = completion_tx.as_mut() {
+                                // `--no-focus` is the probe form and answers with an empty stdout
+                                // either way, so only the moving form reports a miss
+                                if !no_focus {
+                                    c.set_error_message(NO_CLIENT_TO_MOVE_TO_A_TAB.to_owned());
+                                }
+                            }
+                        },
                     }
                 }
                 if let Some(client_id) = client_id {
