@@ -2,8 +2,8 @@ mod kdl_layout_parser;
 use crate::data::{
     BareKey, Direction, FloatingPaneCoordinates, InputMode, KeyWithModifier, LayoutInfo,
     LayoutMetadata, MultiplayerColors, Palette, PaletteColor, PaneId, PaneInfo, PaneManifest,
-    PermissionType, Resize, SessionInfo, StyleDeclaration, Styling, TabInfo, WebSharing,
-    DEFAULT_STYLES,
+    PermissionType, PluginInfo, Resize, SessionInfo, StyleDeclaration, Styling, TabInfo,
+    WebSharing, DEFAULT_STYLES,
 };
 use crate::envs::EnvironmentVariables;
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -7222,6 +7222,55 @@ impl SessionInfo {
             .and_then(|e| e.value().as_i64())
             .map(|c| Duration::from_secs(c as u64))
             .unwrap_or_default();
+        // fork addition: see the encoding side. A file written before this shipped has no `plugins`
+        // node, and reads back as a session running none rather than as a parse failure
+        let mut plugins: BTreeMap<u32, PluginInfo> = BTreeMap::new();
+        if let Some(kdl_plugins) = kdl_document.get("plugins").and_then(|p| p.children()) {
+            for plugin_node in kdl_plugins.nodes() {
+                let plugin_id = plugin_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("id"))
+                    .and_then(|e| e.value().as_i64())
+                    .map(|id| id as u32);
+                let location = plugin_node
+                    .entries()
+                    .iter()
+                    .find(|e| e.name().map(|n| n.value()) == Some("location"))
+                    .and_then(|e| e.value().as_string())
+                    .map(|l| l.to_owned());
+                let (Some(plugin_id), Some(location)) = (plugin_id, location) else {
+                    continue;
+                };
+                let mut configuration = BTreeMap::new();
+                if let Some(kdl_configuration) = plugin_node
+                    .children()
+                    .and_then(|c| c.get("configuration"))
+                    .and_then(|c| c.children())
+                {
+                    for configuration_entry in kdl_configuration.nodes() {
+                        if let Some(value) = configuration_entry
+                            .entries()
+                            .iter()
+                            .next()
+                            .and_then(|e| e.value().as_string())
+                        {
+                            configuration.insert(
+                                configuration_entry.name().value().to_owned(),
+                                value.to_owned(),
+                            );
+                        }
+                    }
+                }
+                plugins.insert(
+                    plugin_id,
+                    PluginInfo {
+                        location,
+                        configuration,
+                    },
+                );
+            }
+        }
         Ok(SessionInfo {
             name,
             tabs,
@@ -7231,7 +7280,7 @@ impl SessionInfo {
             available_layouts,
             web_client_count,
             web_clients_allowed,
-            plugins: Default::default(), // we do not serialize plugin information
+            plugins,
             tab_history,
             pane_history,
             creation_time,
@@ -7280,6 +7329,37 @@ impl SessionInfo {
             available_layouts_children.nodes_mut().push(layout_node);
         }
         available_layouts.set_children(available_layouts_children);
+
+        // fork addition: the plugins running in this session. Dropped here until now, which made
+        // `SessionInfo::plugins` answerable only for the session doing the asking - every other
+        // session on the machine came back off disk with an empty map
+        let mut plugins = KdlNode::new("plugins");
+        let mut plugins_children = KdlDocument::new();
+        for (plugin_id, plugin_info) in &self.plugins {
+            let mut plugin_node = KdlNode::new("plugin");
+            plugin_node
+                .entries_mut()
+                .push(KdlEntry::new_prop("id", *plugin_id as i64));
+            plugin_node
+                .entries_mut()
+                .push(KdlEntry::new_prop("location", plugin_info.location.clone()));
+            if !plugin_info.configuration.is_empty() {
+                let mut configuration_node = KdlNode::new("configuration");
+                let mut configuration_children = KdlDocument::new();
+                for (key, value) in &plugin_info.configuration {
+                    let mut configuration_entry = KdlNode::new(key.clone());
+                    configuration_entry.push(value.clone());
+                    configuration_children.nodes_mut().push(configuration_entry);
+                }
+                configuration_node.set_children(configuration_children);
+                plugin_node
+                    .ensure_children()
+                    .nodes_mut()
+                    .push(configuration_node);
+            }
+            plugins_children.nodes_mut().push(plugin_node);
+        }
+        plugins.set_children(plugins_children);
 
         let mut tab_history = KdlNode::new("tab_history");
         let mut tab_history_children = KdlDocument::new();
@@ -7335,6 +7415,7 @@ impl SessionInfo {
         kdl_document.nodes_mut().push(web_clients_allowed);
         kdl_document.nodes_mut().push(web_client_count);
         kdl_document.nodes_mut().push(available_layouts);
+        kdl_document.nodes_mut().push(plugins);
         kdl_document.nodes_mut().push(tab_history);
         kdl_document.nodes_mut().push(pane_history);
 
@@ -8174,6 +8255,68 @@ fn session_info_round_trip_keeps_pane_identity_and_stack_fields() {
     assert_eq!(round_tripped_pane.index_in_stack, pane.index_in_stack);
     assert!(round_tripped_pane.is_expanded_in_stack);
     assert!(deserialized.tabs[0].has_bell_notification);
+}
+
+#[test]
+fn session_info_round_trip_keeps_the_running_plugins() {
+    // the codec dropped this outright, so `SessionInfo::plugins` could only ever be answered for
+    // the session doing the asking - which patches its own list back in after the read. Every peer
+    // session came back off disk claiming to run no plugins at all
+    let mut configuration = BTreeMap::new();
+    configuration.insert("mode".to_owned(), "compact".to_owned());
+    configuration.insert("an empty value".to_owned(), String::new());
+    let mut plugins = BTreeMap::new();
+    plugins.insert(
+        0,
+        PluginInfo {
+            location: "zellij:tab-bar".to_owned(),
+            configuration,
+        },
+    );
+    plugins.insert(
+        7,
+        PluginInfo {
+            location: "file:/home/user/plugins/thing.wasm".to_owned(),
+            // a plugin with no configuration writes no configuration block, and has to come back
+            // with an empty map rather than as a plugin that failed to parse
+            configuration: BTreeMap::new(),
+        },
+    );
+    let session_info = SessionInfo {
+        name: "plugin session".to_owned(),
+        plugins: plugins.clone(),
+        ..Default::default()
+    };
+
+    let serialized = session_info.to_string();
+    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
+    assert_eq!(session_info, deserialized);
+    assert_eq!(
+        deserialized.plugins, plugins,
+        "the plugins running in a session survive the trip through session-metadata.kdl"
+    );
+}
+
+#[test]
+fn session_info_from_a_build_that_did_not_write_plugins_still_parses() {
+    // the file on disk outlives the binary that wrote it: a session started by the previous release
+    // has no `plugins` node, and it reads back as a session running none rather than as a failure
+    let mut session_info = SessionInfo::default();
+    session_info.name = "older session".to_owned();
+    let mut serialized: KdlDocument = session_info.to_string().parse().unwrap();
+    serialized
+        .nodes_mut()
+        .retain(|node| node.name().value() != "plugins");
+    let without_plugins = serialized.to_string();
+    assert!(
+        !without_plugins.contains("plugins"),
+        "the fixture still names the node this test exists to remove: {}",
+        without_plugins
+    );
+
+    let deserialized = SessionInfo::from_string(&without_plugins, "not this session")
+        .expect("metadata written before plugins were serialized still parses");
+    assert!(deserialized.plugins.is_empty());
 }
 
 #[test]
