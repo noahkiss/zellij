@@ -128,6 +128,17 @@ Whole-binary builds are the expensive ones, because they pull in `zellij-server`
 `wasmtime`. Prefer `cargo check` and a `-p <crate>` test while iterating, and keep the full
 `cargo build --release` for the end.
 
+**Three test surfaces, and a release must run all of them.** The nextest suites (`-p zellij-utils
+-p zellij-server -p zellij-client`, plus `-p zellij` after a plugins-only build) are the fast loop.
+`cargo xtask integration-test` is the whole-app suite the `Rust` workflow runs — snapshot changes
+that touch pane titles or handles land here, and nothing in the fast loop covers it. The Docker
+e2e suite (`src/tests/e2e`, the `End to End tests` workflow) runs only on pushes to `main` and
+test branches — **an `rc/**` push never exercises it**, so a green RC does not prove it. Before
+cutting any release: run the nextest suites and the integration suite locally, and account for
+e2e either by running it locally (Docker) or by the fact that the exact tree already went green on
+a `main` push. The v16 release shipped with four stale integration snapshots and two stale e2e
+snapshots because local gates covered only the first surface.
+
 CI also runs `cargo xtask build` and `cargo xtask test` on Linux and macOS, plus a `--no-web` test
 pass. A change behind a feature flag still has to compile without it. **There is no Windows job**,
 and Windows is not a shipped target — the release builds `x86_64-unknown-linux-gnu` and
