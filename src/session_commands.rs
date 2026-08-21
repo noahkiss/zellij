@@ -11,7 +11,7 @@
 //! What survives from the scripts is the discipline: every one of these commands states a
 //! post-condition and checks it. See [`zellij_utils::session_lifecycle`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
 
@@ -1439,6 +1439,25 @@ fn restart_restore_target(fresh: bool, restore: Option<String>) -> UpShape {
     }
 }
 
+/// The two handles the daemonized restart writes its output through, both append-mode.
+///
+/// **Both being append-mode is not a style choice, and mixing them cost a warning.** A descriptor
+/// from `File::create` carries an offset of its own, starting at zero; an append-mode one writes at
+/// the end of the file on every write. Handing stdout the first and stderr the second let the two
+/// cursors diverge: stderr's line landed at EOF, then the next stdout write went down at its own
+/// lower offset and overwrote the front of it. That is what ate the first 36 bytes of
+/// `warning: the pin was NOT refreshed: S…` and left a log holding `ecurity: SecKeychain…`
+/// (nkmk.12 fleet finding, deterministic, cosmetic). An `O_APPEND` write seeks to the end as part
+/// of the write itself, so two of them interleave by line instead of landing on top of each other.
+///
+/// Truncating is now a step of its own rather than a side effect of `create`, because starting the
+/// generation and handing out a descriptor were two jobs one call was doing.
+fn open_restart_log(log_file: &Path) -> std::io::Result<(std::fs::File, std::fs::File)> {
+    std::fs::File::create(log_file)?;
+    let appending = || std::fs::OpenOptions::new().append(true).open(log_file);
+    Ok((appending()?, appending()?))
+}
+
 fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
     use zellij_utils::consts::ZELLIJ_STATE_DIR;
 
@@ -1454,13 +1473,10 @@ fn restart(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -> ! {
     if log_file.exists() {
         let _ = std::fs::rename(&log_file, log_file.with_extension("log.1"));
     }
-    let (stdout, stderr) = match (
-        std::fs::File::create(&log_file),
-        std::fs::OpenOptions::new().append(true).open(&log_file),
-    ) {
-        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-        _ => {
-            eprintln!("Failed to open {}", log_file.display());
+    let (stdout, stderr) = match open_restart_log(&log_file) {
+        Ok(handles) => handles,
+        Err(e) => {
+            eprintln!("Failed to open {}: {}", log_file.display(), e);
             process::exit(1);
         },
     };
@@ -1546,6 +1562,45 @@ mod tests {
             restart_restore_target(false, Some("abc123".to_owned())),
             UpShape::Snapshot("abc123".to_owned())
         );
+    }
+
+    /// The two handles wrote over each other while only one of them appended: the second stream's
+    /// line landed at the end of the file, and the first stream's next write went down at its own
+    /// lower offset and ate the front of it. Written here in the order the fleet finding saw -
+    /// stderr's long warning, then a shorter line on stdout - because that is the order that
+    /// exposes it.
+    #[test]
+    fn both_restart_log_handles_append_so_neither_stream_eats_the_other() {
+        use std::io::Write;
+
+        let scratch = tempfile::tempdir().unwrap();
+        let log_file = scratch.path().join("restart.log");
+        let (mut stdout, mut stderr) = open_restart_log(&log_file).unwrap();
+
+        let warning = "warning: the pin was NOT refreshed: Security: SecKeychainUnlock failed";
+        writeln!(stderr, "{}", warning).unwrap();
+        writeln!(stdout, "tearing down go-for-flight").unwrap();
+
+        let written = std::fs::read_to_string(&log_file).unwrap();
+        assert!(written.contains(warning), "{:?}", written);
+        assert!(
+            written.contains("tearing down go-for-flight"),
+            "{:?}",
+            written
+        );
+    }
+
+    /// A restart keeps one generation, so the handles must start an empty file rather than append
+    /// to whatever the last run left.
+    #[test]
+    fn opening_the_restart_log_starts_a_new_generation() {
+        let scratch = tempfile::tempdir().unwrap();
+        let log_file = scratch.path().join("restart.log");
+        std::fs::write(&log_file, "output from the run before this one\n").unwrap();
+
+        let _handles = open_restart_log(&log_file).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&log_file).unwrap(), "");
     }
 
     #[test]

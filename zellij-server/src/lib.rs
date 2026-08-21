@@ -420,6 +420,16 @@ impl SessionMetaData {
         for (client_id, new_config) in config_changes {
             if new_plugin_config.is_none() {
                 new_plugin_config = Some(new_config.plugins.clone());
+
+                // Two settings the server keeps as process globals, because their readers are
+                // nowhere near a config: the title format is read by a pane while it renders, and
+                // the snapshot settings are read on the way out, after the session data has gone.
+                // Everything else here travels to a client through `Reconfigure`; these two have no
+                // per-client home to travel in, so they are rewritten from the FIRST config of the
+                // change set and are the same for every client - which is what they already were,
+                // fixed at `FirstClientConnected` and unchanged for the life of the session.
+                set_snapshot_settings(SnapshotSettings::from_options(Some(&new_config.options)));
+                set_terminal_title_format(TerminalTitleFormat::from_options(&new_config.options));
             }
 
             self.default_shell = new_config.options.default_shell.as_ref().map(|shell| {
@@ -936,16 +946,28 @@ mod session_state_tests {
 
 /// The snapshot archive settings of the session running in this server.
 ///
-/// Set once the first client has connected and the config file has been read, because that is the
-/// earliest point at which they are known - and read again on the way out, long after the session
-/// data has been dropped.
-static SNAPSHOT_SETTINGS: std::sync::OnceLock<SnapshotSettings> = std::sync::OnceLock::new();
+/// First set when the first client connects and the config file has been read, set again on every
+/// live reload, and read again on the way out - long after the session data has been dropped, which
+/// is why it is a global rather than a field.
+///
+/// **A `RwLock` and not a `OnceLock`.** It was the latter, so an edited `snapshot_*` setting did
+/// nothing until the session was recreated, which is the one thing a person editing snapshot
+/// retention is least likely to want to do.
+static SNAPSHOT_SETTINGS: std::sync::RwLock<Option<SnapshotSettings>> =
+    std::sync::RwLock::new(None);
 
 pub(crate) fn snapshot_settings() -> SnapshotSettings {
     SNAPSHOT_SETTINGS
-        .get()
-        .cloned()
+        .read()
+        .ok()
+        .and_then(|settings| settings.clone())
         .unwrap_or_else(SnapshotSettings::default)
+}
+
+fn set_snapshot_settings(settings: SnapshotSettings) {
+    if let Ok(mut slot) = SNAPSHOT_SETTINGS.write() {
+        *slot = Some(settings);
+    }
 }
 
 /// The pane privacy policy this session answers with, compiled once when the first client
@@ -1223,7 +1245,7 @@ pub fn start_server_impl(
                     },
                 };
 
-                let _ = SNAPSHOT_SETTINGS.set(SnapshotSettings::from_options(Some(
+                set_snapshot_settings(SnapshotSettings::from_options(Some(
                     &runtime_config_options,
                 )));
                 // the policy is compiled once, here, and answered from `route.rs` for the life of

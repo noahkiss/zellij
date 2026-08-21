@@ -89,6 +89,15 @@ impl ServiceExe {
 /// A PATH entry counts only if it resolves to the SAME file as the running binary - another
 /// zellij, further along the same PATH, is a different program and a unit that execs it is a unit
 /// that keeps the wrong version alive.
+///
+/// **The name on PATH does not have to match.** Probing `<dir>/zellij` alone was enough only while
+/// the binary being installed was the one `zellij` on PATH leads to. Two builds on one machine
+/// break that: with a stock `zellij` linked, `<dir>/zellij` is somebody else's file, the probe
+/// fails, and the unit gets the versioned path of this build - which the next upgrade deletes. The
+/// stable name was sitting on PATH the whole time under another spelling. So a failed same-name
+/// probe is followed by a search of the same directories for ANY entry that resolves here, in PATH
+/// order and then alphabetically, which is a stable answer rather than whatever `read_dir` returns
+/// first. The scan is paid for only in the case that used to give the wrong answer.
 pub fn resolve_service_exe(
     explicit: Option<PathBuf>,
     pinned: Option<PathBuf>,
@@ -111,7 +120,30 @@ pub fn resolve_service_exe(
             return ServiceExe::Stable(candidate);
         }
     }
+    for dir in path_dirs {
+        if let Some(candidate) = path_entry_leading_to(dir, &resolved) {
+            return ServiceExe::Stable(candidate);
+        }
+    }
     ServiceExe::Resolved(resolved)
+}
+
+/// The alphabetically first entry of `dir` that resolves to `resolved`, whatever it is called.
+///
+/// Alphabetical rather than `read_dir` order so that a machine with both `zellij-nkmk` and a `zj`
+/// beside it writes the same unit every time. A directory that cannot be read is simply not a
+/// directory this binary is on.
+fn path_entry_leading_to(dir: &Path, resolved: &Path) -> Option<PathBuf> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|entry| entry.canonicalize().ok().as_deref() == Some(resolved))
 }
 
 /// The directories of the PATH variable, in the order they are searched.
@@ -3227,6 +3259,47 @@ mod tests {
         std::fs::write(other_dir.join("zellij"), b"another binary").unwrap();
         assert_eq!(
             resolve_service_exe(None, None, &real, &[other_dir]),
+            ServiceExe::Resolved(real.canonicalize().unwrap())
+        );
+    }
+
+    /// Two builds on one machine, which is the case that used to give the wrong answer. `zellij` on
+    /// PATH is the stock build's, so the same-name probe finds somebody else's file - but this
+    /// build's own stable name is on the same PATH under another spelling, and a unit naming that
+    /// survives the upgrade the versioned path does not.
+    #[test]
+    #[cfg(unix)]
+    fn a_stable_name_on_path_counts_even_when_another_build_owns_the_plain_name() {
+        let (root, real, stable) = versioned_install();
+        let stable_dir = stable.parent().unwrap().to_path_buf();
+        // the stock build, linked under the plain name, in the same directory
+        let stock = root.path().join("versions/9.9.9/bin");
+        std::fs::create_dir_all(&stock).unwrap();
+        std::fs::write(stock.join("zellij"), b"the stock build").unwrap();
+        std::fs::remove_file(&stable).unwrap();
+        std::os::unix::fs::symlink(stock.join("zellij"), &stable).unwrap();
+        // and this build beside it, under a name of its own
+        let ours = stable_dir.join("zellij-nkmk");
+        std::os::unix::fs::symlink(&real, &ours).unwrap();
+
+        assert_eq!(
+            resolve_service_exe(None, None, &real, &[stable_dir]),
+            ServiceExe::Stable(ours)
+        );
+    }
+
+    /// The negative control for the scan: a directory holding neither name that leads here is not a
+    /// directory this binary is on, and the answer stays the honest `Resolved` that warns.
+    #[test]
+    #[cfg(unix)]
+    fn scanning_a_path_directory_does_not_invent_a_stable_name() {
+        let (root, real, _stable) = versioned_install();
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::write(unrelated.join("zellij"), b"another binary").unwrap();
+        std::fs::write(unrelated.join("zellij-nkmk"), b"and another").unwrap();
+        assert_eq!(
+            resolve_service_exe(None, None, &real, &[unrelated]),
             ServiceExe::Resolved(real.canonicalize().unwrap())
         );
     }
