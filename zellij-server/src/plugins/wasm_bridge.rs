@@ -170,6 +170,15 @@ impl LoadingContext {
 
 pub type PluginCache = Arc<Mutex<HashMap<PathBuf, Module>>>;
 
+/// fork addition: what starting a plugin in an existing pane needs, for a pane that has no running
+/// plugin to read it off. See `WasmBridge::plugin_pane_placements`.
+#[derive(Clone, Debug)]
+struct PluginPanePlacement {
+    size: Size,
+    tab_index: Option<usize>,
+    cwd: Option<PathBuf>,
+}
+
 pub struct WasmBridge {
     connected_clients: Arc<Mutex<Vec<ClientId>>>,
     senders: ThreadSenders,
@@ -193,6 +202,15 @@ pub struct WasmBridge {
     /// keeps the plugin in the serialized layout, so a restore of a plugin whose file is gone
     /// stays a plugin pane instead of decaying into a blank one.
     failed_plugins: HashMap<PluginId, RunPlugin>,
+    /// Where each plugin pane sits, so a plugin can be started in one that never held a running
+    /// instance.
+    ///
+    /// The reload path reads the plugin's config, size, tab index and cwd off the RUNNING instance.
+    /// A pane whose plugin failed to load has none, so the reload bailed and the only way back was
+    /// to restore the layout - which is the wrong shape for the loop this exists to serve: fix the
+    /// file, reload the pane. Recorded when the load is started, kept current by resizes, and
+    /// dropped when the pane closes.
+    plugin_pane_placements: HashMap<PluginId, PluginPanePlacement>,
     pending_plugin_reloads: HashSet<RunPlugin>,
     path_to_default_shell: PathBuf,
     watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
@@ -274,6 +292,7 @@ impl WasmBridge {
             cached_worker_messages: HashMap::new(),
             loading_plugins: HashSet::new(),
             failed_plugins: HashMap::new(),
+            plugin_pane_placements: HashMap::new(),
             pending_plugin_reloads: HashSet::new(),
             zellij_cwd,
             session_env_vars,
@@ -334,6 +353,18 @@ impl WasmBridge {
             })?;
 
         let plugin_id = self.next_plugin_id;
+
+        // fork addition: remembered here, before anything can fail, because this is the only moment
+        // that knows where the pane is without asking a running plugin. A load that fails leaves a
+        // pane with no instance to ask, and a reload of that pane needs these three
+        self.plugin_pane_placements.insert(
+            plugin_id,
+            PluginPanePlacement {
+                size,
+                tab_index,
+                cwd: cwd.clone(),
+            },
+        );
 
         match run {
             Some(run) => {
@@ -538,6 +569,7 @@ impl WasmBridge {
         info!("Bye from plugin {}", &pid);
         // the pane is going away, so nothing will ask about this id again
         self.failed_plugins.remove(&pid);
+        self.plugin_pane_placements.remove(&pid);
         // a pane closed while its plugin was still loading would otherwise be recorded as failed by
         // the loader's report, which arrives after this, and never removed again
         self.loading_plugins
@@ -650,22 +682,34 @@ impl WasmBridge {
             log::error!("No connected clients, cannot reload plugin.");
             return Ok(());
         };
-        let Some(plugin_config) = self.plugin_config_of_plugin_id(plugin_id) else {
-            log::error!("Could not find running plugin with id: {}", plugin_id);
+        // fork addition: all four of these used to be read off the RUNNING instance and nowhere
+        // else, so a pane whose plugin failed to load could not be reloaded at all - the loop this
+        // command exists for, fix the file and reload the pane, bailed here and the only way back
+        // was restoring the layout. A running instance is still the first answer, because it is the
+        // current one; the pane's remembered placement answers for a pane that has none.
+        //
+        // The config is the half that makes recovery work: `from_run_plugin` re-resolves the
+        // location, so the file that has since come back is the one this reload loads.
+        let placement = self.plugin_pane_placements.get(&plugin_id).cloned();
+        let Some(plugin_config) = self
+            .plugin_config_of_plugin_id(plugin_id)
+            .or_else(|| PluginConfig::from_run_plugin(&run_plugin))
+        else {
+            log::error!("Could not resolve plugin with id: {}", plugin_id);
             return Ok(());
         };
-        let Some((rows, columns)) = self.size_of_plugin_id(plugin_id) else {
-            log::error!(
-                "Could not find size of running plugin with id: {}",
-                plugin_id
-            );
+        let Some(size) = self
+            .size_of_plugin_id(plugin_id)
+            .map(|(rows, cols)| Size { rows, cols })
+            .or_else(|| placement.as_ref().map(|placement| placement.size))
+        else {
+            log::error!("Could not find size of plugin with id: {}", plugin_id);
             return Ok(());
         };
-        let tab_index = self.tab_index_of_plugin_id(plugin_id);
-        let size = Size {
-            rows,
-            cols: columns,
-        };
+        let (rows, columns) = (size.rows, size.cols);
+        let tab_index = self
+            .tab_index_of_plugin_id(plugin_id)
+            .or_else(|| placement.as_ref().and_then(|placement| placement.tab_index));
 
         self.cached_events_for_pending_plugins
             .insert(plugin_id, vec![]);
@@ -679,7 +723,11 @@ impl WasmBridge {
 
         let plugin_executor = self.plugin_executor.clone();
 
-        let cwd = self.cwd_of_plugin_id(plugin_id);
+        let cwd = self.cwd_of_plugin_id(plugin_id).or_else(|| {
+            placement
+                .as_ref()
+                .and_then(|placement| placement.cwd.clone())
+        });
 
         let loading_context = LoadingContext::new(
             &self,
@@ -743,7 +791,13 @@ impl WasmBridge {
             Ok(plugin_ids) => plugin_ids,
             Err(e) => match self.all_plugin_ids_for_plugin_location_only(&run_plugin.location) {
                 Ok(plugin_ids) => plugin_ids,
-                Err(_) => return Err(e),
+                // a pane whose plugin failed to load is in no plugin map, so neither lookup above
+                // can see it and the caller falls through to spawning a stray pane beside the
+                // broken one. The failure record is the last thing that still knows the id
+                Err(_) => match self.failed_plugin_ids_for_location(&run_plugin.location) {
+                    plugin_ids if !plugin_ids.is_empty() => plugin_ids,
+                    _ => return Err(e),
+                },
             },
         };
         for plugin_id in &plugin_ids {
@@ -945,6 +999,13 @@ impl WasmBridge {
                 current_size.0 = new_rows;
                 current_size.1 = new_columns;
             }
+        }
+        // fork addition: a pane whose plugin never loaded gets no resize applied anywhere above -
+        // there is no instance to resize - so this is the only record that can follow it, and a
+        // reload of that pane would otherwise start the plugin at the size it had when it failed
+        if let Some(placement) = self.plugin_pane_placements.get_mut(&pid) {
+            placement.size.rows = new_rows;
+            placement.size.cols = new_columns;
         }
         Ok(())
     }
@@ -1471,6 +1532,7 @@ impl WasmBridge {
     pub fn cleanup(&mut self) {
         self.loading_plugins.clear();
         self.failed_plugins.clear();
+        self.plugin_pane_placements.clear();
         if let Some(plugin_file_watcher) = self.plugin_file_watcher.take() {
             plugin_file_watcher.stop();
         }
@@ -1755,6 +1817,20 @@ impl WasmBridge {
             .lock()
             .unwrap()
             .all_plugin_ids_for_plugin_location(plugin_location, plugin_configuration)
+    }
+    /// fork addition: the panes at this location whose plugin failed to load.
+    ///
+    /// Nothing else can find them: a failed load leaves the pane and nothing in `plugin_map`, which
+    /// is what every other lookup here reads.
+    fn failed_plugin_ids_for_location(&self, plugin_location: &RunPluginLocation) -> Vec<PluginId> {
+        let mut plugin_ids: Vec<PluginId> = self
+            .failed_plugins
+            .iter()
+            .filter(|(_plugin_id, run_plugin)| &run_plugin.location == plugin_location)
+            .map(|(plugin_id, _run_plugin)| *plugin_id)
+            .collect();
+        plugin_ids.sort_unstable();
+        plugin_ids
     }
     fn all_plugin_ids_for_plugin_location_only(
         &self,
