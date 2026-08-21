@@ -13198,6 +13198,8 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::SetFloatingPanePinned(pane_id, should_be_pinned) => {
                 screen.set_floating_pane_pinned(pane_id, should_be_pinned);
+                screen.render(None)?;
+                screen.log_and_report_session_state()?;
             },
             ScreenInstruction::StackPanes(
                 pane_ids_to_stack,
