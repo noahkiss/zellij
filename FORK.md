@@ -5587,6 +5587,41 @@ tab strip. The scroll arms are gone: switching tabs is deliberate only — a cli
 keybind. The stock `tab-bar` and `compact-bar` keep their upstream behaviour; only the fork's own
 bar changed.
 
+||||||| 96ff926e8
+### An RC binary reports the RC
+
+A release candidate is tagged `v0.45.0-nkmk.17-rc.1` from a branch whose `Cargo.toml` reads
+`0.45.0-nkmk.17`, because the branch is bumped to the version it is heading for. The suffix
+therefore lived on the tag and nowhere else, and the artifact it produced said `0.45.0-nkmk.17` —
+the same string the final release would say. Two checks were written around that rather than against
+it: the tap's install verification cut `-rc.N` off before comparing, and the rc formula's `test`
+block did the same. Between them, a Mac on `zellij-nkmk-rc` was running unproven code that answered
+`zellij --version` with the name of a release that did not exist yet, and nothing anywhere could
+tell the two apart.
+
+`release.yml` now patches the version to the whole tag before it builds a candidate. It is the same
+edit a `chore: bump version` commit makes — the workspace version and the path-dependency pins in
+`Cargo.toml` and `zellij-integration-tests/Cargo.toml`, plus the seven package stanzas in
+`Cargo.lock`, which has to move too because the build is `--locked`. `sed -i` is spelled differently
+on the two runners, so it writes through a temp file instead.
+
+**It refuses a tag that is not a candidate for the version in the checkout.** `v…-nkmk.17-rc.1` on a
+branch still reading `nkmk.16` is a tag cut before the bump, and rewriting every pin to a version no
+crate claims is the wrong way to find that out.
+
+A candidate is the only build that patches its own checkout. A final tag builds what main says,
+untouched, which is why nothing here needs a matching un-patch.
+
+Two consequences worth knowing. `VersionInfo::from_version_string` split the fork counter on the
+last `.`, so `nkmk.17-rc.1` read as fork `nkmk.17-rc`, counter `1`; it now takes a trailing
+`-rc.<n>` off first, and a candidate reports the counter it is a candidate **for** while `version`
+keeps the candidate number. And `ZELLIJ_PLUGIN_ARTIFACT_DIR` is keyed by the version string, so a
+candidate extracts its plugins into its own directory rather than into the final release's —
+correct, and the reason a candidate never leaves an artifact behind that the release would reuse.
+
+The tap changes with it: the install check and the rc formula's test block assert the full rc
+version instead of stripping it. They are in `noahkiss/homebrew-tap`, not here.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
@@ -5684,9 +5719,10 @@ thing here — but it now has a `workflow_dispatch`, so it can be aimed at a bra
 
 A patch is proved as a **release candidate** before it lands. On its branch, bump the version it is
 heading for, then tag `v<version>-rc.1` and push the tag. The pipeline runs exactly as below, with
-two differences: the GitHub release is marked `--prerelease`, and the tap bump rewrites
-`zellij-nkmk-rc` instead of `zellij-nkmk`. So the candidate can be installed on a real Mac while
-every machine keeps running the last final release:
+three differences: the workspace version is patched to the whole tag before the build, the GitHub
+release is marked `--prerelease`, and the tap bump rewrites `zellij-nkmk-rc` instead of
+`zellij-nkmk`. So the candidate can be installed on a real Mac while every machine keeps running the
+last final release:
 
 ```
 brew update && brew unlink zellij-nkmk
@@ -5700,9 +5736,9 @@ and, when the proof is done:
 brew uninstall zellij-nkmk-rc && brew link zellij-nkmk
 ```
 
-`-rc.2`, `-rc.3` follow the same way. The version the binary reports has no `-rc.N` in it — the
-suffix lives on the tag, not in `Cargo.toml` — which is why the tap strips it before checking an
-install. Once the candidate holds up, squash-merge the branch and cut the final tag from main:
+`-rc.2`, `-rc.3` follow the same way. The version the binary reports is the whole tag, `-rc.N` and
+all — see [An RC binary reports the RC](#an-rc-binary-reports-the-rc). Once the candidate holds up,
+squash-merge the branch and cut the final tag from main:
 
 1. Land the patches, bump the workspace version in `Cargo.toml` (and the `zellij-client` /
    `zellij-server` pins), `cargo build --release` once so `Cargo.lock` is current, commit.

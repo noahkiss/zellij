@@ -73,9 +73,12 @@ patch ledger readable, because the rebase onto a newer upstream tag replays it c
    brew uninstall zellij-nkmk-rc && brew link zellij-nkmk
    ```
 
-   An RC tag carries a suffix the binary does not: the branch bumps `Cargo.toml` to the final
-   version, so `zellij --version` prints `0.45.0-nkmk.12` under a `v0.45.0-nkmk.12-rc.1` tag. Both
-   the tap's install check and the rc formula's test block strip `-rc.N` before comparing.
+   **An RC binary reports the RC.** The branch bumps `Cargo.toml` to the version it is heading
+   for, and `release.yml` patches that version to the whole tag before it builds, so
+   `zellij --version` prints `0.45.0-nkmk.12-rc.1` under a `v0.45.0-nkmk.12-rc.1` tag. Nothing
+   strips the suffix, and a Mac can no longer be running a candidate that calls itself the
+   release. The bake is the only build that patches its own checkout — a final tag builds what
+   main says. It refuses a tag that is not a candidate for the version the branch is bumped to.
 3. **Land by squash-merge**, so one ledger entry is one commit. `FORK.md` is updated in that commit,
    not in a follow-up.
 4. **Tag the final release from main** — `v<version>`, no suffix. It bumps `zellij-nkmk` as before.
