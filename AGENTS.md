@@ -100,6 +100,22 @@ can sit in a group placed after one of its callers. That is accepted: the tip an
 of each release build, the middle may not. The last chronological, bisectable series is kept at
 `backup/main-pre-squash-2026-08-16`; when a bug needs `git bisect`, bisect there.
 
+**After any history rewrite, check the series before you trust it.** Every latent bug a rewrite
+has shipped so far was visible in the series itself on the day of the rewrite. Nobody looked. Two
+kinds of rewrite, two checks:
+
+- **Same base — squash, condense, reorder.** The tip tree must not change. Run
+  `git diff <old-tip> <new-tip>` and expect no output. Any hunk it prints is one the rewrite dropped
+  or mangled. Find it now, not two releases later.
+- **New base — rebase.** Run `git range-diff <old-base>..<old-tip> <new-base>..<new-tip>`. It shows
+  each patch's drift on its own, so a conflict resolved wrong stands out from the base moving under
+  it. Read every patch it marks `!`. Then run the whole gate from "Build and test": the nextest
+  suites, `cargo xtask integration-test`, the wasm check, and e2e — which runs on a pull request
+  and on a push to `main`, never on a bare `rc/**` push.
+
+Keep the pre-rewrite tip on a `backup/main-pre-<rewrite>-<date>` branch until both the checks and
+the next release pass; it is the `<old-tip>` those commands need, and the only place to bisect.
+
 ## Build and test
 
 ```
