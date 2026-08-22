@@ -5480,7 +5480,6 @@ built 2026-08-21`. A `build.rs` was the alternative and is worse: `zellij-utils`
 compiles for wasm, and stamping a date there would make the checked-in plugin assets differ on
 every rebuild.
 
-||||||| f632d561f
 ### The launchd `env` block: an environment variable a launch agent can actually read
 
 The systemd side has always been able to say this. An `Environment=` line is a directive like any
@@ -5588,7 +5587,6 @@ tab strip. The scroll arms are gone: switching tabs is deliberate only — a cli
 keybind. The stock `tab-bar` and `compact-bar` keep their upstream behaviour; only the fork's own
 bar changed.
 
-||||||| 96ff926e8
 ### An RC binary reports the RC
 
 A release candidate is tagged `v0.45.0-nkmk.17-rc.1` from a branch whose `Cargo.toml` reads
