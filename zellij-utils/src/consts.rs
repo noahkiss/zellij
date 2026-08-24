@@ -190,6 +190,8 @@ pub const BUILTIN_PLUGIN_NAMES: &[&str] = &[
     // embedded in the binary, and version-locked to it.
     "slim-tab-bar",
     "slim-keybinds",
+    // Fork-added prompt. The tab-mode close key launches it instead of sending CloseTab.
+    "confirm-close-tab",
 ];
 
 #[cfg(not(target_family = "wasm"))]
@@ -256,6 +258,7 @@ mod not_wasm {
                 add_plugin!(assets, "link.wasm");
                 add_plugin!(assets, "slim-tab-bar.wasm");
                 add_plugin!(assets, "slim-keybinds.wasm");
+                add_plugin!(assets, "confirm-close-tab.wasm");
             }
             assets
         };

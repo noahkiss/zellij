@@ -64,6 +64,7 @@ members = [
     "default-plugins/link",
     "default-plugins/slim-tab-bar",
     "default-plugins/slim-keybinds",
+    "default-plugins/confirm-close-tab",
     "zellij-client",
     "zellij-integration-tests",
     "zellij-server",
