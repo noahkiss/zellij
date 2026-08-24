@@ -366,22 +366,26 @@ that were silently carried by the shell all fail at once.
 carrying three new keys through the previous release's binary: `setup --check` still reported
 `CONFIG FILE: Well defined`.
 
-**The rule stops at the top level. A block that parses its own children rejects an unknown one, and
-that fails the WHOLE config, not just the block.** `session_service` is the known example:
+**A block that parses its own children used to reject an unknown one, failing the WHOLE config,
+not just the block.** `session_service` was the known example:
 
 ```
 × Failed to parse Zellij configuration
 ╰── Unknown session_service entry: "manage_my_session" (expected systemd, launchd, pin_exe, managed_session or restart_via_launchd)
 ```
 
-(`managed_session` was the key that taught this lesson, in 2026-08. It has since shipped, so it is
-no longer an example of an unknown one — the rule it proved is unchanged.)
+(`managed_session` taught that lesson in 2026-08; `launchd { env }` paid for it again.) From
+nkmk.18 on, `session_service` warns and ignores an unknown name at every depth — see FORK.md's
+"An unknown key in `session_service` warns instead of failing the config". But the old rule is
+not dead: `pane_privacy` and `resurrect_command_hints` still reject an unknown child, and a
+machine still on ≤ nkmk.17 still rejects a nested `session_service` key.
 
-So a key nested inside such a block CANNOT be rolled out ahead of the binary — it has to ship with
-the code that accepts it. Do not generalise a top-level probe to a nested key: test the key you
-actually intend to add, in the position you intend to add it, and re-run `zellij setup --check`
-**before committing**. Getting this wrong breaks every machine that pulls the config, not just the
-one that is behind.
+So before seeding a nested key ahead of the binary, check both sides: the block must be a
+warn-and-ignore one in the build that ships the key, and the OLDEST binary in the fleet must
+tolerate it too. Do not generalise a top-level probe to a nested key: test the key you actually
+intend to add, in the position you intend to add it, against the oldest release still running,
+and re-run `zellij setup --check` **before committing**. Getting this wrong breaks every machine
+that pulls the config, not just the one that is behind.
 
 That decides the rollout order for a config-only feature. The key can be added to a shared config
 first and the binaries upgraded afterwards, in any order — machines still on the old build ignore it
