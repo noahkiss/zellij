@@ -1058,6 +1058,20 @@ pub struct SessionServiceOptions {
     /// reads a unitless time span as. Nothing here writes a systemd time span like `15min`.
     #[serde(default)]
     pub watchdog_interval_secs: Option<u64>,
+    /// Entries in this block that this binary does not know, in the words a human should read.
+    ///
+    /// A block that parses its own children used to REJECT an unknown one, and a rejection here
+    /// fails the whole config rather than the block - so a key could never reach a shared config
+    /// before the binary that understands it reached every machine. Keeping the names instead of
+    /// erroring is what makes the order "config first, binaries after" work for a nested key the
+    /// way it already worked for a top-level one.
+    ///
+    /// Kept rather than only logged because `zellij setup --check` is where someone looks when a
+    /// key appears to do nothing, and a server log line is not there. Not written back out by
+    /// [`crate::input::config::Config::to_string`]: an ignored key is not part of this build's
+    /// configuration, and re-emitting it would make a dump claim otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_entries: Vec<String>,
 }
 
 /// Literal directive lines, per section of the generated `.service` file.
@@ -1152,6 +1166,9 @@ const GENERATED_LAUNCHD_KEYS: &[&str] = &["Label", "ProgramArguments", "Environm
 const FORBIDDEN_ENV_NAMES: &[&str] = &["TMPDIR", "ZELLIJ_SOCKET_DIR"];
 
 impl SessionServiceOptions {
+    /// Whether this block says anything this build acts on. [`Self::unknown_entries`] deliberately
+    /// does not count: a block holding nothing else is empty, and writing it back out would put a
+    /// key this build ignores into a config dump that claims to describe this build.
     pub fn is_empty(&self) -> bool {
         self.systemd.unit.is_empty()
             && self.systemd.service.is_empty()
@@ -1162,6 +1179,25 @@ impl SessionServiceOptions {
             && self.restart_via_launchd.is_none()
             && self.managed_session.is_none()
             && self.watchdog_interval_secs.is_none()
+    }
+
+    /// Record an entry of this block that this binary does not know, and say so in the log.
+    ///
+    /// The two surfaces are one call because they answer the same question in two places: the log
+    /// line is for a session that is already running, and the kept string is what
+    /// `zellij setup --check` prints for someone holding a config that seems to be ignored.
+    pub fn note_unknown_entry(&mut self, message: String) {
+        log::warn!("{}", message);
+        self.unknown_entries.push(message);
+    }
+
+    /// Whether a `systemd` child block names a section of the generated unit.
+    ///
+    /// Split out of [`Self::add_systemd_directive`] because an unknown section has to be caught
+    /// BEFORE its directives are walked: a misspelled section holding no lines never reaches that
+    /// function at all, and so would be ignored without a word.
+    pub fn is_known_systemd_section(section: &str) -> bool {
+        matches!(section, "unit" | "service" | "install")
     }
 
     /// Whether anything here is written INTO a unit. `pin_exe` is in this block but is not one of
