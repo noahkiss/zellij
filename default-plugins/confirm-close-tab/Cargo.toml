@@ -1,0 +1,12 @@
+[package]
+name = "confirm-close-tab"
+version = "0.1.0"
+authors = ["Noah Kiss"]
+description = "Confirms before the tab-mode close key closes a tab holding more than one pane"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Nothing beyond zellij-tile: every builtin is embedded in the binary with include_bytes!, so a
+# dependency here is paid for by every zellij install.
+zellij-tile = { path = "../../zellij-tile" }
