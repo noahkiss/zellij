@@ -3957,6 +3957,14 @@ impl Options {
     /// is checked HERE, at parse time, rather than when a unit is written, so that a config error
     /// is reported by `zellij setup --check` and by every other command, not only by the one
     /// command that would have used it.
+    ///
+    /// An entry this build does not KNOW is a different case from one whose value is wrong, and
+    /// only the second is an error. An unknown name - at any depth in this block - is kept in
+    /// [`SessionServiceOptions::unknown_entries`], logged, and otherwise ignored, so a new key can
+    /// go into a shared config before every machine has the binary that reads it. That is how an
+    /// unknown TOP-LEVEL key has always behaved; a block that parses its own children lost the
+    /// property by accident, and `managed_session` and `launchd { env }` each cost a config that
+    /// would not load on any machine that was behind.
     fn session_service_from_kdl(
         kdl_session_service: &KdlNode,
     ) -> Result<SessionServiceOptions, ConfigError> {
@@ -4024,6 +4032,14 @@ impl Options {
                     for section in kdl_children_nodes_or_error!(init_system, "empty systemd block")
                     {
                         let section_name = kdl_name!(section);
+                        if !SessionServiceOptions::is_known_systemd_section(section_name) {
+                            session_service.note_unknown_entry(format!(
+                                "unknown systemd section {:?} in session_service, ignored \
+                                 (expected unit, service or install)",
+                                section_name
+                            ));
+                            continue;
+                        }
                         for directive in kdl_string_arguments!(section) {
                             session_service
                                 .add_systemd_directive(section_name, directive)
@@ -4081,30 +4097,21 @@ impl Options {
                                 }
                             },
                             other => {
-                                return Err(ConfigError::new_kdl_error(
-                                    format!(
-                                        "Unknown launchd option: {:?} (expected a `keys` or `env` \
-                                         block)",
-                                        other
-                                    ),
-                                    block.span().offset(),
-                                    block.span().len(),
-                                ))
+                                session_service.note_unknown_entry(format!(
+                                    "unknown launchd option {:?} in session_service, ignored \
+                                     (expected a `keys` or `env` block)",
+                                    other
+                                ));
                             },
                         }
                     }
                 },
                 other => {
-                    return Err(ConfigError::new_kdl_error(
-                        format!(
-                            "Unknown session_service entry: {:?} (expected systemd, launchd, \
-                             pin_exe, managed_session, restart_via_launchd or \
-                             watchdog_interval_secs)",
-                            other
-                        ),
-                        init_system.span().offset(),
-                        init_system.span().len(),
-                    ))
+                    session_service.note_unknown_entry(format!(
+                        "unknown session_service entry {:?}, ignored (expected systemd, launchd, \
+                         pin_exe, managed_session, restart_via_launchd or watchdog_interval_secs)",
+                        other
+                    ));
                 },
             }
         }
@@ -10292,20 +10299,28 @@ fn managed_session_is_off_unless_the_config_turns_it_on() {
     ));
 }
 
-/// `managed_session` is a nested key, so an old binary rejects it and fails the WHOLE config - the
-/// reason it ships in the same patch as the behaviour rather than being seeded ahead of it. What
-/// this build owes in return is an error that names the key when the VALUE is wrong.
+/// A binary that does not know `managed_session` ignores it and says so, rather than failing the
+/// whole config - `manage_my_session` is the misspelling that taught the lesson. What this build
+/// owes in return is a warning naming the key it does accept, and an error when the VALUE is wrong.
 #[test]
 fn managed_session_takes_a_bool_and_is_named_among_what_the_block_accepts() {
-    let error = Config::from_kdl(
+    let config = Config::from_kdl(
         "session_service {
     manage_my_session true
 }",
         None,
     )
-    .unwrap_err();
-    let error = format!("{:?}", error);
-    assert!(error.contains("managed_session"), "{}", error);
+    .unwrap();
+    let warnings = config
+        .options
+        .session_service
+        .as_ref()
+        .unwrap()
+        .unknown_entries
+        .clone();
+    assert_eq!(warnings.len(), 1, "{:?}", warnings);
+    assert!(warnings[0].contains("manage_my_session"), "{}", warnings[0]);
+    assert!(warnings[0].contains("managed_session"), "{}", warnings[0]);
 
     let error = Config::from_kdl(
         "session_service {
@@ -10374,20 +10389,40 @@ fn watchdog_interval_secs_is_the_generators_own_unless_the_config_retimes_it() {
     assert!(retimed.to_string(false).contains("watchdog_interval_secs"));
 }
 
-/// `watchdog_interval_secs` is a nested key, so an old binary rejects it and fails the WHOLE config
-/// - the reason it ships in the same patch as the behaviour rather than being seeded ahead of it.
-/// What this build owes in return is an error that names the key when the VALUE is wrong.
+/// A binary that does not know `watchdog_interval_secs` ignores it and says so, naming the key it
+/// does accept. What this build owes in return is an error when the VALUE is wrong.
 #[test]
 fn watchdog_interval_secs_takes_whole_seconds_and_is_named_among_what_the_block_accepts() {
-    let error = Config::from_kdl(
+    let config = Config::from_kdl(
         "session_service {
     watchdog_interval 15
 }",
         None,
     )
-    .unwrap_err();
-    let error = format!("{:?}", error);
-    assert!(error.contains("watchdog_interval_secs"), "{}", error);
+    .unwrap();
+    let warnings = config
+        .options
+        .session_service
+        .as_ref()
+        .unwrap()
+        .unknown_entries
+        .clone();
+    assert_eq!(warnings.len(), 1, "{:?}", warnings);
+    assert!(
+        warnings[0].contains("watchdog_interval_secs"),
+        "{}",
+        warnings[0]
+    );
+    // the misspelling is ignored, so the interval is still the generator's own
+    assert_eq!(
+        config
+            .options
+            .session_service
+            .as_ref()
+            .unwrap()
+            .watchdog_interval_secs,
+        None
+    );
 
     // a word is not a number of seconds
     let error = Config::from_kdl(
@@ -10505,13 +10540,12 @@ fn a_launchd_env_block_round_trips_through_the_config() {
     );
 }
 
-/// A nested block parses its own children, so a misspelling fails the WHOLE config rather than
-/// being ignored - which is what makes this unrollable ahead of the binary. What this build owes in
-/// return is an error naming what the block does accept, and one naming the entry when the value is
-/// wrong.
+/// A child block this build does not know is ignored with a warning naming what the block does
+/// accept - `environment` for `env` is the misspelling that reads as if it should work. What this
+/// build owes in return is an error naming the entry when the value is wrong.
 #[test]
 fn the_launchd_block_names_env_among_what_it_accepts() {
-    let error = Config::from_kdl(
+    let config = Config::from_kdl(
         "session_service {
     launchd {
         environment {
@@ -10521,10 +10555,21 @@ fn the_launchd_block_names_env_among_what_it_accepts() {
 }",
         None,
     )
-    .unwrap_err();
-    let error = format!("{:?}", error);
-    assert!(error.contains("env"), "{}", error);
-    assert!(error.contains("keys"), "{}", error);
+    .unwrap();
+    let session_service = config.options.session_service.as_ref().unwrap();
+    assert_eq!(
+        session_service.unknown_entries.len(),
+        1,
+        "{:?}",
+        session_service.unknown_entries
+    );
+    let warning = &session_service.unknown_entries[0];
+    assert!(warning.contains("environment"), "{}", warning);
+    assert!(warning.contains("env"), "{}", warning);
+    assert!(warning.contains("keys"), "{}", warning);
+    // nothing of the ignored block reached the plist
+    assert!(session_service.launchd_env.is_empty());
+    assert!(session_service.launchd.is_empty());
 
     // an environment variable is a string, and a bare word is not one
     let error = Config::from_kdl(
@@ -10563,20 +10608,30 @@ fn the_launchd_block_names_env_among_what_it_accepts() {
     );
 }
 
-/// The `session_service` block parses its OWN children, so an unknown one fails the whole config
-/// rather than being ignored the way an unknown top-level key is. That is what makes this key
-/// unrollable ahead of the binary, and the error has to name what it does accept.
+/// The `session_service` block parses its OWN children, and an unknown one is ignored the way an
+/// unknown top-level key is - with a warning that names what the block does accept.
 #[test]
 fn session_service_names_restart_via_launchd_among_what_it_accepts() {
-    let error = Config::from_kdl(
+    let config = Config::from_kdl(
         "session_service {
     restart_when_i_say_so true
 }",
         None,
     )
-    .unwrap_err();
-    let error = format!("{:?}", error);
-    assert!(error.contains("restart_via_launchd"), "{}", error);
+    .unwrap();
+    let warnings = config
+        .options
+        .session_service
+        .as_ref()
+        .unwrap()
+        .unknown_entries
+        .clone();
+    assert_eq!(warnings.len(), 1, "{:?}", warnings);
+    assert!(
+        warnings[0].contains("restart_via_launchd"),
+        "{}",
+        warnings[0]
+    );
 
     // and it takes a bool, not a word
     let error = Config::from_kdl(
@@ -10597,6 +10652,136 @@ fn session_service_names_restart_via_launchd_among_what_it_accepts() {
 fn session_service_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.session_service, None);
+}
+
+/// The rollout property, at every depth this block parses: a name this build does not know costs a
+/// warning, not the config. A machine still on an older binary reads a config written for a newer
+/// one, keeps every setting it does understand, and starts.
+#[test]
+fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() {
+    let config = Config::from_kdl(
+        r#"
+        session_service {
+            managed_session true
+            some_key_from_a_later_build "whatever"
+            systemd {
+                service "Nice=-5"
+                sockets "ListenStream=1234"
+            }
+            launchd {
+                keys {
+                    ProcessType "Interactive"
+                }
+                sandbox {
+                    profile "none"
+                }
+            }
+        }
+    "#,
+        None,
+    )
+    .unwrap();
+    let session_service = config.options.session_service.as_ref().unwrap();
+
+    // every known entry beside the unknown ones is still read
+    assert_eq!(session_service.managed_session, Some(true));
+    assert_eq!(session_service.systemd.service, vec!["Nice=-5".to_owned()]);
+    assert_eq!(
+        session_service.launchd,
+        vec![LaunchdKey {
+            name: "ProcessType".to_owned(),
+            value: PlistValue::String("Interactive".to_owned()),
+        }]
+    );
+
+    // and each unknown one is named exactly once, in the words setup --check prints
+    assert_eq!(
+        session_service.unknown_entries.len(),
+        3,
+        "{:?}",
+        session_service.unknown_entries
+    );
+    let warnings = session_service.unknown_entries.join("\n");
+    assert!(
+        warnings.contains("some_key_from_a_later_build"),
+        "{}",
+        warnings
+    );
+    assert!(warnings.contains("sockets"), "{}", warnings);
+    assert!(warnings.contains("sandbox"), "{}", warnings);
+}
+
+/// A misspelled systemd section holding nothing is the case a softened error would have missed:
+/// its directives are what used to be walked, and there are none to walk.
+#[test]
+fn an_unknown_systemd_section_is_named_even_with_no_directives_in_it() {
+    let config = Config::from_kdl(
+        "session_service {
+    systemd {
+        servce
+    }
+}",
+        None,
+    )
+    .unwrap();
+    let warnings = config
+        .options
+        .session_service
+        .as_ref()
+        .unwrap()
+        .unknown_entries
+        .clone();
+    assert_eq!(warnings.len(), 1, "{:?}", warnings);
+    assert!(warnings[0].contains("servce"), "{}", warnings[0]);
+    assert!(warnings[0].contains("service"), "{}", warnings[0]);
+}
+
+/// Only the UNKNOWN-name case softened. A name this build knows, given a value it cannot mean, is
+/// still the whole config failing to parse - the operator meant that setting and is not getting it.
+#[test]
+fn a_wrong_value_for_a_known_entry_is_still_an_error() {
+    for bad in [
+        // wrong type for a known key
+        "session_service {\n    managed_session \"yes\"\n}",
+        "session_service {\n    watchdog_interval_secs \"often\"\n}",
+        // a known key, a value outside what it can mean
+        "session_service {\n    watchdog_interval_secs 0\n}",
+        "session_service {\n    pin_exe 3\n}",
+        // a known systemd section, a line that is not a directive
+        "session_service {\n    systemd {\n        service \"Nice\"\n    }\n}",
+        // a known systemd section, a directive the generator owns
+        "session_service {\n    systemd {\n        service \"ExecStart=/bin/true\"\n    }\n}",
+        // a known launchd block, a key the generator owns
+        "session_service {\n    launchd {\n        keys {\n            Label \"mine\"\n        }\n    }\n}",
+        // a known launchd block, a value that is neither a string nor a number
+        "session_service {\n    launchd {\n        env {\n            SSH_AUTH_SOCK true\n        }\n    }\n}",
+    ] {
+        assert!(
+            Config::from_kdl(bad, None).is_err(),
+            "should not have parsed: {}",
+            bad
+        );
+    }
+}
+
+/// An entry this build ignores is not this build's configuration, so a dump does not claim it is.
+/// The block round-trips to nothing when the unknown names were all it held.
+#[test]
+fn an_ignored_entry_is_not_written_back_out() {
+    let config = Config::from_kdl(
+        "session_service {
+    some_key_from_a_later_build true
+}",
+        None,
+    )
+    .unwrap();
+    assert!(config.options.session_service.as_ref().unwrap().is_empty());
+    let written_out = config.to_string(false);
+    assert!(
+        !written_out.contains("some_key_from_a_later_build"),
+        "{}",
+        written_out
+    );
 }
 
 #[test]
