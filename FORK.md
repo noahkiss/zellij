@@ -5856,6 +5856,87 @@ per-client `ModeInfo` on every focus change, so `ModeUpdate` keeps firing with t
 which now happens to equal the focused pane's — and the status bar is right with no plugin change.
 A plugin that wants to *read* a pane's mode would be a separate patch and a separate cost.
 
+### Closing a tab with more than one pane asks first
+
+The tab-mode close key and `zellij action close-tab` used to be the same button. One is pressed by
+somebody who meant to close a *pane* and reached one menu too far; the other is typed on purpose.
+Now only the key is gated, by a new bundled plugin, `zellij:confirm-close-tab`.
+
+The default binding is no longer `CloseTab`:
+
+```
+bind "x" {
+    LaunchOrFocusPlugin "zellij:confirm-close-tab" {
+        floating true
+        move_to_focused_tab true
+    };
+    SwitchToMode "Normal"
+}
+```
+
+- **A tab with one pane closes with no prompt at all.** The plugin decides in `load`, from
+  `get_focused_pane_info` and `get_tab_info`, before it has rendered a frame. There is nothing to
+  confirm when closing the tab loses nothing, and the key stays as fast as it was.
+- **A tab with more than one asks**, in a small floating pane: `close tab? 3 panes open  [y/N/p]`.
+  `y` closes the tab. `n`, `Esc` and `Enter` cancel. `p` closes only the pane you were in and
+  leaves the tab, which is what the miss-press usually meant.
+- **`SwitchToMode "Normal"` is part of the binding, not decoration.** `y`, `n`, `p`, `Esc` and
+  `Enter` are all unbound in the default Normal mode, so they reach the prompt as key events. Left
+  in tab mode, `n` would open a new tab.
+
+**The CLI is exempt structurally, not by a check.** `zellij action close-tab` confirms client-side
+in `confirm_or_exit`, before the action is ever sent, and it never launches a plugin. A keybind
+gate and the CLI gate cannot collide, and `--yes` still means what it meant. This is the doctrine
+in "Anything that cannot be undone asks first" seen from the other end: a key is pressed by a
+person who is looking at the thing it acts on, so the *key* is where a look-again belongs.
+
+**`p` closes the previously focused tiled pane.** The tiled and floating layers keep separate
+focus, so the pane you were in is still marked focused in the pane manifest while the prompt holds
+the floating layer's focus — which is exactly why a previously focused *floating* pane cannot be
+recovered. If you were in a floating pane, `p` falls back to the focused tiled pane. The prompt
+offers `[y/N]` instead of `[y/N/p]` when there is no pane it can name. The manifest is the only
+source for this: by the time the plugin runs, `get_focused_pane_info` already names the prompt's
+own pane.
+
+**One case it cannot put back: a tab whose floating panes were hidden.** Opening a floating pane
+unhides the tab's whole floating layer, and by the time the plugin runs, that has already
+happened — `are_floating_panes_visible` reads `true` at its `load`, whatever it was a moment
+earlier, and nothing exposes the value from before. The common case needs no help: zellij hides
+the layer again by itself when the last floating pane in a tab closes, so a tab that had no
+floating panes is left exactly as it was found. A tab that had hidden ones keeps them on screen
+after a cancel, until the floating toggle is pressed. Detecting this would take a server-side
+change, not a plugin one.
+
+**With two clients in one tab, `p` may pick the other client's pane.** `PaneInfo.is_focused` is
+not per-client, so "the focused tiled pane" is whoever focused it. The count and the tab are right
+— `TabUpdate` is per client — and `p` becomes exact if per-client focus lands on `PaneInfo`. `y`
+and cancel are unaffected.
+
+**Only the instance whose client pressed the key may act.** Zellij loads a plugin once per
+connected client and runs `load` in every one of them, each seeing its own client's focus
+(`clone_instance_for_other_clients` in `zellij-server/src/plugins/plugin_loader.rs`; the plugin map
+is keyed by plugin id *and* client id). An instance that does not find its client focused on the
+prompt's own pane is inert for the rest of its life: it closes nothing and renders nothing.
+
+Without that guard one keypress closed one tab per attached client. The instances run in turn and
+`close_focused_tab` blocks until the server confirms, so the second instance woke to a session that
+had already lost the first tab, found its client focused on the *next* tab, decided that tab was
+worth nothing either, and closed it too. With two tabs open and two clients that emptied the
+session and took the server down with it. The cost of the guard is small and visible only to a
+second client: it sees an empty floating pane until the client that asked answers the prompt.
+
+**Known gap: the tab-mode hint line no longer lists the close key.** The status bar finds the key
+for a hint by matching the action list it is bound to — `[CloseTab, SwitchToMode "Normal"]`, in
+`default-plugins/status-bar/src/second_line.rs` and `one_line_ui.rs`. The binding is now a
+`LaunchOrFocusPlugin`, which nothing there matches, so `x  Close` has dropped out of the tab-mode
+line entirely. Teaching the status bar to recognise the launch is a separate patch.
+
+**Rollout order is the reverse of the usual one.** The binding lives in the binary's own
+`default.kdl`, so nothing has to be rolled out at all: an older binary keeps `CloseTab` and a newer
+one gets the prompt. A user `config.kdl` that already overrides tab-mode `x` keeps its own binding
+and sees no change until it is rewritten — and it must not be rewritten ahead of the binary,
+because `zellij:confirm-close-tab` is a plugin location an older build does not have.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
