@@ -55,8 +55,8 @@ use zellij_utils::input::config::Config;
 use zellij_utils::input::keybinds::{shortcut_for_action, Keybinds};
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::input::options::{
-    Clipboard, DefaultFloatingSize, HostNotificationProtocol, NestedSessionHandling,
-    PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
+    Clipboard, DefaultFloatingSize, HostNotificationProtocol, InputWhileScrolled,
+    NestedSessionHandling, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::{
     ExitReason, MobileActivePanePayload, MobilePanePayload, MobileSessionPayload,
@@ -867,6 +867,7 @@ pub enum ScreenInstruction {
         nested_session_handling: NestedSessionHandling,
         dangerously_enable_paste_buffer_read: bool,
         default_floating_size: Option<DefaultFloatingSize>,
+        input_while_scrolled: InputWhileScrolled,
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
@@ -1595,6 +1596,7 @@ pub(crate) struct Screen {
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
     stacked_resize: Rc<RefCell<bool>>,
     default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
+    input_while_scrolled: Rc<RefCell<InputWhileScrolled>>,
     stacked_pane_list: Rc<RefCell<bool>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     kitty_image_store: Rc<RefCell<KittyImageStore>>,
@@ -1863,6 +1865,7 @@ impl Screen {
         stacked_pane_list: bool,
         default_editor: Option<PathBuf>,
         default_floating_size: Option<DefaultFloatingSize>,
+        input_while_scrolled: InputWhileScrolled,
         web_clients_allowed: bool,
         web_sharing: WebSharing,
         advanced_mouse_actions: bool,
@@ -1892,6 +1895,7 @@ impl Screen {
             character_cell_size: Rc::new(RefCell::new(None)),
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
             default_floating_size: Rc::new(RefCell::new(default_floating_size)),
+            input_while_scrolled: Rc::new(RefCell::new(input_while_scrolled)),
             stacked_pane_list: Rc::new(RefCell::new(stacked_pane_list)),
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
             kitty_image_store: Rc::new(RefCell::new(KittyImageStore::default())),
@@ -5092,6 +5096,7 @@ impl Screen {
             self.stacked_resize.clone(),
             self.stacked_pane_list.clone(),
             self.default_floating_size.clone(),
+            self.input_while_scrolled.clone(),
             self.sixel_image_store.clone(),
             self.kitty_image_store.clone(),
             self.bus
@@ -6679,6 +6684,14 @@ impl Screen {
     // under unlock-first), so a client in another mode (Pane, Tab, Search, ...) is never
     // pulled out of it. See #638.
     fn sync_scroll_mode_on_focus(&mut self, client_id: ClientId) -> Result<()> {
+        // fork addition: `input_while_scrolled` decides whether the implicit sync runs at
+        // all. Guarding here disables every call site at once, because both
+        // sync_scroll_mode_if_scroll_changed and sync_scroll_mode_for_pane_id funnel through
+        // this function. An explicit SwitchToMode "Scroll" goes through change_mode and is
+        // untouched by the option.
+        if !self.implicit_scroll_mode_sync_enabled() {
+            return Ok(());
+        }
         // base_mode is the default config reloads keep current; .mode is the fallback.
         let default_mode = self
             .default_mode_info
@@ -6705,6 +6718,12 @@ impl Screen {
             .senders
             .send_to_server(ServerInstruction::ChangeMode(client_id, new_mode, None))
             .with_context(|| format!("failed to sync scroll mode on focus for client {client_id}"))
+    }
+    // fork addition: true only under `input_while_scrolled "scroll-mode"`, the upstream
+    // behaviour. `jump` and `stay` both mean "no implicit mode switch"; they differ only in
+    // what a keypress does to the viewport, which Tab decides.
+    fn implicit_scroll_mode_sync_enabled(&self) -> bool {
+        *self.input_while_scrolled.borrow() == InputWhileScrolled::ScrollMode
     }
     fn active_pane_is_scrolled(&self, client_id: ClientId) -> bool {
         self.get_active_tab(client_id)
@@ -7610,6 +7629,7 @@ impl Screen {
         nested_session_handling: NestedSessionHandling,
         dangerously_enable_paste_buffer_read: bool,
         default_floating_size: Option<DefaultFloatingSize>,
+        input_while_scrolled: InputWhileScrolled,
         client_id: ClientId,
     ) -> Result<()> {
         let should_support_arrow_fonts = !simplified_ui;
@@ -7656,6 +7676,9 @@ impl Screen {
         }
         {
             *self.default_floating_size.borrow_mut() = default_floating_size;
+        }
+        {
+            *self.input_while_scrolled.borrow_mut() = input_while_scrolled;
         }
         if let Some(copy_to_clipboard) = copy_to_clipboard {
             self.copy_options.clipboard = copy_to_clipboard;
@@ -8862,6 +8885,7 @@ pub(crate) fn screen_thread_main(
     let stacked_resize = config_options.stacked_resize.unwrap_or(true);
     let stacked_pane_list = config_options.stacked_pane_list.unwrap_or(true);
     let default_floating_size = config_options.default_floating_size.clone();
+    let input_while_scrolled = config_options.input_while_scrolled.unwrap_or_default();
     let web_clients_allowed = config_options
         .web_sharing
         .map(|s| s.web_clients_allowed())
@@ -8921,6 +8945,7 @@ pub(crate) fn screen_thread_main(
         stacked_pane_list,
         default_editor,
         default_floating_size,
+        input_while_scrolled,
         web_clients_allowed,
         web_sharing,
         advanced_mouse_actions,
@@ -12659,6 +12684,7 @@ pub(crate) fn screen_thread_main(
                 nested_session_handling,
                 dangerously_enable_paste_buffer_read,
                 default_floating_size,
+                input_while_scrolled,
             } => {
                 screen.host_theme_dark_styling = host_theme_dark;
                 screen.host_theme_light_styling = host_theme_light;
@@ -12693,6 +12719,7 @@ pub(crate) fn screen_thread_main(
                         nested_session_handling,
                         dangerously_enable_paste_buffer_read,
                         default_floating_size,
+                        input_while_scrolled,
                         client_id,
                     )
                     .non_fatal();

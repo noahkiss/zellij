@@ -3201,6 +3201,17 @@ impl Options {
             },
             None => None,
         };
+        let input_while_scrolled =
+            match kdl_property_first_arg_as_string_or_error!(kdl_options, "input_while_scrolled") {
+                Some((value, entry)) => {
+                    use crate::input::options::InputWhileScrolled;
+                    match value.parse::<InputWhileScrolled>() {
+                        Ok(v) => Some(v),
+                        Err(e) => return Err(kdl_parsing_error!(e, entry)),
+                    }
+                },
+                None => None,
+            };
         let host_notification_protocol = match kdl_property_first_arg_as_string_or_error!(
             kdl_options,
             "host_notification_protocol"
@@ -3295,6 +3306,7 @@ impl Options {
             client_async_worker_tasks,
             nested_session_handling,
             dangerously_enable_paste_buffer_read,
+            input_while_scrolled,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -5642,6 +5654,42 @@ impl Options {
             None
         }
     }
+    fn input_while_scrolled_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        use crate::input::options::InputWhileScrolled;
+        let comment_text = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            " ",
+            "// What a keypress does in a pane whose viewport is scrolled up.",
+            "// Options:",
+            "//   - \"scroll-mode\" (Default — scrolling a pane enters Scroll mode)",
+            "//   - \"jump\" (the key clears the scroll, then reaches the pane)",
+            "//   - \"stay\" (the key reaches the pane, the viewport stays put)",
+            "// ",
+        );
+        let create_node = |value: InputWhileScrolled| -> KdlNode {
+            let mut node = KdlNode::new("input_while_scrolled");
+            let s = match value {
+                InputWhileScrolled::ScrollMode => "scroll-mode",
+                InputWhileScrolled::Jump => "jump",
+                InputWhileScrolled::Stay => "stay",
+            };
+            node.push(KdlValue::String(s.to_string()));
+            node
+        };
+        if let Some(value) = self.input_while_scrolled {
+            let mut node = create_node(value);
+            if add_comments {
+                node.set_leading(format!("{}\n", comment_text));
+            }
+            Some(node)
+        } else if add_comments {
+            let mut node = create_node(InputWhileScrolled::ScrollMode);
+            node.set_leading(format!("{}\n// ", comment_text));
+            Some(node)
+        } else {
+            None
+        }
+    }
     fn host_notification_protocol_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         use crate::input::options::HostNotificationProtocol;
         let comment_text = format!(
@@ -5964,6 +6012,9 @@ impl Options {
         }
         if let Some(nested_session_handling) = self.nested_session_handling_to_kdl(add_comments) {
             nodes.push(nested_session_handling);
+        }
+        if let Some(input_while_scrolled) = self.input_while_scrolled_to_kdl(add_comments) {
+            nodes.push(input_while_scrolled);
         }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
@@ -9477,6 +9528,42 @@ fn nested_session_handling_kdl_round_trip_for_every_variant() {
             Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
         assert_eq!(parsed, reparsed, "round-trip mismatch for {value}");
     }
+}
+
+#[test]
+fn input_while_scrolled_kdl_round_trip_for_every_variant() {
+    use crate::input::options::InputWhileScrolled;
+    let cases = [
+        ("scroll-mode", InputWhileScrolled::ScrollMode),
+        ("jump", InputWhileScrolled::Jump),
+        ("stay", InputWhileScrolled::Stay),
+    ];
+    for (value, expected) in cases {
+        let fake_config = format!(
+            r##"
+                input_while_scrolled "{value}"
+            "##
+        );
+        let document: KdlDocument = fake_config.parse().unwrap();
+        let parsed = Options::from_kdl(&document).unwrap();
+        assert_eq!(parsed.input_while_scrolled, Some(expected), "case: {value}");
+
+        let mut serialized = Options::to_kdl(&parsed, false);
+        let mut fake_document = KdlDocument::new();
+        fake_document.nodes_mut().append(&mut serialized);
+        let reparsed =
+            Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
+        assert_eq!(parsed, reparsed, "round-trip mismatch for {value}");
+    }
+}
+
+#[test]
+fn input_while_scrolled_rejects_an_unknown_value() {
+    let fake_config = r##"
+        input_while_scrolled "sideways"
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    assert!(Options::from_kdl(&document).is_err());
 }
 
 #[test]

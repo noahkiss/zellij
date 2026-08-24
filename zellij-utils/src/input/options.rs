@@ -92,6 +92,39 @@ impl FromStr for NestedSessionHandling {
     }
 }
 
+/// What happens when a key is pressed in a pane whose viewport is scrolled up.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+pub enum InputWhileScrolled {
+    /// Scrolling or focusing a scrolled pane implicitly enters Scroll mode.
+    #[serde(alias = "scroll-mode")]
+    ScrollMode,
+    /// No implicit mode switch. A key clears the pane's scroll, flushes the held
+    /// output, then reaches the pty.
+    #[serde(alias = "jump")]
+    Jump,
+    /// No implicit mode switch. A key reaches the pty and the viewport stays put.
+    #[serde(alias = "stay")]
+    Stay,
+}
+
+impl Default for InputWhileScrolled {
+    fn default() -> Self {
+        Self::ScrollMode
+    }
+}
+
+impl FromStr for InputWhileScrolled {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ScrollMode" | "scroll-mode" => Ok(Self::ScrollMode),
+            "Jump" | "jump" => Ok(Self::Jump),
+            "Stay" | "stay" => Ok(Self::Stay),
+            _ => Err(format!("No such input_while_scrolled: {}", s)),
+        }
+    }
+}
+
 impl Default for OnForceClose {
     fn default() -> Self {
         Self::Detach
@@ -619,6 +652,12 @@ pub struct Options {
     #[clap(long, value_parser)]
     #[serde(default)]
     pub dangerously_enable_paste_buffer_read: Option<bool>,
+
+    /// What a keypress does in a pane that is scrolled up
+    /// (scroll-mode, jump, stay)
+    #[clap(skip)]
+    #[serde(default)]
+    pub input_while_scrolled: Option<InputWhileScrolled>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -833,6 +872,7 @@ impl Options {
         let dangerously_enable_paste_buffer_read = other
             .dangerously_enable_paste_buffer_read
             .or(self.dangerously_enable_paste_buffer_read);
+        let input_while_scrolled = other.input_while_scrolled.or(self.input_while_scrolled);
 
         Options {
             simplified_ui,
@@ -909,6 +949,7 @@ impl Options {
             client_async_worker_tasks,
             nested_session_handling,
             dangerously_enable_paste_buffer_read,
+            input_while_scrolled,
         }
     }
 
@@ -1058,6 +1099,7 @@ impl Options {
         let dangerously_enable_paste_buffer_read = other
             .dangerously_enable_paste_buffer_read
             .or(self.dangerously_enable_paste_buffer_read);
+        let input_while_scrolled = other.input_while_scrolled.or(self.input_while_scrolled);
 
         Options {
             simplified_ui,
@@ -1134,6 +1176,7 @@ impl Options {
             client_async_worker_tasks,
             nested_session_handling,
             dangerously_enable_paste_buffer_read,
+            input_while_scrolled,
         }
     }
 

@@ -11,7 +11,7 @@ use zellij_utils::channels::{unbounded, Receiver, SenderWithContext};
 use zellij_utils::data::{Direction, NewPanePlacement, Resize, ResizeStrategy, WebSharing};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::layout::{SplitDirection, SplitSize, TiledPaneLayout};
-use zellij_utils::input::options::PaneFrameStyle;
+use zellij_utils::input::options::{InputWhileScrolled, PaneFrameStyle};
 use zellij_utils::ipc::IpcReceiverWithContext;
 use zellij_utils::pane_size::{PaneGeom, Size, SizeInPixels};
 
@@ -192,6 +192,7 @@ fn create_new_tab(size: Size, stacked_resize: bool) -> Tab {
         stacked_resize,
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -284,6 +285,7 @@ fn create_new_tab_with_layout(size: Size, layout: TiledPaneLayout) -> Tab {
         stacked_resize,
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -382,6 +384,7 @@ fn create_new_tab_with_cell_size(
         stacked_resize,
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(InputWhileScrolled::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -459,6 +462,101 @@ fn write_to_suppressed_pane() {
         None,
     )
     .unwrap();
+}
+
+// Fork addition: the two halves of `input_while_scrolled` that Tab decides. `jump` drops the
+// viewport back to the bottom and flushes the output held while the pane was scrolled, before
+// the key reaches the pty. `stay` leaves both alone — which is why `stay` inherits upstream's
+// MAX_PENDING_VTE_EVENTS force-reset as its only backstop.
+fn scrolled_pane_with_held_output(input_while_scrolled: InputWhileScrolled) -> Tab {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    *tab.input_while_scrolled.borrow_mut() = input_while_scrolled;
+
+    // Fill the scrollback so there is somewhere to scroll to.
+    let mut pane_contents = String::new();
+    for i in 0..40 {
+        pane_contents.push_str(&format!("line {}\n\r", i));
+    }
+    tab.handle_pty_bytes(1, pane_contents.into_bytes()).unwrap();
+    tab.scroll_active_terminal_up(1);
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the pane should be scrolled before the write"
+    );
+
+    // Output arriving now is held rather than rendered, because the pane is scrolled.
+    tab.handle_pty_bytes(1, b"held output\n\r".to_vec())
+        .unwrap();
+    assert_eq!(
+        tab.pending_vte_events.get(&1).map(|e| e.len()),
+        Some(1),
+        "output should be held while the pane is scrolled"
+    );
+    tab
+}
+
+#[test]
+fn writing_to_a_scrolled_pane_jumps_to_the_bottom_under_jump() {
+    let mut tab = scrolled_pane_with_held_output(InputWhileScrolled::Jump);
+    tab.write_to_pane_id(&None, vec![b'x'], false, PaneId::Terminal(1), Some(1), None)
+        .unwrap();
+    assert!(
+        !tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the write should have cleared the pane's scroll"
+    );
+    assert!(
+        tab.pending_vte_events
+            .get(&1)
+            .map(|e| e.is_empty())
+            .unwrap_or(true),
+        "the write should have flushed the held output"
+    );
+}
+
+#[test]
+fn writing_to_a_scrolled_pane_leaves_the_viewport_alone_under_stay() {
+    let mut tab = scrolled_pane_with_held_output(InputWhileScrolled::Stay);
+    tab.write_to_pane_id(&None, vec![b'x'], false, PaneId::Terminal(1), Some(1), None)
+        .unwrap();
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the write should have left the pane scrolled"
+    );
+    assert_eq!(
+        tab.pending_vte_events.get(&1).map(|e| e.len()),
+        Some(1),
+        "the write should have left the held output held"
+    );
+}
+
+#[test]
+fn writing_to_a_scrolled_pane_leaves_the_viewport_alone_under_scroll_mode() {
+    // The default value keeps upstream's behaviour: Tab does nothing, because the client is
+    // in Scroll mode and the key never reaches this path in the first place.
+    let mut tab = scrolled_pane_with_held_output(InputWhileScrolled::ScrollMode);
+    tab.write_to_pane_id(&None, vec![b'x'], false, PaneId::Terminal(1), Some(1), None)
+        .unwrap();
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .is_scrolled(),
+        "the write should have left the pane scrolled"
+    );
+    assert_eq!(
+        tab.pending_vte_events.get(&1).map(|e| e.len()),
+        Some(1),
+        "the write should have left the held output held"
+    );
 }
 
 #[test]

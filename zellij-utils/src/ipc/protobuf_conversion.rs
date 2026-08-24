@@ -1021,6 +1021,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             pane_privacy: None,
             resurrect_command_hints: None,
             default_floating_size: None,
+            input_while_scrolled: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

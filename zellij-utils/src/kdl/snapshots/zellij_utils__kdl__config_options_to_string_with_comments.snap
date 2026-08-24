@@ -355,6 +355,14 @@ web_sharing "disabled"
 // 
 // nested_session_handling "ask"
  
+// What a keypress does in a pane whose viewport is scrolled up.
+// Options:
+//   - "scroll-mode" (Default — scrolling a pane enters Scroll mode)
+//   - "jump" (the key clears the scroll, then reaches the pane)
+//   - "stay" (the key reaches the pane, the viewport stays put)
+// 
+// input_while_scrolled "scroll-mode"
+ 
 // Which escape sequence desktop notifications coming from panes are
 // forwarded to the host terminal with.
 // Options:

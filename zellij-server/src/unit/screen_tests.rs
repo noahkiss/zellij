@@ -20,7 +20,7 @@ use zellij_utils::input::layout::{
 };
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::input::options::{
-    HostNotificationProtocol, NestedSessionHandling, Options, PaneFrameStyle,
+    HostNotificationProtocol, InputWhileScrolled, NestedSessionHandling, Options, PaneFrameStyle,
     DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::IpcReceiverWithContext;
@@ -480,6 +480,7 @@ fn create_new_screen_with_capture(
         false,
         None,
         None,
+        InputWhileScrolled::default(),
         false,
         web_sharing,
         advanced_mouse_actions,
@@ -6294,6 +6295,7 @@ fn create_new_screen_with_pane_send_state(
         false,
         None,
         None,
+        InputWhileScrolled::default(),
         false,
         web_sharing,
         true,
@@ -10239,6 +10241,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         false,
         None,
         None,
+        InputWhileScrolled::default(),
         false,
         web_sharing,
         true,
@@ -11092,6 +11095,7 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
         false,
         None,
         None,
+        InputWhileScrolled::default(),
         false,
         web_sharing,
         true,
@@ -11627,6 +11631,7 @@ fn create_non_mirrored_screen(size: Size) -> Screen {
         false,
         None,
         None, // default_floating_size
+        InputWhileScrolled::default(),
         false,
         WebSharing::Off,
         true, // advanced_mouse_actions
@@ -13429,6 +13434,129 @@ fn assert_focus_change_syncs_scroll_mode(default_mode: InputMode) {
         last_change_mode(),
         Some(default_mode),
         "focusing the unscrolled pane should return the client to its default mode",
+    );
+
+    mock_screen.teardown(vec![server_thread, screen_thread]);
+}
+
+#[test]
+pub fn focusing_a_scrolled_pane_does_not_enter_scroll_mode_under_jump() {
+    assert_focus_change_does_not_sync_scroll_mode(InputWhileScrolled::Jump);
+}
+
+#[test]
+pub fn focusing_a_scrolled_pane_does_not_enter_scroll_mode_under_stay() {
+    assert_focus_change_does_not_sync_scroll_mode(InputWhileScrolled::Stay);
+}
+
+// Fork addition: `input_while_scrolled "jump"` and `"stay"` both turn the implicit sync off.
+// Scrolling a pane, and focusing one that is already scrolled, must emit no ChangeMode at all
+// — and neither must scrolling back to the bottom while the client sits in Scroll mode,
+// because a mode the user chose explicitly is not the option's to undo. Only the implicit
+// sync is governed; `jump` and `stay` differ later, in what a keypress does to the viewport.
+fn assert_focus_change_does_not_sync_scroll_mode(input_while_scrolled: InputWhileScrolled) {
+    let size = Size { cols: 80, rows: 10 };
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.config.options.input_while_scrolled = Some(input_while_scrolled);
+    let client_id = mock_screen.main_client_id;
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+    let change_mode_count = || -> usize {
+        received_server_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|instruction| {
+                matches!(instruction, ServerInstruction::ChangeMode(cid, _, _) if *cid == client_id)
+            })
+            .count()
+    };
+
+    // Same shape as assert_focus_change_syncs_scroll_mode: fill the left pane, scroll it up
+    // from Scroll mode, then return to Normal, leaving the left pane scrolled and the right
+    // pane unscrolled.
+    let mut pane_contents = String::new();
+    for i in 0..20 {
+        pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
+    }
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        0,
+        pane_contents.as_bytes().to_vec(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Scroll,
+        None,
+        client_id,
+        None,
+    ));
+    let scroll_up = CliAction::ScrollUp { pane_id: None };
+    for _ in 0..4 {
+        send_cli_action_to_server(&session_metadata, scroll_up.clone(), client_id);
+    }
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Normal,
+        None,
+        client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        change_mode_count(),
+        0,
+        "scrolling a pane should not switch the client's mode under {:?}",
+        input_while_scrolled,
+    );
+
+    // Focus away to the unscrolled pane, then back onto the scrolled one. Under scroll-mode
+    // the second move emits ChangeMode(Scroll); under jump and stay neither move emits
+    // anything.
+    for direction in [Direction::Right, Direction::Left] {
+        send_cli_action_to_server(
+            &session_metadata,
+            CliAction::MoveFocus { direction },
+            client_id,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        change_mode_count(),
+        0,
+        "focusing a scrolled pane should not switch the client's mode under {:?}",
+        input_while_scrolled,
+    );
+
+    // The implicit *exit* is off too: a client who chose Scroll explicitly stays in it when
+    // the pane scrolls back to the bottom.
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Scroll,
+        None,
+        client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::ScrollToBottom { pane_id: None },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        change_mode_count(),
+        0,
+        "scrolling back to the bottom should not drop the client out of Scroll under {:?}",
+        input_while_scrolled,
     );
 
     mock_screen.teardown(vec![server_thread, screen_thread]);

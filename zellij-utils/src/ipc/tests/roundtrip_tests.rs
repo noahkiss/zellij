@@ -473,6 +473,7 @@ fn test_client_messages() {
                 pane_privacy: None,
                 resurrect_command_hints: None,
                 default_floating_size: None,
+                input_while_scrolled: None,
                 simplified_ui: Some(true),
                 theme: Some("theme".to_owned()),
                 theme_dark: Some("theme_dark".to_owned()),
