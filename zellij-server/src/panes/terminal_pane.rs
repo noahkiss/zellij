@@ -158,6 +158,9 @@ pub struct TerminalPane {
     exclude_from_sync: bool,
     fake_cursor_locations: HashSet<(usize, usize)>, // (x, y) - these hold a record of previous fake cursors which we need to clear on render
     search_term: String,
+    // fork addition: the scroll/search mode this pane was last left in. Set by Screen when a
+    // client changes mode while this pane is focused, read back when the pane is focused again.
+    remembered_input_mode: Option<InputMode>,
     is_held: Option<(Option<i32>, IsFirstRun, RunCommand)>, // a "held" pane means that its command has either exited and the pane is waiting for a
     // possible user instruction to be re-run, or that the command has not yet been run
     banner: Option<String>, // a banner to be rendered inside this TerminalPane, used for panes
@@ -795,6 +798,12 @@ impl Pane for TerminalPane {
     }
     fn is_scrolled(&self) -> bool {
         self.grid.is_scrolled
+    }
+    fn remembered_input_mode(&self) -> Option<InputMode> {
+        self.remembered_input_mode
+    }
+    fn set_remembered_input_mode(&mut self, mode: Option<InputMode>) {
+        self.remembered_input_mode = mode;
     }
 
     fn active_at(&self) -> Instant {
@@ -1468,6 +1477,7 @@ impl TerminalPane {
             exclude_from_sync: false,
             fake_cursor_locations: HashSet::new(),
             search_term: String::new(),
+            remembered_input_mode: None,
             is_held: None,
             banner: None,
             pane_frame_color_override: None,
