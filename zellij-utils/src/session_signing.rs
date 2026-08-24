@@ -1066,6 +1066,7 @@ fn sign_down_the_ladder(
     let mut findings = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
     let mut asked_for_the_key = false;
+    let mut asked_to_unlock = false;
     let apple_offered = ladder
         .iter()
         .any(|rung| !matches!(rung, Rung::SelfSigned(_)));
@@ -1086,6 +1087,23 @@ fn sign_down_the_ladder(
             },
             other => other,
         };
+        if !matches!(rung, Rung::SelfSigned(_)) && !asked_to_unlock {
+            // An Apple rung never runs `set-key-partition-list`, so before this it never handed
+            // the password to `security` at all - and `ZELLIJ_KEYCHAIN_PASSWORD` did nothing on the
+            // machines most likely to need it. A locked keychain then refused `codesign` with
+            // `errSecInternalComponent`, while the remedy the report printed named the very
+            // variable the run had ignored. The operator's answer was an `unlock-keychain` by hand
+            // before every doctor run; this is that step, taken by doctor.
+            //
+            // Once per run and not once per rung: a password the keychain rejected will be
+            // rejected again one rung down, and saying so twice is noise. Only for a rung we did
+            // not mint, because the self-signed one already unlocks as a side effect of `-k` on the
+            // partition list - see `allow_codesign_to_reach_the_key`.
+            if let Some(password) = context.keychain_password.as_deref() {
+                asked_to_unlock = true;
+                findings.extend(unlock_the_keychain(commander, &context.keychain, password));
+            }
+        }
         if matches!(rung, Rung::SelfSigned(_)) && !asked_for_the_key {
             // BEFORE signing, and on every run rather than only the one that minted. The ACL that
             // lets `codesign` reach the key is a property of the keychain, not of the certificate,
@@ -1149,11 +1167,9 @@ fn sign_down_the_ladder(
     // or a key-access dialog nobody was there to answer. Both remedies are given on EVERY
     // exhausted ladder, including the rung we mint: a certificate doctor made itself is exactly
     // the one whose key has never been approved.
-    exhausted = exhausted
-        .note("a locked keychain or an unanswered key-access dialog refuses like this")
-        .note(KEY_ACCESS_REMEDIES[0])
-        .note(KEY_ACCESS_REMEDIES[1])
-        .note(KEY_ACCESS_REMEDIES[2]);
+    exhausted = with_key_access_remedies(
+        exhausted.note("a locked keychain or an unanswered key-access dialog refuses like this"),
+    );
     findings.push(exhausted);
     if !apple_offered {
         // an Apple certificate is still a real alternative to one we minted, so the steps stay -
@@ -2271,16 +2287,64 @@ fn allow_codesign_to_reach_the_key(
         Ok(output) => first_line(output.stderr.trim()).to_owned(),
         Err(reason) => reason,
     };
-    Some(
+    Some(with_key_access_remedies(
         Finding::needs_you(
             "signing",
             format!("codesign may ask for the key: {}", refusal),
         )
-        .note("without the partition list, macOS asks once per signature instead of never")
-        .note(KEY_ACCESS_REMEDIES[0])
-        .note(KEY_ACCESS_REMEDIES[1])
-        .note(KEY_ACCESS_REMEDIES[2]),
-    )
+        .note("without the partition list, macOS asks once per signature instead of never"),
+    ))
+}
+
+/// Unlock the keychain, so that `codesign` can reach a key it is otherwise refused.
+///
+/// **The step the Apple rungs were missing.** A keychain that is locked - which is every keychain
+/// under launchd, and every one on a machine reached over SSH that nobody has typed into - lets
+/// `security find-identity` list the certificate and then refuses `codesign` the private key, with
+/// `errSecInternalComponent` and nothing else said. The self-signed rung never met this, because
+/// `-k` on `set-key-partition-list` unlocks the keychain on its way past; the Apple rungs run no
+/// `security` command at all before signing, so they met it every time.
+///
+/// Like the partition list, a refusal here is survivable: the run goes on to sign, and the worst
+/// case is the `codesign` failure it would have had anyway. So this returns a `Needs you` rather
+/// than stopping the walk.
+///
+/// The password goes in argv because `security` reads it nowhere else - the same trade
+/// [`allow_codesign_to_reach_the_key`] makes, for the same reason - and **it is never put in a
+/// finding**. The refusal quoted here is the tool's own stderr, which names the keychain and not
+/// the password.
+fn unlock_the_keychain(
+    commander: &dyn Commander,
+    keychain: &str,
+    keychain_password: &str,
+) -> Option<Finding> {
+    let refusal = match commander.run(
+        "security",
+        &["unlock-keychain", "-p", keychain_password, keychain],
+        None,
+    ) {
+        Ok(output) if output.success => return None,
+        Ok(output) => first_line(output.stderr.trim()).to_owned(),
+        Err(reason) => reason,
+    };
+    Some(with_key_access_remedies(
+        Finding::needs_you(
+            "signing",
+            format!("the keychain would not unlock: {}", refusal),
+        )
+        .note("ZELLIJ_KEYCHAIN_PASSWORD is set, so doctor tried to unlock it before signing")
+        .note("a wrong password refuses like this, and a locked keychain refuses codesign"),
+    ))
+}
+
+/// Every way a person can give `codesign` the key, said the same way wherever it is said.
+///
+/// Written as a fold rather than three chained `.note()` calls so that a remedy can be added or
+/// reworded in one place - the list has already grown once.
+fn with_key_access_remedies(finding: Finding) -> Finding {
+    KEY_ACCESS_REMEDIES
+        .iter()
+        .fold(finding, |finding, remedy| finding.note(*remedy))
 }
 
 /// The two ways a person can give `codesign` the key, in the order worth trying them.
@@ -2292,10 +2356,14 @@ fn allow_codesign_to_reach_the_key(
 /// detached pane do not have and an SSH session cannot answer unattended, and a prompt nobody sees
 /// is a program that hangs. Every child doctor runs is put in its own session for that reason; see
 /// `SystemCommander::run`.
-const KEY_ACCESS_REMEDIES: [&str; 3] = [
+const KEY_ACCESS_REMEDIES: [&str; 4] = [
     "either run doctor from a terminal in the desktop session and click Always Allow",
     "  on the key-access dialog macOS raises, once, for this certificate",
     "or set ZELLIJ_KEYCHAIN_PASSWORD and run it again - doctor reads it, never asks",
+    // and this half used to be a lie on the rungs that most needed it. Until doctor unlocked the
+    // keychain itself, the variable was read only by the self-signed rung's partition list, so a
+    // machine signing with an Apple certificate was sent to set a variable that changed nothing.
+    "  it unlocks the keychain, whichever certificate the run signs with",
 ];
 
 #[cfg(test)]
@@ -4482,6 +4550,246 @@ Signature=adhoc
         );
         assert!(
             !commander.called_with("security set-key-partition-list"),
+            "{:?}",
+            commander.calls()
+        );
+    }
+
+    /// A run that signs with the Apple Development certificate of `APPLE_AND_OURS`, with the
+    /// keychain answering `unlock`.
+    fn signing_with_an_apple_certificate(pin: &Path, unlock: CommandOutput) -> RecordedCommander {
+        RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(APPLE_AND_OURS)),
+            ("security unlock-keychain", unlock),
+            (
+                "codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334",
+                recorded(""),
+            ),
+            ("codesign -d --verbose=2 -r- ", recorded(APPLE_DEVELOPMENT)),
+            ("codesign --verify ", recorded("")),
+        ])
+    }
+
+    /// The Apple rungs ran no `security` command at all before signing, so
+    /// `ZELLIJ_KEYCHAIN_PASSWORD` reached nothing on the machines most likely to need it: a locked
+    /// keychain refused `codesign` with `errSecInternalComponent`, and the report answered by
+    /// naming the variable the run had just ignored.
+    #[test]
+    fn the_keychain_is_unlocked_before_signing_with_an_apple_certificate() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = signing_with_an_apple_certificate(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.keychain_password = Some(String::from("hunter2"));
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        let calls = commander.calls();
+        let unlocked = commander
+            .position_of("security unlock-keychain")
+            .unwrap_or_else(|| panic!("the keychain was never unlocked: {:?}", calls));
+        // spelled out in full: the keychain has to be NAMED. Without it `security` unlocks the
+        // default one, which is not always the one this run imports into and signs from.
+        assert_eq!(
+            calls[unlocked],
+            "security unlock-keychain -p hunter2 login.keychain-db"
+        );
+        let signed = commander
+            .position_of("codesign -s ")
+            .unwrap_or_else(|| panic!("nothing was signed: {:?}", calls));
+        assert!(unlocked < signed, "unlocked after it signed: {:?}", calls);
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::Changed
+                    && finding.message.contains("Apple Development")),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// A keychain that refuses the password is survivable, exactly as the partition list is: the
+    /// worst that follows is the `codesign` failure the run would have had anyway. It says so once
+    /// and goes on to sign.
+    #[test]
+    fn a_keychain_that_will_not_unlock_is_reported_and_the_run_still_signs() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = signing_with_an_apple_certificate(
+            &pin,
+            recorded_failure(
+                "security: SecKeychainUnlock login.keychain-db: The user name or passphrase you \
+                 entered is not correct.",
+            ),
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        // a value no prose in this file could contain by accident, because the assertion below is
+        // a substring search over the whole report
+        context.keychain_password = Some(String::from("sw0rdf1sh"));
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        let refused = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("would not unlock"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert_eq!(refused.status, Status::NeedsYou);
+        // the password is in argv and it is in NO finding, message or note
+        let printed = format!("{:?}", run.findings);
+        assert!(!printed.contains("sw0rdf1sh"), "{}", printed);
+        assert!(
+            commander.called_with("codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334"),
+            "{:?}",
+            commander.calls()
+        );
+    }
+
+    /// Once per run, not once per rung. A password the keychain rejected is rejected again one
+    /// rung down, and a report that says so twice is a report that is read less carefully.
+    #[test]
+    fn the_keychain_is_unlocked_once_however_many_apple_rungs_are_walked() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            ("security unlock-keychain", recorded("")),
+            // both Apple rungs refuse, so the walk visits each of them
+            (
+                "codesign -s 0011223344556677889900AABBCCDDEEFF001122",
+                recorded_failure("errSecInternalComponent"),
+            ),
+            (
+                "codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334",
+                recorded_failure("errSecInternalComponent"),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.keychain_password = Some(String::from("hunter2"));
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        let calls = commander.calls();
+        let unlocks = calls
+            .iter()
+            .filter(|call| call.starts_with("security unlock-keychain"))
+            .count();
+        assert_eq!(unlocks, 1, "{:?}", calls);
+    }
+
+    /// With no password there is nothing to unlock with, and the remedy has to say what setting
+    /// the variable would actually buy - which for two releases it did not, on this rung.
+    #[test]
+    fn without_a_password_nothing_is_unlocked_and_the_remedy_says_what_one_would_do() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(AD_HOC),
+            ),
+            (FIND_IDENTITY, recorded(APPLE_AND_OURS)),
+            (
+                "codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334",
+                recorded_failure("errSecInternalComponent"),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context(scratch.path()),
+        );
+
+        assert!(
+            !commander.called_with("security unlock-keychain"),
+            "{:?}",
+            commander.calls()
+        );
+        let refused = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("refused to sign"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        let notes = refused.notes.join("\n");
+        assert!(notes.contains("ZELLIJ_KEYCHAIN_PASSWORD"), "{}", notes);
+        assert!(notes.contains("it unlocks the keychain"), "{}", notes);
+    }
+
+    /// And our own rung is untouched by all of it. `-k` on the partition list already unlocks the
+    /// keychain on its way past, so a second `security` command there would be one more way for a
+    /// run that works today to start failing.
+    #[test]
+    fn our_own_rung_unlocks_through_the_partition_list_and_not_a_second_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the working copy").unwrap();
+        let commander = signing_with_our_own(&pin, recorded(""));
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.keychain_password = Some(String::from("hunter2"));
+        sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        assert!(
+            commander.called_with("set-key-partition-list"),
+            "{:?}",
+            commander.calls()
+        );
+        assert!(
+            commander.called_with("-k hunter2"),
+            "{:?}",
+            commander.calls()
+        );
+        assert!(
+            !commander.called_with("security unlock-keychain"),
             "{:?}",
             commander.calls()
         );

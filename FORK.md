@@ -2681,6 +2681,24 @@ desktop can answer it with **Always Allow**, once. So a refusal is reported and 
 and a `codesign` that then refuses too names both remedies: run doctor from a terminal in the
 desktop session and click Always Allow, or set `ZELLIJ_KEYCHAIN_PASSWORD`.
 
+**The password unlocks the keychain on the Apple rungs too, and until now it did not.** It reached
+`security` only as `-k` on `set-key-partition-list`, and that command runs only for the certificate
+we mint — so a machine signing with an Apple Development or Developer ID certificate ran no
+`security` command at all before `codesign`, and `ZELLIJ_KEYCHAIN_PASSWORD` did nothing on it. A
+locked keychain — every launchd run, and every machine reached over SSH that nobody has typed into —
+then refused the key with `errSecInternalComponent`, while the remedy printed beside the refusal
+told the reader to set the one variable the run had ignored. The workaround was a
+`security unlock-keychain -p` typed by hand before each doctor run. Doctor now takes that step
+itself: on the first rung that is not ours, and only when the variable is set, it runs
+`security unlock-keychain -p <password> <keychain>` against the same default keychain it signs from.
+Once per run and not once per rung — a password the keychain rejected is rejected again one rung
+down, and saying so twice is noise. A refusal there is survivable in the same way the partition
+list's is: it is a `Needs you`, and the run goes on to sign. Our own rung is untouched, because `-k`
+already unlocks the keychain on its way past. The password stays out of every finding; what is
+quoted is `security`'s own stderr, which names the keychain and not the password. The remedy now
+says what setting the variable buys — it unlocks the keychain, whichever certificate the run signs
+with — because on the rungs that most needed it, that sentence used to be a lie.
+
 That rule has a consequence in the *discovery* step, and it is not obvious. `security find-identity
 -v -p codesigning` lists valid identities, and validity there is a **trust** decision — so a
 certificate we minted, which chains to nothing, is reported as `(CSSMERR_TP_NOT_TRUSTED)` and the
