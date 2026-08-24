@@ -2190,6 +2190,68 @@ expressible, and that each lands in the plist exactly once.
 same interval on both init systems at once; this hatch still wins over it on macOS, and the entry
 for that key says why.
 
+### An unknown key in `session_service` warns instead of failing the config
+
+An unknown TOP-LEVEL key in `config.kdl` has always been ignored, which is what lets a config reach
+every machine before the binary that reads it does. A block that parses its own children lost that
+property: `session_service` answered an unknown child with a config error, and a config error is
+the WHOLE file, not the block.
+
+```
+× Failed to parse Zellij configuration
+╰── Unknown session_service entry: "managed_session" (expected systemd, launchd, pin_exe, ...)
+```
+
+So a nested key could not be seeded ahead of the binary, and a shared config carrying one would not
+load on any machine that was behind. `managed_session` and `launchd { env }` each paid that price,
+and each entry above says so.
+
+A name this build does not know is now **kept, logged and ignored**, at every depth this block
+parses — an entry of `session_service`, a section of `systemd`, a child of `launchd`:
+
+```kdl
+session_service {
+    managed_session true                       // read
+    some_key_from_a_later_build "whatever"     // ignored, with a warning
+    systemd {
+        service "Nice=-5"                      // read
+        sockets "ListenStream=1234"            // ignored, with a warning
+    }
+}
+```
+
+**Only the unknown-NAME case softened.** A name this build knows, given a value it cannot mean, is
+still the whole config failing to parse: a wrong type, a `watchdog_interval_secs` of zero, a
+`pin_exe` that is neither a switch nor a path, a systemd line that is not `Key=value`, and every
+guard against an entry taking over what the generator owns. The operator meant that setting and is
+not getting it, which is worth stopping for. An unknown name means the opposite — nobody who typed
+it expected THIS build to act on it.
+
+The warning reaches two places, because the question is asked in two. `zellij setup --check` prints
+it under the config it just read, which is where someone looks when a setting appears to do
+nothing:
+
+```
+[CONFIG FILE]: Well defined.
+[CONFIG WARNING]: unknown session_service entry "some_key_from_a_later_build", ignored (expected
+systemd, launchd, pin_exe, managed_session, restart_via_launchd or watchdog_interval_secs)
+```
+
+and the parse also logs it at `warn`, so a session already running says it too. Every warning names
+the entry it read and what the block does accept, so a misspelling reads as a misspelling.
+
+An ignored entry is **not** written back out by `setup --dump-config`. It is not part of this
+build's configuration, and a dump that re-emitted it would claim otherwise.
+
+The rollout order this restores is the one AGENTS.md gives for a top-level key, now with no
+exception for a nested one: the config can go everywhere first and the binaries follow in any
+order. It does not extend to the **command surface** — a script or a unit calling a new subcommand
+still breaks on every machine that has not upgraded.
+
+Scope is `session_service` and its children only. Upstream's own strict blocks are untouched, and
+so are the fork's other two — `pane_privacy` and `resurrect_command_hints` still refuse a child
+they do not know, and have the same rollout problem waiting in them.
+
 ### A pinned copy of the binary (`pin_exe`)
 
 ```kdl
@@ -4698,7 +4760,10 @@ watching, and a Mac that cannot start its session is a bad place to need a new r
 
 It is a key **nested inside a block that parses its own children**, so it cannot be rolled out
 ahead of the binary — an older build fails the whole config on it, not just the block. Ship the
-binary first; the key is only ever needed after.
+binary first; the key is only ever needed after. (That is what every build up to and including
+`0.45.0-nkmk.17` does. From [the entry that softened
+it](#an-unknown-key-in-session_service-warns-instead-of-failing-the-config) on, a build ignores a
+key it does not know — but the builds this had to be rolled out past are the older ones.)
 
 Operator-visible, on upgrading each Mac and with **no `session enable` re-run and no plist change**:
 `zjr` goes through launchd rather than spawning a server from the Cellar path, and the TCC prompts
@@ -5187,11 +5252,12 @@ the session here, loudly: somebody is waiting at a terminal, and the fault this 
 session with fewer capabilities than it should have, not a session that does not exist. `session
 up` is stricter and reports a post-condition failure, because nobody is waiting for it.
 
-Nested key, so the usual rule applies with no exceptions: `session_service` parses its own
+Nested key, so the rule of the day applied with no exceptions: `session_service` parses its own
 children, and an older build fails the **whole** config on `managed_session`, not just the block.
 Verified against `0.45.0-nkmk.15`, which answers `Unknown session_service entry: "managed_session"`
-and refuses the file. It cannot be seeded into a shared config ahead of the binary; it ships with
-the code that accepts it.
+and refuses the file. It could not be seeded into a shared config ahead of the binary; it shipped
+with the code that accepts it. This is one of the two keys that bought [the entry that softened
+that rule](#an-unknown-key-in-session_service-warns-instead-of-failing-the-config).
 
 ### A plugin that failed says so afterwards
 
@@ -5436,10 +5502,12 @@ left exactly as it was. The consequence is worth knowing rather than fixing: on 
 shows the interval, because `StartInterval` is a key on the job itself, while on Linux it appears
 only in the comment line — the file that carries it is not the file that command dumps.
 
-Nested key, so the usual rule applies with no exceptions: `session_service` parses its own
+Nested key, so the rule of the day applied with no exceptions: `session_service` parses its own
 children, and an older build fails the **whole** config on `watchdog_interval_secs`, not just the
-block. It cannot be seeded into a shared config ahead of the binary; it ships with the code that
-accepts it, and every machine takes the binary first.
+block. It could not be seeded into a shared config ahead of the binary; it shipped with the code
+that accepts it, and every machine took the binary first. A key added after [the entry that
+softened that rule](#an-unknown-key-in-session_service-warns-instead-of-failing-the-config) is no
+longer held back this way.
 
 ### `--version` says which upstream base it was cut from
 
@@ -5526,10 +5594,11 @@ Unset, the generated plist is byte-identical to what it was — asserted by comp
 against a default block. `session status` lists the entries as `env NAME = value`, prefixed because
 they are not plist keys and a listing that showed them the same way would say they were.
 
-Nested key, so the usual rule applies with no exceptions: the `launchd` block parses its own
-children, and an older build fails the **whole** config on `env`, not just the block. It cannot be
-seeded into a shared config ahead of the binary; it ships with the code that accepts it, and every
-machine takes the binary first.
+Nested key, so the rule of the day applied with no exceptions: the `launchd` block parses its own
+children, and an older build fails the **whole** config on `env`, not just the block. It could not
+be seeded into a shared config ahead of the binary; it shipped with the code that accepts it, and
+every machine took the binary first. This is the second of the two keys that bought [the entry that
+softened that rule](#an-unknown-key-in-session_service-warns-instead-of-failing-the-config).
 
 ### The checked-in plugin assets no longer name the machine that built them
 
