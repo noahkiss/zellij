@@ -294,6 +294,14 @@ load_plugins {
 //
 // nested_session_handling "ask"
 
+// Choose what a keypress does in a pane whose viewport is scrolled up
+// Options:
+//   - scroll-mode (Default - scrolling or focusing a scrolled pane enters Scroll mode)
+//   - jump (the key clears the pane's scroll, flushes the held output, then reaches the pane)
+//   - stay (the key reaches the pane, the viewport stays where it is)
+//
+// input_while_scrolled "scroll-mode"
+
 //  Send a request for a simplified ui (without arrow fonts) to plugins
 //  Options:
 //    - true

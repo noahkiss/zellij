@@ -5690,6 +5690,67 @@ correct, and the reason a candidate never leaves an artifact behind that the rel
 The tap changes with it: the install check and the rc formula's test block assert the full rc
 version instead of stripping it. They are in `noahkiss/homebrew-tap`, not here.
 
+### `input_while_scrolled`: typing into a scrolled pane no longer eats the key
+
+Upstream 0.45 puts the client into Scroll mode whenever the focused pane is scrolled — when you
+scroll it, and again when you focus back onto one you left scrolled. The mode then decides what a
+key means, and `Keybinds::default_action_for_mode` returns `Action::Write` only for `Locked` and
+for the client's own default mode. So a printable key typed into a scrolled pane is not sent
+somewhere wrong; it is **discarded**. `e` and `s` are worse than discarded — the default scroll
+keymap binds them to `EditScrollback` and `EnterSearch`. Read a log, scroll up, start typing the
+next command: the first few characters vanish and the fourth opens an editor.
+
+```kdl
+input_while_scrolled "scroll-mode"
+```
+
+Three values, and the default is the upstream behaviour, so an unset config is 0.45 exactly:
+
+| Value | Implicit mode switch | A key typed into a scrolled pane |
+|---|---|---|
+| `scroll-mode` (default) | yes, as upstream | resolved in Scroll mode; an unbound key is discarded |
+| `jump` | no | clears the pane's scroll, flushes the held output, then reaches the pty |
+| `stay` | no | reaches the pty; the viewport does not move |
+
+`jump` is the 0.44 feel. Upstream `c428ae93b` deleted the branch of `change_mode` that cleared the
+active pane's scroll on the way out of Scroll mode, which is what used to snap the viewport back;
+this puts the snap on the keypress instead of on the mode change, where it is the same gesture a
+terminal user already expects. `stay` is for reading while a pane is busy: send the key, keep
+looking at what you were looking at.
+
+**The option governs only the *implicit* sync — both halves of it.** An explicit `SwitchToMode
+"Scroll"` behaves identically under all three values, because it goes through `change_mode` and
+nothing here touches that function. Under `jump` and `stay` the implicit *exit* is off too: a
+client who chose Scroll deliberately is not dropped out of it by scrolling back to the bottom.
+That is the point of turning the automation off, not an oversight.
+
+The guard is one early return at the top of `sync_scroll_mode_on_focus`, behind a named predicate
+(`implicit_scroll_mode_sync_enabled`). All 37 call sites funnel through that function — the focus
+verbs call it directly, the scroll verbs through `sync_scroll_mode_if_scroll_changed`, and the
+pane-id-targeted ones through `sync_scroll_mode_for_pane_id` — so one guard disables the lot and
+no call site is edited. `jump`'s other half is a single branch in `Tab::write_to_pane_id`, inside
+the `AdjustedInput::WriteBytesToTerminal` arm and nowhere else: only that arm is a byte actually
+reaching the pty, and re-run, close and drop-to-shell must not move the viewport. It flushes
+before the write, because the held output belongs above the echo of the key being sent.
+
+**`stay` inherits upstream's wart, and does not fix it.** Output arriving at a scrolled pane is
+held in `pending_vte_events` rather than rendered, and the queue is capped at
+`MAX_PENDING_VTE_EVENTS` — 7000 pty reads, not 7000 bytes. Reach the cap and the pane clears its
+own scroll and drains, yanking the viewport to the bottom. That is the design that came with
+upstream's buffered-output hold (#4850) and every value here lives with it; under `stay` a chatty
+pane left scrolled will eventually jump on its own. Scroll down, or clear the scroll, to flush on
+purpose.
+
+**Rollout is free.** It is a TOP-LEVEL key, so a binary that predates it ignores it rather than
+failing the config — unlike a key nested in a block that parses its own children. The config can
+be seeded on every machine before any of them takes the binary, in any order.
+
+It never crosses the wire. The field is `#[clap(skip)]`, so it stays out of `CliAssets`; no
+`message Options` field is added, and `protobuf_conversion.rs` reads it as `None` in the
+proto→Options direction like every other fork option. The server loads the config itself, and the
+value reaches tabs as an `Rc<RefCell<_>>` shared with `Screen`, the way `default_floating_size`
+does, so a config reload applies to tabs opened before it with no per-tab update chain.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
