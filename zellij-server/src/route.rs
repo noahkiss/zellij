@@ -412,6 +412,7 @@ pub(crate) fn route_action(
                 .send_to_server(ServerInstruction::ChangeMode(
                     client_id,
                     input_mode,
+                    false,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;

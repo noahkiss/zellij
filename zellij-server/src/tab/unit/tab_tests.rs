@@ -8,7 +8,9 @@ use crate::{os_input_output::ServerOsApi, panes::PaneId, thread_bus::ThreadSende
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use zellij_utils::channels::{unbounded, Receiver, SenderWithContext};
-use zellij_utils::data::{Direction, NewPanePlacement, Resize, ResizeStrategy, WebSharing};
+use zellij_utils::data::{
+    Direction, InputMode, NewPanePlacement, Resize, ResizeStrategy, WebSharing,
+};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::layout::{SplitDirection, SplitSize, TiledPaneLayout};
 use zellij_utils::input::options::{InputWhileScrolled, PaneFrameStyle};
@@ -556,6 +558,68 @@ fn writing_to_a_scrolled_pane_leaves_the_viewport_alone_under_scroll_mode() {
         tab.pending_vte_events.get(&1).map(|e| e.len()),
         Some(1),
         "the write should have left the held output held"
+    );
+}
+
+#[test]
+fn a_pane_remembers_its_input_mode_while_another_pane_is_focused() {
+    // The memory is per pane, not per client, so nothing about focusing elsewhere disturbs it.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    tab.vertical_split(PaneId::Terminal(2), None, 1, None, None)
+        .unwrap();
+    tab.set_remembered_input_mode_for_pane(PaneId::Terminal(1), Some(InputMode::Search));
+    tab.set_remembered_input_mode_for_pane(PaneId::Terminal(2), Some(InputMode::Scroll));
+    tab.focus_next_pane(1);
+    assert_eq!(
+        tab.remembered_input_mode_for_pane(PaneId::Terminal(1)),
+        Some(InputMode::Search),
+        "the unfocused pane should still remember the mode it was left in"
+    );
+    assert_eq!(
+        tab.remembered_input_mode_for_pane(PaneId::Terminal(2)),
+        Some(InputMode::Scroll),
+        "each pane remembers its own mode"
+    );
+}
+
+#[test]
+fn a_pane_forgets_its_input_mode_when_it_closes() {
+    // Why the memory lives on the pane rather than in a map on Screen: closing the pane is all
+    // the cleanup there is, on every close path at once.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    tab.vertical_split(PaneId::Terminal(2), None, 1, None, None)
+        .unwrap();
+    tab.set_remembered_input_mode_for_pane(PaneId::Terminal(2), Some(InputMode::Scroll));
+    tab.close_pane(PaneId::Terminal(2), false, None);
+    assert_eq!(
+        tab.remembered_input_mode_for_pane(PaneId::Terminal(2)),
+        None,
+        "a closed pane's remembered mode should be gone with it"
+    );
+}
+
+#[test]
+fn a_plugin_pane_remembers_no_input_mode() {
+    // The trait methods are defaulted, so only TerminalPane carries the field. A plugin pane has
+    // no scrollback to search and must stay on the defaults.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, true);
+    tab.set_remembered_input_mode_for_pane(PaneId::Plugin(1), Some(InputMode::Scroll));
+    assert_eq!(
+        tab.remembered_input_mode_for_pane(PaneId::Plugin(1)),
+        None,
+        "setting a mode on a pane that does not exist should not invent one"
     );
 }
 

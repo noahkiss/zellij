@@ -127,7 +127,10 @@ pub enum ServerInstruction {
         client_id: ClientId,
     },
     DisconnectAllClientsExcept(ClientId),
-    ChangeMode(ClientId, InputMode, Option<NotificationEnd>),
+    /// The `bool` is a fork addition: `true` when the screen is restoring a newly focused pane's
+    /// remembered mode rather than the user asking for a mode. Carried through to
+    /// `Screen::change_mode`, which uses it to leave the destination pane's search alone.
+    ChangeMode(ClientId, InputMode, bool, Option<NotificationEnd>),
     ChangeModeForAllClients(InputMode),
     Reconfigure {
         client_id: ClientId,
@@ -1510,6 +1513,7 @@ pub fn start_server_impl(
                         default_mode,
                         Some(default_mode),
                         client_id,
+                        false,
                         None,
                     ))
                     .unwrap();
@@ -1968,7 +1972,7 @@ pub fn start_server_impl(
                     .unwrap()
                     .associate_pipe_with_client(pipe_id, client_id);
             },
-            ServerInstruction::ChangeMode(client_id, input_mode, completion) => {
+            ServerInstruction::ChangeMode(client_id, input_mode, is_focus_restore, completion) => {
                 let mut session_data = session_data.write().unwrap();
                 let session_data = session_data.as_mut().unwrap();
                 let base_mode = session_data
@@ -1983,6 +1987,7 @@ pub fn start_server_impl(
                         input_mode,
                         Some(base_mode),
                         client_id,
+                        is_focus_restore,
                         completion,
                     ))
                     .unwrap();

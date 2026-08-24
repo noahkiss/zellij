@@ -614,10 +614,15 @@ pub enum ScreenInstruction {
     SetDarkTheme(Option<NotificationEnd>),
     SetLightTheme(Option<NotificationEnd>),
     ToggleTheme(Option<NotificationEnd>),
+    /// The `bool` is a fork addition: `true` when this mode change comes from restoring the
+    /// remembered mode of a newly focused pane, rather than from the user asking for it. Focus
+    /// moves before the restore lands, so a focus-driven change must not clear the destination
+    /// pane's search. See `Screen::change_mode`.
     ChangeMode(
         InputMode,
         Option<InputMode>,
         ClientId,
+        bool,
         Option<NotificationEnd>,
     ),
     ChangeModeForAllClients(InputMode, Option<InputMode>, Option<NotificationEnd>),
@@ -1790,6 +1795,13 @@ const STARTUP_SENTINEL_TOKEN: u32 = 0;
 const SERVER_FORWARD_TIMEOUT_MS: u64 = 1000;
 
 const SERVER_CLIPBOARD_FORWARD_TIMEOUT_MS: u64 = 35_000;
+
+/// fork addition: the modes a pane remembers for itself, so focusing it again puts the client
+/// back in the mode that pane was left in. Deliberately the same set as `search_related_modes`
+/// in `Screen::change_mode`: these are the modes that act on one pane's scrollback, and every
+/// other mode is a transient menu that belongs to the client rather than to a pane.
+const REMEMBERED_INPUT_MODES: [InputMode; 3] =
+    [InputMode::Scroll, InputMode::Search, InputMode::EnterSearch];
 
 /// How many entries the action ring holds before the oldest falls out.
 ///
@@ -6615,7 +6627,9 @@ impl Screen {
         new_mode: InputMode,
         base_mode: Option<InputMode>,
         client_id: ClientId,
+        is_focus_restore: bool,
     ) -> Result<()> {
+        let had_a_mode = self.mode_info.contains_key(&client_id);
         let mut mode_info = self
             .mode_info
             .get(&client_id)
@@ -6632,9 +6646,23 @@ impl Screen {
         let search_related_modes = [InputMode::EnterSearch, InputMode::Search, InputMode::Scroll];
         if search_related_modes.contains(&previous_mode)
             && !search_related_modes.contains(&mode_info.mode)
+            // fork addition: focus already moved by the time a restore's ChangeMode arrives, so
+            // `client_id`'s active pane here is the DESTINATION pane. Clearing its search would
+            // wipe state the user never asked to lose, on a pane they only just arrived at.
+            && !is_focus_restore
         {
             active_tab!(self, client_id, |tab: &mut Tab| tab.clear_search(client_id));
         }
+
+        // fork addition: remember the new mode on the pane the client is looking at, so focusing
+        // it again restores it. Only the scroll/search family is worth remembering; every other
+        // mode is a transient menu, and returning to the default mode clears the memory.
+        self.remember_input_mode_for_active_pane(
+            client_id,
+            mode_info.mode,
+            mode_info.base_mode,
+            had_a_mode,
+        );
 
         if mode_info.mode == InputMode::RenameTab {
             if let Ok(active_tab) = self.get_active_tab_mut(client_id) {
@@ -6678,21 +6706,62 @@ impl Screen {
         }
         Ok(())
     }
-    // Keep the client's mode in sync with the pane it just focused: entering a scrolled
-    // pane switches to Scroll so its position is navigable, leaving it returns to the
-    // default mode. Only the default<->Scroll pair is touched (Normal by default, Locked
-    // under unlock-first), so a client in another mode (Pane, Tab, Search, ...) is never
-    // pulled out of it. See #638.
+    // Keep the client's mode in sync with the pane it just focused. Upstream (#638) derives it
+    // from whether the pane is scrolled: entering a scrolled pane switches to Scroll so its
+    // position is navigable, leaving it returns to the default mode, and only that pair is
+    // touched (Normal by default, Locked under unlock-first).
+    //
+    // fork addition (#5419, #5470): the pane's own remembered mode comes first, so a pane left
+    // in Scroll, Search or EnterSearch gets that mode back and a pane that remembers nothing
+    // takes the client out of that family. Upstream's derivation is what is left when the pane
+    // remembers nothing, and it is the only half `input_while_scrolled` governs.
     fn sync_scroll_mode_on_focus(&mut self, client_id: ClientId) -> Result<()> {
-        // fork addition: `input_while_scrolled` decides whether the implicit sync runs at
-        // all. Guarding here disables every call site at once, because both
-        // sync_scroll_mode_if_scroll_changed and sync_scroll_mode_for_pane_id funnel through
-        // this function. An explicit SwitchToMode "Scroll" goes through change_mode and is
-        // untouched by the option.
+        // base_mode is the default config reloads keep current; .mode is the fallback.
+        let default_mode = self
+            .default_mode_info
+            .base_mode
+            .unwrap_or(self.default_mode_info.mode);
+        if default_mode == InputMode::Scroll {
+            return Ok(());
+        }
+        let current_mode = match self.mode_info.get(&client_id) {
+            Some(mode_info) => mode_info.mode,
+            None => return Ok(()),
+        };
+        // fork addition: the newly focused pane's own mode wins. A pane left in Scroll, Search
+        // or EnterSearch gets that mode back, and a pane that remembers nothing takes the
+        // client out of the scroll/search family it was in for the pane it just left. Both
+        // happen under every `input_while_scrolled` value: the option governs the implicit
+        // derivation below, not a mode the user chose for a pane.
+        let remembered_mode = self.get_active_tab(client_id).ok().and_then(|tab| {
+            tab.get_active_pane_id(client_id)
+                .and_then(|pane_id| tab.remembered_input_mode_for_pane(pane_id))
+        });
+        let new_mode = match remembered_mode {
+            Some(remembered_mode) if remembered_mode == current_mode => return Ok(()),
+            Some(remembered_mode) => remembered_mode,
+            None if REMEMBERED_INPUT_MODES.contains(&current_mode)
+                && current_mode != default_mode =>
+            {
+                default_mode
+            },
+            None => return self.sync_scroll_mode_from_scroll_state(client_id, true),
+        };
+        self.send_mode_change_to_server(client_id, new_mode, true)
+    }
+    // The upstream half: derive the mode from whether the focused pane is scrolled. Reached
+    // from a focus change only when the pane remembers no mode of its own, and directly from
+    // the scroll verbs, where nothing has been focused and there is no memory to consult.
+    fn sync_scroll_mode_from_scroll_state(
+        &mut self,
+        client_id: ClientId,
+        is_focus_restore: bool,
+    ) -> Result<()> {
+        // fork addition: `input_while_scrolled` decides whether the implicit sync runs at all.
+        // An explicit SwitchToMode "Scroll" goes through change_mode and is untouched by it.
         if !self.implicit_scroll_mode_sync_enabled() {
             return Ok(());
         }
-        // base_mode is the default config reloads keep current; .mode is the fallback.
         let default_mode = self
             .default_mode_info
             .base_mode
@@ -6710,14 +6779,68 @@ impl Screen {
             (InputMode::Scroll, false) => default_mode,
             _ => return Ok(()),
         };
-        // Route through the server like SwitchToMode does, so the client's authoritative
-        // input mode (current_input_modes, used for keybind resolution) is updated and not
-        // just the mode_info used for rendering. A direct change_mode() would desync the
-        // two: the status line would show Scroll while keys still resolved in Normal.
+        self.send_mode_change_to_server(client_id, new_mode, is_focus_restore)
+    }
+    // Route through the server like SwitchToMode does, so the client's authoritative input mode
+    // (current_input_modes, used for keybind resolution) is updated and not just the mode_info
+    // used for rendering. A direct change_mode() would desync the two: the status line would
+    // show Scroll while keys still resolved in Normal.
+    //
+    // fork addition: `is_focus_restore` says whether focus has already moved by the time this
+    // lands. Set, it stops change_mode clearing the search of the pane the client just arrived
+    // at. The scroll verbs clear it, because focus has not moved and leaving the search family
+    // there clears the search of the pane the user is looking at - upstream's behaviour, and
+    // still the right one.
+    fn send_mode_change_to_server(
+        &self,
+        client_id: ClientId,
+        new_mode: InputMode,
+        is_focus_restore: bool,
+    ) -> Result<()> {
         self.bus
             .senders
-            .send_to_server(ServerInstruction::ChangeMode(client_id, new_mode, None))
-            .with_context(|| format!("failed to sync scroll mode on focus for client {client_id}"))
+            .send_to_server(ServerInstruction::ChangeMode(
+                client_id,
+                new_mode,
+                is_focus_restore,
+                None,
+            ))
+            .with_context(|| format!("failed to sync scroll mode for client {client_id}"))
+    }
+    // fork addition: the scroll/search modes a pane remembers. Every other mode is a transient
+    // menu that a focus change has no business restoring, and the default mode means "nothing to
+    // restore" - so it is stored as None rather than as itself.
+    fn remember_input_mode_for_active_pane(
+        &mut self,
+        client_id: ClientId,
+        new_mode: InputMode,
+        base_mode: Option<InputMode>,
+        client_had_a_mode: bool,
+    ) {
+        let default_mode = base_mode.unwrap_or_else(|| {
+            self.default_mode_info
+                .base_mode
+                .unwrap_or(self.default_mode_info.mode)
+        });
+        let remembered = if new_mode == default_mode {
+            // A client's first mode change is AttachClient putting it in its default mode. The
+            // pane's memory belongs to the clients already looking at it, so somebody joining
+            // must not clear it - which is also what makes the mode survive detach and re-attach.
+            if !client_had_a_mode {
+                return;
+            }
+            None
+        } else if REMEMBERED_INPUT_MODES.contains(&new_mode) {
+            Some(new_mode)
+        } else {
+            // A transient menu: leave whatever the pane already remembers alone.
+            return;
+        };
+        if let Ok(tab) = self.get_active_tab_mut(client_id) {
+            if let Some(pane_id) = tab.get_active_pane_id(client_id) {
+                tab.set_remembered_input_mode_for_pane(pane_id, remembered);
+            }
+        }
     }
     // fork addition: true only under `input_while_scrolled "scroll-mode"`, the upstream
     // behaviour. `jump` and `stay` both mean "no implicit mode switch"; they differ only in
@@ -6738,13 +6861,13 @@ impl Screen {
         if self.active_pane_is_scrolled(client_id) == was_scrolled {
             return Ok(());
         }
-        self.sync_scroll_mode_on_focus(client_id)
+        self.sync_scroll_mode_from_scroll_state(client_id, false)
     }
     fn sync_scroll_mode_for_pane_id(&mut self, pane_id: PaneId) -> Result<()> {
         let client_ids: Vec<ClientId> = self.active_tab_ids.keys().copied().collect();
         for client_id in client_ids {
             if self.get_active_pane_id(&client_id) == Some(pane_id) {
-                self.sync_scroll_mode_on_focus(client_id)?;
+                self.sync_scroll_mode_from_scroll_state(client_id, false)?;
             }
         }
         Ok(())
@@ -6763,7 +6886,7 @@ impl Screen {
 
         let connected_client_ids: Vec<ClientId> = self.active_tab_ids.keys().copied().collect();
         for client_id in connected_client_ids {
-            self.change_mode(new_mode, base_mode, client_id)
+            self.change_mode(new_mode, base_mode, client_id, false)
                 .with_context(err_context)?;
         }
         Ok(())
@@ -11159,10 +11282,11 @@ pub(crate) fn screen_thread_main(
                 input_mode,
                 base_mode,
                 client_id,
+                is_focus_restore,
                 _completion_tx, // the action ends here, dropping this will release anything
                                 // waiting for it
             ) => {
-                screen.change_mode(input_mode, base_mode, client_id)?;
+                screen.change_mode(input_mode, base_mode, client_id, is_focus_restore)?;
                 screen.render(None)?;
             },
             ScreenInstruction::ChangeModeForAllClients(

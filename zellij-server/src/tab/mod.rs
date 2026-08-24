@@ -390,6 +390,13 @@ pub trait Pane {
     fn clear_command_output_flash(&mut self) {}
     fn clear_scroll(&mut self);
     fn is_scrolled(&self) -> bool;
+    // fork addition: the scroll/search mode this pane was last left in, so focusing it again
+    // restores it. `None` means "nothing to restore" - the pane is in the client's default mode.
+    // Only terminal panes remember anything; plugin panes have no scrollback to search.
+    fn remembered_input_mode(&self) -> Option<InputMode> {
+        None
+    }
+    fn set_remembered_input_mode(&mut self, _mode: Option<InputMode>) {}
     fn active_at(&self) -> Instant;
     fn set_active_at(&mut self, instant: Instant);
     fn set_frame(&mut self, frame: bool);
@@ -3933,6 +3940,17 @@ impl Tab {
         self.get_active_pane(client_id)
             .map(|pane| pane.is_scrolled())
             .unwrap_or(false)
+    }
+    // fork addition: read/write the scroll or search mode a pane was left in. The memory lives on
+    // the pane, so it dies with the pane and travels with it between tabs.
+    pub fn remembered_input_mode_for_pane(&self, pane_id: PaneId) -> Option<InputMode> {
+        self.get_pane_with_id(pane_id)
+            .and_then(|pane| pane.remembered_input_mode())
+    }
+    pub fn set_remembered_input_mode_for_pane(&mut self, pane_id: PaneId, mode: Option<InputMode>) {
+        if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+            pane.set_remembered_input_mode(mode);
+        }
     }
     pub fn get_pane_with_id(&self, pane_id: PaneId) -> Option<&dyn Pane> {
         self.floating_panes

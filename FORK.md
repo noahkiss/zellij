@@ -5724,11 +5724,12 @@ nothing here touches that function. Under `jump` and `stay` the implicit *exit* 
 client who chose Scroll deliberately is not dropped out of it by scrolling back to the bottom.
 That is the point of turning the automation off, not an oversight.
 
-The guard is one early return at the top of `sync_scroll_mode_on_focus`, behind a named predicate
-(`implicit_scroll_mode_sync_enabled`). All 37 call sites funnel through that function — the focus
-verbs call it directly, the scroll verbs through `sync_scroll_mode_if_scroll_changed`, and the
-pane-id-targeted ones through `sync_scroll_mode_for_pane_id` — so one guard disables the lot and
-no call site is edited. `jump`'s other half is a single branch in `Tab::write_to_pane_id`, inside
+The guard is one early return behind a named predicate (`implicit_scroll_mode_sync_enabled`), in
+`sync_scroll_mode_from_scroll_state` — the function that holds upstream's derive-the-mode-from-
+`is_scrolled` logic. Every one of the 37 call sites reaches that function: the focus verbs through
+`sync_scroll_mode_on_focus`, the scroll verbs through `sync_scroll_mode_if_scroll_changed`, and the
+pane-id-targeted ones through `sync_scroll_mode_for_pane_id`. So one guard disables the lot and no
+call site is edited. `jump`'s other half is a single branch in `Tab::write_to_pane_id`, inside
 the `AdjustedInput::WriteBytesToTerminal` arm and nowhere else: only that arm is a byte actually
 reaching the pty, and re-run, close and drop-to-shell must not move the viewport. It flushes
 before the write, because the held output belongs above the echo of the key being sent.
@@ -5750,6 +5751,59 @@ It never crosses the wire. The field is `#[clap(skip)]`, so it stays out of `Cli
 proto→Options direction like every other fork option. The server loads the config itself, and the
 value reaches tabs as an `Rc<RefCell<_>>` shared with `Screen`, the way `default_floating_size`
 does, so a config reload applies to tabs opened before it with no per-tab update chain.
+
+### Each pane keeps its own scroll and search mode across focus changes
+
+Upstream 0.45 stores the input mode per client, so it is one mode for every pane that client looks
+at. Scroll position, search term, search results and the search toggles are already per pane — the
+mode flag is the only thing that is not. The result is the complaint in upstream
+[#5419](https://github.com/zellij-org/zellij/issues/5419) and
+[#5470](https://github.com/zellij-org/zellij/issues/5470): search a log in one pane, glance at
+another, come back, and the pane is still where you left it while your mode is not. Neither issue
+has a maintainer reply.
+
+Now a pane remembers the mode it was left in, and focusing it puts the client back in that mode.
+
+- **Only the scroll/search family is remembered** — `Scroll`, `Search`, `EnterSearch`. Every other
+  mode is a transient menu that belongs to the client, not to a pane, and returning to the default
+  mode clears the memory rather than storing the default as a mode of its own.
+- **Focusing a pane that remembers nothing takes you out of the family**, back to the default mode.
+  Otherwise you would sit in `Search` on a pane that has no search, which is half of what the
+  issues are complaining about.
+- **The restore works under all three `input_while_scrolled` values.** That option governs the mode
+  zellij *derives* from a pane being scrolled; a mode you picked for a pane is not its to undo.
+
+The memory is **per pane, not per (pane, client)**, matching the scroll and search state it sits
+beside. It lives on the pane itself, behind two default-implemented `Pane` trait methods
+(`remembered_input_mode` / `set_remembered_input_mode`) that only `TerminalPane` overrides. A map
+on `Screen` would have had to be pruned on every close path or leak for the life of the session;
+on the pane, a closed pane's mode dies with it and a pane that moves between tabs carries its mode
+along. Plugin panes and the test mocks keep the defaults and needed no edit.
+
+**Detach and re-attach keep the memory, one step later than you would guess.** `AddClient` does
+call the focus sync, but a client that has just joined has no mode yet, so the sync returns
+without doing anything — and the `ChangeMode` that `AttachClient` sends next, putting the client
+in its default mode, would have *cleared* the focused pane's memory. So a client's **first** mode
+change never clears one. Somebody joining a session cannot wipe the mode the people already there
+are using, the memory survives a detach, and it is restored on the re-attached client's next focus
+change rather than on the attach itself.
+
+**One guard was needed, and it is the whole reason this is more than a two-file patch.** Focus
+moves *first*, and the mode change is a round trip through the server thread — the screen cannot
+change how a key resolves on its own, so it sends `ServerInstruction::ChangeMode` and the change
+lands later. By then the client's active pane is the pane it just arrived at, which is the wrong
+pane for `change_mode`'s "leaving the search family clears the search" branch to act on. Left
+alone, focusing away from a scrolled pane would silently wipe the search of the pane you focused.
+So both `ServerInstruction::ChangeMode` and `ScreenInstruction::ChangeMode` carry an
+`is_focus_restore` flag, and `change_mode` skips the clear when it is set. A user's own
+`SwitchToMode` passes `false` and still clears the search exactly as upstream does. Both enums are
+server-internal Rust; neither appears in a `.proto`, so the flag costs nothing on the contract.
+
+**Nothing crosses the plugin API.** `PaneInfo` gains no field, `event.proto` is untouched, and no
+`TryFrom` impl moves. The per-pane mode is server-internal state projected onto the existing
+per-client `ModeInfo` on every focus change, so `ModeUpdate` keeps firing with the client's mode —
+which now happens to equal the focused pane's — and the status bar is right with no plugin change.
+A plugin that wants to *read* a pane's mode would be a separate patch and a separate cost.
 
 ## Assessed and deliberately not built
 

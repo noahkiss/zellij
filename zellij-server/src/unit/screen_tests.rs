@@ -13284,6 +13284,7 @@ pub fn keep_scroll_position_when_exiting_scroll_mode() {
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     send_cli_action_to_server(&session_metadata, scroll_up_cli_action.clone(), client_id);
@@ -13295,6 +13296,7 @@ pub fn keep_scroll_position_when_exiting_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13352,7 +13354,7 @@ fn assert_focus_change_syncs_scroll_mode(default_mode: InputMode) {
             .iter()
             .rev()
             .find_map(|instruction| match instruction {
-                ServerInstruction::ChangeMode(cid, mode, _) if *cid == client_id => Some(*mode),
+                ServerInstruction::ChangeMode(cid, mode, _, _) if *cid == client_id => Some(*mode),
                 _ => None,
             })
     };
@@ -13374,6 +13376,7 @@ fn assert_focus_change_syncs_scroll_mode(default_mode: InputMode) {
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     let scroll_up = CliAction::ScrollUp { pane_id: None };
@@ -13384,6 +13387,7 @@ fn assert_focus_change_syncs_scroll_mode(default_mode: InputMode) {
         default_mode,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13418,6 +13422,7 @@ fn assert_focus_change_syncs_scroll_mode(default_mode: InputMode) {
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13478,7 +13483,7 @@ fn assert_focus_change_does_not_sync_scroll_mode(input_while_scrolled: InputWhil
             .unwrap()
             .iter()
             .filter(|instruction| {
-                matches!(instruction, ServerInstruction::ChangeMode(cid, _, _) if *cid == client_id)
+                matches!(instruction, ServerInstruction::ChangeMode(cid, _, _, _) if *cid == client_id)
             })
             .count()
     };
@@ -13499,6 +13504,7 @@ fn assert_focus_change_does_not_sync_scroll_mode(input_while_scrolled: InputWhil
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     let scroll_up = CliAction::ScrollUp { pane_id: None };
@@ -13509,6 +13515,7 @@ fn assert_focus_change_does_not_sync_scroll_mode(input_while_scrolled: InputWhil
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13543,6 +13550,7 @@ fn assert_focus_change_does_not_sync_scroll_mode(input_while_scrolled: InputWhil
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13589,7 +13597,7 @@ pub fn focusing_a_scrolled_pane_with_the_mouse_enters_scroll_mode() {
             .iter()
             .rev()
             .find_map(|instruction| match instruction {
-                ServerInstruction::ChangeMode(cid, mode, _) if *cid == client_id => Some(*mode),
+                ServerInstruction::ChangeMode(cid, mode, _, _) if *cid == client_id => Some(*mode),
                 _ => None,
             })
     };
@@ -13608,6 +13616,7 @@ pub fn focusing_a_scrolled_pane_with_the_mouse_enters_scroll_mode() {
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     let scroll_up = CliAction::ScrollUp { pane_id: None };
@@ -13618,6 +13627,7 @@ pub fn focusing_a_scrolled_pane_with_the_mouse_enters_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13657,7 +13667,7 @@ fn last_change_mode_for_client(
         .iter()
         .rev()
         .find_map(|instruction| match instruction {
-            ServerInstruction::ChangeMode(cid, mode, _) if *cid == client_id => Some(*mode),
+            ServerInstruction::ChangeMode(cid, mode, _, _) if *cid == client_id => Some(*mode),
             _ => None,
         })
 }
@@ -13680,6 +13690,7 @@ fn fill_and_scroll_focused_pane(
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     let scroll_up = CliAction::ScrollUp { pane_id: None };
@@ -13731,6 +13742,7 @@ pub fn toggling_floating_panes_syncs_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13772,6 +13784,7 @@ pub fn switching_tabs_syncs_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13819,6 +13832,7 @@ pub fn switching_tabs_syncs_scroll_mode() {
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13861,6 +13875,7 @@ pub fn closing_focused_pane_syncs_scroll_mode_on_fallback_pane() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13915,6 +13930,7 @@ pub fn focus_pane_with_id_syncs_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13976,6 +13992,7 @@ pub fn scrolling_the_focused_pane_syncs_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -13996,6 +14013,7 @@ pub fn scrolling_the_focused_pane_syncs_scroll_mode() {
         InputMode::Scroll,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -14043,6 +14061,7 @@ pub fn scrolling_the_focused_pane_with_the_mouse_syncs_scroll_mode() {
         InputMode::Normal,
         None,
         client_id,
+        false,
         None,
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -14103,6 +14122,385 @@ pub fn scrolling_an_unfocused_pane_does_not_sync_scroll_mode() {
     );
 
     mock_screen.teardown(vec![server_thread, screen_thread]);
+}
+
+// Fork addition, upstream #5419 / #5470: each pane keeps its own mode for the scroll/search
+// family, and focusing a pane restores the mode it was left in. The tests below drive the
+// screen the way the server would, because MockScreen has no server loop: the screen emits
+// ServerInstruction::ChangeMode and the test feeds the matching ScreenInstruction::ChangeMode
+// back in, carrying the same is_focus_restore flag the real server would have forwarded.
+
+#[test]
+pub fn focusing_a_pane_restores_the_mode_it_was_left_in() {
+    assert_focused_pane_restores_its_own_mode(InputWhileScrolled::ScrollMode);
+}
+
+#[test]
+pub fn focusing_a_pane_restores_the_mode_it_was_left_in_under_jump() {
+    assert_focused_pane_restores_its_own_mode(InputWhileScrolled::Jump);
+}
+
+#[test]
+pub fn focusing_a_pane_restores_the_mode_it_was_left_in_under_stay() {
+    assert_focused_pane_restores_its_own_mode(InputWhileScrolled::Stay);
+}
+
+// `input_while_scrolled` governs the mode zellij derives from a pane being scrolled, never a
+// mode the user picked for a pane - so the restore has to work under all three values.
+fn assert_focused_pane_restores_its_own_mode(input_while_scrolled: InputWhileScrolled) {
+    let size = Size { cols: 80, rows: 10 };
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut mock_screen = MockScreen::new(size);
+    mock_screen.config.options.input_while_scrolled = Some(input_while_scrolled);
+    let client_id = mock_screen.main_client_id;
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+
+    // Choose Search on the left pane. Neither pane is scrolled, so nothing here is implicit.
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Search,
+        None,
+        client_id,
+        false,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Focus the right pane, which remembers nothing: the client leaves the search family
+    // rather than staying in Search on a pane that has no search.
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        last_change_mode_for_client(&received_server_instructions, client_id),
+        Some(InputMode::Normal),
+        "focusing a pane that remembers no mode should return the client to its default mode \
+         under {:?}",
+        input_while_scrolled,
+    );
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Normal,
+        None,
+        client_id,
+        true,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Focus back: the left pane still remembers Search.
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Left,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        last_change_mode_for_client(&received_server_instructions, client_id),
+        Some(InputMode::Search),
+        "focusing the pane again should put the client back in the mode it left it in under {:?}",
+        input_while_scrolled,
+    );
+
+    mock_screen.teardown(vec![server_thread, screen_thread]);
+}
+
+#[test]
+pub fn a_pane_returned_to_the_default_mode_remembers_nothing() {
+    // Only the scroll/search family is remembered, and returning to the default mode clears the
+    // memory rather than storing the default as a mode of its own. Otherwise every pane would
+    // pin the client to whatever mode it last passed through.
+    let size = Size { cols: 80, rows: 10 };
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut mock_screen = MockScreen::new(size);
+    let client_id = mock_screen.main_client_id;
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+
+    // Into Search on the left pane and back out again, then through Pane mode, which is a
+    // transient menu and must not be remembered either.
+    for mode in [InputMode::Search, InputMode::Normal, InputMode::Pane] {
+        let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+            mode, None, client_id, false, None,
+        ));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    for direction in [Direction::Right, Direction::Left] {
+        send_cli_action_to_server(
+            &session_metadata,
+            CliAction::MoveFocus { direction },
+            client_id,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        last_change_mode_for_client(&received_server_instructions, client_id),
+        None,
+        "a pane that was returned to the default mode should have nothing to restore",
+    );
+
+    mock_screen.teardown(vec![server_thread, screen_thread]);
+}
+
+#[test]
+pub fn a_joining_client_does_not_erase_what_the_focused_pane_remembers() {
+    // AttachClient sets every client that joins to its own default mode. That mode change lands
+    // on whatever pane is focused, so without the had_a_mode check it would clear the memory of
+    // a pane the clients already there are using - and re-attaching would lose the mode you were
+    // in before you detached.
+    let size = Size { cols: 80, rows: 10 };
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut mock_screen = MockScreen::new(size);
+    let client_id = mock_screen.main_client_id;
+    let second_client_id = client_id + 1;
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+
+    // The first client chooses Search on the left pane.
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Search,
+        None,
+        client_id,
+        false,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // A second client joins and is set to its default mode, the way AttachClient does it.
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Normal,
+        Some(InputMode::Normal),
+        second_client_id,
+        false,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // The left pane must still remember Search. Focus away with the first client, apply the
+    // mode the server would have set, then focus back.
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Normal,
+        None,
+        client_id,
+        true,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Left,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        last_change_mode_for_client(&received_server_instructions, client_id),
+        Some(InputMode::Search),
+        "a client joining must not erase the mode the focused pane remembers",
+    );
+
+    mock_screen.teardown(vec![server_thread, screen_thread]);
+}
+
+#[test]
+pub fn a_focus_restore_does_not_clear_the_destination_pane_search() {
+    assert_search_survives_leaving_the_search_family(true);
+}
+
+#[test]
+pub fn an_explicit_mode_change_still_clears_the_search() {
+    assert_search_survives_leaving_the_search_family(false);
+}
+
+// The trap this patch's is_focus_restore flag exists for. Focus moves BEFORE the mode change
+// the screen asks for lands, so by the time change_mode runs, the client's active pane is the
+// pane it just arrived at - and change_mode's "leaving the search family clears the search"
+// branch would clear the search of THAT pane, which the user never touched.
+//
+// Passing is_focus_restore = false here is what the code did before the guard, and it is also
+// the real explicit-SwitchToMode path, which still clears the search exactly as upstream does.
+// So the same instruction with the flag flipped must produce the two different outcomes.
+fn assert_search_survives_leaving_the_search_family(is_focus_restore: bool) {
+    let size = Size { cols: 80, rows: 10 };
+    let mut initial_layout = TiledPaneLayout::default();
+    initial_layout.children_split_direction = SplitDirection::Vertical;
+    initial_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut mock_screen = MockScreen::new(size);
+    let client_id = mock_screen.main_client_id;
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let received_server_instructions = Arc::new(Mutex::new(vec![]));
+    let server_receiver = mock_screen.server_receiver.take().unwrap();
+    let server_thread = log_actions_in_thread!(
+        received_server_instructions,
+        ServerInstruction::KillSession,
+        server_receiver
+    );
+
+    let mut pane_contents = String::new();
+    for i in 0..20 {
+        pane_contents.push_str(&format!("fill pane up with something {}\n\r", i));
+    }
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        1,
+        pane_contents.as_bytes().to_vec(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Give the right pane a search term without touching the mode. `zellij action search-input`
+    // does exactly this, so the right pane holds a search and remembers no mode - which is what
+    // makes it a bystander when the client's mode changes on arrival.
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::UpdateSearch(
+        "something".as_bytes().to_vec(),
+        client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Back to the left pane and into Scroll mode there, so the left pane remembers Scroll.
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Left,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Scroll,
+        None,
+        client_id,
+        false,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Focus the right pane. It remembers nothing, so the screen takes the client out of Scroll
+    // - flagged as a focus restore, because focus has already moved.
+    send_cli_action_to_server(
+        &session_metadata,
+        CliAction::MoveFocus {
+            direction: Direction::Right,
+        },
+        client_id,
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        received_server_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|instruction| match instruction {
+                ServerInstruction::ChangeMode(cid, mode, is_focus_restore, _)
+                    if *cid == client_id =>
+                    Some((*mode, *is_focus_restore)),
+                _ => None,
+            }),
+        Some((InputMode::Normal, true)),
+        "leaving Scroll because focus moved should be flagged as a focus restore",
+    );
+
+    // Feed the mode change back in the way the server would.
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Normal,
+        None,
+        client_id,
+        is_focus_restore,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // The pane frame shows "SEARCHING: <term>" while the client is in Search mode and the pane
+    // still has a term, so the rendered frame is the observable for "the search survived".
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ChangeMode(
+        InputMode::Search,
+        None,
+        client_id,
+        false,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![server_thread, screen_thread]);
+    let snapshots = take_snapshots_and_cursor_coordinates_from_render_events(
+        received_server_instructions.lock().unwrap().iter(),
+        size,
+    );
+    let (_cursor_position, last_snapshot) = snapshots.last().unwrap();
+    if is_focus_restore {
+        assert!(
+            last_snapshot.contains("SEARCHING: something"),
+            "a focus-driven mode change must leave the destination pane's search alone, \
+             got:\n{}",
+            last_snapshot,
+        );
+    } else {
+        assert!(
+            !last_snapshot.contains("SEARCHING: something"),
+            "an explicit mode change out of the search family still clears the search, \
+             got:\n{}",
+            last_snapshot,
+        );
+    }
 }
 
 fn subscribe_pane_to_focus_events(screen: &mut Screen, client_id: ClientId, terminal_id: u32) {
