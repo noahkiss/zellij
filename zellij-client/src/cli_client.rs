@@ -27,12 +27,15 @@ use zellij_utils::{
 /// ambient `$ZELLIJ_PANE_ID`, and this is the same answer given deliberately instead of inherited.
 /// It is a terminal id because that is what the message carries; the refusal for anything else
 /// happens before this, where there is a caller to tell.
+///
+/// `pipe_timeout` is what `pipe --timeout` asked for, and `None` is the pipe that waits forever.
 pub fn start_cli_client(
     mut os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     actions: Vec<Action>,
     anchor_pane: Option<u32>,
     mut chosen_handle: Option<String>,
+    pipe_timeout: Option<Duration>,
 ) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
@@ -83,6 +86,7 @@ pub fn start_cli_client(
                     pane_id,
                     cwd,
                     pane_title,
+                    pipe_timeout,
                 );
             },
             action => {
@@ -150,6 +154,7 @@ fn pipe_client(
     pane_id: Option<u32>,
     cwd: Option<PathBuf>,
     pane_title: Option<String>,
+    timeout: Option<Duration>,
 ) {
     let mut stdin = os_input.get_stdin_reader();
     let name = name
@@ -189,6 +194,31 @@ fn pipe_client(
         }
     };
     let is_piped = !os_input.stdin_is_terminal();
+    // Only a plugin that received the message can unblock a pipe, so a session with none listening
+    // never answers and the wait below has nothing to end it.
+    //
+    // `--timeout` is an IDLE window rather than a budget for the call: it measures how long the
+    // session has said nothing, and anything it says resets it. That is what makes it safe for a
+    // streaming pipe - `tail -f | zellij pipe` spends its time in the `read_line` below, which is
+    // outside the window entirely, and each answer the plugin sends starts it again.
+    //
+    // The messages are read on a thread because `recv_from_server` blocks, and a session with
+    // nothing to say is exactly the case where it blocks longest.
+    let incoming = timeout.map(|_| {
+        let (sender, incoming) = mpsc::channel();
+        let reader = os_input.box_clone();
+        std::thread::spawn(move || {
+            while let Some((message, _)) = reader.recv_from_server() {
+                if sender.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        incoming
+    });
+    // when the session was last heard from, which is what the idle window is measured against. It
+    // is set at the top of the loop below, where each wait for an answer begins
+    let mut last_heard;
     loop {
         if let Some(payload) = payload.take() {
             let msg = create_msg(Some(payload));
@@ -213,10 +243,44 @@ fn pipe_client(
                 os_input.send_to_server(msg);
             }
         }
+        // a message just went out, so the wait for an answer starts now
+        last_heard = Instant::now();
         loop {
             // wait for a response and act accordingly
-            match os_input.recv_from_server() {
-                Some((ServerToClientMsg::UnblockCliPipeInput { pipe_name }, _)) => {
+            let message = match (&incoming, timeout) {
+                (Some(incoming), Some(timeout)) => {
+                    let idle_until = last_heard + timeout;
+                    match incoming
+                        .recv_timeout(idle_until.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(message) => {
+                            last_heard = Instant::now();
+                            Some(message)
+                        },
+                        // the pipe went unanswered for the whole window. Whatever the plugins sent
+                        // has already been written to stdout, so the sentence goes to stderr and
+                        // the status says the pipe was not answered rather than that it failed
+                        Err(RecvTimeoutError::Timeout) => {
+                            // the pipe is named for the caller, not for the wire: `--name` is what
+                            // they typed, and the id is a uuid that means nothing to them
+                            eprintln!(
+                                "{}",
+                                pipe_timed_out(name.as_deref().unwrap_or(&pipe_id), timeout)
+                            );
+                            os_input.send_to_server(ClientToServerMsg::ClientExited);
+                            process::exit(2);
+                        },
+                        Err(RecvTimeoutError::Disconnected) => {
+                            eprintln!("The session stopped answering while the pipe was waiting.");
+                            process::exit(1);
+                        },
+                    }
+                },
+                // `--timeout 0`: the wait is the blocking read it has always been
+                _ => os_input.recv_from_server().map(|(message, _)| message),
+            };
+            match message {
+                Some(ServerToClientMsg::UnblockCliPipeInput { pipe_name }) => {
                     // unblock this pipe, meaning we need to stop waiting for a response and read
                     // once more from STDIN
                     if pipe_name == pipe_id {
@@ -229,7 +293,7 @@ fn pipe_client(
                         }
                     }
                 },
-                Some((ServerToClientMsg::CliPipeOutput { pipe_name, output }, _)) => {
+                Some(ServerToClientMsg::CliPipeOutput { pipe_name, output }) => {
                     // send data to STDOUT, this *does not* mean we need to unblock the input
                     let err_context = "Failed to write to stdout";
                     if pipe_name == pipe_id {
@@ -241,15 +305,15 @@ fn pipe_client(
                         stdout.flush().context(err_context).non_fatal();
                     }
                 },
-                Some((ServerToClientMsg::Log { lines: log_lines }, _)) => {
+                Some(ServerToClientMsg::Log { lines: log_lines }) => {
                     log_lines.iter().for_each(|line| println!("{line}"));
                     process::exit(0);
                 },
-                Some((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
+                Some(ServerToClientMsg::LogError { lines: log_lines }) => {
                     log_lines.iter().for_each(|line| eprintln!("{line}"));
                     process::exit(2);
                 },
-                Some((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
+                Some(ServerToClientMsg::Exit { exit_reason }) => match exit_reason {
                     ExitReason::Error(e) => {
                         eprintln!("{}", e);
                         process::exit(2);
@@ -262,6 +326,20 @@ fn pipe_client(
             }
         }
     }
+}
+
+/// The sentence a pipe that ran out of time prints on stderr.
+///
+/// Exit 2 is one bucket with several doors into it, so the sentence is what tells a script which
+/// one this was. It names the pipe and the window, and it says why a pipe can go unanswered at
+/// all - which is the thing a caller who has just met this for the first time does not know.
+fn pipe_timed_out(pipe_id: &str, timeout: Duration) -> String {
+    format!(
+        "The pipe '{}' went unanswered for {}s and gave up. A pipe is unblocked by a plugin that \
+         received it, and none did. `--timeout 0` waits for one however long it takes.",
+        pipe_id,
+        timeout.as_secs()
+    )
 }
 
 /// Asks the running session one question, on a connection opened for it and closed after it.
@@ -1095,6 +1173,19 @@ mod tests {
         assert_eq!(
             with_handle(vec!["tab_id: 4".to_owned()], "build"),
             vec!["tab_id: 4".to_owned(), "handle: build".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_pipe_that_ran_out_of_time_says_which_door_it_came_through() {
+        // exit 2 is shared by every kind of "nothing happened", so the sentence is what a caller
+        // reads to tell a timed-out pipe from a session that is not there
+        let said = pipe_timed_out("logs", Duration::from_secs(5));
+        assert!(said.contains("'logs'"), "{said}");
+        assert!(said.contains("5s"), "{said}");
+        assert!(
+            said.contains("unblocked by a plugin"),
+            "the sentence says why a pipe goes unanswered: {said}"
         );
     }
 

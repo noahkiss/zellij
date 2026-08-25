@@ -1810,6 +1810,13 @@ pub(crate) fn route_action(
             } else {
                 log::error!("Message must have a name");
             }
+            // the pipe answers for itself, on the plugin's own messages. Falling through to the
+            // wait below would read the completion channel dropped above as "the action reported
+            // nothing" and send the caller `Action CliPipe ended without reporting a result` - an
+            // error every `zellij pipe` got, ahead of the plugin's real answer, whether or not
+            // anything was wrong. Returning here also keeps the audit ring off a streaming pipe,
+            // which would otherwise record a row per line.
+            return Ok((should_break, None));
         },
         Action::KeybindPipe {
             mut name,

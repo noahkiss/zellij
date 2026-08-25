@@ -229,6 +229,7 @@ fn main() {
             args,
             plugin,
             plugin_configuration,
+            timeout,
         })) = opts.command
         {
             let command_cli_action = CliAction::Pipe {
@@ -237,6 +238,7 @@ fn main() {
                 args,
                 plugin,
                 plugin_configuration,
+                timeout,
 
                 force_launch_plugin: false,
                 skip_plugin_cache: false,
