@@ -1042,6 +1042,30 @@ something the session pushes — as long as the tool in the pane rings the bell.
 
 Proto tag 36.
 
+### `is_focused` names a client that is still here
+
+A pane is reported focused only while a **connected** client focuses it. `zellij action list-panes`
+used to answer `FOCUSED=true` for a pane the last client had been on before it detached — and on a
+session nobody had ever attached to, because `session up` creates one and leaves. A consumer asking
+"is anyone looking at this pane" got a yes from a session with no clients at all. Upstream
+[#5468](https://github.com/zellij-org/zellij/issues/5468).
+
+The stale answer and the useful behaviour come from the same map. `Tab::remove_client` drops the
+client from `connected_clients` and deliberately leaves its entry in `ActivePanes`, which is what
+puts a re-attaching client back on the pane it left. So the map is right and the question asked of
+it was wrong: `pane_info` now asks
+`ActivePanes::pane_id_is_focused_by_connected_client`, which is the same lookup with the connected
+set applied. Upstream's own PR for this issue deleted the entry instead and re-attach went back to
+the first pane in the tab; nothing here moves, and a detach-and-re-attach still lands on the pane
+it left.
+
+- **`is_fullscreen` stays on the unfiltered answer.** Fullscreen is the tab's shape, not a claim
+  about who is looking: a detached tab left fullscreen still is one.
+- **The session snapshot is untouched.** `PaneLayoutMetadata` builds its own `focused_clients` from
+  the same map without the filter, so `session down` still records where the focus was.
+- **This is `PaneInfo`, so plugins see it too** — the honest value, on a field they already read.
+  No field is added, `event.proto` is not touched, and no `TryFrom` moves.
+
 ### `report_pane_env`: named environment variables on every pane
 
 ```kdl
