@@ -5929,6 +5929,54 @@ query has made it the default on a replying terminal since #2798 — and it was 
 point. The disagreement is about the pre-reply default, not about detection, and a fork that runs
 on known terminals can take the optimistic side of it.
 
+### The server raises its own open-file limit, and a refused connection is not fatal
+
+A five-day-old session with about twenty-five tabs died and took every pane with it:
+
+```
+Error occurred in server:
+
+  × Thread 'server_listener' panicked.
+  ├─▶ At zellij-server/src/lib.rs:935:29
+  ╰─▶ err Os { code: 24, kind: Uncategorized, message: "Too many open files" }
+```
+
+Two separate faults, both fixed here.
+
+**The soft limit was whatever the shell handed over.** macOS still defaults that to 256, and the
+server keeps what it inherits. A session's descriptor use grows with what is in it — a pty per
+pane, a tab-bar and a status-bar plugin instance per tab, the mounts and caches each of those holds
+— so a long-lived session walks into the ceiling and everything downstream of a descriptor starts
+failing at once: plugins fail to load, session serialization fails in a loop, and eventually an
+`accept()` fails. The server now raises its own soft limit at startup, before it opens anything, to
+**`min(hard limit, 10240)`**. It never lowers a soft limit that is already higher and never touches
+the hard limit, which would need privileges it does not have. 10240 rather than the hard limit
+because macOS reports an unlimited one and honours nothing above `kern.maxfilesperproc`; a failed
+`getrlimit` or `setrlimit` is logged and the server runs with what it had. Unix only — Windows has
+no equivalent to raise.
+
+Measured on Linux with a server started from a shell holding a soft limit of 1024: the log says
+`raised the open-file limit from 1024 to 10240` and `/proc/<pid>/limits` agrees. A second or two
+later, once the session has finished starting, the soft limit there rises again to the hard limit —
+something in session startup asks for it and Linux grants it, which is why this was never a Linux
+crash. macOS is where it bites: the reporter's server sat at 256 for five days.
+
+**A connection that could not be accepted killed the session.** The listener's error arm was
+`panic!`, and the panic hook takes the server down, so one client's failed attach cost every pane
+in the session. It now logs and backs off: 50 ms after the first failure, doubling to a ceiling of
+one second, reset by the next connection that succeeds. EMFILE is transient by nature — a
+descriptor is returned, or the limit is raised — so a client that is merely unlucky retries into a
+wait it cannot notice. A failure that is not transient costs a log line and a sleeping thread
+instead of the session, and the log thins out after the first five so a run of them does not bury
+everything else: every one of the first five, then one a minute at the ceiling.
+
+The launcher-owned session this fork exists to serve is exactly the victim of both. It is created
+once and lives until the machine reboots, so it is the one that reaches the ceiling, and it holds
+the work that a panic in an accept loop throws away.
+
+Reported upstream as [#5474](https://github.com/zellij-org/zellij/issues/5474); nothing has landed
+there.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
