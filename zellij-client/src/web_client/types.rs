@@ -279,12 +279,20 @@ pub struct ControlParams {
 pub struct LoginRequest {
     pub auth_token: String,
     pub remember_me: Option<bool>,
+    /// Hand the session token back in the body instead of in a `Set-Cookie`, for a caller with no
+    /// cookie jar. It is the same token and the same login; only where it is delivered changes.
+    pub headless: Option<bool>,
 }
 
 #[derive(Serialize)]
 pub struct LoginResponse {
     pub success: bool,
     pub message: String,
+    /// The session token, present only for a `headless` login. A browser never sees it in the
+    /// body: the cookie is `HttpOnly` so that page scripts cannot read it, and putting the token
+    /// here unasked would hand it to any script on the page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
 }
 
 pub const BRACKETED_PASTE_START: [u8; 6] = [27, 91, 50, 48, 48, 126]; // \u{1b}[200~

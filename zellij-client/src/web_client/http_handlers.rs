@@ -45,6 +45,17 @@ pub async fn login_handler(
         login_request.remember_me.unwrap_or(false),
     ) {
         Ok(session_token) => {
+            // a headless login has no cookie jar to put the token in, so it is handed back in the
+            // body and no cookie is set: one login, one channel, and a browser still never meets
+            // the token in a place a page script could read
+            if login_request.headless.unwrap_or(false) {
+                return Json(LoginResponse {
+                    success: true,
+                    message: "Login successful".to_string(),
+                    session_token: Some(session_token),
+                })
+                .into_response();
+            }
             let is_https = state.is_https;
             let cookie = if login_request.remember_me.unwrap_or(false) {
                 // Persistent cookie for remember_me
@@ -68,6 +79,9 @@ pub async fn login_handler(
             let mut response = Json(LoginResponse {
                 success: true,
                 message: "Login successful".to_string(),
+                // the browser's token lives in the HttpOnly cookie below, and nowhere a page
+                // script can read it
+                session_token: None,
             })
             .into_response();
 
@@ -82,6 +96,7 @@ pub async fn login_handler(
             Json(LoginResponse {
                 success: false,
                 message: "Invalid authentication token".to_string(),
+                session_token: None,
             }),
         )
             .into_response(),
