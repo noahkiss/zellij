@@ -3080,13 +3080,21 @@ impl TiledPanes {
     }
     pub fn pane_info(&self, current_pane_group: &HashMap<ClientId, Vec<PaneId>>) -> Vec<PaneInfo> {
         let index_in_stack = self.index_in_stack_per_pane();
+        let connected_clients = { self.connected_clients.borrow().clone() };
         let mut pane_infos = vec![];
         for (pane_id, pane) in self.panes.iter() {
             let mut pane_info_for_pane = pane_info_for_pane(pane_id, pane, &current_pane_group);
             let is_focused = self.active_panes.pane_id_is_focused(pane_id);
             pane_info_for_pane.is_floating = false;
             pane_info_for_pane.is_suppressed = false;
-            pane_info_for_pane.is_focused = is_focused;
+            // fork addition: reported focus names the clients that are still here. A detached
+            // client keeps its entry in `active_panes` so it lands back where it was, and reading
+            // that map straight told `list-panes` a pane nobody is looking at is focused
+            pane_info_for_pane.is_focused = self
+                .active_panes
+                .pane_id_is_focused_by_connected_client(pane_id, &connected_clients);
+            // fullscreen is the tab's own shape rather than a claim about who is looking, so it
+            // stays on the unfiltered answer: a detached tab left fullscreen still is one
             pane_info_for_pane.is_fullscreen = is_focused && self.fullscreen_is_active();
             pane_info_for_pane.index_in_stack = index_in_stack.get(pane_id).copied();
             pane_infos.push(pane_info_for_pane);

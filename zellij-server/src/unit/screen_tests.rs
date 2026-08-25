@@ -17313,6 +17313,66 @@ fn a_tab_made_with_nobody_attached_holds_its_panes() {
 }
 
 #[test]
+fn a_detached_clients_focus_is_not_reported_as_focus() {
+    // `list-panes -a` read the focus map straight, and a client that detaches keeps its entry
+    // there - so a pane nobody was looking at kept `FOCUSED=true` for the life of the session
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+
+    let tab = screen.tabs.get(&0).expect("the session's own first tab");
+    assert!(
+        screen
+            .pane_infos_for_tab(tab)
+            .iter()
+            .any(|pane| pane.is_focused),
+        "a client is attached, so it focuses a pane"
+    );
+
+    screen.remove_client(1).expect("TEST"); // the only client detaches
+
+    let tab = screen.tabs.get(&0).expect("the tab outlives the client");
+    let focused: Vec<u32> = screen
+        .pane_infos_for_tab(tab)
+        .into_iter()
+        .filter(|pane| pane.is_focused)
+        .map(|pane| pane.id)
+        .collect();
+    assert!(
+        focused.is_empty(),
+        "nothing is attached, so no pane is focused: {:?}",
+        focused
+    );
+}
+
+#[test]
+fn one_client_detaching_does_not_unfocus_the_pane_another_is_on() {
+    // the other direction: the answer is about who is still here, not about how many have left
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.set_client_size(2, size);
+    screen.add_client(2, false).expect("TEST");
+
+    screen.remove_client(2).expect("TEST");
+
+    let tab = screen.tabs.get(&0).expect("TEST");
+    assert!(
+        screen
+            .pane_infos_for_tab(tab)
+            .iter()
+            .any(|pane| pane.is_focused),
+        "the client that stayed is still looking at its pane"
+    );
+}
+
+#[test]
 fn a_tab_made_while_detached_survives_the_next_client_to_attach() {
     // the other half of the ghost: the empty tab was thrown away by the next attach, so a script
     // got a success and an id and the human saw nothing. The tab has to still be there, hold its
