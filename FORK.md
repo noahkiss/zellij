@@ -3779,6 +3779,43 @@ rule above stays silent. There — and only there — the binary on `PATH` is th
 that copy, so it is what gets compared. Once the refresh runs it renames over the pinned path, which
 unlinks the file the server started from, and the ` (deleted)` rule answers on its own.
 
+### The keybind bar says whether Full Disk Access is still there
+
+The vitals cluster `slim-keybinds` draws gets one more segment, at the right-hand end:
+
+```
+ Ctrl +  LOCK  PANE  TAB  RESIZE        cpu 12% | ram 7.0/23G | disk 412/931G | fda no
+```
+
+A Mac that loses Full Disk Access loses it quietly. Nothing announces the revocation, and the first
+sign of it is whatever needed the permission failing, hours later. [The tab bar's warning
+badge](#one-warning-badge-in-the-tab-bar) answers the same question from the server, but only where
+`expect_full_disk_access` is set and only in the *other* bar. This puts the fact where the eye
+already is on a bar whose cluster is switched on.
+
+**No new spawn, and no new permission.** The reading rides the one `/bin/sh` the cluster already
+runs every ten seconds, as one more tagged line in the probe's Darwin branch. The cluster costs
+exactly what it cost before, and `RunCommands` is the permission it already held. Vitals are off by
+default (`show_vitals`), so a bar that never asked for the cluster is unaffected.
+
+**The question is a real `open`.** `head -c 1` against
+`~/Library/Application Support/com.apple.TCC/TCC.db` — the same file, and the same shell idiom,
+`zellij session doctor` runs in a pane. TCC refuses at `open(2)` while `access(2)` reads only the
+permission bits, so `[ -r ]` answers "readable" on a machine holding no grant at all. One byte is
+read out of the file and nothing is kept.
+
+**Three answers, not two.** `fda ok` when the open succeeded, `fda no` when it was refused, and
+**nothing at all** when the question went unanswered: the gated file is not there, or the host is
+not macOS and has no such permission to be missing. That is the server's `full_disk_access_granted`
+rule — an `Option<bool>`, where `None` is never a denial — carried into the bar. A Linux session's
+cluster is therefore byte-identical to what it drew before.
+
+`fda no` is painted in `exit_code_error` from the active theme, bold: the colour and the weight the
+tab bar's badge uses, so one wrong thing looks the same in both bars. `fda ok` is a plain reading
+like the rest of the cluster. The answer is re-asked on every tick rather than remembered, because
+an FDA toggle takes effect on a live process — a session refused at startup can be granted while it
+runs, and a cached answer would go on reporting a problem the user has already fixed.
+
 ### `pin_exe` covers a session you started by hand
 
 [`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe) keeps a copy of the binary at a path zellij owns,

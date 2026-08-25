@@ -223,6 +223,11 @@ impl SlimKeybinds {
     /// cluster, so the two bars read as one system. `None` when vitals are off or no probe has
     /// landed yet, which is also what keeps the bar from flashing a half-built cluster on
     /// startup.
+    ///
+    /// A segment the probe marked as an alert takes `exit_code_error` and bold — the same colour
+    /// and weight `slim-tab-bar` gives its warning badge, from the same theme, so one wrong thing
+    /// looks the same in both bars. Still no colour literal: it is the colour the theme itself
+    /// picked for "something is wrong".
     fn vitals_segment(&self, colors: &Styling) -> Option<Segment> {
         if !self.show_vitals {
             return None;
@@ -234,7 +239,7 @@ impl SlimKeybinds {
         let style = colors.text_unselected;
         let mut part = String::new();
         let mut len = 0usize;
-        for (label, value) in segments {
+        for (label, value, alert) in segments {
             if len > 0 {
                 part.push_str(&paint(VITALS_SEP, style.base, style.background, "2"));
                 len += VITALS_SEP.width();
@@ -245,7 +250,12 @@ impl SlimKeybinds {
                 style.background,
                 "2",
             ));
-            part.push_str(&paint(&value, style.base, style.background, ""));
+            let (fg, attrs) = if alert {
+                (colors.exit_code_error.base, "1")
+            } else {
+                (style.base, "")
+            };
+            part.push_str(&paint(&value, fg, style.background, attrs));
             len += label.width() + 1 + value.width();
         }
         Some(Segment { part, len })
