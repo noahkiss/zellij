@@ -1,7 +1,7 @@
 use crate::tab::Pane;
 
 use crate::{os_input_output::ServerOsApi, panes::PaneId, ClientId};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Clone)]
 pub struct ActivePanes {
@@ -117,5 +117,20 @@ impl ActivePanes {
             .values()
             .find(|p_id| **p_id == *pane_id)
             .is_some()
+    }
+    /// The same question, asked only of the clients that are still connected.
+    ///
+    /// A client that detaches keeps its entry here on purpose - it is what puts the client back on
+    /// the pane it left when it re-attaches - so this map outlives the connection. Anything
+    /// *reporting* focus has to say who is looking now, and nobody is looking through a client that
+    /// went away.
+    pub fn pane_id_is_focused_by_connected_client(
+        &self,
+        pane_id: &PaneId,
+        connected_clients: &HashSet<ClientId>,
+    ) -> bool {
+        self.active_panes
+            .iter()
+            .any(|(client_id, focused)| focused == pane_id && connected_clients.contains(client_id))
     }
 }
