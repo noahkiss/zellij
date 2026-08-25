@@ -31,6 +31,9 @@ static MORE_MSG: &str = " ... ";
 const TO_NORMAL: Action = Action::SwitchToMode {
     input_mode: InputMode::Normal,
 };
+/// The plugin this fork's default config launches from tab mode's close key, written exactly as
+/// the binding writes it — there is no alias for it. See [`confirm_close_tab_key`].
+const CONFIRM_CLOSE_TAB_PLUGIN: &str = "zellij:confirm-close-tab";
 
 #[derive(Default)]
 struct State {
@@ -494,6 +497,31 @@ pub fn action_key(
             }
         })
         .collect::<Vec<KeyWithModifier>>()
+}
+
+/// Get the key that closes a tab through the confirmation prompt.
+///
+/// [`action_key`] resolves a hint by matching the ACTION LIST a key is bound to, and this fork
+/// binds tab mode's `x` to `[LaunchOrFocusPlugin "zellij:confirm-close-tab", SwitchToMode
+/// "Normal"]` instead of to `CloseTab`. A plugin launch matches no action pattern, so the close
+/// hint dropped out of the tab-mode line entirely.
+///
+/// The match is deliberately narrow, and is not the beginning of a way to hint plugins in general:
+/// the plugin has to be named exactly, and launching it has to be the whole of what the key does
+/// apart from leaving the mode. Matching on the variant alone would claim the first plugin launch
+/// bound in the mode, whatever it launches.
+///
+/// The first such binding wins, which is the same rule the other plugin-key lookups here use.
+pub fn confirm_close_tab_key(keymap: &[(KeyWithModifier, Vec<Action>)]) -> Vec<KeyWithModifier> {
+    keymap
+        .iter()
+        .find(|(_, acvec)| {
+            acvec.len() == 2
+                && acvec[0].launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN)
+                && matches!(acvec[1], Action::SwitchToMode { .. })
+        })
+        .map(|(key, _)| vec![key.clone()])
+        .unwrap_or_default()
 }
 
 /// Get multiple keys for multiple actions.
