@@ -1,6 +1,6 @@
 //! System vitals: one host probe per tick, parsed into a right-corner cluster.
 //!
-//!     cpu 12% │ ram 7.0/23G │ disk 412/931G │ bat 87%
+//!     cpu 12% │ ram 7.0/23G │ disk 412/931G │ bat 87% │ fda ok
 //!
 //! The probe/parse design is lifted from `~/develop/zellij-claude-bar` (`request_vitals_refresh`,
 //! `parse_vitals`), which learned these the hard way:
@@ -40,6 +40,13 @@ pub struct Vitals {
     /// Seconds since boot. The shell does the arithmetic on both platforms so the plugin never
     /// needs a wall clock of its own — WASI's is UTC-only and this is a duration, not a time.
     pub uptime_secs: Option<u64>,
+    /// Whether a pane of this session can open a Full-Disk-Access-gated file. macOS only.
+    ///
+    /// `None` is "not answered" and is deliberately NOT "denied": the question goes unanswered on
+    /// every platform without the permission, and on macOS when the gated file is not there at
+    /// all. Same three-way shape as the server's `full_disk_access_granted`, and the same rule —
+    /// a probe that could not answer is never reported as a refusal.
+    pub full_disk_access: Option<bool>,
 }
 
 /// `(busy, total)` jiffies from a `/proc/stat` aggregate `cpu` line, without its tag.
@@ -97,6 +104,15 @@ fn duration(secs: u64) -> String {
 /// wraps a long device name onto a second line, which shifts every column index by one and
 /// silently misreports the numbers. Fields are then `1` = 1K-blocks total and `3` = available on
 /// both Linux and macOS.
+///
+/// **The Full-Disk-Access question is a real `open`, and it is asked here rather than spawned on
+/// its own.** `head -c 1` opens the file; `[ -r ]` would call `access(2)`, which reads the
+/// permission bits while TCC refuses at `open(2)` instead — so a test on the bits answers
+/// "readable" on a machine holding no grant at all. `[ -e ]` first, because TCC gates the open and
+/// not the stat: a file that is not there is not a refusal and is reported apart. The same idiom
+/// `zellij session doctor` runs in a pane (`session_doctor_macos.rs`), and one byte is all that is
+/// read out of the file. Only the Darwin branch asks it — nowhere else has the permission to be
+/// missing.
 pub fn probe_command() -> String {
     "case \"$(uname)\" in \
        Darwin) \
@@ -104,6 +120,10 @@ pub fn probe_command() -> String {
          echo \"MEMTOTAL $(sysctl -n hw.memsize)\"; \
          vm_stat; \
          echo \"BAT $(pmset -g batt | grep -Eo '[0-9]+%' | head -1)\"; \
+         _db=\"$(eval echo ~\"$(id -un)\")/Library/Application Support/com.apple.TCC/TCC.db\"; \
+         if [ ! -e \"$_db\" ]; then echo \"FDA unknown\"; \
+         elif head -c 1 \"$_db\" >/dev/null 2>&1; then echo \"FDA yes\"; \
+         else echo \"FDA no\"; fi; \
          _b=$(sysctl -n kern.boottime | tr ',' '\\n' | \
               sed -n 's/.*sec = \\([0-9]*\\).*/\\1/p' | head -1); \
          [ -n \"$_b\" ] && echo \"UP $(( $(date +%s) - _b ))\";; \
@@ -154,6 +174,7 @@ impl Vitals {
             self.disk.clone(),
             self.battery_pct,
             self.uptime_secs.map(duration),
+            self.full_disk_access,
         );
 
         let mut memtotal_kb: Option<f64> = None;
@@ -239,6 +260,16 @@ impl Vitals {
                 // Empty on anything without a battery — the probe always emits the tag, and an
                 // empty value is the signal to omit the segment.
                 self.battery_pct = rest.trim().trim_end_matches('%').parse().ok();
+            } else if let Some(rest) = line.strip_prefix("FDA ") {
+                // Darwin only, and re-read on every tick rather than remembered: an FDA toggle
+                // takes effect on a live process, so a session refused at startup can be granted
+                // while it runs. `unknown` — the gated file missing — clears the reading back to
+                // "not answered" instead of falling through to a denial.
+                self.full_disk_access = match rest.trim() {
+                    "yes" => Some(true),
+                    "no" => Some(false),
+                    _ => None,
+                };
             } else if let Some(rest) = line.strip_prefix("UP ") {
                 // Linux gives a float ("1384059.35"), macOS an integer — parse as f64 and
                 // truncate so one branch handles both.
@@ -291,28 +322,43 @@ impl Vitals {
                 self.disk.clone(),
                 self.battery_pct,
                 self.uptime_secs.map(duration),
+                self.full_disk_access,
             )
     }
 
-    /// `(label, value)` pairs in display order. Empty until the first probe lands, and each
-    /// segment is skipped individually when its probe returned nothing — a machine with no
+    /// `(label, value, alert)` triples in display order. Empty until the first probe lands, and
+    /// each segment is skipped individually when its probe returned nothing — a machine with no
     /// battery shows no `bat`, rather than `bat ?`.
-    pub fn segments(&self) -> Vec<(&'static str, String)> {
+    ///
+    /// `alert` marks a value the theme should paint as wrong rather than as a reading. Only the
+    /// Full-Disk-Access segment ever sets it: the others are quantities, and a quantity being
+    /// large is not the bar's business.
+    pub fn segments(&self) -> Vec<(&'static str, String, bool)> {
         let mut out = Vec::new();
         if let Some(c) = self.cpu_pct {
-            out.push(("cpu", format!("{}%", c)));
+            out.push(("cpu", format!("{}%", c), false));
         }
         if let Some(m) = &self.mem {
-            out.push(("ram", m.clone()));
+            out.push(("ram", m.clone(), false));
         }
         if let Some(d) = &self.disk {
-            out.push(("disk", d.clone()));
+            out.push(("disk", d.clone(), false));
         }
         if let Some(b) = self.battery_pct {
-            out.push(("bat", format!("{}%", b)));
+            out.push(("bat", format!("{}%", b), false));
         }
         if let Some(u) = self.uptime_secs {
-            out.push(("up", duration(u)));
+            out.push(("up", duration(u), false));
+        }
+        // Last, and only when the probe actually answered. It is the odd segment out — a
+        // permission rather than a quantity — and it is the one worth reading at the far edge of
+        // the bar when it says `no`.
+        if let Some(granted) = self.full_disk_access {
+            out.push((
+                "fda",
+                if granted { "ok" } else { "no" }.to_string(),
+                !granted,
+            ));
         }
         out
     }
