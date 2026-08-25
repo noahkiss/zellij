@@ -21,7 +21,7 @@ use std::rc::Rc;
 use std::time::{self, Instant};
 use uuid::Uuid;
 use vte;
-use zellij_utils::data::{NoteColor, PaneContents};
+use zellij_utils::data::{NoteColor, PaneCommandState, PaneContents};
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::pane_size::Offset;
@@ -1353,6 +1353,9 @@ impl Pane for TerminalPane {
     ) -> PaneContents {
         self.grid
             .pane_contents_with_ansi(get_full_scrollback, max_scrollback_lines)
+    }
+    fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
+        self.grid.osc133_command_state()
     }
     fn update_exit_status(&mut self, exit_status: i32) {
         if let Some(notification_end) = self.notification_end.as_mut() {
