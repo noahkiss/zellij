@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use unicode_width::UnicodeWidthChar;
 use zellij_utils::data::{
-    HighlightLayer, HighlightStyle, HostTerminalThemeMode, RegexHighlight, Style,
+    HighlightLayer, HighlightStyle, HostTerminalThemeMode, PaneCommandState, RegexHighlight, Style,
 };
 use zellij_utils::errors::prelude::*;
 
@@ -3556,6 +3556,38 @@ impl Grid {
         self.output_buffer.update_all_lines();
         self.mark_for_rerender();
         true
+    }
+
+    /// What this pane's shell says it is doing, from the last OSC 133 marker it wrote.
+    ///
+    /// The markers are already parsed on the input path and kept on the row - `A`/`B` where the
+    /// prompt and the typed command line start, `C` where output starts, `D` where the command
+    /// ended, carrying its exit code when the shell reports one. The last of them is the pane's
+    /// current state, so this walks back from the newest row and stops at the first marker it
+    /// finds. `None` means the shell writes no markers, which is a different answer from "idle".
+    pub fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
+        if !self.osc133_markers_seen {
+            return None;
+        }
+        let first_line = -(self.lines_above.len() as isize);
+        let last_line = (self.viewport.len() + self.lines_below.len()) as isize - 1;
+        for line in (first_line..=last_line).rev() {
+            let Some(row) = self.row_at(line) else {
+                continue;
+            };
+            // markers on a row are kept sorted by column, and a shell writes them left to right,
+            // so the rightmost on the newest row carrying any is the latest one written
+            if let Some(marker) = row.osc133_markers.last() {
+                return Some(match marker.kind {
+                    Osc133MarkerKind::Prompt | Osc133MarkerKind::Input => {
+                        (PaneCommandState::Prompt, None)
+                    },
+                    Osc133MarkerKind::Output => (PaneCommandState::Running, None),
+                    Osc133MarkerKind::End(exit_code) => (PaneCommandState::Done, exit_code),
+                });
+            }
+        }
+        None
     }
 
     #[cfg(test)]

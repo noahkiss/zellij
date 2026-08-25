@@ -310,6 +310,8 @@ mod tests {
             tab_position: tab_id,
             tab_name: format!("tab {}", tab_id),
             agent: None,
+            command_state: None,
+            last_command_exit_code: None,
         }
     }
 

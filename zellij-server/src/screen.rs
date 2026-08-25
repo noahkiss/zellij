@@ -5792,11 +5792,23 @@ impl Screen {
             tab: &crate::tab::Tab,
             agent: Option<PaneAgent>,
         ) -> PaneListEntry {
+            // the markers are on the pane's own grid, so this is a lookup by id rather than
+            // something `pane_infos_for_tab` could have carried out
+            let (command_state, last_command_exit_code) = if pane_info.is_plugin {
+                (None, None)
+            } else {
+                tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .and_then(|pane| pane.osc133_command_state())
+                    .map(|(state, exit_code)| (Some(state), exit_code))
+                    .unwrap_or((None, None))
+            };
             PaneListEntry {
                 pane_info,
                 tab_position: tab.position,
                 tab_name: tab.name.clone(),
                 agent,
+                command_state,
+                last_command_exit_code,
             }
         }
 

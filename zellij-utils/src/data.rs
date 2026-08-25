@@ -2643,6 +2643,23 @@ pub struct PaneInfo {
     pub tab_id: usize,
 }
 
+/// What a shell's OSC 133 markers say about the pane's command right now.
+///
+/// A shell that emits the markers (`PS1`/`precmd` hooks in bash, zsh, fish, nushell) reports where
+/// its prompt starts, where a command's output starts, and where the command ended. That is the
+/// only exact answer to "is this pane busy" there is: everything else - a foreground process group,
+/// a child process, output arriving - infers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCommandState {
+    /// The shell has drawn a prompt and no command has started. Nothing is running.
+    Prompt,
+    /// A command has started producing output and has not reported an end.
+    Running,
+    /// The last command reported an end.
+    Done,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PaneListEntry {
     #[serde(flatten)]
@@ -2660,6 +2677,17 @@ pub struct PaneListEntry {
     /// something they can already be told for free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<PaneAgent>,
+    /// What the pane's shell says it is doing, from its OSC 133 markers.
+    ///
+    /// Absent for a plugin pane, and for a terminal pane whose shell emits no markers - which is
+    /// the honest answer rather than a guess. Like `agent`, it lives on this CLI-only row rather
+    /// than on `PaneInfo`, whose readers would each cost a protobuf tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_state: Option<PaneCommandState>,
+    /// The exit code the last command reported, when `command_state` is `done` and the shell put
+    /// one in its end marker. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_command_exit_code: Option<i32>,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;

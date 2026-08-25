@@ -456,6 +456,8 @@ mod tests {
             tab_position: 0,
             tab_name: "develop".to_owned(),
             agent: detect_command_line("/opt/bin/claude", &env(&[])),
+            command_state: None,
+            last_command_exit_code: None,
         };
         let agents = agents_from_pane_list(vec![entry]);
         assert_eq!(agents.len(), 1);

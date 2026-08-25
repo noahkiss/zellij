@@ -19,7 +19,7 @@ use zellij_utils::data::{
     Direction, KeyWithModifier, NewPanePlacement, PaneInfo, PermissionStatus, PermissionType,
     PluginPermission, RegexHighlight, ResizeStrategy, Style, StyledText, WebSharing,
 };
-use zellij_utils::data::{NoteColor, PaneContents};
+use zellij_utils::data::{NoteColor, PaneCommandState, PaneContents};
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
@@ -843,6 +843,13 @@ pub trait Pane {
         _max_scrollback_lines: Option<usize>,
     ) -> PaneContents {
         Default::default()
+    }
+    /// What the pane's shell says it is doing, from its OSC 133 markers.
+    ///
+    /// Only a terminal pane can answer: a plugin pane has no shell, and a terminal pane whose
+    /// shell writes no markers says `None` rather than guessing at idle.
+    fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
+        None
     }
     fn update_exit_status(&mut self, _exit_status: i32) {}
     fn set_plugin_regex_highlights(

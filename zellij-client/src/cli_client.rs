@@ -1448,6 +1448,8 @@ mod tests {
                 tab_position: 0,
                 tab_name: "tab".to_owned(),
                 agent: None,
+                command_state: None,
+                last_command_exit_code: None,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()
