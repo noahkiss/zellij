@@ -6194,6 +6194,52 @@ implementations. It is also carried by the KDL codec behind `session-metadata.kd
 `id` and read back optionally so metadata from an older build still parses. The client/server
 contract has no `PaneInfo` and is untouched.
 
+### Structural lifecycle events: tabs, focus and clients
+
+`PaneClosed`, and the fork's `PaneOpened` and `PaneExited`, were the only structural events in the
+tree. Everything else — a tab appearing, being renamed or closing, focus moving, a client arriving
+or leaving — had to be recovered by diffing successive `TabUpdate` and `PaneUpdate` snapshots. That
+is work every consumer repeats, and it is why a consumer with no client attached saw a different
+world from one with a client: the snapshot it diffed was gated on somebody being there.
+
+Six events, subscribed to like any other and gated on `ReadApplicationState`, the same permission
+`PaneClosed` answers to:
+
+| Event | Payload | Fires when |
+|---|---|---|
+| `TabAdded` | tab id, position, name | a tab is created, from any path including a layout |
+| `TabRemoved` | tab id | a tab closes |
+| `TabRenamed` | tab id, new name | a tab's name changes, from any source |
+| `FocusChanged` | client id, pane id, tab id | a client's focus moves, to another pane or another tab |
+| `ClientAttached` | client id | a client attaches |
+| `ClientDetached` | client id | a client detaches, or its connection goes away |
+
+All six are broadcast `(None, None)` like `PaneClosed`, so they reach background plugins and
+plugins in tabs nobody is looking at, whether or not a client is attached.
+
+**Focus is per client, and that is the point.** With a human and an agent attached to one session,
+"the focused pane" is two answers. `FocusChanged` fires for the client that moved and says nothing
+about the others.
+
+**Four of the six are found by diffing, rather than announced from each site.** A tab is renamed
+from nine call sites and focus moves from more than that; every one of them already ends at
+`log_and_report_session_state`, so the change is detected there by comparing with the last report.
+That is the shape the single-pane tab names already used, and it is why a path added later cannot
+forget to announce itself.
+
+**Focus is diffed from a second place as well**, because moving focus *inside* a tab only renders —
+it never reaches `log_and_report_session_state` — and that is the commonest focus change there is.
+The focus diff therefore also runs in `render_to_clients`, beside the single-pane tab name check.
+It costs two hash lookups per connected client, on a render that is already debounced to 10ms.
+
+`ClientAttached` and `ClientDetached` are the exceptions to the diffing: a client that attached and
+left between two reports would vanish from a diff, so those two are sent from the one place each
+happens.
+
+The events cross the plugin API: `event.proto` gains `EventType` values 55–60 and payload tags
+49–54, with regenerated prost output and both `TryFrom` implementations. The client/server contract
+is untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

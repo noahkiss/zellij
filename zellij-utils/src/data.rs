@@ -1082,6 +1082,34 @@ pub enum Event {
     SoftKeyboardVisibilityChanged(bool),
     HintText(BTreeMap<usize, StyledText>),
     ActivePaneScroll(Option<(usize, usize)>),
+    /// A tab was created in this session, whether or not a client is attached
+    ///
+    /// The payload is the tab's stable id, its position at the moment it was created, and its
+    /// name. Position is the only one of the three that can go stale: a later tab created before
+    /// this one, or a reorder, moves it. `TabUpdate` carries the current list.
+    TabAdded(usize, usize, String), // tab_id, position, name
+    /// A tab was closed. The payload is the tab's stable id.
+    ///
+    /// The tab is already gone when this fires, so the id is all there is to report - look it up
+    /// against the last `TabUpdate` if the name matters.
+    TabRemoved(usize), // tab_id
+    /// A tab was renamed. The payload is the tab's stable id and its new name.
+    ///
+    /// It fires for a rename from any source - the tab bar, `zellij action rename-tab`, a plugin -
+    /// and only when the name actually changes.
+    TabRenamed(usize, String), // tab_id, new name
+    /// A client's focus moved to another pane, in this or another tab
+    ///
+    /// The payload names the client, the pane it now looks at, and that pane's tab. Focus is per
+    /// client, so this fires once for the client that moved and says nothing about the others -
+    /// which is the point: with a human and an agent attached, "the focused pane" is two answers.
+    /// A switch to another tab reports the pane focused in it, since that is what the client is
+    /// now looking at.
+    FocusChanged(ClientId, PaneId, usize), // client_id, pane_id, tab_id
+    /// A client attached to this session
+    ClientAttached(ClientId),
+    /// A client detached from this session, or its connection went away
+    ClientDetached(ClientId),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

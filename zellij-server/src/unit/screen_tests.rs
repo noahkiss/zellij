@@ -15128,6 +15128,146 @@ fn a_pane_in_the_manifest_names_the_tab_it_is_in() {
     assert_eq!(panes_at_position(&after, 1), vec![(1, 0)]);
 }
 
+/// Every structural lifecycle event broadcast to all plugins, in the order it was sent.
+fn lifecycle_events(instructions: &[PluginInstruction]) -> Vec<Event> {
+    let mut events = vec![];
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (plugin_id, _client_id, event) in updates {
+                if plugin_id.is_some() {
+                    continue;
+                }
+                if matches!(
+                    event,
+                    Event::TabAdded(..)
+                        | Event::TabRemoved(..)
+                        | Event::TabRenamed(..)
+                        | Event::FocusChanged(..)
+                        | Event::ClientAttached(..)
+                        | Event::ClientDetached(..)
+                ) {
+                    events.push(event.clone());
+                }
+            }
+        }
+    }
+    events
+}
+
+#[test]
+pub fn the_structural_lifecycle_events_are_broadcast() {
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    mock_screen.new_tab(TiledPaneLayout::default());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::UpdateTabName(
+        "renamed".as_bytes().to_vec(),
+        main_client_id,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // moving focus INSIDE a tab only renders - it never reaches log_and_report_session_state -
+    // so it is the focus change most easily missed
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::FocusNextPane(main_client_id, None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::CloseTab(main_client_id, None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(second_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let events = lifecycle_events(&instructions);
+
+    let tabs_added: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::TabAdded(tab_id, ..) => Some(*tab_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tabs_added,
+        vec![0, 1],
+        "both tabs are announced as they are created, got: {:?}",
+        events
+    );
+    // `UpdateTabName` appends to the name the tab already has, so the new name ends with what
+    // was typed rather than being it
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TabRenamed(0, name) if name.ends_with("renamed"))),
+        "renaming the focused tab announces it, got: {:?}",
+        events
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::TabRemoved(0))),
+        "closing a tab announces it, got: {:?}",
+        events
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, Event::ClientAttached(client) if *client == second_client_id)
+        ),
+        "a client attaching announces itself, got: {:?}",
+        events
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, Event::ClientDetached(client) if *client == second_client_id)
+        ),
+        "a client detaching announces itself, got: {:?}",
+        events
+    );
+    let focus_moves: Vec<(u16, usize)> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::FocusChanged(client_id, _, tab_id) => Some((*client_id, *tab_id)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        focus_moves
+            .iter()
+            .filter(|(client_id, _)| *client_id == main_client_id)
+            .count()
+            >= 2,
+        "the main client is reported when it arrives and again when it moves inside its tab, \
+         got: {:?}",
+        events
+    );
+}
+
 /// The last `PaneUpdate` manifest delivered to `plugin_id`, flattened into one list of panes.
 fn last_pane_update_for_plugin(
     instructions: &[PluginInstruction],

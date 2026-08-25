@@ -2331,6 +2331,14 @@ fn check_event_permission(
         | Event::CommandPaneOpened(..)
         | Event::CommandPaneExited(..)
         | Event::PaneClosed(..)
+        // the structural lifecycle events describe the same session state `PaneClosed` does, so
+        // they answer to the same permission
+        | Event::TabAdded(..)
+        | Event::TabRemoved(..)
+        | Event::TabRenamed(..)
+        | Event::FocusChanged(..)
+        | Event::ClientAttached(..)
+        | Event::ClientDetached(..)
         | Event::EditPaneOpened(..)
         | Event::EditPaneExited(..)
         | Event::FailedToWriteConfigToDisk(..)
