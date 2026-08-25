@@ -45,6 +45,7 @@ tabs {
 panes {
     pane {
         id 1
+        tab_id 3
         is_plugin false
         is_focused true
         is_fullscreen true
@@ -68,6 +69,7 @@ panes {
     }
     pane {
         id 1
+        tab_id 3
         is_plugin true
         is_focused true
         is_fullscreen true

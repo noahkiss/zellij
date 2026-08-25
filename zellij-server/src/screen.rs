@@ -5854,7 +5854,6 @@ impl Screen {
         ) -> PaneListEntry {
             PaneListEntry {
                 pane_info,
-                tab_id: tab.id,
                 tab_position: tab.position,
                 tab_name: tab.name.clone(),
                 agent,

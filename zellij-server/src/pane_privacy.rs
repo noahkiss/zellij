@@ -172,7 +172,7 @@ impl PanePrivacy {
                 // fail closed: every pane and every tab in the list
                 for entry in entries {
                     verdicts.panes.insert(key_of(entry));
-                    verdicts.tabs.insert(entry.tab_id);
+                    verdicts.tabs.insert(entry.pane_info.tab_id);
                 }
                 return verdicts;
             },
@@ -185,7 +185,7 @@ impl PanePrivacy {
             if matched {
                 verdicts.panes.insert(key_of(entry));
             }
-            matched_by_tab.push((entry.tab_id, matched));
+            matched_by_tab.push((entry.pane_info.tab_id, matched));
         }
 
         let tab_ids: HashSet<usize> = matched_by_tab.iter().map(|(tab_id, _)| *tab_id).collect();
@@ -202,7 +202,7 @@ impl PanePrivacy {
 
         // a withheld tab takes its panes with it, whichever rule decided it
         for entry in entries {
-            if verdicts.tabs.contains(&entry.tab_id) {
+            if verdicts.tabs.contains(&entry.pane_info.tab_id) {
                 verdicts.panes.insert(key_of(entry));
             }
         }
@@ -304,9 +304,9 @@ mod tests {
         info.id = id;
         info.title = format!("pane {}", id);
         info.pane_cwd = cwd.map(String::from);
+        info.tab_id = tab_id;
         PaneListEntry {
             pane_info: info,
-            tab_id,
             tab_position: tab_id,
             tab_name: format!("tab {}", tab_id),
             agent: None,
@@ -430,7 +430,7 @@ mod tests {
         let (kept, withheld) = policy.filter(panes);
         assert_eq!(withheld, 2);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].tab_id, 4);
+        assert_eq!(kept[0].pane_info.tab_id, 4);
     }
 
     #[test]
