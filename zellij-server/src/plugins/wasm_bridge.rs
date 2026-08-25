@@ -18,8 +18,16 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::{Arc, LazyLock, Mutex},
+    time::Duration,
 };
 use tokio::sync::mpsc::Sender;
+
+/// How long a session teardown waits for every plugin's `BeforeClose` handler to finish.
+///
+/// A handler is a plugin's only chance to say anything on the way out - flush a queue, tell a
+/// server it is going. Bounded because a plugin that hangs in it must not hang the session; when
+/// the window closes the teardown proceeds and that plugin's last words are lost.
+const BEFORE_CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 use url::Url;
 use wasmi::{Engine, Module};
 use zellij_utils::consts::{ZELLIJ_CACHE_DIR, ZELLIJ_SESSION_CACHE_DIR, ZELLIJ_TMP_DIR};
@@ -1581,6 +1589,19 @@ impl WasmBridge {
         let plugin_ids = self.plugin_map.lock().unwrap().plugin_ids();
         for plugin_id in &plugin_ids {
             drop(self.unload_plugin(*plugin_id));
+        }
+        // every unload queues a `BeforeClose` handler on a worker thread. Until this wait, nothing
+        // looked at them again: the session's last word from each plugin was whatever the handler
+        // had managed before the process went away, which on a fast teardown was nothing at all.
+        // The window is bounded so a plugin that hangs in its handler cannot hold the session open.
+        if !self
+            .plugin_executor
+            .wait_until_idle(BEFORE_CLOSE_FLUSH_TIMEOUT)
+        {
+            log::error!(
+                "timed out after {:?} waiting for plugins to finish closing",
+                BEFORE_CLOSE_FLUSH_TIMEOUT
+            );
         }
         if let Some(watcher) = self.watcher.take() {
             watcher.stop_nonblocking();

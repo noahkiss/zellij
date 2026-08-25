@@ -6499,6 +6499,45 @@ a re-subscribe naming only dead panes used to leave the old subscription in plac
 replaces it — the server drops the subscription and answers `Pane N not found`, on which the CLI
 exits 2.
 
+### A plugin's `BeforeClose` handler gets a window to finish in
+
+`Event::BeforeClose` is a plugin's one chance to say anything on the way out — flush a queue, post
+a last state, tell whatever it reports to that it is going. It was delivered, and then the session
+did not wait for it.
+
+Two separate things cut it off, and a plugin hit both at once on a session teardown:
+
+- **Nothing waited for the handler to run.** `WasmBridge::cleanup` unloads every plugin, and each
+  unload queues its `BeforeClose` call on a worker thread and returns. The plugin thread then
+  returned as well, the server followed, and what the handler had managed by then was whatever the
+  scheduler had got round to — on a fast teardown, nothing at all.
+- **Its outbound work had nowhere left to go.** A `web_request` or a `run_command` from a plugin is
+  dispatched by the background-jobs thread, and that thread was told to exit at the same moment as
+  every other one — long before a handler running on a worker thread could reach it.
+
+So the teardown now holds the door open:
+
+- `cleanup` waits for the queued handlers, up to **two seconds**. A plugin that hangs in its
+  handler cannot hang the session; when the window closes the teardown proceeds and that plugin's
+  last words are lost, with the timeout in the session log.
+- **Background jobs are told to exit last**, after the plugin thread has joined, so a request a
+  handler issues still reaches the dispatcher.
+- The background-jobs thread then **waits up to three seconds for the web requests already in
+  flight**, which is shorter than the 30s a request itself is allowed: one that has not answered by
+  now is not worth holding a closing session open for. A session whose plugins had nothing
+  outstanding pays none of this.
+
+**A pane closing on its own is unchanged.** The wait is in `cleanup`, which runs once, at session
+teardown. Closing one plugin pane in a live session queues its handler exactly as before and blocks
+nobody.
+
+**SIGKILL stays lossy, and always will.** There is no `BeforeClose` under `SIGKILL` because there
+is no code left to run one — the process is gone between one instruction and the next. A plugin
+that must survive that has to write down what it knows as it goes rather than at the end, and a
+consumer that must detect it has to notice the session stop rather than wait to be told. `SIGTERM`
+is the signal that gets the graceful path (see [The server serializes and archives on
+SIGTERM](#the-server-serializes-and-archives-on-sigterm)), and `zellij session down` sends that one.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

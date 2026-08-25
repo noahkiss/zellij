@@ -569,7 +569,6 @@ impl Drop for SessionMetaData {
         let _ = self.senders.send_to_screen(ScreenInstruction::Exit);
         let _ = self.senders.send_to_plugin(PluginInstruction::Exit);
         let _ = self.senders.send_to_pty_writer(PtyWriteInstruction::Exit);
-        let _ = self.senders.send_to_background_jobs(BackgroundJob::Exit);
         // pty before screen: dropping `Pty` is what signals the pane shells, and screen can take
         // an unbounded amount of time to wind down (it is still being fed by panes that are alive
         // until pty kills them). Joining screen first made the shells outlive the whole teardown.
@@ -585,6 +584,10 @@ impl Drop for SessionMetaData {
         if let Some(pty_writer_thread) = self.pty_writer_thread.take() {
             let _ = pty_writer_thread.join();
         }
+        // background jobs are told to exit only once the plugin thread has: a `web_request` or a
+        // `run_command` a plugin issues from its `BeforeClose` handler is dispatched from here, and
+        // told to exit alongside the others this thread was gone before the handler had run
+        let _ = self.senders.send_to_background_jobs(BackgroundJob::Exit);
         if let Some(background_jobs_thread) = self.background_jobs_thread.take() {
             let _ = background_jobs_thread.join();
         }

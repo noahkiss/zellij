@@ -7,7 +7,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use wasmi::Engine;
+
+/// How often `wait_until_idle` looks at the busy counters. Short enough that a shutdown with
+/// nothing to flush is not noticeably slower, long enough not to spin.
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// A dynamic thread pool that pins jobs to specific threads based on plugin_id
 /// Starts with 1 thread and expands when threads are busy, shrinks when plugins unload
@@ -310,6 +315,35 @@ impl PinnedExecutor {
                 executor.unregister_plugin(plugin_id);
             },
         );
+    }
+
+    /// Block until every queued job has finished running, or until `timeout` elapses.
+    ///
+    /// Work is handed to a worker thread and forgotten, which is right for everything the executor
+    /// normally runs: the caller has nothing to wait for. Shutdown is the exception. The last job
+    /// each plugin gets is its `BeforeClose` handler, and the plugin thread used to return as soon
+    /// as that job was queued - so a handler that flushes state on the way out could be cut off
+    /// before it had run at all. Returns whether the queues drained.
+    pub fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // the lock is taken and released around each look, never held across the sleep: the
+            // jobs being waited for take it themselves when they unregister their plugin
+            let idle = {
+                let threads = self.execution_threads.lock().unwrap();
+                threads
+                    .iter()
+                    .flatten()
+                    .all(|thread| thread.jobs_in_flight.load(Ordering::SeqCst) == 0)
+            };
+            if idle {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(IDLE_POLL_INTERVAL);
+        }
     }
 
     /// Unregister a plugin and potentially shrink the pool
@@ -1083,6 +1117,50 @@ mod tests {
         barrier.wait();
 
         // Test completes without panic
+    }
+
+    #[test]
+    fn wait_until_idle_waits_for_a_queued_job() {
+        // this is what a session teardown does with the BeforeClose handlers: queue them, then
+        // hold the door open until they have run
+        let executor = create_test_executor(4);
+        executor.register_plugin(1);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_job = ran.clone();
+        executor.execute_for_plugin(1, move |_s, _p, _c, _ca, _e| {
+            thread::sleep(Duration::from_millis(100));
+            ran_in_job.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert!(
+            executor.wait_until_idle(Duration::from_secs(5)),
+            "the queue drains within the window"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "and the job had finished before the wait returned"
+        );
+    }
+
+    #[test]
+    fn wait_until_idle_gives_up_on_a_job_that_does_not_finish() {
+        // a plugin that hangs in its handler must not hang the session
+        let executor = create_test_executor(4);
+        executor.register_plugin(1);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_in_job = barrier.clone();
+        executor.execute_for_plugin(1, move |_s, _p, _c, _ca, _e| {
+            barrier_in_job.wait();
+        });
+
+        assert!(
+            !executor.wait_until_idle(Duration::from_millis(50)),
+            "the wait reports that it gave up"
+        );
+        barrier.wait();
     }
 
     #[test]
