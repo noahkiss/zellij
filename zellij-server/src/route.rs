@@ -261,6 +261,28 @@ fn new_pane_routing(
     }
 }
 
+/// Whether this action drops the asking client's own viewport to the bottom before it is carried
+/// out.
+///
+/// Typing into the pane your hands are on scrolls you back down to see what you typed, which is
+/// what you meant. A write that NAMES a pane means the opposite: it is somebody else's pane, often
+/// in another tab, and the person watching this session did not ask for their scrollback to move.
+/// The clear was sent for every write, targeted or not, and `ClearScroll` resolves "the client" by
+/// falling back to whichever one the server can find - so a script writing to a background pane
+/// reset a bystander's viewport and could flip them out of Scroll mode.
+///
+/// The written-to pane still answers for its own scroll, in `Tab::write_to_pane_id`, under the
+/// `input_while_scrolled` option. That is the half that belongs to the target.
+fn clears_the_asking_clients_scroll(action: &Action) -> bool {
+    use Action::*;
+    match action {
+        Write { .. } | WriteChars { .. } => true,
+        // one verb, both shapes: only the targetless form is about the asking client's own pane
+        Paste { pane_id, .. } => pane_id.is_none(),
+        _ => false,
+    }
+}
+
 pub(crate) fn route_action(
     mut action: Action,
     client_id: ClientId,
@@ -316,6 +338,14 @@ pub(crate) fn route_action(
         return Ok((should_break, None));
     }
 
+    // fork addition: asked once, here, instead of by each writing arm below. The arms all sent it
+    // and a targeted write must not - see `clears_the_asking_clients_scroll`
+    if clears_the_asking_clients_scroll(&action) {
+        senders
+            .send_to_screen(ScreenInstruction::ClearScroll(client_id))
+            .with_context(err_context)?;
+    }
+
     match action {
         Action::ToggleTab => {
             senders
@@ -331,9 +361,6 @@ pub(crate) fn route_action(
             is_kitty_keyboard_protocol,
         } => {
             senders
-                .send_to_screen(ScreenInstruction::ClearScroll(client_id))
-                .with_context(err_context)?;
-            senders
                 .send_to_screen(ScreenInstruction::WriteCharacter(
                     key_with_modifier,
                     raw_bytes,
@@ -344,9 +371,6 @@ pub(crate) fn route_action(
                 .with_context(err_context)?;
         },
         Action::WriteChars { chars } => {
-            senders
-                .send_to_screen(ScreenInstruction::ClearScroll(client_id))
-                .with_context(err_context)?;
             let chars = chars.into_bytes();
             senders
                 .send_to_screen(ScreenInstruction::WriteCharacter(
@@ -360,9 +384,6 @@ pub(crate) fn route_action(
         },
         Action::WriteToPaneId { bytes, pane_id } => {
             senders
-                .send_to_screen(ScreenInstruction::ClearScroll(client_id))
-                .with_context(err_context)?;
-            senders
                 .send_to_screen(ScreenInstruction::WriteToPaneId(
                     bytes,
                     pane_id.into(),
@@ -371,9 +392,6 @@ pub(crate) fn route_action(
                 .with_context(err_context)?;
         },
         Action::WriteCharsToPaneId { chars, pane_id } => {
-            senders
-                .send_to_screen(ScreenInstruction::ClearScroll(client_id))
-                .with_context(err_context)?;
             let bytes = chars.into_bytes();
             senders
                 .send_to_screen(ScreenInstruction::WriteToPaneId(
@@ -384,9 +402,6 @@ pub(crate) fn route_action(
                 .with_context(err_context)?;
         },
         Action::Paste { chars, pane_id } => {
-            senders
-                .send_to_screen(ScreenInstruction::ClearScroll(client_id))
-                .with_context(err_context)?;
             let bytes = chars.into_bytes();
             senders
                 .send_to_screen(ScreenInstruction::Paste(
@@ -4472,6 +4487,66 @@ mod tests {
             Some(ZellijUtilsPaneId::Terminal(3))
         );
         assert_eq!(privacy_target_of(&Action::ToggleTab), (None, None));
+    }
+
+    /// A write that names a pane leaves every client's viewport where it is.
+    ///
+    /// The four verbs that take `--pane-id` - `write`, `write-chars`, `send-keys` and `paste` -
+    /// become these three actions, and each used to drop the asking client's scroll on the way
+    /// through. Read from a script that is a bystander's scrollback jumping for no reason.
+    #[test]
+    fn a_targeted_write_does_not_clear_the_asking_clients_scroll() {
+        let targeted = [
+            Action::WriteToPaneId {
+                bytes: b"ls\n".to_vec(),
+                pane_id: ZellijUtilsPaneId::Terminal(3),
+            },
+            Action::WriteCharsToPaneId {
+                chars: "ls\n".to_owned(),
+                pane_id: ZellijUtilsPaneId::Terminal(3),
+            },
+            Action::Paste {
+                chars: "ls\n".to_owned(),
+                pane_id: Some(ZellijUtilsPaneId::Terminal(3)),
+            },
+        ];
+        for action in targeted {
+            assert!(
+                !clears_the_asking_clients_scroll(&action),
+                "{:?} names a pane, so it is not about the asking client's own viewport",
+                action
+            );
+        }
+    }
+
+    /// The untargeted half is unchanged: typing scrolls you back down to what you typed.
+    #[test]
+    fn an_untargeted_write_still_clears_the_asking_clients_scroll() {
+        let untargeted = [
+            Action::Write {
+                key_with_modifier: None,
+                bytes: b"ls\n".to_vec(),
+                is_kitty_keyboard_protocol: false,
+            },
+            Action::WriteChars {
+                chars: "ls\n".to_owned(),
+            },
+            Action::Paste {
+                chars: "ls\n".to_owned(),
+                pane_id: None,
+            },
+        ];
+        for action in untargeted {
+            assert!(
+                clears_the_asking_clients_scroll(&action),
+                "{:?} is about the pane the caller's hands are on",
+                action
+            );
+        }
+        assert!(
+            !clears_the_asking_clients_scroll(&Action::ToggleTab),
+            "only a write moves a viewport"
+        );
     }
 
     /// A withheld directory leaves the request as a request with no directory in it.
