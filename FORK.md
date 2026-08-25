@@ -6277,6 +6277,50 @@ The field crosses the plugin API: `event.proto` tag 48, regenerated prost output
 implementations, and the KDL codec behind `session-metadata.kdl` — written beside `is_focused` only
 when it says something, and read back optionally. The client/server contract is untouched.
 
+### `zellij pipe` answers, and gives up when nothing does
+
+```
+zellij pipe --name build-done -- ok        # gives up after 30 idle seconds
+zellij pipe --timeout 5 --name build-done -- ok
+zellij pipe --timeout 0 --name build-done -- ok   # waits for a plugin however long it takes
+```
+
+Two things were wrong on this path, and each hid the other.
+
+**Every CLI pipe reported an error it had no reason to report.** `Action::CliPipe` drops its
+completion channel on purpose — a pipe is released by the plugin that received it, on the plugin's
+own messages, not by the route thread — but the route thread then reads a dropped channel as "the
+action reported nothing" and sends the caller `Action CliPipe ended without reporting a result`.
+That message reached the client ahead of the plugin's real answer, so `zellij pipe` exited **2**
+about fifty milliseconds after it was called, whether or not anything was wrong. The pipe arm now
+returns where it finishes, the way [every other action that answers for itself
+does](#the-cli-output-convention), so nothing is sent on its behalf. The same return keeps the
+[audit ring](#list-events) off a streaming pipe, which would otherwise record a row
+per line.
+
+**With that gone, the hang underneath it is reachable.** Only a plugin that received the message
+can unblock a pipe, so a session with none listening — a bare layout, or a `--plugin` that was
+launched by this very call and is still loading when the message is dispatched — never answers, and
+the client waited on it forever. A hook that shells out to `zellij pipe` inherited that wait.
+`--timeout` bounds it: exit **2**, and a sentence on stderr naming the pipe and saying why a pipe
+goes unanswered, which is [the `2` door for a wait that ran
+out](#the-cli-output-convention).
+
+**The window is idle time, not a budget for the call.** It measures how long the *session* has said
+nothing, and any message restarts it. That is what makes a default safe: `tail -f | zellij pipe`
+spends its time blocked on `read_line`, which is outside the window entirely, and a plugin that
+streams output restarts it on every send. Verified — a producer emitting a line every two seconds
+for six ran to completion under `--timeout 3`.
+
+**So it defaults to 30 seconds rather than to nothing.** A flag-only patch would have turned
+today's fast (if wrong) exit into an unbounded hang for every existing caller, which is a worse
+trade than the one this makes. Thirty seconds is generous enough for the slow legitimate case, a
+first plugin load that compiles wasm; `--timeout 0` restores the unbounded wait for a caller who
+wants it, and says so in the timeout message.
+
+The flag never reaches the session. It is taken off the request by `CliAction::take_pipe_timeout`
+and held by the client, so `Action::CliPipe` and the client/server contract are untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
