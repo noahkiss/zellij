@@ -3445,6 +3445,10 @@ pub struct SubscribeToPaneRendersMsg {
     pub scrollback: ::core::option::Option<u32>,
     #[prost(bool, tag="3")]
     pub ansi: bool,
+    /// fork addition: subscribe to every pane in the session, including panes created later.
+    /// `pane_ids` is empty when this is set.
+    #[prost(bool, tag="4")]
+    pub all_panes: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

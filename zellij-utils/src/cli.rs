@@ -170,7 +170,7 @@ pub enum Command {
 
     /// Subscribe to pane render updates (viewport and scrollback)
     #[clap(override_usage(
-        "zellij [--session <OTHER SESSION NAME>] subscribe [OPTIONS] --pane-id..."
+        "zellij [--session <OTHER SESSION NAME>] subscribe [OPTIONS] <--pane-id...|--all>"
     ))]
     Subscribe(SubscribeCli),
 }
@@ -183,10 +183,15 @@ pub struct SubscribeCli {
     #[clap(
         short,
         long,
-        required = true,
+        required_unless_present = "all",
         num_args(1..)
     )]
     pub pane_id: Vec<String>,
+
+    /// Subscribe to every pane in the session, including panes opened after the subscription
+    /// starts. Panes a `pane_privacy` policy withholds are not included
+    #[clap(long, conflicts_with = "pane_id")]
+    pub all: bool,
 
     /// Include scrollback lines in initial delivery.
     /// Bare --scrollback = all scrollback, --scrollback N = last N lines.
@@ -3253,6 +3258,12 @@ mod tests {
         parse_cli(full_args).is_err()
     }
 
+    fn subscribe_parse_fails(args: &[&str]) -> bool {
+        let mut full_args = vec!["zellij".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        parse_cli(full_args).is_err()
+    }
+
     fn parse_subscribe(args: &[&str]) -> SubscribeCli {
         let mut full_args = vec!["zellij".to_string()];
         full_args.extend(args.iter().map(|a| a.to_string()));
@@ -3285,6 +3296,28 @@ mod tests {
     fn subscribe_scrollback_absent() {
         let s = parse_subscribe(&["subscribe", "--pane-id", "terminal_1"]);
         assert_eq!(s.scrollback, None);
+    }
+
+    #[test]
+    fn subscribe_all_replaces_naming_the_panes() {
+        let s = parse_subscribe(&["subscribe", "--all"]);
+        assert!(s.all);
+        assert!(s.pane_id.is_empty());
+    }
+
+    #[test]
+    fn subscribe_all_and_pane_id_are_mutually_exclusive() {
+        assert!(subscribe_parse_fails(&[
+            "subscribe",
+            "--all",
+            "--pane-id",
+            "terminal_1"
+        ]));
+    }
+
+    #[test]
+    fn subscribe_still_needs_one_of_the_two() {
+        assert!(subscribe_parse_fails(&["subscribe"]));
     }
 
     #[test]

@@ -130,10 +130,12 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
                 pane_ids,
                 scrollback,
                 ansi,
+                all_panes,
             } => client_to_server_msg::Message::SubscribeToPaneRenders(SubscribeToPaneRendersMsg {
                 pane_ids: pane_ids.into_iter().map(|id| id.into()).collect(),
                 scrollback: scrollback.map(|s| s as u32),
                 ansi,
+                all_panes,
             }),
             ClientToServerMsg::DesktopNotificationResponse { raw_bytes } => {
                 client_to_server_msg::Message::DesktopNotificationResponse(
@@ -306,6 +308,7 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
                     pane_ids: pane_ids?,
                     scrollback: msg.scrollback.map(|s| s as usize),
                     ansi: msg.ansi,
+                    all_panes: msg.all_panes,
                 })
             },
             Some(client_to_server_msg::Message::DesktopNotificationResponse(msg)) => {

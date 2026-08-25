@@ -6426,6 +6426,79 @@ switch changes nothing, and a subscription made before a client attached keeps e
 - The cost is unchanged. All of it is behind the `is_empty()` gate on the subscriber map, so a
   session with no subscribers does the same work it did before.
 
+### A `subscribe` feed does not narrow when somebody attaches
+
+```
+zellij subscribe --pane-id sunny-otter --pane-id brave-heron --format json
+```
+
+Two panes in two different tabs. With nobody attached, both feeds ran. The moment a human attached,
+the pane in the tab they were not looking at went silent — and it came back when they switched tabs.
+A consumer therefore got *more* data while nobody was watching, and the feed rearranged itself
+around a human's tab.
+
+The cause is that the two delivery paths read from different places. With a client attached,
+subscribers were served out of the render report, which carries only what was rendered:
+`Tab::render` returns early for a tab whose `connected_clients` set is empty, so panes in every
+other tab are simply not in it. With no client attached nothing renders, and the fallback path
+queried every subscribed pane from its tab directly — which is why the detached feed was the
+complete one.
+
+There is now one path. It takes the render report when there is one, and queries whatever the
+report is missing from the pane's own tab. Attached and detached feeds are the same feed, a tab
+switch changes nothing, and a subscription made before a client attached keeps every pane it named.
+
+- **Floating panes are covered by the same fix.** They are rendered only while they are visible, so
+  a subscribed floating pane went silent when its tab hid it. It no longer does.
+- **A subscribed plugin pane is read through a client.** A plugin pane keeps a grid per client, and
+  the direct query passed `None`, which matches no grid and returns nothing — so the fallback path
+  served empty contents for one. It now reads through a regular client, the way the initial
+  delivery at subscribe time always did. With nobody attached there is no client to read through
+  and a plugin pane still reports empty; a terminal pane is unaffected either way.
+- The cost is unchanged. All of it is behind the `is_empty()` gate on the subscriber map, so a
+  session with no subscribers does the same work it did before.
+
+### `subscribe --all`: every pane, including the ones that do not exist yet
+
+```
+zellij subscribe --all --format json
+```
+
+A subscription had to name its panes, so a consumer that wanted the whole session had to list
+`list-panes` first and re-subscribe every time a pane was opened — and in the window between the
+two it saw nothing of the new pane. `--all` asks for the session instead of for panes. It takes
+every pane there is, and a pane opened later joins the feed on its own.
+
+- **`--all` and `--pane-id` are mutually exclusive**, and one of them is still required. A bare
+  `zellij subscribe` remains an error.
+- **A pane that joins later arrives as an initial delivery** — `is_initial: true`, the same framing
+  the named panes get at subscribe time — so a consumer can tell a pane it has never seen from one
+  that merely changed. It carries no scrollback even under `--scrollback`: a pane that has just
+  been created has none, and the flag describes the panes that were already there.
+- **A closing pane still says so.** `pane_closed` fires for a wildcard exactly as for a named
+  subscription. What does not happen is the exit: a named subscription ends when its last pane
+  closes, because those panes were the request, while a wildcard outlives all of them and runs
+  until the session does.
+- **`pane_privacy` is honoured, and this is the reason the expansion lives in the server.**
+  `SubscribeToPaneRenders` is a client/server message rather than a CLI action, so it does not pass
+  through the privacy guard in `route.rs` — a wildcard expanded anywhere else would hand a consumer
+  every withheld pane without it having named one. The wildcard resolves to what `list-panes --all`
+  would answer, filtered by the policy, and the filter is re-run on every delivery rather than once
+  at subscribe time, because what a policy withholds follows a pane's live command and title. A
+  pane the policy begins to withhold leaves the feed without being reported as closed. That
+  re-filtering builds the pane list on each render tick, which is the one cost here — it is paid
+  only by a session that has both a wildcard subscriber and an active policy.
+
+The flag rides on the existing `SubscribeToPaneRendersMsg` (field 4), so it adds no message to the
+client/server contract and changes no numbering. A fork client's `--all` against a stock server of
+the same contract subscribes to nothing, which is the same answer that contract gives for every
+other field it does not know.
+
+**The adjacent fail-open bug was already fixed** and is recorded here so nobody looks for it again:
+a re-subscribe naming only dead panes used to leave the old subscription in place. Since nkmk.17 it
+replaces it — the server drops the subscription and answers `Pane N not found`, on which the CLI
+exits 2.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

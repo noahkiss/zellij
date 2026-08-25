@@ -218,6 +218,9 @@ pub enum ClientToServerMsg {
         pane_ids: Vec<PaneId>,
         scrollback: Option<usize>,
         ansi: bool,
+        /// Every pane in the session, including the ones created after this message. `pane_ids` is
+        /// empty when this is set.
+        all_panes: bool,
     },
     DesktopNotificationResponse {
         raw_bytes: Vec<u8>,
