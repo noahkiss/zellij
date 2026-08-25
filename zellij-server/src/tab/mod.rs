@@ -1738,6 +1738,10 @@ impl Tab {
         }
         let multiple_users_exist_in_session = { self.connected_clients_in_app.borrow().len() > 1 };
         let should_draw_pane_frames = self.pane_frame_style.draws_full_frames();
+        // fork addition: the third render path that builds a `PaneContentsAndUi` of its own, after
+        // the tiled and floating ones. Without this the stack list is the one place `top_only`
+        // visibly does not hold
+        let top_only_frames = self.pane_frame_style.is_top_only();
         let session_is_mirrored = self.stack_list_session_is_mirrored;
         let current_pane_group: HashMap<ClientId, Vec<PaneId>> =
             { self.current_pane_group.borrow().clone_inner() };
@@ -1815,6 +1819,7 @@ impl Tab {
                     self.dimmed_clients.clone(),
                 );
                 pane_contents_and_ui.set_frame_geom_override(Some(header_geom));
+                pane_contents_and_ui.set_top_only_frames(top_only_frames);
                 pane_contents_and_ui.set_stack_list_entry(
                     Some(widest_member_title),
                     *member == list.visible,

@@ -16439,6 +16439,68 @@ fn single_pane_top_only_frame_style_draws_title_row() {
     assert_snapshot!(snapshot);
 }
 
+// Fork addition: the stack list draws its rows through a `PaneContentsAndUi` of its own, which
+// used to be the one place in a tab that never learned the frame style.
+#[test]
+fn stack_list_rows_follow_the_top_only_frame_style() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab_with_stacked_pane_list(size, ModeInfo::default(), true, None);
+    tab.new_pane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::default(),
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    tab.new_pane(
+        PaneId::Terminal(3),
+        None,
+        None,
+        false,
+        true,
+        NewPanePlacement::Stacked {
+            pane_id_to_stack_under: None,
+            borderless: None,
+        },
+        Some(client_id),
+        None,
+    )
+    .unwrap();
+    assert!(tab.has_stack_lists(), "the test needs a stack list to draw");
+    tab.set_pane_frames(PaneFrameStyle::TopOnly);
+    let mut output = Output::default();
+    tab.render(&mut output, None).unwrap();
+    let snapshot = take_snapshot(
+        output.serialize().unwrap().get(&client_id).unwrap(),
+        size.rows,
+        size.cols,
+        Palette::default(),
+    );
+    // `top_only` draws no separators between panes, so the only `│` left on screen is the pair
+    // bracketing a stack list entry - which makes those rows the ones carrying it
+    let entry_rows: Vec<&str> = snapshot.lines().filter(|line| line.contains('│')).collect();
+    assert!(
+        !entry_rows.is_empty(),
+        "the stack list drew no entries at all, got: {:?}",
+        snapshot
+    );
+    for entry_row in &entry_rows {
+        assert!(
+            entry_row.contains('─'),
+            "a stack list row must carry top_only's rule, got: {:?}",
+            entry_row
+        );
+    }
+}
+
 #[test]
 fn single_pane_titles_frame_style_omits_title_row() {
     let size = Size { cols: 40, rows: 6 };
