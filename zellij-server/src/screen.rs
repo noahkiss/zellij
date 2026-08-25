@@ -4529,8 +4529,11 @@ impl Screen {
                 }
             }
 
-            // focus that moved inside a tab reaches here and nowhere else
-            self.report_focus_changes();
+            // focus that moved inside a tab reaches here and nowhere else, and the manifest
+            // reports who is looking at each pane, so it is rebuilt with it
+            if self.report_focus_changes() {
+                self.generate_and_report_pane_state()?;
+            }
             let single_pane_names_changed = self.update_single_pane_tab_names();
             if bells.state_changed || single_pane_names_changed {
                 self.log_and_report_session_state()?;
@@ -6046,7 +6049,8 @@ impl Screen {
         // announced before the snapshots below, so a subscriber hears what changed and then sees
         // the state that already reflects it
         self.report_tab_changes();
-        self.report_focus_changes();
+        // the manifest below is rebuilt either way, so the return is not needed here
+        let _ = self.report_focus_changes();
         // generate own session info
         let pane_manifest = self.generate_and_report_pane_state()?;
         let tab_infos = self.generate_and_report_tab_state()?;
@@ -8671,7 +8675,7 @@ impl Screen {
     /// focus inside a tab only renders - it never reaches `log_and_report_session_state` - so a
     /// diff taken only there would miss the commonest focus change there is. This costs two hash
     /// lookups per connected client, and the render it hangs off is already debounced to 10ms.
-    fn report_focus_changes(&mut self) {
+    fn report_focus_changes(&mut self) -> bool {
         let mut events = vec![];
         let mut current_focus = HashMap::new();
         let connected_clients: Vec<ClientId> =
@@ -8690,7 +8694,9 @@ impl Screen {
         }
         self.last_reported_focus = current_focus;
 
+        let focus_moved = !events.is_empty();
         self.broadcast_all_to_plugins(events);
+        focus_moved
     }
     fn broadcast_all_to_plugins(&self, events: Vec<Event>) {
         if events.is_empty() {

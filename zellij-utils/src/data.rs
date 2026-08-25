@@ -2621,6 +2621,18 @@ pub struct PaneInfo {
     /// The colour `note` is drawn in. Meaningless, and `info`, when there is no note.
     #[serde(default)]
     pub note_color: NoteColor,
+    /// Which of the connected clients are focused on this pane, ascending
+    ///
+    /// `is_focused` is the same answer collapsed to a yes, and stays exactly what it was: true
+    /// when this list is not empty. The list is what a consumer needs as soon as two clients are
+    /// attached - a human and an agent, which is the normal case here - because then "the focused
+    /// pane" is two panes and a boolean cannot say whose.
+    ///
+    /// Empty for a suppressed pane, and for a pane whose only focused client has detached: a
+    /// detached client keeps its place so it lands back where it was, but nobody is looking
+    /// through it. The counterpart push event is `FocusChanged`.
+    #[serde(default)]
+    pub focused_by_client_ids: Vec<ClientId>,
     /// The `TabInfo::tab_id` of the tab this pane is in
     ///
     /// `PaneManifest` is keyed by tab POSITION, which moves when tabs are reordered and is not the

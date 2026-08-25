@@ -3090,9 +3090,10 @@ impl TiledPanes {
             // fork addition: reported focus names the clients that are still here. A detached
             // client keeps its entry in `active_panes` so it lands back where it was, and reading
             // that map straight told `list-panes` a pane nobody is looking at is focused
-            pane_info_for_pane.is_focused = self
+            pane_info_for_pane.focused_by_client_ids = self
                 .active_panes
-                .pane_id_is_focused_by_connected_client(pane_id, &connected_clients);
+                .connected_clients_focused_on_pane(pane_id, &connected_clients);
+            pane_info_for_pane.is_focused = !pane_info_for_pane.focused_by_client_ids.is_empty();
             // fullscreen is the tab's own shape rather than a claim about who is looking, so it
             // stays on the unfiltered answer: a detached tab left fullscreen still is one
             pane_info_for_pane.is_fullscreen = is_focused && self.fullscreen_is_active();

@@ -15128,6 +15128,56 @@ fn a_pane_in_the_manifest_names_the_tab_it_is_in() {
     assert_eq!(panes_at_position(&after, 1), vec![(1, 0)]);
 }
 
+#[test]
+pub fn a_pane_names_every_connected_client_focused_on_it() {
+    let size = Size { cols: 80, rows: 10 };
+    let second_client_id = 2;
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    // a second client attaches to the same tab, so both are looking at the same pane
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddClient(
+        second_client_id,
+        false,
+        size,
+        Some(0),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // one of them moves away, the other does not
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::FocusNextPane(second_client_id, None));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let focus: Vec<(u32, Vec<u16>, bool)> = panes
+        .iter()
+        .filter(|pane| !pane.is_plugin)
+        .map(|pane| (pane.id, pane.focused_by_client_ids.clone(), pane.is_focused))
+        .collect();
+    assert_eq!(
+        focus,
+        vec![(0, vec![main_client_id], true), (1, vec![second_client_id], true)],
+        "each pane names the client looking at it, and `is_focused` stays the same answer collapsed"
+    );
+}
+
 /// Every structural lifecycle event broadcast to all plugins, in the order it was sent.
 fn lifecycle_events(instructions: &[PluginInstruction]) -> Vec<Event> {
     let mut events = vec![];

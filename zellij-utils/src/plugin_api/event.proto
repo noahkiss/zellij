@@ -598,6 +598,7 @@ message PaneInfo {
     bool has_explicit_title = 45;
     string handle = 46;
     uint32 tab_id = 47;
+    repeated uint32 focused_by_client_ids = 48;
 }
 
 message PaneEnvVar {

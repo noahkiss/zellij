@@ -7526,6 +7526,7 @@ impl Tab {
             pane_info_for_suppressed_pane.is_floating = false;
             pane_info_for_suppressed_pane.is_suppressed = true;
             pane_info_for_suppressed_pane.is_focused = false;
+            pane_info_for_suppressed_pane.focused_by_client_ids = vec![];
             pane_info_for_suppressed_pane.is_fullscreen = false;
             pane_info_for_suppressed_pane.stack_id = None;
             pane_info_for_suppressed_pane.is_expanded_in_stack = false;

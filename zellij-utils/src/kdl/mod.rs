@@ -7868,6 +7868,18 @@ impl PaneInfo {
 
         let is_plugin = bool_node!("is_plugin");
         let is_focused = bool_node!("is_focused");
+        // optional: absent for a pane nobody is looking at, and from metadata written before the
+        // field existed
+        let focused_by_client_ids: Vec<crate::data::ClientId> = kdl_document
+            .get("focused_by_client_ids")
+            .map(|node| {
+                node.entries()
+                    .iter()
+                    .filter_map(|e| e.value().as_i64())
+                    .map(|client_id| client_id as crate::data::ClientId)
+                    .collect()
+            })
+            .unwrap_or_default();
         let is_fullscreen = bool_node!("is_fullscreen");
         let is_floating = bool_node!("is_floating");
         let is_suppressed = bool_node!("is_suppressed");
@@ -7935,6 +7947,7 @@ impl PaneInfo {
             restored_from,
             handle,
             tab_id,
+            focused_by_client_ids,
             // a note describes live state, and a saved layout describes what a pane IS, so a
             // restored pane comes back without one
             note: String::new(),
@@ -8015,6 +8028,13 @@ impl PaneInfo {
         int_node!("tab_id", self.tab_id);
         bool_node!("is_plugin", self.is_plugin);
         bool_node!("is_focused", self.is_focused);
+        if !self.focused_by_client_ids.is_empty() {
+            let mut focused_by = KdlNode::new("focused_by_client_ids");
+            for client_id in &self.focused_by_client_ids {
+                focused_by.push(*client_id as i64);
+            }
+            kdl_doucment.nodes_mut().push(focused_by);
+        }
         bool_node!("is_fullscreen", self.is_fullscreen);
         bool_node!("is_floating", self.is_floating);
         bool_node!("is_suppressed", self.is_suppressed);
@@ -8190,6 +8210,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             restored_from: String::new(),
             handle: String::new(),
             tab_id: 3,
+            focused_by_client_ids: vec![1, 2],
             note: String::new(),
             note_color: Default::default(),
             pane_cwd: None,
@@ -8241,6 +8262,7 @@ fn serialize_and_deserialize_session_info_with_data() {
             restored_from: String::new(),
             handle: String::new(),
             tab_id: 3,
+            focused_by_client_ids: vec![1, 2],
             note: String::new(),
             note_color: Default::default(),
             pane_cwd: None,
