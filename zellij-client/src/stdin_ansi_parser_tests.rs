@@ -1,6 +1,6 @@
 //! Unit tests for the continuous host-reply parser.
 
-use super::{schedule_forward_timeout, HostReply, PendingPartial, StdinAnsiParser};
+use super::{schedule_forward_timeout, HostReply, PendingPartial, StdinAnsiParser, SyncOutput};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -80,6 +80,58 @@ fn color_register_reply() {
             assert_eq!(regs[0].1, "rgb:8080/8080/8080");
         },
         other => panic!("unexpected reply: {:?}", other),
+    }
+}
+
+#[test]
+fn synchronized_output_default_assumes_the_host_supports_2026() {
+    // Every terminal but alacritty gets the CSI form before the host has
+    // answered the startup DECRPM query — including a host that never
+    // answers it at all.
+    for term in [None, Some("xterm-256color"), Some("ghostty"), Some("dumb")] {
+        match SyncOutput::default_for_host(term, None) {
+            Some(SyncOutput::CSI) => {},
+            other => panic!("TERM={:?} should default to CSI, got {:?}", term, other),
+        }
+    }
+    match SyncOutput::default_for_host(Some("alacritty"), None) {
+        Some(SyncOutput::DCS) => {},
+        other => panic!("alacritty should keep the DCS form, got {:?}", other),
+    }
+}
+
+#[test]
+fn zellij_sync_output_overrides_the_default() {
+    assert!(SyncOutput::default_for_host(Some("ghostty"), Some("off")).is_none());
+    assert!(SyncOutput::default_for_host(Some("ghostty"), Some(" OFF ")).is_none());
+    assert!(SyncOutput::default_for_host(Some("ghostty"), Some("none")).is_none());
+    match SyncOutput::default_for_host(Some("alacritty"), Some("csi")) {
+        Some(SyncOutput::CSI) => {},
+        other => panic!("csi should force the CSI form, got {:?}", other),
+    }
+    match SyncOutput::default_for_host(Some("ghostty"), Some("DCS")) {
+        Some(SyncOutput::DCS) => {},
+        other => panic!("dcs should force the DCS form, got {:?}", other),
+    }
+    // An unrecognised value leaves the default alone rather than
+    // disabling synchronisation by accident.
+    match SyncOutput::default_for_host(Some("ghostty"), Some("yes")) {
+        Some(SyncOutput::CSI) => {},
+        other => panic!("an unknown value should be ignored, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_host_that_does_not_know_mode_2026_turns_the_default_off() {
+    // The DECRPM reply stays the authority over the optimistic default:
+    // 0 (unrecognised) and 4 (permanently reset) disable it again.
+    for reply in [&b"\x1b[?2026;0$y"[..], &b"\x1b[?2026;4$y"[..]] {
+        let mut parser = StdinAnsiParser::new();
+        let (replies, _residue) = feed_once(&mut parser, reply);
+        match &replies[0] {
+            HostReply::SynchronizedOutput(None) => {},
+            other => panic!("{:?} should disable sync output, got {:?}", reply, other),
+        }
     }
 }
 

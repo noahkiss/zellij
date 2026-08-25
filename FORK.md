@@ -5885,6 +5885,50 @@ one gets the prompt. A user `config.kdl` that already overrides tab-mode `x` kee
 and sees no change until it is rewritten — and it must not be rewritten ahead of the binary,
 because `zellij:confirm-close-tab` is a plugin location an older build does not have.
 
+### Synchronised output is assumed, not withheld until a terminal proves it
+
+Upstream wraps a rendered frame in synchronised output (DEC private mode 2026 — the terminal buffers
+the whole frame and paints it in one go) in two ways. It queries the host at client startup with
+`CSI ?2026$p` and switches the wrapper on when the reply says the mode is known, and until that
+reply lands it uses a `TERM` match that names exactly one terminal:
+
+```rust
+match os_input.env_variable("TERM").as_deref() {
+    Some("alacritty") => Some(SyncOutput::DCS),
+    _ => None,
+}
+```
+
+The query is the part that matters, and it works. What is wrong is the default it falls back on: a
+terminal is presumed not to support 2026 until it says otherwise, so anything that supports the mode
+but never answers a DECRQM — and anything at all during the round trip at startup — renders
+unsynchronised. Zellij's server sends only the lines that changed and clears its output buffer the
+moment it has, so a frame that reaches the terminal in pieces is not just a flicker: the terminal
+draws part of it at the wrong cursor position and nothing re-sends those lines until they change
+again. Over SSH that drift accumulates into duplicated pane borders until a detach and re-attach
+forces a full redraw.
+
+The default is now the other way round. Every terminal but alacritty starts on the CSI form, and the
+host's DECRPM reply is still the authority in both directions — a reply of `0` (mode unrecognised)
+or `4` (permanently reset) turns synchronisation back off. Assuming support is safe because a
+terminal that does not implement a DEC private mode still parses the sequence and ignores it; the
+cost of being wrong is sixteen bytes a frame that nothing acts on, against a corrupted screen for
+being wrong the other way. The remote-attach client gets the change too, and needs it more: its
+binding is immutable and never sees the DECRPM reply at all, so the default is the only value it
+will ever have.
+
+`ZELLIJ_SYNC_OUTPUT` is the escape hatch for the one host this cannot fix by itself — one that
+mishandles mode 2026 and stays silent when asked about it. `off` (or `none`) never synchronises,
+`csi` and `dcs` force an implementation, any other value is ignored. It is read once per client, so
+it is exported before `zellij` rather than set inside a pane.
+
+**Upstream will not take this.** [#4693](https://github.com/zellij-org/zellij/issues/4693) reports
+the SSH corruption and [#4694](https://github.com/zellij-org/zellij/pull/4694) proposes the same
+two-line flip, but argues that the CSI path was "never made the default" — which is untrue, the
+query has made it the default on a replying terminal since #2798 — and it was rejected on that
+point. The disagreement is about the pre-reply default, not about detection, and a fork that runs
+on known terminals can take the optimistic side of it.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
