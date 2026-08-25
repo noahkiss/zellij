@@ -2593,13 +2593,22 @@ pub struct PaneInfo {
     /// The colour `note` is drawn in. Meaningless, and `info`, when there is no note.
     #[serde(default)]
     pub note_color: NoteColor,
+    /// The `TabInfo::tab_id` of the tab this pane is in
+    ///
+    /// `PaneManifest` is keyed by tab POSITION, which moves when tabs are reordered and is not the
+    /// same number as the tab's id. This is the join a consumer holding a manifest needs to say
+    /// which tab a pane is in without correlating a `PaneUpdate` against a `TabUpdate` that may
+    /// have been delivered at a different moment.
+    #[serde(default)]
+    pub tab_id: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PaneListEntry {
     #[serde(flatten)]
     pub pane_info: PaneInfo,
-    pub tab_id: usize,
+    /// The tab's 0-indexed position. Its stable id is `pane_info.tab_id`, which this row used to
+    /// carry itself - two `tab_id` keys in one flattened object is one too many.
     pub tab_position: usize,
     pub tab_name: String,
     /// The coding agent running in this pane, if one is.

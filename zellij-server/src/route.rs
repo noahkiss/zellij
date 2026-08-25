@@ -2781,8 +2781,8 @@ fn pane_privacy_refusal(action: &Action, senders: &ThreadSenders) -> Option<Priv
         // one it is cannot be told from the number. Both are checked: over-refusing is the safe
         // direction for a filter, and under-refusing is the leak
         let matches_target = entries.iter().any(|entry| {
-            (entry.tab_id == tab_target || entry.tab_position == tab_target)
-                && verdicts.withholds_tab(entry.tab_id)
+            (entry.pane_info.tab_id == tab_target || entry.tab_position == tab_target)
+                && verdicts.withholds_tab(entry.pane_info.tab_id)
         });
         if matches_target {
             return Some(tab_miss_refusal(action, tab_target));
@@ -2862,7 +2862,7 @@ fn withhold_tabs(senders: &ThreadSenders, tab_infos: Vec<TabInfo>) -> Vec<TabInf
     let verdicts = policy.verdicts(&entries);
     let withheld_positions: HashSet<usize> = entries
         .iter()
-        .filter(|entry| verdicts.withholds_tab(entry.tab_id))
+        .filter(|entry| verdicts.withholds_tab(entry.pane_info.tab_id))
         .map(|entry| entry.tab_position)
         .collect();
     tab_infos
@@ -3029,9 +3029,12 @@ fn available_pane_targets(senders: &ThreadSenders) -> Result<Vec<String>> {
     };
     let mut current_tab: Option<usize> = None;
     for entry in panes {
-        if current_tab != Some(entry.tab_id) {
-            lines.push(format!("  tab {} {}", entry.tab_id, entry.tab_name));
-            current_tab = Some(entry.tab_id);
+        if current_tab != Some(entry.pane_info.tab_id) {
+            lines.push(format!(
+                "  tab {} {}",
+                entry.pane_info.tab_id, entry.tab_name
+            ));
+            current_tab = Some(entry.pane_info.tab_id);
         }
         lines.push(format!(
             "    {}  {}  {}",
@@ -4092,7 +4095,7 @@ fn build_table_row(
     let mut row = Vec::new();
 
     if show_tab {
-        row.push(entry.tab_id.to_string());
+        row.push(entry.pane_info.tab_id.to_string());
         row.push(entry.tab_position.to_string());
         row.push(entry.tab_name.clone());
     }
@@ -4206,7 +4209,7 @@ fn format_tree(tab_infos: &[TabInfo], pane_entries: &[PaneListEntry]) -> Vec<Str
         ));
         for entry in pane_entries
             .iter()
-            .filter(|entry| entry.tab_id == tab.tab_id)
+            .filter(|entry| entry.pane_info.tab_id == tab.tab_id)
         {
             lines.push(format!(
                 "  handle: {}  pane_id: {}  title: {}  command: {}  focused: {}  note: {}",
@@ -4235,7 +4238,7 @@ fn format_tree_as_json(tab_infos: &[TabInfo], pane_entries: &[PaneListEntry]) ->
             let mut value = serde_json::to_value(tab).unwrap_or(serde_json::Value::Null);
             let tab_panes: Vec<&PaneListEntry> = pane_entries
                 .iter()
-                .filter(|entry| entry.tab_id == tab.tab_id)
+                .filter(|entry| entry.pane_info.tab_id == tab.tab_id)
                 .collect();
             if let Some(object) = value.as_object_mut() {
                 object.insert(
@@ -4755,9 +4758,9 @@ mod tests {
         pane_info.id = id;
         pane_info.title = format!("pane {}", id);
         pane_info.handle = handle.to_string();
+        pane_info.tab_id = 1;
         PaneListEntry {
             pane_info,
-            tab_id: 1,
             tab_position: 0,
             tab_name: "tab1".to_string(),
             agent: None,
@@ -4766,7 +4769,7 @@ mod tests {
 
     fn pane_entry_in_tab(id: u32, handle: &str, tab_id: usize) -> PaneListEntry {
         let mut entry = pane_entry(id, handle);
-        entry.tab_id = tab_id;
+        entry.pane_info.tab_id = tab_id;
         entry
     }
 

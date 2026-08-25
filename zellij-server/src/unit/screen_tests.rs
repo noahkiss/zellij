@@ -15088,6 +15088,46 @@ fn switching_tabs_is_not_a_change_to_the_tab_list() {
     );
 }
 
+#[test]
+fn a_pane_in_the_manifest_names_the_tab_it_is_in() {
+    // the manifest is keyed by tab POSITION and the pane carries the tab's stable ID. The two
+    // agree until a tab moves, which is the whole reason the id is on the pane: a consumer that
+    // reads the key as an identity is wrong from the first reorder onwards
+    let mut screen = create_fixed_size_screen();
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    let panes_at_position = |manifest: &zellij_utils::data::PaneManifest, position: usize| {
+        let mut panes: Vec<(u32, usize)> = manifest
+            .panes
+            .get(&position)
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin)
+                    .map(|pane| (pane.id, pane.tab_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        panes.sort();
+        panes
+    };
+
+    let before = screen.generate_and_report_pane_state().expect("TEST");
+    assert_eq!(panes_at_position(&before, 0), vec![(1, 0)]);
+    assert_eq!(panes_at_position(&before, 1), vec![(2, 1)]);
+
+    screen.move_active_tab_to_left(1).expect("TEST");
+
+    let after = screen.generate_and_report_pane_state().expect("TEST");
+    assert_eq!(
+        panes_at_position(&after, 0),
+        vec![(2, 1)],
+        "the manifest key follows the move; the tab id the pane carries does not"
+    );
+    assert_eq!(panes_at_position(&after, 1), vec![(1, 0)]);
+}
+
 /// The last `PaneUpdate` manifest delivered to `plugin_id`, flattened into one list of panes.
 fn last_pane_update_for_plugin(
     instructions: &[PluginInstruction],

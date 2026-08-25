@@ -7863,6 +7863,8 @@ impl PaneInfo {
         }
         let tab_position = int_node!("tab_position", usize);
         let id = int_node!("id", u32);
+        // optional: metadata written before the field existed carries no tab id
+        let tab_id = optional_int_node!("tab_id", usize).unwrap_or_default();
 
         let is_plugin = bool_node!("is_plugin");
         let is_focused = bool_node!("is_focused");
@@ -7932,6 +7934,7 @@ impl PaneInfo {
         let pane_info = PaneInfo {
             restored_from,
             handle,
+            tab_id,
             // a note describes live state, and a saved layout describes what a pane IS, so a
             // restored pane comes back without one
             note: String::new(),
@@ -8009,6 +8012,7 @@ impl PaneInfo {
         }
 
         int_node!("id", self.id);
+        int_node!("tab_id", self.tab_id);
         bool_node!("is_plugin", self.is_plugin);
         bool_node!("is_focused", self.is_focused);
         bool_node!("is_fullscreen", self.is_fullscreen);
@@ -8185,6 +8189,7 @@ fn serialize_and_deserialize_session_info_with_data() {
         PaneInfo {
             restored_from: String::new(),
             handle: String::new(),
+            tab_id: 3,
             note: String::new(),
             note_color: Default::default(),
             pane_cwd: None,
@@ -8235,6 +8240,7 @@ fn serialize_and_deserialize_session_info_with_data() {
         PaneInfo {
             restored_from: String::new(),
             handle: String::new(),
+            tab_id: 3,
             note: String::new(),
             note_color: Default::default(),
             pane_cwd: None,

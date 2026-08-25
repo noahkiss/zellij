@@ -6169,6 +6169,31 @@ event and does not need the session info regenerated with it. No plugin API fiel
 [Pane identity and stack membership in `PaneInfo`](#pane-identity-and-stack-membership-in-paneinfo)),
 so `event.proto` and the client/server contract are untouched.
 
+### Which tab a pane is in, on the pane
+
+`PaneManifest` is keyed by tab **position**, and a position moves whenever tabs are reordered. So a
+plugin holding a manifest could not say which tab a pane was in: the key it had was not an identity,
+and turning it into one meant holding the latest `TabUpdate` too and correlating two events that are
+not delivered together. Everything that reports "pane X in tab Y" rebuilt that join by hand.
+
+`PaneInfo` now carries `tab_id`, the same stable id `TabInfo.tab_id` reports. The join is one field
+lookup, it survives a reorder, and it needs no second event.
+
+```
+zellij action list-panes --all --json | jq '.[] | {id, tab_id, tab_position}'
+```
+
+**`PaneListEntry` no longer carries a `tab_id` of its own.** It flattens `PaneInfo` into the same
+JSON object, so keeping both would write the key twice — and on the way back in, the outer field
+would swallow it and leave `PaneInfo.tab_id` at zero. The CLI output is unchanged: the same
+`tab_id`, with the same value, now coming from the flattened `PaneInfo`. `tab_position` and
+`tab_name` stay where they are.
+
+The field crosses the plugin API: `event.proto` tag 47, regenerated prost output, both `TryFrom`
+implementations. It is also carried by the KDL codec behind `session-metadata.kdl`, written beside
+`id` and read back optionally so metadata from an older build still parses. The client/server
+contract has no `PaneInfo` and is untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

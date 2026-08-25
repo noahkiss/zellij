@@ -7533,6 +7533,9 @@ impl Tab {
         }
         let stack_list_membership = self.stack_list_membership();
         for info in pane_info.iter_mut() {
+            // the manifest is keyed by tab POSITION, which moves when tabs are reordered - the
+            // pane carries the tab's stable id so a consumer needs no second lookup
+            info.tab_id = self.id;
             Self::apply_stack_list_membership(&stack_list_membership, info);
             let pane_id = if info.is_plugin {
                 PaneId::Plugin(info.id)
