@@ -567,6 +567,9 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        // read before anything is removed: this is the last moment the id still resolves to what it
+        // was running, which is what decides whether its .wasm is still worth watching
+        let unloaded_run_plugin = self.run_plugin_of_plugin_id(pid);
         // the pane is going away, so nothing will ask about this id again
         self.failed_plugins.remove(&pid);
         self.plugin_pane_placements.remove(&pid);
@@ -663,6 +666,28 @@ impl WasmBridge {
                 .context("failed to unblock input pipe");
         }
         let plugin_list = self.plugin_map.lock().unwrap().list_plugins();
+
+        // the watch registered when this plugin loaded goes away with it, so watches stop
+        // accumulating for the life of the session. It is keyed by .wasm file rather than by plugin
+        // id, so only the last thing loaded from that file releases it - and three things count as
+        // still needing it: a running instance, one that is still loading (watched before its
+        // instance exists), and one that failed to load (watched so that fixing the file reloads
+        // the broken pane, which is the loop the watch is for).
+        if let Some(unloaded_run_plugin) = unloaded_run_plugin {
+            let still_wanted = plugin_list
+                .values()
+                .chain(
+                    self.loading_plugins
+                        .iter()
+                        .map(|(_plugin_id, run_plugin)| run_plugin),
+                )
+                .chain(self.failed_plugins.values())
+                .any(|run_plugin| run_plugin == &unloaded_run_plugin);
+            if !still_wanted {
+                self.unwatch_plugin_file(&unloaded_run_plugin);
+            }
+        }
+
         let _ = self
             .senders
             .send_to_background_jobs(BackgroundJob::ReportPluginList(plugin_list));
@@ -1524,6 +1549,11 @@ impl WasmBridge {
     fn watch_plugin_file(&mut self, run_plugin: &RunPlugin) {
         if let Some(plugin_file_watcher) = self.plugin_file_watcher.as_mut() {
             plugin_file_watcher.watch(run_plugin);
+        }
+    }
+    fn unwatch_plugin_file(&mut self, run_plugin: &RunPlugin) {
+        if let Some(plugin_file_watcher) = self.plugin_file_watcher.as_mut() {
+            plugin_file_watcher.unwatch(run_plugin);
         }
     }
     /// Reload every plugin whose .wasm just changed on disk. The reload path skips the in-memory
