@@ -5929,6 +5929,25 @@ not per-client, so "the focused tiled pane" is whoever focused it. The count and
 — `TabUpdate` is per client — and `p` becomes exact if per-client focus lands on `PaneInfo`. `y`
 and cancel are unaffected.
 
+**Only the instance whose client pressed the key may act.** Zellij loads a plugin once per
+connected client and runs `load` in every one of them, each seeing its own client's focus
+(`clone_instance_for_other_clients` in `zellij-server/src/plugins/plugin_loader.rs`; the plugin map
+is keyed by plugin id *and* client id). An instance that does not find its client focused on the
+prompt's own pane is inert for the rest of its life: it closes nothing and renders nothing.
+
+Without that guard one keypress closed one tab per attached client. The instances run in turn and
+`close_focused_tab` blocks until the server confirms, so the second instance woke to a session that
+had already lost the first tab, found its client focused on the *next* tab, decided that tab was
+worth nothing either, and closed it too. With two tabs open and two clients that emptied the
+session and took the server down with it. The cost of the guard is small and visible only to a
+second client: it sees an empty floating pane until the client that asked answers the prompt.
+
+**Known gap: the tab-mode hint line no longer lists the close key.** The status bar finds the key
+for a hint by matching the action list it is bound to — `[CloseTab, SwitchToMode "Normal"]`, in
+`default-plugins/status-bar/src/second_line.rs` and `one_line_ui.rs`. The binding is now a
+`LaunchOrFocusPlugin`, which nothing there matches, so `x  Close` has dropped out of the tab-mode
+line entirely. Teaching the status bar to recognise the launch is a separate patch.
+
 **Rollout order is the reverse of the usual one.** The binding lives in the binary's own
 `default.kdl`, so nothing has to be rolled out at all: an older binary keeps `CloseTab` and a newer
 one gets the prompt. A user `config.kdl` that already overrides tab-mode `x` keeps its own binding

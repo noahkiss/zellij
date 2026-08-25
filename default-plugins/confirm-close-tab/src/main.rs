@@ -162,6 +162,15 @@ impl ZellijPlugin for State {
         // so it is already one of the tab's selectable panes. That makes the count exact here, and
         // a tab worth nothing can be closed before a frame is ever drawn.
         let counts_own_pane = focused_pane_id == PaneId::Plugin(self.own_plugin_id);
+        if !counts_own_pane {
+            // Zellij loads a plugin once per connected client and runs `load` in every instance,
+            // each one seeing its own client's focus. Only the client that pressed the key is
+            // focused on this pane, so only that instance may act. Every other instance stays
+            // inert for the whole of its life: it neither closes a tab of its own nor closes this
+            // pane out from under the client that asked for it.
+            self.done = true;
+            return;
+        }
         let Some(tab_info) = get_tab_info(tab_id) else {
             return; // decide on the first TabUpdate instead
         };
