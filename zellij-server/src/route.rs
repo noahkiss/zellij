@@ -3581,6 +3581,7 @@ pub(crate) fn route_thread_main(
                             ref pane_ids,
                             ref scrollback,
                             ansi,
+                            all_panes,
                         } => {
                             let _ = send_to_screen_or_retry_queue!(
                                 senders,
@@ -3589,6 +3590,7 @@ pub(crate) fn route_thread_main(
                                     pane_ids: pane_ids.clone(),
                                     scrollback: *scrollback,
                                     ansi,
+                                    all_panes,
                                 },
                                 instruction,
                                 retry_queue

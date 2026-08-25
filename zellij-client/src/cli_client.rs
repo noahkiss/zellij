@@ -1008,6 +1008,7 @@ fn wait_on_renders(
         pane_ids: vec![pane],
         scrollback: None,
         ansi: false,
+        all_panes: false,
     });
     let (sender, updates) = mpsc::channel();
     let reader = os_input.box_clone();
@@ -1133,9 +1134,11 @@ pub fn start_subscribe_client(
         pane_ids: pane_ids.clone(),
         scrollback: subscribe_cli.scrollback,
         ansi: subscribe_cli.ansi,
+        all_panes: subscribe_cli.all,
     });
 
-    // Track remaining panes for exit-on-all-closed
+    // Track remaining panes for exit-on-all-closed. A wildcard subscription named no pane, so no
+    // pane closing ends it: it runs until the session does.
     let mut remaining_panes: HashSet<PaneId> = pane_ids.into_iter().collect();
 
     // Streaming receive loop
@@ -1194,7 +1197,7 @@ pub fn start_subscribe_client(
                         let _ = stdout.flush();
                     },
                 }
-                if remaining_panes.is_empty() {
+                if remaining_panes.is_empty() && !subscribe_cli.all {
                     break;
                 }
             },
