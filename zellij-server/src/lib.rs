@@ -836,6 +836,59 @@ impl SessionState {
 }
 
 #[cfg(test)]
+mod open_files_and_accept_tests {
+    use super::*;
+
+    #[test]
+    fn the_macos_default_is_raised_to_the_ceiling() {
+        // 256 soft, unlimited hard: what a macOS server inherits from a shell.
+        assert_eq!(
+            desired_open_file_limit(256, u64::MAX),
+            Some(DESIRED_OPEN_FILES)
+        );
+    }
+
+    #[test]
+    fn the_hard_limit_is_never_exceeded() {
+        // Raising the hard limit needs privileges the server does not have, so a process capped
+        // below what it wants takes the cap.
+        assert_eq!(desired_open_file_limit(64, 1024), Some(1024));
+    }
+
+    #[test]
+    fn a_process_that_already_has_enough_is_left_alone() {
+        assert_eq!(desired_open_file_limit(DESIRED_OPEN_FILES, u64::MAX), None);
+        assert_eq!(desired_open_file_limit(1_048_576, u64::MAX), None);
+        // Never lower a soft limit that is already above what the hard limit would allow us to
+        // ask for.
+        assert_eq!(desired_open_file_limit(4096, 4096), None);
+    }
+
+    #[test]
+    fn the_accept_backoff_doubles_up_to_a_ceiling() {
+        assert_eq!(accept_backoff(1).as_millis(), 50);
+        assert_eq!(accept_backoff(2).as_millis(), 100);
+        assert_eq!(accept_backoff(3).as_millis(), 200);
+        assert_eq!(accept_backoff(5).as_millis(), 800);
+        assert_eq!(accept_backoff(6).as_millis(), 1000);
+        // A long run must stay at the ceiling rather than overflow the shift.
+        assert_eq!(accept_backoff(64).as_millis(), 1000);
+        assert_eq!(accept_backoff(u32::MAX).as_millis(), 1000);
+    }
+
+    #[test]
+    fn a_run_of_failures_is_logged_at_the_start_and_then_thinned_out() {
+        for n in 1..=5 {
+            assert!(should_log_accept_failure(n), "{} should be logged", n);
+        }
+        assert!(!should_log_accept_failure(6));
+        assert!(!should_log_accept_failure(59));
+        assert!(should_log_accept_failure(60));
+        assert!(should_log_accept_failure(120));
+    }
+}
+
+#[cfg(test)]
 mod session_state_tests {
     use super::*;
 
@@ -1026,6 +1079,93 @@ fn promote_orphaned_session_info_folders(own_session_name: &str, settings: &Snap
     }
 }
 
+/// How many open files the server asks for. A session's descriptors grow with what is in it -- a
+/// pty per pane, a plugin instance per tab for each of the bars, the mounts and caches each of
+/// those holds -- so the ceiling has to clear a session that has been added to for weeks, not one
+/// that was just created. It is deliberately not "as many as the kernel will give": macOS reports
+/// an unlimited hard limit and 10240 is the value `setrlimit` there actually honours.
+const DESIRED_OPEN_FILES: u64 = 10_240;
+
+/// The soft limit to ask for, given the limits the process was started with, or `None` when the
+/// process already has enough. The soft limit is never lowered, and the hard limit is never
+/// exceeded -- raising that needs privileges the server does not have and should not want.
+fn desired_open_file_limit(soft: u64, hard: u64) -> Option<u64> {
+    let target = hard.min(DESIRED_OPEN_FILES);
+    if target > soft {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// Raise this process's soft open-file limit towards its hard limit.
+///
+/// The server inherits whatever the shell that launched it had, and macOS still hands out 256. A
+/// session that lives for weeks walks into that ceiling and everything downstream of a descriptor
+/// -- spawning a plugin, serializing the session, accepting a client -- starts failing at once.
+///
+/// A failure here is logged and otherwise ignored: the server runs with what it has, exactly as it
+/// did before.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        log::warn!(
+            "could not read the open-file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let Some(target) = desired_open_file_limit(limit.rlim_cur as u64, limit.rlim_max as u64) else {
+        log::info!("open-file limit is {}, leaving it alone", limit.rlim_cur);
+        return;
+    };
+    let raised = libc::rlimit {
+        rlim_cur: target as libc::rlim_t,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        log::warn!(
+            "could not raise the open-file limit from {} to {}: {}",
+            limit.rlim_cur,
+            target,
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    log::info!(
+        "raised the open-file limit from {} to {}",
+        limit.rlim_cur,
+        target
+    );
+}
+
+/// How long to wait after `accept()` has failed `consecutive_failures` times in a row.
+///
+/// EMFILE is the failure this exists for and it is transient: a descriptor comes back, or the
+/// operator raises the limit, and the next accept succeeds. So the wait starts short enough to be
+/// invisible to a client that is merely unlucky, and doubles up to a ceiling so that a failure
+/// which is not transient costs one log line a second instead of a spinning thread.
+fn accept_backoff(consecutive_failures: u32) -> std::time::Duration {
+    const FIRST_BACKOFF_MS: u64 = 50;
+    const MAX_BACKOFF_MS: u64 = 1_000;
+    // The exponent is clamped before the shift, not after: `50 << 63` wraps to zero and would
+    // turn a long run of failures into a spin.
+    let exponent = consecutive_failures.saturating_sub(1).min(16);
+    std::time::Duration::from_millis((FIRST_BACKOFF_MS << exponent).min(MAX_BACKOFF_MS))
+}
+
+/// Whether a failure this far into a run of them is worth a log line. Every one of the first few
+/// is, because that is the run an operator is going to read; after that the run is a condition
+/// rather than an event, and at the backoff ceiling one line a minute is enough to show it is
+/// still going.
+fn should_log_accept_failure(consecutive_failures: u32) -> bool {
+    consecutive_failures <= 5 || consecutive_failures % 60 == 0
+}
+
 pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     // The listener below unlinks whatever sits at this path before it binds, which is right for a
     // socket a dead server left behind and catastrophic for one a live server is still holding:
@@ -1045,6 +1185,12 @@ pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
     }
 
     info!("Starting Zellij server!");
+
+    // Before anything opens a descriptor, and while this is still the only thread. Only the real
+    // server process does this -- the in-process server the integration tests run must not touch
+    // the harness's limits.
+    #[cfg(unix)]
+    raise_open_file_limit();
 
     #[cfg(unix)]
     {
@@ -1166,9 +1312,11 @@ pub fn start_server_impl(
                 #[cfg(windows)]
                 let reply_listener = zellij_utils::consts::ipc_bind_reply(&socket_path).unwrap();
 
+                let mut consecutive_accept_failures: u32 = 0;
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
+                            consecutive_accept_failures = 0;
                             let mut os_input = os_input.clone();
                             let client_id = session_state.write().unwrap().new_client();
 
@@ -1203,7 +1351,23 @@ pub fn start_server_impl(
                                 .unwrap();
                         },
                         Err(err) => {
-                            panic!("err {:?}", err);
+                            // A connection that could not be accepted is one client that has to
+                            // try again. It used to be every pane in the session: this panicked,
+                            // and the panic hook takes the server down with it. EMFILE is the
+                            // failure that made that a real loss -- a session with enough tabs
+                            // runs out of descriptors, and the attach that finds the ceiling is
+                            // not the thing that deserves to be blamed for it.
+                            consecutive_accept_failures = consecutive_accept_failures.saturating_add(1);
+                            let backoff = accept_backoff(consecutive_accept_failures);
+                            if should_log_accept_failure(consecutive_accept_failures) {
+                                log::error!(
+                                    "failed to accept a client connection ({} in a row), retrying in {:?}: {:?}",
+                                    consecutive_accept_failures,
+                                    backoff,
+                                    err
+                                );
+                            }
+                            thread::sleep(backoff);
                         },
                     }
                 }
