@@ -29,6 +29,10 @@ use zellij_utils::{
 /// happens before this, where there is a caller to tell.
 ///
 /// `pipe_timeout` is what `pipe --timeout` asked for, and `None` is the pipe that waits forever.
+///
+/// `output_json` is `action --json`: the report is printed as one object instead of `key: value`
+/// lines. It reaches only the printing - what the session is asked, and what it answers, are the
+/// same either way.
 pub fn start_cli_client(
     mut os_input: Box<dyn ClientOsApi>,
     session_name: &str,
@@ -36,6 +40,7 @@ pub fn start_cli_client(
     anchor_pane: Option<u32>,
     mut chosen_handle: Option<String>,
     pipe_timeout: Option<Duration>,
+    output_json: bool,
 ) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
@@ -131,7 +136,7 @@ pub fn start_cli_client(
                         }
                     },
                 };
-                lines.iter().for_each(|line| println!("{line}"));
+                print_report(&lines, output_json);
             },
         }
     }
@@ -340,6 +345,74 @@ fn pipe_timed_out(pipe_id: &str, timeout: Duration) -> String {
         pipe_id,
         timeout.as_secs()
     )
+}
+
+/// A record report as one JSON object, or `None` for lines that are not a record.
+///
+/// A reporting verb prints `key: value` lines, so the object is that report with its keys kept and
+/// its values typed the way the JSON surfaces already type them: `-` is the fork's "no value" and
+/// becomes `null`, a whole number becomes a number, `true`/`false` become booleans, and everything
+/// else stays a string. A pane id is a string in `list-panes --json` and stays one here.
+///
+/// `None` is the guard rather than a case that arises: a verb whose output is not a record is
+/// refused before the call is made. If one ever reaches this, the lines are printed as they are
+/// rather than folded into an object that has lost half of them.
+///
+/// The object is written out rather than collected into a `serde_json::Map`, because that map is a
+/// `BTreeMap` here and would alphabetise the keys. The surface promises them in the order the
+/// command prints them, and a reader of `--json` should meet the same order.
+fn json_report(lines: &[String]) -> Option<String> {
+    let mut pairs = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (key, value) = line.split_once(": ")?;
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            return None;
+        }
+        pairs.push(format!(
+            "  {}: {}",
+            serde_json::Value::String(key.to_owned()),
+            json_value(value)
+        ));
+    }
+    Some(if pairs.is_empty() {
+        "{}".to_owned()
+    } else {
+        format!("{{\n{}\n}}", pairs.join(",\n"))
+    })
+}
+
+/// One reported value, typed.
+fn json_value(value: &str) -> serde_json::Value {
+    match value {
+        // the fork prints `-` where a field has no value, rather than an empty column
+        "-" => serde_json::Value::Null,
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        _ => match value.parse::<i64>() {
+            Ok(number) => serde_json::Value::from(number),
+            Err(_) => serde_json::Value::String(value.to_owned()),
+        },
+    }
+}
+
+/// The report the caller asked for, in the shape they asked for it.
+///
+/// A verb that reported nothing still answers `{}` under `--json`: a parser asked for an object
+/// and "there was nothing to say" is one. Without the flag it prints nothing, exactly as before.
+fn print_report(lines: &[String], output_json: bool) {
+    if !output_json {
+        lines.iter().for_each(|line| println!("{line}"));
+        return;
+    }
+    match json_report(lines) {
+        Some(json) => println!("{}", json),
+        None => {
+            eprintln!(
+                "This report is not a record, so it is printed as it stands rather than as JSON."
+            );
+            lines.iter().for_each(|line| println!("{line}"));
+        },
+    }
 }
 
 /// Asks the running session one question, on a connection opened for it and closed after it.
@@ -737,6 +810,7 @@ pub fn start_wait_client(
     pane: PaneId,
     condition: WaitCondition,
     timeout: Option<Duration>,
+    output_json: bool,
 ) -> i32 {
     let started = Instant::now();
     let deadline = timeout.map(|timeout| started + timeout);
@@ -762,9 +836,7 @@ pub fn start_wait_client(
     };
     match outcome {
         Ok(found) => {
-            for line in wait_report(started.elapsed(), found) {
-                println!("{}", line);
-            }
+            print_report(&wait_report(started.elapsed(), found), output_json);
             0
         },
         Err(WaitMiss::Missed(message)) => {
@@ -1187,6 +1259,50 @@ mod tests {
             said.contains("unblocked by a plugin"),
             "the sentence says why a pipe goes unanswered: {said}"
         );
+    }
+
+    #[test]
+    fn a_record_report_becomes_one_object_with_its_values_typed() {
+        let report = vec![
+            "tab_id: 4".to_owned(),
+            "pane_id: terminal_9".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(
+            json_report(&report).unwrap(),
+            "{\n  \"tab_id\": 4,\n  \"pane_id\": \"terminal_9\",\n  \"handle\": \"sunny-otter\"\n}",
+            "the keys are the report's own, and a tab id is a number the way list-tabs --json \
+             reports one"
+        );
+        // a verb that reported nothing still answers an object: a parser asked for one
+        assert_eq!(json_report(&[]).unwrap(), "{}");
+    }
+
+    #[test]
+    fn the_values_a_report_can_carry_are_typed_the_way_the_other_json_surfaces_type_them() {
+        assert_eq!(
+            json_value("-"),
+            serde_json::Value::Null,
+            "the no-value mark"
+        );
+        assert_eq!(json_value("true"), serde_json::Value::Bool(true));
+        assert_eq!(json_value("false"), serde_json::Value::Bool(false));
+        assert_eq!(json_value("0"), serde_json::Value::from(0));
+        assert_eq!(json_value("-3"), serde_json::Value::from(-3));
+        // a pane id is a string in list-panes --json and stays one here, and so does a handle that
+        // happens to look like nothing else
+        assert_eq!(
+            json_value("terminal_9"),
+            serde_json::Value::String("terminal_9".to_owned())
+        );
+    }
+
+    #[test]
+    fn lines_that_are_not_a_record_are_not_folded_into_an_object() {
+        // the guard, not a case that arises: a payload verb is refused before the call is made.
+        // Folding these would silently lose the lines that carry no key
+        assert_eq!(json_report(&["some screen content".to_owned()]), None);
+        assert_eq!(json_report(&["Tab #1: hello".to_owned()]), None);
     }
 
     #[test]
