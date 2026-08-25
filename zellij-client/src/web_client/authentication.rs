@@ -1,10 +1,10 @@
 use crate::web_client::utils::parse_cookies;
 use axum::body::Body;
-use axum::http::header::SET_COOKIE;
+use axum::http::header::{AUTHORIZATION, SET_COOKIE};
 use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use zellij_utils::web_authentication_tokens::{
-    hash_token, is_session_token_read_only, validate_session_token,
+    hash_token, is_session_token_read_only, refresh_session_token, validate_session_token,
 };
 
 #[derive(Clone)]
@@ -13,16 +13,40 @@ pub struct SessionTokenHash(pub String);
 #[derive(Clone, Copy)]
 pub struct IsReadOnly(pub bool);
 
-pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
-    let cookies = parse_cookies(&request);
+/// The session token a request presented, from whichever of the two places carries it.
+///
+/// The cookie is the browser's channel and is tried first, so nothing about a browser session
+/// changes. `Authorization: Bearer <session token>` is the same credential in a header, for a
+/// caller that has no cookie jar - a script, or anything driving the server over HTTP. It is the
+/// SAME token: the header is not a second way to authenticate, only a second way to present what
+/// `/command/login` already issued, and it is validated by the same call.
+fn presented_session_token(request: &Request) -> Option<String> {
+    if let Some(token) = parse_cookies(request).get("session_token") {
+        return Some(token.clone());
+    }
+    let header = request.headers().get(AUTHORIZATION)?.to_str().ok()?;
+    // the scheme is matched case-insensitively, as RFC 7235 requires
+    let (scheme, token) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
 
-    let session_token = match cookies.get("session_token") {
-        Some(token) => token.clone(),
+pub async fn auth_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let session_token = match presented_session_token(&request) {
+        Some(token) => token,
         None => return Err(StatusCode::UNAUTHORIZED),
     };
 
     match validate_session_token(&session_token) {
         Ok(true) => {
+            // a short-lived token lives five minutes from when it was last used rather than from
+            // when it was issued, so a session someone is actually using is not logged out
+            // mid-use. An expired token matches nothing here and stays expired
+            let _ = refresh_session_token(&session_token);
+
             // Check if this is a read-only token
             let is_read_only = is_session_token_read_only(&session_token).unwrap_or(true);
 

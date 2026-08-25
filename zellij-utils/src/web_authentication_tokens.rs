@@ -199,14 +199,16 @@ pub fn create_session_token(auth_token: &str, remember_me: bool) -> Result<Strin
         let four_weeks = 4 * 7 * 24 * 60 * 60;
         format!("datetime({}, 'unixepoch')", now + four_weeks)
     } else {
-        // For session-only: very short expiration (e.g., 5 minutes)
+        // For session-only: very short expiration
         // The browser will handle the session aspect via cookie expiration
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let short_duration = 5 * 60; // 5 minutes
-        format!("datetime({}, 'unixepoch')", now + short_duration)
+        format!(
+            "datetime({}, 'unixepoch')",
+            now + SESSION_TOKEN_TTL_SECS as u64
+        )
     };
 
     conn.execute(
@@ -215,6 +217,48 @@ pub fn create_session_token(auth_token: &str, remember_me: bool) -> Result<Strin
     )?;
 
     Ok(session_token)
+}
+
+/// How long a session token that was not `remember_me` lives, from the moment it is last used.
+///
+/// It is short on purpose: the browser is meant to drop the cookie when it closes, and this is the
+/// server's half of that. It is also why [`refresh_session_token`] exists - without a refresh the
+/// window is five minutes from the LOGIN, and an active session is logged out mid-use.
+pub const SESSION_TOKEN_TTL_SECS: i64 = 5 * 60;
+
+/// Pushes a live short-lived session token's expiry back out to the full window.
+///
+/// Called on every request that presented a valid token, so an active session stays alive and an
+/// abandoned one still expires on time. Three things it deliberately does not do:
+///
+/// - **It cannot resurrect an expired token.** `expires_at > datetime('now')` is part of the
+///   update, so a token that has already lapsed matches nothing and stays lapsed.
+/// - **It leaves `remember_me` tokens alone.** Those already live four weeks; sliding them would
+///   make them live forever.
+/// - **It writes only in the last half of the window.** A session that is being used constantly
+///   would otherwise write a row per request, and the guard costs nothing to express.
+///
+/// Returns whether a row was actually extended, which is what the tests read.
+pub fn refresh_session_token(session_token: &str) -> Result<bool> {
+    let conn = open_db()?;
+
+    let session_token_hash = hash_token(session_token);
+
+    let rows_affected = conn.execute(
+        &format!(
+            "UPDATE session_tokens \
+             SET expires_at = datetime('now', '+{} seconds') \
+             WHERE session_token_hash = ?1 \
+               AND remember_me = 0 \
+               AND expires_at > datetime('now') \
+               AND expires_at < datetime('now', '+{} seconds')",
+            SESSION_TOKEN_TTL_SECS,
+            SESSION_TOKEN_TTL_SECS / 2
+        ),
+        [&session_token_hash],
+    )?;
+
+    Ok(rows_affected > 0)
 }
 
 pub fn validate_session_token(session_token: &str) -> Result<bool> {
@@ -390,4 +434,81 @@ pub fn validate_token(token: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Moves a session token's expiry to a fixed number of seconds from now.
+    ///
+    /// A sliding window is only interesting once time has passed, and a test cannot wait five
+    /// minutes for it. Reaching into the row is the cheap way to stand where the clock would have
+    /// put us.
+    fn expire_in(session_token: &str, seconds: i64) {
+        let conn = open_db().expect("the token db opens");
+        conn.execute(
+            &format!(
+                "UPDATE session_tokens SET expires_at = datetime('now', '{:+} seconds') \
+                 WHERE session_token_hash = ?1",
+                seconds
+            ),
+            [&hash_token(session_token)],
+        )
+        .expect("the row is there to move");
+    }
+
+    /// The whole of the refresh, in one test: these all share the one token database, so they
+    /// cannot be separate tests without a lock between them.
+    #[test]
+    fn a_short_lived_session_token_slides_while_it_is_being_used() {
+        let _ = delete_db();
+        let (auth_token, _name) = create_token(Some("refresh-test".to_owned()), false)
+            .expect("an auth token can be made");
+
+        // a token nothing issued is not extended, and does not error
+        assert!(!refresh_session_token("no-such-token").expect("the db answers"));
+
+        let session_token =
+            create_session_token(&auth_token, false).expect("a session token can be made");
+        // fresh: the whole window is ahead of it, so there is nothing to write yet
+        assert!(
+            !refresh_session_token(&session_token).expect("the db answers"),
+            "a token in the first half of its window is not rewritten on every request"
+        );
+
+        // now stand in the last half of the window, where the refresh is the point
+        expire_in(&session_token, SESSION_TOKEN_TTL_SECS / 4);
+        assert!(
+            refresh_session_token(&session_token).expect("the db answers"),
+            "a token that is about to lapse under an active session is extended"
+        );
+        assert!(
+            validate_session_token(&session_token).expect("the db answers"),
+            "and it is still valid afterwards"
+        );
+        // extended by the full window, so it is back in the half that does not rewrite
+        assert!(!refresh_session_token(&session_token).expect("the db answers"));
+
+        // an expired token stays expired: a refresh must not be a way back in
+        expire_in(&session_token, -1);
+        assert!(!validate_session_token(&session_token).expect("the db answers"));
+        assert!(
+            !refresh_session_token(&session_token).expect("the db answers"),
+            "a lapsed token is not resurrected by presenting it"
+        );
+        assert!(!validate_session_token(&session_token).expect("the db answers"));
+
+        // a remember_me token already lives four weeks, and sliding it would make it live forever
+        let remembered =
+            create_session_token(&auth_token, true).expect("a session token can be made");
+        expire_in(&remembered, SESSION_TOKEN_TTL_SECS / 4);
+        assert!(
+            !refresh_session_token(&remembered).expect("the db answers"),
+            "a remembered token keeps the expiry it was given"
+        );
+
+        let _ = revoke_token("refresh-test");
+        let _ = delete_db();
+    }
 }
