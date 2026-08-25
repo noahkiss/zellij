@@ -5979,17 +5979,37 @@ worth nothing either, and closed it too. With two tabs open and two clients that
 session and took the server down with it. The cost of the guard is small and visible only to a
 second client: it sees an empty floating pane until the client that asked answers the prompt.
 
-**Known gap: the tab-mode hint line no longer lists the close key.** The status bar finds the key
-for a hint by matching the action list it is bound to — `[CloseTab, SwitchToMode "Normal"]`, in
-`default-plugins/status-bar/src/second_line.rs` and `one_line_ui.rs`. The binding is now a
-`LaunchOrFocusPlugin`, which nothing there matches, so `x  Close` has dropped out of the tab-mode
-line entirely. Teaching the status bar to recognise the launch is a separate patch.
-
 **Rollout order is the reverse of the usual one.** The binding lives in the binary's own
 `default.kdl`, so nothing has to be rolled out at all: an older binary keeps `CloseTab` and a newer
 one gets the prompt. A user `config.kdl` that already overrides tab-mode `x` keeps its own binding
 and sees no change until it is rewritten — and it must not be rewritten ahead of the binary,
 because `zellij:confirm-close-tab` is a plugin location an older build does not have.
+
+### The tab-mode close hint follows the key that launches the prompt
+
+`x  Close` is back on the tab-mode hint line. It dropped out when `x` was rebound to
+[the confirmation prompt](#closing-a-tab-with-more-than-one-pane-asks-first): the status bar
+resolves a hint by matching the ACTION LIST a key is bound to — `[CloseTab, SwitchToMode "Normal"]`
+— and the binding is now a `LaunchOrFocusPlugin`, which matches no pattern there at all. A bar that
+stops naming a key the mode still has is worse than one that names nothing, because the key works.
+
+One lookup answers it, in `default-plugins/status-bar/src/main.rs` and called from both hint tables
+(`second_line.rs` and `one_line_ui.rs`): the first key in the mode bound to exactly two actions,
+where the first launches `zellij:confirm-close-tab` and the second leaves the mode. It runs only as
+a **fallback**, when the direct `CloseTab` lookup found nothing — a config that still binds
+`CloseTab` is answered exactly as before, and no hint ever lists two keys for one verb.
+
+**The matcher names the plugin, and that is the point.** `action_key` compares actions with
+`shallow_eq`, which looks at the variant and not at its fields, so a pattern of "some
+`LaunchOrFocusPlugin`, then leave the mode" would claim whichever plugin launch happened to be
+bound first in tab mode. This is a repair for the one keybind this fork moved, not the start of a
+general way to hint plugins — that needs the hint to come from the plugin, and is a different
+patch.
+
+**The other two bars still have the gap.** `slim-keybinds` (`derive.rs`) and upstream's
+`compact-bar` (`keybind_utils.rs`) derive their tab-mode hints from a list of predicates over
+single actions, `matches!(a, Action::CloseTab)` among them. That is a different shape from the
+status bar's action-list match, so neither is touched here.
 
 ### Synchronised output is assumed, not withheld until a terminal proves it
 
