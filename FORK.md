@@ -6067,6 +6067,27 @@ would leak a watch for a plugin whose `.wasm` was deleted while it was loaded, b
 `canonicalize` fails on the way back out. The directory the watch actually sits on is released
 separately, once no watched file is left in it.
 
+### A stack list obeys `top_only` as well
+
+The third render path to be told the frame style, after the tiled one and the floating one. A stack
+list's rows are drawn by `Tab::render_stack_list_headers`, which builds a `PaneContentsAndUi` of its
+own and never called `set_top_only_frames` — so under
+[`pane_frame_style "top_only"`](#pane_frame_style-top_only) every pane in the tab wore a rule and
+the stack list sat among them on blank lines. It was the one place the setting visibly did not
+hold.
+
+**One of the four differences carries over, and it is the visible one.** A stack list row *is* the
+title line of the pane it names, so `top_only`'s rule fills the room around the entry instead of
+leaving it blank — difference 1, the same one condition. Difference 2 costs nothing here (these
+rows draw no boundaries to suppress) and difference 3 does not arise.
+
+**The title's left alignment (difference 4) deliberately does not.** The entry stays centred. Its
+start is also the budget the multi-client focus indicator is drawn into, so moving the entry to the
+left edge would drop that indicator; and the entry is a bracketed list item rather than a bare
+title, which is the thing difference 4 is about. What is inside the brackets stays blank for the
+same reason it does on a title line: a placed element is not a gap. The `>` on the selected row
+outranks the fill and is still drawn.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
