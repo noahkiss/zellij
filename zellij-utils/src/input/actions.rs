@@ -2093,6 +2093,9 @@ impl Action {
                 in_place_plugin,
                 plugin_cwd,
                 plugin_title,
+                // the client holds the pipe's deadline; it never becomes part of the action, so
+                // `--timeout` costs the client/server contract nothing
+                timeout: _,
             } => {
                 let current_dir = get_current_dir();
                 let cwd = plugin_cwd

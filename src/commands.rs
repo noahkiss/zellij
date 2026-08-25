@@ -1102,6 +1102,9 @@ fn attach_with_cli_client(
     // anything is created rather than a pane that came out under a name nobody asked for
     let mut cli_action = cli_action;
     let chosen_handle = cli_action.take_chosen_handle();
+    // `pipe --timeout` is the client's to hold: the session has nothing to time out, and keeping it
+    // here is what keeps the flag off `Action::CliPipe` and off the client/server contract
+    let pipe_timeout = cli_action.take_pipe_timeout();
     if let Some(handle) = &chosen_handle {
         if let Ok(taken_by) = resolve_pane_target(handle) {
             eprintln!(
@@ -1199,6 +1202,7 @@ fn attach_with_cli_client(
                 actions,
                 anchor_pane,
                 chosen_handle,
+                pipe_timeout,
             );
             if should_archive {
                 match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)

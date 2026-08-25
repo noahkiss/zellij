@@ -12,6 +12,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use url::Url;
 
 const fn ansi(color: AnsiColor) -> Style {
@@ -831,6 +832,12 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// considered a different plugin for the purposes of determining the pipe destination)
         #[clap(short('c'), long, value_parser, display_order(4))]
         plugin_configuration: Option<PluginUserConfiguration>,
+        /// Seconds the session may say NOTHING before this gives up and exits 2. The window is
+        /// idle time, not a budget for the call: every answer restarts it, and time spent
+        /// waiting on STDIN is outside it, so a `tail -f | zellij pipe` is unaffected. `0` waits
+        /// forever, which only a plugin that received the message can end
+        #[clap(long, value_parser, default_value = "30", display_order(5))]
+        timeout: u64,
     },
 }
 
@@ -2246,6 +2253,12 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// If launching a plugin, specify its pane title
         #[clap(short('t'), long, value_parser, display_order(10))]
         plugin_title: Option<String>,
+        /// Seconds the session may say NOTHING before this gives up and exits 2. The window is
+        /// idle time, not a budget for the call: every answer restarts it, and time spent
+        /// waiting on STDIN is outside it, so a `tail -f | zellij pipe` is unaffected. `0` waits
+        /// forever, which only a plugin that received the message can end
+        #[clap(long, value_parser, default_value = "30", display_order(11))]
+        timeout: u64,
     },
     /// List the clients attached to this session
     ///
@@ -2631,6 +2644,25 @@ impl CliAction {
     pub fn take_chosen_handle(&mut self) -> Option<String> {
         match self {
             CliAction::NewPane { handle, .. } | CliAction::Edit { handle, .. } => handle.take(),
+            _ => None,
+        }
+    }
+
+    /// The deadline `pipe --timeout` set, taken out of the request for the client to hold.
+    ///
+    /// A pipe is unblocked by the plugin that received it, so the wait belongs to the client that
+    /// is holding the connection and not to the session, which has nothing to time out. Taking it
+    /// here keeps the flag off `Action::CliPipe` and therefore off the client/server contract.
+    ///
+    /// `None` is a pipe that waits forever, which is what `--timeout 0` means. It is not the
+    /// default: a pipe nothing answers has no other end, and a hook that shells out to one would
+    /// hang with it.
+    pub fn take_pipe_timeout(&mut self) -> Option<Duration> {
+        match self {
+            CliAction::Pipe { timeout, .. } => {
+                let seconds = std::mem::take(timeout);
+                (seconds > 0).then(|| Duration::from_secs(seconds))
+            },
             _ => None,
         }
     }
@@ -3962,6 +3994,31 @@ mod tests {
         assert_eq!(action.take_chosen_handle().as_deref(), Some("build"));
         // taken once: the client applies it, and it must not also travel with the action
         assert_eq!(action.take_chosen_handle(), None);
+    }
+
+    #[test]
+    fn a_pipe_deadline_is_taken_out_of_the_request() {
+        let mut action = parse_action(&["pipe", "--timeout", "5", "--name", "logs"]);
+        assert_eq!(
+            action.take_pipe_timeout(),
+            Some(Duration::from_secs(5)),
+            "the client holds the idle window; the action never carries it"
+        );
+        // taken once: the client waits on it, and it must not also travel with the action
+        assert_eq!(action.take_pipe_timeout(), None);
+    }
+
+    #[test]
+    fn a_pipe_gives_up_by_default_and_hangs_only_when_told_to() {
+        // a pipe nothing answers has no other end, so the window is on by default and a caller
+        // who wants the old unbounded wait asks for it by name
+        let mut default = parse_action(&["pipe", "--name", "logs"]);
+        assert_eq!(default.take_pipe_timeout(), Some(Duration::from_secs(30)));
+        let mut asked_for = parse_action(&["pipe", "--timeout", "0", "--name", "logs"]);
+        assert_eq!(asked_for.take_pipe_timeout(), None);
+        // the negative control: no other verb has a pipe deadline to give up
+        let mut other = parse_action(&["new-pane"]);
+        assert_eq!(other.take_pipe_timeout(), None);
     }
 
     #[test]
