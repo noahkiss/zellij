@@ -6394,6 +6394,38 @@ leaves `remember_me` tokens alone, since sliding a four-week token would make it
 it writes only once the token is in the last half of its window, so a busy session does not write a
 row per request.
 
+### A `subscribe` feed does not narrow when somebody attaches
+
+```
+zellij subscribe --pane-id sunny-otter --pane-id brave-heron --format json
+```
+
+Two panes in two different tabs. With nobody attached, both feeds ran. The moment a human attached,
+the pane in the tab they were not looking at went silent — and it came back when they switched tabs.
+A consumer therefore got *more* data while nobody was watching, and the feed rearranged itself
+around a human's tab.
+
+The cause is that the two delivery paths read from different places. With a client attached,
+subscribers were served out of the render report, which carries only what was rendered:
+`Tab::render` returns early for a tab whose `connected_clients` set is empty, so panes in every
+other tab are simply not in it. With no client attached nothing renders, and the fallback path
+queried every subscribed pane from its tab directly — which is why the detached feed was the
+complete one.
+
+There is now one path. It takes the render report when there is one, and queries whatever the
+report is missing from the pane's own tab. Attached and detached feeds are the same feed, a tab
+switch changes nothing, and a subscription made before a client attached keeps every pane it named.
+
+- **Floating panes are covered by the same fix.** They are rendered only while they are visible, so
+  a subscribed floating pane went silent when its tab hid it. It no longer does.
+- **A subscribed plugin pane is read through a client.** A plugin pane keeps a grid per client, and
+  the direct query passed `None`, which matches no grid and returns nothing — so the fallback path
+  served empty contents for one. It now reads through a regular client, the way the initial
+  delivery at subscribe time always did. With nobody attached there is no client to read through
+  and a plugin pane still reports empty; a terminal pane is unaffected either way.
+- The cost is unchanged. All of it is behind the `is_empty()` gate on the subscriber map, so a
+  session with no subscribers does the same work it did before.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
