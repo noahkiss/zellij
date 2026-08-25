@@ -726,6 +726,9 @@ pub struct Grid {
     pub pending_messages_to_pty: Vec<Vec<u8>>,
     pub selection: Selection,
     pub title: Option<String>,
+    /// Set when the program running here changed the title it sets for itself, cleared by whoever
+    /// reports the change onwards. See `take_title_changed`.
+    title_changed: bool,
     pub is_scrolled: bool,
     pub link_handler: Rc<RefCell<LinkHandler>>,
     pub ring_bell: bool,
@@ -1109,6 +1112,7 @@ impl Grid {
             selection: Default::default(),
             title_stack: vec![],
             title: None,
+            title_changed: false,
             changed_colors: None,
             is_scrolled: false,
             link_handler,
@@ -3578,7 +3582,17 @@ impl Grid {
         }
     }
     fn set_title(&mut self, title: String) {
+        if self.title.as_deref() != Some(title.as_str()) {
+            self.title_changed = true;
+        }
         self.title = Some(title);
+    }
+    /// Whether the program's own title changed since this was last asked, clearing the flag.
+    ///
+    /// A program can set the same title over and over - most shells do, once per prompt - so this
+    /// reports a change of value, not a write.
+    pub fn take_title_changed(&mut self) -> bool {
+        std::mem::take(&mut self.title_changed)
     }
     fn push_current_title_to_stack(&mut self) {
         if self.title_stack.len() > MAX_TITLE_STACK_SIZE {
@@ -3590,7 +3604,7 @@ impl Grid {
     }
     fn pop_title_from_stack(&mut self) {
         if let Some(popped_title) = self.title_stack.pop() {
-            self.title = Some(popped_title);
+            self.set_title(popped_title);
         }
     }
     fn transfer_rows_to_lines_above(&mut self, count: usize) {

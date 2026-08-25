@@ -15168,6 +15168,86 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
     assert_eq!(reported.pane_command.as_deref(), Some("claude --resume"));
 }
 
+/// How many `PaneUpdate`s delivered to `plugin_id` carried `program_title` on pane 1.
+fn pane_updates_carrying_program_title(
+    instructions: &[PluginInstruction],
+    plugin_id: u32,
+    program_title: &str,
+) -> usize {
+    let mut count = 0;
+    for instruction in instructions {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if pid != &Some(plugin_id) {
+                    continue;
+                }
+                if let Event::PaneUpdate(manifest) = event {
+                    if manifest.panes.values().flatten().any(|pane| {
+                        pane.id == 1
+                            && !pane.is_plugin
+                            && pane.program_title.as_deref() == Some(program_title)
+                    }) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+pub fn an_osc_title_change_reports_a_pane_update() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    subscribe_background_plugin(&mock_screen, 99, main_client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+
+    // the program in pane 1 renames itself twice, and writes the first name a second time in
+    // between - a shell that sets its title on every prompt does exactly that
+    for title in ["osc-first", "osc-first", "osc-second"] {
+        let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+            1,
+            format!("\u{1b}]2;{}\u{7}", title).into_bytes(),
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let panes = last_pane_update_for_plugin(&instructions, 99)
+        .expect("the background plugin should have received a PaneUpdate");
+    let reported = panes
+        .iter()
+        .find(|pane| !pane.is_plugin && pane.id == 1)
+        .expect("terminal pane 1 should be in the manifest");
+    assert_eq!(
+        reported.program_title.as_deref(),
+        Some("osc-second"),
+        "the manifest should carry the title the program set last"
+    );
+    assert_eq!(
+        pane_updates_carrying_program_title(&instructions, 99, "osc-first"),
+        1,
+        "writing the same title twice is one change, so it is reported once"
+    );
+    assert_eq!(
+        pane_updates_carrying_program_title(&instructions, 99, "osc-second"),
+        1,
+        "the second title is a change of its own and is reported"
+    );
+}
+
 /// `list-panes` as Screen builds it, for a session whose pane 1 runs `claude`.
 ///
 /// The whole point of the pair below is the `detect_agents` argument, so the setup is shared and

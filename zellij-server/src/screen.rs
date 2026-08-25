@@ -9133,11 +9133,13 @@ pub(crate) fn screen_thread_main(
                     .insert(PaneId::Terminal(pid), Instant::now());
                 let all_tabs = screen.get_tabs_mut();
                 let mut vte_bytes = Some(vte_bytes);
+                let mut program_title_changed = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_terminal_pid(pid) {
                         if let Some(bytes) = vte_bytes.take() {
                             tab.handle_pty_bytes(pid, bytes)
                                 .context("failed to process pty bytes")?;
+                            program_title_changed = tab.take_program_title_changed(pid);
                         }
                         break;
                     }
@@ -9147,6 +9149,11 @@ pub(crate) fn screen_thread_main(
                         .entry(PaneId::Terminal(pid))
                         .or_default()
                         .push(ScreenInstruction::PtyBytes(pid, vte_bytes));
+                }
+                // a title the program set for itself is a pane state change like any other, and
+                // the only one that arrives as pty output rather than as an instruction
+                if program_title_changed {
+                    screen.generate_and_report_pane_state()?;
                 }
                 let _ = screen
                     .bus

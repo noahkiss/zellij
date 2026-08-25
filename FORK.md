@@ -6145,6 +6145,30 @@ title, which is the thing difference 4 is about. What is inside the brackets sta
 same reason it does on a title line: a placed element is not a gap. The `>` on the selected row
 outranks the fill and is still drawn.
 
+### A title the program sets for itself reaches plugins
+
+A pane title set with OSC 0/2 updated zellij's own pane state but produced no `PaneUpdate`, so a
+plugin's cached titles went stale for exactly the panes whose program renames them — which is most
+of them. `list-panes --json` reported the new title immediately, and a plugin subscribed to
+`EventType::PaneUpdate` heard nothing until some unrelated pane event happened to rebuild the
+manifest. A plugin could only see the change by polling `get_pane_info` on a timer. Upstream
+[#5482](https://github.com/zellij-org/zellij/issues/5482).
+
+The cause is that the OSC title is the one pane state change that arrives as pty output rather than
+as an instruction. Every other change runs through `log_and_report_session_state`; pty bytes go
+straight into the grid and never touch the reporting path.
+
+An OSC title change now reports the pane state, so subscribers get a `PaneUpdate` carrying both
+`title` and `program_title`. **A change of value, not a write:** most shells rewrite the same title
+on every prompt, so the grid flags the change only when the new title differs from the one it
+already held. OSC 22/23 title push/pop counts, since it changes what is reported.
+
+Only the pane manifest is rebuilt, not the whole session state — a title change is a per-prompt
+event and does not need the session info regenerated with it. No plugin API field is added:
+`program_title` already ships (see
+[Pane identity and stack membership in `PaneInfo`](#pane-identity-and-stack-membership-in-paneinfo)),
+so `event.proto` and the client/server contract are untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

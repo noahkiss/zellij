@@ -1214,6 +1214,9 @@ impl Pane for TerminalPane {
     fn program_title(&self) -> Option<String> {
         self.grid.title.clone()
     }
+    fn take_program_title_changed(&mut self) -> bool {
+        self.grid.take_title_changed()
+    }
     fn custom_title(&self) -> Option<String> {
         if self.pane_name.is_empty() {
             None

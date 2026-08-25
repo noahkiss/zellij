@@ -751,6 +751,10 @@ pub trait Pane {
     fn program_title(&self) -> Option<String> {
         None
     }
+    /// Whether `program_title` changed since this was last asked, clearing the flag.
+    fn take_program_title_changed(&mut self) -> bool {
+        false
+    }
     /// The uuid given to this pane when it was created. Unlike the pane id, it is never reused.
     fn pane_uuid(&self) -> Uuid;
     /// The uuid of the pane this one continues, when it was built from a serialized session.
@@ -4378,6 +4382,21 @@ impl Tab {
             }
         }
         self.process_pty_bytes(pid, bytes).with_context(err_context)
+    }
+    /// Whether the program in terminal pane `pid` renamed itself (OSC 0/2) since this was last
+    /// asked, clearing the flag. The caller reports the change to plugins.
+    pub fn take_program_title_changed(&mut self, pid: u32) -> bool {
+        self.tiled_panes
+            .get_pane_mut(PaneId::Terminal(pid))
+            .or_else(|| self.floating_panes.get_pane_mut(PaneId::Terminal(pid)))
+            .or_else(|| {
+                self.suppressed_panes
+                    .values_mut()
+                    .find(|s_p| s_p.1.pid() == PaneId::Terminal(pid))
+                    .map(|s_p| &mut s_p.1)
+            })
+            .map(|pane| pane.take_program_title_changed())
+            .unwrap_or(false)
     }
     pub fn handle_plugin_bytes(
         &mut self,
