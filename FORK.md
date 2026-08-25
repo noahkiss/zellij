@@ -6046,6 +6046,27 @@ the work that a panic in an accept loop throws away.
 Reported upstream as [#5474](https://github.com/zellij-org/zellij/issues/5474); nothing has landed
 there.
 
+### A plugin's `.wasm` watch goes away when the plugin does
+
+[`plugin_watch`](#plugin-hot-reload-plugin_watch-default-on) registered a watch when a plugin
+loaded and never removed it, so a session that opens and closes plugin panes all day accumulates
+watches until it exits. Nothing misbehaved — a change to a `.wasm` nothing is running resolves to
+no instances and reloads nothing — but the inotify watches, the debouncer's cache entries and the
+map of watched files all grew for the life of the server. They are now released in
+`unload_plugin`, beside the subscription and the failure record that are already dropped there.
+
+**The watch belongs to the file, not to the plugin id.** One `.wasm` backs every id loaded from it
+— the same plugin in two panes, or one instance per connected client — so the watch is released
+only when the last of them is gone. Three things count as still wanting it: a running instance, one
+that is still loading (the watch is registered before the instance exists), and one that *failed*
+to load. That last is the one worth naming: a plugin whose `.wasm` is broken is exactly the pane
+the hot-reload loop exists to rescue, so its watch has to survive until the pane does not.
+
+**The entry is found by comparison, not by path.** Unwatching by re-resolving the plugin's path
+would leak a watch for a plugin whose `.wasm` was deleted while it was loaded, because
+`canonicalize` fails on the way back out. The directory the watch actually sits on is released
+separately, once no watched file is left in it.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
@@ -6066,8 +6087,6 @@ there.
   that address a pane, would be the fix. Not done because it is a new shape for the tool to return
   rather than a flag to pass through, and every drift gate here rests on a tool returning exactly
   what its CLI command prints.
-- **Unwatching a plugin's `.wasm` when it unloads.** Watches accumulate for the life of the
-  session; a change to a no-longer-loaded plugin resolves to no running instances and does nothing.
 - **A plugin column on `zellij ls --json`.** The metadata `ls` reads now carries each session's
   plugins, but `SessionListEntry` does not, so nothing is printed. Three parsers read that array
   and the question `ls` answers is which sessions exist, not what runs inside one — the detail is

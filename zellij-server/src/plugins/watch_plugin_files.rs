@@ -114,6 +114,50 @@ impl PluginFileWatcher {
             .insert(run_plugin.clone());
     }
 
+    /// Stop watching this plugin's .wasm. The inverse of [`PluginFileWatcher::watch`], and
+    /// idempotent in the same way: a plugin that is not watched is a no-op.
+    ///
+    /// Deciding that a plugin is really gone is the caller's job. One `RunPlugin` backs every
+    /// plugin id loaded from that file - the same plugin in two panes, or one instance per
+    /// connected client - and the watch belongs to the file, so it has to outlive all of them but
+    /// the last.
+    ///
+    /// The watched entry is found by comparison rather than by path, so a plugin whose .wasm has
+    /// since been deleted still releases its watch: `canonicalize` would fail on the way back out
+    /// and leave the entry behind forever.
+    pub fn unwatch(&mut self, run_plugin: &RunPlugin) {
+        // `RunPlugin` derives `Hash` over fields its `Eq` ignores, so a set lookup can miss an
+        // entry a comparison finds - walk the set instead of removing by hash.
+        for run_plugins in self.watched_files.values_mut() {
+            run_plugins.retain(|watched| watched != run_plugin);
+        }
+        self.watched_files
+            .retain(|_path, run_plugins| !run_plugins.is_empty());
+
+        // the directory is what is watched, not the file, so it stays until nothing in it is
+        let unwatched_dirs: Vec<PathBuf> = self
+            .watched_dirs
+            .iter()
+            .filter(|dir| {
+                !self
+                    .watched_files
+                    .keys()
+                    .any(|path| path.parent() == Some(dir.as_path()))
+            })
+            .cloned()
+            .collect();
+        for dir in unwatched_dirs {
+            if let Err(e) = self.debouncer.unwatch(&dir) {
+                log::warn!(
+                    "Failed to unwatch plugin directory {}: {}",
+                    dir.display(),
+                    e
+                );
+            }
+            self.watched_dirs.remove(&dir);
+        }
+    }
+
     /// The watched plugins whose .wasm is among `changed_paths`.
     pub fn plugins_for_changed_paths(&self, changed_paths: &[PathBuf]) -> Vec<RunPlugin> {
         let mut changed_plugins: Vec<RunPlugin> = vec![];
@@ -133,5 +177,111 @@ impl PluginFileWatcher {
 
     pub fn stop(self) {
         self.debouncer.stop_nonblocking();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use zellij_utils::input::layout::PluginUserConfiguration;
+
+    fn run_plugin_for(path: &Path, instance: &str) -> RunPlugin {
+        // the configuration is what tells two plugins loaded from one file apart: `RunPlugin`'s
+        // `Eq` reads the location and the configuration and nothing else
+        let mut configuration = PluginUserConfiguration::default();
+        configuration.insert("instance", instance);
+        RunPlugin {
+            _allow_exec_host_cmd: false,
+            location: RunPluginLocation::File(path.to_path_buf()),
+            configuration,
+            initial_cwd: None,
+        }
+    }
+
+    fn watcher() -> PluginFileWatcher {
+        PluginFileWatcher::new(ThreadSenders {
+            should_silently_fail: true,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn unwatch_releases_the_file_and_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm, b"").unwrap();
+        let run_plugin = run_plugin_for(&wasm, "one");
+
+        let mut watcher = watcher();
+        watcher.watch(&run_plugin);
+        assert_eq!(watcher.watched_files.len(), 1);
+        assert_eq!(watcher.watched_dirs.len(), 1);
+
+        watcher.unwatch(&run_plugin);
+        assert!(watcher.watched_files.is_empty());
+        assert!(watcher.watched_dirs.is_empty());
+    }
+
+    #[test]
+    fn unwatch_keeps_a_file_another_plugin_is_still_loaded_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm, b"").unwrap();
+        let first = run_plugin_for(&wasm, "one");
+        let second = run_plugin_for(&wasm, "two");
+
+        let mut watcher = watcher();
+        watcher.watch(&first);
+        watcher.watch(&second);
+
+        watcher.unwatch(&first);
+        assert_eq!(watcher.watched_files.len(), 1);
+        assert_eq!(watcher.watched_dirs.len(), 1);
+        assert_eq!(
+            watcher.plugins_for_changed_paths(&[wasm.clone()]),
+            vec![second.clone()]
+        );
+
+        watcher.unwatch(&second);
+        assert!(watcher.watched_files.is_empty());
+        assert!(watcher.watched_dirs.is_empty());
+    }
+
+    #[test]
+    fn unwatch_keeps_a_directory_another_plugin_is_watched_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_wasm = dir.path().join("first.wasm");
+        let second_wasm = dir.path().join("second.wasm");
+        std::fs::write(&first_wasm, b"").unwrap();
+        std::fs::write(&second_wasm, b"").unwrap();
+        let first = run_plugin_for(&first_wasm, "one");
+        let second = run_plugin_for(&second_wasm, "two");
+
+        let mut watcher = watcher();
+        watcher.watch(&first);
+        watcher.watch(&second);
+        assert_eq!(watcher.watched_dirs.len(), 1);
+
+        watcher.unwatch(&first);
+        assert_eq!(watcher.watched_files.len(), 1);
+        assert_eq!(watcher.watched_dirs.len(), 1);
+    }
+
+    #[test]
+    fn unwatch_releases_a_plugin_whose_wasm_is_gone_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm, b"").unwrap();
+        let run_plugin = run_plugin_for(&wasm, "one");
+
+        let mut watcher = watcher();
+        watcher.watch(&run_plugin);
+        std::fs::remove_file(&wasm).unwrap();
+
+        watcher.unwatch(&run_plugin);
+        assert!(watcher.watched_files.is_empty());
+        assert!(watcher.watched_dirs.is_empty());
     }
 }
