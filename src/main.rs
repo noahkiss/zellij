@@ -29,8 +29,12 @@ fn main() {
 
     {
         let config = Config::try_from(&opts).ok();
-        if let Some(Command::Action(cli_action)) = opts.command {
-            commands::send_action_to_session(*cli_action, opts.session, config);
+        if let Some(Command::Action {
+            json,
+            action: cli_action,
+        }) = opts.command
+        {
+            commands::send_action_to_session(*cli_action, opts.session, config, json);
             std::process::exit(0);
         }
         if let Some(Command::Subscribe(subscribe_cli)) = opts.command {
@@ -112,7 +116,7 @@ fn main() {
                 borderless,
                 tab_id,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
         if let Some(Command::Sessions(Sessions::Plugin {
@@ -171,7 +175,7 @@ fn main() {
                 borderless,
                 tab_id,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
         if let Some(Command::Sessions(Sessions::Edit {
@@ -220,7 +224,7 @@ fn main() {
                 tab_id,
                 handle,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
         if let Some(Command::Sessions(Sessions::Pipe {
@@ -247,7 +251,7 @@ fn main() {
                 plugin_cwd: None,
                 plugin_title: None,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
     }
@@ -340,7 +344,12 @@ fn main() {
                 block_until_exit: false,
                 no_focus: false,
             };
-            commands::send_action_to_session(new_layout_cli_action, Some(session_name), config);
+            commands::send_action_to_session(
+                new_layout_cli_action,
+                Some(session_name),
+                config,
+                false,
+            );
         } else {
             commands::start_client(opts);
         }

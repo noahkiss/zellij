@@ -79,12 +79,12 @@ you how to read the next.
   which is why `pane_id` is `terminal_7` everywhere and never `7` in one place and `terminal_7` in
   another.
 - **Where `--json` exists it carries the same information, structured.** JSON is the interface for
-  programs; the default output is for a human or an agent reading a shell. The goal is `--json` on
-  every query and on every mutation that reports something. Seven have it — `ls`, `list-panes`,
-  `list-tabs`, `list-tree`, `list-clients`, `list-events`, `current-tab-info`; `wait` and
-  `are-floating-panes-visible` do not, and the payload commands never will. The mutations do not
-  yet, so for those this bullet is a direction rather than a promise you can write a script
-  against.
+  programs; the default output is for a human or an agent reading a shell. Every `zellij action`
+  verb that reports a record now has it, in front of the verb — see [`zellij action
+  --json`](#zellij-action---json-answers-the-mutations-too). The verbs that were already answering
+  in JSON keep their own trailing flag, and for those the two spellings are one call: `ls`,
+  `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents`,
+  `current-tab-info`. The payload commands refuse it and always will.
 - **Results go to stdout, diagnostics go to stderr.** A command whose output you are capturing never
   mixes an explanation into it.
 - **Exit codes are `0` acted, `1` error, `2` the command changed nothing.** The `2` is one bucket
@@ -6320,6 +6320,51 @@ wants it, and says so in the timeout message.
 
 The flag never reaches the session. It is taken off the request by `CliAction::take_pipe_timeout`
 and held by the client, so `Action::CliPipe` and the client/server contract are untouched.
+
+### `zellij action --json` answers the mutations too
+
+```
+$ zellij action --json new-tab
+{
+  "tab_id": 2,
+  "pane_id": "terminal_4",
+  "handle": "hefty-magpie"
+}
+$ zellij action --json close-pane --pane-id sunny-otter --yes
+{
+  "closed": "terminal_3"
+}
+$ zellij action --json toggle-floating-panes
+{}
+```
+
+[The convention](#the-cli-output-convention) said `--json` was the direction for the mutations and
+not yet a promise. It is one now. A verb that reports a record answers with one object; a verb that
+reports nothing answers `{}`, because a parser that asked for an object should get one rather than
+an empty stream.
+
+**The flag goes in front of the verb, and that is deliberate.** The seven verbs that were already
+answering in JSON own the trailing `--json`, and a second flag by the same name on the same command
+is not something clap will take. Rather than invent a second spelling, the parent takes it — and
+for those seven `zellij action --json list-panes` and `zellij action list-panes --json` are the
+**same call**, because the parent flag simply turns the verb's own one on. One name, one meaning,
+two positions only where both already existed.
+
+**A payload refuses rather than answering something wrong.** `dump-screen` and `dump-layout` print
+what a pane or a layout holds, which has no keys; the call exits **2** and says so. Which verbs
+those are is read from the same `prints:` table `zellij setup --dump-surface` publishes, so the flag
+and the map cannot drift apart.
+
+**The values are typed the way the other JSON surfaces type them.** A tab id is a number, as it is
+in `list-tabs --json`; a pane id is a string, as it is in `list-panes --json`; `true` and `false`
+are booleans; and `-`, which is how the fork's output says a field has no value, is `null`. The keys
+come out in the order the command prints them rather than alphabetised, so the object reads like the
+record it replaces.
+
+**Nothing about the plain output moved.** Without the flag every verb prints exactly the bytes it
+printed before: the whole feature is in the client's printer, so no action, no message and no part
+of the client/server contract changed. `zellij run`, `zellij edit` and `zellij pipe` are their own
+top-level commands rather than `action` verbs, and do not take it.
 
 ## Assessed and deliberately not built
 
