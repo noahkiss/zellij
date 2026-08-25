@@ -42,6 +42,35 @@ impl SyncOutput {
             SyncOutput::CSI => CSI_ESU_SEQ,
         }
     }
+
+    /// Which implementation to wrap a rendered frame in before the host
+    /// terminal has answered the startup `CSI ?2026$p` query — or at all,
+    /// if it never answers.
+    ///
+    /// The DECRPM reply remains the authority: it upgrades a host to
+    /// `CSI` and, when the host answers that mode 2026 is unrecognised or
+    /// permanently reset, turns synchronisation back off. This only picks
+    /// what to assume until then, and the assumption is that the host
+    /// supports it: a terminal that does not recognise a DEC private mode
+    /// consumes the sequence and ignores it, while an unsynchronised frame
+    /// split across TCP segments tears.
+    ///
+    /// `ZELLIJ_SYNC_OUTPUT` overrides the assumption for a host that both
+    /// mishandles mode 2026 and stays silent about it: `off` (or `none`)
+    /// never synchronises, `csi` and `dcs` force an implementation. Any
+    /// other value is ignored.
+    pub fn default_for_host(term: Option<&str>, override_var: Option<&str>) -> Option<SyncOutput> {
+        match override_var.map(str::trim).map(str::to_ascii_lowercase) {
+            Some(value) if value == "off" || value == "none" => return None,
+            Some(value) if value == "csi" => return Some(SyncOutput::CSI),
+            Some(value) if value == "dcs" => return Some(SyncOutput::DCS),
+            _ => {},
+        }
+        match term {
+            Some("alacritty") => Some(SyncOutput::DCS),
+            _ => Some(SyncOutput::CSI),
+        }
+    }
 }
 
 /// A classified host-terminal reply received on stdin.

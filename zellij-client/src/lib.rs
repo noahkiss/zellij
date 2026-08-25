@@ -601,10 +601,10 @@ pub async fn run_remote_client_terminal_loop(
 ) -> Result<Option<ConnectToSession>, RemoteClientError> {
     use crate::os_input_output::{AsyncSignals, AsyncStdin};
 
-    let synchronised_output = match os_input.env_variable("TERM").as_deref() {
-        Some("alacritty") => Some(SyncOutput::DCS),
-        _ => None,
-    };
+    let synchronised_output = SyncOutput::default_for_host(
+        os_input.env_variable("TERM").as_deref(),
+        os_input.env_variable("ZELLIJ_SYNC_OUTPUT").as_deref(),
+    );
 
     let mut async_stdin: Box<dyn AsyncStdin> = os_input.get_async_stdin_reader();
     let mut async_signals: Box<dyn AsyncSignals> = os_input
@@ -1430,10 +1430,10 @@ pub fn start_client(
     };
 
     let mut exit_msg = String::new();
-    let mut synchronised_output = match os_input.env_variable("TERM").as_deref() {
-        Some("alacritty") => Some(SyncOutput::DCS),
-        _ => None,
-    };
+    let mut synchronised_output = SyncOutput::default_for_host(
+        os_input.env_variable("TERM").as_deref(),
+        os_input.env_variable("ZELLIJ_SYNC_OUTPUT").as_deref(),
+    );
 
     loop {
         let (client_instruction, mut err_ctx) = receive_client_instructions
