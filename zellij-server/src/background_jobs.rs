@@ -25,7 +25,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
@@ -187,6 +187,13 @@ static WEB_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// The connect phase gets a shorter budget of its own, so an unreachable host fails fast instead
 /// of spending the whole request budget.
 static WEB_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// How long a session teardown waits for the web requests already in flight. Shorter than
+/// `WEB_REQUEST_TIMEOUT_SECS` on purpose: a request that has not answered by now is not worth
+/// holding a closing session open for, and the wait is only ever paid by a session whose plugins
+/// still had a request outstanding.
+const WEB_REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the drain looks at the in-flight count.
+const WEB_REQUEST_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// The status a `WebRequestResult` carries when no HTTP response was received at all. Real
 /// statuses start at 100, so a plugin can tell "the transport failed" from "the server answered
 /// and refused". The failure kind is in the `x-zellij-error-kind` header.
@@ -254,6 +261,9 @@ pub(crate) fn background_jobs_main(
         .ok();
     // We needn't do anything with the runtime, but it should exist at this point.
     let runtime = crate::global_async_runtime::get_tokio_runtime();
+    // web requests outlive the send that started them, and the last ones a session makes are the
+    // ones a plugin issues from its `BeforeClose` handler. Counting them lets the exit wait.
+    let web_requests_in_flight = Arc::new(AtomicUsize::new(0));
 
     {
         let senders = bus.senders.clone();
@@ -452,10 +462,13 @@ pub(crate) fn background_jobs_main(
                 });
             },
             BackgroundJob::WebRequest(plugin_id, client_id, url, verb, headers, body, context) => {
+                web_requests_in_flight.fetch_add(1, Ordering::SeqCst);
                 runtime.spawn({
                     let senders = bus.senders.clone();
                     let http_client = http_client.clone();
+                    let in_flight = web_requests_in_flight.clone();
                     async move {
+                        let _in_flight = InFlightGuard::new(in_flight);
                         async fn web_request(
                             url: String,
                             verb: HttpVerb,
@@ -840,9 +853,49 @@ pub(crate) fn background_jobs_main(
                 let cache_file_name =
                     session_info_cache_file_name(&current_session_name.lock().unwrap().to_owned());
                 let _ = std::fs::remove_file(cache_file_name);
+                drain_web_requests(&web_requests_in_flight, WEB_REQUEST_DRAIN_TIMEOUT);
                 return Ok(());
             },
         }
+    }
+}
+
+/// Counts a task for as long as it runs, however it ends.
+///
+/// The web-request task returns early on a missing http client and can be cancelled by the runtime,
+/// so a decrement written at the end of the body would be skipped in exactly the cases the count
+/// exists to describe.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        InFlightGuard(count)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Wait for the web requests a session has already sent to come back, or give up after `timeout`.
+///
+/// The requests worth waiting for are the ones a plugin issues from its `BeforeClose` handler: they
+/// are dispatched with the session already going away, and nothing else would keep the process
+/// alive long enough for them to reach the wire.
+fn drain_web_requests(in_flight: &AtomicUsize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while in_flight.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= deadline {
+            log::error!(
+                "timed out after {:?} waiting for {} web request(s) to finish",
+                timeout,
+                in_flight.load(Ordering::SeqCst)
+            );
+            return;
+        }
+        std::thread::sleep(WEB_REQUEST_DRAIN_POLL_INTERVAL);
     }
 }
 
