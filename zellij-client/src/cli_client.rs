@@ -1235,7 +1235,6 @@ mod tests {
                     exit_status: *exit_status,
                     ..Default::default()
                 },
-                tab_id: 0,
                 tab_position: 0,
                 tab_name: "tab".to_owned(),
                 agent: None,

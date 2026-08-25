@@ -216,7 +216,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
             Some(AgentListEntry {
                 handle: entry.pane_info.handle.clone(),
                 pane_id: entry.pane_info.id,
-                tab_id: entry.tab_id,
+                tab_id: entry.pane_info.tab_id,
                 tab_position: entry.tab_position,
                 tab_name: entry.tab_name,
                 title: entry.pane_info.title.clone(),
@@ -450,9 +450,9 @@ mod tests {
                 handle: "sunny-otter".to_owned(),
                 pane_command: Some("sleep 900".to_owned()),
                 terminal_command: Some("/opt/bin/claude".to_owned()),
+                tab_id: 1,
                 ..Default::default()
             },
-            tab_id: 1,
             tab_position: 0,
             tab_name: "develop".to_owned(),
             agent: detect_command_line("/opt/bin/claude", &env(&[])),

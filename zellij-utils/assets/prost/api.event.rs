@@ -757,6 +757,8 @@ pub struct PaneInfo {
     pub has_explicit_title: bool,
     #[prost(string, tag="46")]
     pub handle: ::prost::alloc::string::String,
+    #[prost(uint32, tag="47")]
+    pub tab_id: u32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
