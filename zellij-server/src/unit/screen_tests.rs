@@ -16794,6 +16794,80 @@ pub fn going_to_a_tab_position_that_is_not_there_is_a_miss_with_nobody_attached(
 }
 
 #[test]
+pub fn going_to_a_tab_by_an_id_nothing_answers_to_is_a_miss_with_nobody_attached() {
+    // the same gap `go-to-tab` had, in the verb that takes an id: the miss used to be reported
+    // from inside the branch that had found a client, so a detached session answered nothing at
+    // all and the CLI exited 0 for a tab that was never there
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::GoToTabWithId(
+        999,
+        None, // nobody is attached
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a tab id nothing answers to never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab with id 999"),
+        "{:?}",
+        result.error_message
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_that_is_there_with_nobody_attached_says_it_has_no_client_to_move() {
+    // the tab is real, so this is not a miss - it is the same half-a-command `go-to-tab-name`
+    // refuses when a detached session leaves it nothing but a focus move
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let main_client_id = mock_screen.main_client_id;
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(main_client_id));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::GoToTabWithId(
+        0,
+        None, // nobody is attached
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a switch with nobody to switch never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some(crate::screen::NO_CLIENT_TO_MOVE_TO_A_TAB_BY_ID),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "nothing moved, so there is no from/to to print: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
 pub fn closing_a_tab_by_id_says_what_it_closed() {
     let size = Size {
         cols: 121,

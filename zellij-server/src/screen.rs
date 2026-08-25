@@ -1849,6 +1849,11 @@ pub const NO_FOCUSED_PANE_TO_CLOSE: &str =
 pub const NO_CLIENT_TO_MOVE_TO_A_TAB: &str =
     "`go-to-tab-name` has no client to move: nothing is attached to this session.";
 
+/// The same, for the verb that takes an id. It has no `--create` half to answer, so with nothing
+/// attached there is nothing left of it at all.
+pub const NO_CLIENT_TO_MOVE_TO_A_TAB_BY_ID: &str =
+    "`go-to-tab-by-id` has no client to move: nothing is attached to this session.";
+
 impl Screen {
     /// Creates and returns a new [`Screen`].
     pub fn new(
@@ -12429,6 +12434,20 @@ pub(crate) fn screen_thread_main(
                 screen.log_and_report_session_state()?;
             },
             ScreenInstruction::GoToTabWithId(tab_id, client_id, mut completion_tx) => {
+                // fork addition: the miss is answered before a client is looked for, the way
+                // `go-to-tab` answers one. Asking about the client first left an id nothing answers
+                // to reported only while somebody was attached, so a script driving a detached
+                // session got a silent success for a tab that was never there.
+                //
+                // Only asked once the tab list has settled - a pending tab already holds its id and
+                // is about to answer to it, which is the same reason `go-to-tab` waits for it
+                if pending_tab_ids.is_empty() && screen.get_tab_position_by_id(tab_id).is_none() {
+                    log::error!("Tab with ID {} not found", tab_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!("No tab with id {}", tab_id));
+                    }
+                    continue;
+                }
                 let client_id_to_switch = client_id
                     .and_then(|cid| {
                         if screen.active_tab_ids.contains_key(&cid) {
@@ -12460,6 +12479,11 @@ pub(crate) fn screen_thread_main(
                             c.set_error_message(format!("No tab with id {}", tab_id));
                         }
                     }
+                } else if let Some(c) = completion_tx.as_mut() {
+                    // the tab is there and nothing is attached, so the whole of this command is a
+                    // focus move with no focus to move. `go-to-tab-name` refuses in this state
+                    // already; staying silent here exits 0 on a session that did not move
+                    c.set_error_message(NO_CLIENT_TO_MOVE_TO_A_TAB_BY_ID.to_owned());
                 }
             },
             ScreenInstruction::RenameTabWithId(tab_id, new_name, mut completion_tx) => {
