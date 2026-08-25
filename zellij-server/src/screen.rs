@@ -4477,7 +4477,7 @@ impl Screen {
 
             // Subscriber delivery — gated behind is_empty() for zero overhead
             if !self.pane_render_subscribers.is_empty() {
-                self.deliver_to_pane_subscribers_from_report(&pane_render_report);
+                self.deliver_to_pane_subscribers(Some(&pane_render_report));
             }
 
             let _ = self
@@ -4548,9 +4548,9 @@ impl Screen {
                 self.log_and_report_session_state()?;
             }
 
-            // No regular clients but subscribers exist — query panes directly
+            // No regular clients but subscribers exist — every pane is queried directly
             if !self.pane_render_subscribers.is_empty() {
-                self.deliver_to_pane_subscribers_directly();
+                self.deliver_to_pane_subscribers(None);
             }
         }
 
@@ -8814,14 +8814,19 @@ impl Screen {
             self.pane_render_subscribers.remove(&subscriber_client_id);
         }
     }
-    fn deliver_to_pane_subscribers_from_report(&mut self, report: &PaneRenderReport) {
-        let Some(pane_map) = report.all_pane_contents.values().next() else {
-            return;
-        };
-        let ansi_pane_map = report.all_pane_contents_with_ansi.values().next();
-        self.deliver_subscriber_updates_from_map(pane_map, ansi_pane_map);
-    }
-    fn deliver_to_pane_subscribers_directly(&mut self) {
+    /// Build one contents map for every subscribed pane and deliver from it.
+    ///
+    /// The render report only carries the panes a client is looking at: `Tab::render` returns early
+    /// for a tab no client is on, and floating panes are rendered only while they are visible. So a
+    /// subscriber that named a pane elsewhere would be served from the report while nobody was
+    /// attached and go silent the moment somebody was. Whatever the report is missing is queried
+    /// from its tab here, which is what the detached path always did for every pane — `report` is
+    /// simply `None` there.
+    fn deliver_to_pane_subscribers(&mut self, report: Option<&PaneRenderReport>) {
+        let reported = report.and_then(|r| r.all_pane_contents.values().next());
+        let reported_with_ansi = report.and_then(|r| r.all_pane_contents_with_ansi.values().next());
+        let has_ansi_subscribers = self.pane_render_subscribers.values().any(|s| s.ansi);
+
         // Collect unique pane IDs across all subscribers
         let all_subscribed_ids: HashSet<zellij_utils::data::PaneId> = self
             .pane_render_subscribers
@@ -8829,19 +8834,45 @@ impl Screen {
             .flat_map(|sub| sub.pane_ids.iter().copied())
             .collect();
 
-        let has_ansi_subscribers = self.pane_render_subscribers.values().any(|s| s.ansi);
+        // a plugin pane keeps a grid per client, so it is read the way the initial delivery reads
+        // it - through a regular client - rather than through the None a terminal pane wants
+        let regular_client_id = self
+            .connected_clients
+            .borrow()
+            .keys()
+            .find(|id| !self.watcher_clients.contains_key(id))
+            .copied();
 
-        // Query pane contents directly from tabs
         let mut pane_map: HashMap<zellij_utils::data::PaneId, PaneContents> = HashMap::new();
         let mut ansi_pane_map: HashMap<zellij_utils::data::PaneId, PaneContents> = HashMap::new();
         for pane_id in &all_subscribed_ids {
+            if let Some(contents) = reported.and_then(|m| m.get(pane_id)) {
+                pane_map.insert(*pane_id, contents.clone());
+            }
+            if let Some(contents) = reported_with_ansi.and_then(|m| m.get(pane_id)) {
+                ansi_pane_map.insert(*pane_id, contents.clone());
+            }
+            let needs_plain = !pane_map.contains_key(pane_id);
+            let needs_ansi = has_ansi_subscribers && !ansi_pane_map.contains_key(pane_id);
+            if !needs_plain && !needs_ansi {
+                continue;
+            }
+
             let server_pane_id: PaneId = (*pane_id).into();
+            let query_client_id = match server_pane_id {
+                PaneId::Plugin(_) => regular_client_id,
+                PaneId::Terminal(_) => None,
+            };
             for tab in self.tabs.values() {
                 if let Some(pane) = tab.get_pane_with_id(server_pane_id) {
-                    pane_map.insert(*pane_id, pane.pane_contents(None, false, None));
-                    if has_ansi_subscribers {
-                        ansi_pane_map
-                            .insert(*pane_id, pane.pane_contents_with_ansi(None, false, None));
+                    if needs_plain {
+                        pane_map.insert(*pane_id, pane.pane_contents(query_client_id, false, None));
+                    }
+                    if needs_ansi {
+                        ansi_pane_map.insert(
+                            *pane_id,
+                            pane.pane_contents_with_ansi(query_client_id, false, None),
+                        );
                     }
                     break;
                 }

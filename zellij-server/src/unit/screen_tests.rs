@@ -6935,7 +6935,7 @@ fn delivery_path_a_and_b_produce_same_content() {
         all_pane_contents,
         all_pane_contents_with_ansi: HashMap::new(),
     };
-    screen.deliver_to_pane_subscribers_from_report(&report);
+    screen.deliver_to_pane_subscribers(Some(&report));
 
     let viewport_a = {
         let msgs = messages.lock().unwrap();
@@ -6957,7 +6957,7 @@ fn delivery_path_a_and_b_produce_same_content() {
             vec!["old".to_string()],
         );
 
-    screen.deliver_to_pane_subscribers_directly();
+    screen.deliver_to_pane_subscribers(None);
 
     let viewport_b = {
         let msgs = messages.lock().unwrap();
@@ -6972,6 +6972,65 @@ fn delivery_path_a_and_b_produce_same_content() {
         viewport_a, viewport_b,
         "Both delivery paths should produce identical viewport"
     );
+}
+
+#[test]
+fn subscriber_is_served_a_pane_the_render_report_does_not_carry() {
+    // a tab nobody is looking at is not rendered, so its panes are absent from the report an
+    // attached session delivers from. The subscriber asked for that pane and keeps getting it.
+    let size = Size { cols: 80, rows: 20 };
+    let (mut screen, messages) = create_new_screen_with_message_capture(size);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+
+    screen.subscribe_to_pane_renders(
+        100,
+        vec![zellij_utils::data::PaneId::Terminal(1)],
+        None,
+        false,
+    );
+    messages.lock().unwrap().get_mut(&100).unwrap().clear();
+
+    screen
+        .tabs
+        .get_mut(&0)
+        .unwrap()
+        .handle_pty_bytes(1, b"output from an unwatched tab".to_vec())
+        .unwrap();
+
+    // the report of a render in which client 1 is looking at the second tab: it says nothing at
+    // all about pane 1
+    let mut pane_map = HashMap::new();
+    pane_map.insert(
+        zellij_utils::data::PaneId::Terminal(2),
+        PaneContents::default(),
+    );
+    let mut all_pane_contents = HashMap::new();
+    all_pane_contents.insert(1 as ClientId, pane_map);
+    let report = PaneRenderReport {
+        all_pane_contents,
+        all_pane_contents_with_ansi: HashMap::new(),
+    };
+    screen.deliver_to_pane_subscribers(Some(&report));
+
+    let msgs = messages.lock().unwrap();
+    let client_msgs = msgs.get(&100).unwrap();
+    assert_eq!(client_msgs.len(), 1, "one update for the unrendered pane");
+    match &client_msgs[0] {
+        ServerToClientMsg::PaneRenderUpdate {
+            pane_id, viewport, ..
+        } => {
+            assert_eq!(pane_id, &zellij_utils::data::PaneId::Terminal(1));
+            assert!(
+                viewport
+                    .iter()
+                    .any(|line| line.contains("output from an unwatched tab")),
+                "expected the pane's own contents, got {:?}",
+                viewport
+            );
+        },
+        other => panic!("Expected PaneRenderUpdate, got {:?}", other),
+    }
 }
 
 #[test]
