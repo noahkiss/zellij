@@ -1310,3 +1310,44 @@ pub fn collapsed_stack_member_keeps_its_grid() {
         "re-expanding a collapsed member gets its screen back"
     );
 }
+
+#[test]
+pub fn dump_screen_returns_logical_lines_not_the_wrapped_grid() {
+    let mut fake_win_size = PaneGeom::default();
+    fake_win_size.cols.set_inner(20);
+    fake_win_size.rows.set_inner(10);
+
+    let mut terminal_pane = TerminalPane::new(
+        1,
+        fake_win_size,
+        Style::default(),
+        0,
+        String::new(),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(SixelImageStore::default())),
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        Rc::new(RefCell::new(Palette::default())),
+        Rc::new(RefCell::new(HashMap::new())),
+        None,
+        None,
+        false,
+        true,
+        true,
+        true,
+        false,
+        None,
+    );
+
+    // 50 characters into a 20 column pane: the grid holds three rows, two of them continuations
+    let long_line = "a".repeat(50);
+    terminal_pane.handle_pty_bytes(format!("{}\n\rshort", long_line).into_bytes());
+
+    let dump = terminal_pane.dump_screen(false, None);
+    let lines: Vec<&str> = dump.lines().collect();
+    assert_eq!(
+        lines,
+        vec![long_line.as_str(), "short"],
+        "dump-screen already unwraps: it breaks a line only where the grid says the line began"
+    );
+}
