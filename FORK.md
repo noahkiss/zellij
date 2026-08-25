@@ -5823,6 +5823,32 @@ per-client `ModeInfo` on every focus change, so `ModeUpdate` keeps firing with t
 which now happens to equal the focused pane's — and the status bar is right with no plugin change.
 A plugin that wants to *read* a pane's mode would be a separate patch and a separate cost.
 
+### A write that names a pane leaves every viewport alone
+
+`zellij action write --pane-id`, and the `write-chars`, `send-keys` and `paste` forms of the same
+thing, used to drop somebody else's scrollback to the bottom. Scroll up in the pane you are reading,
+let a script write into a pane in another tab, and your viewport jumped — and under the default
+`input_while_scrolled "scroll-mode"` you were dropped out of Scroll mode with it. Upstream
+[#5476](https://github.com/zellij-org/zellij/issues/5476), no maintainer reply.
+
+The cause is one instruction sent too widely. Every writing verb in `route_action` sent a
+`ScreenInstruction::ClearScroll(client_id)` ahead of the write, and `ClearScroll` resolves "the
+client" through `active_tab_and_connected_client_id!`, which falls back to whichever client the
+server can find. A CLI caller is not one of them, so the clear landed on a bystander.
+
+- **The clear is asked once now, behind `clears_the_asking_clients_scroll`**, instead of by each of
+  the five arms that wrote it out. A verb that names a pane answers `false`.
+- **The untargeted half is unchanged.** `write`, `write-chars` and a `paste` with no `--pane-id`
+  still clear, because there the pane being written to *is* the caller's own — typing scrolls you
+  back down to see what you typed, which is the gesture a terminal user expects.
+- **The written-to pane still answers for its own scroll**, in `Tab::write_to_pane_id`, under
+  [`input_while_scrolled`](#input_while_scrolled-typing-into-a-scrolled-pane-no-longer-eats-the-key).
+  That option is the one place that decides what an incoming byte does to the target's viewport, and
+  it did not need to change.
+
+Nothing crosses a contract: no `Action` is added, no message is renumbered, and `ClearScroll` is a
+`ScreenInstruction`, which is server-internal Rust.
+
 ### Closing a tab with more than one pane asks first
 
 The tab-mode close key and `zellij action close-tab` used to be the same button. One is pressed by
