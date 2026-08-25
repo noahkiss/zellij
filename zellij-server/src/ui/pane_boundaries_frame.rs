@@ -919,10 +919,22 @@ impl PaneFrame {
         let (mut focus_part, focus_length) = self
             .bracketed_focus_indicator(left_budget)
             .unwrap_or((vec![], 0));
+        // fork addition: a stack list row IS the title line of the pane it names, and `top_only`
+        // fills a title line with a rule - the same one condition as `compose_bracketed_title`.
+        // Only the room around the entry is filled: what is inside the entry's own brackets is a
+        // placed element, not a gap
+        let fill_character = if self.top_only_frames {
+            foreground_color(boundary_type::HORIZONTAL, self.color)
+                .into_iter()
+                .next()
+                .unwrap_or(EMPTY_TERMINAL_CHARACTER)
+        } else {
+            EMPTY_TERMINAL_CHARACTER
+        };
         let mut line = Vec::with_capacity(usable_cols);
         line.append(&mut focus_part);
         for _ in focus_length..left_budget {
-            line.push(EMPTY_TERMINAL_CHARACTER);
+            line.push(fill_character.clone());
         }
         let unfocused_color = self.style.colors.frame_unselected.map(|frame| frame.base);
         let style_entry_text = |text: &str| {
@@ -938,7 +950,7 @@ impl PaneFrame {
             line.append(&mut foreground_color(selection_marker, None));
         } else {
             for _ in 0..marker_width {
-                line.push(EMPTY_TERMINAL_CHARACTER);
+                line.push(fill_character.clone());
             }
         }
         line.append(&mut foreground_color(boundary_type::VERTICAL, None));
@@ -961,13 +973,13 @@ impl PaneFrame {
         if self.exit_status.is_some() {
             let (mut exit_part, exit_length) = self.first_exited_held_title_part_full();
             if occupied_columns + 1 + exit_length + scroll_length <= usable_cols {
-                line.push(EMPTY_TERMINAL_CHARACTER);
+                line.push(fill_character.clone());
                 line.append(&mut exit_part);
                 occupied_columns += 1 + exit_length;
             }
         }
         while occupied_columns < usable_cols.saturating_sub(scroll_length) {
-            line.push(EMPTY_TERMINAL_CHARACTER);
+            line.push(fill_character.clone());
             occupied_columns += 1;
         }
         line.append(&mut scroll_part);
@@ -1681,6 +1693,119 @@ mod tests {
 
     fn characters_to_string(chars: &[TerminalCharacter]) -> String {
         chars.iter().map(|c| c.character).collect()
+    }
+
+    /// One row of a stack list, in either frame style.
+    fn stack_list_row(
+        cols: usize,
+        label: &str,
+        is_selected: bool,
+        top_only_frames: bool,
+    ) -> String {
+        let frame = PaneFrame::new(
+            Viewport {
+                x: 0,
+                y: 0,
+                cols,
+                rows: 1,
+            },
+            (0, 0),
+            String::new(),
+            FrameParams {
+                focused_client: None,
+                is_main_client: true,
+                other_focused_clients: vec![],
+                style: Style::default(),
+                color: None,
+                other_cursors_exist_in_session: false,
+                pane_is_stacked_over: false,
+                pane_is_stacked_under: false,
+                pane_is_stacked: true,
+                should_draw_pane_frames: false,
+                pane_is_floating: false,
+                content_offset: Offset::default(),
+                mouse_is_hovering_over_pane: false,
+                pane_is_selectable: true,
+                show_help_text: false,
+                highlight_tooltip: None,
+                omit_title: false,
+                frame_geom_override: None,
+                stack_list_entry: Some(StackListEntry {
+                    width: label.width(),
+                    label: label.to_owned(),
+                    is_selected,
+                    is_emphasized: false,
+                    stack_is_focused: true,
+                }),
+                blank_title: false,
+                pane_handle: String::new(),
+                pane_note: None,
+                top_only_frames,
+                mouse_scroll_resize: false,
+                mouse_hover_tips: false,
+                dimmed: false,
+                guest_choice_indicator: None,
+            },
+        );
+        let (chunks, _) = frame.render().unwrap();
+        characters_to_string(&chunks[0].terminal_characters)
+    }
+
+    // Fork addition: a stack list row is the title line of the pane it names, so `top_only` rules
+    // it the way it rules every other title line.
+    #[test]
+    fn a_stack_list_row_is_a_rule_under_top_only() {
+        let row = stack_list_row(30, "editor", false, true);
+        assert!(
+            row.starts_with('─') && row.ends_with('─'),
+            "top_only fills the room around the entry with its rule, got: {:?}",
+            row
+        );
+        assert!(
+            row.contains("│ editor │"),
+            "the entry itself is unchanged, got: {:?}",
+            row
+        );
+        assert!(
+            row.contains("─│ editor │─"),
+            "and nothing blank is left beside it, got: {:?}",
+            row
+        );
+    }
+
+    #[test]
+    fn a_selected_stack_list_row_keeps_its_marker_under_top_only() {
+        let row = stack_list_row(30, "editor", true, true);
+        assert!(
+            row.contains("> │ editor │"),
+            "the selection marker outranks the fill, got: {:?}",
+            row
+        );
+        assert!(
+            row.starts_with('─') && row.ends_with('─'),
+            "and the rest of the row is still the rule, got: {:?}",
+            row
+        );
+    }
+
+    #[test]
+    fn a_stack_list_row_is_blank_around_the_entry_in_every_other_style() {
+        let row = stack_list_row(30, "editor", false, false);
+        assert!(
+            !row.contains('─'),
+            "only top_only draws a rule here, got: {:?}",
+            row
+        );
+        assert!(
+            row.starts_with(' ') && row.ends_with(' '),
+            "the room around the entry stays blank, got: {:?}",
+            row
+        );
+        assert!(
+            row.contains("│ editor │"),
+            "the entry itself is unchanged, got: {:?}",
+            row
+        );
     }
 
     /// A frame with a title, a handle and an optional scroll position, in either frame style.
