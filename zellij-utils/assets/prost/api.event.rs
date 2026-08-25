@@ -817,6 +817,8 @@ pub struct PaneInfo {
     pub handle: ::prost::alloc::string::String,
     #[prost(uint32, tag="47")]
     pub tab_id: u32,
+    #[prost(uint32, repeated, tag="48")]
+    pub focused_by_client_ids: ::prost::alloc::vec::Vec<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

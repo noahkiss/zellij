@@ -2125,6 +2125,11 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             restored_from: protobuf_pane_info.restored_from,
             handle: protobuf_pane_info.handle,
             tab_id: protobuf_pane_info.tab_id as usize,
+            focused_by_client_ids: protobuf_pane_info
+                .focused_by_client_ids
+                .into_iter()
+                .map(|client_id| client_id as ClientId)
+                .collect(),
             pane_cwd: protobuf_pane_info.pane_cwd,
             pane_pid: protobuf_pane_info.pane_pid,
             pane_command: protobuf_pane_info.pane_command,
@@ -2196,6 +2201,11 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             restored_from: pane_info.restored_from,
             handle: pane_info.handle,
             tab_id: pane_info.tab_id as u32,
+            focused_by_client_ids: pane_info
+                .focused_by_client_ids
+                .into_iter()
+                .map(|client_id| client_id as u32)
+                .collect(),
             pane_cwd: pane_info.pane_cwd,
             pane_pid: pane_info.pane_pid,
             pane_command: pane_info.pane_command,
@@ -3351,6 +3361,7 @@ fn serialize_session_update_event_with_non_default_values() {
             note: String::new(),
             note_color: Default::default(),
             tab_id: 7,
+            focused_by_client_ids: vec![1, 2],
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -3404,6 +3415,7 @@ fn serialize_session_update_event_with_non_default_values() {
             note: String::new(),
             note_color: Default::default(),
             tab_id: 7,
+            focused_by_client_ids: vec![1, 2],
             id: 1,
             is_plugin: true,
             is_focused: true,

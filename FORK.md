@@ -6240,6 +6240,43 @@ The events cross the plugin API: `event.proto` gains `EventType` values 55–60 
 49–54, with regenerated prost output and both `TryFrom` implementations. The client/server contract
 is untouched.
 
+### Which clients are looking at a pane
+
+```
+zellij action list-panes --all --json | jq '.[] | {id, is_focused, focused_by_client_ids}'
+```
+
+`PaneInfo.is_focused` is one boolean for the whole session, so with two clients attached — a human
+and an agent, which is the normal case here — a consumer could not tell who was looking at what. It
+could invert `SessionInfo.pane_history` or ask `list-clients`, but both need a second lookup and the
+first keeps entries for clients that have gone.
+
+`PaneInfo` now carries `focused_by_client_ids`: the connected clients focused on this pane,
+ascending. `is_focused` is unchanged and is the same answer collapsed — true exactly when the list
+is not empty. Empty for a suppressed pane, and for a pane whose only focused client has detached: a
+detached client keeps its place in the focus map so it lands back where it was, but nobody is
+looking through it.
+
+The state was already there. `ActivePanes` is a per-client focus map, and
+[`is_focused` names a client that is still here](#is_focused-names-a-client-that-is-still-here)
+already established the connected-clients filter this reads through; this is the same lookup kept as
+a list rather than collapsed to a yes.
+
+**A focus move inside a tab now refreshes the manifest.** Moving focus between panes of one tab only
+renders — it never rebuilt the pane state — so `is_focused` described the focus the session had
+before the move until something else happened to report. The render path now rebuilds the manifest
+when the focus diff says somebody moved. `Event::FocusChanged` is the push complement; this is the
+snapshot.
+
+**No client list is added to `SessionInfo`.** The survey paired this with one, but
+`SessionInfo.pane_history` already names every client and the last entry of each is its focused
+pane, and `Event::ListClients` / `zellij action list-clients` answer the same question with a
+running command attached. A third copy would cost a protobuf tag to say what is already said.
+
+The field crosses the plugin API: `event.proto` tag 48, regenerated prost output, both `TryFrom`
+implementations, and the KDL codec behind `session-metadata.kdl` — written beside `is_focused` only
+when it says something, and read back optionally. The client/server contract is untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
