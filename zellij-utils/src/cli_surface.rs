@@ -351,6 +351,18 @@ pub fn promised_output_keys(command: &str) -> Option<&'static str> {
         .filter(|keys| !keys.is_empty())
 }
 
+/// The shape a command's stdout takes, or `None` for one that prints nothing when it succeeds.
+///
+/// Exported because `--json` is a question about the shape: a record becomes an object, and a
+/// payload has nothing to structure. Reading it here rather than listing the verbs again is what
+/// keeps the two answers from drifting apart.
+pub fn output_shape(command: &str) -> Option<&'static str> {
+    OUTPUTS
+        .iter()
+        .find(|o| o.command == command)
+        .map(|o| o.shape)
+}
+
 /// The conventions, said once, at the top of `zellij action --help`.
 pub const ACTION_PREAMBLE: &str = "\
 Send an action to a session: the one you are in, or the one `--session` names.
@@ -360,9 +372,12 @@ How every one of these answers:
   * A single record is `key: value` lines. A list of like things is a table with an UPPER_SNAKE
     header row. A nesting of them is an indented outline. Keys and columns are append-only:
     a release may add one, never rename or remove one.
-  * `--json` carries the same information, structured, wherever it is offered: `ls`, `list-panes`,
-    `list-tabs`, `list-tree`, `list-clients`, `list-events` and `current-tab-info`. The other
-    reads and every mutation print their own shape only.
+  * `--json` carries the same information, structured. Seven verbs take it after their own name -
+    `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents` and
+    `current-tab-info` - and every verb that reports a record takes it BEFORE the verb, as
+    `zellij action --json close-pane --pane-id sunny-otter`, which answers `{\"closed\":
+    \"terminal_3\"}`. For those seven the two positions are the same call. A verb that reports
+    nothing answers `{}`; `dump-screen` and `dump-layout` print a payload and refuse the flag.
   * Results go to stdout, diagnostics go to stderr, and a payload command prints its payload
     alone.
   * Exit 0 acted or found, 1 error, 2 the command changed nothing. That 2 covers every way a

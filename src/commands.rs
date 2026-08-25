@@ -782,6 +782,7 @@ pub(crate) fn send_action_to_session(
     cli_action: zellij_utils::cli::CliAction,
     requested_session_name: Option<String>,
     config: Option<Config>,
+    output_json: bool,
 ) {
     match get_active_session() {
         ActiveSession::None => {
@@ -796,7 +797,7 @@ pub(crate) fn send_action_to_session(
                     ));
                 }
             }
-            attach_with_cli_client(cli_action, &session_name, config);
+            attach_with_cli_client(cli_action, &session_name, config, output_json);
         },
         ActiveSession::Many => {
             let existing_sessions: Vec<String> = get_sessions()
@@ -806,7 +807,7 @@ pub(crate) fn send_action_to_session(
                 .collect();
             if let Some(session_name) = requested_session_name {
                 if existing_sessions.contains(&session_name) {
-                    attach_with_cli_client(cli_action, &session_name, config);
+                    attach_with_cli_client(cli_action, &session_name, config, output_json);
                 } else {
                     no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
@@ -814,7 +815,7 @@ pub(crate) fn send_action_to_session(
                     ));
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
-                attach_with_cli_client(cli_action, &session_name, config);
+                attach_with_cli_client(cli_action, &session_name, config, output_json);
             } else {
                 no_session_answers_to(
                     "Please specify the session name to send actions to. The following sessions \
@@ -949,7 +950,29 @@ fn attach_with_cli_client(
     cli_action: zellij_utils::cli::CliAction,
     session_name: &str,
     config: Option<Config>,
+    output_json: bool,
 ) {
+    // `action --json` is answered in one of two places, and which one is a question about the verb.
+    // A verb that already prints JSON owns the flag, so it is simply turned on and nothing else
+    // changes; every other reporting verb prints a record, which the client structures. A payload
+    // has no keys to structure, so it is refused here rather than answered with something wrong.
+    let mut cli_action = cli_action;
+    let mut structure_report = false;
+    if output_json && !cli_action.set_output_json() {
+        let verb = cli_action.verb();
+        match zellij_utils::cli_surface::output_shape(&format!("action {}", verb)) {
+            Some(shape) if shape != "record" => {
+                eprintln!(
+                    "`{}` prints a {}, which has no keys to answer with. `--json` is for the \
+                     verbs that report a record.",
+                    verb, shape
+                );
+                std::process::exit(2);
+            },
+            _ => structure_report = true,
+        }
+    }
+    let cli_action = cli_action;
     // an action is the usual way a script meets a session, so it is where a stale server is usually
     // met too - the warning costs one process scan and changes nothing about the action
     zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
@@ -1076,6 +1099,7 @@ fn attach_with_cli_client(
             condition,
             // `--timeout 0` is the caller asking, by name, for a wait that can hang
             (*timeout > 0).then(|| Duration::from_secs(*timeout)),
+            structure_report,
         );
         std::process::exit(exit_status);
     }
@@ -1203,6 +1227,7 @@ fn attach_with_cli_client(
                 anchor_pane,
                 chosen_handle,
                 pipe_timeout,
+                structure_report,
             );
             if should_archive {
                 match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)

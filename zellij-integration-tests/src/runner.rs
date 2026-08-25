@@ -501,6 +501,8 @@ impl TestSession {
                     // no `--handle`: the pane keeps the one it named itself
                     None,
                     pipe_timeout,
+                    // no `action --json`: the harness reads the report's own lines
+                    false,
                 )
             })
             .unwrap()

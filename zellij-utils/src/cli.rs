@@ -150,8 +150,19 @@ pub enum Command {
     ///
     /// `zellij action --help` states the conventions every one of these verbs follows.
     #[clap(visible_alias = "ac")]
-    #[clap(subcommand)]
-    Action(Box<CliAction>),
+    Action {
+        /// Answer in JSON instead of the shape this verb prints. It goes BEFORE the verb, because
+        /// the seven verbs that were already answering in JSON own the trailing `--json`
+        /// themselves - and for those `zellij action --json list-panes` and `zellij action
+        /// list-panes --json` are the same call. A verb that reports a record answers one object; one
+        /// that reports nothing answers `{}`; a verb that prints a payload refuses, because a
+        /// payload has nothing to structure
+        #[clap(long)]
+        json: bool,
+
+        #[clap(subcommand)]
+        action: Box<CliAction>,
+    },
 
     /// Explore existing zellij sessions
     #[clap(flatten)]
@@ -1064,7 +1075,7 @@ impl Default for WaitFor {
     }
 }
 
-#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize, strum_macros::Display)]
 pub enum CliAction {
     /// Block until a pane does something, then say what it did
     ///
@@ -2667,6 +2678,45 @@ impl CliAction {
         }
     }
 
+    /// The verb this action is, spelled the way it is typed: `NewPane` is `new-pane`.
+    ///
+    /// The variant name is the one clap derives the verb from, so the two cannot drift; the
+    /// kebab-casing is the same rule clap's derive applies. It is how a caller looks the verb up
+    /// in [`crate::cli_surface`], which is keyed by the typed name.
+    pub fn verb(&self) -> String {
+        let name = self.to_string();
+        let mut verb = String::with_capacity(name.len() + 4);
+        for (index, character) in name.chars().enumerate() {
+            if character.is_uppercase() && index > 0 {
+                verb.push('-');
+            }
+            verb.extend(character.to_lowercase());
+        }
+        verb
+    }
+
+    /// Turns on the verb's OWN `--json`, and says whether it had one.
+    ///
+    /// The seven verbs that already answer in JSON own the flag, and `zellij action --json
+    /// list-panes` is meant to be the same call as `zellij action list-panes --json` rather than a
+    /// second JSON shape for the same command. `false` means the verb has no JSON of its own, and
+    /// the report it prints is structured by the client instead.
+    pub fn set_output_json(&mut self) -> bool {
+        match self {
+            CliAction::ListPanes { json, .. }
+            | CliAction::ListTabs { json, .. }
+            | CliAction::ListTree { json, .. }
+            | CliAction::ListClients { json, .. }
+            | CliAction::ListEvents { json, .. }
+            | CliAction::ListAgents { json, .. }
+            | CliAction::CurrentTabInfo { json, .. } => {
+                *json = true;
+                true
+            },
+            _ => false,
+        }
+    }
+
     /// The tab `--in-tab` named, for the caller that can ask the session which tab that is.
     ///
     /// The flag takes a name or a stable id, and neither can be turned into the `--tab-id` the
@@ -3171,7 +3221,7 @@ mod tests {
         full_args.extend(args.iter().map(|a| a.to_string()));
         let cli = parse_cli(full_args).unwrap();
         match cli.command {
-            Some(Command::Action(action)) => *action,
+            Some(Command::Action { action, .. }) => *action,
             other => panic!("Expected Action, got {:?}", other),
         }
     }
@@ -4019,6 +4069,81 @@ mod tests {
         // the negative control: no other verb has a pipe deadline to give up
         let mut other = parse_action(&["new-pane"]);
         assert_eq!(other.take_pipe_timeout(), None);
+    }
+
+    #[test]
+    fn a_verb_names_itself_the_way_it_is_typed() {
+        // the name the surface table is keyed by, derived from the same variant clap derives the
+        // verb from, so a renamed verb cannot keep an old shape entry alive
+        assert_eq!(parse_action(&["new-pane"]).verb(), "new-pane");
+        assert_eq!(
+            parse_action(&["go-to-tab-name", "logs"]).verb(),
+            "go-to-tab-name"
+        );
+        assert_eq!(parse_action(&["detach"]).verb(), "detach");
+        // and every verb it names is one the shape table or the band list knows, which is what
+        // stops `--json` from asking about a command spelled a way nothing answers to
+        for args in [vec!["dump-screen"], vec!["close-pane"], vec!["list-panes"]] {
+            let verb = parse_action(&args).verb();
+            assert!(
+                crate::cli_surface::band_of(&verb).is_some(),
+                "`{}` is not in any band",
+                verb
+            );
+        }
+    }
+
+    #[test]
+    fn the_verbs_that_already_print_json_own_the_flag() {
+        // `zellij action --json list-panes` is the same call as `zellij action list-panes --json`,
+        // rather than a second JSON shape for one command
+        for args in [
+            vec!["list-panes"],
+            vec!["list-tabs"],
+            vec!["list-tree"],
+            vec!["list-clients"],
+            vec!["list-events"],
+            vec!["list-agents"],
+            vec!["current-tab-info"],
+        ] {
+            let mut action = parse_action(&args);
+            assert!(
+                action.set_output_json(),
+                "`{}` prints JSON of its own and did not take the flag",
+                args[0]
+            );
+        }
+        // the negative control: a mutation has no JSON of its own, and its record is structured by
+        // the client instead
+        assert!(!parse_action(&["close-pane", "--pane-id", "terminal_1"]).set_output_json());
+        assert!(!parse_action(&["dump-screen"]).set_output_json());
+    }
+
+    #[test]
+    fn a_json_answer_is_offered_for_a_record_and_refused_for_a_payload() {
+        // the two sides of the refusal in `attach_with_cli_client`, read off the shape table so
+        // the flag and the printer cannot disagree about what a verb answers with
+        for verb in ["close-pane", "new-pane", "move-tab", "wait"] {
+            assert_eq!(
+                crate::cli_surface::output_shape(&format!("action {}", verb)),
+                Some("record"),
+                "`{}` is answered as a record",
+                verb
+            );
+        }
+        for verb in ["dump-screen", "dump-layout"] {
+            assert_eq!(
+                crate::cli_surface::output_shape(&format!("action {}", verb)),
+                Some("payload"),
+                "`{}` has no keys to answer with",
+                verb
+            );
+        }
+        // a verb that prints nothing has no entry at all, and answers `{}`
+        assert_eq!(
+            crate::cli_surface::output_shape("action toggle-floating-panes"),
+            None
+        );
     }
 
     #[test]
