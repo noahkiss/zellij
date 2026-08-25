@@ -679,6 +679,215 @@ mod web_client_tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_bearer_header_is_the_same_credential_without_a_cookie_jar() {
+        let _ = delete_db();
+
+        let test_token_name = "test_token_bearer";
+        let (auth_token, _) = create_token(Some(test_token_name.to_string()), false)
+            .expect("Failed to create test token");
+
+        let session_manager = Arc::new(MockSessionManager::new());
+        let client_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+
+        let config = Config::default();
+        let options = Options::default();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let temp_config_path = std::env::temp_dir().join("test_config.kdl");
+        let server_handle = tokio::spawn(async move {
+            serve_web_client(
+                config,
+                options,
+                Some(temp_config_path),
+                listener,
+                None,
+                Some(session_manager),
+                Some(client_os_api_factory),
+                addr.ip(),
+                port,
+            )
+            .await;
+        });
+
+        wait_for_server(port, Duration::from_secs(5))
+            .await
+            .expect("Server failed to start");
+
+        // a headless login hands the token back in the body and sets no cookie: there is no jar
+        // for one, and a caller that asked for the token is the only one that gets it
+        let login_url = format!("http://127.0.0.1:{}/command/login", port);
+        let login_payload = serde_json::json!({
+            "auth_token": auth_token,
+            "headless": true
+        });
+        let mut response = timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                isahc::Request::post(&login_url)
+                    .header("Content-Type", "application/json")
+                    .body(login_payload.to_string())
+                    .unwrap()
+                    .send()
+            }),
+        )
+        .await
+        .expect("Login request timed out")
+        .expect("Spawn blocking failed")
+        .expect("Login request failed");
+
+        assert!(response.status().is_success());
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "a headless login has one credential channel, and it is the body"
+        );
+        let response_json: serde_json::Value =
+            serde_json::from_str(&response.text().expect("Failed to read response body"))
+                .expect("Failed to parse JSON");
+        let session_token = response_json["session_token"]
+            .as_str()
+            .expect("a headless login answers with the session token")
+            .to_string();
+
+        // that token, in the header, reaches an authenticated route with no cookie at all
+        let session_url = format!("http://127.0.0.1:{}/session", port);
+        let authorized = session_url.clone();
+        let bearer = format!("Bearer {}", session_token);
+        let response = timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                isahc::Request::post(&authorized)
+                    .header("Authorization", bearer)
+                    .body("{}")
+                    .unwrap()
+                    .send()
+            }),
+        )
+        .await
+        .expect("Session request timed out")
+        .expect("Spawn blocking failed")
+        .expect("Session request failed");
+        assert!(
+            response.status().is_success(),
+            "a valid session token in the header authenticates the same as one in the cookie"
+        );
+
+        // and the header is not a way past validation: a token nothing issued is still refused,
+        // and so is a scheme that is not Bearer
+        for header in [
+            "Bearer 00000000-0000-4000-8000-000000000000".to_string(),
+            "Bearer ".to_string(),
+            format!("Basic {}", session_token),
+            session_token.clone(),
+        ] {
+            let refused = session_url.clone();
+            let response = timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    isahc::Request::post(&refused)
+                        .header("Authorization", header)
+                        .body("{}")
+                        .unwrap()
+                        .send()
+                }),
+            )
+            .await
+            .expect("Session request timed out")
+            .expect("Spawn blocking failed")
+            .expect("Session request failed");
+            assert_eq!(
+                response.status(),
+                401,
+                "only a valid session token presented as Bearer is accepted"
+            );
+        }
+
+        let _ = revoke_token(test_token_name);
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_browser_login_still_meets_its_token_only_in_the_cookie() {
+        let _ = delete_db();
+
+        let test_token_name = "test_token_no_body_leak";
+        let (auth_token, _) = create_token(Some(test_token_name.to_string()), false)
+            .expect("Failed to create test token");
+
+        let session_manager = Arc::new(MockSessionManager::new());
+        let client_os_api_factory = Arc::new(MockClientOsApiFactory::new());
+
+        let config = Config::default();
+        let options = Options::default();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        let temp_config_path = std::env::temp_dir().join("test_config.kdl");
+        let server_handle = tokio::spawn(async move {
+            serve_web_client(
+                config,
+                options,
+                Some(temp_config_path),
+                listener,
+                None,
+                Some(session_manager),
+                Some(client_os_api_factory),
+                addr.ip(),
+                port,
+            )
+            .await;
+        });
+
+        wait_for_server(port, Duration::from_secs(5))
+            .await
+            .expect("Server failed to start");
+
+        let login_url = format!("http://127.0.0.1:{}/command/login", port);
+        let login_payload = serde_json::json!({
+            "auth_token": auth_token,
+            "remember_me": false
+        });
+        let mut response = timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                isahc::Request::post(&login_url)
+                    .header("Content-Type", "application/json")
+                    .body(login_payload.to_string())
+                    .unwrap()
+                    .send()
+            }),
+        )
+        .await
+        .expect("Login request timed out")
+        .expect("Spawn blocking failed")
+        .expect("Login request failed");
+
+        assert!(response.status().is_success());
+        assert!(
+            response.headers().get("set-cookie").is_some(),
+            "an ordinary login still delivers the token as a cookie"
+        );
+        let response_json: serde_json::Value =
+            serde_json::from_str(&response.text().expect("Failed to read response body"))
+                .expect("Failed to parse JSON");
+        assert!(
+            response_json.get("session_token").is_none(),
+            "the cookie is HttpOnly so a page script cannot read the token; the body must not \
+             hand it over instead: {}",
+            response_json
+        );
+
+        let _ = revoke_token(test_token_name);
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_unauthorized_access_without_session() {
         let _ = delete_db();
 

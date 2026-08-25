@@ -6366,6 +6366,34 @@ printed before: the whole feature is in the client's printer, so no action, no m
 of the client/server contract changed. `zellij run`, `zellij edit` and `zellij pipe` are their own
 top-level commands rather than `action` verbs, and do not take it.
 
+### The web server takes a token in a header, and keeps an active session alive
+
+Two changes to how an EXISTING session token may be presented. Neither widens who can get one:
+`/command/login` still takes an auth token that `zellij web --create-token` made, still refuses
+anything else, and still issues exactly the token it issued before.
+
+**`Authorization: Bearer <session token>` is accepted where the cookie was the only way.** The
+cookie is still tried first, so nothing about a browser changes. The header carries the same
+credential, validated by the same call, and it exists because a program driving the web server had
+to keep a cookie jar to talk to it. A scheme that is not `Bearer`, an empty token, and a token
+nothing issued are each refused with the `401` they always got.
+
+**A headless login hands the token back instead of setting a cookie.** A caller with no jar had no
+way to hold the token at all, because the login answered only with `Set-Cookie`. Sending
+`"headless": true` in the login body returns `session_token` in the response and sets no cookie —
+one login, one channel. A browser login is untouched and its response body still carries no token:
+the cookie is `HttpOnly` precisely so a page script cannot read it, and putting the token in the
+body unasked would hand it to any script on the page.
+
+**A short-lived token now lives five minutes from its last use rather than from the login.** A
+login without `remember_me` issued a token that expired five minutes later whatever the user was
+doing, so an open session was logged out mid-use. Every request that presents a valid token pushes
+its expiry back out to the full window. Three things it deliberately does not do: it cannot
+resurrect an expired token, because "still valid" is part of the same statement that extends it; it
+leaves `remember_me` tokens alone, since sliding a four-week token would make it live forever; and
+it writes only once the token is in the last half of its window, so a busy session does not write a
+row per request.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
