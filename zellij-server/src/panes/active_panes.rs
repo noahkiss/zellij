@@ -133,4 +133,25 @@ impl ActivePanes {
             .iter()
             .any(|(client_id, focused)| focused == pane_id && connected_clients.contains(client_id))
     }
+    /// Which of the connected clients are focused on this pane, ascending.
+    ///
+    /// The same map and the same connected filter as above, kept as a list rather than collapsed
+    /// to a yes: with a human and an agent attached, "is this pane focused" has two answers and a
+    /// consumer usually wants to know whose.
+    pub fn connected_clients_focused_on_pane(
+        &self,
+        pane_id: &PaneId,
+        connected_clients: &HashSet<ClientId>,
+    ) -> Vec<ClientId> {
+        let mut client_ids: Vec<ClientId> = self
+            .active_panes
+            .iter()
+            .filter(|(client_id, focused)| {
+                *focused == pane_id && connected_clients.contains(client_id)
+            })
+            .map(|(client_id, _)| *client_id)
+            .collect();
+        client_ids.sort_unstable();
+        client_ids
+    }
 }
