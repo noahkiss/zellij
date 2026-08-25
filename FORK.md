@@ -343,7 +343,7 @@ of what moved to get there.
 | `list-tabs` | every column, always. The gating flags stay accepted and do nothing |
 | `list-clients` | gains `TTY`, `SIZE` and `CURRENT` — the fields that were reachable only through `--json` |
 | `ls` | a table: `NAME STATUS CURRENT CLIENTS CREATED`. `-s` is untouched |
-| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2 — including with nobody attached, where `go-to-tab` used to queue the switch for a tab that was never coming and exit 0. `--no-focus` stays the existence probe, answering `id: <n>` |
+| `go-to-tab`, `go-to-tab-name`, `go-to-tab-by-id` | print `from:` and `to:`, each `<tab id> <tab name>`. A target nothing answers to exits 2 — including with nobody attached, where `go-to-tab` used to queue the switch for a tab that was never coming and exit 0, and where `go-to-tab-by-id` asked about the client first and so reported its miss only while somebody was attached. A tab that is really there and nothing attached to move to it is not a miss but is still nothing done: `go-to-tab-name` and `go-to-tab-by-id` both say they have no client to move, exit 2. `--no-focus` stays the existence probe, answering `id: <n>` |
 | `close-pane` | `closed: terminal_3`, with or without `--pane-id`. A pane id nothing answers to exits 2 with `No pane answers to 'terminal_9'`. Without `--pane-id` on a session nothing is attached to, nothing holds the focus, so that too is a miss |
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
