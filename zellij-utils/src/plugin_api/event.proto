@@ -80,6 +80,12 @@ enum EventType {
     PaneOpened = 52;
     PaneExited = 53;
     PluginDied = 54;
+    TabAdded = 55;
+    TabRemoved = 56;
+    TabRenamed = 57;
+    FocusChanged = 58;
+    ClientAttached = 59;
+    ClientDetached = 60;
 }
 
 message EventNameList {
@@ -139,6 +145,12 @@ message Event {
     PaneOpenedPayload pane_opened_payload = 46;
     PaneExitedPayload pane_exited_payload = 47;
     PluginDiedPayload plugin_died_payload = 48;
+    TabAddedPayload tab_added_payload = 49;
+    TabRemovedPayload tab_removed_payload = 50;
+    TabRenamedPayload tab_renamed_payload = 51;
+    FocusChangedPayload focus_changed_payload = 52;
+    ClientAttachedPayload client_attached_payload = 53;
+    ClientDetachedPayload client_detached_payload = 54;
   }
 }
 
@@ -286,6 +298,35 @@ message PaneExitedPayload {
 message PluginDiedPayload {
   uint32 plugin_id = 1;
   string message = 2;
+}
+
+message TabAddedPayload {
+  uint32 tab_id = 1;
+  uint32 position = 2;
+  string name = 3;
+}
+
+message TabRemovedPayload {
+  uint32 tab_id = 1;
+}
+
+message TabRenamedPayload {
+  uint32 tab_id = 1;
+  string name = 2;
+}
+
+message FocusChangedPayload {
+  uint32 client_id = 1;
+  PaneId pane_id = 2;
+  uint32 tab_id = 3;
+}
+
+message ClientAttachedPayload {
+  uint32 client_id = 1;
+}
+
+message ClientDetachedPayload {
+  uint32 client_id = 1;
 }
 
 // duplicate of plugin_command.PaneId because protobuffs don't like recursive imports

@@ -334,6 +334,56 @@ impl TryFrom<ProtobufEvent> for Event {
                 ),
                 _ => Err("Malformed payload for the PluginDied Event"),
             },
+            Some(ProtobufEventType::TabAdded) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::TabAddedPayload(tab_added_payload)) => {
+                    Ok(Event::TabAdded(
+                        tab_added_payload.tab_id as usize,
+                        tab_added_payload.position as usize,
+                        tab_added_payload.name,
+                    ))
+                },
+                _ => Err("Malformed payload for the TabAdded Event"),
+            },
+            Some(ProtobufEventType::TabRemoved) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::TabRemovedPayload(tab_removed_payload)) => {
+                    Ok(Event::TabRemoved(tab_removed_payload.tab_id as usize))
+                },
+                _ => Err("Malformed payload for the TabRemoved Event"),
+            },
+            Some(ProtobufEventType::TabRenamed) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::TabRenamedPayload(tab_renamed_payload)) => {
+                    Ok(Event::TabRenamed(
+                        tab_renamed_payload.tab_id as usize,
+                        tab_renamed_payload.name,
+                    ))
+                },
+                _ => Err("Malformed payload for the TabRenamed Event"),
+            },
+            Some(ProtobufEventType::FocusChanged) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::FocusChangedPayload(focus_changed_payload)) => {
+                    let pane_id = focus_changed_payload
+                        .pane_id
+                        .ok_or("Malformed payload for the FocusChanged Event")?;
+                    Ok(Event::FocusChanged(
+                        focus_changed_payload.client_id as ClientId,
+                        PaneId::try_from(pane_id)?,
+                        focus_changed_payload.tab_id as usize,
+                    ))
+                },
+                _ => Err("Malformed payload for the FocusChanged Event"),
+            },
+            Some(ProtobufEventType::ClientAttached) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::ClientAttachedPayload(client_attached_payload)) => Ok(
+                    Event::ClientAttached(client_attached_payload.client_id as ClientId),
+                ),
+                _ => Err("Malformed payload for the ClientAttached Event"),
+            },
+            Some(ProtobufEventType::ClientDetached) => match protobuf_event.payload {
+                Some(ProtobufEventPayload::ClientDetachedPayload(client_detached_payload)) => Ok(
+                    Event::ClientDetached(client_detached_payload.client_id as ClientId),
+                ),
+                _ => Err("Malformed payload for the ClientDetached Event"),
+            },
             Some(ProtobufEventType::EditPaneOpened) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::EditPaneOpenedPayload(command_pane_opened_payload)) => {
                     Ok(Event::EditPaneOpened(
@@ -1078,6 +1128,51 @@ impl TryFrom<Event> for ProtobufEvent {
                     plugin_id,
                     message,
                 })),
+            }),
+            Event::TabAdded(tab_id, position, name) => Ok(ProtobufEvent {
+                name: ProtobufEventType::TabAdded as i32,
+                payload: Some(event::Payload::TabAddedPayload(TabAddedPayload {
+                    tab_id: tab_id as u32,
+                    position: position as u32,
+                    name,
+                })),
+            }),
+            Event::TabRemoved(tab_id) => Ok(ProtobufEvent {
+                name: ProtobufEventType::TabRemoved as i32,
+                payload: Some(event::Payload::TabRemovedPayload(TabRemovedPayload {
+                    tab_id: tab_id as u32,
+                })),
+            }),
+            Event::TabRenamed(tab_id, name) => Ok(ProtobufEvent {
+                name: ProtobufEventType::TabRenamed as i32,
+                payload: Some(event::Payload::TabRenamedPayload(TabRenamedPayload {
+                    tab_id: tab_id as u32,
+                    name,
+                })),
+            }),
+            Event::FocusChanged(client_id, pane_id, tab_id) => Ok(ProtobufEvent {
+                name: ProtobufEventType::FocusChanged as i32,
+                payload: Some(event::Payload::FocusChangedPayload(FocusChangedPayload {
+                    client_id: client_id as u32,
+                    pane_id: Some(pane_id.try_into()?),
+                    tab_id: tab_id as u32,
+                })),
+            }),
+            Event::ClientAttached(client_id) => Ok(ProtobufEvent {
+                name: ProtobufEventType::ClientAttached as i32,
+                payload: Some(event::Payload::ClientAttachedPayload(
+                    ClientAttachedPayload {
+                        client_id: client_id as u32,
+                    },
+                )),
+            }),
+            Event::ClientDetached(client_id) => Ok(ProtobufEvent {
+                name: ProtobufEventType::ClientDetached as i32,
+                payload: Some(event::Payload::ClientDetachedPayload(
+                    ClientDetachedPayload {
+                        client_id: client_id as u32,
+                    },
+                )),
             }),
             Event::PaneExited(pane_id, exit_status) => Ok(ProtobufEvent {
                 name: ProtobufEventType::PaneExited as i32,
@@ -2493,6 +2588,12 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::PaneOpened => EventType::PaneOpened,
             ProtobufEventType::PaneExited => EventType::PaneExited,
             ProtobufEventType::PluginDied => EventType::PluginDied,
+            ProtobufEventType::TabAdded => EventType::TabAdded,
+            ProtobufEventType::TabRemoved => EventType::TabRemoved,
+            ProtobufEventType::TabRenamed => EventType::TabRenamed,
+            ProtobufEventType::FocusChanged => EventType::FocusChanged,
+            ProtobufEventType::ClientAttached => EventType::ClientAttached,
+            ProtobufEventType::ClientDetached => EventType::ClientDetached,
             ProtobufEventType::EditPaneOpened => EventType::EditPaneOpened,
             ProtobufEventType::EditPaneExited => EventType::EditPaneExited,
             ProtobufEventType::CommandPaneReRun => EventType::CommandPaneReRun,
@@ -2556,6 +2657,12 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::PaneOpened => ProtobufEventType::PaneOpened,
             EventType::PaneExited => ProtobufEventType::PaneExited,
             EventType::PluginDied => ProtobufEventType::PluginDied,
+            EventType::TabAdded => ProtobufEventType::TabAdded,
+            EventType::TabRemoved => ProtobufEventType::TabRemoved,
+            EventType::TabRenamed => ProtobufEventType::TabRenamed,
+            EventType::FocusChanged => ProtobufEventType::FocusChanged,
+            EventType::ClientAttached => ProtobufEventType::ClientAttached,
+            EventType::ClientDetached => ProtobufEventType::ClientDetached,
             EventType::EditPaneOpened => ProtobufEventType::EditPaneOpened,
             EventType::EditPaneExited => ProtobufEventType::EditPaneExited,
             EventType::CommandPaneReRun => ProtobufEventType::CommandPaneReRun,
@@ -3785,6 +3892,31 @@ mod tests {
         let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
         let roundtripped: Event = protobuf.try_into().unwrap();
         assert_eq!(event, roundtripped);
+    }
+
+    #[test]
+    fn the_structural_lifecycle_events_roundtrip_through_protobuf() {
+        let events = vec![
+            Event::TabAdded(3, 1, "develop".to_owned()),
+            Event::TabRemoved(3),
+            Event::TabRenamed(3, "renamed".to_owned()),
+            Event::FocusChanged(2, PaneId::Plugin(7), 3),
+            Event::ClientAttached(2),
+            Event::ClientDetached(2),
+        ];
+        // each one also has to reach the wire under its own name, or a subscriber filtering by
+        // event type gets somebody else's payload
+        let mut names = HashSet::new();
+        for event in events {
+            let protobuf: ProtobufEvent = event.clone().try_into().unwrap();
+            assert!(
+                names.insert(protobuf.name),
+                "{:?} shares a protobuf event name with an earlier one",
+                event
+            );
+            let roundtripped: Event = protobuf.try_into().unwrap();
+            assert_eq!(event, roundtripped);
+        }
     }
 
     #[test]
