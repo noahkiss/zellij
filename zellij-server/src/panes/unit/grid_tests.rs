@@ -11,7 +11,7 @@ use std::rc::Rc;
 use vte;
 use zellij_utils::consts::SCROLL_BUFFER_SIZE;
 use zellij_utils::{
-    data::{Palette, Style},
+    data::{Palette, PaneCommandState, Style},
     input::options::DEFAULT_WORD_SEPARATORS,
     pane_size::SizeInPixels,
     position::Position,
@@ -4143,6 +4143,79 @@ fn viewport_position_of(grid: &Grid, needle: &str) -> Position {
                 .map(|column| Position::new(line as i32, column as u16))
         })
         .unwrap_or_else(|| panic!("{needle:?} not found in viewport"))
+}
+
+#[test]
+fn osc133_command_state_is_none_without_markers() {
+    let grid = create_grid_with_content("$ echo hi\r\nhi\r\n$ ");
+
+    assert_eq!(
+        grid.osc133_command_state(),
+        None,
+        "a shell that writes no markers is not reported as idle"
+    );
+}
+
+#[test]
+fn osc133_command_state_at_a_prompt() {
+    let grid = create_grid_with_content("\x1b]133;A\x07$ \x1b]133;B\x07");
+
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Prompt, None))
+    );
+}
+
+#[test]
+fn osc133_command_state_while_a_command_runs() {
+    let grid = create_grid_with_content(
+        "\x1b]133;A\x07$ \x1b]133;B\x07sleep 900\x1b]133;C\x07\r\nworking",
+    );
+
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Running, None))
+    );
+}
+
+#[test]
+fn osc133_command_state_after_a_command_ends() {
+    let grid = create_grid_with_content(
+        "\x1b]133;A\x07$ \x1b]133;B\x07false\x1b]133;C\x07\r\n\x1b]133;D;1\x07",
+    );
+
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Done, Some(1))),
+        "the exit code the shell reported comes with the end marker"
+    );
+}
+
+#[test]
+fn osc133_command_state_after_an_end_marker_without_a_code() {
+    let grid = create_grid_with_content(
+        "\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D\x07",
+    );
+
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Done, None)),
+        "a shell that reports no code says done and nothing else"
+    );
+}
+
+#[test]
+fn osc133_command_state_follows_the_latest_command() {
+    let grid = create_grid_with_content(
+        "\x1b]133;A\x07$ \x1b]133;B\x07true\x1b]133;C\x07\r\n\x1b]133;D;0\x07\r\n\x1b]133;A\x07$ \
+         \x1b]133;B\x07sleep 900\x1b]133;C\x07\r\n",
+    );
+
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Running, None)),
+        "the finished command does not outrank the one running now"
+    );
 }
 
 #[test]

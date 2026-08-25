@@ -4773,6 +4773,8 @@ mod tests {
             tab_position: 0,
             tab_name: "tab1".to_string(),
             agent: None,
+            command_state: None,
+            last_command_exit_code: None,
         }
     }
 

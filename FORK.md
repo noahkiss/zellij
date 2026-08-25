@@ -6538,6 +6538,55 @@ consumer that must detect it has to notice the session stop rather than wait to 
 is the signal that gets the graceful path (see [The server serializes and archives on
 SIGTERM](#the-server-serializes-and-archives-on-sigterm)), and `zellij session down` sends that one.
 
+### Whether a pane's command is still running (`command_state`)
+
+```
+$ zellij action list-panes --all --json | jq '.[] | {handle, command_state, last_command_exit_code}'
+{"handle":"sunny-otter","command_state":"running"}
+{"handle":"brave-heron","command_state":"done","last_command_exit_code":1}
+{"handle":"quiet-lark","command_state":"prompt"}
+```
+
+A shell that emits OSC 133 says exactly where its prompt starts, where a command's output starts,
+and where the command ended — with its exit code, when it reports one. zellij has parsed those
+markers on the input path for a while and kept them on the row, and used them for one thing: the
+triple-click that selects a command and its output. Nothing could read them.
+
+They are the only exact answer to "is this pane busy". Everything else in the tree infers it: the
+foreground process group (wrong when the shell has job control off — see [What a pane is running,
+when the shell has no job control](#what-a-pane-is-running-when-the-shell-has-no-job-control)), the
+newest child process, `last_output_at` going quiet. Each of those is a guess about a shell that
+knows the answer and is already telling us.
+
+- `command_state` is `prompt` (the shell has drawn a prompt, nothing is running), `running` (a
+  command is producing output and has reported no end) or `done` (the last one ended).
+- `last_command_exit_code` comes with a `done` and only with a `done`, and only when the shell put
+  a code in its end marker.
+- **Both keys are absent for a shell that emits no markers, and for a plugin pane.** Absent means
+  "this pane cannot answer", which is a different thing from `prompt`. A consumer that must work
+  against a bare `sh` still has `last_output_at` and the process columns.
+- The state is read from the last marker in the grid, walking back from the newest row, so it costs
+  a short scan per pane on a command that already builds every pane's info.
+
+#### Why this surface and not a plugin event
+
+Both were assessed. The consumer is a program driving zellij over the CLI, and it already polls
+`list-panes --json` — for the pane list, the handles, `last_output_at` and the agent column. Two
+more keys on a row it is already reading cost that consumer nothing to adopt and cost this fork
+nothing to carry: `PaneListEntry` is CLI-only, so there is no protobuf tag, no regenerated prost
+output, no second `TryFrom` and no plugin-visible contract. It is the cheapest of the three
+surfaces AGENTS.md ranks, and it answers the question that was asked.
+
+A `CommandStateChanged` event was the alternative, riding the pattern the [six lifecycle
+events](#structural-lifecycle-events-tabs-focus-and-clients) just established. It was not built,
+for two reasons. It would cost an `EventType` and a payload tag to tell plugins something no
+plugin here wants, and the CLI consumer — the one that does want it — cannot subscribe to plugin
+events at all. And a push event has to be *detected*, which means diffing every pane's marker state
+on a path that runs at render frequency; the six lifecycle events could be diffed inside
+`log_and_report_session_state` because their state was already being reported there, and this one
+is not. If a plugin ever needs it, the event is a separate patch on top of this one, and this
+patch's grid accessor is what it would read.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
