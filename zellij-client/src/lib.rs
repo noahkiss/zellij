@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use zellij_utils::errors::prelude::Context;
 use zellij_utils::errors::FatalError;
 use zellij_utils::shared::web_server_base_url;
 
@@ -69,6 +70,15 @@ const DISABLE_HOST_THEME_NOTIFY: &str = "\u{1b}[?2031l";
 /// same `CSI ? 997 ; {1|2} n` form as unsolicited notifications, so the
 /// stdin parser handles both uniformly.
 const QUERY_HOST_THEME: &str = "\u{1b}[?996n";
+
+/// Contexts for the teardown calls below. Everything a client does after it has decided to leave
+/// is talking to a terminal that may already be gone - an ssh transport that dropped, a window
+/// that was closed - and on such a tty every one of these calls returns EIO. None of them can
+/// achieve anything at that point, so a failure is logged and stepped over rather than unwrapped.
+/// The startup counterparts stay unguarded on purpose: there the tty is expected live, and a
+/// failure means the client cannot run at all.
+const RAW_MODE_TEARDOWN_ERR: &str = "failed to unset raw mode on the way out";
+const TEARDOWN_WRITE_ERR: &str = "failed to write the teardown message to a terminal that is gone";
 
 /// Spawn an async runtime for this client instance.
 ///
@@ -920,12 +930,18 @@ pub fn start_remote_client(
 
     let reset_controlling_terminal_state = |e: String, exit_status: i32| {
         os_input.disable_mouse().non_fatal();
-        os_input.unset_raw_mode().unwrap();
+        os_input
+            .unset_raw_mode()
+            .context(RAW_MODE_TEARDOWN_ERR)
+            .non_fatal();
         os_input.restore_console_mode();
         let error = terminal_teardown_message(&e, full_screen_ws.rows, true);
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(error.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(error.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
         if exit_status == 0 {
             log::info!("{}", e);
         } else {
@@ -961,8 +977,11 @@ pub fn start_remote_client(
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(clear_screen.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(clear_screen.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
     }
 
     Ok(reconnect_to_session)
@@ -1416,7 +1435,10 @@ pub fn start_client(
 
     let handle_error = |backtrace: String| {
         os_input.disable_mouse().non_fatal();
-        os_input.unset_raw_mode().unwrap();
+        os_input
+            .unset_raw_mode()
+            .context(RAW_MODE_TEARDOWN_ERR)
+            .non_fatal();
         os_input.restore_console_mode();
         let error = terminal_teardown_message(
             &backtrace,
@@ -1424,12 +1446,17 @@ pub fn start_client(
             !explicitly_disable_kitty_keyboard_protocol,
         );
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(error.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(error.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
         std::process::exit(1);
     };
 
     let mut exit_msg = String::new();
+    // Set once a render has failed, which on a tty means the terminal is gone for good.
+    let mut terminal_is_gone = false;
     let mut synchronised_output = SyncOutput::default_for_host(
         os_input.env_variable("TERM").as_deref(),
         os_input.env_variable("ZELLIJ_SYNC_OUTPUT").as_deref(),
@@ -1455,22 +1482,39 @@ pub fn start_client(
             ClientInstruction::Error(backtrace) => {
                 handle_error(backtrace);
             },
+            ClientInstruction::Render(_) if terminal_is_gone => {
+                // Nothing to render into. Keep draining the channel anyway - see below.
+            },
             ClientInstruction::Render(output) => {
                 let mut stdout = os_input.get_stdout_writer();
-                if let Some(sync) = synchronised_output {
-                    stdout
-                        .write_all(sync.start_seq())
-                        .expect("cannot write to stdout");
+                let rendered = (|| -> std::io::Result<()> {
+                    if let Some(sync) = synchronised_output {
+                        stdout.write_all(sync.start_seq())?;
+                    }
+                    stdout.write_all(output.as_bytes())?;
+                    if let Some(sync) = synchronised_output {
+                        stdout.write_all(sync.end_seq())?;
+                    }
+                    stdout.flush()
+                })();
+                if let Err(e) = rendered {
+                    // The terminal we render into is gone - the window was closed, or the ssh
+                    // transport carrying us dropped, and the tty now answers EIO. Panicking here
+                    // aborted the process before it had told the server anything, leaving the
+                    // server to find out only when the socket closed. Ask to be detached instead,
+                    // exactly as a hangup does.
+                    //
+                    // Do NOT break out of this loop to do it. The router thread ends only after
+                    // it has pushed an `Exit` into these bounded channels (see its `send(...)`
+                    // above), so a main loop that stops draining deadlocks the `join()` below
+                    // against a router blocked on a full channel. Keep looping, drop the renders,
+                    // and let the `Exit` we just asked for arrive through the usual door.
+                    Err::<(), _>(e)
+                        .context("failed to render to a terminal that is gone, detaching")
+                        .non_fatal();
+                    terminal_is_gone = true;
+                    os_input.send_to_server(ClientToServerMsg::ClientExited);
                 }
-                stdout
-                    .write_all(output.as_bytes())
-                    .expect("cannot write to stdout");
-                if let Some(sync) = synchronised_output {
-                    stdout
-                        .write_all(sync.end_seq())
-                        .expect("cannot write to stdout");
-                }
-                stdout.flush().expect("could not flush");
             },
             ClientInstruction::UnblockInputThread => {
                 command_is_executing.unblock_input_thread();
@@ -1660,16 +1704,25 @@ pub fn start_client(
 
         os_input.disable_mouse().non_fatal();
         info!("{}", exit_msg);
-        os_input.unset_raw_mode().unwrap();
+        os_input
+            .unset_raw_mode()
+            .context(RAW_MODE_TEARDOWN_ERR)
+            .non_fatal();
         os_input.restore_console_mode();
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(goodbye_message.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(goodbye_message.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
     } else {
         let clear_screen = "\u{1b}[2J";
         let mut stdout = os_input.get_stdout_writer();
-        stdout.write_all(clear_screen.as_bytes()).unwrap();
-        stdout.flush().unwrap();
+        stdout
+            .write_all(clear_screen.as_bytes())
+            .and_then(|_| stdout.flush())
+            .context(TEARDOWN_WRITE_ERR)
+            .non_fatal();
     }
 
     let _ = send_input_instructions.send(InputInstruction::Exit);
