@@ -43,7 +43,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     thread,
 };
 use zellij_utils::envs;
@@ -563,6 +566,91 @@ impl SessionMetaData {
     }
 }
 
+/// How long teardown waits for one session thread to finish before leaving it behind.
+///
+/// These joins used to be unbounded, and that is what turned a stuck session thread into a server
+/// that stays alive forever holding its listening socket: the socket file is unlinked at the very
+/// end of `start_server_impl`, after this `Drop` returns, so a join that never returns leaves an
+/// orphan that accepts connections and answers none of them.
+///
+/// Five separate waits rather than one shared budget. The plugin thread's `BeforeClose` window and
+/// the background-jobs thread's web-request drain are each bounded already (2s and 3s), and a
+/// shared budget would let a slow pty spend the window one of those was promised.
+const SESSION_THREAD_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long teardown waits to get the session out of its lock.
+///
+/// The wait is normally instant: [`route_thread_main`] holds the read guard for a statement at a
+/// time and never across a blocking call, which is a rule the router already keeps deliberately.
+/// This bound is for the day something breaks it, because the cost of that is the whole process.
+const SESSION_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the session out of its lock, or give up and leave it where it is.
+///
+/// The lock is taken on a helper thread and waited for over a channel rather than polled with
+/// `try_write`: a poll would livelock against the route threads reading the same lock, while a
+/// real blocking `write()` queues ahead of new readers and is guaranteed to get in as soon as the
+/// guards in flight are dropped.
+///
+/// Giving up means the session's `Drop` never runs on this thread. Nothing is lost by that at this
+/// point -- the process is about to exit, which closes the pane shells' ptys and the listening
+/// socket. If the helper does get the lock later, it drops the session there instead, on its own
+/// bounded joins.
+fn take_session_within(
+    session_data: &Arc<RwLock<Option<SessionMetaData>>>,
+    timeout: std::time::Duration,
+) -> Option<SessionMetaData> {
+    let (taken_sender, taken_receiver) = channels::bounded(1);
+    let session_data = session_data.clone();
+    let _ = thread::Builder::new()
+        .name("server_session_take".to_string())
+        .spawn(move || {
+            let taken = session_data
+                .write()
+                .ok()
+                .and_then(|mut session| session.take());
+            // the receiver is gone if we were too slow: drop the session here instead
+            if let Err(
+                channels::TrySendError::Full(session)
+                | channels::TrySendError::Disconnected(session),
+            ) = taken_sender.try_send(taken)
+            {
+                drop(session);
+            }
+        });
+    match taken_receiver.recv_timeout(timeout) {
+        Ok(session) => session,
+        Err(_) => {
+            log::error!(
+                "could not take the session out of its lock within {:?}, exiting without it",
+                timeout
+            );
+            None
+        },
+    }
+}
+
+/// Join a session thread, or give up on it and say which one it was.
+///
+/// Giving up leaves the thread running and lets teardown carry on, which is the point: the process
+/// is on its way out, and exiting closes the pane shells' ptys and the listening socket with it.
+/// A thread that will not finish costs a log line, not the session's ability to end.
+fn join_or_give_up(handle: thread::JoinHandle<()>, thread_name: &str) {
+    let deadline = std::time::Instant::now() + SESSION_THREAD_JOIN_TIMEOUT;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::error!(
+                "the {} thread did not finish within {:?}, leaving it behind so the session can exit",
+                thread_name,
+                SESSION_THREAD_JOIN_TIMEOUT
+            );
+            return;
+        }
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let _ = handle.join();
+}
+
 impl Drop for SessionMetaData {
     fn drop(&mut self) {
         let _ = self.senders.send_to_pty(PtyInstruction::Exit);
@@ -573,23 +661,23 @@ impl Drop for SessionMetaData {
         // an unbounded amount of time to wind down (it is still being fed by panes that are alive
         // until pty kills them). Joining screen first made the shells outlive the whole teardown.
         if let Some(pty_thread) = self.pty_thread.take() {
-            let _ = pty_thread.join();
+            join_or_give_up(pty_thread, "pty");
         }
         if let Some(screen_thread) = self.screen_thread.take() {
-            let _ = screen_thread.join();
+            join_or_give_up(screen_thread, "screen");
         }
         if let Some(plugin_thread) = self.plugin_thread.take() {
-            let _ = plugin_thread.join();
+            join_or_give_up(plugin_thread, "plugin");
         }
         if let Some(pty_writer_thread) = self.pty_writer_thread.take() {
-            let _ = pty_writer_thread.join();
+            join_or_give_up(pty_writer_thread, "pty writer");
         }
         // background jobs are told to exit only once the plugin thread has: a `web_request` or a
         // `run_command` a plugin issues from its `BeforeClose` handler is dispatched from here, and
         // told to exit alongside the others this thread was gone before the handler had run
         let _ = self.senders.send_to_background_jobs(BackgroundJob::Exit);
         if let Some(background_jobs_thread) = self.background_jobs_thread.take() {
-            let _ = background_jobs_thread.join();
+            join_or_give_up(background_jobs_thread, "background jobs");
         }
     }
 }
@@ -1250,6 +1338,10 @@ pub fn start_server_impl(
     let to_server = SenderWithContext::new(to_server);
     let session_data: Arc<RwLock<Option<SessionMetaData>>> = Arc::new(RwLock::new(None));
     let session_state = Arc::new(RwLock::new(SessionState::new()));
+    // Set the moment the main loop breaks, and read by the accept loop below. Nothing past that
+    // point can serve a client, and a connection accepted anyway is worse than one refused -- see
+    // the accept loop for what it costs.
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     if install_panic_hook {
         std::panic::set_hook({
@@ -1300,6 +1392,7 @@ pub fn start_server_impl(
             let session_state = session_state.clone();
             let to_server = to_server.clone();
             let socket_path = socket_path.clone();
+            let shutting_down = shutting_down.clone();
             move || {
                 drop(std::fs::remove_file(&socket_path));
                 let listener = ipc_bind(&socket_path).unwrap();
@@ -1320,6 +1413,19 @@ pub fn start_server_impl(
                     match stream {
                         Ok(stream) => {
                             consecutive_accept_failures = 0;
+                            if shutting_down.load(Ordering::Acquire) {
+                                // The main loop has broken and nothing behind this socket will
+                                // answer again. Registering the connection anyway allocates a
+                                // client id and two threads -- a router and the client's sender --
+                                // for a client nothing can serve, and leaves the caller waiting on
+                                // a reply that is not coming. That is the shape of the wedge this
+                                // guard exists for: connections arriving during the shutdown
+                                // window each leak a pair, and the caller they belong to hangs.
+                                // Closing the stream answers honestly instead, and the liveness
+                                // probe reads that as "not a session" rather than blocking on it.
+                                drop(stream);
+                                continue;
+                            }
                             let mut os_input = os_input.clone();
                             let client_id = session_state.write().unwrap().new_client();
 
@@ -2499,6 +2605,10 @@ pub fn start_server_impl(
         }
     }
 
+    // The accept loop is still running and will be until the process goes. Tell it to stop turning
+    // connections into clients: from here on there is nobody to serve them.
+    shutting_down.store(true, Ordering::Release);
+
     // Nobody reads `to_server` past this point and it is bounded, so any thread that sends into it
     // while winding down would block there forever and never reach its own exit — with the session
     // threads joined below, that is a teardown that never finishes. Keep the channel drained. The
@@ -2510,7 +2620,7 @@ pub fn start_server_impl(
 
     // Take the session out of the lock before dropping it. Its `Drop` joins every session thread,
     // and doing that while holding the write lock blocks every route thread that touches it.
-    let session = session_data.write().unwrap().take();
+    let session = take_session_within(&session_data, SESSION_LOCK_TIMEOUT);
     drop(session);
 
     // Archive after the last serialize and before the socket goes: the socket disappearing is what

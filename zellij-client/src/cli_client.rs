@@ -282,7 +282,19 @@ fn pipe_client(
                     }
                 },
                 // `--timeout 0`: the wait is the blocking read it has always been
-                _ => os_input.recv_from_server().map(|(message, _)| message),
+                _ => match os_input.recv_from_server() {
+                    Some((message, _)) => Some(message),
+                    // The socket is gone and nothing more is coming down it. Falling through to
+                    // the match below returned `None` for every iteration from then on, which is
+                    // a spin at 100% of a core for as long as the process lives -- a session that
+                    // ends while a pipe is waiting left one of these behind per pipe. The
+                    // `--timeout` path already ends here, by way of its reader thread closing the
+                    // channel; this says the same thing the same way.
+                    None => {
+                        eprintln!("The session stopped answering while the pipe was waiting.");
+                        process::exit(1);
+                    },
+                },
             };
             match message {
                 Some(ServerToClientMsg::UnblockCliPipeInput { pipe_name }) => {

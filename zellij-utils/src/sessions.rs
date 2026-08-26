@@ -290,9 +290,34 @@ fn assert_socket(name: &str) -> bool {
     }
 }
 
+/// How long the liveness probe gives one server to answer before calling it unresponsive.
+///
+/// A server that accepts the connection and then never replies is the case this exists for. The
+/// probe used to block in `recv` with no deadline, so a single session whose teardown had wedged
+/// hung every command that enumerates sessions -- `zellij ls`, `attach`, `delete-session`,
+/// `kill-session`, `session up` -- for every session in the socket directory, not just its own.
+/// One bad tab close took session enumeration out machine-wide until the pid was killed by hand.
+///
+/// The scan is serial and the wait is per socket, so this is short enough that a directory holding
+/// several dead sockets still answers, and long enough that a merely busy server is not mistaken
+/// for a dead one.
+///
+/// A probe that gives up costs a session its row in a listing and nothing more. The *destructive*
+/// paths do not ask this question: [`socket_is_occupied`] asks whether anything is listening and
+/// waits for no reply at all, which is what keeps a slow server from being replaced out from under
+/// its own panes.
+#[cfg(unix)]
+const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Ask a connected server whether it is alive.
 #[cfg(unix)]
 fn socket_answers(stream: interprocess::local_socket::Stream) -> bool {
+    use interprocess::local_socket::traits::Stream as _;
+    // both directions, because an unresponsive peer is unresponsive in both: a server that has
+    // stopped reading fills the send buffer just as surely as one that has stopped writing leaves
+    // the receive buffer empty
+    let _ = stream.set_send_timeout(Some(LIVENESS_PROBE_TIMEOUT));
+    let _ = stream.set_recv_timeout(Some(LIVENESS_PROBE_TIMEOUT));
     let mut sender: IpcSenderWithContext<ClientToServerMsg> = IpcSenderWithContext::new(stream);
     let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
     let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
