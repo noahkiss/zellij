@@ -6587,6 +6587,54 @@ on a path that runs at render frequency; the six lifecycle events could be diffe
 is not. If a plugin ever needs it, the event is a separate patch on top of this one, and this
 patch's grid accessor is what it would read.
 
+### A client whose terminal dies detaches instead of crashing
+
+Kill the terminal window a client is attached to, or drop the ssh connection carrying one, and the
+tty starts answering EIO. The client used to panic on the way out, because its exit teardown
+unwrapped calls that only a live terminal can satisfy:
+
+```rust
+os_input.disable_mouse().non_fatal();      // already tolerant
+os_input.unset_raw_mode().unwrap();        // EIO here on linux
+stdout.write_all(goodbye_message.as_bytes()).unwrap();   // EIO here on macos
+stdout.flush().unwrap();
+```
+
+Which line goes first is the platform: after a hangup linux fails `tcsetattr` too, macOS still
+lets it through and falls over on the write. Both are unguarded, so all thirteen unwrapped calls in
+these five teardown blocks are now `.context(...).non_fatal()` — the two in `start_remote_client`,
+the three in `start_client`. The errors are logged, not discarded. The **startup** counterparts are
+deliberately left alone: there the terminal is expected live, and a failure means the client cannot
+run at all.
+
+The panic was worse than it looks, and not only because it is noisy. `handle_panic` printed its
+report with `println!`, which itself panics when stdout is gone — and a panic raised inside a panic
+hook aborts the process. That is the `Abort trap: 6` in the crash reports, and it is why the same
+event exits 101 on linux (where the hook's `unset_raw_mode()` guard fails first, so `handle_panic`
+never runs) and SIGABRTs on macOS. That `println!` is now a best-effort write.
+
+The render path is the half that actually mattered for the session. `ClientInstruction::Render`
+wrote with `expect("cannot write to stdout")`, so a render landing on a dead tty killed the client
+**before** it had sent `ClientExited`, leaving the server to notice only when the socket closed.
+A failed render now sets the client's own detach in motion: it says `ClientExited` once, drops
+further renders, and leaves through the ordinary exit. It does **not** break out of the loop to do
+it — the router thread ends only after pushing an `Exit` into a `bounded(50)` channel, so a main
+loop that stops draining deadlocks `router_thread.join()` against a router blocked on a full
+channel. That was measured, not guessed: the first attempt hung with both threads in `futex_wait`.
+
+The reported symptom was two things, and only one of them reproduced. The client crash reproduces
+exactly — spawn a client on a pty, close the master, and the hangup that starts a normal detach is
+the same event that makes the tty answer EIO. The *server* being left unattachable does not: after
+the crash, `zellij ls` reported `CLIENTS 0` and the next `attach` came up on a session with its
+panes and scrollback intact. The client sends `ClientExited` before the teardown block, and
+`route.rs` announces `RemoveClient` whenever a route thread's loop ends, which a closed socket
+forces — so nothing in this path can strand a client server-side. The reporter said themselves they
+could not tie the two together.
+
+Upstream carries an open, unmerged pull request for the teardown unwraps whose author could not
+reproduce the crash; this patch takes the same shape for those calls and adds the parts that
+reproducing it found — the `handle_panic` abort and the render path.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

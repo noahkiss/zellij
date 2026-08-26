@@ -834,6 +834,7 @@ mod not_wasm {
     where
         T: ErrorInstruction + Clone,
     {
+        use std::io::{self, Write};
         use std::{process, thread};
         let thread = thread::current();
         let thread = thread.name().unwrap_or("unnamed");
@@ -883,7 +884,12 @@ mod not_wasm {
             // here we only show the first line because the backtrace is not readable otherwise
             // a better solution would be to escape raw mode before we do this, but it's not trivial
             // to get os_input here
-            println!("\u{1b}[2J{}", fmt_report(report));
+            //
+            // Not `println!`: that panics when stdout cannot be written, and a panic raised from
+            // inside a panic hook aborts the process. A client whose tty had died reached this
+            // line already panicking, and the abort is what the crash reports showed. The message
+            // is best-effort - there is nobody left to read it on a terminal that is gone.
+            let _ = writeln!(io::stdout(), "\u{1b}[2J{}", fmt_report(report));
             process::exit(1);
         } else {
             let _ = sender.unwrap().send(T::error(fmt_report(report)));
