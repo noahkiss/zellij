@@ -6711,6 +6711,69 @@ command-less `zellij action new-pane` goes from "works, ignores `--cwd`" to "doe
 naming a command, or `--blocking`, still works. Nothing else is affected, and no existing message
 was renumbered or reshaped.
 
+### One session that will not answer no longer hangs every command that lists sessions
+
+A server whose teardown wedges keeps its listening socket, and a socket that accepts a connection
+and then says nothing used to hang **every** command that enumerates sessions — for every session
+in the directory, not just its own. `zellij ls`, `attach`, `delete-session`, `kill-session`,
+`session up` and the "did you mean" name suggester all go through `get_sessions`, which probes each
+socket in turn and used to block in `recv` with no deadline. One bad tab close took session
+enumeration out machine-wide until the pid was killed by hand.
+
+Measured on the tip before this patch, with one unresponsive socket sitting beside a healthy
+session in the same directory: `zellij ls` had not returned twenty seconds later, and the healthy
+session was never listed. After: 2.1 seconds, the healthy session listed, the unresponsive one left
+alone.
+
+Four changes, and they are four because the failure has four parts.
+
+**The probe is bounded.** The liveness probe gives a server two seconds to answer, in both
+directions, and treats silence as "not a session". That is the answer it already gave to a socket
+that refused the connection, so nothing downstream had to learn a new case. A probe that gives up
+costs a session its row in a listing and nothing more — the *destructive* paths do not ask this
+question. `socket_is_occupied`, which is what stands between a new session and a live server's
+name, asks only whether anything is listening and waits for no reply at all. The unresponsive
+socket is deliberately left in place: unlinking it would orphan a server whose panes are still
+running, which is the failure that function exists to prevent.
+
+**The accept loop stops making clients once the session is over.** The listener runs until the
+process does, and every connection it accepted was turned into a client id, a router thread and a
+sender thread. After the main loop has broken there is nobody left to serve any of them, so a late
+connection left its caller waiting on a reply that was never coming and left threads behind —
+upstream measured exactly `+1 router +1 listener` per probe, climbing without limit. A connection
+accepted during shutdown is now closed instead. Under a storm of connections arriving through a
+last-tab close, the census two seconds after the close went from forty sender threads left behind
+to none; the router threads exit on their own here, the sender threads did not.
+
+**A pipe whose session went away stops instead of spinning.** `zellij pipe --timeout 0` waits with
+a blocking read, and a read that returns nothing because the socket closed fell through to the top
+of the same loop and read again — a spin at 100% of a core, for as long as the process lived. A
+session ending under fifty in-flight pipes left fifty of them behind. It now says the session
+stopped answering and exits 1, which is what the `--timeout` path has always done by way of its
+reader thread closing its channel. Closing a connection accepted during shutdown, rather than
+registering it, is what made this easy to hit rather than occasional.
+
+**Every wait in teardown is bounded.** The five joins in `SessionMetaData::Drop` and the write lock
+the session is taken out of were all unbounded, and the socket file is unlinked only after they
+return — so one stuck thread meant a server that stays alive forever holding a socket that answers
+nothing, which is the orphan the first two changes are cleaning up after. Each join now waits five
+seconds and then leaves the thread behind with a log line saying which one it was. Five separate
+budgets rather than one shared: the plugin thread's `BeforeClose` window and the background-jobs
+thread's web-request drain are each bounded already, and a shared budget would let a slow pty spend
+the window one of those was promised. The lock is taken on a helper thread and waited for over a
+channel, because polling `try_write` would livelock against the route threads reading the same
+lock.
+
+The wedge itself did not reproduce here — a last-tab close under fifty in-flight `zellij pipe`
+clients, then under two hundred and sixty, then under a continuous storm of them arriving through
+the close, exited cleanly every time, which the accept-loop and `BeforeClose` patches above have a
+lot to do with. The leak and the hang both did reproduce, and they are what turns a wedge anywhere
+in teardown into a machine-wide outage. This patch is about the blast radius rather than the
+trigger.
+
+Reported upstream as [#5440](https://github.com/zellij-org/zellij/issues/5440); nothing has landed
+there.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
