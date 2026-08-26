@@ -6006,10 +6006,30 @@ bound first in tab mode. This is a repair for the one keybind this fork moved, n
 general way to hint plugins — that needs the hint to come from the plugin, and is a different
 patch.
 
-**The other two bars still have the gap.** `slim-keybinds` (`derive.rs`) and upstream's
-`compact-bar` (`keybind_utils.rs`) derive their tab-mode hints from a list of predicates over
-single actions, `matches!(a, Action::CloseTab)` among them. That is a different shape from the
-status bar's action-list match, so neither is touched here.
+**The other two bars answer it their own way.** `slim-keybinds` — the bar this fork actually draws
+— and upstream's `compact-bar` do not match action lists at all. Each walks an ordered list of
+predicates over single actions (`derive.rs`, `keybind_utils.rs`), takes the first bind whose first
+action matches, and then gathers every other key in the mode whose first action projects to the
+same `ActionType`. Two edits per bar follow from that shape:
+
+- the tab-mode close predicate becomes `matches!(a, Action::CloseTab) ||
+  a.launches_plugin("zellij:confirm-close-tab")`, so the key is found at all;
+- `ActionType::from_action` maps that same launch to `ActionType::CloseTab`, so the key is
+  *labelled* `close` and gathered into the close hint rather than into a hint of its own.
+
+The second edit is the one that does the work, and it sits beside the four rows already there for
+`session-manager`, `configuration`, `plugin-manager` and `zellij:about` — a `LaunchOrFocusPlugin`
+has always had to be classified by the plugin it names, because the variant alone says nothing.
+
+**Where this differs from the status bar, and why.** There the confirm-close-tab lookup is a
+*fallback*: it runs only when the direct `CloseTab` lookup found nothing, so a hint never lists two
+keys for one verb. Here a config binding both `CloseTab` and the prompt gets one hint listing both
+keys — because collapsing several keys for one verb into a single hint is what `ActionType` exists
+to do, and is how `h`, `j`, `k` and `l` already become one `focus` hint. Making it a fallback would
+be new behaviour in these bars, not parity with the status bar.
+
+The plugin is still named exactly, for the same reason as in the status bar: a predicate matching
+any plugin launch would claim whichever one is bound first in tab mode.
 
 ### Synchronised output is assumed, not withheld until a terminal proves it
 
