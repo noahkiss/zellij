@@ -15,7 +15,7 @@
 //!
 //! Nothing in here knows about colour or width; it returns plain strings and `main.rs` draws them.
 
-use crate::action_types::ActionType;
+use crate::action_types::{ActionType, CONFIRM_CLOSE_TAB_PLUGIN};
 use std::collections::HashSet;
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
@@ -332,7 +332,9 @@ fn predicates_for_mode(mode: InputMode) -> &'static [fn(&Action) -> bool] {
         InputMode::Tab => &[
             |a| matches!(a, Action::GoToPreviousTab | Action::GoToNextTab),
             |a| matches!(a, Action::NewTab { .. }),
-            |a| matches!(a, Action::CloseTab),
+            // `|| launches_plugin(..)` because this fork binds tab mode's close key to the
+            // confirmation prompt, not to `CloseTab` - see `ActionType::from_action`.
+            |a| matches!(a, Action::CloseTab) || a.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN),
             |a| {
                 matches!(
                     a,

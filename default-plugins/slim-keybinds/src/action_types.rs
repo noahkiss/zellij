@@ -9,6 +9,11 @@
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 
+/// The plugin this fork's default config launches from tab mode's close key, written exactly as
+/// the binding writes it. Naming it is the whole point: matching the `LaunchOrFocusPlugin`
+/// variant alone would claim whichever plugin launch happens to be bound first in the mode.
+pub const CONFIRM_CLOSE_TAB_PLUGIN: &str = "zellij:confirm-close-tab";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ActionType {
     MoveFocus,
@@ -167,6 +172,10 @@ impl ActionType {
             action if action.launches_plugin("configuration") => ActionType::Configuration,
             action if action.launches_plugin("plugin-manager") => ActionType::PluginManager,
             action if action.launches_plugin("zellij:about") => ActionType::About,
+            // Tab mode's close key launches a confirmation prompt rather than running `CloseTab`,
+            // so the key is classified by what it launches. Both keys collapse into one hint if a
+            // config binds both, which is what this type is for.
+            action if action.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN) => ActionType::CloseTab,
             _ => ActionType::Other,
         }
     }
