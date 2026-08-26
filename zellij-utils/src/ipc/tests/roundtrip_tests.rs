@@ -2776,6 +2776,36 @@ fn test_client_messages() {
         client_id: Some(100),
         is_cli_client: true,
     });
+    for placement in [
+        NewPanePlacement::Tiled {
+            direction: Some(Direction::Right),
+            borderless: Some(true),
+        },
+        NewPanePlacement::Floating(None),
+        NewPanePlacement::Stacked {
+            pane_id_to_stack_under: None,
+            borderless: None,
+        },
+        NewPanePlacement::InPlace {
+            pane_id_to_replace: Some(PaneId::Terminal(3)),
+            close_replaced_pane: true,
+            borderless: None,
+        },
+    ] {
+        test_client_roundtrip!(ClientToServerMsg::Action {
+            action: Action::NewShellPane {
+                placement,
+                pane_name: Some("named".to_owned()),
+                cwd: Some(PathBuf::from("/some/dir")),
+                near_current_pane: true,
+                no_focus: false,
+                tab_id: Some(2),
+            },
+            terminal_id: Some(1),
+            client_id: Some(100),
+            is_cli_client: true,
+        });
+    }
     test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::EditFile {
             payload: OpenFilePayload {

@@ -243,6 +243,23 @@ pub enum Action {
         no_focus: bool,
         tab_id: Option<usize>,
     },
+    /// fork addition: open a pane running the session's default shell, in a cwd of the caller's
+    /// choosing.
+    ///
+    /// The four `New*Pane` variants carry their working directory inside `RunCommandAction`, so a
+    /// pane with no command has nowhere to put one and `--cwd` was dropped in silence. This is the
+    /// command-less half of `zellij action new-pane`, and it is CLI-only: `placement` says which of
+    /// the four it stands in for.
+    ///
+    /// Returns: Created pane ID (format: terminal_<id>)
+    NewShellPane {
+        placement: NewPanePlacement,
+        pane_name: Option<String>,
+        cwd: Option<PathBuf>,
+        near_current_pane: bool,
+        no_focus: bool,
+        tab_id: Option<usize>,
+    },
     /// Open the file in a new pane using the default editor
     /// Returns: Created pane ID (format: terminal_<id>)
     EditFile {
@@ -1211,6 +1228,11 @@ impl Action {
                 // cwd should only be specified in a plugin alias if it was explicitly given to us,
                 // otherwise the current_dir might override a cwd defined in the alias itself
                 let alias_cwd = cwd.clone().map(|cwd| current_dir.join(cwd));
+                // fork addition: the directory the caller actually named, resolved but not
+                // defaulted. A pane that runs a command has always started in the caller's own
+                // directory, but a command-less one inherits the focused pane's - so the
+                // shell-pane branch below needs to tell "no --cwd" apart from "--cwd .".
+                let explicit_cwd = cwd.clone().map(|cwd| current_dir.join(cwd));
                 let cwd = cwd
                     .map(|cwd| current_dir.join(cwd))
                     .or_else(|| Some(current_dir.clone()));
@@ -1430,46 +1452,38 @@ impl Action {
                         }])
                     }
                 } else {
-                    if floating {
-                        Ok(vec![Action::NewFloatingPane {
-                            command: None,
-                            pane_name: name,
-                            coordinates: FloatingPaneCoordinates::new(
-                                x, y, width, height, pinned, borderless,
-                            ),
-                            near_current_pane,
-                            no_focus,
-                            tab_id,
-                        }])
+                    // fork addition: a pane with no command has no `RunCommandAction` to carry the
+                    // cwd, so the four `New*Pane` variants dropped `--cwd` here. `NewShellPane`
+                    // carries it, and `placement` says which of the four this would have been.
+                    let placement = if floating {
+                        NewPanePlacement::Floating(FloatingPaneCoordinates::new(
+                            x, y, width, height, pinned, borderless,
+                        ))
                     } else if in_place {
-                        Ok(vec![Action::NewInPlacePane {
-                            command: None,
-                            pane_name: name,
-                            near_current_pane,
-                            no_focus,
+                        NewPanePlacement::InPlace {
                             pane_id_to_replace,
                             close_replaced_pane,
-                            tab_id,
-                        }])
-                    } else if stacked {
-                        Ok(vec![Action::NewStackedPane {
-                            command: None,
-                            pane_name: name,
-                            near_current_pane,
-                            no_focus,
-                            tab_id,
-                        }])
-                    } else {
-                        Ok(vec![Action::NewTiledPane {
-                            direction,
-                            command: None,
-                            pane_name: name,
-                            near_current_pane,
-                            no_focus,
                             borderless,
-                            tab_id,
-                        }])
-                    }
+                        }
+                    } else if stacked {
+                        NewPanePlacement::Stacked {
+                            pane_id_to_stack_under: None,
+                            borderless,
+                        }
+                    } else {
+                        NewPanePlacement::Tiled {
+                            direction,
+                            borderless,
+                        }
+                    };
+                    Ok(vec![Action::NewShellPane {
+                        placement,
+                        pane_name: name,
+                        cwd: explicit_cwd,
+                        near_current_pane,
+                        no_focus,
+                        tab_id,
+                    }])
                 }
             },
             CliAction::Edit {
@@ -4519,10 +4533,19 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::NewTiledPane { tab_id, .. } => {
+            Action::NewShellPane {
+                placement, tab_id, ..
+            } => {
                 assert_eq!(*tab_id, Some(3));
+                assert!(matches!(
+                    placement,
+                    NewPanePlacement::Tiled {
+                        direction: Some(Direction::Right),
+                        ..
+                    }
+                ));
             },
-            _ => panic!("Expected NewTiledPane action"),
+            _ => panic!("Expected NewShellPane action"),
         }
     }
 
@@ -4572,10 +4595,96 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::NewTiledPane { tab_id, .. } => {
+            Action::NewShellPane {
+                placement, tab_id, ..
+            } => {
                 assert_eq!(*tab_id, None);
+                assert!(matches!(placement, NewPanePlacement::Tiled { .. }));
             },
-            _ => panic!("Expected NewTiledPane action"),
+            _ => panic!("Expected NewShellPane action"),
+        }
+    }
+
+    fn command_less_new_pane_with_cwd(cwd: Option<PathBuf>, stacked: bool) -> Vec<Action> {
+        let cli_action = CliAction::NewPane {
+            direction: None,
+            command: vec![],
+            plugin: None,
+            cwd,
+            floating: false,
+            in_place: false,
+            close_replaced_pane: false,
+            pane_id: None,
+            name: None,
+            close_on_exit: false,
+            start_suspended: false,
+            configuration: None,
+            skip_plugin_cache: false,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            pinned: None,
+            stacked,
+            blocking: false,
+            block_until_exit_success: false,
+            block_until_exit_failure: false,
+            block_until_exit: false,
+            unblock_condition: None,
+            new_tab: None,
+            in_tab: None,
+            near: None,
+            handle: None,
+            near_current_pane: false,
+            no_focus: false,
+            borderless: None,
+            tab_id: None,
+        };
+        Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_command_less_new_pane_carries_an_explicit_cwd() {
+        let actions = command_less_new_pane_with_cwd(Some(PathBuf::from("/some/dir")), false);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::NewShellPane { cwd, .. } => {
+                assert_eq!(*cwd, Some(PathBuf::from("/some/dir")));
+            },
+            other => panic!("Expected NewShellPane action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_less_new_pane_resolves_a_relative_cwd() {
+        let actions = command_less_new_pane_with_cwd(Some(PathBuf::from("sub/dir")), true);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::NewShellPane { cwd, placement, .. } => {
+                assert_eq!(*cwd, Some(PathBuf::from("/tmp/sub/dir")));
+                assert!(matches!(placement, NewPanePlacement::Stacked { .. }));
+            },
+            other => panic!("Expected NewShellPane action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_command_less_new_pane_without_cwd_names_no_directory() {
+        // without a `--cwd` the pane still inherits the focused pane's directory, which is what
+        // the server does for a `None` cwd - so nothing may be filled in on the caller's behalf
+        let actions = command_less_new_pane_with_cwd(None, false);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::NewShellPane { cwd, .. } => {
+                assert_eq!(*cwd, None);
+            },
+            other => panic!("Expected NewShellPane action, got {:?}", other),
         }
     }
 
@@ -4625,12 +4734,17 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::NewInPlacePane {
-                pane_id_to_replace, ..
-            } => {
-                assert_eq!(*pane_id_to_replace, Some(PaneId::Terminal(4)));
+            Action::NewShellPane { placement, .. } => {
+                assert!(matches!(
+                    placement,
+                    NewPanePlacement::InPlace {
+                        pane_id_to_replace: Some(PaneId::Terminal(4)),
+                        close_replaced_pane: true,
+                        ..
+                    }
+                ));
             },
-            _ => panic!("Expected NewInPlacePane action"),
+            _ => panic!("Expected NewShellPane action"),
         }
     }
 
@@ -4727,10 +4841,13 @@ mod tests {
         let actions = result.unwrap();
         assert_eq!(actions.len(), 1);
         match &actions[0] {
-            Action::NewFloatingPane { tab_id, .. } => {
+            Action::NewShellPane {
+                placement, tab_id, ..
+            } => {
                 assert_eq!(*tab_id, Some(5));
+                assert!(matches!(placement, NewPanePlacement::Floating(_)));
             },
-            _ => panic!("Expected NewFloatingPane action"),
+            _ => panic!("Expected NewShellPane action"),
         }
     }
 

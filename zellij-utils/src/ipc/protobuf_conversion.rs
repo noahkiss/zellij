@@ -1224,6 +1224,7 @@ impl From<crate::input::actions::Action>
             NewInPlacePaneAction,
             NewInPlacePluginPaneAction,
             NewPaneAction,
+            NewShellPaneAction,
             NewStackedPaneAction,
             NewTabAction,
             NewTiledPaneAction,
@@ -1619,6 +1620,21 @@ impl From<crate::input::actions::Action>
                 near_current_pane,
                 tab_id: tab_id.map(|t| t as u32),
                 no_focus,
+            }),
+            crate::input::actions::Action::NewShellPane {
+                placement,
+                pane_name,
+                cwd,
+                near_current_pane,
+                no_focus,
+                tab_id,
+            } => ActionType::NewShellPane(NewShellPaneAction {
+                placement: Some(placement.into()),
+                pane_name,
+                cwd: cwd.map(|p| p.to_string_lossy().to_string()),
+                near_current_pane,
+                no_focus,
+                tab_id: tab_id.map(|t| t as u32),
             }),
             crate::input::actions::Action::TogglePaneEmbedOrFloating => {
                 ActionType::TogglePaneEmbedOrFloating(TogglePaneEmbedOrFloatingAction {})
@@ -2598,6 +2614,19 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     near_current_pane: new_blocking_action.near_current_pane,
                     no_focus: new_blocking_action.no_focus,
                     tab_id: new_blocking_action.tab_id.map(|t| t as usize),
+                })
+            },
+            ActionType::NewShellPane(new_shell_pane_action) => {
+                Ok(crate::input::actions::Action::NewShellPane {
+                    placement: new_shell_pane_action
+                        .placement
+                        .ok_or_else(|| anyhow!("NewShellPane missing placement"))?
+                        .try_into()?,
+                    pane_name: new_shell_pane_action.pane_name,
+                    cwd: new_shell_pane_action.cwd.map(|c| c.into()),
+                    near_current_pane: new_shell_pane_action.near_current_pane,
+                    no_focus: new_shell_pane_action.no_focus,
+                    tab_id: new_shell_pane_action.tab_id.map(|t| t as usize),
                 })
             },
             ActionType::TogglePaneEmbedOrFloating(_) => {

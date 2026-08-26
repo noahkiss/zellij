@@ -6635,6 +6635,62 @@ Upstream carries an open, unmerged pull request for the teardown unwraps whose a
 reproduce the crash; this patch takes the same shape for those calls and adds the parts that
 reproducing it found — the `handle_panic` abort and the render path.
 
+### `--cwd` reaches a pane that runs no command
+
+```
+$ zellij action new-pane --cwd /etc -- ls    # always opened in /etc
+$ zellij action new-pane --cwd /etc          # opened wherever the focused pane was; now /etc
+```
+
+`zellij action new-pane` has two halves, and only one of them ever honoured `--cwd`. A pane that
+runs a command carries its working directory inside `RunCommandAction`, the struct that says what
+to run. A pane that runs no command has no such struct — it gets the session's default shell —
+and none of the four `Action::New*Pane` variants has a field for a directory. The CLI resolved
+`--cwd`, built the action, and dropped the value on the floor. It was silent: no warning, no
+error, a pane in the wrong directory.
+
+Every command-less placement was affected — plain, `--floating`, `--stacked` and `--in-place`.
+Three neighbours were not, and they are why this read as a fork bug rather than an upstream one: a
+`new-pane` **with** a command works, `new-pane --blocking` works (`Action::NewBlockingPane` is a
+fork addition and carries a `RunCommandAction`), and `new-tab --cwd` works (`Action::NewTab` has
+carried a `cwd` all along). So four of seven ways to name a directory did what they said.
+
+**The fix is one new action, not a field on four old ones.** `Action::NewShellPane` is the
+command-less half of `new-pane`: a placement, a name, a directory, and the three routing flags.
+`NewPanePlacement` — the enum `NewBlockingPane` already uses — says which of the four this stands
+in for, so one action replaces four and the CLI reads the same way for the blocking and the
+non-blocking case.
+
+It had to be a new action. `NewFloatingPaneAction`, `NewTiledPaneAction`, `NewStackedPaneAction`
+and `NewInPlacePaneAction` are upstream messages in the versioned client/server contract, and
+adding a field to one is the thing "Adding a field, and which contract it crosses" in
+[AGENTS.md](AGENTS.md) forbids outright. A new message in the fork's reserved tag block costs a
+tag and nothing else. `NewShellPaneAction` takes **173**; the block starts at 160 and 160–172 were
+already spoken for, up to `MoveTabToIndex`.
+
+**No `--cwd` still means "wherever the focused pane is".** This is the part that had to be got
+right, and the CLI made it easy to get wrong: `new-pane` defaults its `cwd` to the caller's own
+directory before it builds the action, because a *command* pane has always started where the
+caller stood. A command-less pane has not — it inherits from the pane you were looking at, which
+`Pty::fill_cwd` does by filling a directory that is still `None`. So the new action carries only a
+directory the caller actually named. Nothing is filled in on their behalf, and a bare
+`zellij action new-pane` opens exactly where it did before.
+
+**`--borderless` now reaches `--stacked` too.** The old `Action::NewStackedPane` had no field for
+it, so `new-pane --stacked --borderless` ignored the flag while `new-pane --stacked --borderless
+--blocking` honoured it. `NewPanePlacement` carries it, so both agree now. `--in-place` still
+ignores it: that pane is spawned through `SpawnInPlaceTerminal`, which has no borderless argument,
+and giving it one is a different patch.
+
+**Mixed versions: this action degrades to nothing, and the command-less `new-pane` degrades with
+it.** Sockets are scoped by contract version, not by version string, so a fork client can reach a
+stock server of the same contract. Tag 173 means nothing there: the server decodes an `Action`
+with no `action_type` set and makes no pane at all. Before this patch the same command sent an
+upstream message and opened a pane in the wrong directory. So against a stock server, a
+command-less `zellij action new-pane` goes from "works, ignores `--cwd`" to "does nothing" —
+naming a command, or `--blocking`, still works. Nothing else is affected, and no existing message
+was renumbered or reshaped.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
