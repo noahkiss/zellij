@@ -1619,9 +1619,11 @@ Homebrew-shaped `PATH` and the unit pinned none at all. The **server** resolves 
 a `zellij run --`, a `zellij edit` and a `copy_command` against its own `PATH` — once, fixed for the
 life of the session — so in a launcher-created session on Linux those failed with "Command not
 found" while an interactive pane in the same session worked: the rc chain had fixed the *shell's*
-`PATH`, not the server's. Both generators now write one, derived rather than hardcoded: the
-directory the unit's own binary was found in, then the platform default. A package-manager prefix
-arrives that way on its own.
+`PATH`, not the server's. Both generators now write one. It was first derived — the directory the
+unit's own binary was found in, then the platform default, on the reasoning that a package-manager
+prefix would arrive that way on its own. [`pin_exe` broke exactly that
+reasoning](#a-generated-unit-carries-the-path-of-the-shell-that-enabled-it), and the value is now
+**recorded** instead.
 
 **The launchd log paths are what the whole design rests on.** `session up` asserts the session it
 created is really there and prints why when it is not; launchd sends the output of a job naming no
@@ -1630,6 +1632,70 @@ anywhere. They default to `$XDG_STATE_HOME/zellij/session-<name>.{out,err}.log` 
 directory as the restart log and the snapshot archive, per-user, and surviving the reboot the log is
 about. `session enable` creates that directory before loading the job, because launchd will not, and
 a job whose stdout cannot be opened does not run.
+
+### A generated unit carries the `PATH` of the shell that enabled it
+
+The entry above gave a generated unit the `PATH` `<directory of the binary the unit execs>` followed
+by the platform default, on the reasoning that the directory a binary was found in is the one
+directory a machine is known to keep terminal software in — so a package-manager prefix arrived on
+its own and nothing had to be hardcoded.
+
+[`pin_exe`](#a-pinned-copy-of-the-binary-pin_exe) makes that reasoning false. The binary the unit
+execs is then zellij's own pin directory, which holds zellij and **nothing else**, so the package
+prefix drops out along with `~/.local/bin` and every npm or bun global bin:
+
+```
+Environment="PATH=/home/user/.local/share/zellij/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+```
+
+A server started from that unit cannot resolve `claude`, `codex` or `opencode`. What it costs:
+every layout `command` pane, every `zellij run --`, `zellij edit`, `copy_command`, and every command
+a snapshot resurrects — each failing with "command not found" beside an interactive pane in the same
+session that works, because the rc chain fixes the *shell's* `PATH` and never the server's. A
+resurrected command pane reports it as a pane held at exit status 2.
+
+**So the `PATH` is recorded rather than reasoned about**, the same principle as the state root and
+the binary path: resolve once, at `enable` time, in the environment that ran it. The unit now
+carries the directory of the binary it execs, followed by the whole `PATH` of the shell that enabled
+it — what that shell could resolve, the server it installs can resolve too:
+
+```
+Environment="PATH=/home/user/.local/share/zellij/bin:/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+```
+
+Both generators take it from the same function, so the plist's `PATH` entry inside
+`EnvironmentVariables` is the same string. Three rules make it predictable:
+
+- **The binary's own directory leads**, pinned or not — the unit must be able to reach the build it
+  execs whatever the recorded `PATH` says. Where the recorded `PATH` already names that directory,
+  its own ordering stands: hoisting a directory the operator placed deliberately would change which
+  build of *everything else* the server resolves.
+- **Order is preserved and repeats are dropped**, so the recorded value reads as the operator's own
+  `PATH` and resolves the same way. An empty entry — the `.` a `::` means to every exec — is dropped
+  rather than recorded.
+- **An environment with no `PATH` falls back to the platform default**, so a unit generated from a
+  degenerate environment still starts a server that can run something.
+
+It stays a **default**, so `launchd { env { PATH … } }`, a `PATH` through the launchd `keys` hatch,
+and `systemd { service "Environment=PATH=…" }` each still replace it and are never written beside
+it. A machine that wants to state its own `PATH` is unaffected by any of this.
+
+**The rollout caveat: a recorded value is a snapshot.** A unit enabled before this change carries
+the old narrow `PATH`, and nothing rewrites it in place — [the drift
+check](#the-config-and-the-installed-unit-are-compared) reports it, and the remedy is what it always
+is:
+
+```
+zellij session enable <name>     # re-records this shell's PATH into the unit
+zellij session restart <name>    # the server keeps the PATH it was created with
+```
+
+Both halves are needed. A server's `PATH` is fixed for the life of the server, so rewriting the unit
+changes nothing until the session is created again. And the snapshot goes stale the same way
+afterwards: install a new package prefix, and the unit learns about it at the next `session enable`,
+not before. Drift is the mechanism that says so — regenerating from a shell whose `PATH` differs
+from the recorded one reports drift, and following that report is safe, because the rewrite records
+a real shell's `PATH`.
 
 ### `session up` will not create a session in the wrong macOS session domain
 
