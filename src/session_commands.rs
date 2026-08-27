@@ -11,6 +11,7 @@
 //! What survives from the scripts is the discipline: every one of these commands states a
 //! post-condition and checks it. See [`zellij_utils::session_lifecycle`].
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{Duration, Instant};
@@ -488,6 +489,9 @@ fn disable(name: &str, opts: &CliArgs) -> Result<(), ()> {
 ///
 /// Exits 0 when the unit is installed AND loaded, whatever the session is doing - the session is
 /// the thing the unit repairs, and `zellij session up` is the command that reports on it.
+///
+/// The report goes through a handle rather than through `println!` so that a reader who stops
+/// reading ends it. See [`report_exit_code`].
 fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
     let Ok(kind) = native_service_kind() else {
         return 1;
@@ -504,8 +508,32 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
         },
     };
 
-    println!("session   {}", name);
-    println!("init      {}", status.kind.name());
+    let mut stdout = io::stdout().lock();
+    let report = print_status(
+        &mut stdout,
+        name,
+        kind,
+        exe.path(),
+        &status,
+        extras.as_ref(),
+        pinned.as_deref(),
+    );
+    report_exit_code("session status", report)
+}
+
+/// The body of `session status`, written to a handle a test can hand a closed pipe.
+#[allow(clippy::too_many_arguments)]
+fn print_status<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    kind: ServiceKind,
+    exe: &std::path::Path,
+    status: &session_service::ServiceStatus,
+    extras: Option<&SessionServiceOptions>,
+    pinned: Option<&std::path::Path>,
+) -> io::Result<i32> {
+    writeln!(out, "session   {}", name)?;
+    writeln!(out, "init      {}", status.kind.name())?;
     print_unit_dir_disagreement();
     // A job that runs `session up` for this session under another name is doing the work, so the
     // file this build would have written being absent is not the fault it looks like. It is
@@ -537,7 +565,7 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
             },
             (true, false, ..) => "installed".to_owned(),
         };
-        println!("{:9} {} - {}", file.role, file.path.display(), state);
+        writeln!(out, "{:9} {} - {}", file.role, file.path.display(), state)?;
     }
     let installed = match elsewhere {
         // this build did not write that install and cannot say which files belong to it, so
@@ -551,36 +579,61 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
             .all(|file| file.present || (file.role == "timer" && timer_elsewhere.is_some())),
     };
     for other in status.installed_as.iter().skip(1) {
-        println!(
+        writeln!(
+            out,
             "{:9} {} also runs `session up {}` ({})",
             "ambiguous",
             other.name,
             name,
             other.path.display()
-        );
+        )?;
     }
-    println!(
+    writeln!(
+        out,
         "loaded    {} ({})",
         if status.loaded { "yes" } else { "no" },
         status.load_detail
-    );
+    )?;
 
     // what the config adds is reported here because it can be: this is the whole argument for
     // keeping it in the config rather than in a drop-in directory the tool cannot see
-    print_configured_extras(kind, extras.as_ref());
-    let unit_is_current = print_unit_drift(kind, exe.path(), name, extras.as_ref());
-    let pinned_agrees = print_pin_state(name, pinned.as_deref());
+    print_configured_extras(out, kind, extras)?;
+    let unit_is_current = print_unit_drift(out, kind, exe, name, extras)?;
+    let pinned_agrees = print_pin_state(out, name, pinned)?;
 
     let facts = SessionFacts::collect(name);
     match facts.assert_up() {
-        Ok(()) => println!("running   yes, in {}", facts.socket_dir.display()),
-        Err(reason) => println!("running   no - {}", reason),
+        Ok(()) => writeln!(out, "running   yes, in {}", facts.socket_dir.display())?,
+        Err(reason) => writeln!(out, "running   no - {}", reason)?,
     }
 
-    if installed && status.loaded && pinned_agrees && unit_is_current {
-        0
-    } else {
-        1
+    // A pipe holds what has been written until the reader takes it, so the last line of the report
+    // can still fail here rather than at the `writeln!` that produced it.
+    out.flush()?;
+
+    let healthy = installed && status.loaded && pinned_agrees && unit_is_current;
+    Ok(if healthy { 0 } else { 1 })
+}
+
+/// What a report that could not finish being written exits with.
+///
+/// `zellij session status <name> | head -3` closes the pipe as soon as it has its three lines, and
+/// the next write gets `EPIPE` back. `println!` turns that into a panic - `failed printing
+/// to stdout: Broken pipe (os error 32)` - which is a crash report for a reader doing something
+/// entirely ordinary. A reader that left is not this command's failure, so it exits 0 and says
+/// nothing.
+///
+/// Only `BrokenPipe`. A full disk on a redirected stdout is a real failure and is still reported,
+/// and the process-wide `SIGPIPE` disposition is deliberately left alone - this binary also runs
+/// the server and every pane in it.
+fn report_exit_code(label: &str, report: io::Result<i32>) -> i32 {
+    match report {
+        Ok(code) => code,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => 0,
+        Err(e) => {
+            eprintln!("{}: could not write the report: {}", label, e);
+            1
+        },
     }
 }
 
@@ -595,44 +648,54 @@ fn status(name: &str, exe: Option<PathBuf>, opts: &CliArgs) -> i32 {
 /// whose CONTENT changed needs `bootout` then `bootstrap`, and `launchctl kickstart` restarts the
 /// job from the definition launchd already holds - so the obvious command runs the old plist and
 /// looks like the edit did nothing.
-fn print_unit_drift(
+fn print_unit_drift<W: Write + ?Sized>(
+    out: &mut W,
     kind: ServiceKind,
     exe: &std::path::Path,
     name: &str,
     extras: Option<&SessionServiceOptions>,
-) -> bool {
+) -> io::Result<bool> {
     match session_service::unit_drift(kind, exe, name, extras) {
         Ok(UnitDrift::NotInstalled) => {
-            println!("drift     nothing zellij wrote is installed to compare against");
-            true
+            writeln!(
+                out,
+                "drift     nothing zellij wrote is installed to compare against"
+            )?;
+            Ok(true)
         },
         Ok(UnitDrift::Current) => {
-            println!("drift     none - the installed unit is what this config would write");
-            true
+            writeln!(
+                out,
+                "drift     none - the installed unit is what this config would write"
+            )?;
+            Ok(true)
         },
         Ok(UnitDrift::Drifted { paths }) => {
             for path in paths {
-                println!(
+                writeln!(
+                    out,
                     "drift     {} is NOT what this config would write now",
                     path.display()
-                );
+                )?;
             }
-            println!(
+            writeln!(
+                out,
                 "drift     run `zellij session enable {}` to rewrite and reload it",
                 name
-            );
+            )?;
             if kind == ServiceKind::Launchd {
-                println!(
+                writeln!(
+                    out,
                     "drift     a changed plist needs bootout then bootstrap, which that command \
                      does; `launchctl kickstart` restarts the job from the definition launchd \
                      already holds"
-                );
+                )?;
             }
-            false
+            Ok(false)
         },
         Err(reason) => {
             eprintln!("session status: {}", reason);
-            false
+            Ok(false)
         },
     }
 }
@@ -798,36 +861,43 @@ pub(crate) fn create_through_the_unit(name: &str, opts: &CliArgs) -> bool {
 /// internally fine. It is the state a key turned on after `session enable` leaves behind, and the
 /// paths are BOTH named because a macOS grant is keyed to one exact path - a reader who is about to
 /// add it by hand in System Settings needs to know which.
-fn print_pin_state(name: &str, pinned: Option<&std::path::Path>) -> bool {
+fn print_pin_state<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    pinned: Option<&std::path::Path>,
+) -> io::Result<bool> {
     let Some(pinned) = pinned else {
-        println!("pin       off (no `pin_exe` in session_service)");
-        return true;
+        writeln!(out, "pin       off (no `pin_exe` in session_service)")?;
+        return Ok(true);
     };
     match pin_state_of(name, pinned) {
         PinState::Recorded(path) => {
-            println!("pin       {} - the launcher runs it", path.display());
-            true
+            writeln!(out, "pin       {} - the launcher runs it", path.display())?;
+            Ok(true)
         },
         PinState::Unrecorded(path) => {
-            println!(
+            writeln!(
+                out,
                 "pin       {} - nothing installed runs it yet",
                 path.display()
-            );
-            true
+            )?;
+            Ok(true)
         },
         PinState::Mismatch {
             configured,
             installed,
         } => {
-            println!(
+            writeln!(
+                out,
                 "pin       {} - NOT what the launcher runs",
                 configured.display()
-            );
-            println!(
+            )?;
+            writeln!(
+                out,
                 "pin       the launcher runs {} - `zellij session enable {}` re-points it",
                 installed, name
-            );
-            false
+            )?;
+            Ok(false)
         },
     }
 }
@@ -875,10 +945,13 @@ fn plist_value_summary(value: &PlistValue) -> String {
 }
 
 /// List what `session_service` in the config puts into the unit, for the init system in use.
-fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOptions>) {
+fn print_configured_extras<W: Write + ?Sized>(
+    out: &mut W,
+    kind: ServiceKind,
+    extras: Option<&SessionServiceOptions>,
+) -> io::Result<()> {
     let Some(extras) = extras.filter(|extras| extras.has_unit_extras()) else {
-        println!("config    no session_service extras");
-        return;
+        return writeln!(out, "config    no session_service extras");
     };
     match kind {
         ServiceKind::Systemd => {
@@ -889,26 +962,28 @@ fn print_configured_extras(kind: ServiceKind, extras: Option<&SessionServiceOpti
             ];
             for (section, directives) in sections {
                 for directive in directives {
-                    println!("config    [{}] {}", section, directive);
+                    writeln!(out, "config    [{}] {}", section, directive)?;
                 }
             }
         },
         ServiceKind::Launchd => {
             for key in &extras.launchd {
-                println!(
+                writeln!(
+                    out,
                     "config    {} = {}",
                     key.name,
                     plist_value_summary(&key.value)
-                );
+                )?;
             }
             // Prefixed, because these are not plist keys: they go inside EnvironmentVariables, and
             // a listing that showed them the same way would read as a claim that launchd has a
             // top-level key by that name.
             for entry in &extras.launchd_env {
-                println!("config    env {} = {}", entry.name, entry.value);
+                writeln!(out, "config    env {} = {}", entry.name, entry.value)?;
             }
         },
     }
+    Ok(())
 }
 
 /// The name to act on: what was asked for, else the session this shell is in (for `restart`, which
@@ -1769,5 +1844,54 @@ mod tests {
     #[test]
     fn the_wait_for_a_server_outlasts_a_measured_launchd_start() {
         assert!(SERVER_APPEARANCE_TIMEOUT >= Duration::from_secs(30));
+    }
+
+    /// The stdout `head -3` leaves behind: every write after the reader has gone gets `EPIPE`.
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+    }
+
+    /// `zellij session status <name> | head -3` used to panic here, because every line of the
+    /// report went out through `println!`. The exit code is 0 even though the report it was
+    /// carrying was going to be 1: the reader left before the answer, so there is nobody to fail.
+    #[test]
+    fn a_reader_that_stopped_reading_ends_the_report_at_zero() {
+        let cut_short =
+            print_configured_extras(&mut ClosedPipe, ServiceKind::Systemd, None).map(|()| 1);
+
+        assert_eq!(
+            cut_short.as_ref().unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(report_exit_code("session status", cut_short), 0);
+    }
+
+    /// The other half of the same rule. A redirected stdout that cannot be written is this
+    /// command's failure and is still reported - it is only the reader leaving that is not.
+    #[test]
+    fn a_write_that_fails_for_another_reason_is_still_a_failure() {
+        let failed = Err(io::Error::new(io::ErrorKind::PermissionDenied, "read-only"));
+
+        assert_eq!(report_exit_code("session status", failed), 1);
+    }
+
+    /// The negative control: routing the report through a handle must not stop it being written.
+    #[test]
+    fn a_reader_that_stays_gets_the_line() {
+        let mut out = Vec::new();
+
+        print_configured_extras(&mut out, ServiceKind::Systemd, None).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "config    no session_service extras\n"
+        );
     }
 }

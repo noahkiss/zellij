@@ -6846,6 +6846,38 @@ trigger.
 Reported upstream as [#5440](https://github.com/zellij-org/zellij/issues/5440); nothing has landed
 there.
 
+### `session status` ends quietly when the reader stops reading
+
+```
+$ zellij session status mysession | head -3
+session   mysession
+init      systemd
+service   /home/user/.config/systemd/user/zellij-mysession.service - installed
+thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+failed printing to stdout: Broken pipe (os error 32)
+```
+
+`head` closes the pipe once it has its three lines, and the fourth `println!` gets `EPIPE` back.
+`println!` has one answer to a failed write, which is to panic — so a reader doing something
+entirely ordinary produced a crash report, a `101` exit, and a stack trace in the middle of a
+script.
+
+The report now goes through a handle. `print_status` takes a `Write` and returns `io::Result<i32>`,
+its three stdout sub-printers (`print_unit_drift`, `print_pin_state`, `print_configured_extras`) do
+the same, and `report_exit_code` turns the outcome into a status: `BrokenPipe` exits **0** and says
+nothing, any other write error is reported on stderr and exits 1. A reader that left is not this
+command's failure; a full disk on a redirected stdout still is.
+
+Two things it deliberately does not do. It does not touch the process-wide `SIGPIPE` disposition —
+this binary is also the server and every pane in it, and restoring the default disposition would
+change what happens to a pane's process group, not just to this printer. And it does not sweep the
+rest of the CLI: `print_unit_dir_disagreement` is the one printer beside these that `status` calls,
+it writes to **stderr**, and stderr is not the handle `| head` closes.
+
+The exit code is 0 even when the report that was cut short was going to be 1. Nothing read the
+answer, so there is no answer to fail with, and a `| head` that exits non-zero half the time is the
+next bug report.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
