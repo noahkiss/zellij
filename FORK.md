@@ -2272,9 +2272,75 @@ exception for a nested one: the config can go everywhere first and the binaries 
 order. It does not extend to the **command surface** — a script or a unit calling a new subcommand
 still breaks on every machine that has not upgraded.
 
-Scope is `session_service` and its children only. Upstream's own strict blocks are untouched, and
-so are the fork's other two — `pane_privacy` and `resurrect_command_hints` still refuse a child
-they do not know, and have the same rollout problem waiting in them.
+Scope is `session_service` and its children only. Upstream's own strict blocks are untouched. The
+fork's other two — `pane_privacy` and `resurrect_command_hints` — had the same rollout problem
+waiting in them until [the entry
+below](#pane_privacy-and-resurrect_command_hints-warn-on-a-key-they-do-not-know) softened them the
+same way.
+
+### `pane_privacy` and `resurrect_command_hints` warn on a key they do not know
+
+The rule the entry above wrote for `session_service`, now applied to the fork's other two blocks
+that parse their own children. They were the last places where a nested key could not be seeded
+into a shared config ahead of the binary, because an unknown child failed the WHOLE file:
+
+```
+× Failed to parse Zellij configuration
+╰── Unknown pane_privacy entry: "patterns_files" (expected patterns_file, pattern, ...)
+```
+
+A name this build does not know is now **kept, logged and ignored**:
+
+```kdl
+pane_privacy {
+    pattern "pretend-private"                  // read
+    some_key_from_a_later_build "whatever"     // ignored, with a warning
+}
+resurrect_command_hints {
+    claude {
+        match "claude"                         // read
+        env "CLAUDE_CODE_SESSION_ID"           // read
+        resume_args "--continue"               // read
+        resume "yes"                           // ignored, with a warning
+    }
+}
+```
+
+**Only the unknown-NAME case is softened**, exactly as above. `on_unknown_cwd "withold"` is still
+the whole config failing, and so is a `match_fields` naming a field that is not one, a hint whose
+`resume_args` is not a string, and a hint that names no `match`, `env` or `resume_args` at all. A
+privacy setting silently dropped is worse than one that refuses, and the operator who wrote it
+meant it. An unknown name means the opposite — nobody who typed it expected THIS build to act on
+it.
+
+`rewrite` stays a **known** name in a hint, not an unknown one. It is retired, and it has its own
+warning saying what replaced it and whether the hint was skipped; reporting it as merely unknown
+would lose that.
+
+The warnings reach the same two places as `session_service`'s, printed as one run under the config
+`zellij setup --check` just read, and logged at `warn` for a session already running:
+
+```
+[CONFIG FILE]: Well defined.
+[CONFIG WARNING]: unknown pane_privacy entry "patterns_files", ignored (expected patterns_file,
+pattern, match_fields, on_unknown_cwd or tab_rule)
+[CONFIG WARNING]: unknown resurrect_command_hints entry "resume" in hint "claude", ignored
+(expected match, env or resume_args)
+```
+
+A hint's warning names the hint it was read under, because a config carries several and the entry
+name alone would not say which one is short a setting.
+
+An ignored entry is **not** written back out by `setup --dump-config`, and a `pane_privacy` block
+holding nothing else is not written out at all — it sets nothing this build acts on.
+
+One implementation note worth keeping: in a hint, the unknown name is checked BEFORE the entry's
+value is read. Every entry this build knows carries a string, and the old code enforced that first,
+so an unknown entry with a number or a bool in it would have failed the config on a rule invented
+for it on its way to being ignored.
+
+With this, every block the fork added parses its own children the way an unknown top-level key has
+always behaved. Upstream's own strict blocks are still untouched.
 
 ### A pinned copy of the binary (`pin_exe`)
 
@@ -3573,7 +3639,10 @@ not degradable: `Config::from_kdl` fails the whole file, and every path into a s
 `zellij attach -c`, the session unit — prints the parse error and exits before the terminal is
 touched. Refusing `rewrite` would therefore have stopped every machine whose config still carried
 it, over a key that only decides how nicely a pane comes back. A skipped hint costs a resumable
-command; a refused config costs the session.
+command; a refused config costs the session. That argument is now the whole block's: [an entry this
+build does not know](#pane_privacy-and-resurrect_command_hints-warn-on-a-key-they-do-not-know) is
+warned about and ignored rather than refused. `rewrite` is not one of those — it is a name this
+build knows, and the warning above is its own.
 
 A `{}` keeps one residual risk, which is why the shipped `claude` hint carries none. The variable is
 read from the pane's whole process subtree, so the value can come from a child — a subagent, a hook —
@@ -4581,8 +4650,11 @@ name alone can say what the work is.
 count. A redacted row still says where the private work is.
 
 Being top-level, the block is ignored by a binary that predates it, so it can go into a shared
-config ahead of the upgrade. Its own children are strict, so it cannot be rolled out one key at a
-time.
+config ahead of the upgrade. Its own children were strict, so it could not be rolled out one key at
+a time — which is what every build before [the entry that softened
+it](#pane_privacy-and-resurrect_command_hints-warn-on-a-key-they-do-not-know) does. From that entry
+on, a build ignores a child it does not know, and a nested key can be seeded ahead of the binaries
+like any other.
 
 #### What it does to each command
 

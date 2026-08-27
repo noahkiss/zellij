@@ -635,13 +635,33 @@ impl Setup {
                     // is well defined and the key still does nothing. This is the only place a
                     // person is told which one - the parse also logs it, and a log is not where
                     // someone looks when a setting appears to have no effect.
-                    for warning in config
+                    // Every block that parses its own children keeps its own list, and they are
+                    // printed as one run: a person reading this wants the keys this build ignored,
+                    // not which block each came from - the warning itself names that.
+                    let unknown_entries = config
                         .options
                         .session_service
                         .as_ref()
                         .map(|session_service| session_service.unknown_entries.as_slice())
                         .unwrap_or_default()
-                    {
+                        .iter()
+                        .chain(
+                            config
+                                .options
+                                .pane_privacy
+                                .as_ref()
+                                .map(|pane_privacy| pane_privacy.unknown_entries.as_slice())
+                                .unwrap_or_default(),
+                        )
+                        .chain(
+                            config
+                                .options
+                                .resurrect_command_hints
+                                .as_ref()
+                                .map(|hints| hints.unknown_entries.as_slice())
+                                .unwrap_or_default(),
+                        );
+                    for warning in unknown_entries {
                         writeln!(&mut message, "[CONFIG WARNING]: {}", warning).unwrap();
                     }
                 },

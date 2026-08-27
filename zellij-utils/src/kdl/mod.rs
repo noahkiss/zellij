@@ -3835,8 +3835,13 @@ impl Options {
     /// ```
     ///
     /// A TOP-LEVEL block, so a binary that predates the feature ignores the whole thing instead of
-    /// failing to parse the config. Its own children are strict: an unknown one is an error, which
-    /// is the point - a privacy setting that was silently dropped is worse than one that refuses.
+    /// failing to parse the config. A CHILD this build does not know is now ignored the same way:
+    /// it is kept in [`PanePrivacyOptions::unknown_entries`], logged, and otherwise passed over, so
+    /// a new key can go into a shared config before every machine has the binary that reads it.
+    ///
+    /// Only the unknown-NAME case is soft. A name this build KNOWS, given a value it cannot mean,
+    /// is still the whole config failing to parse - a privacy setting that was silently dropped is
+    /// worse than one that refuses, and the operator who wrote `on_unknown_cwd "withold"` meant it.
     ///
     /// Nothing here compiles a pattern or reads a file. This function is built for wasm along with
     /// the rest of the config parser, and the matcher is not.
@@ -3911,15 +3916,11 @@ impl Options {
                     })?);
                 },
                 other => {
-                    return Err(ConfigError::new_kdl_error(
-                        format!(
-                            "Unknown pane_privacy entry: {:?} (expected patterns_file, pattern, \
-                             match_fields, on_unknown_cwd or tab_rule)",
-                            other
-                        ),
-                        entry.span().offset(),
-                        entry.span().len(),
-                    ))
+                    pane_privacy.note_unknown_entry(format!(
+                        "unknown pane_privacy entry {:?}, ignored (expected patterns_file, \
+                         pattern, match_fields, on_unknown_cwd or tab_rule)",
+                        other
+                    ));
                 },
             }
         }
@@ -3927,7 +3928,9 @@ impl Options {
     }
     fn pane_privacy_to_kdl(&self) -> Option<KdlNode> {
         let pane_privacy = self.pane_privacy.as_ref()?;
-        if pane_privacy == &PanePrivacyOptions::default() {
+        // an entry this build ignored is not a setting it holds, so a block carrying nothing else
+        // is still nothing to write out
+        if pane_privacy.is_default_ignoring_unknown_entries() {
             return None;
         }
         let mut node = KdlNode::new("pane_privacy");
@@ -4241,6 +4244,13 @@ impl Options {
     /// `zellij` exits before it starts a session, so refusing the key would let an upgraded binary
     /// brick every machine whose config still carries it. A hint that does not load costs a
     /// resumable command; a config that does not load costs the session.
+    ///
+    /// An entry this build does not KNOW is the same argument one step further, and is kept in
+    /// [`ResurrectCommandHints::unknown_entries`], logged, and otherwise passed over - so a new
+    /// entry can go into a shared config before every machine has the binary that reads it. Only
+    /// the unknown-NAME case is soft: a name this build knows, given a value it cannot mean, and a
+    /// hint that names no `match`, `env` or `resume_args` at all, are both still the whole config
+    /// failing. The operator meant that hint and is not getting it.
     fn resurrect_command_hints_from_kdl(
         kdl_hints: &KdlNode,
     ) -> Result<ResurrectCommandHints, ConfigError> {
@@ -4258,6 +4268,17 @@ impl Options {
                 format!("empty resurrect_command_hints entry: {:?}", name)
             ) {
                 let entry_name = kdl_name!(entry);
+                // checked BEFORE the value is read: every entry this build knows carries a string,
+                // and an entry it does not know is not held to that rule on its way to being
+                // ignored
+                if !ResurrectCommandHints::is_known_hint_entry(entry_name) {
+                    hints.note_unknown_entry(format!(
+                        "unknown resurrect_command_hints entry {:?} in hint {:?}, ignored \
+                         (expected match, env or resume_args)",
+                        entry_name, name
+                    ));
+                    continue;
+                }
                 let value = kdl_first_entry_as_string!(entry)
                     .ok_or(ConfigError::new_kdl_error(
                         format!(
@@ -4273,17 +4294,8 @@ impl Options {
                     "env" => env = Some(value),
                     "resume_args" => resume_args = Some(value),
                     "rewrite" => retired_rewrite = Some(value),
-                    other => {
-                        return Err(ConfigError::new_kdl_error(
-                            format!(
-                                "Unknown resurrect_command_hints entry: {:?} (expected match, env \
-                                 or resume_args)",
-                                other
-                            ),
-                            entry.span().offset(),
-                            entry.span().len(),
-                        ))
-                    },
+                    // unreachable: is_known_hint_entry above lists exactly these names
+                    _ => {},
                 }
             }
             if let Some(rewrite) = retired_rewrite {
@@ -10033,10 +10045,11 @@ fn no_pane_privacy_block_is_no_policy() {
     assert_eq!(config.options.pane_privacy, None);
 }
 
+/// A name this build KNOWS, given a value it cannot mean, is still the whole config failing: the
+/// operator meant that setting, and a privacy setting silently dropped is worse than one refused.
 #[test]
-fn pane_privacy_rejects_entries_it_does_not_know() {
+fn pane_privacy_rejects_values_it_cannot_read() {
     for bad in [
-        "pane_privacy {\n patterns_files \"/invented/patterns.txt\"\n}",
         "pane_privacy {\n match_fields \"cwd\" \"hostname\"\n}",
         "pane_privacy {\n on_unknown_cwd \"maybe\"\n}",
         "pane_privacy {\n tab_rule \"some\"\n}",
@@ -10050,6 +10063,65 @@ fn pane_privacy_rejects_entries_it_does_not_know() {
             bad
         );
     }
+}
+
+/// A binary that does not know an entry ignores it and says so, rather than failing the whole
+/// config - `patterns_files` for `patterns_file` is the misspelling that reads as if it should
+/// work. The warning has to name what the block does accept, so a misspelling reads as one.
+#[test]
+fn pane_privacy_ignores_an_entry_it_does_not_know_and_names_what_it_accepts() {
+    let config = Config::from_kdl(
+        "pane_privacy {
+    patterns_files \"/invented/patterns.txt\"
+    pattern \"pretend-private\"
+}",
+        None,
+    )
+    .unwrap();
+    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
+    assert_eq!(
+        pane_privacy.unknown_entries.len(),
+        1,
+        "{:?}",
+        pane_privacy.unknown_entries
+    );
+    let warning = &pane_privacy.unknown_entries[0];
+    assert!(warning.contains("\"patterns_files\""), "{}", warning);
+    assert!(warning.contains("expected patterns_file,"), "{}", warning);
+    assert!(warning.contains("on_unknown_cwd"), "{}", warning);
+    // the ignored entry named no file, and the entry beside it was still read
+    assert_eq!(pane_privacy.patterns_file, None);
+    assert_eq!(pane_privacy.patterns, vec!["pretend-private".to_owned()]);
+}
+
+/// An ignored entry is not part of this build's configuration, so a dump does not re-emit it - and
+/// a block holding nothing else is not written out at all.
+#[test]
+fn an_ignored_pane_privacy_entry_is_not_dumped() {
+    let config = Config::from_kdl(
+        "pane_privacy {
+    some_key_from_a_later_build \"whatever\"
+}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config
+            .options
+            .pane_privacy
+            .as_ref()
+            .unwrap()
+            .unknown_entries
+            .len(),
+        1
+    );
+    let serialized = config.to_string(false);
+    assert!(
+        !serialized.contains("some_key_from_a_later_build"),
+        "{}",
+        serialized
+    );
+    assert!(!serialized.contains("pane_privacy"), "{}", serialized);
 }
 
 #[test]
@@ -10995,11 +11067,10 @@ fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
     claude {
         match \"claude\"
         env \"X\"
-        resume_args \"--continue\"
-        resume \"yes\"
+        resume_args true
     }
 }",
-            "resume",
+            "string value",
         ),
     ];
     for (config, expected) in offenders {
@@ -11012,6 +11083,67 @@ fn resurrect_command_hints_refuses_a_hint_that_cannot_apply() {
             error
         );
     }
+}
+
+/// A binary that does not know an entry of a hint ignores it and says so, rather than failing the
+/// whole config - `resume` for `resume_args` is the misspelling that reads as if it should work.
+/// The warning names the hint it was read under, because a config can carry several.
+#[test]
+fn a_hint_entry_it_does_not_know_is_ignored_and_the_hint_still_loads() {
+    let config = Config::from_kdl(
+        r#"resurrect_command_hints {
+    claude {
+        match "claude"
+        env "CLAUDE_CODE_SESSION_ID"
+        resume_args "--continue"
+        resume "yes"
+        some_key_from_a_later_build 12
+    }
+}"#,
+        None,
+    )
+    .unwrap();
+    let hints = config.options.resurrect_command_hints.as_ref().unwrap();
+    assert_eq!(
+        hints.unknown_entries.len(),
+        2,
+        "{:?}",
+        hints.unknown_entries
+    );
+    let warning = &hints.unknown_entries[0];
+    assert!(warning.contains("\"resume\""), "{}", warning);
+    assert!(
+        warning.contains("expected match, env or resume_args"),
+        "{}",
+        warning
+    );
+    assert!(warning.contains("\"claude\""), "{}", warning);
+    // an entry this build does not know is not held to the string rule the known ones follow
+    assert!(
+        hints.unknown_entries[1].contains("some_key_from_a_later_build"),
+        "{}",
+        hints.unknown_entries[1]
+    );
+
+    // the hint beside the ignored entries is whole
+    assert_eq!(
+        hints.hints,
+        vec![ResurrectCommandHint {
+            name: "claude".to_owned(),
+            match_command: "claude".to_owned(),
+            env: "CLAUDE_CODE_SESSION_ID".to_owned(),
+            resume_args: "--continue".to_owned(),
+        }]
+    );
+
+    // and nothing of the ignored entries is written back out
+    let serialized = config.to_string(false);
+    assert!(
+        !serialized.contains("some_key_from_a_later_build"),
+        "{}",
+        serialized
+    );
+    assert!(serialized.contains("resume_args"), "{}", serialized);
 }
 
 /// The upgrade path that must never brick a machine: a config written for the retired `rewrite`
