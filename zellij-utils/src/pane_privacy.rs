@@ -23,7 +23,9 @@
 //! in `zellij-server`, which never builds for wasm and already depends on `regex`.
 //!
 //! The settings are a top-level `pane_privacy` block in `config.kdl`, so a binary that predates the
-//! feature ignores the whole block rather than failing to parse the config.
+//! feature ignores the whole block rather than failing to parse the config. A CHILD this build does
+//! not know is ignored the same way, and kept in [`PanePrivacyOptions::unknown_entries`] so
+//! `zellij setup --check` can name it.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -157,6 +159,20 @@ pub struct PanePrivacyOptions {
     pub on_unknown_cwd: Option<OnUnknownCwd>,
     /// How a tab inherits its panes' verdict. Unset means [`TabRule::Any`].
     pub tab_rule: Option<TabRule>,
+    /// Entries in this block that this binary does not know, in the words a human should read.
+    ///
+    /// A block that parses its own children used to REJECT an unknown one, and a rejection here
+    /// fails the whole config rather than the block - so a key could never reach a shared config
+    /// before the binary that understands it reached every machine. Keeping the names instead of
+    /// erroring is what makes the order "config first, binaries after" work for a nested key the
+    /// way it already worked for a top-level one.
+    ///
+    /// Kept rather than only logged because `zellij setup --check` is where someone looks when a
+    /// key appears to do nothing, and a server log line is not there. Not written back out by
+    /// [`crate::input::config::Config::to_string`]: an ignored key is not part of this build's
+    /// configuration, and re-emitting it would make a dump claim otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_entries: Vec<String>,
 }
 
 /// The fields tried when the config does not say: where a private path lands by itself.
@@ -166,9 +182,31 @@ impl PanePrivacyOptions {
     /// Whether this block asks for nothing.
     ///
     /// Only the patterns decide. A block that sets `match_fields` and names no pattern withholds
-    /// nothing, and the whole filter short-circuits on this one question.
+    /// nothing, and the whole filter short-circuits on this one question. [`Self::unknown_entries`]
+    /// does not count either: a name this build ignores cannot withhold a pane.
     pub fn is_empty(&self) -> bool {
         self.patterns_file.is_none() && self.patterns.is_empty()
+    }
+
+    /// Whether this block sets nothing this build acts on, ignoring [`Self::unknown_entries`].
+    ///
+    /// Asked by the config dump, which writes the block out only when it differs from the default.
+    /// An entry this build ignores is not a difference: it is not part of this build's
+    /// configuration, and a dump that emitted an otherwise empty block for it would say it was.
+    pub fn is_default_ignoring_unknown_entries(&self) -> bool {
+        let mut known = self.clone();
+        known.unknown_entries.clear();
+        known == PanePrivacyOptions::default()
+    }
+
+    /// Record an entry of this block that this binary does not know, and say so in the log.
+    ///
+    /// The two surfaces are one call because they answer the same question in two places: the log
+    /// line is for a session that is already running, and the kept string is what
+    /// `zellij setup --check` prints for someone holding a config that seems to be ignored.
+    pub fn note_unknown_entry(&mut self, message: String) {
+        log::warn!("{}", message);
+        self.unknown_entries.push(message);
     }
 
     pub fn match_fields_or_default(&self) -> Vec<MatchField> {

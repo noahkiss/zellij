@@ -99,11 +99,50 @@ impl ResurrectCommandHint {
 pub struct ResurrectCommandHints {
     #[serde(default)]
     pub hints: Vec<ResurrectCommandHint>,
+    /// Entries of a hint that this binary does not know, in the words a human should read.
+    ///
+    /// A block that parses its own children used to REJECT an unknown one, and a rejection here
+    /// fails the whole config rather than the block - so a key could never reach a shared config
+    /// before the binary that understands it reached every machine. Keeping the names instead of
+    /// erroring is what makes the order "config first, binaries after" work for a nested key the
+    /// way it already worked for a top-level one.
+    ///
+    /// Kept rather than only logged because `zellij setup --check` is where someone looks when a
+    /// key appears to do nothing, and a server log line is not there. Not written back out by
+    /// [`crate::input::config::Config::to_string`]: an ignored key is not part of this build's
+    /// configuration, and re-emitting it would make a dump claim otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_entries: Vec<String>,
 }
 
 impl ResurrectCommandHints {
+    /// Whether this block holds no hint. [`Self::unknown_entries`] deliberately does not count: an
+    /// entry this build ignores adds nothing to a recorded command, and a block holding only
+    /// ignored names is as empty as one holding nothing.
     pub fn is_empty(&self) -> bool {
         self.hints.is_empty()
+    }
+
+    /// Whether a hint's child names something this build reads.
+    ///
+    /// `rewrite` is here even though it is retired: it is a name this build knows and answers with
+    /// its own warning, which says what replaced it. Reporting it as merely unknown would lose
+    /// that.
+    ///
+    /// Asked BEFORE a child's value is read, because the value of every child has to be a string
+    /// and an unknown name must not be held to a rule this build made up for it.
+    pub fn is_known_hint_entry(entry: &str) -> bool {
+        matches!(entry, "match" | "env" | "resume_args" | "rewrite")
+    }
+
+    /// Record an entry of a hint that this binary does not know, and say so in the log.
+    ///
+    /// The two surfaces are one call because they answer the same question in two places: the log
+    /// line is for a session that is already running, and the kept string is what
+    /// `zellij setup --check` prints for someone holding a config that seems to be ignored.
+    pub fn note_unknown_entry(&mut self, message: String) {
+        log::warn!("{}", message);
+        self.unknown_entries.push(message);
     }
 
     pub fn push(&mut self, hint: ResurrectCommandHint) {
