@@ -4235,6 +4235,13 @@ goes to the originating plugin exactly as before.
 - It fires for a plain shell exiting too, which is the same event from zellij's point of view.
 - A pane that holds after exiting keeps reporting `exited` and `exit_status` on `PaneInfo`; a pane
   configured to close is announced by `PaneClosed` immediately afterwards.
+- **The order of the two is decided by which end went first, and `PaneClosed` is often the one in
+  front.** When the *command* ends, the exit is broadcast and the close follows it, as above. When
+  something *closes the pane* — `close-pane`, a tab closing, the session ending — the pane is
+  announced closed and the exit arrives afterwards, because the process is not reaped until it has
+  been killed. A consumer that forgets a pane on `PaneClosed` therefore has nowhere to put the
+  status when it lands: keep the pane until its exit is in, or take the status off `PaneInfo` while
+  the pane is still listed. Observed on a fully detached session driven from the CLI.
 
 Proto: `EventType` 53, event payload 47.
 

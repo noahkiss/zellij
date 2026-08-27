@@ -89,6 +89,13 @@ pub fn show_cursor(cursor_position: Option<(usize, usize)>) {
     unsafe { host_run_plugin_command() };
 }
 
+/// Ask for the permissions this plugin needs, and wait for the answer before using them
+///
+/// **The answer arrives later, as `PermissionRequestResult`.** The call returns as soon as the ask
+/// is sent, so a permission asked for in `load()` is not granted by the time `load()` returns, and
+/// anything done under it in the same breath is refused. A command that reports its own refusal
+/// says so; [`web_request`] does not, and is dropped in silence - see its note. Subscribe to
+/// `EventType::PermissionRequestResult` and do the work when it lands.
 pub fn request_permission(permissions: &[PermissionType]) {
     let plugin_command = PluginCommand::RequestPluginPermissions(permissions.into());
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
@@ -864,6 +871,11 @@ pub fn run_command_with_env_variables_and_cwd(
 /// The request is given up on after 30 seconds (10 to connect). A request that never got an HTTP
 /// response reports status 0 with an `x-zellij-error-kind` header, so a transport failure is never
 /// mistaken for a status the server sent.
+///
+/// **A request made before `WebAccess` is granted is dropped in silence**: no `WebRequestResult`,
+/// no error, nothing in the log. That is the shape of a request issued from `load()`, because
+/// [`request_permission`] is answered later by a `PermissionRequestResult` event - so the first
+/// request of a plugin's life is the one most likely to vanish. Wait for that event, then send.
 pub fn web_request<S: AsRef<str>>(
     url: S,
     verb: HttpVerb,
@@ -1638,24 +1650,36 @@ pub fn rename_session(name: &str) {
 }
 
 /// Unblock the input side of a pipe, requesting the next message be sent if there is one
-pub fn unblock_cli_pipe_input(pipe_name: &str) {
-    let plugin_command = PluginCommand::UnblockCliPipeInput(pipe_name.to_owned());
+///
+/// **The argument is the pipe's ID, not its name.** It is the string inside
+/// `PipeSource::Cli(id)` on the [`PipeMessage`] being answered - a uuid the session made, which
+/// nobody typed. `PipeMessage::name` is what `zellij pipe --name` said, and it is a different
+/// string: the session keys its pipes by id, so a name reaches no pipe and this call does nothing
+/// at all. Nothing reports that; the CLI pipe simply waits until `--timeout` ends it.
+pub fn unblock_cli_pipe_input(pipe_id: &str) {
+    let plugin_command = PluginCommand::UnblockCliPipeInput(pipe_id.to_owned());
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
 }
 
 /// Block the input side of a pipe, will only be released once this or another plugin unblocks it
-pub fn block_cli_pipe_input(pipe_name: &str) {
-    let plugin_command = PluginCommand::BlockCliPipeInput(pipe_name.to_owned());
+///
+/// The argument is the pipe's ID, on the same terms as [`unblock_cli_pipe_input`].
+pub fn block_cli_pipe_input(pipe_id: &str) {
+    let plugin_command = PluginCommand::BlockCliPipeInput(pipe_id.to_owned());
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
 }
 
 /// Send output to the output side of a pipe, ths does not affect the input side of same pipe
-pub fn cli_pipe_output(pipe_name: &str, output: &str) {
-    let plugin_command = PluginCommand::CliPipeOutput(pipe_name.to_owned(), output.to_owned());
+///
+/// **The argument is the pipe's ID, not its name** - see [`unblock_cli_pipe_input`] for which
+/// string that is. Output sent under the `--name` the caller typed is dropped without a word, and
+/// the pipe prints nothing.
+pub fn cli_pipe_output(pipe_id: &str, output: &str) {
+    let plugin_command = PluginCommand::CliPipeOutput(pipe_id.to_owned(), output.to_owned());
     let protobuf_plugin_command: ProtobufPluginCommand = plugin_command.try_into().unwrap();
     object_to_stdout(&protobuf_plugin_command.encode_to_vec());
     unsafe { host_run_plugin_command() };
