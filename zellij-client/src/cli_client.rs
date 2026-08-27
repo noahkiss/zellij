@@ -199,6 +199,9 @@ fn pipe_client(
         }
     };
     let is_piped = !os_input.stdin_is_terminal();
+    // whether the pipe's own words came from the invocation, asked before the payload is taken out
+    // of the loop below
+    let payload_from_command_line = payload.is_some();
     // Only a plugin that received the message can unblock a pipe, so a session with none listening
     // never answers and the wait below has nothing to end it.
     //
@@ -206,6 +209,9 @@ fn pipe_client(
     // session has said nothing, and anything it says resets it. That is what makes it safe for a
     // streaming pipe - `tail -f | zellij pipe` spends its time in the `read_line` below, which is
     // outside the window entirely, and each answer the plugin sends starts it again.
+    //
+    // Nothing bounds that read, which is why only a pipe that IS its stdin reaches it - see
+    // [`pipe_reads_stdin`].
     //
     // The messages are read on a thread because `recv_from_server` blocks, and a session with
     // nothing to say is exactly the case where it blocks longest.
@@ -228,11 +234,17 @@ fn pipe_client(
         if let Some(payload) = payload.take() {
             let msg = create_msg(Some(payload));
             os_input.send_to_server(msg);
-        } else if !is_piped {
+        } else if !pipe_reads_stdin(is_piped, payload_from_command_line) {
             // here we send an empty message to trigger the plugin, because we don't have any more
             // data
             let msg = create_msg(None);
             os_input.send_to_server(msg);
+            // the pipe said everything it had to say, so this end-of-pipe message is the last one
+            // there is: the same place `zellij pipe -- 'payload' < /dev/null` has always ended. A
+            // pipe reading a terminal never arrives here - it exits from the answer below - so
+            // this is where a command-line payload stops instead of falling through to a stdin the
+            // pipe never owned
+            break;
         } else {
             // we didn't get payload from the command line, meaning we listen on STDIN because this
             // signifies the user is about to pipe more (eg. cat my-large-file | zellij pipe ...)
@@ -343,6 +355,28 @@ fn pipe_client(
             }
         }
     }
+}
+
+/// Whether this pipe reads stdin at all, once the message it was invoked with has gone out.
+///
+/// Two things answer no, and only one of them used to be asked. Stdin that is a **terminal** is a
+/// person at a keyboard rather than data waiting to be sent. And a payload given on the **command
+/// line** is the whole pipe: `zellij pipe --name claim -- 'payload'` said its piece in the
+/// invocation, so the stdin it inherited belongs to whoever spawned it and is nothing to do with
+/// the pipe.
+///
+/// That second answer is what makes `--timeout` mean anything. The read it prevents sits outside
+/// the idle window, so a stdin that is neither a terminal nor ever at EOF held the pipe open with
+/// nothing able to end it - and that is the ordinary shape of an inherited stdin: a command run
+/// over ssh, or a child of a long-lived server. `zellij pipe --timeout 5 --name claim -- 'payload'`
+/// got its answer and then blocked forever anyway. Redirecting from `/dev/null` was the only cure,
+/// and a caller should not have to know that.
+///
+/// The cost is that `echo data | zellij pipe --name n -- 'payload'` now sends only the payload. An
+/// invocation that says its message twice was always ambiguous; the one that means the stream is
+/// the one that leaves the payload off.
+fn pipe_reads_stdin(stdin_is_piped: bool, payload_from_command_line: bool) -> bool {
+    stdin_is_piped && !payload_from_command_line
 }
 
 /// The sentence a pipe that ran out of time prints on stderr.
@@ -1521,6 +1555,25 @@ mod tests {
             with_handle(vec!["tab_id: 4".to_owned()], "build"),
             vec!["tab_id: 4".to_owned(), "handle: build".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_payload_on_the_command_line_is_the_whole_pipe() {
+        // the bug: a payload was sent, answered, and then the pipe read the stdin it had inherited
+        // - which for a command run over ssh, or a child of a long-lived server, is a handle that
+        // never reaches EOF and is not covered by `--timeout`
+        assert!(
+            !pipe_reads_stdin(true, true),
+            "a command-line payload ends the pipe even when stdin is not a terminal"
+        );
+        // `echo data | zellij pipe --name n` is still the streaming pipe it always was
+        assert!(
+            pipe_reads_stdin(true, false),
+            "a pipe with no payload of its own reads the stream it was given"
+        );
+        // a terminal is a person, not data
+        assert!(!pipe_reads_stdin(false, false));
+        assert!(!pipe_reads_stdin(false, true));
     }
 
     #[test]

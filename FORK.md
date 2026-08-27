@@ -6473,6 +6473,9 @@ spends its time blocked on `read_line`, which is outside the window entirely, an
 streams output restarts it on every send. Verified — a producer emitting a line every two seconds
 for six ran to completion under `--timeout 3`.
 
+Nothing bounds that read, which is the whole reason [only a pipe that *is* its
+stdin](#a-payload-on-the-command-line-is-the-whole-pipe) is allowed to reach it.
+
 **So it defaults to 30 seconds rather than to nothing.** A flag-only patch would have turned
 today's fast (if wrong) exit into an unbounded hang for every existing caller, which is a worse
 trade than the one this makes. Thirty seconds is generous enough for the slow legitimate case, a
@@ -6481,6 +6484,42 @@ wants it, and says so in the timeout message.
 
 The flag never reaches the session. It is taken off the request by `CliAction::take_pipe_timeout`
 and held by the client, so `Action::CliPipe` and the client/server contract are untouched.
+
+### A payload on the command line is the whole pipe
+
+```
+zellij pipe --timeout 5 --name claim -- payload      # answers, then exits - whatever stdin is
+echo data | zellij pipe --name logs                  # unchanged: this one IS its stdin
+```
+
+**`zellij pipe -- payload` got its answer and then blocked forever**, on any stdin that is neither a
+terminal nor ever at EOF. The client sends the payload, prints what the plugin says, and then loops
+for more to send; the test for whether there is more asked only whether stdin was a terminal. A
+non-terminal it never intended to read is the *usual* case for a program that shells out — a command
+run over ssh, or a child of a long-lived server, inherits a handle that stays open for the life of
+the parent. Measured on a session with nothing listening: `< /dev/null` answered in 25ms, the same
+call with an inherited handle sat there until it was killed, and `( sleep 30 ) | zellij pipe
+--timeout 5 -- payload` spent the whole thirty seconds.
+
+**`--timeout` could not end it**, because the read is outside the window by design — that is what
+makes the window safe for `tail -f | zellij pipe`. So the flag that exists to bound a pipe was
+powerless against the one way a pipe hangs by accident, and `< /dev/null` was the only cure. A
+caller should not have to know that.
+
+**A payload given on the command line is now a reason not to read stdin, the same as a terminal is.**
+The pipe sends it, waits for the answer under `--timeout`, sends the end-of-pipe message and stops —
+which is exactly where `zellij pipe -- payload < /dev/null` has always ended. Both shapes above now
+return in about 20ms. Nothing changes for a pipe that means its stdin: `echo data | zellij pipe
+--name logs` with no payload still reads the stream to EOF, and a terminal still exits on the
+plugin's answer.
+
+The one behaviour traded away is `echo data | zellij pipe --name n -- payload`, which used to send
+both and now sends only the payload. An invocation that says its message twice never had an obvious
+meaning; the one that means the stream is the one that leaves the payload off, and `pipe --help` now
+says so on the argument itself.
+
+Client-side, and one branch of it: `pipe_reads_stdin` in `zellij-client/src/cli_client.rs`. No
+action, no message and no contract changed.
 
 ### `zellij action --json` answers the mutations too
 
