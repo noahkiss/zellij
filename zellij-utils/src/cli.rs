@@ -833,7 +833,8 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// The name of the pipe
         #[clap(short, long, value_parser, display_order(1))]
         name: Option<String>,
-        /// The data to send down this pipe (if blank, will listen to STDIN)
+        /// The data to send down this pipe. Given here it is the WHOLE pipe and STDIN is never read;
+        /// leave it blank to send what arrives on STDIN instead
         payload: Option<String>,
 
         #[clap(short, long, value_parser, display_order(2))]
@@ -2238,7 +2239,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// The name of the pipe
         #[clap(short, long, value_parser, display_order(1))]
         name: Option<String>,
-        /// The data to send down this pipe (if blank, will listen to STDIN)
+        /// The data to send down this pipe. Given here it is the WHOLE pipe and STDIN is never read;
+        /// leave it blank to send what arrives on STDIN instead
         payload: Option<String>,
 
         #[clap(short, long, value_parser, display_order(2))]
