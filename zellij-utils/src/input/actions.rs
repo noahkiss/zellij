@@ -1042,13 +1042,25 @@ impl Action {
                 path,
                 full,
                 pane_id,
+                all,
                 ansi,
             } => {
+                // a sweep is the client's to run, one pane at a time down one connection, and no
+                // action carries more than one pane. Reaching here with a sweep means something
+                // built the action itself and went past the client that answers it - which would
+                // otherwise dump one pane of the several asked for and say nothing
+                if all || pane_id.len() > 1 {
+                    return Err(
+                        "A dump-screen of several panes is not one action: the client \
+                                asks for them a pane at a time."
+                            .to_owned(),
+                    );
+                }
                 // the two spellings of the same argument; clap has already refused both at once
                 let file_path = path
                     .or(file)
                     .map(|p| p.as_os_str().to_string_lossy().into());
-                match pane_id {
+                match pane_id.into_iter().next() {
                     Some(pane_id_str) => {
                         let parsed_pane_id = resolve_pane_target(&pane_id_str);
                         match parsed_pane_id {
@@ -4142,7 +4154,8 @@ mod tests {
             file: None,
             path: Some(PathBuf::from("/tmp/test")),
             full: true,
-            pane_id: None,
+            pane_id: vec![],
+            all: false,
             ansi: true,
         };
         let result = Action::actions_from_cli(
@@ -4168,12 +4181,40 @@ mod tests {
     }
 
     #[test]
+    fn dump_screen_of_several_panes_is_not_one_action() {
+        for pane_id in [
+            vec!["terminal_5".to_string(), "terminal_6".to_string()],
+            vec![],
+        ] {
+            let all = pane_id.is_empty();
+            let cli_action = CliAction::DumpScreen {
+                file: None,
+                path: None,
+                full: false,
+                pane_id,
+                all,
+                ansi: false,
+            };
+            let result = Action::actions_from_cli(
+                cli_action,
+                Box::new(|| PathBuf::from("/tmp")),
+                None,
+                &pane_ids_only,
+            );
+            // the client runs a sweep a pane at a time; nothing here may quietly answer with the
+            // first pane of several
+            assert!(result.is_err(), "a sweep is not an action");
+        }
+    }
+
+    #[test]
     fn test_dump_screen_with_pane_id_and_ansi() {
         let cli_action = CliAction::DumpScreen {
             file: None,
             path: None,
             full: false,
-            pane_id: Some("terminal_5".to_string()),
+            pane_id: vec!["terminal_5".to_string()],
+            all: false,
             ansi: true,
         };
         let result = Action::actions_from_cli(

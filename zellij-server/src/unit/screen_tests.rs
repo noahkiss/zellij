@@ -3346,7 +3346,8 @@ pub fn send_cli_dump_screen_action() {
         file: None,
         path: Some(PathBuf::from("/tmp/foo")),
         full: true,
-        pane_id: None,
+        pane_id: vec![],
+        all: false,
         ansi: false,
     };
     let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
@@ -8593,7 +8594,8 @@ pub fn send_cli_dump_screen_action_with_ansi() {
         file: None,
         path: Some(PathBuf::from("/tmp/foo_ansi")),
         full: true,
-        pane_id: None,
+        pane_id: vec![],
+        all: false,
         ansi: true,
     };
     let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
@@ -8634,7 +8636,8 @@ pub fn send_cli_dump_screen_action_without_ansi_strips_codes() {
         file: None,
         path: Some(PathBuf::from("/tmp/foo_plain")),
         full: true,
-        pane_id: None,
+        pane_id: vec![],
+        all: false,
         ansi: false,
     };
     let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
@@ -10272,7 +10275,8 @@ pub fn pty_bytes_and_hold_pane_buffered_before_new_pane() {
         file: None,
         path: Some(PathBuf::from("/tmp/dump_early_bytes")),
         full: true,
-        pane_id: None,
+        pane_id: vec![],
+        all: false,
         ansi: false,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);

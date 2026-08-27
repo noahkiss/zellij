@@ -2704,6 +2704,27 @@ pub struct ListPanesEnvelope {
     pub withheld: usize,
 }
 
+/// One pane's screen, in a `dump-screen` sweep of several: one JSON object per line.
+///
+/// A sweep prints these rather than a single array because the content of one pane can be megabytes
+/// under `--full`: a line is written the moment that pane answers, so the caller can read the sweep
+/// while it is still running and nothing has to hold every dump at once. `jq -s .` collects them
+/// into the array a caller that wants one document is after.
+///
+/// It is a CLI-only shape, like [`PaneListEntry`] and [`AgentListEntry`]: a sweep is the same
+/// per-pane request the session already answers, asked N times down one connection, so nothing
+/// here crosses the plugin API or the client/server contract.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneDump {
+    /// The pane, spelled the way `--pane-id` takes it back: `terminal_7`, `plugin_2`.
+    pub pane_id: String,
+    /// The pane's two-word handle, its address. Empty for a pane the session's own list did not
+    /// name - which is a pane that closed between the listing and the dump.
+    pub handle: String,
+    /// What the pane is showing, exactly what a single-pane `dump-screen` would have printed.
+    pub content: String,
+}
+
 /// One pane that is running a coding agent: `zellij action list-agents`.
 ///
 /// A projection of [`PaneListEntry`] rather than a second walk of the session - the same pane
@@ -3501,6 +3522,31 @@ impl std::fmt::Display for PaneTarget {
             PaneTarget::Handle(handle) => write!(f, "{}", handle),
             PaneTarget::Uuid(uuid) => write!(f, "{}", uuid),
         }
+    }
+}
+
+#[cfg(test)]
+mod pane_dump_tests {
+    use super::*;
+
+    #[test]
+    fn a_dump_is_one_line_whatever_the_pane_was_showing() {
+        let dump = PaneDump {
+            pane_id: "terminal_3".to_owned(),
+            handle: "sunny-otter".to_owned(),
+            content: "one\ntwo\t\"three\"\n".to_owned(),
+        };
+        let line = serde_json::to_string(&dump).expect("a dump is JSON");
+        // the whole point of a line per pane: content with newlines in it stays on its own line
+        assert_eq!(line.lines().count(), 1);
+        assert_eq!(
+            line,
+            r#"{"pane_id":"terminal_3","handle":"sunny-otter","content":"one\ntwo\t\"three\"\n"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<PaneDump>(&line).expect("and reads back"),
+            dump
+        );
     }
 }
 

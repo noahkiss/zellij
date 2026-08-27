@@ -1121,6 +1121,34 @@ fn attach_with_cli_client(
         );
         std::process::exit(exit_status);
     }
+    // a `dump-screen` of several panes never becomes several actions either. It is the same per-pane
+    // request, asked N times down one connection, and holding that in the client is what keeps a
+    // sweep off the client/server contract. One `--pane-id` is not a sweep and does not come here:
+    // it keeps printing the bare content it always did
+    if let zellij_utils::cli::CliAction::DumpScreen {
+        file,
+        path,
+        full,
+        pane_id,
+        all,
+        ansi,
+    } = &cli_action
+    {
+        if *all || pane_id.len() > 1 {
+            let exit_status = zellij_client::cli_client::start_dump_screen_client(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                pane_id.clone(),
+                *all,
+                *full,
+                *ansi,
+                path.clone().or_else(|| file.clone()),
+            );
+            std::process::exit(exit_status);
+        }
+    }
     // `--handle` is applied to the pane once it exists, by the client that gets the report. It is
     // checked against the live panes first, so a name that is already taken is an error before
     // anything is created rather than a pane that came out under a name nobody asked for
