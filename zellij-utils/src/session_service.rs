@@ -1568,32 +1568,77 @@ fn env_default(directives: &[String], name: &str, value: &str) -> String {
     }
 }
 
-/// The PATH a generated unit gives the server, and through it every command the server resolves.
+/// The platform's own default PATH, as `sh` uses with no PATH at all.
+///
+/// The FALLBACK now, and nothing else: a unit records the PATH of the environment that installed
+/// it, and this is what an environment with no PATH to record leaves behind. It is deliberately
+/// still a working PATH, so a unit generated from a degenerate environment starts a usable server.
+const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The PATH to WRITE DOWN in a unit, resolved once here at generate time.
 ///
 /// This is not the same question as a pane's PATH, and that is the trap. A pane shell sources the
 /// rc chain and fixes its own PATH; the SERVER resolves a layout `command`, a `zellij run --`, a
-/// `zellij edit` and a `copy_command` against the PATH it was started with, once, for the life of
-/// the session. So a launcher-created session had an interactive pane that worked beside a layout
-/// pane reporting "Command not found" - and only on the machine where the launcher won the race.
+/// `zellij edit`, a `copy_command` and every command a snapshot resurrects against the PATH it was
+/// started with, once, for the life of the session. So a launcher-created session had an
+/// interactive pane that worked beside a layout pane reporting "Command not found" - and only on
+/// the machine where the launcher won the race.
 ///
-/// The directory the unit's own binary lives in leads the list, because that is the one directory
-/// this machine is known to keep terminal software in: it is where the binary the unit execs was
-/// found. A package manager prefix arrives that way instead of being hardcoded. The rest is the
-/// platform's own default, as `sh` would use with no PATH at all.
-const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
+/// It used to be the binary's own directory ahead of [`PLATFORM_PATH`], on the reasoning that the
+/// directory the binary was found in is the one directory this machine is known to keep terminal
+/// software in - so a package manager prefix arrived that way instead of being hardcoded. `pin_exe`
+/// broke exactly that: the binary the unit execs is then zellij's own pin directory, which holds
+/// zellij and nothing else, and the package prefix drops out along with `~/.local/bin` and every
+/// npm or bun global bin. `claude`, `codex` and `opencode` all stopped resolving.
+///
+/// So the answer is RECORDED rather than reasoned about - the same principle as
+/// [`recorded_state_home`], and as the absolute binary path the unit names instead of a name to
+/// re-resolve. What the shell that ran `session enable` could resolve, the server it installs can
+/// resolve too. The binary's own directory still leads, because that entry has its own purpose:
+/// the unit must be able to reach the build it execs whatever the recorded PATH says. An installing
+/// PATH that already names that directory keeps its own ordering instead, because hoisting a
+/// directory the operator placed deliberately would change which build of everything else the
+/// server resolves.
+///
+/// It is a SNAPSHOT, so it goes stale: a PATH that changes after the install is not the one the
+/// unit carries until the next `session enable`. That is the same trade [`recorded_state_home`]
+/// makes and it is the reason `status` and `doctor` can report drift here - regenerating from a
+/// shell with a different PATH writes a different unit. Following that report is safe, because the
+/// rewrite records a real shell's PATH.
 fn service_path(exe: &Path) -> String {
-    match exe.parent().map(|dir| dir.display().to_string()) {
-        Some(dir)
-            if !dir.is_empty()
-                && !PLATFORM_PATH
-                    .split(':')
-                    .any(|platform_dir| platform_dir == dir) =>
-        {
-            format!("{}:{}", dir, PLATFORM_PATH)
-        },
-        _ => PLATFORM_PATH.to_owned(),
+    service_path_over(exe, &path_dirs())
+}
+
+/// [`service_path`] over a given PATH, so the rule is provable without touching this process's
+/// environment.
+fn service_path_over(exe: &Path, installing: &[PathBuf]) -> String {
+    let exe_dir = exe
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    // An empty entry is `.` to every exec that reads a PATH, and a server that resolves commands
+    // against whatever directory it happens to sit in is not what a `::` in a shell's PATH asked
+    // for. Dropped here rather than recorded.
+    let installing: Vec<String> = installing
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .filter(|dir| !dir.is_empty())
+        .collect();
+    let recorded = if installing.is_empty() {
+        PLATFORM_PATH.split(':').map(str::to_owned).collect()
+    } else {
+        installing
+    };
+    let mut dirs: Vec<String> = Vec::with_capacity(recorded.len() + 1);
+    if !exe_dir.is_empty() && !recorded.iter().any(|dir| *dir == exe_dir) {
+        dirs.push(exe_dir);
     }
+    for dir in recorded {
+        if !dirs.iter().any(|seen| *seen == dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs.join(":")
 }
 
 /// The `XDG_STATE_HOME` to WRITE DOWN in a unit, resolved once here at generate time.
@@ -1757,10 +1802,12 @@ KillMode=process
 # in the config's `session_service` block replaces this line rather than adding a second one.
 {term}\
 # PATH, for the same reason and a different symptom. The SERVER resolves a layout `command`, a
-# `zellij run --`, a `zellij edit` and a `copy_command` against its own PATH, once, for the life of
-# the session - a pane shell fixing its own PATH from the rc chain does not fix that. A unit is
-# started with none. The first entry is where the binary below was found; setting PATH in the
-# config's `session_service` block replaces this line.
+# `zellij run --`, a `zellij edit`, a `copy_command` and every command a snapshot resurrects against
+# its own PATH, once, for the life of the session - a pane shell fixing its own PATH from the rc
+# chain does not fix that. A unit is started with none. This is the PATH of the shell that ran
+# `session enable`, written down then rather than re-derived here, led by the directory the binary
+# below was found in. It is a snapshot: a PATH that changes afterwards reaches the server at the
+# next `session enable`. Setting PATH in the config's `session_service` block replaces this line.
 {path}{state_home}ExecStart={quoted_exe} session up {quoted_session}
 {service_extra}
 [Install]
@@ -2037,9 +2084,12 @@ fn launchd_plist(
   TERM is here because a launch agent has none, and the server hands its own environment to every
   pane shell it spawns: without it every pane of a session this agent created comes up with
   TERM=dumb. PATH is here for the same reason and a different symptom: the SERVER resolves a layout
-  `command`, a `zellij run --`, a `zellij edit` and a `copy_command` against its own PATH, once, for
-  the life of the session, and a pane shell fixing its own PATH from the rc chain does not fix that.
-  Its first entry is the directory the binary above was found in.
+  `command`, a `zellij run --`, a `zellij edit`, a `copy_command` and every command a snapshot
+  resurrects against its own PATH, once, for the life of the session, and a pane shell fixing its
+  own PATH from the rc chain does not fix that. Like XDG_STATE_HOME it is recorded rather than
+  reasoned about: it is the PATH of the shell that ran `session enable`, led by the directory the
+  binary above was found in, so what that shell could resolve this server can resolve too. It is a
+  snapshot - a PATH that changes afterwards reaches the server at the next `session enable`.
 
   StandardOutPath and StandardErrorPath are not decoration. `zellij session up` asserts that the
   session it created is really there and prints why if it is not, and launchd sends the output of a
@@ -4519,6 +4569,27 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         )));
     }
 
+    /// The PATH an install would record here, for the tests that assert a whole generated file.
+    /// The rule itself is proved over a fixed list below, where nothing depends on the environment
+    /// the suite happens to run in.
+    fn recorded_path() -> String {
+        service_path(&exe())
+    }
+
+    /// A PATH of the shape an operator's shell actually has: a package prefix, a per-user bin, and
+    /// the platform's own directories under them.
+    fn installing_path() -> Vec<PathBuf> {
+        [
+            "/opt/homebrew/bin",
+            "/home/user/.local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
     /// The server resolves a layout `command`, `zellij run --`, `zellij edit` and `copy_command`
     /// against its OWN PATH, once, for the life of the session - so a launcher-created session had
     /// an interactive pane that worked beside a layout pane reporting "Command not found". Both
@@ -4528,23 +4599,109 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     fn both_generators_give_the_server_a_path() {
         let unit = service_unit(ServiceKind::Systemd, &exe(), "work", None, None);
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, None);
-        let expected = service_path(&exe());
+        let expected = recorded_path();
         assert!(unit.contains(&format!("Environment=\"PATH={}\"\n", expected)));
         assert!(plist.contains(&format!(
             "<key>PATH</key>\n        <string>{}</string>",
             expected
         )));
-        // derived, not hardcoded: the directory the unit's own binary was found in leads the list
-        assert!(expected.starts_with("/usr/local/bin:"));
-        assert!(expected.contains(PLATFORM_PATH));
+        // whatever this environment's PATH is, the binary's own directory can always be reached
+        assert!(expected.split(':').any(|dir| dir == "/usr/local/bin"));
     }
 
+    /// The bug `pin_exe` created. The old rule was the binary's directory ahead of the platform
+    /// default, on the reasoning that the binary's directory is where this machine keeps terminal
+    /// software - and a pin directory holds zellij and nothing else, so the package prefix,
+    /// `~/.local/bin` and every npm or bun global bin dropped out and `claude` stopped resolving.
     #[test]
-    fn a_binary_outside_the_platform_path_puts_its_own_directory_first() {
-        let path = service_path(Path::new("/opt/homebrew/bin/zellij"));
-        assert_eq!(path, format!("/opt/homebrew/bin:{}", PLATFORM_PATH));
-        // and a directory the platform default already names is not repeated
-        assert_eq!(service_path(Path::new("/usr/bin/zellij")), PLATFORM_PATH);
+    fn the_recorded_path_is_the_installing_environments_own() {
+        let pinned = Path::new("/home/user/.local/share/zellij/bin/zellij");
+        assert_eq!(
+            service_path_over(pinned, &installing_path()),
+            "/home/user/.local/share/zellij/bin:/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+        );
+        // and unpinned, where the exe directory is a package prefix, the rest still comes along
+        let unpinned = Path::new("/opt/homebrew/bin/zellij");
+        assert_eq!(
+            service_path_over(unpinned, &installing_path()),
+            "/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+        );
+    }
+
+    /// The exe directory leads because the unit must be able to reach the build it execs whatever
+    /// the recorded PATH says. Where the recorded PATH already names it, its own ordering stands:
+    /// hoisting a directory the operator placed deliberately would change which build of everything
+    /// ELSE the server resolves, which is a bigger blast radius than the bug being fixed.
+    #[test]
+    fn a_directory_the_installing_path_already_names_keeps_its_place() {
+        let exe = Path::new("/usr/bin/zellij");
+        assert_eq!(
+            service_path_over(exe, &installing_path()),
+            "/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+        );
+        // a PATH that repeats a directory is recorded once, in its first position
+        let repeated = ["/usr/bin", "/opt/bin", "/usr/bin", "/opt/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        assert_eq!(service_path_over(exe, &repeated), "/usr/bin:/opt/bin");
+    }
+
+    /// A launcher's environment can have no PATH at all, and a unit generated from one still has to
+    /// start a server that can run something. The platform default is what is left to record.
+    #[test]
+    fn an_environment_with_no_path_falls_back_to_the_platform_default() {
+        let exe = Path::new("/opt/homebrew/bin/zellij");
+        assert_eq!(
+            service_path_over(exe, &[]),
+            format!("/opt/homebrew/bin:{}", PLATFORM_PATH)
+        );
+        // an empty PATH entry is `.` to every exec that reads one, so it is dropped rather than
+        // recorded - a server resolving commands against its own working directory is nobody's
+        // intent. A PATH of nothing but empties is an environment with no PATH.
+        assert_eq!(
+            service_path_over(exe, &[PathBuf::from(""), PathBuf::from("")]),
+            format!("/opt/homebrew/bin:{}", PLATFORM_PATH)
+        );
+        assert_eq!(
+            service_path_over(exe, &[PathBuf::from(""), PathBuf::from("/opt/bin")]),
+            "/opt/homebrew/bin:/opt/bin"
+        );
+        // and a binary the platform default already names does not repeat itself
+        assert_eq!(
+            service_path_over(Path::new("/usr/bin/zellij"), &[]),
+            PLATFORM_PATH
+        );
+    }
+
+    /// The recording is a DEFAULT like every other value in a generated unit: a machine that states
+    /// its own PATH gets it, and the recorded one is not written beside it.
+    #[test]
+    fn a_configured_path_beats_the_recorded_one_in_both_generators() {
+        let recorded = recorded_path();
+
+        let mut systemd = SessionServiceOptions::default();
+        systemd
+            .add_systemd_directive("service", "Environment=PATH=/my/bin")
+            .unwrap();
+        let unit = service_unit(ServiceKind::Systemd, &exe(), "work", Some(&systemd), None);
+        assert!(unit.contains("Environment=PATH=/my/bin"));
+        assert!(!unit.contains(&format!("PATH={}", recorded)));
+
+        // the launchd `env` block, which is the one launchd reads
+        let mut env = SessionServiceOptions::default();
+        env.add_launchd_env("PATH", "/my/bin").unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&env), None);
+        assert!(plist.contains("<key>PATH</key>\n        <string>/my/bin</string>"));
+        assert!(!plist.contains(&recorded));
+
+        // and the `keys` hatch, which is routed into that same dictionary
+        let mut keys = SessionServiceOptions::default();
+        keys.add_launchd_key("PATH", PlistValue::String("/my/bin".to_owned()))
+            .unwrap();
+        let plist = service_unit(ServiceKind::Launchd, &exe(), "work", Some(&keys), None);
+        assert!(plist.contains("<key>PATH</key>\n        <string>/my/bin</string>"));
+        assert!(!plist.contains(&recorded));
     }
 
     /// Each generated default has to be replaceable, and replacing it must not leave the key in the
