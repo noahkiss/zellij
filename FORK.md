@@ -98,7 +98,10 @@ you how to read the next.
   server that failed. **The sentence on stderr, not the exit code, says which door it came
   through.**
 - **A payload command prints the payload and nothing else.** `dump-screen` writes screen content to
-  stdout; it does not introduce it.
+  stdout; it does not introduce it. Asked for [several panes at
+  once](#dump-screen-sweeps-many-panes-in-one-invocation) it prints one JSON object per pane
+  instead, because a payload cannot say which pane it came from — one pane is still the bare
+  content, and `--json` is still refused.
 
 **A session nothing answers to is a miss, and answers like one.** A wrong name, a name whose server
 is gone, or no name at all where the CLI cannot choose one prints its sentence and the live session
@@ -6877,6 +6880,69 @@ it writes to **stderr**, and stderr is not the handle `| head` closes.
 The exit code is 0 even when the report that was cut short was going to be 1. Nothing read the
 answer, so there is no answer to fail with, and a `| head` that exits non-zero half the time is the
 next bug report.
+
+### `dump-screen` sweeps many panes in one invocation
+
+```
+$ zellij action dump-screen -p sunny-otter -p terminal_3 -p brisk-heron
+{"pane_id":"terminal_1","handle":"sunny-otter","content":"$ cargo test\nrunning 4 tests\n"}
+{"pane_id":"terminal_3","handle":"quiet-fern","content":"$ \n"}
+{"pane_id":"terminal_9","handle":"brisk-heron","content":"error[E0308]\n"}
+
+$ zellij action dump-screen --all | jq -r 'select(.content | test("error")) | .handle'
+brisk-heron
+```
+
+`--pane-id` repeats, and `--all` is every pane the session has. A caller reading a session over ssh
+pays for the **round trip**, not for the dump: a sweep of ten panes was ten ssh invocations, ten
+process starts and ten connections to read ten screens the session already holds. It is now one of
+each, and ten local messages.
+
+**It is the same request, asked N times down one connection.** Nothing new travels: the client
+sends the per-pane `DumpScreen` the session has always answered, once per pane, and wraps each
+answer as it arrives. No new action, no message tag, no protobuf, nothing added to the client/server
+contract — the same reason `list-agents` and `wait` are client-side.
+
+**One pane is what it always was, byte for byte.** `dump-screen --pane-id sunny-otter` prints the
+bare content and nothing else; a consumer parsing it raw sees no change at all. The shape follows
+what was asked for, so it turns into JSON only when more than one pane is named, or with `--all`.
+A caller that wants the JSON shape for exactly one pane has to ask for the sweep some other way —
+`--all` on a one-pane session — and that is the one rough edge here: a script that builds
+`--pane-id` from a list must know that a list of one answers differently from a list of two.
+
+**A line per pane, not one array.** A `--full` sweep of a long-lived session is megabytes, and a
+line is written the moment that pane answers — so the caller can read the sweep while it is still
+running and nothing has to hold every dump at once. Each line stands alone, which means a sweep cut
+short is still a sequence of whole answers. `jq -s .` collects them into an array for a caller that
+wants one document. It is the shape `subscribe --format json` already prints, for the same reason.
+
+**Misses are per pane, and the sweep finishes.** A named pane nobody answers to gets the sentence
+every `--pane-id` verb gives it — `No pane answers to 'terminal_99'` on stderr — the panes beside it
+are still dumped, and the invocation exits **2** at the end. One bad name costs that one pane rather
+than the nine that were there, which is what makes a sweep worth building a script on. A target that
+names no pane in any *form* is malformed input rather than a miss: it is read before anything is
+asked, so it exits **1** with nothing dumped. `--all` on a session with no panes to dump prints
+nothing and exits **0** — nothing was asked for by name, so nothing is missing.
+
+`--full` and `--ansi` shape every dump in the sweep. `--file` (and `--path`) writes the same bytes
+it would have printed, and a reader that stops reading — `| head -1` — ends the sweep quietly at 0,
+the answer [`session status`](#session-status-ends-quietly-when-the-reader-stops-reading) gives.
+`--all` sweeps the panes `list-panes` itself reports, in its order, so a pane privacy policy that
+withholds a pane withholds it here too, and the two commands cannot disagree about what the session
+holds.
+
+**The trap, for the next client that sends more than one message.** The session answers a CLI
+message with its report *and then* an `UnblockInputThread`, sent from the bottom of the route loop.
+A client that asks one question and exits can ignore the second message; a client that asks several
+cannot, because the unblock it left behind is the first thing the next question reads — and every
+answer after that is one question late, which reads as an empty dump for a pane that is plainly
+there. `ask_in_sequence` reads *through* the unblock and leaves the connection on a message
+boundary. `start_cli_client` survives the same hazard by accident: its `--handle` follow-up throws
+its own answer away.
+
+`Action::actions_from_cli` refuses a sweep rather than building one action out of it. Nothing on
+the CLI path reaches that — the client takes the sweep first — but the integration harness builds
+actions directly, and the alternative was dumping the first of several panes and saying nothing.
 
 ## Assessed and deliberately not built
 
