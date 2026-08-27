@@ -375,10 +375,11 @@ not just the block.** `session_service` was the known example:
 ```
 
 (`managed_session` taught that lesson in 2026-08; `launchd { env }` paid for it again.) From
-nkmk.18 on, `session_service` warns and ignores an unknown name at every depth — see FORK.md's
-"An unknown key in `session_service` warns instead of failing the config". But the old rule is
-not dead: `pane_privacy` and `resurrect_command_hints` still reject an unknown child, and a
-machine still on ≤ nkmk.17 still rejects a nested `session_service` key.
+nkmk.18 on, all three blocks — `session_service`, `pane_privacy` and `resurrect_command_hints` —
+warn and ignore an unknown name at every depth; see FORK.md's "An unknown key in
+`session_service` warns instead of failing the config" and "`pane_privacy` and
+`resurrect_command_hints` warn on a key they do not know". But the old rule is not dead: a
+machine still on ≤ nkmk.17 still rejects an unknown nested key in any of them.
 
 So before seeding a nested key ahead of the binary, check both sides: the block must be a
 warn-and-ignore one in the build that ships the key, and the OLDEST binary in the fleet must
