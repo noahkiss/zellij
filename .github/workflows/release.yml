@@ -21,6 +21,11 @@ on:
       tag:
         description: 'Existing tag to build and release'
         required: true
+      tap_only:
+        description: 'Skip the build and only re-fire the tap bump for a tag whose release is already published'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -33,6 +38,7 @@ jobs:
   # can consume a release that is missing a platform. A leg that fails leaves the
   # release unpublished rather than permanently half-built.
   create-release:
+    if: ${{ !inputs.tap_only }}
     runs-on: ubuntu-latest
     steps:
       - name: Ensure release exists
@@ -192,103 +198,61 @@ jobs:
           esac
           gh release edit "$tag" --draft=false --prerelease="$prerelease"
 
-  # The last manual step in a release: firing the tap's bump. It runs after
-  # `finalize`, never beside it — the tap asserts every asset is attached before
-  # it rewrites a formula, and a draft release is invisible to that check.
-  #
-  # Needs a PAT in HOMEBREW_TAP_TOKEN with `workflow` scope on the tap. This
-  # repo's GITHUB_TOKEN is scoped to this repo and cannot dispatch another one.
-  # With no secret set the job says what to run by hand and passes, so a release
-  # never fails for want of a token nobody has created yet.
-  bump-tap:
-    needs: finalize
+  # Which formula the tag owns, and the exact inputs the tap's bump-zellij.yml
+  # takes. The tap re-derives the same rule from the tag and refuses a
+  # mismatch, so a hand-run dispatch that forgets the input fails instead of
+  # pointing `zellij-nkmk` at a candidate.
+  plan:
     runs-on: ubuntu-latest
-    # Up to 7.5 min of dispatch retries plus a 50 min poll, with headroom. The
-    # poll has to outlast two real `brew install` legs in the tap.
-    timeout-minutes: 90
+    outputs:
+      tap_inputs: ${{ steps.plan.outputs.tap_inputs }}
     steps:
-      - name: Dispatch the tap bump
-        id: dispatch
+      - name: Resolve the tag and its formula
+        id: plan
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          TAP_REPO: noahkiss/homebrew-tap
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = 'workflow_dispatch' ]; then
-            tag='${{ inputs.tag }}'
+            tag="$INPUT_TAG"
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
-          echo "tap_repo=${TAP_REPO}" >> "$GITHUB_OUTPUT"
-
-          # Which formula this tag owns. The tap re-derives the same rule from the
-          # tag and refuses a mismatch, so a hand-run dispatch that forgets the
-          # input fails instead of pointing `zellij-nkmk` at a candidate.
           case "$tag" in
             *-rc.*) formula='zellij-nkmk-rc' ;;
             *)      formula='zellij-nkmk' ;;
           esac
-          echo "bumping ${formula}"
+          echo "${tag} -> ${formula}"
+          echo "tap_inputs=$(jq -cn --arg tag "$tag" --arg formula "$formula" '{tag: $tag, formula: $formula}')" >> "$GITHUB_OUTPUT"
 
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::notice::HOMEBREW_TAP_TOKEN not set - bump the tap by hand:"
-            echo "  gh workflow run bump-zellij.yml -R ${TAP_REPO} -f tag=${tag} -f formula=${formula}"
-            echo "dispatched=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # `gh workflow run` reports nothing identifying, so this id is the only
-          # handle on the run it starts. The tap echoes it in its run-name.
-          request_id="zellij-${tag}-${GITHUB_RUN_ID}"
-          echo "request_id=${request_id}" >> "$GITHUB_OUTPUT"
-
-          for attempt in 1 2 3 4 5 6; do
-            if gh workflow run bump-zellij.yml -R "$TAP_REPO" \
-                 -f tag="$tag" -f formula="$formula" -f request_id="$request_id"; then
-              echo "dispatched ${request_id}"
-              echo "dispatched=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if [ "$attempt" -eq 6 ]; then
-              echo "::error::could not dispatch the tap bump after ${attempt} attempts"
-              exit 1
-            fi
-            sleep $((attempt * 30))
-          done
-
-      # A dispatch that succeeds proves only that the tap ACCEPTED the request.
-      # Without this, a bump that fails its own `brew install` verification leaves
-      # the tap pointing at the previous version and nothing says so - the release
-      # looks complete and `brew upgrade` quietly does nothing.
-      - name: Wait for the tap bump
-        if: steps.dispatch.outputs.dispatched == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          TAP_REPO: ${{ steps.dispatch.outputs.tap_repo }}
-          REQUEST_ID: ${{ steps.dispatch.outputs.request_id }}
-        run: |
-          set -euo pipefail
-          # The tap pours a real `brew install` on macos-14 and ubuntu before it
-          # commits, so minutes, not seconds. Poll rather than sleep-and-hope.
-          for _ in $(seq 1 100); do
-            run="$(gh run list -R "$TAP_REPO" --workflow=bump-zellij.yml \
-                     --limit 40 --json databaseId,displayTitle,status,conclusion,url \
-                   | jq -c --arg id "$REQUEST_ID" \
-                       'map(select((.displayTitle // "") | contains($id))) | first // empty')"
-            if [ -n "$run" ]; then
-              status="$(printf '%s' "$run" | jq -r '.status')"
-              if [ "$status" = 'completed' ]; then
-                conclusion="$(printf '%s' "$run" | jq -r '.conclusion')"
-                url="$(printf '%s' "$run" | jq -r '.url')"
-                echo "tap bump ${conclusion}: ${url}"
-                [ "$conclusion" = 'success' ] || {
-                  echo "::error::tap bump did not succeed (${conclusion}): ${url}"
-                  exit 1
-                }
-                exit 0
-              fi
-            fi
-            sleep 30
-          done
-          echo "::error::timed out waiting for the tap bump (${REQUEST_ID})"
-          exit 1
+  # The last step in a release: firing the tap's bump and failing unless it
+  # lands. It runs after `finalize`, never beside it — the tap asserts every
+  # asset is attached before it rewrites a formula, and a draft release is
+  # invisible to that check.
+  #
+  # A dispatch that is merely accepted proves nothing: a bump that fails its
+  # own `brew install` leaves the formula on the previous version and `brew
+  # upgrade` quietly does nothing. The shared workflow injects a request_id,
+  # finds the tap run by it, and waits for its verdict. The tap installs on two
+  # runners before it commits, so this takes minutes, not seconds.
+  #
+  # Needs a PAT in HOMEBREW_TAP_TOKEN with `workflow` scope on the tap. This
+  # repo's GITHUB_TOKEN is scoped to this repo and cannot dispatch another one.
+  # With `tap_only` the build is skipped and only this hop re-runs, for a tag
+  # whose release is already published — a failed bump, or a tap outage.
+  # The fallback when no token is at hand:
+  #
+  #   gh workflow run bump-zellij.yml -R noahkiss/homebrew-tap -f tag=<tag> -f formula=<formula>
+  bump-tap:
+    needs: [plan, finalize]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' &&
+      (needs.finalize.result == 'success' || inputs.tap_only)
+    uses: noahkiss/workflows/.github/workflows/dispatch-and-wait.yml@main
+    with:
+      repo: noahkiss/homebrew-tap
+      workflow: bump-zellij.yml
+      inputs_json: ${{ needs.plan.outputs.tap_inputs }}
+      timeout_minutes: 60
+    secrets:
+      token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
