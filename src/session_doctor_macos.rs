@@ -25,13 +25,9 @@ use zellij_utils::session_signing::{
     refresh_belongs_to_signing, sign_pin, signing_context, NO_HOME,
 };
 
-/// How long to wait for a pane to write its answer before giving up on it.
-///
-/// A pane that is going to answer does so as fast as a shell starts. Waiting longer would only
-/// lengthen the run on a machine where the session is wedged, which is a machine with a worse
-/// problem that the checks above have already reported.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+use crate::session_doctor_probe::{
+    parse_pane_answer, probe_step, FullDiskAccess, PaneAnswer, ProbeStep, PROBE_POLL,
+};
 
 pub(crate) fn checks(
     report: &mut Report,
@@ -191,28 +187,30 @@ fn check_from_inside_a_pane(report: &mut Report, name: &str, session_is_up: bool
     }
 
     match answer.full_disk_access {
-        Some(true) => report.push(Finding::ok(
+        FullDiskAccess::Granted => report.push(Finding::ok(
             "fda",
             "the server has Full Disk Access, so every pane does",
         )),
-        Some(false) => report.push(
+        FullDiskAccess::Denied => report.push(
             Finding::needs_you("fda", "the server does NOT have Full Disk Access")
                 .note("every pane sees \"Operation not permitted\" in a protected directory,")
                 .note("whatever it runs. No program can grant this - Apple offers no API for it.")
                 .note("System Settings > Privacy & Security > Full Disk Access, and add the")
                 .note("EXACT path the server runs; the grant is keyed to it and to its signature."),
         ),
-        None => report.push(Finding::ok(
+        FullDiskAccess::Unanswered => report.push(
+            Finding::needs_you("fda", "the Full Disk Access check did not finish in time")
+                .note("the pane answered, so the server is serving - it is this one check that")
+                .note("hung, and on macOS that is what a REFUSAL looks like: a machine holding")
+                .note("the grant is let in at once, a machine without it waits to be told no.")
+                .note("Read it as not granted until it answers. System Settings > Privacy &")
+                .note("Security > Full Disk Access, and add the EXACT path the server runs."),
+        ),
+        FullDiskAccess::Undetermined => report.push(Finding::ok(
             "fda",
             "the probe could not tell whether Full Disk Access is granted",
         )),
     }
-}
-
-/// What one pane came back with.
-struct PaneAnswer {
-    manager: Option<String>,
-    full_disk_access: Option<bool>,
 }
 
 /// How many lines of the client's stderr to quote. Enough for a message and its context, few
@@ -285,6 +283,11 @@ enum ProbeFailure {
 /// A client that SUCCEEDS is not the answer. `zellij run` returns as soon as the pane is created,
 /// long before the pane's shell has written anything, so a zero exit is one more reason to keep
 /// waiting and only a non-zero one ends the wait early.
+///
+/// The two lines are read against two deadlines, which is
+/// [`probe_step`](crate::session_doctor_probe::probe_step)'s whole job and where the reasoning
+/// lives: the first line is proof of life and the second is an answer that TCC can be slow to
+/// give.
 fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
     let answer_file = ZELLIJ_TMP_DIR.join(format!("doctor-probe-{}", std::process::id()));
     let _ = std::fs::remove_file(&answer_file);
@@ -332,18 +335,20 @@ fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
         .spawn()
         .map_err(|e| ProbeFailure::CouldNotSpawn(e.to_string()))?;
 
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let started = std::time::Instant::now();
     let mut client_is_gone = false;
     loop {
-        if let Ok(written) = std::fs::read_to_string(&answer_file) {
-            // the trailing newline is what says the line is finished. The pane writes its two
-            // answers with two calls, so a read can land between them - and half of "fda=yes" is
-            // an answer that parses to "could not tell" on a machine that could have told.
-            if written.contains("fda=") && written.ends_with('\n') {
-                let _ = std::fs::remove_file(&answer_file);
-                reap(&mut client);
-                return Ok(parse_pane_answer(&written));
-            }
+        // an unreadable file is a file with nothing in it yet, which the step below already knows
+        // what to do with
+        let written = std::fs::read_to_string(&answer_file).unwrap_or_default();
+        let step = probe_step(&written, started.elapsed());
+        if matches!(
+            step,
+            ProbeStep::Answered | ProbeStep::FullDiskAccessUnanswered
+        ) {
+            let _ = std::fs::remove_file(&answer_file);
+            reap(&mut client);
+            return Ok(parse_pane_answer(&written));
         }
         // Asked once. A zero exit only means the pane was created, so the wait goes on; a non-zero
         // one means no pane will ever write, and there is nothing left to wait for.
@@ -359,7 +364,9 @@ fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        // asked after the client, so a client that failed is reported in its own words rather than
+        // as a deadline nobody met
+        if matches!(step, ProbeStep::Wedged) {
             let _ = std::fs::remove_file(&answer_file);
             reap(&mut client);
             return Err(ProbeFailure::TimedOut);
@@ -387,22 +394,6 @@ fn reap(client: &mut std::process::Child) {
         let _ = client.kill();
     }
     let _ = client.wait();
-}
-
-fn parse_pane_answer(written: &str) -> PaneAnswer {
-    let value = |key: &str| {
-        written
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(key).map(str::to_owned))
-    };
-    PaneAnswer {
-        manager: value("manager=").filter(|value| !value.is_empty()),
-        full_disk_access: value("fda=").and_then(|value| match value.as_str() {
-            "yes" => Some(true),
-            "no" => Some(false),
-            _ => None,
-        }),
-    }
 }
 
 /// Wrap a path for a shell, the only way that is right for every path: single quotes, with any
