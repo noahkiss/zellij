@@ -20,11 +20,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// A rebase onto a newer upstream tag must update this and [`UPSTREAM_BASE_COMMIT`] - see FORK.md.
 /// It is spelled literally rather than derived from git, so a build from a tarball or a shallow
 /// checkout reports the same answer as a build from a full clone.
-pub const UPSTREAM_BASE_TAG: &str = "v0.45.0";
+pub const UPSTREAM_BASE_TAG: &str = "v0.45.1";
 
-/// The commit [`UPSTREAM_BASE_TAG`] points at, abbreviated. `v0.45.0` is an annotated tag, so this
-/// is `git rev-parse --short 'v0.45.0^{commit}'` - `--short v0.45.0` gives the tag object instead.
-pub const UPSTREAM_BASE_COMMIT: &str = "13e1c25a2";
+/// The commit [`UPSTREAM_BASE_TAG`] points at, abbreviated. `v0.45.1` is an annotated tag, so this
+/// is `git rev-parse --short 'v0.45.1^{commit}'` - `--short v0.45.1` gives the tag object instead.
+pub const UPSTREAM_BASE_COMMIT: &str = "efd8fd5a8";
 
 /// The day this binary was built, if whoever built it said so.
 ///
