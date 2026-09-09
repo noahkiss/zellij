@@ -7082,6 +7082,78 @@ default shell as nothing. So the next resurrection brings that pane back as a pl
 same directory, rather than offering the command again. That is the cost of not pressing ESC, paid
 at the same moment ESC used to pay it.
 
+### A slow Full Disk Access denial is not a wedged server
+
+```
+$ zellij session doctor mysession        # before, on a healthy Mac without the grant
+Needs you
+  probe     the pane probe did not answer in time
+            the pane was opened, so the server may be wedged
+            the session domain and Full Disk Access could not be checked
+```
+
+Nothing was wedged. The macOS probe opens a floating pane that writes two lines to a file, and the
+two are not worth the same. `manager=` is written the moment the pane's shell starts. `fda=` is
+written after an `open(2)` on `TCC.db`, and **TCC is fast to allow and slow to refuse**: on a Mac
+that holds the grant the open returns at once, and on a Mac that does not it sits. Measured on a
+rollout: `manager=` immediately, `fda=no` at about 5.5 to 5.8 seconds.
+
+The deadline was five seconds, and the reader waited for a finished `fda=` line specifically. So
+every Mac without Full Disk Access — the one machine the check exists for — was told its server may
+be wedged, five seconds after it had already proved otherwise.
+
+**Proof of life is the first line, not the last.** A finished `manager=` line says the server
+accepted the `run`, made the pane, and the pane's shell ran. From that line on, `probe` cannot be a
+Needs-you whatever becomes of the second answer, and the domain finding is reported from it as
+before.
+
+**The two lines now have two deadlines.** `PROBE_TIMEOUT` stays five seconds and now buys only
+proof of life. `FDA_TIMEOUT` is ten seconds — comfortably past the observed refusal, and still a
+bounded run. A finished `fda=` line ends the wait whenever it arrives, even past its own deadline:
+a late answer is still an answer.
+
+**A fourth answer, for a check that never finished.** `Option<bool>` became a four-state
+`FullDiskAccess`: `Granted`, `Denied`, `Undetermined` (`fda=unknown` — there is no `TCC.db` to
+open, so there is nothing to be refused by) and the new `Unanswered`.
+
+```
+$ zellij session doctor mysession        # after, when the second line never lands
+Needs you
+  fda       the Full Disk Access check did not finish in time
+            the pane answered, so the server is serving - it is this one check that
+            hung, and on macOS that is what a REFUSAL looks like: a machine holding
+            the grant is let in at once, a machine without it waits to be told no.
+            Read it as not granted until it answers. System Settings > Privacy &
+            Security > Full Disk Access, and add the EXACT path the server runs.
+```
+
+**It is a Needs-you, the same as `fda=no`, and deliberately so.** The severity matches the answer
+it most likely is: an `open(2)` that has not returned in ten seconds is an open that is being
+refused, not one that is being allowed. Calling that "already correct" would put the machine the
+check exists for back into the section a reader skips. It is worded as an unfinished check rather
+than as a denial, so nobody acts on it as a fact — but it counts against the exit code, because a
+doctor that exits 0 on a machine it could not clear is a doctor nobody has to read.
+
+Everything else is untouched: `fda=yes`, `fda=no` and `fda=unknown` print exactly the sentences
+they printed, `--dry-run` renders the same lines (the probe reads and changes nothing, so it runs
+either way), and a probe that produces no line at all is still `TimedOut` in the same words.
+
+The clock and the parser moved to `src/session_doctor_probe.rs`, which is compiled on every
+platform while `session_doctor_macos` stays `#[cfg(target_os = "macos")]`. `probe_step(written,
+elapsed)` is a pure function of the file's contents and the time since the client was spawned, so
+the four cases that matter — answered fast, denied at six seconds, alive with no answer, and
+nothing at all — are unit tests that run on Linux instead of behaviour only a Mac can reach. The
+completeness rule the reader and the parser share lives there too, in one `finished_line`: a
+trailing newline is what says a line is finished, and half of `fda=yes` used to parse as "could not
+tell" on a machine that could have told.
+
+Verified by compiling it, as [the probe's last
+patch](#the-pane-probe-reports-what-the-client-said-instead-of-charging-five-seconds-for-it) was:
+this fork's Linux box cannot cross-compile the tree to `aarch64-apple-darwin` (a vendored C
+dependency, `libnghttp2-sys`, wants a macOS C toolchain), so the macOS module was type-checked by
+ungating it and its two macOS-only imports for one `cargo check` and then putting the gates back.
+The timings themselves came from a Mac, and are what the deadline is set against.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

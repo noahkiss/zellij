@@ -6,6 +6,7 @@ mod session_doctor_command;
 mod session_doctor_linux;
 #[cfg(target_os = "macos")]
 mod session_doctor_macos;
+mod session_doctor_probe;
 #[cfg(test)]
 mod tests;
 
