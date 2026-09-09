@@ -25,6 +25,7 @@ Some(
                         },
                     ),
                     use_terminal_title: false,
+                    resurrected: false,
                 },
             ),
         ),
