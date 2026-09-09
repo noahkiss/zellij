@@ -1,3 +1,4 @@
+use crate::consts::SERIALIZED_SESSION_LAYOUT_FILE_NAME;
 use crate::data::{CommandOrPlugin, LayoutInfo};
 use crate::input::options::Options;
 use crate::pane_size::Size;
@@ -97,6 +98,13 @@ impl CliAssets {
             layout.recursively_add_start_suspended(Some(false));
         }
 
+        // fork addition: a layout that came back with a session, rather than out of a file a
+        // person wrote, marks its commands so that a clean exit drops the pane to the shell
+        // instead of holding the exit banner. See `RunCommand::resurrected`.
+        if self.layout_is_a_serialized_session() {
+            layout.recursively_mark_resurrected();
+        }
+
         config_with_merged_layout_opts.themes = config_with_merged_layout_opts
             .themes
             .merge(get_default_themes());
@@ -121,6 +129,25 @@ impl CliAssets {
         }
 
         (config_with_merged_layout_opts, layout)
+    }
+
+    /// fork addition: whether the layout this client asks for is a serialized session rather than
+    /// an authored layout.
+    ///
+    /// Only a path reaches the server - the client resolves which file to resurrect from and hands
+    /// over `LayoutInfo::File` - so the file name is what is left to recognise it by. Both
+    /// resurrection sources write that one name: the in-place cache
+    /// (`session_layout_cache_file_name`) and a snapshot (`SNAPSHOT_LAYOUT_FILE_NAME`). Nothing
+    /// else zellij writes shares it, and a hand-written layout has to be called
+    /// `session-layout.kdl` to be taken for one.
+    fn layout_is_a_serialized_session(&self) -> bool {
+        match &self.layout {
+            Some(LayoutInfo::File(path, _)) => {
+                std::path::Path::new(path).file_name()
+                    == Some(std::ffi::OsStr::new(SERIALIZED_SESSION_LAYOUT_FILE_NAME))
+            },
+            _ => false,
+        }
     }
 }
 
@@ -151,5 +178,47 @@ mod tests {
     #[test]
     fn a_host_without_any_of_the_known_variables_yields_an_empty_env() {
         assert!(host_terminal_env_from(|_| None).is_empty());
+    }
+
+    fn assets_for_layout(layout: Option<LayoutInfo>) -> CliAssets {
+        CliAssets {
+            layout,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_serialized_session_layout_is_recognised_wherever_it_lives() {
+        let cache = crate::consts::session_layout_cache_file_name("my-session");
+        assert!(
+            assets_for_layout(Some(LayoutInfo::File(
+                cache.display().to_string(),
+                Default::default()
+            )))
+            .layout_is_a_serialized_session(),
+            "the in-place resurrection cache is a serialized session"
+        );
+        assert!(
+            assets_for_layout(Some(LayoutInfo::File(
+                "/some/snapshot/dir/session-layout.kdl".to_owned(),
+                Default::default()
+            )))
+            .layout_is_a_serialized_session(),
+            "a snapshot writes the same file name, in its own directory"
+        );
+    }
+
+    #[test]
+    fn an_authored_layout_is_not_a_serialized_session() {
+        assert!(!assets_for_layout(Some(LayoutInfo::File(
+            "/home/someone/.config/zellij/layouts/dev.kdl".to_owned(),
+            Default::default()
+        )))
+        .layout_is_a_serialized_session());
+        assert!(
+            !assets_for_layout(Some(LayoutInfo::BuiltIn("default".to_owned())))
+                .layout_is_a_serialized_session()
+        );
+        assert!(!assets_for_layout(None).layout_is_a_serialized_session());
     }
 }

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_SESSION_SNAPSHOT_LIMIT: usize = 10;
 
 pub const SNAPSHOT_SIDECAR_FILE_NAME: &str = "snapshot.kdl";
-pub const SNAPSHOT_LAYOUT_FILE_NAME: &str = "session-layout.kdl";
+pub const SNAPSHOT_LAYOUT_FILE_NAME: &str = crate::consts::SERIALIZED_SESSION_LAYOUT_FILE_NAME;
 pub const SNAPSHOT_METADATA_FILE_NAME: &str = "session-metadata.kdl";
 
 /// What caused a snapshot to be cut. Recorded in the sidecar, and only ever additive: an unknown
