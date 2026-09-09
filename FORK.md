@@ -1,8 +1,8 @@
 # zellij (noahkiss fork)
 
 A personal fork of [zellij](https://github.com/zellij-org/zellij), rebased onto the upstream
-**`v0.45.0`** tag (upstream workspace version **0.45.0**), carrying a curated patch set aimed at
-the plugin development loop and a few session-lifecycle papercuts.
+**`v0.45.1`** tag (upstream workspace version **0.45.1**, commit `efd8fd5a8`), carrying a curated
+patch set aimed at the plugin development loop and a few session-lifecycle papercuts.
 
 **This fork is not accepting issues or pull requests, and none of these patches have been submitted
 upstream.** If you found it by accident, you want [the real thing](https://github.com/zellij-org/zellij).
@@ -7052,8 +7052,8 @@ actions directly, and the alternative was dumping the first of several panes and
 ## Working on this fork
 
 `upstream` points at `zellij-org/zellij`. Each patch is its own commit on top of the recorded
-upstream base, currently the **`v0.45.0`** tag. Moving to a newer base is
-`git fetch upstream --tags && git rebase --onto <new-tag> v0.45.0`, then recording the new base
+upstream base, currently the **`v0.45.1`** tag. Moving to a newer base is
+`git fetch upstream --tags && git rebase --onto <new-tag> v0.45.1`, then recording the new base
 here.
 
 **A moved base is also two consts.** `UPSTREAM_BASE_TAG` and `UPSTREAM_BASE_COMMIT` in
