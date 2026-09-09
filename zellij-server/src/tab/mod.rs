@@ -721,6 +721,15 @@ pub trait Pane {
     fn hold(&mut self, _exit_status: Option<i32>, _is_first_run: bool, _run_command: RunCommand) {
         // No-op by default, only terminal panes support holding
     }
+    /// Leave the held state the way ESC on a held pane does, and report the directory a shell
+    /// should take its place in. `None` when this pane is not held (or cannot hold at all).
+    ///
+    /// fork addition: extracted from `TerminalPane::handle_held_drop_to_shell` so that a caller
+    /// other than the key handler can take the same path. See `Tab::drop_held_pane_to_shell`.
+    fn drop_held_to_shell(&mut self) -> Option<Option<PathBuf>> {
+        // No-op by default, only terminal panes support holding
+        None
+    }
     fn has_bell(&self) -> bool {
         false
     }
@@ -6163,6 +6172,9 @@ impl Tab {
                 ));
             return;
         }
+        // fork addition: a command a session resurrection brought back, which has just exited
+        // cleanly, does not wait to be dismissed - see `Tab::drop_held_pane_to_shell`
+        let should_drop_to_shell = run_command.resurrected && exit_status == Some(0);
         if self.floating_panes.panes_contain(&id) {
             self.floating_panes
                 .hold_pane(id, exit_status, is_first_run, run_command);
@@ -6172,6 +6184,34 @@ impl Tab {
         } else if let Some(pane) = self.suppressed_panes.values_mut().find(|p| p.1.pid() == id) {
             pane.1.hold(exit_status, is_first_run, run_command);
         }
+        if should_drop_to_shell {
+            self.drop_held_pane_to_shell(id);
+        }
+    }
+    /// fork addition: take the "drop to shell" path a held pane offers under ESC, without the ESC.
+    ///
+    /// The pane is held first and released here, rather than never held at all, so that this is
+    /// the same sequence a keypress produces: the pane resets its grid and drops its banner in
+    /// `drop_held_to_shell`, and the pty thread replaces the dead command with the default shell in
+    /// the directory the command ran in. Only a resurrected command pane that exited with status 0
+    /// reaches this; every other exit holds, and a layout command pane is untouched.
+    fn drop_held_pane_to_shell(&mut self, id: PaneId) {
+        let PaneId::Terminal(terminal_id) = id else {
+            return;
+        };
+        let Some(working_dir) = self
+            .get_pane_with_id_mut(id)
+            .and_then(|pane| pane.drop_held_to_shell())
+        else {
+            return;
+        };
+        self.pids_waiting_resize.insert(terminal_id);
+        let _ = self.senders.send_to_pty(PtyInstruction::DropToShellInPane {
+            pane_id: id,
+            shell: Some(self.default_shell.clone()),
+            working_dir,
+            completion_tx: None,
+        });
     }
     pub fn replace_pane_with_suppressed_pane(
         &mut self,

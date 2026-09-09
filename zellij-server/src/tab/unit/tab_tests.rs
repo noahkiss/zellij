@@ -3,6 +3,7 @@ use crate::pane_groups::PaneGroups;
 use crate::panes::kitty_graphics::KittyImageStore;
 use crate::panes::sixel::SixelImageStore;
 use crate::plugins::PluginInstruction;
+use crate::pty::PtyInstruction;
 use crate::pty_writer::PtyWriteInstruction;
 use crate::screen::CopyOptions;
 use crate::{os_input_output::ServerOsApi, panes::PaneId, thread_bus::ThreadSenders, ClientId};
@@ -18074,5 +18075,89 @@ fn floating_plugin_panes_are_not_shown_again_when_their_tab_returns_with_the_sur
     assert!(
         !drain_visible_events(&plugin_receiver).contains(&(Some(1), true)),
         "a plugin whose floating surface is hidden should not be told it is visible when its tab returns"
+    );
+}
+
+// fork additions: a command a session resurrection brought back does not wait to be dismissed when
+// it exits cleanly - it takes the same "drop to shell" path ESC offers on a held pane. A failure
+// still holds, and a layout command pane is untouched.
+
+fn tab_with_pty_receiver(stacked_resize: bool) -> (Tab, Receiver<(PtyInstruction, ErrorContext)>) {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut tab = create_new_tab(size, stacked_resize);
+    let (to_pty, pty_receiver): ChannelWithContext<PtyInstruction> = unbounded();
+    tab.senders.replace_to_pty(SenderWithContext::new(to_pty));
+    (tab, pty_receiver)
+}
+
+fn held_run_command(resurrected: bool) -> RunCommand {
+    let mut run_command = RunCommand::new(PathBuf::from("codex"));
+    run_command.args = vec!["resume".to_owned()];
+    run_command.cwd = Some(PathBuf::from("/tmp/a-working-dir"));
+    run_command.hold_on_close = true;
+    run_command.resurrected = resurrected;
+    run_command
+}
+
+#[test]
+fn a_resurrected_command_pane_drops_to_the_shell_when_its_command_exits_cleanly() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(true));
+
+    assert!(
+        !tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a resurrected command pane should not stay held after a clean exit"
+    );
+    let (instruction, _err_ctx) = pty_receiver
+        .try_recv()
+        .expect("expected the pane to be dropped to the shell");
+    match instruction {
+        PtyInstruction::DropToShellInPane {
+            pane_id,
+            shell,
+            working_dir,
+            ..
+        } => {
+            assert_eq!(pane_id, PaneId::Terminal(1));
+            assert_eq!(shell, Some(PathBuf::from("my_default_shell")));
+            assert_eq!(working_dir, Some(PathBuf::from("/tmp/a-working-dir")));
+        },
+        other => panic!("expected DropToShellInPane, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_resurrected_command_pane_still_holds_when_its_command_fails() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+
+    tab.hold_pane(PaneId::Terminal(1), Some(1), false, held_run_command(true));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a failure must stay on screen, so a non-zero exit still holds"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a failing resurrected command pane should not be dropped to the shell"
+    );
+}
+
+#[test]
+fn a_layout_command_pane_still_holds_when_its_command_exits_cleanly() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a layout command pane keeps its hold and its ENTER-to-re-run banner"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a layout command pane should not be dropped to the shell"
     );
 }

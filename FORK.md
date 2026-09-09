@@ -7024,6 +7024,64 @@ its own answer away.
 the CLI path reaches that — the client takes the sweep first — but the integration harness builds
 actions directly, and the alternative was dumping the first of several panes and saying nothing.
 
+### A resurrected command pane drops to the shell when its command exits cleanly
+
+```
+$ zellij session up mysession      # the pane comes back holding `codex resume`
+                                   # ENTER runs it, you work, you quit codex
+                                   # before: EXIT CODE: 0, and an ESC to reach the shell
+                                   # now:    the shell, in the directory codex ran in
+```
+
+A pane that a session resurrection brought back used to end its command the way every command pane
+does: it held, printed `EXIT CODE: 0`, and offered `<ENTER> run, <ESC> drop to shell, <Ctrl-c>
+exit`. For a tool you quit on purpose - a coding agent, a REPL - the answer was always ESC, so the
+banner was a keypress between finishing and having a prompt back. It now takes that path itself.
+
+**It is the ESC path, not a copy of it.** `TerminalPane::handle_held_drop_to_shell` was split into
+a `drop_held_to_shell` on the `Pane` trait - it leaves the held state, resets the grid, drops the
+banner and reports the directory the command ran in - and the key handler now calls that. `Tab`
+calls the same method, then sends the same `PtyInstruction::DropToShellInPane` with the same
+default shell that ESC sends. The pane is still held first and released a moment later, rather than
+never held, so the sequence is the one a keypress produces and nothing new was taught to the
+screen thread.
+
+**A failure still holds.** Only `Some(0)` takes this path. A non-zero status holds and prints its
+code as before, and so does a signal - a killed child reports `None`, never `Some(0)`. The pane
+that fails is the pane you want left on screen.
+
+**A layout command pane is untouched.** Its hold, its `EXIT CODE`, and its ENTER-to-re-run are
+load-bearing, and this changes none of them. There is no config key: the scope is exactly panes
+whose command came back with a session.
+
+**How a pane is known to be resurrected.** `RunCommand` gains a `resurrected` bool, set on every
+command in the layout when that layout is loaded, and read once where the exit is handled. Both pty
+quit callbacks funnel through `ScreenInstruction::HoldPane`, so `Tab::hold_pane` is the only place
+that had to change - the flag reaches it whether the command was spawned with the session
+(`attach --force-run-commands`) or run by the ENTER a suspended pane offers.
+
+Which layouts get marked is decided by the layout's **file name**. Only a path reaches the server -
+the client resolves which file to resurrect from and hands over a `LayoutInfo::File` - and both
+resurrection sources write one name, `session-layout.kdl`: the in-place cache under the session's
+info folder, and a snapshot. So a hand-written layout would have to be called `session-layout.kdl`
+to be taken for a serialized session, and if it were, it would be one.
+
+**Nothing crosses a contract.** `resurrected` is `#[serde(skip)]` and is not in either protobuf, so
+it reaches neither disk, the plugin API, nor the client/server contract. It is provenance, and it is
+kept out of `PartialEq` for the same reason: the tree compares `Option<Run>` in half a dozen places
+to decide whether a pane already running something is the pane a layout means, and a marked pane has
+to keep matching the entry it always matched. `RunCommand`'s `PartialEq` is therefore hand-written,
+with the fields destructured exhaustively so that a field added upstream fails to compile rather
+than dropping out of equality unnoticed.
+
+**What the pane gives up.** Two things, and they are the two ESC already gave up. The ENTER that
+re-runs the command is gone with the banner, so running it again means typing it. And the pane is
+now running a shell, which is what the next serialization records - a held pane keeps the command
+in its recorded layout, because no child is left to observe, while a pane at a prompt records the
+default shell as nothing. So the next resurrection brings that pane back as a plain shell in the
+same directory, rather than offering the command again. That is the cost of not pressing ESC, paid
+at the same moment ESC used to pay it.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

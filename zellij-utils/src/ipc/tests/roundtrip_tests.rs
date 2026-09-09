@@ -2076,6 +2076,7 @@ fn test_client_messages() {
                     hold_on_start: false,
                     originating_plugin: None,
                     use_terminal_title: true,
+                    resurrected: false,
                 })),
                 ..Default::default()
             }),
@@ -2107,6 +2108,7 @@ fn test_client_messages() {
                         context: empty_context.clone(),
                     }),
                     use_terminal_title: true,
+                    resurrected: false,
                 })),
                 ..Default::default()
             }),

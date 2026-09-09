@@ -70,8 +70,13 @@ pub fn session_info_cache_file_name(session_name: &str) -> PathBuf {
     session_info_folder_for_session(session_name).join("session-metadata.kdl")
 }
 
+/// The file name zellij writes a serialized session's layout under, in the in-place resurrection
+/// cache and inside a snapshot alike. It is what tells a layout that describes a session that
+/// really ran apart from one a person authored - see `CliAssets::layout_is_a_serialized_session`.
+pub const SERIALIZED_SESSION_LAYOUT_FILE_NAME: &str = "session-layout.kdl";
+
 pub fn session_layout_cache_file_name(session_name: &str) -> PathBuf {
-    session_info_folder_for_session(session_name).join("session-layout.kdl")
+    session_info_folder_for_session(session_name).join(SERIALIZED_SESSION_LAYOUT_FILE_NAME)
 }
 
 pub fn session_info_folder_for_session(session_name: &str) -> PathBuf {

@@ -56,7 +56,7 @@ impl OpenFilePayload {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Default, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Default, Serialize, Eq)]
 pub struct RunCommand {
     #[serde(alias = "cmd")]
     pub command: PathBuf,
@@ -72,6 +72,46 @@ pub struct RunCommand {
     pub originating_plugin: Option<OriginatingPlugin>,
     #[serde(default)]
     pub use_terminal_title: bool,
+    /// fork addition: this command came back with a session, rather than out of a layout a person
+    /// wrote. A pane running it drops to the shell when the command exits cleanly, instead of
+    /// holding the exit banner and waiting for the ESC that offers the same thing.
+    ///
+    /// Provenance, not identity: it is set once, when the resurrection layout is loaded (see
+    /// `CliAssets::load_config_and_layout`), and it is `#[serde(skip)]` so it never reaches disk,
+    /// the plugin API or the client/server contract.
+    #[serde(skip)]
+    pub resurrected: bool,
+}
+
+/// fork addition: `PartialEq` is hand-written so that `resurrected` stays out of it.
+///
+/// The flag says where a command came from, not what it runs, and the tree compares `RunCommand`s
+/// - and `Option<Run>`s built from them - to decide whether a pane already running something is
+/// the pane a layout means. A resurrected pane must keep matching the same layout entry it always
+/// did, so the flag is excluded and every existing comparison answers exactly as before.
+///
+/// The fields are destructured exhaustively on purpose: a field added upstream fails to compile
+/// here rather than dropping silently out of equality.
+impl PartialEq for RunCommand {
+    fn eq(&self, other: &Self) -> bool {
+        let RunCommand {
+            command,
+            args,
+            cwd,
+            hold_on_close,
+            hold_on_start,
+            originating_plugin,
+            use_terminal_title,
+            resurrected: _,
+        } = self;
+        command == &other.command
+            && args == &other.args
+            && cwd == &other.cwd
+            && hold_on_close == &other.hold_on_close
+            && hold_on_start == &other.hold_on_start
+            && originating_plugin == &other.originating_plugin
+            && use_terminal_title == &other.use_terminal_title
+    }
 }
 
 impl std::fmt::Display for RunCommand {
@@ -121,6 +161,7 @@ impl From<RunCommandAction> for RunCommand {
             hold_on_start: action.hold_on_start,
             originating_plugin: action.originating_plugin,
             use_terminal_title: action.use_terminal_title,
+            resurrected: false,
         }
     }
 }

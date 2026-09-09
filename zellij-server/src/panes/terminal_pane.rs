@@ -17,6 +17,7 @@ use crate::ClientId;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{self, Instant};
 use uuid::Uuid;
@@ -1265,6 +1266,17 @@ impl Pane for TerminalPane {
             run_command.clone()
         })
     }
+    fn drop_held_to_shell(&mut self) -> Option<Option<PathBuf>> {
+        self.is_held.take().map(|(_, _, run_command)| {
+            // Drop to shell in the same working directory as the command was run
+            let working_dir = run_command.cwd.clone();
+            self.is_held = None;
+            self.grid.reset_terminal_state();
+            self.set_should_render(true);
+            self.remove_banner();
+            working_dir
+        })
+    }
     fn update_theme(&mut self, theme: Styling) {
         self.style.colors = theme.clone();
         self.grid.update_theme(theme);
@@ -1695,15 +1707,8 @@ impl TerminalPane {
         })
     }
     fn handle_held_drop_to_shell(&mut self) -> Option<AdjustedInput> {
-        self.is_held.take().map(|(_, _, run_command)| {
-            // Drop to shell in the same working directory as the command was run
-            let working_dir = run_command.cwd.clone();
-            self.is_held = None;
-            self.grid.reset_terminal_state();
-            self.set_should_render(true);
-            self.remove_banner();
-            AdjustedInput::DropToShellInThisPane { working_dir }
-        })
+        self.drop_held_to_shell()
+            .map(|working_dir| AdjustedInput::DropToShellInThisPane { working_dir })
     }
 }
 

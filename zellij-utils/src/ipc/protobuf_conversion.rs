@@ -4777,6 +4777,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Run>
                         .map(|op| op.try_into())
                         .transpose()?,
                     use_terminal_title: cmd.use_terminal_title,
+                    // fork addition: provenance, not part of the contract - a command that
+                    // crosses the wire is being asked for now, not resurrected
+                    resurrected: false,
                 },
             )),
             RunType::EditFile(edit) => Ok(crate::input::layout::Run::EditFile(

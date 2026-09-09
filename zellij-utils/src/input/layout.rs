@@ -378,6 +378,13 @@ impl Run {
             }
         }
     }
+    /// fork addition: mark a command as one a session resurrection brought back. See
+    /// `RunCommand::resurrected`.
+    pub fn mark_resurrected(&mut self) {
+        if let Run::Command(run_command) = self {
+            run_command.resurrected = true;
+        }
+    }
     pub fn is_same_category(first: &Option<Run>, second: &Option<Run>) -> bool {
         match (first, second) {
             (Some(Run::Plugin(..)), Some(Run::Plugin(..))) => true,
@@ -846,6 +853,12 @@ impl FloatingPaneLayout {
             run.add_start_suspended(start_suspended);
         }
     }
+    /// fork addition: see `Run::mark_resurrected`.
+    pub fn mark_resurrected(&mut self) {
+        if let Some(run) = self.run.as_mut() {
+            run.mark_resurrected();
+        }
+    }
 }
 
 impl From<&TiledPaneLayout> for FloatingPaneLayout {
@@ -1236,6 +1249,15 @@ impl TiledPaneLayout {
         }
         for child in self.children.iter_mut() {
             child.recursively_add_start_suspended(start_suspended);
+        }
+    }
+    /// fork addition: see `Run::mark_resurrected`.
+    pub fn recursively_mark_resurrected(&mut self) {
+        if let Some(run) = self.run.as_mut() {
+            run.mark_resurrected();
+        }
+        for child in self.children.iter_mut() {
+            child.recursively_mark_resurrected();
         }
     }
 }
@@ -1759,6 +1781,17 @@ impl Layout {
             tiled_panes.recursively_add_start_suspended(start_suspended);
             for floating_pane in floating_panes.iter_mut() {
                 floating_pane.add_start_suspended(start_suspended);
+            }
+        }
+    }
+    /// fork addition: mark every command this layout would run as one a session resurrection
+    /// brought back. The tab template is deliberately left alone - a tab opened later is a new
+    /// tab, not a resurrected one. See `RunCommand::resurrected`.
+    pub fn recursively_mark_resurrected(&mut self) {
+        for (_tab_name, tiled_panes, floating_panes) in self.tabs.iter_mut() {
+            tiled_panes.recursively_mark_resurrected();
+            for floating_pane in floating_panes.iter_mut() {
+                floating_pane.mark_resurrected();
             }
         }
     }
