@@ -1595,10 +1595,12 @@ const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// [`recorded_state_home`], and as the absolute binary path the unit names instead of a name to
 /// re-resolve. What the shell that ran `session enable` could resolve, the server it installs can
 /// resolve too. The binary's own directory still leads, because that entry has its own purpose:
-/// the unit must be able to reach the build it execs whatever the recorded PATH says. An installing
-/// PATH that already names that directory keeps its own ordering instead, because hoisting a
-/// directory the operator placed deliberately would change which build of everything else the
-/// server resolves.
+/// the unit must be able to reach the build it execs whatever the recorded PATH says. It leads
+/// even when the installing PATH already names it further down - a shell whose PATH puts the pin
+/// directory eighth would otherwise record it eighth, and then the unit execs one build while
+/// every `zellij` the server resolves by NAME is a different one. Only that one directory moves:
+/// the later occurrence is dropped by the same dedup that drops any other repeat, and every other
+/// entry keeps its place, so which build of everything ELSE the server resolves does not change.
 ///
 /// It is a SNAPSHOT, so it goes stale: a PATH that changes after the install is not the one the
 /// unit carries until the next `session enable`. That is the same trade [`recorded_state_home`]
@@ -1630,7 +1632,11 @@ fn service_path_over(exe: &Path, installing: &[PathBuf]) -> String {
         installing
     };
     let mut dirs: Vec<String> = Vec::with_capacity(recorded.len() + 1);
-    if !exe_dir.is_empty() && !recorded.iter().any(|dir| *dir == exe_dir) {
+    // Unconditionally, not only when the recorded PATH is missing it. A shell that already names
+    // the directory further down would otherwise record it there, and then the unit execs one
+    // build while every `zellij` the server resolves by name is a different one. The dedup below
+    // drops the later occurrence, so nothing else moves.
+    if !exe_dir.is_empty() {
         dirs.push(exe_dir);
     }
     for dir in recorded {
@@ -4629,22 +4635,45 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     }
 
     /// The exe directory leads because the unit must be able to reach the build it execs whatever
-    /// the recorded PATH says. Where the recorded PATH already names it, its own ordering stands:
-    /// hoisting a directory the operator placed deliberately would change which build of everything
-    /// ELSE the server resolves, which is a bigger blast radius than the bug being fixed.
+    /// the recorded PATH says - and it leads even when the installing PATH already names it. The
+    /// bug: an agent shell whose PATH put the pin directory eighth, behind a package prefix,
+    /// recorded it eighth, so the unit execd the pinned build while every `zellij` the server
+    /// resolved by name was the package one.
     #[test]
-    fn a_directory_the_installing_path_already_names_keeps_its_place() {
-        let exe = Path::new("/usr/bin/zellij");
+    fn the_exe_directory_leads_even_when_the_installing_path_already_names_it() {
+        let exe = Path::new("/home/user/.local/share/zellij/bin/zellij");
+        let shell = [
+            "/opt/homebrew/bin",
+            "/home/user/.local/bin",
+            "/home/user/.local/share/zellij/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+        // hoisted to the front, and the later occurrence is gone rather than repeated
         assert_eq!(
-            service_path_over(exe, &installing_path()),
+            service_path_over(exe, &shell),
+            "/home/user/.local/share/zellij/bin:/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+        );
+        // nothing else moves: a PATH whose first entry is already the exe directory is recorded
+        // exactly as the shell had it
+        let unpinned = Path::new("/opt/homebrew/bin/zellij");
+        assert_eq!(
+            service_path_over(unpinned, &installing_path()),
             "/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
         );
-        // a PATH that repeats a directory is recorded once, in its first position
+        // and a PATH that repeats some OTHER directory is still recorded once, in its first
+        // position - the hoist is the only reordering
         let repeated = ["/usr/bin", "/opt/bin", "/usr/bin", "/opt/bin"]
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        assert_eq!(service_path_over(exe, &repeated), "/usr/bin:/opt/bin");
+        assert_eq!(
+            service_path_over(Path::new("/usr/local/bin/zellij"), &repeated),
+            "/usr/local/bin:/usr/bin:/opt/bin"
+        );
     }
 
     /// A launcher's environment can have no PATH at all, and a unit generated from one still has to
@@ -4667,10 +4696,10 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
             service_path_over(exe, &[PathBuf::from(""), PathBuf::from("/opt/bin")]),
             "/opt/homebrew/bin:/opt/bin"
         );
-        // and a binary the platform default already names does not repeat itself
+        // and a binary the platform default already names leads it, without repeating itself
         assert_eq!(
             service_path_over(Path::new("/usr/bin/zellij"), &[]),
-            PLATFORM_PATH
+            "/usr/bin:/usr/local/bin:/bin:/usr/sbin:/sbin"
         );
     }
 

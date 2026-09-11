@@ -1697,6 +1697,40 @@ not before. Drift is the mechanism that says so — regenerating from a shell wh
 from the recorded one reports drift, and following that report is safe, because the rewrite records
 a real shell's `PATH`.
 
+### The generated unit's `PATH` always leads with the binary's directory
+
+The entry above says the binary's own directory leads, and it did — **except** when the shell that
+ran `session enable` already named that directory somewhere further down. Then the shell's ordering
+stood, on the reasoning that hoisting a directory an operator placed deliberately would change which
+build of everything else the server resolves.
+
+That reasoning misses what the entry it qualifies is for. A shell that carries a package prefix
+ahead of the pin directory records the pin directory behind it, so the unit `exec`s the pinned
+build while every `zellij` the **server** resolves by name — a `zellij run --`, a `zellij edit`, a
+resurrected command — is the package one. Seen on a shell whose `PATH` put the pin directory
+eighth:
+
+```
+Environment="PATH=/home/user/.bun/bin:…:/home/user/.local/share/zellij/bin:…"
+```
+
+The directory the unit's binary was found in now leads unconditionally, and the later occurrence of
+that same directory is dropped by the same dedup that drops any other repeat. **That is the only
+reordering**: every other entry keeps its place and its relative order, so which build of everything
+else the server resolves is unchanged. Both generators take the value from the same function, so
+the plist's `PATH` inside `EnvironmentVariables` moves with the unit's.
+
+It is still a **default**. A machine whose config states its own `PATH` — `launchd { env { PATH … }
+}`, the launchd `keys` hatch, or `systemd { service "Environment=PATH=…" }` — is unaffected, because
+none of them is generated.
+
+A unit enabled before this change carries the old order and nothing rewrites it in place, so [the
+drift check](#the-config-and-the-installed-unit-are-compared) reports it and `session enable`
+re-records it — and then `session restart`, because a server keeps the `PATH` it was created with.
+Only a machine whose old order actually differs sees that drift: where the recorded `PATH` did not
+name the binary's directory, or already named it first, the generated value is byte-identical and
+nothing is reported.
+
 ### `session up` will not create a session in the wrong macOS session domain
 
 macOS puts every process in a session domain, and only the graphical (`Aqua`) one carries the
