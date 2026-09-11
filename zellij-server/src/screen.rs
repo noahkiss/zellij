@@ -55,8 +55,8 @@ use zellij_utils::input::config::Config;
 use zellij_utils::input::keybinds::{shortcut_for_action, Keybinds};
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::input::options::{
-    Clipboard, DefaultFloatingSize, HostNotificationProtocol, InputWhileScrolled,
-    NestedSessionHandling, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
+    Clipboard, CommandPaneOnCleanExit, DefaultFloatingSize, HostNotificationProtocol,
+    InputWhileScrolled, NestedSessionHandling, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::{
     ExitReason, MobileActivePanePayload, MobilePanePayload, MobileSessionPayload,
@@ -893,6 +893,7 @@ pub enum ScreenInstruction {
         dangerously_enable_paste_buffer_read: bool,
         default_floating_size: Option<DefaultFloatingSize>,
         input_while_scrolled: InputWhileScrolled,
+        command_pane_on_clean_exit: CommandPaneOnCleanExit,
     },
     RerunCommandPane(u32, Option<NotificationEnd>), // u32 - terminal pane id
     ResizePaneWithId(ResizeStrategy, PaneId),
@@ -1629,6 +1630,7 @@ pub(crate) struct Screen {
     stacked_resize: Rc<RefCell<bool>>,
     default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
     input_while_scrolled: Rc<RefCell<InputWhileScrolled>>,
+    command_pane_on_clean_exit: Rc<RefCell<CommandPaneOnCleanExit>>,
     stacked_pane_list: Rc<RefCell<bool>>,
     sixel_image_store: Rc<RefCell<SixelImageStore>>,
     kitty_image_store: Rc<RefCell<KittyImageStore>>,
@@ -1920,6 +1922,7 @@ impl Screen {
         default_editor: Option<PathBuf>,
         default_floating_size: Option<DefaultFloatingSize>,
         input_while_scrolled: InputWhileScrolled,
+        command_pane_on_clean_exit: CommandPaneOnCleanExit,
         web_clients_allowed: bool,
         web_sharing: WebSharing,
         advanced_mouse_actions: bool,
@@ -1951,6 +1954,7 @@ impl Screen {
             stacked_resize: Rc::new(RefCell::new(stacked_resize)),
             default_floating_size: Rc::new(RefCell::new(default_floating_size)),
             input_while_scrolled: Rc::new(RefCell::new(input_while_scrolled)),
+            command_pane_on_clean_exit: Rc::new(RefCell::new(command_pane_on_clean_exit)),
             stacked_pane_list: Rc::new(RefCell::new(stacked_pane_list)),
             sixel_image_store: Rc::new(RefCell::new(SixelImageStore::default())),
             kitty_image_store: Rc::new(RefCell::new(KittyImageStore::default())),
@@ -5205,6 +5209,7 @@ impl Screen {
             self.stacked_pane_list.clone(),
             self.default_floating_size.clone(),
             self.input_while_scrolled.clone(),
+            self.command_pane_on_clean_exit.clone(),
             self.sixel_image_store.clone(),
             self.kitty_image_store.clone(),
             self.bus
@@ -7880,6 +7885,7 @@ impl Screen {
         dangerously_enable_paste_buffer_read: bool,
         default_floating_size: Option<DefaultFloatingSize>,
         input_while_scrolled: InputWhileScrolled,
+        command_pane_on_clean_exit: CommandPaneOnCleanExit,
         client_id: ClientId,
     ) -> Result<()> {
         let should_support_arrow_fonts = !simplified_ui;
@@ -7931,6 +7937,9 @@ impl Screen {
         }
         {
             *self.input_while_scrolled.borrow_mut() = input_while_scrolled;
+        }
+        {
+            *self.command_pane_on_clean_exit.borrow_mut() = command_pane_on_clean_exit;
         }
         if let Some(copy_to_clipboard) = copy_to_clipboard {
             self.copy_options.clipboard = copy_to_clipboard;
@@ -9425,6 +9434,9 @@ pub(crate) fn screen_thread_main(
     let stacked_pane_list = config_options.stacked_pane_list.unwrap_or(true);
     let default_floating_size = config_options.default_floating_size.clone();
     let input_while_scrolled = config_options.input_while_scrolled.unwrap_or_default();
+    let command_pane_on_clean_exit = config_options
+        .command_pane_on_clean_exit
+        .unwrap_or_default();
     let web_clients_allowed = config_options
         .web_sharing
         .map(|s| s.web_clients_allowed())
@@ -9486,6 +9498,7 @@ pub(crate) fn screen_thread_main(
         default_editor,
         default_floating_size,
         input_while_scrolled,
+        command_pane_on_clean_exit,
         web_clients_allowed,
         web_sharing,
         advanced_mouse_actions,
@@ -13266,6 +13279,7 @@ pub(crate) fn screen_thread_main(
                 dangerously_enable_paste_buffer_read,
                 default_floating_size,
                 input_while_scrolled,
+                command_pane_on_clean_exit,
             } => {
                 screen.host_theme_dark_styling = host_theme_dark;
                 screen.host_theme_light_styling = host_theme_light;
@@ -13302,6 +13316,7 @@ pub(crate) fn screen_thread_main(
                         dangerously_enable_paste_buffer_read,
                         default_floating_size,
                         input_while_scrolled,
+                        command_pane_on_clean_exit,
                         client_id,
                     )
                     .non_fatal();

@@ -6193,6 +6193,7 @@ Config {
         nested_session_handling: None,
         dangerously_enable_paste_buffer_read: None,
         input_while_scrolled: None,
+        command_pane_on_clean_exit: None,
     },
     themes: {},
     plugins: PluginAliases {

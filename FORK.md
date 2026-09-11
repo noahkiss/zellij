@@ -7050,9 +7050,9 @@ screen thread.
 code as before, and so does a signal - a killed child reports `None`, never `Some(0)`. The pane
 that fails is the pane you want left on screen.
 
-**A layout command pane is untouched.** Its hold, its `EXIT CODE`, and its ENTER-to-re-run are
-load-bearing, and this changes none of them. There is no config key: the scope is exactly panes
-whose command came back with a session.
+**This entry's scope is exactly panes whose command came back with a session.** Every other command
+pane held as before, until the entry below it gave them the same drop behind a config key. A
+resurrected pane still needs no key and reads none.
 
 **How a pane is known to be resurrected.** `RunCommand` gains a `resurrected` bool, set on every
 command in the layout when that layout is loaded, and read once where the exit is handled. Both pty
@@ -7081,6 +7081,61 @@ in its recorded layout, because no child is left to observe, while a pane at a p
 default shell as nothing. So the next resurrection brings that pane back as a plain shell in the
 same directory, rather than offering the command again. That is the cost of not pressing ESC, paid
 at the same moment ESC used to pay it.
+
+### A command pane can drop to the shell when its command exits cleanly
+
+```
+// config.kdl
+command_pane_on_clean_exit "shell"
+
+$ zellij run -- cargo test           # before: EXIT CODE: 0, and an ESC to reach the shell
+                                     # now:    the shell, in the directory cargo ran in
+```
+
+The entry above gave a resurrected pane that behaviour and stopped there. But the panes an operator
+actually ends up staring at come from the CLI - `zellij run --`, `zellij action new-pane -- cmd`,
+the same call an agent makes - and each of those still held on success and wanted the same ESC. The
+new option `command_pane_on_clean_exit` extends the drop to all of them.
+
+**Two values, and the default is the old behaviour.** `"hold"` is the default and is upstream: every
+command pane holds on `EXIT CODE: 0` and waits for `<ENTER> run, <ESC> drop to shell, <Ctrl-c>
+exit`. `"shell"` makes a clean exit take the ESC path itself. An unknown value fails the config, as
+every other enum-valued top-level key does.
+
+**It is one global switch, and layout command panes come along.** A per-origin distinction would
+need a field on `RunCommand`, which is the expensive shape the entry above paid for once and this
+one declines to pay again. So a layout `command` pane under `"shell"` also drops, losing the
+ENTER-to-re-run its banner offered. That is the price of the cheap surface, and it is the operator's
+to accept by setting the key.
+
+**A resurrected pane is unconditional.** `run_command.resurrected` still drops on its own, under
+either value. `"hold"` restores upstream behaviour for everything else and changes nothing about a
+pane that came back with a session.
+
+**A failure still holds, under both values.** Only `Some(0)` qualifies. A non-zero status prints its
+code and waits, and a signal reports `None` and does the same.
+
+**A suppressed pane is never dropped.** `Tab::drop_held_pane_to_shell` resolves its pane through
+`get_pane_with_id_mut`, which also reaches the suppressed map - the scrollback-editor path, where a
+pane stands aside for the editor that replaced it. The entry above was safe there only because
+`resurrected` is never set outside a resurrection layout; a config key that any command pane can hit
+is not. So the decision is now taken inside the tiled and floating branches of `Tab::hold_pane` and
+is `false` in the suppressed branch, and a suppressed pane keeps its hold so the pane it stands in
+for is restored.
+
+**Nothing crosses a contract.** It is an `Options` field, and fork `Options` fields are absent from
+the client/server protobuf and set to `None` in the `TryFrom`. No protobuf tag, no plugin API, no
+snapshot format. The value is shared from `Screen` to every `Tab` as an `Rc<RefCell<…>>`, the way
+`input_while_scrolled` is, so a config reload reaches every tab without a per-tab update.
+
+**The consumer sees nothing new.** A dropped pane lands exactly where ESC leaves one today:
+`is_held` false, `exited` false, and the pane running a shell. `list-panes --json` keeps its shape,
+and every reader that already handles an ESC-dropped pane handles this one.
+
+**Roll the config out first.** `command_pane_on_clean_exit` is a top-level key, and an unknown
+top-level key is ignored rather than rejected, so it can be seeded in a shared config before any
+machine has the binary. A machine still on an older build ignores it and holds; a machine that has
+caught up drops. There is no need to gate it per machine.
 
 ### A slow Full Disk Access denial is not a wedged server
 

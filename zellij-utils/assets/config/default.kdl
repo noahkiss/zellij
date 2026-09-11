@@ -311,6 +311,13 @@ load_plugins {
 //
 // input_while_scrolled "scroll-mode"
 
+// Choose what a command pane does when its command exits with status 0
+// Options:
+//   - hold (Default - the pane holds, waiting for ENTER, ESC or Ctrl-C)
+//   - shell (the pane drops to a shell, exactly as an ESC press does)
+//
+// command_pane_on_clean_exit "hold"
+
 //  Send a request for a simplified ui (without arrow fonts) to plugins
 //  Options:
 //    - true

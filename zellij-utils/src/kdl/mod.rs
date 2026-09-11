@@ -3225,6 +3225,19 @@ impl Options {
                 },
                 None => None,
             };
+        let command_pane_on_clean_exit = match kdl_property_first_arg_as_string_or_error!(
+            kdl_options,
+            "command_pane_on_clean_exit"
+        ) {
+            Some((value, entry)) => {
+                use crate::input::options::CommandPaneOnCleanExit;
+                match value.parse::<CommandPaneOnCleanExit>() {
+                    Ok(v) => Some(v),
+                    Err(e) => return Err(kdl_parsing_error!(e, entry)),
+                }
+            },
+            None => None,
+        };
         let host_notification_protocol = match kdl_property_first_arg_as_string_or_error!(
             kdl_options,
             "host_notification_protocol"
@@ -3322,6 +3335,7 @@ impl Options {
             nested_session_handling,
             dangerously_enable_paste_buffer_read,
             input_while_scrolled,
+            command_pane_on_clean_exit,
         })
     }
     pub fn from_string(stringified_keybindings: &String) -> Result<Self, ConfigError> {
@@ -5773,6 +5787,40 @@ impl Options {
             None
         }
     }
+    fn command_pane_on_clean_exit_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
+        use crate::input::options::CommandPaneOnCleanExit;
+        let comment_text = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            " ",
+            "// What a command pane does when its command exits with status 0.",
+            "// Options:",
+            "//   - \"hold\" (Default — the pane holds, waiting for ENTER, ESC or Ctrl-C)",
+            "//   - \"shell\" (the pane drops to a shell, as an ESC press does)",
+            "// ",
+        );
+        let create_node = |value: CommandPaneOnCleanExit| -> KdlNode {
+            let mut node = KdlNode::new("command_pane_on_clean_exit");
+            let s = match value {
+                CommandPaneOnCleanExit::Hold => "hold",
+                CommandPaneOnCleanExit::Shell => "shell",
+            };
+            node.push(KdlValue::String(s.to_string()));
+            node
+        };
+        if let Some(value) = self.command_pane_on_clean_exit {
+            let mut node = create_node(value);
+            if add_comments {
+                node.set_leading(format!("{}\n", comment_text));
+            }
+            Some(node)
+        } else if add_comments {
+            let mut node = create_node(CommandPaneOnCleanExit::Hold);
+            node.set_leading(format!("{}\n// ", comment_text));
+            Some(node)
+        } else {
+            None
+        }
+    }
     fn host_notification_protocol_to_kdl(&self, add_comments: bool) -> Option<KdlNode> {
         use crate::input::options::HostNotificationProtocol;
         let comment_text = format!(
@@ -6104,6 +6152,11 @@ impl Options {
         }
         if let Some(input_while_scrolled) = self.input_while_scrolled_to_kdl(add_comments) {
             nodes.push(input_while_scrolled);
+        }
+        if let Some(command_pane_on_clean_exit) =
+            self.command_pane_on_clean_exit_to_kdl(add_comments)
+        {
+            nodes.push(command_pane_on_clean_exit);
         }
         if let Some(host_notification_protocol) =
             self.host_notification_protocol_to_kdl(add_comments)
@@ -9762,6 +9815,45 @@ fn input_while_scrolled_kdl_round_trip_for_every_variant() {
 fn input_while_scrolled_rejects_an_unknown_value() {
     let fake_config = r##"
         input_while_scrolled "sideways"
+    "##;
+    let document: KdlDocument = fake_config.parse().unwrap();
+    assert!(Options::from_kdl(&document).is_err());
+}
+
+#[test]
+fn command_pane_on_clean_exit_kdl_round_trip_for_every_variant() {
+    use crate::input::options::CommandPaneOnCleanExit;
+    let cases = [
+        ("hold", CommandPaneOnCleanExit::Hold),
+        ("shell", CommandPaneOnCleanExit::Shell),
+    ];
+    for (value, expected) in cases {
+        let fake_config = format!(
+            r##"
+                command_pane_on_clean_exit "{value}"
+            "##
+        );
+        let document: KdlDocument = fake_config.parse().unwrap();
+        let parsed = Options::from_kdl(&document).unwrap();
+        assert_eq!(
+            parsed.command_pane_on_clean_exit,
+            Some(expected),
+            "case: {value}"
+        );
+
+        let mut serialized = Options::to_kdl(&parsed, false);
+        let mut fake_document = KdlDocument::new();
+        fake_document.nodes_mut().append(&mut serialized);
+        let reparsed =
+            Options::from_kdl(&fake_document.to_string().parse::<KdlDocument>().unwrap()).unwrap();
+        assert_eq!(parsed, reparsed, "round-trip mismatch for {value}");
+    }
+}
+
+#[test]
+fn command_pane_on_clean_exit_rejects_an_unknown_value() {
+    let fake_config = r##"
+        command_pane_on_clean_exit "close"
     "##;
     let document: KdlDocument = fake_config.parse().unwrap();
     assert!(Options::from_kdl(&document).is_err());
