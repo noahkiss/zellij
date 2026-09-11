@@ -1595,10 +1595,21 @@ const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// [`recorded_state_home`], and as the absolute binary path the unit names instead of a name to
 /// re-resolve. What the shell that ran `session enable` could resolve, the server it installs can
 /// resolve too. The binary's own directory still leads, because that entry has its own purpose:
-/// the unit must be able to reach the build it execs whatever the recorded PATH says. An installing
-/// PATH that already names that directory keeps its own ordering instead, because hoisting a
-/// directory the operator placed deliberately would change which build of everything else the
-/// server resolves.
+/// the unit must be able to reach the build it execs whatever the recorded PATH says.
+///
+/// Where the installing PATH ALREADY names that directory, two rules, and which one applies turns
+/// on whether the directory is the canonical [`canonical_pinned_exe`] one:
+///
+/// - The pin directory is hoisted to the front anyway. It holds zellij and nothing else, so the
+///   hoist changes which `zellij` the server resolves by NAME and changes nothing else. Without it,
+///   a shell whose PATH puts the pin directory eighth records it eighth, and the unit execs the
+///   pinned build while every `zellij` the server resolves by name - a `zellij run --`, a `zellij
+///   edit`, a resurrected command - is the package one.
+/// - Any OTHER directory keeps its own ordering, because it is one the operator placed
+///   deliberately and hoisting it would change which build of everything ELSE the server resolves.
+///
+/// A hoist is the only reordering: the directory's later occurrence is dropped by the same dedup
+/// that drops any other repeat, and every other entry keeps its place and its relative order.
 ///
 /// It is a SNAPSHOT, so it goes stale: a PATH that changes after the install is not the one the
 /// unit carries until the next `session enable`. That is the same trade [`recorded_state_home`]
@@ -1606,12 +1617,18 @@ const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// shell with a different PATH writes a different unit. Following that report is safe, because the
 /// rewrite records a real shell's PATH.
 fn service_path(exe: &Path) -> String {
-    service_path_over(exe, &path_dirs())
+    // A machine that cannot say where its own data directory is has no pin directory to compare
+    // against, and then every exe directory takes the second rule. That is the same trade
+    // `configured_pinned_exe` makes: no pin, rather than a refused command.
+    let pin_dir = canonical_pinned_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    service_path_over(exe, &path_dirs(), pin_dir.as_deref())
 }
 
-/// [`service_path`] over a given PATH, so the rule is provable without touching this process's
-/// environment.
-fn service_path_over(exe: &Path, installing: &[PathBuf]) -> String {
+/// [`service_path`] over a given PATH and pin directory, so the rule is provable without touching
+/// this process's environment.
+fn service_path_over(exe: &Path, installing: &[PathBuf], pin_dir: Option<&Path>) -> String {
     let exe_dir = exe
         .parent()
         .map(|dir| dir.display().to_string())
@@ -1630,7 +1647,14 @@ fn service_path_over(exe: &Path, installing: &[PathBuf]) -> String {
         installing
     };
     let mut dirs: Vec<String> = Vec::with_capacity(recorded.len() + 1);
-    if !exe_dir.is_empty() && !recorded.iter().any(|dir| *dir == exe_dir) {
+    // Where the recorded PATH already names the exe directory, only the canonical pin directory is
+    // hoisted over its own entry - it holds zellij and nothing else, so the hoist changes which
+    // `zellij` the server resolves by name and nothing more. Any other directory keeps the place
+    // the operator gave it. The dedup below drops a hoisted directory's later occurrence.
+    let is_pin_dir = pin_dir
+        .map(|dir| dir.display().to_string() == exe_dir)
+        .unwrap_or(false);
+    if !exe_dir.is_empty() && (is_pin_dir || !recorded.iter().any(|dir| *dir == exe_dir)) {
         dirs.push(exe_dir);
     }
     for dir in recorded {
@@ -4576,6 +4600,15 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
         service_path(&exe())
     }
 
+    /// The canonical pin directory, as [`canonical_pinned_exe`] reports it on a machine whose home
+    /// is `/home/user`. Which of the two rules an exe directory takes turns on this, so the tests
+    /// state it rather than reading the environment the suite happens to run in.
+    const PIN_DIR: &str = "/home/user/.local/share/zellij/bin";
+
+    fn pin_dir() -> Option<&'static Path> {
+        Some(Path::new(PIN_DIR))
+    }
+
     /// A PATH of the shape an operator's shell actually has: a package prefix, a per-user bin, and
     /// the platform's own directories under them.
     fn installing_path() -> Vec<PathBuf> {
@@ -4615,28 +4648,78 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     /// `~/.local/bin` and every npm or bun global bin dropped out and `claude` stopped resolving.
     #[test]
     fn the_recorded_path_is_the_installing_environments_own() {
+        // a pin directory the installing PATH does not name at all is prepended
         let pinned = Path::new("/home/user/.local/share/zellij/bin/zellij");
         assert_eq!(
-            service_path_over(pinned, &installing_path()),
+            service_path_over(pinned, &installing_path(), pin_dir()),
             "/home/user/.local/share/zellij/bin:/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+        );
+        // and so is a NON-pin exe directory the installing PATH does not name - the two rules only
+        // differ where the PATH already names the directory
+        assert_eq!(
+            service_path_over(
+                Path::new("/opt/local/bin/zellij"),
+                &installing_path(),
+                pin_dir()
+            ),
+            "/opt/local/bin:/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
         );
         // and unpinned, where the exe directory is a package prefix, the rest still comes along
         let unpinned = Path::new("/opt/homebrew/bin/zellij");
         assert_eq!(
-            service_path_over(unpinned, &installing_path()),
+            service_path_over(unpinned, &installing_path(), pin_dir()),
             "/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
         );
     }
 
-    /// The exe directory leads because the unit must be able to reach the build it execs whatever
-    /// the recorded PATH says. Where the recorded PATH already names it, its own ordering stands:
-    /// hoisting a directory the operator placed deliberately would change which build of everything
-    /// ELSE the server resolves, which is a bigger blast radius than the bug being fixed.
+    /// The pin directory leads even when the installing PATH already names it further down. The
+    /// bug: an agent shell whose PATH put the pin directory third, behind a package prefix,
+    /// recorded it third, so the unit execd the pinned build while every `zellij` the server
+    /// resolved by name was the package one. The pin directory holds zellij and nothing else, so
+    /// the hoist changes which `zellij` resolves by name and nothing else about the PATH.
     #[test]
-    fn a_directory_the_installing_path_already_names_keeps_its_place() {
+    fn the_pin_directory_leads_even_when_the_installing_path_already_names_it() {
+        let exe = Path::new("/home/user/.local/share/zellij/bin/zellij");
+        let shell = [
+            "/opt/homebrew/bin",
+            "/home/user/.local/bin",
+            PIN_DIR,
+            "/usr/bin",
+            "/bin",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+        // hoisted to the front, and the later occurrence is gone rather than repeated
+        assert_eq!(
+            service_path_over(exe, &shell, pin_dir()),
+            "/home/user/.local/share/zellij/bin:/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
+        );
+        // a shell that already leads with the pin directory records a byte-identical PATH
+        let already_first = [PIN_DIR, "/opt/homebrew/bin", "/usr/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            service_path_over(exe, &already_first, pin_dir()),
+            "/home/user/.local/share/zellij/bin:/opt/homebrew/bin:/usr/bin"
+        );
+        // and a machine that cannot say where its data directory is has no pin directory to
+        // recognise, so the same PATH takes the other rule
+        assert_eq!(
+            service_path_over(exe, &shell, None),
+            "/opt/homebrew/bin:/home/user/.local/bin:/home/user/.local/share/zellij/bin:/usr/bin:/bin"
+        );
+    }
+
+    /// Any directory that is NOT the pin one keeps the place the installing PATH gave it: hoisting
+    /// a directory the operator placed deliberately would change which build of everything ELSE
+    /// the server resolves, which is a bigger blast radius than the bug being fixed.
+    #[test]
+    fn a_non_pin_directory_the_installing_path_already_names_keeps_its_place() {
         let exe = Path::new("/usr/bin/zellij");
         assert_eq!(
-            service_path_over(exe, &installing_path()),
+            service_path_over(exe, &installing_path(), pin_dir()),
             "/opt/homebrew/bin:/home/user/.local/bin:/usr/bin:/bin"
         );
         // a PATH that repeats a directory is recorded once, in its first position
@@ -4644,7 +4727,24 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
             .iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        assert_eq!(service_path_over(exe, &repeated), "/usr/bin:/opt/bin");
+        assert_eq!(
+            service_path_over(exe, &repeated, pin_dir()),
+            "/usr/bin:/opt/bin"
+        );
+        // including where the exe directory is hoisted over its own entry - the hoist is the only
+        // reordering, and a repeat of some other directory still collapses to its first position
+        let with_pin = ["/usr/bin", PIN_DIR, "/opt/bin", "/usr/bin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            service_path_over(
+                Path::new("/home/user/.local/share/zellij/bin/zellij"),
+                &with_pin,
+                pin_dir()
+            ),
+            "/home/user/.local/share/zellij/bin:/usr/bin:/opt/bin"
+        );
     }
 
     /// A launcher's environment can have no PATH at all, and a unit generated from one still has to
@@ -4653,23 +4753,27 @@ ExecStart=-/opt/my tools/zellij \"session\" up 'my session'
     fn an_environment_with_no_path_falls_back_to_the_platform_default() {
         let exe = Path::new("/opt/homebrew/bin/zellij");
         assert_eq!(
-            service_path_over(exe, &[]),
+            service_path_over(exe, &[], pin_dir()),
             format!("/opt/homebrew/bin:{}", PLATFORM_PATH)
         );
         // an empty PATH entry is `.` to every exec that reads one, so it is dropped rather than
         // recorded - a server resolving commands against its own working directory is nobody's
         // intent. A PATH of nothing but empties is an environment with no PATH.
         assert_eq!(
-            service_path_over(exe, &[PathBuf::from(""), PathBuf::from("")]),
+            service_path_over(exe, &[PathBuf::from(""), PathBuf::from("")], pin_dir()),
             format!("/opt/homebrew/bin:{}", PLATFORM_PATH)
         );
         assert_eq!(
-            service_path_over(exe, &[PathBuf::from(""), PathBuf::from("/opt/bin")]),
+            service_path_over(
+                exe,
+                &[PathBuf::from(""), PathBuf::from("/opt/bin")],
+                pin_dir()
+            ),
             "/opt/homebrew/bin:/opt/bin"
         );
         // and a binary the platform default already names does not repeat itself
         assert_eq!(
-            service_path_over(Path::new("/usr/bin/zellij"), &[]),
+            service_path_over(Path::new("/usr/bin/zellij"), &[], pin_dir()),
             PLATFORM_PATH
         );
     }
