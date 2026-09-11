@@ -7191,31 +7191,15 @@ here.
 both in the rebase commit. The commit is `git rev-parse --short '<new-tag>^{commit}'`; upstream
 tags are annotated, so `--short <new-tag>` gives the tag object instead and is the wrong answer.
 
-The base moved from `98a083707` (an upstream `main` commit) to the **`v0.45.0`** tag and took twelve
-upstream commits. Five of them met a patch here.
+The base moved from the **`v0.45.0`** tag (`13e1c25a2`) to the **`v0.45.1`** tag (`efd8fd5a8`), a
+nineteen-commit patch release. All 118 fork patches replayed: none dropped as upstream-absorbed,
+none added. Twenty-two took textual drift and nothing else.
 
-Upstream now puts tabs in order of actual position when it serializes a session (`85cc8b1fe`,
-#5224) — the identical fix this fork carried, so the fork's copy is dropped and upstream's is what
-runs. Upstream also grew its own `IpcReceiveError { Disconnected, Undecodable }` and a
-`try_recv_client_msg` returning `Result`, which is the fork's `IpcRecvError { Disconnected,
-Malformed }` under other names; the fork's enum, its route-thread arm and its socket test are
-dropped in favour of upstream's, whose test covers strictly more.
-
-Upstream took client/server contract Action tags **148-151** for the scrollback-prompt actions. The
-fork's `move_tab_to_index` was on 148 — its one tag outside the fork-reserved block — and moves to
-**172**, next to the rest of the fork's actions at 160-171. No other tag changed, and the contract
-version is unchanged.
-
-Upstream's new scroll-mode test snapshot is re-recorded, for the same reason it was at the last
-rebase: a pane frame here also carries the pane's fixed-width handle, so the scroll indicator sits
-further left than an upstream frame puts it.
-
-Upstream reworked the about plugin (`18cb94e1c`, `4156b5023`): a keybinding-migration feature with
-its own `<u>`/`<y>`/`<n>` keys, `main_screen()` and `main_screen_builder()` helpers, and help lines
-assembled as a string and coloured by substring instead of by hardcoded column ranges. The fork's
-server-binary paragraph and `<c>` copy key are threaded through the reworked functions as one more
-parameter; the fork's two helpers that computed where `<c>` landed are deleted, because the
-substring colouring makes that arithmetic unnecessary.
+One upstream change met a fork option. Upstream grew its own opt-out for scroll-mode sync
+(`748a6fa9a`, #5532), a `scroll_mode_sync` boolean, where the fork already carried the three-value
+`input_while_scrolled`. Both are kept and both are checked, upstream's first
+(`zellij-server/src/screen.rs:6882-6887`); each defaults to upstream's behaviour. No fork option
+changed name, value, default or effect.
 
 ```
 cargo build --release
