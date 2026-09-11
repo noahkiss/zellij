@@ -61,8 +61,10 @@ patch ledger readable, because the rebase onto a newer upstream tag replays it c
 
 1. **Branch per patch.** Never commit a patch to main directly.
 2. **Prove it with a release candidate, on the branch.** Tag `v<version>-rc.1`, `-rc.2`, … and push
-   the tag. `release.yml` builds and publishes an RC exactly like a final tag, with two differences:
-   the GitHub release is marked `--prerelease`, and the tap bump rewrites the separate
+   the tag by name: `git push origin v<version>-rc.N`. This repo sets `push.followTags false`, so a
+   branch push never carries a tag with it — push every tag explicitly. `release.yml` builds and
+   publishes an RC exactly like a final tag, with two differences: the GitHub release is marked
+   `--prerelease`, and the tap bump rewrites the separate
    `zellij-nkmk-rc` formula. A Mac proof agent then installs the candidate without disturbing the
    formula every machine runs:
 
@@ -81,7 +83,8 @@ patch ledger readable, because the rebase onto a newer upstream tag replays it c
    main says. It refuses a tag that is not a candidate for the version the branch is bumped to.
 3. **Land by squash-merge**, so one ledger entry is one commit. `FORK.md` is updated in that commit,
    not in a follow-up.
-4. **Tag the final release from main** — `v<version>`, no suffix. It bumps `zellij-nkmk` as before.
+4. **Tag the final release from main** — `v<version>`, no suffix — and push it by name:
+   `git push origin v<version>`. It bumps `zellij-nkmk` as before.
    RC tags are proof, never install targets; nothing outside the rc formula points at one.
 5. **Rebase onto a newer upstream tag** with `git rebase --onto <new-base> <old-base> main`, then
    record the new base in `FORK.md`.
