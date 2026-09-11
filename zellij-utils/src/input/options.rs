@@ -125,6 +125,34 @@ impl FromStr for InputWhileScrolled {
     }
 }
 
+/// What happens to a command pane when its command exits with status 0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+pub enum CommandPaneOnCleanExit {
+    /// The pane holds, showing EXIT CODE: 0 and waiting for ENTER, ESC or Ctrl-C.
+    #[serde(alias = "hold")]
+    Hold,
+    /// The pane drops to a shell, exactly as an ESC press does.
+    #[serde(alias = "shell")]
+    Shell,
+}
+
+impl Default for CommandPaneOnCleanExit {
+    fn default() -> Self {
+        Self::Hold
+    }
+}
+
+impl FromStr for CommandPaneOnCleanExit {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Hold" | "hold" => Ok(Self::Hold),
+            "Shell" | "shell" => Ok(Self::Shell),
+            _ => Err(format!("No such command_pane_on_clean_exit: {}", s)),
+        }
+    }
+}
+
 impl Default for OnForceClose {
     fn default() -> Self {
         Self::Detach
@@ -670,6 +698,12 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub input_while_scrolled: Option<InputWhileScrolled>,
+
+    /// What a command pane does when its command exits with status 0
+    /// (hold, shell)
+    #[clap(skip)]
+    #[serde(default)]
+    pub command_pane_on_clean_exit: Option<CommandPaneOnCleanExit>,
 }
 
 #[derive(ValueEnum, Deserialize, Serialize, Debug, Clone, Copy, PartialEq)]
@@ -887,6 +921,9 @@ impl Options {
             .dangerously_enable_paste_buffer_read
             .or(self.dangerously_enable_paste_buffer_read);
         let input_while_scrolled = other.input_while_scrolled.or(self.input_while_scrolled);
+        let command_pane_on_clean_exit = other
+            .command_pane_on_clean_exit
+            .or(self.command_pane_on_clean_exit);
 
         Options {
             simplified_ui,
@@ -966,6 +1003,7 @@ impl Options {
             nested_session_handling,
             dangerously_enable_paste_buffer_read,
             input_while_scrolled,
+            command_pane_on_clean_exit,
         }
     }
 
@@ -1118,6 +1156,9 @@ impl Options {
             .dangerously_enable_paste_buffer_read
             .or(self.dangerously_enable_paste_buffer_read);
         let input_while_scrolled = other.input_while_scrolled.or(self.input_while_scrolled);
+        let command_pane_on_clean_exit = other
+            .command_pane_on_clean_exit
+            .or(self.command_pane_on_clean_exit);
 
         Options {
             simplified_ui,
@@ -1197,6 +1238,7 @@ impl Options {
             nested_session_handling,
             dangerously_enable_paste_buffer_read,
             input_while_scrolled,
+            command_pane_on_clean_exit,
         }
     }
 
