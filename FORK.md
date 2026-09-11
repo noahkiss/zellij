@@ -1669,7 +1669,8 @@ Both generators take it from the same function, so the plist's `PATH` entry insi
 - **The binary's own directory leads**, pinned or not — the unit must be able to reach the build it
   execs whatever the recorded `PATH` says. Where the recorded `PATH` already names that directory,
   its own ordering stands: hoisting a directory the operator placed deliberately would change which
-  build of *everything else* the server resolves.
+  build of *everything else* the server resolves. [The pin directory is the one
+  exception](#the-generated-units-path-leads-with-the-pin-directory), because it holds nothing else.
 - **Order is preserved and repeats are dropped**, so the recorded value reads as the operator's own
   `PATH` and resolves the same way. An empty entry — the `.` a `::` means to every exec — is dropped
   rather than recorded.
@@ -1696,6 +1697,47 @@ afterwards: install a new package prefix, and the unit learns about it at the ne
 not before. Drift is the mechanism that says so — regenerating from a shell whose `PATH` differs
 from the recorded one reports drift, and following that report is safe, because the rewrite records
 a real shell's `PATH`.
+
+### The generated unit's `PATH` leads with the pin directory
+
+The entry above says the binary's own directory leads, and that where the installing `PATH` already
+names that directory its own ordering stands. The second half is right for a directory the operator
+placed, and wrong for the one directory zellij places itself.
+
+A shell that carries a package prefix ahead of the pin directory records the pin directory behind
+it, so the unit `exec`s the pinned build while every `zellij` the **server** resolves by name — a
+`zellij run --`, a `zellij edit`, a resurrected command — is the package one. Seen on a shell whose
+`PATH` put the pin directory eighth:
+
+```
+Environment="PATH=/home/user/.bun/bin:…:/home/user/.local/share/zellij/bin:…"
+```
+
+So the rule splits, and the split is narrow:
+
+- **The canonical `pin_exe` directory is hoisted to the front**, even when the installing `PATH`
+  already names it further down. That directory is the per-user data directory zellij owns, and it
+  holds zellij and nothing else — so the hoist changes which `zellij` the server resolves by name
+  and changes nothing else at all.
+- **Any other directory keeps its place**, exactly as the entry above says. A package prefix, a
+  per-user bin, a directory an operator put where they wanted it: none of them moves, because moving
+  one would change which build of *everything else* the server resolves.
+
+A hoist is the only reordering. The pin directory's later occurrence is dropped by the same dedup
+that drops any other repeat, and every other entry keeps its place and its relative order. Both
+generators take the value from the same function, so the plist's `PATH` inside `EnvironmentVariables`
+moves with the unit's. A machine that cannot say where its own data directory is has no pin directory
+to recognise, and every exe directory there takes the second rule.
+
+It is still a **default**. A machine whose config states its own `PATH` — `launchd { env { PATH … }
+}`, the launchd `keys` hatch, or `systemd { service "Environment=PATH=…" }` — is unaffected, because
+none of them is generated.
+
+A unit enabled before this change carries the old order and nothing rewrites it in place, so [the
+drift check](#the-config-and-the-installed-unit-are-compared) reports it and `session enable`
+re-records it — and then `session restart`, because a server keeps the `PATH` it was created with.
+Only a machine that pins its binary *and* whose shell names the pin directory somewhere other than
+first sees that drift. Everywhere else the generated value is byte-identical and nothing is reported.
 
 ### `session up` will not create a session in the wrong macOS session domain
 
