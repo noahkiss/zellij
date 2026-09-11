@@ -156,7 +156,25 @@ test branches — **an `rc/**` push never exercises it**, so a green RC does not
 cutting any release: run the nextest suites and the integration suite locally, and account for
 e2e either by running it locally (Docker) or by the fact that the exact tree already went green on
 a `main` push. The v16 release shipped with four stale integration snapshots and two stale e2e
-snapshots because local gates covered only the first surface.
+snapshots because local gates covered only the first surface. v19 reached `main` with six stale
+plugin-system snapshots for the same reason, fixed in `5fef6e6b1` before the tag.
+
+**That e2e job is also the only runner of zellij-server's `--ignored` plugin-system suite.**
+`cargo xtask ci e2e --test` runs the Docker e2e tests, then runs `cargo test -- --ignored` inside
+`zellij-server` (`xtask/src/ci.rs:195-221`). Nothing else passes `--ignored` — not `cargo xtask
+test`, not the nextest suites — so the fast loop never compiles those tests, let alone runs them.
+Their snapshots capture `RunCommand`'s derived `Debug`, so a new field on it lands here and in no
+other surface. To run them locally, without Docker:
+
+```
+cargo xtask ci e2e --build                                  # builds the fixture plugin
+cargo test -p zellij-server -- --ignored --test-threads 1
+```
+
+`--build` compiles the plugins for `wasm32-wasip1` and copies them to
+`<target dir>/e2e-data/plugins/`, where the tests look for
+`fixture-plugin-for-tests.wasm`. `<target dir>` honours `CARGO_TARGET_DIR`, so the build and the
+tests agree only when both see the same value.
 
 CI also runs `cargo xtask build` and `cargo xtask test` on Linux and macOS, plus a `--no-web` test
 pass. A change behind a feature flag still has to compile without it. **There is no Windows job**,
