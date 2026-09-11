@@ -20,8 +20,8 @@ use zellij_utils::input::layout::{
 };
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::input::options::{
-    HostNotificationProtocol, InputWhileScrolled, NestedSessionHandling, Options, PaneFrameStyle,
-    DEFAULT_WORD_SEPARATORS,
+    CommandPaneOnCleanExit, HostNotificationProtocol, InputWhileScrolled, NestedSessionHandling,
+    Options, PaneFrameStyle, DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::IpcReceiverWithContext;
 use zellij_utils::pane_handle::is_handle_shaped;
@@ -481,6 +481,7 @@ fn create_new_screen_with_capture(
         None,
         None,
         InputWhileScrolled::default(),
+        CommandPaneOnCleanExit::default(),
         false,
         web_sharing,
         advanced_mouse_actions,
@@ -6298,6 +6299,7 @@ fn create_new_screen_with_pane_send_state(
         None,
         None,
         InputWhileScrolled::default(),
+        CommandPaneOnCleanExit::default(),
         false,
         web_sharing,
         true,
@@ -10486,6 +10488,7 @@ fn create_new_screen_with_forward_capture(size: Size) -> (Screen, ForwardCapture
         None,
         None,
         InputWhileScrolled::default(),
+        CommandPaneOnCleanExit::default(),
         false,
         web_sharing,
         true,
@@ -11389,6 +11392,7 @@ fn create_new_screen_with_theme_capture(size: Size) -> (Screen, ThemeCapture) {
         None,
         None,
         InputWhileScrolled::default(),
+        CommandPaneOnCleanExit::default(),
         false,
         web_sharing,
         true,
@@ -12216,6 +12220,7 @@ fn create_non_mirrored_screen(size: Size) -> Screen {
         None,
         None, // default_floating_size
         InputWhileScrolled::default(),
+        CommandPaneOnCleanExit::default(),
         false,
         WebSharing::Off,
         true, // advanced_mouse_actions

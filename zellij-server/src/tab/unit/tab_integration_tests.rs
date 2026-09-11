@@ -3,7 +3,7 @@ use crate::panes::kitty_graphics::KittyImageStore;
 use crate::panes::sixel::SixelImageStore;
 use crate::screen::{CopyOptions, ScreenInstruction};
 use crate::Arc;
-use zellij_utils::input::options::{InputWhileScrolled, PaneFrameStyle};
+use zellij_utils::input::options::{CommandPaneOnCleanExit, InputWhileScrolled, PaneFrameStyle};
 
 use crate::{
     os_input_output::ServerOsApi, pane_groups::PaneGroups, panes::PaneId,
@@ -281,6 +281,7 @@ fn create_new_tab(size: Size, default_mode: ModeInfo) -> Tab {
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -381,6 +382,7 @@ fn create_new_tab_with_stacked_pane_list(
         stacked_pane_list,
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -477,6 +479,7 @@ fn create_new_tab_without_pane_frames(size: Size, default_mode: ModeInfo) -> Tab
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -586,6 +589,7 @@ fn create_new_tab_with_swap_layouts(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -700,6 +704,7 @@ fn create_new_tab_with_os_api(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -796,6 +801,7 @@ fn create_new_tab_with_layout(size: Size, default_mode: ModeInfo, layout: &str) 
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -920,6 +926,7 @@ fn create_new_tab_with_frame_style_and_mock_pty_writer(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -1021,6 +1028,7 @@ fn create_new_tab_with_sixel_support(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -14114,6 +14122,7 @@ fn create_new_tab_with_plugin_receiver(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -15901,6 +15910,7 @@ fn create_new_tab_with_server_receiver(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,

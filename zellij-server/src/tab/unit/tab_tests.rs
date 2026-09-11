@@ -16,7 +16,7 @@ use zellij_utils::data::{
 use zellij_utils::errors::prelude::*;
 use zellij_utils::errors::ErrorContext;
 use zellij_utils::input::layout::{SplitDirection, SplitSize, TiledPaneLayout};
-use zellij_utils::input::options::{InputWhileScrolled, PaneFrameStyle};
+use zellij_utils::input::options::{CommandPaneOnCleanExit, InputWhileScrolled, PaneFrameStyle};
 use zellij_utils::ipc::IpcReceiverWithContext;
 use zellij_utils::pane_size::{PaneGeom, Size, SizeInPixels};
 
@@ -207,6 +207,7 @@ fn create_new_tab_with_plugin_receiver(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -300,6 +301,7 @@ fn create_new_tab_with_layout(size: Size, layout: TiledPaneLayout) -> Tab {
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -399,6 +401,7 @@ fn create_new_tab_with_cell_size(
         Rc::new(RefCell::new(false)),
         Rc::new(RefCell::new(None)),
         Rc::new(RefCell::new(InputWhileScrolled::default())),
+        Rc::new(RefCell::new(CommandPaneOnCleanExit::default())),
         sixel_image_store,
         Rc::new(RefCell::new(KittyImageStore::default())),
         os_api,
@@ -18159,5 +18162,99 @@ fn a_layout_command_pane_still_holds_when_its_command_exits_cleanly() {
     assert!(
         pty_receiver.try_recv().is_err(),
         "a layout command pane should not be dropped to the shell"
+    );
+}
+
+// fork additions: `command_pane_on_clean_exit "shell"` extends that same drop to every command
+// pane, however it was started. A failure still holds, the default `"hold"` keeps the upstream
+// behaviour, and a suppressed pane is never dropped.
+
+#[test]
+fn a_command_pane_drops_to_the_shell_on_a_clean_exit_under_shell() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert!(
+        !tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a command pane should not stay held after a clean exit under \"shell\""
+    );
+    let (instruction, _err_ctx) = pty_receiver
+        .try_recv()
+        .expect("expected the pane to be dropped to the shell");
+    match instruction {
+        PtyInstruction::DropToShellInPane {
+            pane_id,
+            shell,
+            working_dir,
+            ..
+        } => {
+            assert_eq!(pane_id, PaneId::Terminal(1));
+            assert_eq!(shell, Some(PathBuf::from("my_default_shell")));
+            assert_eq!(working_dir, Some(PathBuf::from("/tmp/a-working-dir")));
+        },
+        other => panic!("expected DropToShellInPane, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_command_pane_still_holds_when_its_command_fails_under_shell() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(7), false, held_run_command(false));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "a failure must stay on screen, so a non-zero exit still holds under \"shell\""
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a failing command pane should not be dropped to the shell"
+    );
+}
+
+#[test]
+fn a_command_pane_still_holds_on_a_clean_exit_under_hold() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Hold;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert!(
+        tab.get_pane_with_id(PaneId::Terminal(1)).unwrap().is_held(),
+        "the default \"hold\" keeps the upstream hold and its ENTER-to-re-run banner"
+    );
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a command pane under \"hold\" should not be dropped to the shell"
+    );
+}
+
+#[test]
+fn a_suppressed_pane_is_never_dropped_to_the_shell() {
+    let (mut tab, pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+    tab.vertical_split(PaneId::Terminal(2), None, 1, None, None)
+        .unwrap();
+    // pane 2 is now the scrollback editor's replaced pane, reachable by id but not on screen
+    tab.replace_active_pane_with_editor_pane(PaneId::Terminal(3), 1)
+        .unwrap();
+    assert_eq!(
+        tab.suppressed_panes
+            .get(&PaneId::Terminal(3))
+            .unwrap()
+            .1
+            .pid(),
+        PaneId::Terminal(2),
+        "pane 2 should be suppressed behind the editor pane"
+    );
+
+    tab.hold_pane(PaneId::Terminal(2), Some(0), false, held_run_command(true));
+
+    assert!(
+        pty_receiver.try_recv().is_err(),
+        "a suppressed pane must keep its hold, so the pane it stands in for is restored"
     );
 }

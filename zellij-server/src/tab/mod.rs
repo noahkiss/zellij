@@ -24,7 +24,7 @@ use zellij_utils::errors::prelude::*;
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::MouseEvent;
 use zellij_utils::input::options::{
-    DefaultFloatingSize, InputWhileScrolled, DEFAULT_WORD_SEPARATORS,
+    CommandPaneOnCleanExit, DefaultFloatingSize, InputWhileScrolled, DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::position::Position;
 use zellij_utils::position::{Column, Line};
@@ -233,6 +233,9 @@ pub(crate) struct Tab {
     /// Fork addition: what a keypress does in a pane that is scrolled up. Shared with `Screen`
     /// the same way, so a config reload reaches every tab.
     input_while_scrolled: Rc<RefCell<InputWhileScrolled>>,
+    /// Fork addition: what a command pane does when its command exits with status 0. Shared with
+    /// `Screen` the same way, so a config reload reaches every tab.
+    command_pane_on_clean_exit: Rc<RefCell<CommandPaneOnCleanExit>>,
     pending_vte_events: HashMap<u32, Vec<VteBytes>>,
     pub selecting_with_mouse_in_pane: Option<PaneId>, // this is only pub for the tests
     pane_being_resized_with_mouse: Option<PaneResizeState>,
@@ -939,6 +942,7 @@ impl Tab {
         stacked_pane_list: Rc<RefCell<bool>>,
         default_floating_size: Rc<RefCell<Option<DefaultFloatingSize>>>,
         input_while_scrolled: Rc<RefCell<InputWhileScrolled>>,
+        command_pane_on_clean_exit: Rc<RefCell<CommandPaneOnCleanExit>>,
         sixel_image_store: Rc<RefCell<SixelImageStore>>,
         kitty_image_store: Rc<RefCell<KittyImageStore>>,
         os_api: Box<dyn ServerOsApi>,
@@ -1073,6 +1077,7 @@ impl Tab {
             auto_layout,
             default_floating_size,
             input_while_scrolled,
+            command_pane_on_clean_exit,
             pending_vte_events: HashMap::new(),
             connected_clients,
             selecting_with_mouse_in_pane: None,
@@ -6172,18 +6177,31 @@ impl Tab {
                 ));
             return;
         }
-        // fork addition: a command a session resurrection brought back, which has just exited
-        // cleanly, does not wait to be dismissed - see `Tab::drop_held_pane_to_shell`
-        let should_drop_to_shell = run_command.resurrected && exit_status == Some(0);
-        if self.floating_panes.panes_contain(&id) {
+        // fork addition: a command pane that has just exited cleanly does not wait to be
+        // dismissed - see `Tab::drop_held_pane_to_shell`. A pane a session resurrection brought
+        // back always takes that path; every other command pane takes it only under
+        // `command_pane_on_clean_exit "shell"`.
+        let exited_cleanly = exit_status == Some(0)
+            && (run_command.resurrected
+                || *self.command_pane_on_clean_exit.borrow() == CommandPaneOnCleanExit::Shell);
+        // The drop resolves its pane through `get_pane_with_id_mut`, which also reaches a
+        // suppressed pane, so it is confined to the two branches holding a visible one. A
+        // suppressed pane is the scrollback-editor path: replacing its command with a shell
+        // would strand the pane it stands in for.
+        let should_drop_to_shell = if self.floating_panes.panes_contain(&id) {
             self.floating_panes
                 .hold_pane(id, exit_status, is_first_run, run_command);
+            exited_cleanly
         } else if self.tiled_panes.panes_contain(&id) {
             self.tiled_panes
                 .hold_pane(id, exit_status, is_first_run, run_command);
+            exited_cleanly
         } else if let Some(pane) = self.suppressed_panes.values_mut().find(|p| p.1.pid() == id) {
             pane.1.hold(exit_status, is_first_run, run_command);
-        }
+            false
+        } else {
+            false
+        };
         if should_drop_to_shell {
             self.drop_held_pane_to_shell(id);
         }
@@ -6193,8 +6211,9 @@ impl Tab {
     /// The pane is held first and released here, rather than never held at all, so that this is
     /// the same sequence a keypress produces: the pane resets its grid and drops its banner in
     /// `drop_held_to_shell`, and the pty thread replaces the dead command with the default shell in
-    /// the directory the command ran in. Only a resurrected command pane that exited with status 0
-    /// reaches this; every other exit holds, and a layout command pane is untouched.
+    /// the directory the command ran in. Only a command pane that exited with status 0 reaches
+    /// this, and only when it was resurrected or `command_pane_on_clean_exit` is `"shell"`; every
+    /// other exit holds.
     fn drop_held_pane_to_shell(&mut self, id: PaneId) {
         let PaneId::Terminal(terminal_id) = id else {
             return;

@@ -373,6 +373,13 @@ web_sharing "disabled"
 // 
 // input_while_scrolled "scroll-mode"
  
+// What a command pane does when its command exits with status 0.
+// Options:
+//   - "hold" (Default — the pane holds, waiting for ENTER, ESC or Ctrl-C)
+//   - "shell" (the pane drops to a shell, as an ESC press does)
+// 
+// command_pane_on_clean_exit "hold"
+ 
 // Which escape sequence desktop notifications coming from panes are
 // forwarded to the host terminal with.
 // Options:

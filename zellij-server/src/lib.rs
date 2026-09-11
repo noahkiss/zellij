@@ -500,6 +500,10 @@ impl SessionMetaData {
                         .options
                         .input_while_scrolled
                         .unwrap_or_default(),
+                    command_pane_on_clean_exit: new_config
+                        .options
+                        .command_pane_on_clean_exit
+                        .unwrap_or_default(),
                     advanced_mouse_actions: new_config
                         .options
                         .advanced_mouse_actions
