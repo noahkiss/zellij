@@ -5150,6 +5150,7 @@ dependencies = [
  "regex",
  "rmcp",
  "serde_json",
+ "shellexpand",
  "ssh2",
  "suggest",
  "tempfile",
