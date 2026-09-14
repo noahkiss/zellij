@@ -19,7 +19,7 @@
 //! build the tool shipped in.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -124,6 +124,21 @@ pub fn argv(
     tool: &str,
     args: &Map<String, Value>,
     ambient_session: Option<&str>,
+) -> Result<Vec<String>, String> {
+    argv_in(tool, args, ambient_session, &CallEnv::from_process())
+}
+
+/// The same, told what the process around it looks like.
+///
+/// Two arguments of `zellij_create` are about the caller's own environment rather than the
+/// session's - the shell a `command` runs in, and what `~`, `$VAR` and a relative path mean in a
+/// `cwd`. Reading those once, here, keeps the building itself a function of its inputs, so a test
+/// can say what `$SHELL` was without changing the environment every other test runs in.
+fn argv_in(
+    tool: &str,
+    args: &Map<String, Value>,
+    ambient_session: Option<&str>,
+    env: &CallEnv,
 ) -> Result<Vec<String>, String> {
     let args = Args::new(args);
     let session = args.string("session");
@@ -259,7 +274,7 @@ pub fn argv(
                     rest.push("new-pane".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push("--cwd".to_owned());
-                        rest.push(cwd);
+                        rest.push(resolve_cwd(&cwd, env)?);
                     }
                     if let Some(name) = args.string("name") {
                         rest.push("--name".to_owned());
@@ -275,14 +290,14 @@ pub fn argv(
                     // `--` last, because everything after it is the command's own argv
                     if let Some(command) = command {
                         rest.push("--".to_owned());
-                        rest.extend(split_command(&command));
+                        rest.extend(shell_command(command, env.shell.clone()));
                     }
                 },
                 "tab" => {
                     rest.push("new-tab".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push("--cwd".to_owned());
-                        rest.push(cwd);
+                        rest.push(resolve_cwd(&cwd, env)?);
                     }
                     if let Some(name) = args.string("name") {
                         rest.push("--name".to_owned());
@@ -300,7 +315,7 @@ pub fn argv(
                     }
                     if let Some(command) = command {
                         rest.push("--".to_owned());
-                        rest.extend(split_command(&command));
+                        rest.extend(shell_command(command, env.shell.clone()));
                     }
                 },
                 other => {
@@ -429,15 +444,80 @@ pub fn argv(
     }
 }
 
-/// A command given as one string, split the way a shell would split a simple one.
+/// What the process around a call looks like, read once at the top of it.
 ///
-/// Whitespace only: it is passed as argv and never to a shell, so quoting, globs and pipes mean
-/// nothing here. Saying so in the tool's own description is cheaper than pretending otherwise.
-fn split_command(command: &str) -> Vec<String> {
-    command
-        .split_whitespace()
-        .map(|word| word.to_owned())
-        .collect()
+/// Every field answers a question about the caller rather than about the session, and none of them
+/// can be answered from the tool call alone. Holding them in one struct is what lets `argv_in`
+/// stay pure and a test be told what it is pretending to be.
+struct CallEnv {
+    /// `$SHELL`: the shell a `command` is handed to.
+    shell: Option<String>,
+    /// `$HOME`: what a leading `~` in a `cwd` means.
+    home: Option<String>,
+    /// Where a relative `cwd` starts from: this process's own directory.
+    base: PathBuf,
+    /// How a `$VAR` in a `cwd` is looked up.
+    var: Box<dyn Fn(&str) -> Option<String>>,
+}
+
+impl CallEnv {
+    /// The real one: this server's own environment and directory.
+    fn from_process() -> Self {
+        CallEnv {
+            shell: std::env::var("SHELL").ok(),
+            home: std::env::var("HOME").ok(),
+            base: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            var: Box::new(|name| std::env::var(name).ok()),
+        }
+    }
+}
+
+/// The shell a `command` is run through: the caller's own, or `/bin/sh` when it has none.
+///
+/// `$SHELL` is what the operator chose, so `-c` in it behaves the way their own scripts do. A
+/// variable set to nothing is not a shell, so an empty value counts as absent rather than as a
+/// command line that would fail to exec.
+fn shell_for_command(env_shell: Option<String>) -> String {
+    env_shell
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_owned())
+}
+
+/// A command given as one string, handed to a shell as one word.
+///
+/// The server execs the argv after `--` itself, with no shell in between, so a whitespace split
+/// made `&&`, a pipe, a quote and a `$VAR` into literal arguments of the first word - `cd x && y`
+/// reported `Command not found: cd`. `<shell> -c <command>` is what makes them mean what the
+/// caller wrote. Nothing here parses the command; the shell does, and it is not interactive, so no
+/// rc file or line editor rewrites it on the way.
+fn shell_command(command: String, env_shell: Option<String>) -> Vec<String> {
+    vec![shell_for_command(env_shell), "-c".to_owned(), command]
+}
+
+/// A `cwd` as the server will take it: expanded, absolute, and known to be a directory.
+///
+/// `--cwd` reaches the server as a path and nothing expands it there, so `~/x`, `$HOME/x` and a
+/// relative path were dropped without a word and the pane opened in the session's own directory
+/// instead. Expanding here, against this process's environment, is the only place that can mean
+/// what the caller meant. Refusing a path that is not a directory turns the rest of that silence
+/// into an answer: a wrong `cwd` is a failed call, not a pane in the wrong place.
+fn resolve_cwd(cwd: &str, env: &CallEnv) -> Result<String, String> {
+    let expanded = shellexpand::full_with_context(
+        cwd,
+        || env.home.clone(),
+        |name| Ok::<Option<String>, std::convert::Infallible>((env.var)(name)),
+    )
+    .map_err(|e| format!("`cwd` {} could not be expanded: {}", cwd, e))?;
+    let path = Path::new(expanded.as_ref());
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env.base.join(path)
+    };
+    if !resolved.is_dir() {
+        return Err(format!("`cwd` {} is not a directory.", resolved.display()));
+    }
+    Ok(resolved.to_string_lossy().into_owned())
 }
 
 /// The session an unqualified tool call is about: whatever this server was started inside.
@@ -463,14 +543,41 @@ mod tests {
         value.as_object().expect("an object").clone()
     }
 
+    /// A process for a test to pretend to be, so a built command line does not change with
+    /// whoever's shell and home directory the suite happens to run under.
+    fn call_env(
+        shell: Option<&str>,
+        home: Option<&str>,
+        base: &Path,
+        vars: &[(&str, &str)],
+    ) -> CallEnv {
+        let vars: BTreeMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        CallEnv {
+            shell: shell.map(str::to_owned),
+            home: home.map(str::to_owned),
+            base: base.to_path_buf(),
+            var: Box::new(move |name| vars.get(name).cloned()),
+        }
+    }
+
+    /// The env every call in this suite is built in unless it says otherwise.
+    fn a_shell_env() -> CallEnv {
+        call_env(Some("/bin/zsh"), Some("/home/tester"), Path::new("/"), &[])
+    }
+
+    fn built(tool: &str, value: Value, session: Option<&str>, env: &CallEnv) -> Vec<String> {
+        argv_in(tool, &args(value), session, env).expect("a call that builds")
+    }
+
     fn line(tool: &str, value: Value, session: Option<&str>) -> String {
-        argv(tool, &args(value), session)
-            .expect("a call that builds")
-            .join(" ")
+        built(tool, value, session, &a_shell_env()).join(" ")
     }
 
     fn refusal(tool: &str, value: Value) -> String {
-        argv(tool, &args(value), None).expect_err("a call that cannot be built")
+        argv_in(tool, &args(value), None, &a_shell_env()).expect_err("a call that cannot be built")
     }
 
     #[test]
@@ -617,8 +724,128 @@ mod tests {
                 json!({"command": "cargo test", "handle": "test-run"}),
                 Some("work")
             ),
-            "-s work action new-pane --handle test-run -- cargo test"
+            "-s work action new-pane --handle test-run -- /bin/zsh -c cargo test"
         );
+    }
+
+    #[test]
+    fn a_command_runs_in_the_callers_shell_and_in_sh_when_it_has_none() {
+        assert_eq!(shell_for_command(Some("/bin/zsh".to_owned())), "/bin/zsh");
+        assert_eq!(shell_for_command(None), "/bin/sh");
+        assert_eq!(shell_for_command(Some(String::new())), "/bin/sh");
+        assert_eq!(shell_for_command(Some("   ".to_owned())), "/bin/sh");
+        let no_shell = call_env(None, Some("/home/tester"), Path::new("/"), &[]);
+        assert_eq!(
+            built("zellij_create", json!({"command": "pwd"}), None, &no_shell).join(" "),
+            "action new-pane -- /bin/sh -c pwd"
+        );
+    }
+
+    #[test]
+    fn a_command_reaches_the_shell_as_one_word_whatever_is_in_it() {
+        // the whole point: `&&`, the quotes, the pipe and the `$HOME` are the shell's to read, and
+        // a split here would hand them to the first word as arguments
+        let command = "cd /tmp && echo \"hello world\" $HOME | cat";
+        let argv = built(
+            "zellij_create",
+            json!({ "command": command }),
+            None,
+            &a_shell_env(),
+        );
+        assert_eq!(
+            argv,
+            vec!["action", "new-pane", "--", "/bin/zsh", "-c", command]
+        );
+        // and the same for a tab, which builds its command line separately
+        let argv = built(
+            "zellij_create",
+            json!({"kind": "tab", "command": command}),
+            None,
+            &a_shell_env(),
+        );
+        assert_eq!(
+            argv,
+            vec!["action", "new-tab", "--", "/bin/zsh", "-c", command]
+        );
+    }
+
+    #[test]
+    fn a_cwd_is_expanded_the_way_a_shell_would_expand_it() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let inside = home.path().join("work");
+        std::fs::create_dir(&inside).expect("a directory to point at");
+        let home_path = home.path().to_string_lossy().into_owned();
+        let env = call_env(
+            Some("/bin/zsh"),
+            Some(&home_path),
+            Path::new("/"),
+            &[("HOME", &home_path)],
+        );
+        let expected = inside.to_string_lossy().into_owned();
+        for cwd in ["~/work", "$HOME/work", "${HOME}/work"] {
+            assert_eq!(
+                built("zellij_create", json!({ "cwd": cwd }), None, &env),
+                vec!["action", "new-pane", "--cwd", &expected]
+            );
+            assert_eq!(
+                built(
+                    "zellij_create",
+                    json!({"kind": "tab", "cwd": cwd}),
+                    None,
+                    &env
+                ),
+                vec!["action", "new-tab", "--cwd", &expected]
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_cwd_starts_from_the_directory_this_server_is_in() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let inside = base.path().join("work");
+        std::fs::create_dir(&inside).expect("a directory to point at");
+        let env = call_env(Some("/bin/zsh"), None, base.path(), &[]);
+        assert_eq!(
+            built("zellij_create", json!({"cwd": "work"}), None, &env),
+            vec![
+                "action",
+                "new-pane",
+                "--cwd",
+                &inside.to_string_lossy().into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cwd_that_is_not_a_directory_is_refused_rather_than_quietly_dropped() {
+        let home = tempfile::tempdir().expect("a temp dir");
+        let home_path = home.path().to_string_lossy().into_owned();
+        let env = call_env(
+            Some("/bin/zsh"),
+            Some(&home_path),
+            Path::new("/"),
+            &[("HOME", &home_path)],
+        );
+        let missing = home.path().join("nope");
+        for cwd in ["~/nope", "$HOME/nope"] {
+            let said = argv_in("zellij_create", &args(json!({ "cwd": cwd })), None, &env)
+                .expect_err("a cwd that is not there");
+            // the message names what it resolved to, not what was typed, because the two differ
+            assert!(
+                said.contains(&missing.to_string_lossy().into_owned()),
+                "{}",
+                said
+            );
+            assert!(said.contains("is not a directory"), "{}", said);
+        }
+        assert!(argv_in(
+            "zellij_create",
+            &args(json!({"kind": "tab", "cwd": "/nonexistent-dir"})),
+            None,
+            &env
+        )
+        .expect_err("a cwd that is not there")
+        .contains("/nonexistent-dir is not a directory"));
     }
 
     #[test]

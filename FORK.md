@@ -7251,6 +7251,49 @@ dependency, `libnghttp2-sys`, wants a macOS C toolchain), so the macOS module wa
 ungating it and its two macOS-only imports for one `cargo check` and then putting the gates back.
 The timings themselves came from a Mac, and are what the deadline is set against.
 
+### `zellij_create` hands its command to a shell, and refuses a `cwd` it cannot find
+
+```
+# before - MCP zellij_create {"cwd": "~/work", "command": "cd /tmp && echo \"a b\" $HOME | cat"}
+action new-pane --cwd ~/work -- cd /tmp && echo "a b" $HOME | cat   # 9 argv words, no shell
+  pane: Command not found: cd          # and the pane is in the session's directory, not ~/work
+  tool: success
+
+# after
+action new-pane --cwd /home/<user>/work -- /bin/zsh -c 'cd /tmp && echo "a b" $HOME | cat'
+  pane: a b /home/<user>
+```
+
+**The command string was argv, and reading it as one was the whole bug.** The tool split it on
+whitespace and the server execs what follows `--` itself, with nothing in between, so `&&`, a pipe,
+a quote and a `$VAR` all became literal arguments of the first word. `cd x && y` reported `Command
+not found: cd`; `echo "hello world"` printed the quotes. It is now handed to one shell as one word -
+`$SHELL -c <command>`, and `/bin/sh` when `$SHELL` is unset or empty - so operators, quoting, globs,
+`~` and `$VAR` mean what they mean in a shell. Nothing in the tool parses the command; the shell
+does, and it is **non-interactive**, so no rc file, alias or line-editor rewrite gets a say.
+
+**`cwd` promised more than it did.** `--cwd` reaches the server as a path and nothing expands it
+there, so `~/x`, `$HOME/x` and a relative path were dropped without a word and the pane opened in
+the session's directory - a wrong answer that looked like a right one. The tool now expands `~` and
+`$VAR`/`${VAR}` against the MCP server's own environment, resolves a relative path against the
+server's own directory, and passes an absolute path. One that is not a directory ends the call
+before the CLI runs:
+
+```
+`cwd` /home/<user>/nope is not a directory.
+```
+
+**Success still means the pane was made**, and nothing more. What the command did is read back from
+`zellij_wait_for` or `list-panes`, exactly as before.
+
+**The cost, and it is visible: the pane's title and its `terminal_command` now name the shell** -
+an unnamed pane reads `/path/to/zsh -c sleep 30` where it used to read `sleep`. A `name` says what a
+pane is for and is the right fix where that matters; the consumer repo never makes command panes, so
+nothing there reads either field.
+
+CLI-side only: `src/mcp/invoke.rs` and one dependency the tree already carried (`shellexpand`). No
+protobuf, no contract change, and `zellij action new-pane` itself is untouched.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
