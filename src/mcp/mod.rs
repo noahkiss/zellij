@@ -7,7 +7,7 @@
 //!
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
-//! * **Seven tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
+//! * **Eight tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
 //!   fails if it grows past eight or if a tool asks for more than eight parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
@@ -43,6 +43,16 @@ works too.
 Which session a call is about: the tool's own `session` argument, or the session this server was
 started inside. Nothing here starts or stops a session; that is the command line's job.
 
+Work in ONE pane. Before you create anything, call zellij_overview and look for a pane you already
+own - its handle is in that answer. Have one? Use zellij_write_input, not zellij_create. Did a
+command fail? Reuse that pane, or close it with zellij_close. Do not answer a failure by making
+another pane. A person is watching this terminal, and a session that grows a pane per command is
+one they cannot read.
+
+zellij_create puts your pane in your own tab: the tab you are in with `-zj` on the end, made the
+first time and reused after. It does not take the person's focus. That keeps your work in one
+place and out of the pane they are looking at.
+
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
 each one is - that is how you find the pane to talk to without being told its name.";
 
@@ -62,19 +72,55 @@ impl ZellijMcp {
 
     /// One tool call: build the command line, run it, and report what the CLI said.
     async fn call(&self, name: &str, arguments: Map<String, Value>) -> CallToolResult {
-        let argv = match invoke::argv(name, &arguments, self.ambient_session.as_deref()) {
-            Ok(argv) => argv,
+        let plan = match invoke::plan(name, &arguments, self.ambient_session.as_deref()).await {
+            Ok(plan) => plan,
             // a call that could not be turned into a command line never ran, and the caller is
             // told what was missing rather than being handed an empty result
             Err(message) => return failed(message, json!({"reason": "bad_arguments"})),
         };
-        let outcome = match invoke::run(&argv).await {
-            Ok(outcome) => outcome,
+        let (argv, outcome) = match self.run_plan(plan).await {
+            Ok(ran) => ran,
             Err(message) => return failed(message, json!({"reason": "not_run"})),
         };
+        self.report(&argv, outcome)
+    }
+
+    /// Run whatever the plan turned out to be, and say which command line answered.
+    ///
+    /// One create, always: whether the agent's tab is there was answered from the pane list before
+    /// the command line was built, so nothing here reads an exit code to decide what to run next.
+    /// The second command line a create can carry is the rename, which `--new-tab` cannot do
+    /// itself.
+    async fn run_plan(&self, plan: invoke::Call) -> Result<(Vec<String>, invoke::Outcome), String> {
+        let (argv, rename) = match plan {
+            invoke::Call::One(argv) => {
+                let outcome = invoke::run(&argv).await?;
+                return Ok((argv, outcome));
+            },
+            invoke::Call::MakingAgentTab { argv, rename } => (argv, rename),
+        };
+        let mut outcome = invoke::run(&argv).await?;
+        // `--new-tab` refuses `--name`, so the pane that arrived with the tab is named now. A
+        // rename that fails is a pane with the wrong title, not a create that did not happen: it
+        // is reported beside the create rather than instead of it, and a rename that could not be
+        // run at all says so rather than vanishing
+        if let (Some(rename), Some(pane)) = (rename, invoke::reported_pane_id(&outcome.stdout)) {
+            match invoke::run(&rename.argv(&pane)).await {
+                Ok(renamed) if renamed.is_error() => {
+                    also_said(&mut outcome.stderr, &renamed.stderr)
+                },
+                Ok(_) => {},
+                Err(message) => also_said(&mut outcome.stderr, &message),
+            }
+        }
+        Ok((argv, outcome))
+    }
+
+    /// What the CLI said, as the protocol carries it.
+    fn report(&self, argv: &[String], outcome: invoke::Outcome) -> CallToolResult {
         let mut structured = Map::new();
         structured.insert("exit_code".to_owned(), json!(outcome.code));
-        for (key, value) in invoke::call_context(&argv) {
+        for (key, value) in invoke::call_context(argv) {
             structured.insert(key, json!(value));
         }
         // the CLI's JSON answers are parsed back so that a client gets structure rather than a
@@ -163,6 +209,23 @@ fn failed(message: String, structured: Value) -> CallToolResult {
 fn with_structure(mut result: CallToolResult, structured: Map<String, Value>) -> CallToolResult {
     result.structured_content = Some(Value::Object(structured));
     result
+}
+
+/// Add what a follow-up command said to what the first one said, on a line of its own.
+///
+/// Two diagnostics run together read as one sentence that neither command wrote, and the caller
+/// gets them as a single `diagnostics` string with no way to split them again.
+fn also_said(said: &mut String, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let kept = said.trim_end().len();
+    said.truncate(kept);
+    if !said.is_empty() {
+        said.push('\n');
+    }
+    said.push_str(line);
 }
 
 /// What the CLI said, preferring its diagnostics: an error's explanation goes to stderr.

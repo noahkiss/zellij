@@ -315,7 +315,10 @@ const OUTPUTS: &[OutputSpec] = &[
         keys: "visible",
     },
     OutputSpec {
-        command: "ls",
+        // the canonical path, not the `ls` alias: every reader of this table - the dump, the JSON
+        // dump, the MCP tool descriptions - looks a command up by the path `collect` recorded, and
+        // a row keyed on an alias is a row nothing ever finds
+        command: "list-sessions",
         shape: "table",
         keys: "NAME STATUS CURRENT CLIENTS CREATED",
     },
@@ -939,6 +942,20 @@ mod tests {
             .find(|r| r.starts_with("command: zellij action list-tree"))
             .expect("list-tree is in the dump");
         assert_eq!(list_tree, EXPECTED_LIST_TREE_RECORD);
+    }
+
+    #[test]
+    fn every_output_row_names_a_command_the_tree_has() {
+        // a row keyed on an alias is a row nothing ever finds: every reader looks a command up by
+        // the canonical path `collect` recorded, so the `ls` this row used to carry never matched
+        // the `list-sessions` record it was written for, and the sessions table went unpromised
+        for output in OUTPUTS {
+            assert!(
+                surface_command(output.command).is_some(),
+                "the OUTPUTS row for `{}` names no command in the tree",
+                output.command
+            );
+        }
     }
 
     #[test]
