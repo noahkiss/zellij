@@ -4603,11 +4603,13 @@ gated per verb - an MCP client allows or denies each tool by name, which on a ma
 pane" and "close a tab" want different answers is the whole point. Hence a server, in the binary, so
 it is version-synced and there is nothing to install.
 
-**Seven tools, not eighty-seven.** `zellij_overview` (panes, agents, or the sessions on this
+**Eight tools, not eighty-seven.** `zellij_overview` (panes, agents, or the sessions on this
 machine), `zellij_read_pane`, `zellij_wait_for`, `zellij_write_input`, `zellij_create`,
-`zellij_arrange`, `zellij_snapshot`. Session lifecycle - `up`, `down`, `restart`, `enable` - is
-deliberately not among them: those start and stop the thing the server is talking to. A test fails
-if the surface grows past eight tools, or a tool past eight parameters.
+`zellij_arrange`, `zellij_close`, `zellij_snapshot`. `zellij_close` is the one that cannot be
+undone, kept apart from the moves so a client can allow one without the other. Session lifecycle -
+`up`, `down`, `restart`, `enable` - is deliberately not among them: those start and stop the thing
+the server is talking to. A test fails if the surface grows past eight tools, or a tool past eight
+parameters.
 
 **The descriptions are generated from the surface map.** A tool's `Returns:` line is built from the
 same `OUTPUTS` row `--dump-surface` prints, and each input-schema property that stands for a real
@@ -4621,8 +4623,9 @@ in-process. That path prints to stdout and exits on a miss; on a stdio server st
 stream and the process is the session, so one missed pane would corrupt the first and end the
 second. A child process also maps the fork's exit convention straight through - **0 a result, 1 an
 error, 2 a miss** - which is what lets `zellij_create` be honest: a pane that was not made reports
-the CLI's own refusal, and there is no id anywhere for it to invent. What cannot be undone
-(`close_pane`, `close_tab`) passes the confirmation the CLI would otherwise refuse to run without.
+the CLI's own refusal, and there is no id anywhere for it to invent. What cannot be undone lives in
+`zellij_close`, where `close_pane` passes the `--yes` the CLI would otherwise refuse to run without
+and `close_tab` has no confirmation to pass.
 
 Which session a call is about: the tool's own `session`, else `ZELLIJ_SESSION_NAME` in the server's
 environment.
@@ -4634,7 +4637,7 @@ because the runtime drops its pending tasks when stdin reaches EOF. `zellij_wait
 too: without `timeout_s` it gives up after 300 seconds rather than blocking for the life of the
 pane, which is the default its own schema has always advertised.
 
-**Every tool declares the shape of what it returns**, and it is the same shape for all seven: the
+**Every tool declares the shape of what it returns**, and it is the same shape for all eight: the
 CLI's exit code, what it printed - parsed when that was JSON - what it wrote to stderr, and on a
 failure whether it was a miss or an error. The per-operation part stays in the `Returns:` line,
 which is generated. A tool that multiplexes several operations says what each of them returns
@@ -7260,7 +7263,7 @@ action new-pane --cwd ~/work -- cd /tmp && echo "a b" $HOME | cat   # 9 argv wor
   tool: success
 
 # after
-action new-pane --cwd /home/<user>/work -- /bin/zsh -c 'cd /tmp && echo "a b" $HOME | cat'
+action new-pane --cwd=/home/<user>/work -- /bin/zsh -c 'cd /tmp && echo "a b" $HOME | cat'
   pane: a b /home/<user>
 ```
 
@@ -7293,6 +7296,111 @@ nothing there reads either field.
 
 CLI-side only: `src/mcp/invoke.rs` and one dependency the tree already carried (`shellexpand`). No
 protobuf, no contract change, and `zellij action new-pane` itself is untouched.
+
+### The MCP surface routes an agent to one tab, one pane, and honest exit codes
+
+```
+# before - zellij_create {"command": "cargo test"}
+action new-pane -- /bin/zsh -c cargo test     # beside whichever pane the PERSON is focused on,
+                                              # titled "/bin/zsh -c cargo test"
+# after
+action new-pane --in-tab=work-zj --no-focus --name='cargo test' -- /bin/zsh -c cargo test
+```
+
+**Placement was whatever the person happened to be looking at.** `zellij_create`'s `kind` had two
+values, `pane` and `tab`, and `pane` ran a bare `new-pane` - which lands beside the **focused**
+pane. So the same call landed somewhere different every time, and every time it shrank the pane the
+person was reading. `tab` was the other half of the complaint: a tab per command.
+
+`kind` is now `agent_tab | pane | tab`, defaulting to **`agent_tab`**. That is the agent's own tab,
+named after the tab the MCP server's own pane is in with **`-zj`** on the end - `work` gives
+`work-zj` - made the first time and reused after. A name that already ends in `-zj` is reused as it
+stands, so an agent working inside one does not nest a second; a server started outside any pane has
+no tab to be named after and gets `zj`. The name tells a person whose tab it is and that closing it
+costs them nothing.
+
+**It never takes the focus.** `--in-tab` places a pane without going there, and `--new-tab`
+would switch the client to what it made, so the create passes `--no-focus` on both. Proved with a
+client attached: the active tab and the focused pane are the same before and after, both when the
+agent's tab is made and when it is reused.
+
+`kind: pane` now passes `--near-current-pane`: beside the **agent's own** pane, not the person's.
+`kind: tab` is unchanged.
+
+Two consequences of `--new-tab` worth naming, both from clap: it refuses `--name`, so a pane that
+arrives with its tab is named in a follow-up `rename-pane` keyed on the `pane_id:` the create
+printed; and it refuses `--floating`, so `floating` with `agent_tab` is refused outright rather than
+working or failing depending on whether the tab happened to exist.
+
+**One create, and the tab is looked up rather than guessed at.** The call that finds the tab the
+agent is in - `action list-panes --json` - already lists every pane with the name of the tab it is
+in, so whether the agent's own tab exists is a second read of a payload the create was already
+fetching. The create then runs once, `--in-tab=` or `--new-tab=` decided before anything ran. The
+alternative was written first and does not work: asking with `--in-tab` and reading the refusal as
+the signal to make the tab cannot tell the two exit **2**s apart, because the CLI exits 2 for a tab
+nothing answers to *and* for a command line clap will not parse. `zellij_create {"name":
+"--force"}` was the second, and it made a **duplicate** `work-zj` tab beside the first - nothing in
+the server dedupes tab names.
+
+**Every value-taking flag is passed as `--flag=value`.** `--name --force` is a usage error;
+`--name=--force` is a name. The tool builds `--name=`, `--handle=`, `--cwd=`, `--in-tab=`,
+`--new-tab=` and `--pane-id=` that way, so a value beginning with a dash - a caller's own `name`,
+or the command a pane is named after - reaches the CLI as a value.
+
+**Two agents can still both make the tab.** Their panes have to share a tab, so they resolve the
+same `-zj` name, and one agent's own calls are serialized. Both then see no tab and both create
+one; the server has no duplicate-name check. Two tabs of one name is the cost, and it is visible in
+the tab bar.
+
+**An unnamed command pane is titled with its command.** The shell wrap above is why it needed
+saying: the pane's title was `/path/to/zsh -c cargo test`. Without a `name`, the command is now the
+name, whitespace collapsed and cut to 48 characters with an ellipsis.
+
+**`close_pane` and `close_tab` moved to their own tool.** Per-verb gating is the reason this
+server exists at all - this file's own words, "an MCP client allows or denies each tool by name" -
+and one `zellij_arrange` bundling four reversible moves with two irreversible closes meant a client
+that wanted to allow a pane to be moved had to allow a tab to be closed. `zellij_arrange` keeps
+`move_pane`, `move_tab`, `stack_panes`, `break_pane` and is no longer flagged destructive; the new
+`zellij_close` takes the two closes and is. That spends the eighth and last tool slot, and the cap
+test now pins the surface shut.
+
+**`close_tab` never worked.** It built `action close-tab-by-id --tab-id <n> --yes`, and that
+command takes a positional `<ID>` and has no `--yes` - a clap error on every call since the tool
+was written. Nothing caught it because the builder is pure and no test ran the CLI. `zellij_close`'s
+`tab` now names the real argument, so the build-time check guards it like every other.
+
+**A parameter may say what it is in the caller's terms.** Clap's help was inherited unconditionally,
+and it is written for a command line: the rendered schema told an agent to put a command "after a
+`--`", to pass keys "one per argument", to pass `-` to read text from stdin - which this server
+nulls - and that a pane defaults to "the focused pane", which does not exist here. A non-empty
+`describe` now wins, and `from` goes on guarding the flag's name, so drift protection is kept.
+
+**Three smaller honesty fixes.** `zellij_wait_for`'s notes now say the thing that matters most on
+this surface: its own `exit_code` answers whether the *wait* worked, and a command that failed still
+returns 0 - the command's status is `exit_status` inside the result. `zellij_read_pane` says that a
+held pane's `[ EXIT CODE: n ]` banner is frame chrome and is not in the grid it returns.
+`zellij_overview`'s `Returns:` line promised the `list-panes` columns for all three scopes while
+two of them run `list-agents` and `list-sessions`; it now names all three, and a `Returns:` line
+that would repeat itself says the shared sentence once for the commands that share it. Naming
+`list-sessions` found a second bug under it: the surface map's row for the sessions table was keyed
+on the **alias** `ls`, while every reader looks a command up by the canonical path, so the row had
+never matched anything - `--dump-surface` printed no `prints:` line for `list-sessions`, and the
+tool description said scope=sessions returns nothing. The row is rekeyed, and a test now requires
+every `OUTPUTS` row to name a command the tree has.
+
+Two more description fixes in the same pass. `zellij_close` said both its verbs are confirmed for a
+person and that the tool passes the confirmation; only `close_pane` has a `--yes`. `close_tab` has
+no confirmation at all and takes every pane in the tab with it, which is what the tip now says.
+And `zellij_create` claimed a session with no client attached cannot lay out a new tab - creating
+is not focus-dependent, and a detached session makes a real tab.
+
+`zellij_snapshot`'s `session` is renamed **`of_session`**: everywhere else on this surface `session`
+means the session to talk to, and here it meant which snapshots to look at and what name to restore
+under.
+
+CLI-side only: `src/mcp/`, and one row of `zellij-utils/src/cli_surface.rs`. No protobuf, no
+contract change, and no CLI flag added - every flag this uses (`--in-tab`, `--new-tab`,
+`--no-focus`, `--near-current-pane`) already shipped.
 
 ## Assessed and deliberately not built
 

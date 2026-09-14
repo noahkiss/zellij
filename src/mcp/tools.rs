@@ -1,4 +1,4 @@
-//! The seven tools, and the half of each one that is generated rather than written.
+//! The eight tools, and the half of each one that is generated rather than written.
 //!
 //! A tool's description is routing logic: it decides whether the tool is called at all, so the
 //! part that says what the tool is FOR is written by hand and kept blunt. The part that says what
@@ -7,7 +7,7 @@
 //! real CLI flag. A flag renamed in `cli.rs` therefore cannot leave a stale description behind:
 //! `every_parameter_names_a_real_argument` fails the build instead.
 //!
-//! Seven, not one per verb. `zellij action` has eighty-seven of those, and a surface nobody can
+//! Eight, not one per verb. `zellij action` has eighty-seven of those, and a surface nobody can
 //! route through is worse than a small one that names its own follow-ups.
 
 use std::borrow::Cow;
@@ -16,6 +16,8 @@ use std::sync::Arc;
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use serde_json::{json, Map, Value};
 use zellij_utils::cli_surface;
+
+use super::invoke;
 
 /// What a tool parameter is, in JSON Schema terms.
 pub enum ParamKind {
@@ -33,10 +35,15 @@ pub struct ParamSpec {
     pub kind: ParamKind,
     pub required: bool,
     /// The CLI command and argument this property stands for, as `--dump-surface` names them.
-    /// When it is set, the property's description is clap's own help for that argument, so the two
-    /// cannot drift. `None` for a property the tool invents, which then uses `describe`.
+    /// A renamed flag then fails the build rather than leaving a stale property behind. `None` for
+    /// a property the tool invents.
     pub from: Option<(&'static str, &'static str)>,
-    /// The description for a property the CLI has no argument for. Ignored when `from` is set.
+    /// What this property is, in the caller's terms.
+    ///
+    /// Clap's help is the fallback rather than the rule: it is written for a command line, and a
+    /// line that says "after a `--`", "one per argument", "pass `-` for stdin" or "without this,
+    /// the focused pane" describes an argv this caller never writes. So a non-empty `describe`
+    /// wins over the inherited help, and `from` goes on standing guard over the flag's name.
     pub describe: &'static str,
     pub default: Option<&'static str>,
 }
@@ -96,12 +103,16 @@ pub const TOOLS: &[ToolSpec] = &[
             "zellij_read_pane to read one pane's screen, or zellij_wait_for to block until \
              something happens in it",
         ),
-        reports: &["action list-panes"],
-        tips: "scope=agents narrows the same walk to the panes running claude, opencode, codex or \
-               pi, each with the harness's own session id where it exports one. scope=sessions \
-               answers about the machine rather than about one session. A `withheld` count above \
-               zero means the session keeps some panes to itself: they are not in this answer, no \
-               tool here will reach them, and there is nothing to ask for.",
+        // one row per scope: `panes` walks list-panes, `agents` walks list-agents and `sessions`
+        // asks the machine with `ls`. One entry promised the pane columns for all three
+        reports: &["action list-panes", "action list-agents", "list-sessions"],
+        tips: "Call this before zellij_create: a pane you already own is cheaper than a new one, \
+               and its handle is in this answer. scope=agents narrows the same walk to the panes \
+               running claude, opencode, codex or pi, each with the harness's own session id where \
+               it exports one. scope=sessions answers about the machine rather than about one \
+               session. A `withheld` count above zero means the session keeps some panes to \
+               itself: they are not in this answer, no tool here will reach them, and there is \
+               nothing to ask for.",
         params: &[
             SESSION,
             ParamSpec {
@@ -135,7 +146,9 @@ pub const TOOLS: &[ToolSpec] = &[
                   name: there is no default pane here.",
         follow_up: Some("zellij_wait_for when the output you want is not there yet"),
         reports: &["action dump-screen"],
-        tips: "",
+        tips: "This is the grid, not the frame. A pane held open after its command exited shows \
+               `[ EXIT CODE: n ]` in its border, and that line is NOT in this answer. Use \
+               zellij_wait_for with until=exit for a command's status.",
         params: &[
             SESSION,
             ParamSpec {
@@ -143,7 +156,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: true,
                 from: Some(("action dump-screen", "--pane-id")),
-                describe: "",
+                describe: "The pane to read: its handle, like sunny-otter, or terminal_1, \
+                           plugin_2, a bare integer or a pane uuid. zellij_overview prints every \
+                           one of them.",
                 default: None,
             },
             ParamSpec {
@@ -177,10 +192,15 @@ pub const TOOLS: &[ToolSpec] = &[
                   blocks, so it is not free.",
         follow_up: Some("zellij_read_pane to read what the pane says once the wait returns"),
         reports: &["action wait"],
-        tips: "A wait that times out is a miss, not an error, and says so. until=match needs a \
-               pattern; until=quiet takes the window in quiet_ms. Every wait is bounded: without \
-               timeout_s it gives up after 300 seconds rather than blocking for the life of the \
-               pane.",
+        tips:
+            "The exit_code of THIS call says whether the wait succeeded, not whether the command \
+               did. A command that failed still returns exit_code 0 here: read `exit_status` in \
+               the result. A wait that times out is a miss, not an error, and says so. until=match \
+               needs a pattern; until=quiet takes the window in quiet_ms. until=match sees lines \
+               that arrive AFTER the wait began, so anchor on a short string rather than on a line \
+               that may wrap. until=exit on a plain shell pane waits for the shell, which is a \
+               timeout. Every wait is bounded: without timeout_s it gives up after 300 seconds \
+               rather than blocking for the life of the pane.",
         params: &[
             SESSION,
             ParamSpec {
@@ -204,7 +224,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action wait", "--match")),
-                describe: "",
+                describe: "The regex a delivered line must match, when until=match. Rust regex \
+                           syntax, unanchored.",
                 default: None,
             },
             ParamSpec {
@@ -212,7 +233,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Int,
                 required: false,
                 from: Some(("action wait", "--quiet-ms")),
-                describe: "",
+                describe: "How long a pane must produce nothing to count as quiet, when \
+                           until=quiet.",
                 default: Some("500"),
             },
             ParamSpec {
@@ -239,9 +261,13 @@ pub const TOOLS: &[ToolSpec] = &[
         not_for: "starting something in a NEW pane, and not for a pane you have not named. There \
                   is no focused pane here: an unnamed target would be a pane you have never seen.",
         follow_up: Some("zellij_wait_for or zellij_read_pane to see what the pane did with it"),
-        reports: &["action send-keys"],
+        // `keys` presses keys and `text` writes characters, which are two verbs, not one with a
+        // flag: a tool that multiplexes says what each of its commands returns
+        reports: &["action send-keys", "action write-chars"],
         tips: "keys goes through the key parser, so `Enter`, `C-c` and `Escape` mean those keys; \
-               text is written literally and presses nothing. Pass one or the other.",
+               text is written literally and presses nothing. Pass one or the other. This is the \
+               cheap way to do more work in a pane you already made: reach for it before \
+               zellij_create.",
         params: &[
             SESSION,
             ParamSpec {
@@ -249,7 +275,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: true,
                 from: Some(("action send-keys", "--pane-id")),
-                describe: "",
+                describe: "The pane to type into: its handle, like sunny-otter, or terminal_1, \
+                           plugin_2, a bare integer or a pane uuid. Required - there is no focused \
+                           pane here.",
                 default: None,
             },
             ParamSpec {
@@ -257,7 +285,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action send-keys", "keys")),
-                describe: "",
+                describe: "The keys to press, space separated, each a modifier chain: `Enter`, \
+                           `C-c`, `Ctrl a`, `F1`.",
                 default: None,
             },
             ParamSpec {
@@ -265,7 +294,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action write-chars", "chars")),
-                describe: "",
+                describe:
+                    "The text to write literally. It presses nothing: add a second call with \
+                           keys `Enter` to submit it.",
                 default: None,
             },
         ],
@@ -275,31 +306,45 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_create",
-        summary: "Make a pane or a tab, optionally running a command in it.",
-        best_for: "starting work somewhere new, when you need the handle of what you made in \
-                   order to talk to it afterwards.",
-        not_for: "running something in a pane that already exists - write to it instead.",
+        summary: "Make a pane to work in, optionally running a command in it.",
+        best_for: "starting work when you have no pane of your own yet. One pane per job is the \
+                   norm; after that, write to the one you have.",
+        not_for:
+            "running something in a pane that already exists - write to it instead. Not for a \
+                  second pane when your first one is idle, and not for replacing a pane whose \
+                  command failed: reuse it, or close it.",
         follow_up: Some("zellij_write_input or zellij_wait_for, using the handle this returns"),
-        reports: &["action new-pane"],
-        tips: "The handle in the answer is the pane's address and survives a session restore; use \
-               it, not the integer id. A session with no client attached cannot lay out a new tab, \
-               and this reports that miss rather than returning a pane that does not exist.",
+        // `kind: tab` runs `new-tab`, which prints the same three keys today and need not keep
+        // doing so. A tool that multiplexes says what each of its commands returns
+        reports: &["action new-pane", "action new-tab"],
+        tips:
+            "Success here means the pane was MADE, not that the command worked: exit_code 0 says \
+               nothing about what ran in it. Follow with zellij_wait_for until=exit and read \
+               `exit_status`. The handle in the answer is the pane's address and survives a \
+               session restore; use it, not the integer id, and pass `handle` yourself when you \
+               want to find the pane again by a name you chose.",
         params: &[
             SESSION,
             ParamSpec {
                 name: "kind",
-                kind: ParamKind::Enum(&["pane", "tab"]),
+                kind: ParamKind::Enum(&["agent_tab", "pane", "tab"]),
                 required: false,
                 from: None,
-                describe: "Whether to make a pane in the current tab, or a whole new tab.",
-                default: Some("pane"),
+                describe: "Where the pane goes. agent_tab, the default, is your own tab - the tab \
+                           you are in with `-zj` on the end, made once, reused after, and it does \
+                           not take the person's focus. It is named after the tab this server's \
+                           own pane is in, even when `session` names a different session. Use it \
+                           unless you have a reason not to. pane splits your own pane where you \
+                           are. tab makes a fresh tab of its own.",
+                default: Some(invoke::CREATE_KIND_DEFAULT),
             },
             ParamSpec {
                 name: "command",
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action new-pane", "command")),
-                describe: "",
+                describe: "The command to run in the pane, through your shell: quotes, pipes, \
+                           `&&`, `~` and `$VAR` all work. Without one the pane runs your shell.",
                 default: None,
             },
             ParamSpec {
@@ -307,7 +352,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action new-pane", "--cwd")),
-                describe: "",
+                describe: "The directory the pane starts in. `~`, `$VAR` and a relative path are \
+                           expanded against this server's own environment; a path that is not a \
+                           directory fails the call rather than being ignored.",
                 default: None,
             },
             ParamSpec {
@@ -315,7 +362,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action new-pane", "--name")),
-                describe: "",
+                describe:
+                    "What to call the pane, drawn on its frame. Without one a pane running a \
+                           command is named after the command.",
                 default: None,
             },
             ParamSpec {
@@ -341,37 +390,28 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_arrange",
-        summary: "Move, stack, break out or close a pane or a tab, always by explicit target.",
-        best_for: "reshaping a session you already have an overview of.",
-        not_for: "anything you cannot name a target for. Every operation here takes one, \
-                  including from inside the session.",
+        summary: "Move, stack or break out a pane or a tab, always by explicit target.",
+        best_for: "reshaping a session you already have an overview of. Nothing here loses \
+                   anything: every operation can be moved back.",
+        not_for: "closing anything - that is zellij_close. Not for anything you cannot name a \
+                  target for, either: every operation here takes one.",
         follow_up: Some("zellij_overview to see the shape the session ended up in"),
         reports: &[
             "action move-pane",
             "action move-tab",
             "action stack-panes",
             "action break-pane",
-            "action close-pane",
-            "action close-tab",
         ],
-        tips: "close_pane and close_tab cannot be undone and are confirmed for a person; this \
-               tool passes the confirmation for you, so treat them as final.",
+        tips: "",
         params: &[
             SESSION,
             ParamSpec {
                 name: "operation",
-                kind: ParamKind::Enum(&[
-                    "move_pane",
-                    "move_tab",
-                    "stack_panes",
-                    "break_pane",
-                    "close_pane",
-                    "close_tab",
-                ]),
+                kind: ParamKind::Enum(&["move_pane", "move_tab", "stack_panes", "break_pane"]),
                 required: true,
                 from: None,
-                describe: "What to do. move_pane and break_pane take pane; move_tab and close_tab \
-                           take tab; stack_panes takes panes; close_pane takes pane.",
+                describe: "What to do. move_pane and break_pane take pane; move_tab takes tab; \
+                           stack_panes takes panes.",
                 default: None,
             },
             ParamSpec {
@@ -379,7 +419,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action move-pane", "--pane-id")),
-                describe: "",
+                describe: "The pane to move or break out: its handle, like sunny-otter, or \
+                           terminal_1, plugin_2, a bare integer or a pane uuid.",
                 default: None,
             },
             ParamSpec {
@@ -387,7 +428,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action stack-panes", "pane_ids")),
-                describe: "",
+                describe: "The panes to stack, space separated: handles, terminal_1, plugin_2, \
+                           bare integers or pane uuids.",
                 default: None,
             },
             ParamSpec {
@@ -395,7 +437,8 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Int,
                 required: false,
                 from: Some(("action move-tab", "--tab-id")),
-                describe: "",
+                describe: "The tab to move, by the stable id zellij_overview prints - not its \
+                           1-based display position.",
                 default: None,
             },
             ParamSpec {
@@ -412,6 +455,54 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action move-tab", "--to-index")),
                 describe: "",
+                default: None,
+            },
+        ],
+        read_only: false,
+        // every operation here is reversible; the two that are not moved out to `zellij_close`, so
+        // that a client can allow a pane to be moved without allowing a tab to be closed
+        destructive: false,
+        idempotent: false,
+    },
+    ToolSpec {
+        name: "zellij_close",
+        summary: "Close a pane or a tab. This cannot be undone.",
+        best_for: "clearing away a pane you are done with, or one whose command failed - close it \
+                   rather than leaving it and making another.",
+        not_for: "moving or restacking anything, which is zellij_arrange, and not for a pane \
+                  somebody else made. Closing a tab closes every pane in it.",
+        follow_up: Some("zellij_overview to see what the session has left"),
+        reports: &["action close-pane", "action close-tab-by-id"],
+        tips: "close_pane passes the `--yes` a person at a terminal would have to type. close_tab \
+               has no confirmation to pass and takes every pane in the tab with it. Both are \
+               final. Closing a pane whose command failed is the right move - do not leave it \
+               behind and create a second one.",
+        params: &[
+            SESSION,
+            ParamSpec {
+                name: "operation",
+                kind: ParamKind::Enum(&["close_pane", "close_tab"]),
+                required: true,
+                from: None,
+                describe: "What to close. close_pane takes pane; close_tab takes tab.",
+                default: None,
+            },
+            ParamSpec {
+                name: "pane",
+                kind: ParamKind::Str,
+                required: false,
+                from: Some(("action close-pane", "--pane-id")),
+                describe: "The pane to close: its handle, like sunny-otter, or terminal_1, \
+                           plugin_2, a bare integer or a pane uuid.",
+                default: None,
+            },
+            ParamSpec {
+                name: "tab",
+                kind: ParamKind::Int,
+                required: false,
+                from: Some(("action close-tab-by-id", "id")),
+                describe: "The tab to close, by the stable id zellij_overview prints - not its \
+                           1-based display position.",
                 default: None,
             },
         ],
@@ -450,11 +541,13 @@ pub const TOOLS: &[ToolSpec] = &[
                 default: None,
             },
             ParamSpec {
-                name: "session",
+                name: "of_session",
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("snapshot list", "--session")),
-                describe: "",
+                describe: "Which session's snapshots: the name they were taken of, and the name a \
+                           restore brings back under. Unlike `session` on the other tools, it does \
+                           not choose which session to talk to.",
                 default: None,
             },
         ],
@@ -568,22 +661,38 @@ pub fn description(spec: &ToolSpec) -> String {
 
 /// What a tool puts out, across every operation it multiplexes.
 ///
-/// One command gets one sentence. Several get one sentence each, named by the command, because a
-/// tool whose `restore` rebuilds a session and whose `list` prints a table cannot honestly promise
-/// the table for both - and a client that was promised columns and handed a payload has been lied
-/// to by the description it routed on.
+/// One command gets one sentence. Several get one sentence per distinct answer, named by the
+/// commands that give it, because a tool whose `restore` rebuilds a session and whose `list` prints
+/// a table cannot honestly promise the table for both - and a client that was promised columns and
+/// handed a payload has been lied to by the description it routed on.
 pub fn returns_for(spec: &ToolSpec) -> String {
     match spec.reports {
         [] => "nothing.".to_owned(),
         [only] => returns_line(only),
         many => {
-            let mut out = String::from("it depends on the operation.");
+            // commands that answer the same way are said once, together. Four verbs that each
+            // print nothing used to spend four sentences saying so, in a line a client routes on
+            let mut said: Vec<(String, Vec<&str>)> = Vec::new();
             for command in many {
-                out.push_str(&format!(
-                    " `zellij {}` returns {}",
-                    command,
-                    returns_line(command)
-                ));
+                let line = returns_line(command);
+                match said.iter_mut().find(|(seen, _)| *seen == line) {
+                    Some((_, commands)) => commands.push(command),
+                    None => said.push((line, vec![command])),
+                }
+            }
+            let mut out = String::from("it depends on the operation.");
+            for (line, commands) in said {
+                let names = commands
+                    .iter()
+                    .map(|command| format!("`zellij {}`", command))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let verb = if commands.len() == 1 {
+                    "returns"
+                } else {
+                    "return"
+                };
+                out.push_str(&format!(" {} {} {}", names, verb, line));
             }
             out
         },
@@ -677,6 +786,9 @@ fn property(param: &ParamSpec) -> Value {
 /// A property's description: clap's own help for the flag it stands for, or the hand-written line
 /// for a property the CLI has no flag for.
 pub fn param_description(param: &ParamSpec) -> String {
+    if !param.describe.is_empty() {
+        return param.describe.to_owned();
+    }
     match param.from {
         Some((command, arg)) => cli_surface::surface_command(command)
             .and_then(|command| command.arg(arg).map(|arg| arg.about.clone()))
@@ -727,6 +839,18 @@ mod tests {
                 let expected = cli_surface::surface_command(command)
                     .and_then(|command| command.arg(arg).map(|arg| arg.about.clone()))
                     .expect("the argument exists");
+                assert!(
+                    !expected.is_empty(),
+                    "`{}` of `zellij {}` has no help for {} to borrow",
+                    arg,
+                    command,
+                    param.name,
+                );
+                if !param.describe.is_empty() {
+                    // a property that says what it is in the caller's terms keeps saying it; the
+                    // flag it names is still checked, above and in the test before this one
+                    continue;
+                }
                 assert_eq!(
                     param_description(param),
                     expected,
@@ -735,12 +859,36 @@ mod tests {
                     param.name,
                     arg,
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_property_written_for_the_caller_beats_the_help_written_for_a_command_line() {
+        // clap's help describes an argv: `--` positions, `-` for stdin, "the focused pane". None of
+        // those exist for a caller passing JSON, and every one of them was in the rendered schema
+        for (tool, param) in [
+            ("zellij_write_input", "keys"),
+            ("zellij_write_input", "text"),
+            ("zellij_read_pane", "pane"),
+            ("zellij_create", "command"),
+            ("zellij_arrange", "panes"),
+        ] {
+            let spec = tool_spec(tool).expect("a tool");
+            let param = spec
+                .params
+                .iter()
+                .find(|candidate| candidate.name == param)
+                .expect("a parameter");
+            let description = param_description(param);
+            assert_eq!(description, param.describe, "{} of {}", param.name, tool);
+            for argv_ism in ["`--`", "after a --", "stdin", "--focused", "see above"] {
                 assert!(
-                    !expected.is_empty(),
-                    "`{}` of `zellij {}` has no help for {} to borrow",
-                    arg,
-                    command,
+                    !description.contains(argv_ism),
+                    "{} of {} still says `{}`",
                     param.name,
+                    tool,
+                    argv_ism,
                 );
             }
         }
@@ -810,6 +958,35 @@ mod tests {
         // restore rebuilds a whole session, so the tool that offers it is destructive whatever its
         // other two operations do
         assert!(tool_spec("zellij_snapshot").expect("a tool").destructive);
+    }
+
+    #[test]
+    fn what_can_be_undone_is_gated_apart_from_what_cannot() {
+        // the reason this server exists is that a client gates verbs one by one. Six operations
+        // under one destructive name meant allowing `move_pane` allowed `close_tab` with it
+        let arrange = tool_spec("zellij_arrange").expect("a tool");
+        assert!(
+            !arrange.destructive,
+            "every arrange operation is reversible"
+        );
+        let close = tool_spec("zellij_close").expect("a tool");
+        assert!(close.destructive, "closing cannot be undone");
+        for spec in [arrange, close] {
+            for param in spec.params {
+                let ParamKind::Enum(operations) = param.kind else {
+                    continue;
+                };
+                for operation in operations {
+                    assert_eq!(
+                        operation.starts_with("close_"),
+                        spec.name == "zellij_close",
+                        "{} offers {}",
+                        spec.name,
+                        operation,
+                    );
+                }
+            }
+        }
     }
 
     #[test]
