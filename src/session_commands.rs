@@ -1143,7 +1143,15 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     // watchdog tick must not start exiting 2 for finding the session up.
     let named_snapshot = matches!(shape, UpShape::Snapshot(_));
     if healthy && !named_snapshot {
-        println!("ok    session '{}' already running", name);
+        // Silent when the init system's own job is the caller. The systemd watchdog runs this
+        // every `watchdog_interval_secs`, and on a healthy session this line was its only output:
+        // ~5,800 journal lines a day saying nothing. A user unit cannot filter it with
+        // `LogLevelMax=` - journald reads that setting for the SYSTEM manager's units only - so the
+        // line has to not be written. Everything that means something still is: the build warning
+        // below and every failure go to stderr, and a pass that CREATES the session prints `up`.
+        if !zellij_utils::session_lifecycle::running_as_the_unit(name) {
+            println!("ok    session '{}' already running", name);
+        }
         // "already running" is exactly the answer that hides a superseded build: an `up` after an
         // upgrade reports success and leaves the old server serving the session.
         warn_if_server_build_differs(name);

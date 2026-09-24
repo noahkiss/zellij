@@ -1542,6 +1542,16 @@ back from the layout, which is how a layout edit is applied.
 Only a session that exists and cannot be removed is a failure. The top-level `delete-session` and
 `kill-session` keep their previous exit codes.
 
+`up` run **by the init system's own job** on a session that is already healthy prints nothing. That
+pass is the watchdog tick, and its `ok ... already running` line was its only output: on Linux a
+journal line every `watchdog_interval_secs` (about 5,800 a day at 15 s), on macOS an append to the
+job's `.out.log` that nothing ever rotates. A user unit cannot filter it with `LogLevelMax=` —
+systemd honours that for the manager's own messages about the unit, but journald reads the
+per-unit level from `/run/systemd/units/`, which only the system manager writes, so the stream
+output of a `--user` unit passes through at any level. What still prints is everything that means
+something: the build-mismatch warning and every failure go to stderr, and a tick that creates the
+session prints `up`. `up` from a shell still says `ok`.
+
 None of these read `ZELLIJ_SOCKET_DIR`. The binary resolves its own socket directory, so there is no
 environment variable for a launcher to get wrong, and none for a long-lived shell to hold a stale
 copy of.
