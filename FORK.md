@@ -4,6 +4,10 @@ A personal fork of [zellij](https://github.com/zellij-org/zellij), rebased onto 
 **`v0.45.1`** tag (upstream workspace version **0.45.1**, commit `efd8fd5a8`), carrying a curated
 patch set aimed at the plugin development loop and a few session-lifecycle papercuts.
 
+Taken ahead of the next base, as `chore(upstream)` commits that drop out empty at the rebase:
+upstream `f19b2ce82` (embedded plugin assets are no longer copied onto the heap; the server's
+resident size falls by the size of the bundled plugins).
+
 **This fork is not accepting issues or pull requests, and none of these patches have been submitted
 upstream.** If you found it by accident, you want [the real thing](https://github.com/zellij-org/zellij).
 Upstream's README, documentation and license apply to everything except the patches below.
