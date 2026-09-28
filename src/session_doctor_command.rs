@@ -681,7 +681,9 @@ fn megabytes(bytes: u64) -> String {
 /// signed pin stale forever.
 #[cfg(unix)]
 fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
-    use zellij_utils::session_lifecycle::{install_pinned_exe, pin_needs_refresh, PinOutcome};
+    use zellij_utils::session_lifecycle::{
+        install_pinned_exe, pin_needs_refresh, this_build_is_a_release_candidate, PinOutcome,
+    };
 
     if refresh_is_deferred(pinned, mode) {
         // Not skipped: handed on. The macOS signing step copies the new build into its own temp,
@@ -704,7 +706,18 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
     if !mode.fix {
         // asked of the same function the fix asks, so a dry run reports the decision the fix would
         // make rather than a condition under which it might make one
-        if !pin_needs_refresh(&current_exe, pinned) {
+        if this_build_is_a_release_candidate() {
+            report.push(
+                Finding::ok(
+                    "pin",
+                    format!(
+                        "{} is left alone: this build is a release candidate",
+                        pinned.display()
+                    ),
+                )
+                .note("a release refreshes it; a candidate is proof and never an install target"),
+            );
+        } else if !pin_needs_refresh(&current_exe, pinned) {
             report.push(Finding::ok(
                 "pin",
                 format!("{} was made from this build", pinned.display()),
@@ -737,6 +750,19 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
                 format!("refreshed and signed the pinned copy at {}", path.display()),
             )
             .note("the running session keeps the old copy until it is restarted"),
+        ),
+        // not a fault and not a change: the pin is deliberately not this build's to take. Saying it
+        // as `Needs you` would tell an operator proving a candidate that something is waiting on
+        // them, and the exit code would say the machine is not clear when it is.
+        Ok(PinOutcome::Candidate(path)) => report.push(
+            Finding::ok(
+                "pin",
+                format!(
+                    "{} was left alone: this build is a release candidate",
+                    path.display()
+                ),
+            )
+            .note("a release refreshes it; a candidate is proof and never an install target"),
         ),
         // the pin was left as it was, and the writer has already said why on stderr. A `Needs you`
         // here would repeat it in a second voice; the signing check reports the state.

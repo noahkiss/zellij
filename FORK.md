@@ -7475,6 +7475,53 @@ check calls it what it is; the ordinary session whose pin predates its socket; a
 cannot be read. An overwrite **in place** needs no test — the kernel refuses it with `ETXTBSY`
 while the server is executing the file, which is why the pin's writer renames.
 
+### A release candidate never becomes the pin
+
+```
+$ zellij session up mysession        # from a candidate, with the rc formula linked
+warning: /Users/<user>/.local/share/zellij/bin/zellij was left alone: this build is a
+         release candidate (0.45.1-nkmk.23-rc.1), and the pin is the build a restart comes
+         back on.
+```
+
+AGENTS.md is unambiguous about what an RC tag is for: **proof, never an install target.** The pin
+did not know that. `install_pinned_exe` asks one question about the build in hand — is it different
+from the pin — and a candidate is certainly different, so proving one on a machine copied it onto
+the path the launcher runs and a restart comes back on. The next reboot then brought a session up on
+a build that was never released, and nothing said so; the RC formula is unlinked at the end of a
+proof, which takes the candidate off `PATH` and leaves it exactly where it does the most harm.
+
+**It is asked at the pin's one writer**, beside the rule that an anchored signature is never
+overwritten, and for the reason that rule is written there: a rule a caller can be written without
+is a rule that will be written without. Three callers reach it — `session up` and `session enable`,
+`session doctor --fix`, and `server_exe_for_interactive_launch` on every interactive launch — and
+none of them can ask for anything else, because there is no parameter to ask with.
+
+- The line is printed **once per pin per process**, like the signing refusal, because `session up`
+  asserts the pin and then launches a client that resolves the server binary through it again.
+- It is asked **after** the staleness checks, so a candidate whose build already is the pin still
+  reports `UpToDate` and says nothing. The line is for a write that was prevented.
+- It is asked **before** the signing guard, so a candidate never opens a keychain dialog for a
+  build that is not going to be installed whatever the answer.
+- **An interactive launch from a candidate serves the session from the candidate**, not from the
+  pin. Falling back to the pin would quietly start the *previous* build under an operator who is
+  holding a candidate and watching for its behaviour — a proof of the wrong thing.
+- **`session enable` refuses** when it would have created the pin and there is nothing there yet. It
+  is about to write a unit naming that path, and a launcher pointed at a file that does not exist
+  fails at boot, where nobody is watching.
+- Doctor reports it in `Already correct`, not `Needs you`: nothing is waiting on a person, and an
+  exit code saying otherwise would make a doctor nobody reads.
+
+`-rc.` is the whole test. `release.yml` patches the entire tag into `Cargo.toml` before it builds —
+that is what makes an RC binary report `0.45.1-nkmk.23-rc.1` rather than the version it is heading
+for — so the suffix is guaranteed rather than conventional, and it is the one thing that separates a
+candidate from the release it is a candidate for. Unit tested both ways, including the spellings
+(`-rcx`, `-rc-`) that must not be mistaken for one.
+
+This does not make the pin safe from every build. Any unreleased binary that creates a session takes
+the pin the same way — a developer's local build included, which is how this was reproduced. The
+guard covers the case the release process actually walks into.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

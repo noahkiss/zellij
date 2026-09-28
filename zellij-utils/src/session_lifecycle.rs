@@ -1679,6 +1679,11 @@ pub enum PinOutcome {
     /// signed copy is a working server that still holds its macOS grants, and starting it beats
     /// replacing it with a new build that holds none. The refusal has already been reported.
     Kept(PathBuf),
+    /// The pin would have been written, and was not, because THIS BUILD IS A RELEASE CANDIDATE.
+    /// The path is handed back for reporting only - see
+    /// [`release_candidate_must_not_be_pinned`], and the callers, which run the candidate itself
+    /// rather than a pin that may not even exist.
+    Candidate(PathBuf),
 }
 
 impl PinOutcome {
@@ -1688,7 +1693,8 @@ impl PinOutcome {
             | PinOutcome::Refreshed(path)
             | PinOutcome::UpToDate(path)
             | PinOutcome::Signed(path)
-            | PinOutcome::Kept(path) => path,
+            | PinOutcome::Kept(path)
+            | PinOutcome::Candidate(path) => path,
         }
     }
 }
@@ -1730,6 +1736,56 @@ where
         Err(reason) => PinRefresh::Kept(reason),
     }
 }
+
+/// Whether a version string names a release candidate.
+///
+/// The one thing that tells a candidate from the release it is a candidate FOR. `release.yml`
+/// patches the whole tag into `Cargo.toml` before it builds, so an RC binary's version is
+/// `0.45.1-nkmk.23-rc.1` where the release's is `0.45.1-nkmk.23` - and `-rc.` is the only part of
+/// that which is guaranteed rather than conventional.
+pub fn version_is_a_release_candidate(version: &str) -> bool {
+    version.contains("-rc.")
+}
+
+/// Whether the binary running now is a release candidate.
+pub fn this_build_is_a_release_candidate() -> bool {
+    version_is_a_release_candidate(crate::consts::VERSION)
+}
+
+/// A candidate never becomes the pin, and this is the only place that decides it.
+///
+/// The pin is not a cache of the build that happened to run last - it is the binary the launcher
+/// starts and a restart comes back on. AGENTS.md puts it plainly: RC tags are proof, never install
+/// targets. But the pin's writer only ever asked whether the build DIFFERS, so proving a candidate
+/// on a machine put the candidate on the path that machine restarts from, and the next reboot
+/// brought up a session on a build that was never released. It happened during an RC proof, with
+/// the rc formula linked, which is the one situation the whole rule exists for.
+///
+/// Said once per pin per process, for the reason the signing refusal is: `session up` asserts the
+/// pin and then launches a client, which resolves the server binary through the pin again, so one
+/// command reaches this twice and two lines would read as two faults.
+#[cfg(unix)]
+fn release_candidate_must_not_be_pinned(target: &Path) -> bool {
+    if !this_build_is_a_release_candidate() {
+        return false;
+    }
+    if let Ok(mut said) = CANDIDATE_REFUSALS.lock() {
+        if !said.iter().any(|pin| pin == target) {
+            said.push(target.to_path_buf());
+            eprintln!(
+                "warning: {} was left alone: this build is a release candidate ({}), and the pin \
+                 is the build a restart comes back on.",
+                target.display(),
+                crate::consts::VERSION
+            );
+        }
+    }
+    true
+}
+
+/// Pins this process has already left alone for being a candidate, so the line is said once.
+#[cfg(unix)]
+static CANDIDATE_REFUSALS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Pins this process has already refused to refresh, so the refusal is said once.
 #[cfg(unix)]
@@ -1843,6 +1899,15 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let refreshing = target.exists();
+    // The SECOND guard on the one writer, and it is asked first because it is the cheaper refusal:
+    // a candidate must not reach the pin at all, so it must not reach the signing transaction
+    // either - that would put a keychain dialog in front of a build that is not going to be
+    // installed whatever the answer. Asked here rather than at the top so that a candidate whose
+    // build already IS the pin still reports `UpToDate` and says nothing: the line is for a write
+    // that was prevented, not for every command an RC runs.
+    if release_candidate_must_not_be_pinned(target) {
+        return Ok(PinOutcome::Candidate(target.to_path_buf()));
+    }
     // THE guard, and it is here because here is the only place the pin is written. A pin that
     // holds an anchored signature holds macOS grants with it, and a plain copy over it destroys
     // both - so from this point the copy runs only once something has said there is nothing to
@@ -3600,6 +3665,26 @@ dev.zellij.session.mysession = {
             BuildMatch::Different,
             "so a restart is owed and doctor has to say so"
         );
+    }
+
+    /// The version an RC binary reports is the whole tag - `release.yml` patches it in before it
+    /// builds - so the candidate and the release it is a candidate for differ in exactly this.
+    #[test]
+    fn a_candidates_version_is_told_from_the_release_it_is_for() {
+        assert!(version_is_a_release_candidate("0.45.1-nkmk.22-rc.1"));
+        assert!(version_is_a_release_candidate("0.45.1-nkmk.22-rc.11"));
+        assert!(!version_is_a_release_candidate("0.45.1-nkmk.22"));
+        // the release must not be read as a candidate on a coincidence of spelling
+        assert!(!version_is_a_release_candidate("0.45.1-nkmk.22-rcx"));
+        assert!(!version_is_a_release_candidate("0.45.1-rc-nkmk.22"));
+    }
+
+    /// The build running these tests is a release version, so every pin test below is testing the
+    /// path the guard lets through. Asserted rather than assumed: if this ever became a candidate,
+    /// the pin tests would pass for the wrong reason.
+    #[test]
+    fn the_build_under_test_is_not_a_candidate() {
+        assert!(!this_build_is_a_release_candidate());
     }
 
     /// The other half of the rule, and the half that costs something to get wrong: the ordinary
