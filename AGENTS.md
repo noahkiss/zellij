@@ -81,6 +81,13 @@ patch ledger readable, because the rebase onto a newer upstream tag replays it c
    strips the suffix, and a Mac can no longer be running a candidate that calls itself the
    release. The bake is the only build that patches its own checkout — a final tag builds what
    main says. It refuses a tag that is not a candidate for the version the branch is bumped to.
+
+   **Open a pull request from the branch when the RC tag goes up, and do not tag the release
+   until its `End to End tests` run is green.** That workflow runs on a push to `main` and on a
+   pull request, and on nothing else: not on a branch push, not on an RC tag. Without the PR the
+   Docker e2e suite first runs *after* the final tag, on the `main` push, which is how v22 and
+   v23 were each tagged with one test surface unproven. The PR is never merged — land as below
+   and close it.
 3. **Land by squash-merge**, so one ledger entry is one commit. `FORK.md` is updated in that commit,
    not in a follow-up.
 4. **Tag the final release from main** — `v<version>`, no suffix — and push it by name:
