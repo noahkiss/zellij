@@ -514,10 +514,9 @@ pub enum Sessions {
 
     /// Serve this CLI to an agent over the Model Context Protocol, on stdin and stdout
     ///
-    /// Seven tools rather than one per verb: read a pane, wait on one, type into one, make and
-    /// rearrange panes and tabs, and ask which panes are running a coding agent. Each one runs
-    /// this same binary, so a tool behaves exactly as the command line does. Session lifecycle is
-    /// deliberately not among them.
+    /// A few tools shaped around jobs rather than one per verb, each running this same binary,
+    /// so a tool behaves exactly as the command line does. The client reads the list from the
+    /// server itself. Session lifecycle is deliberately not among them.
     ///
     /// Speaks the protocol on stdout, so nothing else may be printed there. Run it from an MCP
     /// client's server configuration, not from a terminal.
