@@ -311,6 +311,95 @@ fn team_id_from_keychain(commander: &dyn Commander, keychain: &str, name: &str) 
     team_id_from_subject(&subject.stdout)
 }
 
+/// The team id behind a rung, read off its certificate.
+///
+/// [`Rung::AppleDevelopment`] already carries its own by the time the walk has a rung in hand, and a
+/// Developer ID's is read here rather than when the ladder is built - for the same reason the other
+/// one is: the question costs two keychain commands, and only a rung that is actually being weighed
+/// should pay for them.
+fn team_of(commander: &dyn Commander, keychain: &str, rung: &Rung) -> Option<String> {
+    match rung {
+        Rung::AppleDevelopment { team, .. } => team.clone(),
+        Rung::DeveloperId(identity) => team_id_from_keychain(commander, keychain, &identity.name),
+        // its requirement is its own certificate's hash and names no team at all - and it is never
+        // the rung below an Apple one, see the `retain` in `sign_down_the_ladder`
+        Rung::SelfSigned(_) => None,
+    }
+}
+
+/// The team id a designated requirement anchors on, which is what macOS recorded the grant against.
+///
+/// The `leaf[subject.OU]` in the text, read off the requirement rather than off any certificate:
+/// this is the string TCC compares, so it is the one that says which team the grants belong to.
+/// Both the requirement [`requirement_for`] writes by hand and the one `codesign` derives for a
+/// Developer ID name the OU, which is what makes the two interchangeable when the team matches.
+///
+/// `None` for a requirement anchored on anything else - a CN, a certificate hash, a code hash. Each
+/// of those is a requirement that names no team, and guessing one for it is how a check ends up
+/// refusing a fall it has no evidence against.
+pub fn team_id_from_requirement(requirement: &str) -> Option<String> {
+    let after = requirement.split("leaf[subject.OU]").nth(1)?;
+    let (between, rest) = after.split_once('"')?;
+    // `leaf[subject.OU] = "TEAM"`, and nothing but the operator in between. A quote reached across
+    // some other expression would be some other certificate's field.
+    if between.trim() != "=" {
+        return None;
+    }
+    let (team, _) = rest.split_once('"')?;
+    (!team.is_empty()).then(|| team.to_owned())
+}
+
+/// What falling from one certificate to the next would do to the grants the machine already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallVerdict {
+    /// The two name one team, or nothing here proves they do not. The requirement macOS evaluates
+    /// is the one it recorded, and the grants ride through the fall.
+    KeepsTheTeam,
+    /// The certificate below belongs to another team, so the requirement it writes is one macOS
+    /// never recorded a grant against. Full Disk Access and the rest would go, without a word.
+    ChangesTheTeam { granted: String, candidate: String },
+}
+
+/// Whether the rung below may be signed with, given what the pin is anchored on now.
+///
+/// Pure, and taking three strings rather than a keychain, because this is the decision and the
+/// keychain is only where the strings come from. The machine that runs the suite has neither.
+///
+/// **The pin's own requirement answers this, and the certificates are only the second opinion.** A
+/// grant is keyed to the requirement text macOS read off the pin when the user granted it, so the
+/// team in that text is the team the grants belong to - not the team of whichever certificate the
+/// walk happens to be standing on. `above` is used only when the pin is anchored on a requirement
+/// that names no team, where the certificate the walk is falling FROM is the best description left
+/// of what the grants were made against.
+///
+/// Two cases deliberately keep their fall, and both would be worse guarded:
+///
+/// - **An unsigned or ad-hoc pin** (`anchored_on` is `None`) holds no grant a fall could lose - its
+///   requirement names its own code hash and the last build already voided everything recorded
+///   against it. Refusing here would leave the pin ad-hoc, which is the one state this whole file
+///   exists to remove.
+/// - **A candidate whose certificate could not be read** (`below` is `None`) signs with the
+///   CN-anchored requirement `codesign` derives, which is a change the ladder allows on purpose and
+///   already reports - see [`requirement_for`]. Refusing a fall on a team id nobody could read
+///   would block the commonest unreadable-keychain case on no evidence at all.
+pub fn judge_fall(
+    above: Option<&str>,
+    below: Option<&str>,
+    anchored_on: Option<&str>,
+) -> FallVerdict {
+    let (Some(anchored_on), Some(candidate)) = (anchored_on, below) else {
+        return FallVerdict::KeepsTheTeam;
+    };
+    let granted = team_id_from_requirement(anchored_on).or_else(|| above.map(str::to_owned));
+    match granted {
+        Some(granted) if granted != candidate => FallVerdict::ChangesTheTeam {
+            granted,
+            candidate: candidate.to_owned(),
+        },
+        _ => FallVerdict::KeepsTheTeam,
+    }
+}
+
 /// The first rung of the ladder this keychain can reach.
 ///
 /// Order is the whole design. A Developer ID signature is accepted anywhere and survives its own
@@ -1048,6 +1137,11 @@ pub fn sign_pin(
 /// certificate we mint is not either - its requirement is its own hash - so walking into it would
 /// void every grant on the machine.
 ///
+/// **"When both name the same team" is checked and not assumed.** A keychain can hold certificates
+/// from two teams, and the fall between them changes `leaf[subject.OU]` exactly as a demotion
+/// would. [`judge_fall`] weighs the two against the team the pin is anchored on now, and a fall
+/// that would change it is refused with the grants and the pin left as they are.
+///
 /// That matters because a refusal is not always the certificate's fault. `errSecInternalComponent`,
 /// a keychain locked over SSH, a "Deny" on the key-access dialog: each one is transient, and each
 /// one would otherwise demote the pin permanently. Permanently, because a self-signed signature IS
@@ -1076,6 +1170,8 @@ fn sign_down_the_ladder(
         ladder.retain(|rung| !matches!(rung, Rung::SelfSigned(_)));
     }
     let mut index = 0;
+    // the rung this one is a fall FROM, resolved, so the team check has both sides in hand
+    let mut fell_from: Option<Rung> = None;
 
     while index < ladder.len() {
         // the team id is read off the certificate HERE and not when the ladder was built: it costs
@@ -1087,6 +1183,45 @@ fn sign_down_the_ladder(
             },
             other => other,
         };
+        // The fall between the two Apple rungs keeps the grants only while both name one team, and
+        // until now nothing asked. A keychain holding certificates from two teams - one personal,
+        // one an employer's - would fall to a different `leaf[subject.OU]`, write a requirement
+        // macOS never recorded, and drop Full Disk Access as completely as a demotion to our own
+        // certificate would. Silently, and a `codesign --verify` on the result says nothing is
+        // wrong. So the same boundary that stops the walk at our own certificate stops it here.
+        if let Some(above) = &fell_from {
+            let verdict = judge_fall(
+                team_of(commander, &context.keychain, above).as_deref(),
+                team_of(commander, &context.keychain, &rung).as_deref(),
+                match before {
+                    PinSignature::Anchored { designated, .. } => Some(designated.as_str()),
+                    PinSignature::CodeHashed { .. } | PinSignature::Unsigned => None,
+                },
+            );
+            if let FallVerdict::ChangesTheTeam { granted, candidate } = verdict {
+                findings.push(
+                    Finding::needs_you(
+                        "signing",
+                        format!(
+                            "{} holds grants recorded against team {}, and the certificate below \
+                             belongs to team {}",
+                            pin.display(),
+                            granted,
+                            candidate
+                        ),
+                    )
+                    .note(format!(
+                        "{} is the next rung down and it is not this pin's team",
+                        rung.description()
+                    ))
+                    .note("a requirement naming another team is one macOS never recorded, so Full")
+                    .note("Disk Access and every other grant would stop applying without a word")
+                    .note("sign with a certificate of the granted team, or re-grant the")
+                    .note("permissions for the pin's path once another one is in place"),
+                );
+                break;
+            }
+        }
         if !matches!(rung, Rung::SelfSigned(_)) && !asked_to_unlock {
             // An Apple rung never runs `set-key-partition-list`, so before this it never handed
             // the password to `security` at all - and `ZELLIJ_KEYCHAIN_PASSWORD` did nothing on the
@@ -1136,6 +1271,7 @@ fn sign_down_the_ladder(
             return findings;
         }
         refusals.push(refusal);
+        fell_from = Some(rung);
         index += 1;
     }
 
@@ -2781,6 +2917,184 @@ Signature=adhoc
                 .flatten()
                 .all(|entry| entry.file_name() == "zellij"),
             "a temp file was left behind"
+        );
+    }
+
+    /// The team the pin in these fixtures is anchored on, and the team of the OTHER certificate a
+    /// two-team keychain holds. Both invented: a real team id in a fixture is a real team id in the
+    /// repository.
+    const GRANTED_TEAM: &str = "A1B2C3D4E5";
+    const OTHER_TEAM: &str = "Z9Y8X7W6V5";
+
+    /// The team a grant belongs to is the one in the requirement macOS recorded, so that is where
+    /// it is read from - not from whichever certificate the walk happens to be standing on.
+    #[test]
+    fn the_team_a_grant_belongs_to_is_read_off_the_requirement_it_was_recorded_against() {
+        // the requirement `codesign` derives for a Developer ID, with its two certificate fields
+        assert_eq!(
+            team_id_from_requirement(read_signature(DEVELOPER_ID).designated().unwrap()).as_deref(),
+            Some(GRANTED_TEAM)
+        );
+        // and the one `requirement_for` writes by hand for an Apple Development certificate
+        assert_eq!(
+            team_id_from_requirement(
+                &requirement_for(&apple_development_rung(OTHER_TEAM)).unwrap()
+            )
+            .as_deref(),
+            Some(OTHER_TEAM)
+        );
+        // a requirement anchored on anything but the OU names no team, and inventing one for it
+        // would refuse a fall on no evidence
+        assert_eq!(
+            team_id_from_requirement(read_signature(SELF_SIGNED).designated().unwrap()),
+            None
+        );
+        assert_eq!(
+            team_id_from_requirement(read_signature(AD_HOC).designated().unwrap()),
+            None
+        );
+        assert_eq!(
+            team_id_from_requirement(
+                "designated => identifier \"org.zellij.nkmk\" and anchor apple generic and \
+                 certificate leaf[subject.CN] = \"Apple Development: someone@example.com\""
+            ),
+            None
+        );
+    }
+
+    /// The decision itself, on three strings. The keychain is only where they come from, and the
+    /// machine that runs this suite has none.
+    #[test]
+    fn a_fall_that_would_change_the_team_is_the_one_the_ladder_must_not_take() {
+        let anchored = read_signature(DEVELOPER_ID);
+        let anchored_on = anchored.designated();
+
+        // the fall the walk was built for: one team, one requirement, every grant rides through
+        assert_eq!(
+            judge_fall(Some(GRANTED_TEAM), Some(GRANTED_TEAM), anchored_on),
+            FallVerdict::KeepsTheTeam
+        );
+        // and the fall nothing was checking: a different OU is a requirement macOS never recorded
+        assert_eq!(
+            judge_fall(Some(GRANTED_TEAM), Some(OTHER_TEAM), anchored_on),
+            FallVerdict::ChangesTheTeam {
+                granted: String::from(GRANTED_TEAM),
+                candidate: String::from(OTHER_TEAM),
+            }
+        );
+        // the pin's requirement outranks the certificate the walk fell from, because the grant was
+        // recorded against the first and not the second
+        assert_eq!(
+            judge_fall(Some(OTHER_TEAM), Some(GRANTED_TEAM), anchored_on),
+            FallVerdict::KeepsTheTeam
+        );
+        // with no team in the requirement, the certificate above it is what is left to go on
+        assert_eq!(
+            judge_fall(
+                Some(GRANTED_TEAM),
+                Some(OTHER_TEAM),
+                Some("designated => cdhash H\"ab\"")
+            ),
+            FallVerdict::ChangesTheTeam {
+                granted: String::from(GRANTED_TEAM),
+                candidate: String::from(OTHER_TEAM),
+            }
+        );
+
+        // An ad-hoc or unsigned pin holds no grant a fall could lose, and refusing one would leave
+        // it ad-hoc - the state this whole file exists to remove.
+        assert_eq!(
+            judge_fall(Some(GRANTED_TEAM), Some(OTHER_TEAM), None),
+            FallVerdict::KeepsTheTeam
+        );
+        // a certificate whose team could not be read signs with the requirement `codesign` derives,
+        // which the ladder allows on purpose and already reports
+        assert_eq!(
+            judge_fall(Some(GRANTED_TEAM), None, anchored_on),
+            FallVerdict::KeepsTheTeam
+        );
+        // and neither side known is not evidence of anything
+        assert_eq!(
+            judge_fall(None, None, anchored_on),
+            FallVerdict::KeepsTheTeam
+        );
+    }
+
+    /// A keychain holding certificates from two teams - a personal Apple ID and an employer's - is
+    /// the case the fall was never guarded against. Falling to the second writes a different
+    /// `leaf[subject.OU]`, and every grant recorded against the first stops applying, silently:
+    /// `codesign --verify` on the result says nothing is wrong. So the fall is refused, and the pin
+    /// and its grants are left exactly as they were.
+    #[test]
+    fn a_fall_to_another_teams_certificate_is_refused_rather_than_taken_silently() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            // the pin is anchored on the granted team, and healthy
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(DEVELOPER_ID),
+            ),
+            (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+            // the Developer ID at the head of the ladder will not sign - a locked keychain, a
+            // denied key-access dialog, any of the transient refusals the walk exists for
+            (
+                "codesign -s 0011223344556677889900AABBCCDDEEFF001122",
+                recorded_failure("errSecInternalComponent"),
+            ),
+            // and the certificate below it belongs to the other team
+            (
+                "security find-certificate -c Apple Development:",
+                recorded("-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----\n"),
+            ),
+            (
+                "openssl x509 -noout -subject",
+                recorded(&format!(
+                    "subject= /CN=Apple Development: someone (F6G7H8I9J0)/OU={}\n",
+                    OTHER_TEAM
+                )),
+            ),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build);
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode {
+                fix: true,
+                ..DoctorMode::default()
+            },
+            &context,
+        );
+
+        // nothing was signed with it, which is the whole of the fix
+        assert!(
+            !commander.called_with("codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334"),
+            "the other team's certificate signed the pin: {:?}",
+            commander.calls()
+        );
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            b"the OLD build".to_vec(),
+            "the pin was replaced by a copy the grants do not apply to"
+        );
+        // and the report names both teams, so the person can tell which is which
+        let refused = run
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.status == Status::NeedsYou && finding.message.contains("recorded against")
+            })
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            refused.message.contains(GRANTED_TEAM) && refused.message.contains(OTHER_TEAM),
+            "{:?}",
+            refused
         );
     }
 
