@@ -1009,7 +1009,14 @@ makes it the cheapest liveness signal in the tree — "is this pane still workin
 reading a cell of its content, and without spawning a process per pane to scrape one.
 
 The server already recorded the instant on every read from a pty, for the mobile view, and threw the
-wall-clock meaning away. Reporting it costs one clock read per manifest.
+wall-clock meaning away. It now takes the wall-clock millisecond at the same moment and stores it
+beside the instant, and every read reports that stored value verbatim.
+
+**The value is stable: two reads of an idle pane return the same number.** A consumer can compare
+two reads for equality and take a change to mean output. The first version derived the stamp at
+read time, as the wall clock now minus the monotonic time since the output, and truncated each to
+the millisecond on its own. So an idle pane's stamp moved by a millisecond between reads, and a
+consumer diffing the tree saw every idle pane as busy on every tick.
 
 Nothing pushes on output alone, so a consumer sees the value move on the once-a-second session tick
 rather than the moment bytes land. That is still an order of magnitude better than sweeping panes

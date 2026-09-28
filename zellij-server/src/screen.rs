@@ -1611,6 +1611,31 @@ fn format_guest_modal_shortcut(keys: &[KeyWithModifier]) -> Vec<String> {
     keys.iter().map(|key| key.to_string()).collect()
 }
 
+/// When a pane last wrote output, taken once at the moment the bytes arrive.
+///
+/// `at` answers "how long ago" inside this process. `epoch_ms` is the same moment on the wall
+/// clock, reported verbatim as `PaneInfo::last_output_at`. Deriving it at read time instead - the
+/// wall clock now, minus the monotonic time since `at`, each truncated to the millisecond on its
+/// own - moved an idle pane's stamp by a millisecond between reads, and a consumer comparing two
+/// reads took that for output.
+#[derive(Debug, Clone, Copy)]
+struct PaneOutputStamp {
+    at: Instant,
+    epoch_ms: Option<u64>,
+}
+
+impl PaneOutputStamp {
+    fn now() -> Self {
+        PaneOutputStamp {
+            at: Instant::now(),
+            epoch_ms: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|since_epoch| since_epoch.as_millis() as u64)
+                .ok(),
+        }
+    }
+}
+
 /// A [`Screen`] holds multiple [`Tab`]s, each one holding multiple [`panes`](crate::client::panes).
 /// It only directly controls which tab is active, delegating the rest to the individual `Tab`.
 pub(crate) struct Screen {
@@ -1754,7 +1779,7 @@ pub(crate) struct Screen {
     host_theme_light_styling: Option<Styling>,
     nested_session_handling: NestedSessionHandling,
     last_mobile_state_sent: HashMap<ClientId, MobileStatePayload>,
-    pane_output_activity: HashMap<PaneId, Instant>,
+    pane_output_activity: HashMap<PaneId, PaneOutputStamp>,
     /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
     /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
     pane_process_info: HashMap<u32, PaneProcessInfo>,
@@ -5786,6 +5811,12 @@ impl Screen {
             .context("failed to update tabs")?;
         Ok(tab_infos_for_screen_state.values().cloned().collect())
     }
+    /// Stamp a pane as having written output now. The wall-clock millisecond is taken here, once,
+    /// so every later read of `last_output_at` reports the same value.
+    fn record_pane_output(&mut self, pane_id: PaneId) {
+        self.pane_output_activity
+            .insert(pane_id, PaneOutputStamp::now());
+    }
     /// A tab's panes, with the fields only Screen can fill stamped onto them.
     ///
     /// `Tab` knows a pane's geometry and title; it does not know the pid, the cwd, the command or
@@ -5793,13 +5824,6 @@ impl Screen {
     /// none of them has to know that.
     fn pane_infos_for_tab(&self, tab: &Tab) -> Vec<PaneInfo> {
         let mut pane_infos = tab.pane_infos();
-        // output activity is held as an `Instant`, which says nothing to a consumer in another
-        // process - anchor it to the wall clock once per call rather than once per pane
-        let now = Instant::now();
-        let epoch_now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|since_epoch| since_epoch.as_millis() as u64)
-            .ok();
         for pane_info in pane_infos.iter_mut() {
             if pane_info.is_plugin {
                 continue;
@@ -5816,14 +5840,10 @@ impl Screen {
                     .map(|command| command.join(" "));
                 pane_info.pane_env = process_info.env.clone();
             }
-            pane_info.last_output_at = epoch_now_ms.and_then(|epoch_now_ms| {
-                self.pane_output_activity
-                    .get(&PaneId::Terminal(pane_info.id))
-                    .map(|last_output| {
-                        let ms_ago = now.saturating_duration_since(*last_output).as_millis() as u64;
-                        epoch_now_ms.saturating_sub(ms_ago)
-                    })
-            });
+            pane_info.last_output_at = self
+                .pane_output_activity
+                .get(&PaneId::Terminal(pane_info.id))
+                .and_then(|stamp| stamp.epoch_ms);
         }
         pane_infos
     }
@@ -6284,7 +6304,7 @@ impl Screen {
                 let last_activity_secs_ago = self
                     .pane_output_activity
                     .get(&pane_id)
-                    .map(|instant| now.saturating_duration_since(*instant).as_secs())
+                    .map(|stamp| now.saturating_duration_since(stamp.at).as_secs())
                     .or_else(|| activity.get(&pane_id).copied())
                     .unwrap_or_default();
                 panes.push(MobilePanePayload {
@@ -9561,9 +9581,7 @@ pub(crate) fn screen_thread_main(
                 screen.detect_agents = detect_agents;
             },
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
-                screen
-                    .pane_output_activity
-                    .insert(PaneId::Terminal(pid), Instant::now());
+                screen.record_pane_output(PaneId::Terminal(pid));
                 let all_tabs = screen.get_tabs_mut();
                 let mut vte_bytes = Some(vte_bytes);
                 let mut program_title_changed = false;

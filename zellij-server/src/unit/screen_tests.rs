@@ -16501,6 +16501,43 @@ pub fn a_silent_pane_reports_no_last_output_time() {
 }
 
 #[test]
+fn an_idle_panes_last_output_time_is_the_same_on_every_read() {
+    // consumers compare two reads of the pane list and take a changed `last_output_at` to mean
+    // the pane wrote something. The stamp was rebuilt on every read from the wall clock minus a
+    // monotonic delta, each truncated to the millisecond on its own, so an idle pane wobbled by
+    // a millisecond between reads and looked busy forever
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut screen = create_new_screen(size, true, true);
+    new_tab(&mut screen, 1, 0);
+    screen.record_pane_output(PaneId::Terminal(1));
+
+    let read_stamp = |screen: &Screen| {
+        let tab = screen.tabs.get(&0).expect("the session's own first tab");
+        screen
+            .pane_infos_for_tab(tab)
+            .into_iter()
+            .find(|pane| !pane.is_plugin && pane.id == 1)
+            .expect("terminal pane 1 is in the tab")
+            .last_output_at
+            .expect("a pane that wrote output reports when")
+    };
+    let first = read_stamp(&screen);
+    for read in 1..=40 {
+        // sub-millisecond gaps, so the two clocks' fractional parts drift apart between reads
+        std::thread::sleep(std::time::Duration::from_micros(370));
+        assert_eq!(
+            read_stamp(&screen),
+            first,
+            "read {} of an idle pane moved its last output time",
+            read
+        );
+    }
+}
+
+#[test]
 pub fn a_bell_is_recorded_on_the_pane_that_rang() {
     let size = Size { cols: 80, rows: 10 };
     let mut mock_screen = MockScreen::new(size);
