@@ -282,7 +282,7 @@ pub fn server_exe_for_interactive_launch(
     extras: Option<&SessionServiceOptions>,
     session: Option<&str>,
 ) -> Option<PathBuf> {
-    use crate::session_lifecycle::install_pinned_exe;
+    use crate::session_lifecycle::{install_pinned_exe, PinOutcome};
 
     let pinned = configured_pinned_exe(extras)?;
     #[cfg(any(target_os = "linux", target_os = "macos", all(unix, test)))]
@@ -298,6 +298,11 @@ pub fn server_exe_for_interactive_launch(
         return None;
     }
     match install_pinned_exe(&current_exe, &pinned) {
+        // a candidate proves itself and leaves the pin alone, so the server is this binary. Serving
+        // from the pin instead would start the PREVIOUS build under an operator who is holding a
+        // candidate and watching for its behaviour - a proof of the wrong thing, silently. The
+        // writer has already said the pin was not touched.
+        Ok(PinOutcome::Candidate(_)) => None,
         Ok(outcome) => Some(outcome.path().to_path_buf()),
         Err(reason) => {
             // the ordinary cause is a pin directory this user cannot write; a server executing the

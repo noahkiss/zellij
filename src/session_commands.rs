@@ -190,7 +190,19 @@ pub(crate) fn session_is_managed(name: &str, opts: &CliArgs) -> bool {
 fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
     let existed = pinned.exists();
     match pin_this_build_at(pinned) {
-        Ok(()) => Ok(()),
+        // a candidate does not become the pin, and with nothing already at the path the unit about
+        // to be written would name a binary that does not exist. Refused here rather than reported
+        // later, because a launcher pointed at nothing fails at boot, where nobody is watching.
+        Ok(PinHolds::Nothing) if !existed => {
+            eprintln!(
+                "session enable: nothing was pinned at {}, because this build is a release \
+                 candidate, and the unit would name a binary that is not there. Run it again from \
+                 a release.",
+                pinned.display()
+            );
+            Err(())
+        },
+        Ok(_) => Ok(()),
         Err(reason) if existed => {
             eprintln!("warning: {}", reason);
             eprintln!(
@@ -222,7 +234,7 @@ fn pin_before_writing_the_unit(pinned: &PathBuf) -> Result<(), ()> {
 /// --fix` or `session enable` typed in a shell, where `PATH` leads to the new build. See FORK.md,
 /// "Once the launcher runs the pin".
 #[cfg(unix)]
-fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
+fn pin_this_build_at(pinned: &PathBuf) -> Result<PinHolds, String> {
     use zellij_utils::session_lifecycle::{install_pinned_exe, PinOutcome};
 
     let current_exe =
@@ -241,14 +253,26 @@ fn pin_this_build_at(pinned: &PathBuf) -> Result<(), String> {
         // the pin was left alone because this run could not sign it, and the sink has already said
         // so in full. A second line here would read as a second fault.
         PinOutcome::Kept(_) => {},
+        // likewise for a release candidate, which the writer has already said it left the pin for
+        PinOutcome::Candidate(_) => return Ok(PinHolds::Nothing),
         PinOutcome::UpToDate(_) => {},
     }
-    Ok(())
+    Ok(PinHolds::ABuild)
+}
+
+/// Whether the pinned path holds a build after a pass over it, which is what a unit may name.
+///
+/// Only one outcome answers `Nothing`: the pin was not written because this build is a release
+/// candidate. Every other outcome either wrote a build or found one already there.
+#[derive(Debug, PartialEq, Eq)]
+enum PinHolds {
+    ABuild,
+    Nothing,
 }
 
 #[cfg(not(unix))]
-fn pin_this_build_at(_pinned: &PathBuf) -> Result<(), String> {
-    Ok(())
+fn pin_this_build_at(_pinned: &PathBuf) -> Result<PinHolds, String> {
+    Ok(PinHolds::ABuild)
 }
 
 /// Keep the pinned copy current, on the path the INSTALLED UNIT records.
