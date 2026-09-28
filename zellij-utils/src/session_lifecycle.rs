@@ -1186,6 +1186,25 @@ pub struct ExecutableIdentity {
     pub replaced: bool,
 }
 
+impl ExecutableIdentity {
+    /// Forget everything that was read off the file, keeping only the path and the fact that the
+    /// file is no longer the process's.
+    ///
+    /// The same shape [`identify_executable`] produces for a Linux " (deleted)" path, and for the
+    /// same reason: an inode, a stamp and a size read off a REPLACEMENT describe a build nobody is
+    /// running, and left in place they are worse than nothing - the inode is the first evidence
+    /// [`compare_builds`] trusts, so a pin overwritten in place would compare equal to itself.
+    fn read_off_the_wrong_file(self) -> Self {
+        ExecutableIdentity {
+            path: self.path,
+            file_id: None,
+            build_id: None,
+            size: None,
+            replaced: true,
+        }
+    }
+}
+
 /// What can be learnt about the file at `path`, without failing if the answer is "not much".
 pub fn identify_executable(path: PathBuf) -> ExecutableIdentity {
     let (path, replaced) = match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
@@ -1572,7 +1591,56 @@ pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
     if ours.next().is_some() {
         return None;
     }
-    executable_of_pid(server.pid).map(identify_executable)
+    let identity = identify_executable(executable_of_pid(server.pid)?);
+    Some(
+        if written_after_the_server_started(&identity, &server.socket) {
+            identity.read_off_the_wrong_file()
+        } else {
+            identity
+        },
+    )
+}
+
+/// Whether the file now at the server's executable path was written after that server started.
+///
+/// **This is the check that stops a refreshed pin being compared with itself.** Everything else
+/// here reads the build off the file at the path the process reports, and that file is only the
+/// build the process is running while nobody has written over it. `session enable` writes over it:
+/// it renames a newer build onto the pinned path under a live server, and from that moment the path
+/// holds a build the server is not running. Linux notices on its own - `/proc/<pid>/exe` gains a
+/// " (deleted)" suffix once the file is renamed away. **macOS notices nothing**, because
+/// `proc_pidpath` reports the path and the path now holds the replacement, so the comparison is the
+/// new pin against itself and the answer is `Same`: a machine told its rollout finished while the
+/// old server is still serving.
+///
+/// The reference time is the session's own socket, bound by that server as it came up and never
+/// written again. It costs one `stat`, spawns nothing, parses nothing, and cannot be wrong about
+/// the order: `session up` refreshes the pin and THEN starts the server, so a pin the running
+/// server did start from is always older than the socket.
+///
+/// What it answers, exactly, is "this file is not the one the process started from" - so a rewrite
+/// that did not change the build would be reported as a build that did. That is bounded by
+/// [`install_pinned_exe`] being the pin's one writer and refusing to write unless the build
+/// differs; nothing in the steady state moves the mtime.
+///
+/// Both ways of not knowing answer `false`. A socket or an executable that cannot be stat'ed leaves
+/// the identity exactly as it was read, because a wrong "your session is stale" sends someone to
+/// restart a session that did not need it - the same rule `compare_builds` is written to.
+fn written_after_the_server_started(identity: &ExecutableIdentity, socket: &Path) -> bool {
+    if identity.replaced {
+        // already known to be the wrong file, and there is no mtime left to read
+        return false;
+    }
+    let written = modified_time(&identity.path);
+    let bound = modified_time(socket);
+    match (written, bound) {
+        (Some(written), Some(bound)) => written > bound,
+        _ => false,
+    }
+}
+
+fn modified_time(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 /// The build of the binary running right now.
@@ -3474,6 +3542,97 @@ dev.zellij.session.mysession = {
         let theirs = identify_executable(link);
         assert_eq!(ours.file_id, theirs.file_id, "a symlink is one file");
         assert_eq!(compare_builds(Some(&ours), Some(&theirs)), BuildMatch::Same);
+    }
+
+    /// Give `path` an mtime `seconds` before now, so a test can put two files in an order without
+    /// sleeping through it.
+    #[cfg(unix)]
+    fn written_seconds_ago(path: &Path, seconds: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("a writable temp file")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(when)
+                    .set_modified(when),
+            )
+            .expect("a filesystem that records times");
+    }
+
+    /// The bug this check exists for, in the shape it was reported in: `session enable` refreshed
+    /// the pin while the old server was still serving, so the path the server started from now
+    /// holds a build nobody is running. Read straight off the file it says `Same` - the new pin
+    /// compared with itself - and a rollout stops one step early.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pin_refreshed_under_a_running_server_is_not_the_build_it_is_running() {
+        let scratch = ScratchDir::new("pin-refreshed-under-server");
+        // the pin, holding the build that was installed ten minutes ago...
+        let pinned = scratch.write("zellij", &elf_with_build_id(&[0xcd; 20], 4096));
+        written_seconds_ago(&pinned, 600);
+        // ...the server that started from it five minutes ago, its socket bound as it came up...
+        let socket = scratch.write("mysession", b"");
+        written_seconds_ago(&socket, 300);
+        // ...and the refresh that has just renamed a newer build onto that same path
+        let newer = scratch.write("zellij-newer", &elf_with_build_id(&[0xab; 20], 4096));
+        std::fs::rename(&newer, &pinned).expect("a writable temp dir");
+
+        let read_off_the_path = identify_executable(pinned.clone());
+        let ours =
+            identify_executable(scratch.write("this", &elf_with_build_id(&[0xab; 20], 4096)));
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&read_off_the_path)),
+            BuildMatch::Same,
+            "the file alone cannot tell them apart - that is the bug"
+        );
+
+        assert!(written_after_the_server_started(
+            &read_off_the_path,
+            &socket
+        ));
+        let running = read_off_the_path.read_off_the_wrong_file();
+        assert!(running.replaced);
+        assert_eq!(running.build_id, None, "nothing read off the replacement");
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&running)),
+            BuildMatch::Different,
+            "so a restart is owed and doctor has to say so"
+        );
+    }
+
+    /// The other half of the rule, and the half that costs something to get wrong: the ordinary
+    /// session, whose pin was written before the server that started from it. Calling that stale
+    /// would send someone to restart a session that was fine.
+    #[test]
+    #[cfg(unix)]
+    fn a_pin_older_than_the_socket_is_the_build_that_is_running() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pinned = scratch.path().join("zellij");
+        std::fs::write(&pinned, b"this build").unwrap();
+        written_seconds_ago(&pinned, 600);
+        let socket = scratch.path().join("mysession");
+        std::fs::write(&socket, b"").unwrap();
+
+        let identity = identify_executable(pinned);
+        assert!(!written_after_the_server_started(&identity, &socket));
+    }
+
+    /// Not knowing is not a fault. A socket that has been removed under a live server leaves
+    /// nothing to compare against, and a guess there is the wrong kind of answer.
+    #[test]
+    #[cfg(unix)]
+    fn a_missing_socket_says_nothing_about_the_build() {
+        let scratch = tempfile::tempdir().unwrap();
+        let pinned = scratch.path().join("zellij");
+        std::fs::write(&pinned, b"this build").unwrap();
+
+        let identity = identify_executable(pinned);
+        assert!(!written_after_the_server_started(
+            &identity,
+            &scratch.path().join("gone")
+        ));
     }
 
     #[test]
