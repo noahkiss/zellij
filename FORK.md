@@ -7522,6 +7522,48 @@ This does not make the pin safe from every build. Any unreleased binary that cre
 the pin the same way — a developer's local build included, which is how this was reproduced. The
 guard covers the case the release process actually walks into.
 
+### A pane that dropped to the shell stops naming the command that exited
+
+```
+$ zellij action list-panes --all --json | jq '.[] | {handle, terminal_command, is_held, exited}'
+{"handle":"sunny-otter","terminal_command":"sh -c npm test","is_held":false,"exited":false}  # before
+{"handle":"sunny-otter","is_held":false,"exited":false}                                      # after
+```
+
+The pane had finished `npm test` and fallen back to the shell. `is_held` and `exited` said so, and
+`terminal_command` named a command that was not running — which is the field a consumer keys on to
+decide what a pane is doing, so a pane at a prompt read as a pane still working. True of an
+ESC-dropped pane as long as ESC has offered the drop; [the clean-exit
+drop](#a-command-pane-can-drop-to-the-shell-when-its-command-exits-cleanly) only made it the common
+case.
+
+The pty swapped the dead command for the default shell and nothing told the pane, so `invoked_with`
+— which is where `terminal_command` comes from — still held the `Run::Command` the pane was opened
+with. `Tab` now records the drop on the pane at both sites that send
+`PtyInstruction::DropToShellInPane`: the ESC key handler, and the clean-exit path.
+
+**`None` rather than the name of the shell.** That is what an ordinary shell pane carries — a pane
+opened with the default shell is normalized to `None` at creation — and after the drop this is an
+ordinary shell pane. Both callers hand the pty the tab's own `default_shell`, so there is no other
+shell it could be. A consumer reading `terminal_command` for "what is this pane running" now gets
+the same answer for a dropped pane as for a shell pane that never ran anything, which is the truth.
+
+**The snapshot does not change, and was already right.** `update_terminal_commands` overwrites every
+pane's recorded command with what the OS says its child process is running before a layout is
+serialized, and already wrote `None` for a pane sitting in the default shell — as [the resurrection
+entry](#a-resurrected-command-pane-drops-to-the-shell-when-its-command-exits-cleanly) says in as many
+words. This patch brings the live report into line with what the snapshot has always recorded.
+
+**`command_state` was considered first and is not a substitute.** A shell that emits OSC 133 does
+answer this — it draws a prompt after the drop, so `command_state` reads `prompt` — but the key is
+**absent for a shell that emits no markers**, which is exactly the consumer's fallback case, and a
+field that names a command that is not running is wrong whether or not another field is right.
+
+`zellij-server` only: a `set_invoked_with` on the `Pane` trait, defaulting to a no-op for plugin
+panes, and two call sites. No protobuf, no contract change — `PaneInfo::terminal_command` already
+exists and this changes only what fills it. Two tab unit tests: a dropped pane names nothing, and a
+pane that still holds still names its command, because that one can be re-run with ENTER.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

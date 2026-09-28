@@ -1195,6 +1195,9 @@ impl Pane for TerminalPane {
     fn invoked_with(&self) -> &Option<Run> {
         &self.invoked_with
     }
+    fn set_invoked_with(&mut self, invoked_with: Option<Run>) {
+        self.invoked_with = invoked_with;
+    }
     fn set_title(&mut self, title: String) {
         self.pane_title = title;
     }

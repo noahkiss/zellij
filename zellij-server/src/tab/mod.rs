@@ -751,6 +751,10 @@ pub trait Pane {
     fn clear_pane_frame_color_override(&mut self, _client_id: Option<ClientId>);
     fn frame_color_override(&self) -> Option<PaletteColor>;
     fn invoked_with(&self) -> &Option<Run>;
+    /// fork addition: say what the pane is running now, when that stopped being what it was opened
+    /// with - see [`Tab::record_drop_to_shell`]. A no-op for a plugin pane, which cannot be handed
+    /// a new pty.
+    fn set_invoked_with(&mut self, _invoked_with: Option<Run>) {}
     fn set_title(&mut self, title: String);
     fn update_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
     fn start_loading_indication(&mut self, _loading_indication: LoadingIndication) {} // only relevant for plugins
@@ -4794,6 +4798,7 @@ impl Tab {
                     },
                     Some(AdjustedInput::DropToShellInThisPane { working_dir }) => {
                         self.pids_waiting_resize.insert(active_terminal_id);
+                        self.record_drop_to_shell(PaneId::Terminal(active_terminal_id));
                         self.senders
                             .send_to_pty(PtyInstruction::DropToShellInPane {
                                 pane_id: PaneId::Terminal(active_terminal_id),
@@ -6214,6 +6219,27 @@ impl Tab {
     /// the directory the command ran in. Only a command pane that exited with status 0 reaches
     /// this, and only when it was resurrected or `command_pane_on_clean_exit` is `"shell"`; every
     /// other exit holds.
+    /// fork addition: a pane that has dropped to the shell is running the shell, and now says so.
+    ///
+    /// The pty swaps the dead command for the default shell and nothing told the pane, so
+    /// `invoked_with` still named the command that exited - and with it `terminal_command` in
+    /// `list-panes --json`, which is what a consumer reads to decide what a pane is doing. It
+    /// reported a command that was not running, on every pane that dropped to the shell, whether
+    /// under ESC or on a clean exit.
+    ///
+    /// `None` rather than the shell: that is what an ordinary shell pane carries - see
+    /// [`Tab::normalize_invoked_with_for_default_shell`] - and after the drop this is an ordinary
+    /// shell pane. Both callers hand the pty `self.default_shell`, so there is no other shell it
+    /// could be.
+    ///
+    /// The snapshot is unaffected either way. `update_terminal_commands` overwrites every pane's
+    /// recorded command with what the OS says its child is running before a layout is serialized,
+    /// and already wrote `None` for a pane sitting in the default shell.
+    fn record_drop_to_shell(&mut self, id: PaneId) {
+        if let Some(pane) = self.get_pane_with_id_mut(id) {
+            pane.set_invoked_with(None);
+        }
+    }
     fn drop_held_pane_to_shell(&mut self, id: PaneId) {
         let PaneId::Terminal(terminal_id) = id else {
             return;
@@ -6225,6 +6251,7 @@ impl Tab {
             return;
         };
         self.pids_waiting_resize.insert(terminal_id);
+        self.record_drop_to_shell(id);
         let _ = self.senders.send_to_pty(PtyInstruction::DropToShellInPane {
             pane_id: id,
             shell: Some(self.default_shell.clone()),
