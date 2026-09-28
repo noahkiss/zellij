@@ -3032,12 +3032,12 @@ that both commands take, and that is new machinery with new ways to wedge, for a
 two commands typed seconds apart. What is bought is that the silent half is gone — the run that
 would have clobbered says so, and the recovery is the same one command it always was.
 
-**Known limitation: the same-team assumption is not enforced.** Falling from a Developer ID to an
-Apple Development certificate keeps the requirement only while both carry the same team, and the
-walk compares neither the team id nor the requirement it would derive. A keychain holding
-certificates from two different teams would fall to a different `certificate leaf[subject.OU]`,
-which changes the requirement and drops every grant exactly as a demotion would. One machine
-holding both, from two teams, is rare enough that this is recorded rather than guarded.
+**The same-team assumption is checked and no longer assumed.** Falling from a Developer ID to an
+Apple Development certificate keeps the requirement only while both carry the same team, and until
+nkmk.23 the walk compared neither the team id nor the requirement it would derive — so a keychain
+holding certificates from two teams fell to a different `certificate leaf[subject.OU]` and dropped
+every grant exactly as a demotion would. It is now refused; see [the entry
+below](#a-fall-to-another-teams-certificate-is-refused-instead-of-dropping-every-grant).
 
 **A re-grant is asked for only when the requirement actually changed**, and the question is put to
 the two requirement TEXTS — the one read off the pin before signing and the one read off the signed
@@ -7563,6 +7563,54 @@ field that names a command that is not running is wrong whether or not another f
 panes, and two call sites. No protobuf, no contract change — `PaneInfo::terminal_command` already
 exists and this changes only what fills it. Two tab unit tests: a dropped pane names nothing, and a
 pane that still holds still names its command, because that one can be re-run with ENTER.
+
+### A fall to another team's certificate is refused instead of dropping every grant
+
+```
+signing  Needs you   ~/.local/share/zellij/bin/zellij holds grants recorded against team
+                     A1B2C3D4E5, and the certificate below belongs to team Z9Y8X7W6V5
+                       Apple Development is the next rung down and it is not this pin's team
+                       a requirement naming another team is one macOS never recorded, so Full
+                       Disk Access and every other grant would stop applying without a word
+                       sign with a certificate of the granted team, or re-grant the
+                       permissions for the pin's path once another one is in place
+```
+
+[The signing ladder](#signing-the-pinned-copy-macos) walks past a rung that refuses, and the fall
+from a Developer ID to an Apple Development certificate is safe **because both write the same
+requirement** — `codesign` derives `leaf[subject.OU] = "TEAM"` for the first and
+`requirement_for` writes it by hand for the second. That holds only while the two carry one team,
+and nothing checked. A keychain holding certificates from two teams — a personal Apple ID and an
+employer's, on one laptop — fell to the other team's OU, wrote a requirement macOS had never
+recorded, and every grant against the old one stopped applying. Silently: `codesign --verify` on
+the result reports a perfectly valid signature, because the signature *is* valid; it is the grant
+that is gone. The symptom is a pane that cannot read a directory it read yesterday, weeks later,
+with nothing tying it to a doctor run. It was recorded as a known limitation from nkmk.7 and is now
+the check this entry describes.
+
+**The pin's own requirement decides, not the certificate the walk is standing on.** macOS keyed
+each grant to the requirement text it read off the pin when the user granted it, so the team named
+in *that* text is the team the grants belong to. `judge_fall` takes three strings — the team above,
+the team below, and the requirement the pin is anchored on — and reads the granted team out of the
+requirement, falling back to the certificate above only when the requirement names no team at all
+(the CN-anchored case). A candidate naming a different team is refused, the walk stops, and the pin
+and its grants are left exactly as they were: with a deferred refresh, the previous build is still
+pinned and still holds everything.
+
+**Two falls deliberately keep their pass, and guarding either would be worse.** An unsigned or
+ad-hoc pin holds no grant to lose — its requirement names its own code hash, which the last build
+already voided — so refusing there would leave the pin ad-hoc, the one state signing exists to
+remove. And a certificate whose team could not be read signs with the requirement `codesign`
+derives, which the ladder allows on purpose and already reports; refusing a fall on a team id
+nobody could read would block the commonest unreadable-keychain case on no evidence.
+
+`zellij-utils/src/session_signing.rs` only, and it is the shape the rest of that file already has:
+the decision is a pure function over three strings, the keychain is only where the strings come
+from. `team_of` reads a rung's team off its certificate — the Developer ID's for the first time,
+and only when a fall is actually being weighed, because the question costs two keychain commands.
+Three tests, all of which run on a machine with no keychain: the team read out of the requirement each rung
+writes, the seven-case verdict table, and a two-team keychain driven through `sign_pin`
+that proves the other team's certificate is never handed to `codesign`.
 
 ## Assessed and deliberately not built
 
