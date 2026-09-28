@@ -2684,6 +2684,11 @@ version; leftover wrapper scripts; the unit, its load state and its drift; one s
 whether a dead session's saved layout is holding the name; whether the running server is this build; the pin, and the temp copies an interrupted refresh left
 beside it.
 
+The `config` line names the file the load beneath it read: `--config`, else `--config-dir` (which
+is how `ZELLIJ_CONFIG_DIR` arrives), else the default search. Until nkmk.24 the name came from the
+default search alone while the load honoured `--config-dir`, so a doctor run under a scratch
+`ZELLIJ_CONFIG_DIR` reported the real config as the one that parsed.
+
 A leftover is narrow on purpose. A script in `~/bin` that merely calls zellij is a companion tool,
 not a fault, and a `zellij` there that resolves to this very binary is where zellij is installed —
 neither is reported. Two shapes are: a different build taking the name, and a script that sets

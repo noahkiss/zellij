@@ -141,9 +141,12 @@ fn check_path(report: &mut Report) {
 /// machine that is not the one the user has, because the launcher, the pin and the session name
 /// all come out of it.
 fn check_config(report: &mut Report, opts: &CliArgs) {
+    // name the file the load below actually reads: `--config`, then `--config-dir` (which is how
+    // ZELLIJ_CONFIG_DIR arrives), then the default search - the same order `Setup` resolves it in
     let config_file = opts
         .config
         .clone()
+        .or_else(|| opts.config_dir.as_ref().map(|dir| dir.join("config.kdl")))
         .or_else(|| find_default_config_dir().map(|dir| dir.join("config.kdl")));
     let named = config_file
         .as_ref()
