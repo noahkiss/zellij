@@ -18258,3 +18258,41 @@ fn a_suppressed_pane_is_never_dropped_to_the_shell() {
         "a suppressed pane must keep its hold, so the pane it stands in for is restored"
     );
 }
+
+// fork addition: what a dropped pane says it is running. `terminal_command` in `list-panes --json`
+// reads `invoked_with`, and until the drop updated it a pane that had fallen back to the shell
+// still named the command that exited.
+
+#[test]
+fn a_pane_dropped_to_the_shell_stops_naming_the_command_that_exited() {
+    let (mut tab, _pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Shell;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert_eq!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .invoked_with(),
+        &None,
+        "a pane that dropped to the shell is an ordinary shell pane, and reports no command"
+    );
+}
+
+#[test]
+fn a_pane_that_still_holds_still_names_its_command() {
+    let (mut tab, _pty_receiver) = tab_with_pty_receiver(true);
+    *tab.command_pane_on_clean_exit.borrow_mut() = CommandPaneOnCleanExit::Hold;
+
+    tab.hold_pane(PaneId::Terminal(1), Some(0), false, held_run_command(false));
+
+    assert_eq!(
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .unwrap()
+            .invoked_with(),
+        &Some(zellij_utils::input::layout::Run::Command(held_run_command(
+            false
+        ))),
+        "a held pane can be re-run with ENTER, so its command is still what it is running"
+    );
+}
