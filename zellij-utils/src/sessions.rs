@@ -918,7 +918,9 @@ pub struct SessionListEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_build: Option<String>,
     /// The file the server started from is no longer at its path: an upgrade wrote over it in
-    /// place. Only Linux can say so, and only then is the field there.
+    /// place. Linux says so through `/proc/<pid>/exe`; every platform says so when the file at
+    /// that path was modified after the session's socket was bound. The field is there only when
+    /// the answer is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_exe_replaced: Option<bool>,
 }
