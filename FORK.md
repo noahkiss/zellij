@@ -7413,6 +7413,68 @@ CLI-side only: `src/mcp/`, and one row of `zellij-utils/src/cli_surface.rs`. No 
 contract change, and no CLI flag added - every flag this uses (`--in-tab`, `--new-tab`,
 `--no-focus`, `--near-current-pane`) already shipped.
 
+### A refreshed pin is no longer mistaken for the build the server is running
+
+```
+$ zellij session enable mysession        # refreshes the pinned copy to the new build
+      refreshed the pinned copy at /Users/<user>/.local/share/zellij/bin/zellij
+$ zellij session doctor mysession        # before
+Already correct
+  build     the running server is this build of zellij
+```
+
+It was not. The server had been serving since two days earlier, on the previous build, and a
+restart was still owed. Seen on a rollout, twice, and it is the worst answer this report can give:
+the `build` line is the one an operator and an agent both read to decide whether a rollout
+finished, so a false clean there ends the rollout one step early and leaves the machine on the old
+server with no signal at all.
+
+**Nothing was wrong with the check's shape.** [The stale-build
+warning](#a-warning-when-the-running-session-is-a-different-build) asks the live process, by pid,
+which is the right question: `/proc/<pid>/exe` on Linux, `proc_pidpath` on macOS. It was wrong one
+level down, at the step everything here shares — the answer is a PATH, and the build is then read
+off **the file that path now holds**. That file is the running build only while nobody has written
+over it, and `session enable` writes over it: it renames the new build onto the pinned path under a
+live server, so from that moment the path holds a build the server is not running. Doctor compared
+the new pin with itself and found, correctly, that it was itself.
+
+Linux escaped it by accident. `/proc/<pid>/exe` gains a " (deleted)" suffix once the file is renamed
+away, and `identify_executable` has always read that. **macOS says nothing** — `proc_pidpath`
+reports the path, and the path holds the replacement — which is why the two Linux machines reported
+the difference correctly and the Mac did not. The other Mac reported it correctly too, for a reason
+that is worth knowing rather than trusting: there the refresh happened inside `doctor --fix`, and
+`check_build` runs before `check_pin`, so the pin was read in the one moment it was still the old
+build.
+
+**The reference time is the session's own socket.** The server binds it as it comes up and nothing
+writes it again, so an executable modified after that socket was bound is not the file the process
+started from — whatever the platform does or does not say about it. `server_executable` now asks
+that question and, when the answer is yes, throws away everything it read off the file, keeping the
+path and setting the `replaced` flag that Linux's " (deleted)" already sets. Every reader downstream
+is unchanged and correct from there: `compare_builds` reports `Different`, `ls --json` carries
+`server_exe_replaced: true`, the client's stderr warning fires, and doctor's `build` line says a
+restart is owed.
+
+It costs one `stat`, spawns no process and parses no date — the alternatives were `ps -o lstart=`
+per session with a date parser, or `proc_pidinfo` FFI that this fork's Linux box cannot compile. The
+order it depends on is causal rather than lucky: `session up` refreshes the pin and **then** starts
+the server, so a pin the running server did start from is always older than that server's socket.
+Both ways of not knowing answer "not replaced" — a socket or an executable that cannot be stat'ed
+leaves the identity exactly as it was read, because a wrong "your session is stale" sends someone to
+restart a session that was fine.
+
+What it answers exactly is "this file is not the one the process started from", so a rewrite that
+did not change the build would be reported as a build that did. That is bounded by the pin having
+one writer, which refuses to write unless the build differs — signing included, since the signing
+transaction runs only as part of a refresh. Nothing in the steady state moves that mtime: the
+watchdog's `session up` hands the pin to itself every minute and returns without touching it.
+
+`zellij-utils/src/session_lifecycle.rs` only, and no new dependency. Three unit tests: the refresh
+under a running server, which first asserts that the files alone read as `Same` and then that the
+check calls it what it is; the ordinary session whose pin predates its socket; and a socket that
+cannot be read. An overwrite **in place** needs no test — the kernel refuses it with `ETXTBSY`
+while the server is executing the file, which is why the pin's writer renames.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
