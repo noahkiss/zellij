@@ -4483,8 +4483,9 @@ build", which is the question a script asks.
   two files holding one program, and this is the only field where they agree.
 * `server_build` — `same`, `different` or `unknown` against the binary running the command.
   `unknown` is an answer, not a failure: `compare_builds` reports it rather than guess.
-* `server_exe_replaced` — present only when it is true, and only Linux can say so: an upgrade wrote
-  over the running file in place.
+* `server_exe_replaced` — present only when it is true: the file the server started from is no
+  longer at its path. Every platform can say so since nkmk.23, which compares the file's mtime with
+  the socket's, and a missing file counts since nkmk.25.
 
 All four are absent for a dead session, and for a live one whose server the platform will not answer
 about or which has two servers for its name. Omitted rather than null, like the metadata fields
@@ -7512,6 +7513,15 @@ under a running server, which first asserts that the files alone read as `Same` 
 check calls it what it is; the ordinary session whose pin predates its socket; and a socket that
 cannot be read. An overwrite **in place** needs no test — the kernel refuses it with `ETXTBSY`
 while the server is executing the file, which is why the pin's writer renames.
+
+**A missing file is a replaced one too (nkmk.25, 2026-09-29).** The mtime rule needs a file to read.
+When an upgrade removes the server's executable outright, macOS still reports the old path, with no
+` (deleted)` suffix, and the identity came back with nothing read and `replaced` unset.
+`compare_builds` then said `Unknown`, and nothing warned. `server_executable` now treats a path that
+does not exist as replaced, on every platform, so `ls --json` says `server_build: different` with
+`server_exe_replaced: true`, and doctor's `build` line says a restart is owed. The rule sits in
+`server_executable` and not in `identify_executable`, whose other callers may identify a path that
+is legitimately absent. One unit test: the same identity before and after its file is removed.
 
 ### A release candidate never becomes the pin
 
