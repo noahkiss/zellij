@@ -1660,6 +1660,48 @@ pub fn own_executable() -> Option<ExecutableIdentity> {
     std::env::current_exe().ok().map(identify_executable)
 }
 
+/// The binary a long-lived process should spawn to run itself again.
+///
+/// `current_exe()` is the wrong answer after an upgrade on Linux. An upgrade renames a new build
+/// over the running file, and the kernel then reports the old path with a " (deleted)" suffix. A
+/// process that execs that path fails with `ENOENT` on every spawn until it is restarted. This
+/// strips the suffix, so the spawn runs the build that is there now.
+pub fn own_exe_for_spawn() -> std::io::Result<PathBuf> {
+    exe_for_spawn(
+        std::env::current_exe()?,
+        &crate::session_service::path_dirs(),
+    )
+}
+
+/// [`own_exe_for_spawn`], with `path_dirs` standing in for `PATH`.
+///
+/// When the stripped path does not exist either - the upgrade took the whole versioned directory -
+/// it falls back to the first entry on `PATH` with the same file name.
+pub fn exe_for_spawn(exe: PathBuf, path_dirs: &[PathBuf]) -> std::io::Result<PathBuf> {
+    let exe = match exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(real_path) => PathBuf::from(real_path),
+        None => exe,
+    };
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let name = exe.file_name().unwrap_or_else(|| "zellij".as_ref());
+    path_dirs
+        .iter()
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{} no longer exists, and no `{}` is on PATH",
+                    exe.display(),
+                    name.to_string_lossy()
+                ),
+            )
+        })
+}
+
 /// The path of the binary running right now, with symlinks resolved.
 ///
 /// macOS keys a TCC grant (Full Disk Access and friends) to the RESOLVED executable, so anything
@@ -3888,6 +3930,41 @@ dev.zellij.session.mysession = {
             BuildMatch::Different,
             "so ls --json says different and doctor says a restart is owed"
         );
+    }
+
+    /// Linux reports a file renamed over as "<path> (deleted)". The spawn runs the build that is
+    /// at the path now.
+    #[test]
+    #[cfg(unix)]
+    fn a_deleted_suffix_is_stripped_for_a_spawn() {
+        let scratch = tempfile::tempdir().unwrap();
+        let exe = scratch.path().join("zellij");
+        std::fs::write(&exe, b"the build that is there now").unwrap();
+        let reported = PathBuf::from(format!("{} (deleted)", exe.display()));
+        assert_eq!(exe_for_spawn(reported, &[]).unwrap(), exe);
+        assert_eq!(exe_for_spawn(exe.clone(), &[]).unwrap(), exe);
+    }
+
+    /// The whole versioned directory is gone: the spawn falls back to the same name on PATH, and
+    /// with none there the error names both the path and the name.
+    #[test]
+    #[cfg(unix)]
+    fn a_vanished_executable_is_found_again_on_path() {
+        let gone = tempfile::tempdir().unwrap();
+        let reported = PathBuf::from(format!(
+            "{} (deleted)",
+            gone.path().join("old-version").join("zellij").display()
+        ));
+        let empty = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let installed = bin.path().join("zellij");
+        std::fs::write(&installed, b"the build the upgrade installed").unwrap();
+        let path = [empty.path().to_path_buf(), bin.path().to_path_buf()];
+        assert_eq!(exe_for_spawn(reported.clone(), &path).unwrap(), installed);
+
+        let error = exe_for_spawn(reported, &[empty.path().to_path_buf()]).unwrap_err();
+        assert!(error.to_string().contains("old-version"), "{}", error);
+        assert!(error.to_string().contains("`zellij`"), "{}", error);
     }
 
     /// A scratch "server": its executable written ten minutes ago, its socket five minutes ago,

@@ -15,8 +15,9 @@
 //! That is what makes an honest miss possible: a pane that was not created reports the CLI's own
 //! refusal, and no tool here can invent a pane id the CLI never printed.
 //!
-//! The binary run is this one, found with `current_exe`, so the CLI a tool calls is always the
-//! build the tool shipped in.
+//! The binary run is this one, found with `current_exe`, so the CLI a tool calls is the build the
+//! tool shipped in. After an upgrade renames a new build over it, the tool runs the new build at
+//! the same path instead of failing.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,9 +46,12 @@ impl Outcome {
     }
 }
 
-/// The zellij binary a tool should run: this one.
+/// The zellij binary a tool should run: this one, or the build now at its path after an upgrade.
+///
+/// A long-lived MCP server outlives an upgrade, and on Linux `current_exe()` then names a
+/// " (deleted)" path that no spawn can run.
 pub fn zellij_binary() -> Result<PathBuf, String> {
-    std::env::current_exe()
+    zellij_utils::session_lifecycle::own_exe_for_spawn()
         .map_err(|e| format!("This server could not find its own binary to run: {}", e))
 }
 
