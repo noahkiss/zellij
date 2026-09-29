@@ -7610,13 +7610,18 @@ cannot be read. An overwrite **in place** needs no test — the kernel refuses i
 while the server is executing the file, which is why the pin's writer renames.
 
 **A missing file is a replaced one too (nkmk.25, 2026-09-29).** The mtime rule needs a file to read.
-When an upgrade removes the server's executable outright, macOS still reports the old path, with no
+When an upgrade removes the server's executable outright, macOS marks nothing with a
 ` (deleted)` suffix, and the identity came back with nothing read and `replaced` unset.
 `compare_builds` then said `Unknown`, and nothing warned. `server_executable` now treats a path that
 does not exist as replaced, on every platform, so `ls --json` says `server_build: different` with
 `server_exe_replaced: true`, and doctor's `build` line says a restart is owed. The rule sits in
 `server_executable` and not in `identify_executable`, whose other callers may identify a path that
-is legitimately absent. One unit test: the same identity before and after its file is removed.
+is legitimately absent. On macOS, `proc_pidpath` fails with `ENOENT` once the file is unlinked,
+so without more the server had no path at all and the rule never ran. The fallback reads the
+exec-time path from `KERN_PROCARGS2`, which the kernel keeps for the life of the process, and that
+keeps the answer. Unit tests: the same identity before and after its file is removed; the
+`KERN_PROCARGS2` parse, on every unix; and, on macOS only, a deleted copy of `/bin/sleep` that is
+still named by its exec path.
 
 ### A release candidate never becomes the pin
 

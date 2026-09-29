@@ -1553,6 +1553,8 @@ fn executable_of_pid(pid: u32) -> Option<PathBuf> {
 ///
 /// macOS has no `/proc`, and `ps -o comm=` is not a substitute - it is truncated at the column
 /// width. `proc_pidpath` is the kernel asked directly, and fills a buffer with the full path.
+/// It stays the first choice because it is the resolved path, which TCC and the pin logic want.
+/// When the file has been deleted it answers nothing, so [`exec_path_of_pid`] answers instead.
 #[cfg(target_os = "macos")]
 fn executable_of_pid(pid: u32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
@@ -1566,10 +1568,64 @@ fn executable_of_pid(pid: u32) -> Option<PathBuf> {
         )
     };
     if length <= 0 {
-        return None;
+        return exec_path_of_pid(pid);
     }
     buffer.truncate(length as usize);
     Some(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// The path a process was exec'd with, as the kernel kept it.
+///
+/// `proc_pidpath` fails with `ENOENT` once the executable file is unlinked, so a server whose
+/// binary was removed would have no path at all, and no build to compare. `KERN_PROCARGS2` keeps
+/// the exec-time path for the life of the process, so it still names the file that is gone. It is
+/// the path handed to `execve`, before symlink resolution, which is why it is only the fallback.
+///
+/// The size query is not reliable for `KERN_PROCARGS2`, so the buffer is `ARG_MAX` bytes and the
+/// call is made once. Any failure answers `None`, exactly as a failed `proc_pidpath` did.
+#[cfg(target_os = "macos")]
+fn exec_path_of_pid(pid: u32) -> Option<PathBuf> {
+    let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+    if arg_max <= 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; arg_max as usize];
+    let mut length: libc::size_t = buffer.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    exec_path_from_procargs(&buffer[..length.min(buffer.len())])
+}
+
+/// The exec path out of a `KERN_PROCARGS2` buffer: a native-endian `argc`, then the path the
+/// process was exec'd with up to its NUL, then the arguments. A buffer too short to hold both, an
+/// `argc` below one, or an empty path answers `None`.
+///
+/// Compiled under `cfg(test)` on every unix so the parsing is tested where macOS is not.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+fn exec_path_from_procargs(buffer: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let argc = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    if argc < 1 {
+        return None;
+    }
+    let rest = &buffer[4..];
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    if end == 0 {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&rest[..end])))
 }
 
 /// Everywhere else there is no portable way to ask, so nothing is claimed.
@@ -2989,6 +3045,57 @@ pub fn probe_protected_locations_now() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `KERN_PROCARGS2` buffer as the kernel lays it out: `argc`, the exec path, then argv.
+    #[cfg(unix)]
+    fn procargs(argc: i32, rest: &[u8]) -> Vec<u8> {
+        let mut buffer = argc.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(rest);
+        buffer
+    }
+
+    /// The exec path is the string between `argc` and its NUL, and argv after it is not read.
+    #[cfg(unix)]
+    #[test]
+    fn procargs_yields_the_exec_path() {
+        let buffer = procargs(2, b"/opt/zellij/bin/zellij\0\0\0zellij\0--server\0");
+        assert_eq!(
+            exec_path_from_procargs(&buffer),
+            Some(PathBuf::from("/opt/zellij/bin/zellij"))
+        );
+    }
+
+    /// A buffer that does not hold a whole answer is no answer: too short for `argc`, no process
+    /// arguments, an empty path, or a path the buffer ends inside.
+    #[cfg(unix)]
+    #[test]
+    fn procargs_that_are_malformed_yield_nothing() {
+        assert_eq!(exec_path_from_procargs(&[1, 0]), None);
+        assert_eq!(exec_path_from_procargs(&procargs(0, b"/bin/sleep\0")), None);
+        assert_eq!(exec_path_from_procargs(&procargs(1, b"\0sleep\0")), None);
+        assert_eq!(exec_path_from_procargs(&procargs(1, b"/bin/sle")), None);
+    }
+
+    /// The bug this guards: `proc_pidpath` answers nothing for a process whose executable was
+    /// deleted, so a server whose binary was removed read as "cannot tell" instead of replaced.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_deleted_executable_is_still_named_by_its_exec_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("zellij-deleted-exe-test");
+        std::fs::copy("/bin/sleep", &copy).unwrap();
+        let mut child = std::process::Command::new(&copy).arg("30").spawn().unwrap();
+        std::fs::remove_file(&copy).unwrap();
+        let named = executable_of_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let named = named.expect("no path for a process whose executable was deleted");
+        assert!(
+            named.ends_with("zellij-deleted-exe-test"),
+            "named {} instead of the deleted copy",
+            named.display()
+        );
+    }
 
     /// A pin with nothing to protect is copied over, exactly as it always was. Ad-hoc and unsigned
     /// pins land here: a rebuild voids what they carry anyway, so refusing to refresh one would
