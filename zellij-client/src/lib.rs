@@ -500,10 +500,13 @@ pub fn record_pinned_server_exe(server_exe: Option<PathBuf>) {
 }
 
 /// The binary a new server is started from: the pinned copy if one was recorded, else this one.
+///
+/// "This one" is asked of `own_exe_for_spawn`, not `current_exe()`: after an upgrade on Linux the
+/// latter names a " (deleted)" path that cannot be spawned.
 fn server_exe() -> io::Result<PathBuf> {
     match PINNED_SERVER_EXE.get().cloned().flatten() {
         Some(pinned) => Ok(pinned),
-        None => current_exe(),
+        None => zellij_utils::session_lifecycle::own_exe_for_spawn(),
     }
 }
 

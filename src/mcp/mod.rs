@@ -11,8 +11,8 @@
 //!   fails if it grows past eight or if a tool asks for more than eight parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
-//! * **The tools run the CLI.** Every call is a child process of this same binary, so a tool
-//!   behaves exactly as the command line does, misses included. See [`invoke`].
+//! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so
+//!   a tool behaves exactly as the command line does, misses included. See [`invoke`].
 //!
 //! Session lifecycle - `session up`, `down`, `restart`, `enable` - is deliberately absent. Those
 //! start and stop the thing this server is talking to, and they stay where a person runs them.

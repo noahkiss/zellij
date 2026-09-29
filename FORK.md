@@ -2640,6 +2640,9 @@ the copy is the command that unit runs.
 The explicit-path form is for a launcher written by hand: the launcher names a path, and the pin has
 to be that same one or the two disagree. `--exe` still beats it, being typed for the one command.
 
+Since nkmk.25, a client with no pin recorded starts a server from `own_exe_for_spawn()` rather than
+`current_exe()`, so a client that outlives an upgrade on Linux does not exec a ` (deleted)` path.
+
 ### `zellij session doctor`
 
 ```
@@ -4728,6 +4731,13 @@ crates, no HTTP stack, and nothing on any wasm plugin crate.
 
 Two rows were added to the surface map while wiring this up: `snapshot list` and `snapshot show`
 print a table and a payload respectively, and the map had been claiming they printed nothing.
+
+**A tool call survives an upgrade (nkmk.25, 2026-09-29).** The MCP server is long-lived and spawned
+`current_exe()` for every call. On Linux an upgrade that renames a new build over the binary turns
+that path into `<path> (deleted)`, so every tool call failed with `ENOENT` until the harness
+restarted the server. Calls now spawn `own_exe_for_spawn()`: the same path without the suffix, or,
+when the versioned directory is gone, the first `zellij` on `PATH`. A call after an upgrade runs the
+new build. Two unit tests cover the suffix and the fallback.
 
 ### `session up` comes back with the shape the session had
 
