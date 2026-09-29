@@ -1592,13 +1592,25 @@ pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
         return None;
     }
     let identity = identify_executable(executable_of_pid(server.pid)?);
-    Some(
-        if written_after_the_server_started(&identity, &server.socket) {
-            identity.read_off_the_wrong_file()
-        } else {
-            identity
-        },
-    )
+    Some(as_the_server_runs_it(identity, &server.socket))
+}
+
+/// The identity read off a server's executable path, corrected for what that path no longer holds.
+///
+/// Two ways the file at the path is not the one the server started from, on every platform: it is
+/// gone, or it was written after the server bound `socket`. Either way nothing read off the path
+/// describes the running build, so the identity keeps only the path and the `replaced` flag.
+///
+/// The missing-file rule lives here and not in [`identify_executable`], whose other callers may
+/// identify a path that is legitimately absent. A server's own executable is never legitimately
+/// absent: Linux marks a removed one " (deleted)", but macOS reports the old path and says nothing.
+fn as_the_server_runs_it(identity: ExecutableIdentity, socket: &Path) -> ExecutableIdentity {
+    let gone = !identity.replaced && !identity.path.exists();
+    if gone || written_after_the_server_started(&identity, socket) {
+        identity.read_off_the_wrong_file()
+    } else {
+        identity
+    }
 }
 
 /// Whether the file now at the server's executable path was written after that server started.
@@ -3843,6 +3855,39 @@ dev.zellij.session.mysession = {
             &identity,
             &scratch.path().join("gone")
         ));
+    }
+
+    /// A server whose executable path no longer exists is running a replaced build, on every
+    /// platform. macOS reports the old path with no " (deleted)" suffix, so the path being absent
+    /// is the only signal there.
+    #[test]
+    #[cfg(unix)]
+    fn a_server_executable_that_is_gone_is_a_replaced_one() {
+        let scratch = tempfile::tempdir().unwrap();
+        let exe = scratch.path().join("zellij");
+        std::fs::write(&exe, b"the build the server started as").unwrap();
+        written_seconds_ago(&exe, 600);
+        let socket = scratch.path().join("mysession");
+        std::fs::write(&socket, b"").unwrap();
+
+        let identity = identify_executable(exe.clone());
+        assert!(!as_the_server_runs_it(identity.clone(), &socket).replaced);
+
+        std::fs::remove_file(&exe).unwrap();
+        let running = as_the_server_runs_it(identity, &socket);
+        assert!(running.replaced);
+        assert_eq!(
+            running.file_id, None,
+            "nothing read off a file that is gone"
+        );
+        let this = scratch.path().join("this");
+        std::fs::write(&this, b"the build asking").unwrap();
+        let ours = identify_executable(this);
+        assert_eq!(
+            compare_builds(Some(&ours), Some(&running)),
+            BuildMatch::Different,
+            "so ls --json says different and doctor says a restart is owed"
+        );
     }
 
     /// A scratch "server": its executable written ten minutes ago, its socket five minutes ago,
