@@ -21,7 +21,7 @@ use zellij_utils::cli::CliArgs;
 use zellij_utils::consts::ZELLIJ_SOCK_DIR;
 use zellij_utils::home::find_default_config_dir;
 use zellij_utils::session_doctor::{DoctorMode, Finding, Report};
-use zellij_utils::session_lifecycle::{build_mismatch_warning, SessionFacts};
+use zellij_utils::session_lifecycle::{build_verdict, BuildVerdict, SessionFacts};
 use zellij_utils::session_service::{
     self, configured_pinned_exe, path_dirs, resolve_service_exe, PinState, ServiceExe, ServiceKind,
     SessionServiceOptions, UnitDrift,
@@ -515,21 +515,42 @@ fn check_build(report: &mut Report, name: &str, facts: &SessionFacts) {
     if facts.our_servers().is_empty() {
         return;
     }
-    match build_mismatch_warning(name) {
-        None => report.push(Finding::ok(
+    report.push(build_finding(name, &build_verdict(name)));
+}
+
+/// The `build` finding for a verdict already reached.
+///
+/// OK only for a comparison that said `Same`. It used to be OK whenever no mismatch warning came
+/// back, and that silence also covers a comparison that could not be made - so doctor said "this
+/// build" about a server it had not identified. That case is now its own line, and it needs a
+/// person for the reason an unanswered Full Disk Access probe does: an answer nobody could read is
+/// not a pass.
+fn build_finding(name: &str, verdict: &BuildVerdict) -> Finding {
+    match verdict {
+        BuildVerdict::Same => Finding::ok("build", "the running server is this build of zellij"),
+        BuildVerdict::Different { running, this } => Finding::needs_you(
             "build",
-            "the running server is this build of zellij",
+            format!("'{}' runs a different build from this binary", name),
+        )
+        .note(format!("running: {}", running.display()))
+        .note(format!("this:    {}", this.display()))
+        .note(
+            "A server keeps the binary it started with, so an upgrade does not reach a running \
+             session.",
+        )
+        .note(format!(
+            "Run `zellij session restart {}` to bring it onto this build.",
+            name
         )),
-        Some(warning) => {
-            let mut finding = Finding::needs_you(
-                "build",
-                format!("'{}' runs a different build from this binary", name),
-            );
-            for line in warning.lines().skip(1) {
-                finding = finding.note(line.trim().to_owned());
-            }
-            report.push(finding);
-        },
+        BuildVerdict::CannotTell(reason) => Finding::needs_you(
+            "build",
+            "cannot tell whether the running server is this build of zellij",
+        )
+        .note(reason.clone())
+        .note(format!(
+            "`zellij session restart {}` puts it on this build either way",
+            name
+        )),
     }
 }
 
@@ -1093,6 +1114,41 @@ mod tests {
         let ours = write(ours.path(), "zellij", "this build");
         let faults = wrapper_faults(scratch.path(), Some(&ours.canonicalize().unwrap()));
         assert_eq!(faults.len(), 1, "{:?}", faults);
+    }
+
+    /// The build line said "this build" whenever no mismatch came back, and that silence also
+    /// covers a comparison that could not be made. Fake binaries, so every verdict is reached for
+    /// real rather than handed in.
+    #[test]
+    fn the_build_line_is_ok_only_when_the_comparison_says_same() {
+        use zellij_utils::session_doctor::Status;
+        use zellij_utils::session_lifecycle::{build_verdict_of, identify_executable};
+        let scratch = tempfile::tempdir().unwrap();
+        let this = identify_executable(write(scratch.path(), "this", "one build"));
+        let other = identify_executable(write(scratch.path(), "other", "a longer, other build"));
+
+        let same = build_finding("work", &build_verdict_of(Some(&this), Some(&this)));
+        assert_eq!(same.status, Status::AlreadyCorrect);
+
+        let different = build_finding("work", &build_verdict_of(Some(&this), Some(&other)));
+        assert_eq!(different.status, Status::NeedsYou);
+        assert!(
+            different.message.contains("different build"),
+            "{:?}",
+            different
+        );
+
+        // no server identity: the case that used to read as "this build"
+        let unread = build_finding("work", &build_verdict_of(Some(&this), None));
+        assert_eq!(unread.status, Status::NeedsYou);
+        assert!(unread.message.starts_with("cannot tell"), "{:?}", unread);
+        assert!(unread.notes[0].contains("server's executable could not be read"));
+
+        // two files of one size and no build id: Unknown from `compare_builds` itself
+        let twin = identify_executable(write(scratch.path(), "twin", "one build"));
+        let unknown = build_finding("work", &build_verdict_of(Some(&this), Some(&twin)));
+        assert_eq!(unknown.status, Status::NeedsYou, "{:?}", unknown);
+        assert!(unknown.message.starts_with("cannot tell"), "{:?}", unknown);
     }
 
     #[test]

@@ -2619,6 +2619,58 @@ pub fn running_build() -> Option<&'static RunningBuild> {
         .as_ref()
 }
 
+/// Whether the server serving a session is this build, as a reader acts on it.
+///
+/// [`build_mismatch_warning`] answers only "is it different", so its silence covers two answers:
+/// the same build, and a comparison that could not be made. A report that turns that silence into
+/// "this build" claims something it never checked. This keeps the three apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildVerdict {
+    Same,
+    Different {
+        running: PathBuf,
+        this: PathBuf,
+    },
+    /// The comparison could not be made. The string says what could not be read.
+    CannotTell(String),
+}
+
+/// [`BuildVerdict`] for the session `name`, from this binary and the server serving it.
+pub fn build_verdict(name: &str) -> BuildVerdict {
+    build_verdict_of(own_executable().as_ref(), server_executable(name).as_ref())
+}
+
+/// [`build_verdict`] over identities already read, so each answer is provable without a server.
+pub fn build_verdict_of(
+    ours: Option<&ExecutableIdentity>,
+    theirs: Option<&ExecutableIdentity>,
+) -> BuildVerdict {
+    match (compare_builds(ours, theirs), ours, theirs) {
+        (BuildMatch::Same, ..) => BuildVerdict::Same,
+        (BuildMatch::Different, Some(ours), Some(theirs)) => BuildVerdict::Different {
+            running: theirs.path.clone(),
+            this: ours.path.clone(),
+        },
+        (_, None, _) => {
+            BuildVerdict::CannotTell("this binary's own executable could not be read".to_owned())
+        },
+        (_, _, None) => BuildVerdict::CannotTell(
+            "the running server's executable could not be read, or more than one server \
+             serves the name"
+                .to_owned(),
+        ),
+        (_, Some(ours), _) if ours.replaced => BuildVerdict::CannotTell(
+            "this binary's own file was replaced after it started, so there is nothing to \
+             compare against"
+                .to_owned(),
+        ),
+        _ => BuildVerdict::CannotTell(
+            "the two are different files, and neither a build id nor a size tells them apart"
+                .to_owned(),
+        ),
+    }
+}
+
 /// Whether this running server's own build has been superseded.
 ///
 /// A server keeps the binary it started with for the whole life of the session, so an upgrade

@@ -2695,6 +2695,25 @@ is how `ZELLIJ_CONFIG_DIR` arrives), else the default search. Until nkmk.24 the 
 default search alone while the load honoured `--config-dir`, so a doctor run under a scratch
 `ZELLIJ_CONFIG_DIR` reported the real config as the one that parsed.
 
+**nkmk.25, 2026-09-29: the `build` line says "cannot tell" when it cannot.** It used to be OK
+whenever `build_mismatch_warning` came back empty. That silence covers two answers: the same build,
+and a comparison that could not be made. So doctor said "the running server is this build" about a
+server whose executable it never read. `check_build` now asks `build_verdict`, which calls
+`compare_builds` directly. Only `Same` is OK. `Different` reads as before. A comparison that could
+not be made is its own `Needs you` line, the way an unanswered Full Disk Access probe is:
+
+```
+Needs you
+  build     cannot tell whether the running server is this build of zellij
+            the running server's executable could not be read, or more than one server serves the name
+            `zellij session restart work` puts it on this build either way
+```
+
+The note names what could not be read: this binary, the server's executable, this binary's own
+file replaced since it started, or two files that neither a build id nor a size tells apart. It
+costs a `BuildVerdict` enum beside `build_mismatch_warning` in `session_lifecycle`, and nothing on
+any contract.
+
 A leftover is narrow on purpose. A script in `~/bin` that merely calls zellij is a companion tool,
 not a fault, and a `zellij` there that resolves to this very binary is where zellij is installed —
 neither is reported. Two shapes are: a different build taking the name, and a script that sets
