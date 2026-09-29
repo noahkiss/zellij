@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    colorterm_for_new_session, env_vars_to_drop, lock_up, term_for_new_session,
-    warn_if_server_build_differs, DownOutcome, SessionFacts,
+    build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up, term_for_new_session,
+    warn_if_server_build_differs, BuildVerdict, DownOutcome, SessionFacts,
 };
 use zellij_utils::session_service::{
     self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
@@ -529,7 +529,9 @@ fn disable(name: &str, opts: &CliArgs) -> Result<(), ()> {
 /// Reporting them together as "ok" would hide exactly the case worth reporting.
 ///
 /// Exits 0 when the unit is installed AND loaded, whatever the session is doing - the session is
-/// the thing the unit repairs, and `zellij session up` is the command that reports on it.
+/// the thing the unit repairs, and `zellij session up` is the command that reports on it. Drift, a
+/// pin the launcher does not run, and a running server of another build each fail it too: each is a
+/// step still owed.
 ///
 /// The report goes through a handle rather than through `println!` so that a reader who stops
 /// reading ends it. See [`report_exit_code`].
@@ -647,12 +649,15 @@ fn print_status<W: Write + ?Sized>(
         Ok(()) => writeln!(out, "running   yes, in {}", facts.socket_dir.display())?,
         Err(reason) => writeln!(out, "running   no - {}", reason)?,
     }
+    let verdict = (!facts.our_servers().is_empty()).then(|| build_verdict(name));
+    let build_is_current = print_build(out, name, verdict.as_ref())?;
 
     // A pipe holds what has been written until the reader takes it, so the last line of the report
     // can still fail here rather than at the `writeln!` that produced it.
     out.flush()?;
 
-    let healthy = installed && status.loaded && pinned_agrees && unit_is_current;
+    let healthy =
+        installed && status.loaded && pinned_agrees && unit_is_current && build_is_current;
     Ok(if healthy { 0 } else { 1 })
 }
 
@@ -898,6 +903,47 @@ pub(crate) fn create_through_the_unit(name: &str, opts: &CliArgs) -> bool {
         name, name
     );
     false
+}
+
+/// The `build` line: whether the running server is this build, by the comparison doctor makes.
+///
+/// `Different` counts against the exit code, because a restart is owed and nothing else in this
+/// report says so. `CannotTell` does not: an unread identity is not proof of a stale server, and
+/// failing on it would fail every status taken while the server's executable is unreadable.
+/// `None` is no server of ours running, which leaves nothing to compare.
+fn print_build<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    verdict: Option<&BuildVerdict>,
+) -> io::Result<bool> {
+    match verdict {
+        None => {
+            writeln!(out, "build     no server running to compare")?;
+            Ok(true)
+        },
+        Some(BuildVerdict::Same) => {
+            writeln!(out, "build     the running server is this build")?;
+            Ok(true)
+        },
+        Some(BuildVerdict::Different { running, this }) => {
+            writeln!(
+                out,
+                "build     DIFFERENT - the server runs {}",
+                running.display()
+            )?;
+            writeln!(
+                out,
+                "build     this is {} - `zellij session restart {}` brings it onto this build",
+                this.display(),
+                name
+            )?;
+            Ok(false)
+        },
+        Some(BuildVerdict::CannotTell(reason)) => {
+            writeln!(out, "build     cannot tell - {}", reason)?;
+            Ok(true)
+        },
+    }
 }
 
 /// What the config's `pin_exe` and the installed unit say between them, and whether they agree.
@@ -1929,6 +1975,38 @@ mod tests {
         let failed = Err(io::Error::new(io::ErrorKind::PermissionDenied, "read-only"));
 
         assert_eq!(report_exit_code("session status", failed), 1);
+    }
+
+    /// The build line and its vote on the exit code: only a server known to run another build
+    /// fails the report. A comparison that could not be made is said, and does not fail it.
+    #[test]
+    fn the_build_line_fails_status_only_for_a_different_build() {
+        let line = |verdict: Option<&BuildVerdict>| {
+            let mut out = Vec::new();
+            let current = print_build(&mut out, "work", verdict).unwrap();
+            (String::from_utf8(out).unwrap(), current)
+        };
+
+        let (text, current) = line(Some(&BuildVerdict::Same));
+        assert_eq!(text, "build     the running server is this build\n");
+        assert!(current);
+
+        let (text, current) = line(Some(&BuildVerdict::Different {
+            running: PathBuf::from("/pin/zellij"),
+            this: PathBuf::from("/opt/zellij"),
+        }));
+        assert!(!current);
+        assert!(text.contains("the server runs /pin/zellij"), "{}", text);
+        assert!(text.contains("this is /opt/zellij"), "{}", text);
+        assert!(text.contains("zellij session restart work"), "{}", text);
+
+        let (text, current) = line(Some(&BuildVerdict::CannotTell("unreadable".to_owned())));
+        assert_eq!(text, "build     cannot tell - unreadable\n");
+        assert!(current);
+
+        let (text, current) = line(None);
+        assert_eq!(text, "build     no server running to compare\n");
+        assert!(current);
     }
 
     /// The negative control: routing the report through a handle must not stop it being written.

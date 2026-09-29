@@ -2142,6 +2142,22 @@ A file with no job was never loaded; a job with no session is a unit that is fai
 with no job will not come back. It exits 0 when the unit is installed and loaded, whatever the
 session is doing — repairing the session is the unit's job and `session up` is what reports on it.
 
+**nkmk.25, 2026-09-29: `status` gains a `build` line.** It reported the unit, the load, the pin,
+drift and whether the session runs, and nothing about which build serves it. That was left to
+`session doctor`, so a script reading `status` after an upgrade saw exit 0 while a restart was
+still owed. The line uses the comparison doctor's `build` line makes, `build_verdict`:
+
+```
+build     the running server is this build
+build     DIFFERENT - the server runs /Users/<user>/.local/share/zellij/bin/zellij
+build     this is /opt/homebrew/bin/zellij - `zellij session restart my-session` brings it onto this build
+build     cannot tell - the running server's executable could not be read, or more than one server serves the name
+build     no server running to compare
+```
+
+`DIFFERENT` fails the exit code, like drift and a pin mismatch: each is a step still owed. `cannot
+tell` does not, because an unread identity is not proof of a stale server. CLI-side only.
+
 **Linux gets a timer.** The plist has `StartInterval`, so macOS had a watchdog and Linux did not: a
 session that died overnight came back at the next login there and within a minute here. `enable`
 writes and enables a paired `.timer` at the same interval, `disable` removes both. One unit name
