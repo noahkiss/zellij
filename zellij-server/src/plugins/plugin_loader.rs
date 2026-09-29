@@ -35,7 +35,7 @@ use zellij_utils::{
     input::permission::PluginPermissions,
     input::plugins::PluginConfig,
     pane_size::Size,
-    session_lifecycle::own_executable_path,
+    session_lifecycle::{own_executable_path, running_build},
     session_service::{path_dirs, resolve_service_exe, ServiceExe},
 };
 
@@ -63,10 +63,19 @@ const FULL_DISK_ACCESS_HINT: &str = "full_disk_access";
 /// `current_exe()` is asked on the SERVER side on purpose: the about plugin exists to tell a macOS
 /// user which binary to hand Full Disk Access to, and TCC grants follow the process that actually
 /// opens the file - the server - never the client that launched it.
+///
+/// The path comes from the build the server recorded at startup when there is one. On Linux a
+/// server whose about page is first opened after a pin refresh would otherwise cache the path with
+/// a " (deleted)" suffix.
 fn server_exe_path() -> Option<&'static str> {
     static SERVER_EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     SERVER_EXE
-        .get_or_init(|| own_executable_path().map(|path| path.display().to_string()))
+        .get_or_init(|| {
+            running_build()
+                .map(|build| build.path().to_path_buf())
+                .or_else(own_executable_path)
+                .map(|path| path.display().to_string())
+        })
         .as_deref()
 }
 

@@ -3975,6 +3975,39 @@ rule above stays silent. There — and only there — the binary on `PATH` is th
 that copy, so it is what gets compared. Once the refresh runs it renames over the pinned path, which
 unlinks the file the server started from, and the ` (deleted)` rule answers on its own.
 
+**The server knows the build it started as (nkmk.25, 2026-09-29).** The paragraphs above held on
+Linux only by accident, and never on macOS. With `pin_exe` on, the launcher runs the pin and the
+unit puts the pin directory first on the server's `PATH`. An upgrade renames a new build over the pin
+under the live server:
+
+| Platform | What the server saw | Badge |
+|---|---|---|
+| Linux | `current_exe()` is `<pin> (deleted)` | lit, through the suffix alone |
+| macOS | `current_exe()` is the pin, which exists again and holds the new build | never lit |
+
+On macOS the server read its own identity off the new file and compared the new pin with itself.
+The pin rule was broken on both platforms: it took the first `zellij` on `PATH`, and that was the
+pin itself.
+
+The server now records its identity once, at startup, before anything can write over the file: the
+canonical path with any ` (deleted)` suffix removed, the identity read off it, its mtime, and the
+session socket. Each 30-second tick asks four rules of that record, in order:
+
+1. the start path no longer exists;
+2. the file at the start path was written after the socket was bound, and no longer carries the
+   mtime recorded at startup. Without a socket the snapshot's own time is the reference;
+3. the file at the start path is a different build from the recorded one;
+4. the start path is the pin, and the first `zellij` on `PATH` that is not the pin and not in the
+   pin's directory is a different build from the recorded one.
+
+Rule 2 is the one that lights the badge on macOS. The about page's server path comes from the same
+record, so a Linux server whose page is first opened after a refresh no longer shows ` (deleted)`.
+It costs one `stat` of the executable and one of the socket per tick, plus the read the rules
+already made. `zellij-utils/src/session_lifecycle.rs` holds the record and the rules;
+`zellij-server` records it in `start_server` and reads it in the loader and the warnings. Six unit
+tests: a rewrite after the socket, an untouched file, a removed file, a newer build past the pin, a
+`PATH` that leads only to the pin, and the badge lit through the warnings.
+
 ### The keybind bar says whether Full Disk Access is still there
 
 The vitals cluster `slim-keybinds` draws gets one more segment, at the right-hand end:
