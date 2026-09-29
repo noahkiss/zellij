@@ -1283,6 +1283,11 @@ pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
 
     info!("Starting Zellij server!");
 
+    // Record the build this server started as, while the file at its path is still that build.
+    // An upgrade can rename a new build over it at any moment after this, and the superseded-build
+    // badge and the about page both need the identity from before that happens.
+    zellij_utils::session_lifecycle::record_running_build(socket_path.clone());
+
     // Before anything opens a descriptor, and while this is still the only thread. Only the real
     // server process does this -- the in-process server the integration tests run must not touch
     // the harness's limits.

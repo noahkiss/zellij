@@ -14,7 +14,7 @@
 //! and shipping the answer as [`SessionWarning`] values costs one probe per session per tick, no
 //! matter how many bars draw it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use zellij_utils::data::SessionWarning;
 use zellij_utils::session_lifecycle::{build_is_superseded, full_disk_access_missing};
@@ -57,7 +57,15 @@ fn settings() -> WarningSettings {
 /// Asked fresh every time rather than cached: both answers change under a running server - an FDA
 /// toggle takes effect immediately, and an upgrade can replace the binary at any moment.
 pub fn current_warnings() -> Vec<SessionWarning> {
-    let settings = settings();
+    warnings_for(&settings(), build_is_superseded)
+}
+
+/// [`current_warnings`], with the build question passed in so a test can ask it of a scratch build
+/// instead of the process-global one.
+fn warnings_for(
+    settings: &WarningSettings,
+    build_is_superseded: impl FnOnce(Option<&Path>) -> bool,
+) -> Vec<SessionWarning> {
     let mut warnings = vec![];
     if settings.stale_build_notice && build_is_superseded(settings.pinned_exe.as_deref()) {
         warnings.push(SessionWarning::SupersededBuild);

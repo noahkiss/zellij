@@ -2498,58 +2498,183 @@ pub fn build_mismatch_warning(name: &str) -> Option<String> {
     ))
 }
 
+/// The build this process started as, taken once, before anything can write over it.
+///
+/// **The badge needs this because the file cannot be trusted later.** An upgrade with `pin_exe` on
+/// renames a new build over the pin under the live server. Linux then reports the old path with a
+/// " (deleted)" suffix, but macOS reports the exec-time path, which exists again and holds the NEW
+/// build. Every identity read off that path afterwards describes a build nobody is running, so a
+/// server that reads its own identity late compares the new pin with itself and says `Same`.
+#[derive(Debug, Clone)]
+pub struct RunningBuild {
+    /// The executable as it was at startup: canonical path, inode, stamp and size.
+    pub identity: ExecutableIdentity,
+    /// The session socket the server binds as it comes up. Its mtime marks the start.
+    pub socket: Option<PathBuf>,
+    /// When the snapshot was taken. The reference when there is no socket to read.
+    pub taken_at: std::time::SystemTime,
+    /// The executable's mtime at startup. A file still carrying it has not been rewritten.
+    pub modified_at_start: Option<std::time::SystemTime>,
+}
+
+impl RunningBuild {
+    /// Identify the executable at `path` now, for a server whose socket is `socket`.
+    pub fn taken_now(path: PathBuf, socket: Option<PathBuf>) -> Self {
+        let identity = identify_executable(path);
+        let modified_at_start = if identity.replaced {
+            None
+        } else {
+            modified_time(&identity.path)
+        };
+        RunningBuild {
+            identity,
+            socket,
+            taken_at: std::time::SystemTime::now(),
+            modified_at_start,
+        }
+    }
+
+    /// The canonical path this process started from, without any " (deleted)" suffix.
+    pub fn path(&self) -> &Path {
+        &self.identity.path
+    }
+}
+
+static RUNNING_BUILD: std::sync::OnceLock<Option<RunningBuild>> = std::sync::OnceLock::new();
+
+/// Record the build this server started as. Call it once, at server startup, before any thread
+/// can ask. Only the first call counts.
+pub fn record_running_build(socket: PathBuf) {
+    if let Ok(path) = std::env::current_exe() {
+        let _ = RUNNING_BUILD.set(Some(RunningBuild::taken_now(path, Some(socket))));
+    }
+}
+
+/// The build this process started as.
+///
+/// A process that never called [`record_running_build`] - a test, a client - gets a snapshot
+/// taken on first ask. That is exact until something writes over the file, which is the best a
+/// late snapshot can do.
+pub fn running_build() -> Option<&'static RunningBuild> {
+    RUNNING_BUILD
+        .get_or_init(|| {
+            std::env::current_exe()
+                .ok()
+                .map(|path| RunningBuild::taken_now(path, None))
+        })
+        .as_ref()
+}
+
 /// Whether this running server's own build has been superseded.
 ///
 /// A server keeps the binary it started with for the whole life of the session, so an upgrade
 /// reaches nothing until the session is restarted - and nothing else says so, which is how a
 /// machine sits on a superseded build for days while everyone believes the upgrade took effect.
 ///
-/// Asked of the path this server was STARTED FROM, which is what makes the answer trustworthy
-/// rather than a guess: the file being gone, or holding a different build than the one running, is
-/// proof that what is installed there is no longer what is running. Comparing against whatever
-/// `zellij` happens to be on `PATH` would call a deliberately-mixed setup stale forever.
-///
-/// The one addition is for [`pin_exe`](crate::session_service::configured_pinned_exe): an upgrade
-/// reaches the pinned copy only when something runs `session up`, so between the two the pinned
-/// path still holds the build the server is running and rule two stays silent. There the binary on
-/// `PATH` is the intended source of that copy, so it is the right thing to compare against. Once
-/// the refresh does happen it renames over the pinned path, which unlinks the file this server
-/// started from - and rule one answers.
+/// Asked of the path this server was STARTED FROM, against the identity recorded at startup by
+/// [`record_running_build`]. See [`build_superseded_since`] for the rules.
 pub fn build_is_superseded(pinned_exe: Option<&Path>) -> bool {
-    inner_build_is_superseded(pinned_exe).unwrap_or(false)
+    running_build().map_or(false, |build| {
+        build_superseded_since(build, pinned_exe, &crate::session_service::path_dirs())
+    })
 }
 
-fn inner_build_is_superseded(pinned_exe: Option<&Path>) -> Option<bool> {
-    let running_path = std::env::current_exe().ok()?;
-    let running = own_executable()?;
+/// Whether `build` is no longer what is installed, with `path_dirs` standing in for `PATH`.
+///
+/// Four rules, in order. Each one that holds answers `true`:
+///
+/// 1. the path the server started from no longer exists. The upgrade took the whole versioned
+///    directory with it;
+/// 2. the file at that path was written after the server started: its mtime is newer than the
+///    socket's, or than the snapshot when there is no socket, and differs from the mtime recorded
+///    at startup. This is the rule that catches a pin refreshed under the server on macOS;
+/// 3. the file at that path is a different build from the one recorded at startup;
+/// 4. the path is the configured pin, and the first `zellij` on `PATH` past the pin
+///    ([`installed_beside`]) is a different build from the one recorded at startup. An upgrade
+///    reaches the pin only when something runs `session up`, so between the two the pin still
+///    holds the running build and rules 1 to 3 stay silent.
+///
+/// Rule 4 applies to the pin alone. Comparing an unpinned server against whatever `zellij` is on
+/// `PATH` would call a deliberately-mixed setup stale forever.
+pub fn build_superseded_since(
+    build: &RunningBuild,
+    pinned_exe: Option<&Path>,
+    path_dirs: &[PathBuf],
+) -> bool {
+    let started_from = build.path();
+    if !started_from.exists() {
+        return true;
+    }
+    if rewritten_since_start(build) {
+        return true;
+    }
+    let there_now = identify_executable(started_from.to_path_buf());
+    if compare_builds(Some(&build.identity), Some(&there_now)) == BuildMatch::Different {
+        return true;
+    }
+    if pinned_exe.map_or(false, |pinned| same_executable_path(pinned, started_from)) {
+        return installed_beside_in(started_from, path_dirs).map_or(false, |installed| {
+            compare_builds(Some(&build.identity), Some(&installed)) == BuildMatch::Different
+        });
+    }
+    false
+}
 
-    let superseded = if !running_path.exists() {
-        // the upgrade took the whole versioned directory with it
-        true
-    } else if compare_builds(
-        Some(&running),
-        Some(&identify_executable(running_path.clone())),
-    ) == BuildMatch::Different
-    {
-        true
-    } else if pinned_exe.map_or(false, |pinned| same_executable_path(pinned, &running_path)) {
-        installed_on_path(&running_path).map_or(false, |installed| {
-            compare_builds(Some(&running), Some(&installed)) == BuildMatch::Different
-        })
-    } else {
-        false
+/// Rule 2 of [`build_superseded_since`]: the file at the start path was written after the server
+/// started.
+///
+/// The same reference [`written_after_the_server_started`] uses, with two additions a server can
+/// afford. It knows its own start time, so a missing socket still leaves a reference. And it knows
+/// the mtime the file had at startup, so a file stamped in the future by an archive is not called
+/// rewritten while it still carries that stamp.
+fn rewritten_since_start(build: &RunningBuild) -> bool {
+    if build.identity.replaced {
+        return false;
+    }
+    let Some(written) = modified_time(build.path()) else {
+        return false;
     };
-
-    Some(superseded)
+    if Some(written) == build.modified_at_start {
+        return false;
+    }
+    let reference = build
+        .socket
+        .as_deref()
+        .and_then(modified_time)
+        .unwrap_or(build.taken_at);
+    written > reference
 }
 
-/// The build of the `PATH` entry that shares this binary's file name, if there is one.
-fn installed_on_path(running_path: &Path) -> Option<ExecutableIdentity> {
-    let name = running_path.file_name()?;
-    crate::session_service::path_dirs()
-        .into_iter()
+/// The build of the first `zellij` on `PATH` that is not `running` itself.
+///
+/// It skips any entry that is the same file as `running`, and any entry inside `running`'s
+/// directory. The generated unit puts the pin directory FIRST on the server's `PATH`, so without
+/// the skip this finds the pin and compares the pin with itself.
+pub fn installed_beside(running: &Path) -> Option<ExecutableIdentity> {
+    installed_beside_in(running, &crate::session_service::path_dirs())
+}
+
+/// [`installed_beside`], with `path_dirs` standing in for `PATH`.
+pub fn installed_beside_in(running: &Path, path_dirs: &[PathBuf]) -> Option<ExecutableIdentity> {
+    let name = running.file_name()?;
+    let running = running
+        .canonicalize()
+        .unwrap_or_else(|_| running.to_path_buf());
+    let running_dir = running.parent();
+    path_dirs
+        .iter()
+        .filter(|dir| {
+            let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            Some(dir.as_path()) != running_dir
+        })
         .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+        .filter(|candidate| candidate.is_file())
+        .find(|candidate| {
+            let resolved = candidate
+                .canonicalize()
+                .unwrap_or_else(|_| candidate.clone());
+            resolved != running && resolved.parent() != running_dir
+        })
         .map(identify_executable)
 }
 
@@ -3718,6 +3843,93 @@ dev.zellij.session.mysession = {
             &identity,
             &scratch.path().join("gone")
         ));
+    }
+
+    /// A scratch "server": its executable written ten minutes ago, its socket five minutes ago,
+    /// and the snapshot the server would record at startup.
+    #[cfg(unix)]
+    fn a_started_server(dir: &Path, contents: &[u8]) -> (PathBuf, RunningBuild) {
+        let exe = dir.join("zellij");
+        std::fs::write(&exe, contents).unwrap();
+        written_seconds_ago(&exe, 600);
+        let socket = dir.join("mysession");
+        std::fs::write(&socket, b"").unwrap();
+        written_seconds_ago(&socket, 300);
+        let build = RunningBuild::taken_now(exe.clone(), Some(socket));
+        (exe, build)
+    }
+
+    /// The macOS shape of the bug: a new build renamed over the path the server started from.
+    /// The path exists again, so only the recorded identity and the mtime can tell.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_rewritten_after_the_server_started_is_superseded() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (exe, build) = a_started_server(scratch.path(), b"the build the server started as");
+        let newer = scratch.path().join("zellij-newer");
+        std::fs::write(&newer, b"the build the upgrade wrote").unwrap();
+        std::fs::rename(&newer, &exe).unwrap();
+        assert!(build_superseded_since(&build, None, &[]));
+    }
+
+    /// The ordinary session, which must stay quiet.
+    #[test]
+    #[cfg(unix)]
+    fn an_untouched_executable_is_not_superseded() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (exe, build) = a_started_server(scratch.path(), b"the build the server started as");
+        assert!(!build_superseded_since(&build, None, &[]));
+        assert!(!build_superseded_since(
+            &build,
+            Some(&exe),
+            &[scratch.path().to_path_buf()]
+        ));
+    }
+
+    /// Rule 1: the upgrade removed the file the server started from.
+    #[test]
+    #[cfg(unix)]
+    fn a_removed_executable_is_superseded() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (exe, build) = a_started_server(scratch.path(), b"the build the server started as");
+        std::fs::remove_file(&exe).unwrap();
+        assert!(build_superseded_since(&build, None, &[]));
+    }
+
+    /// Rule 4: the package upgraded, the pin has not been refreshed yet, and the unit puts the pin
+    /// directory first on PATH. The first `zellij` on PATH is the pin itself; the one that counts
+    /// is the one past it.
+    #[test]
+    #[cfg(unix)]
+    fn a_newer_build_past_the_pin_on_path_supersedes_it() {
+        let pin_dir = tempfile::tempdir().unwrap();
+        let (pin, build) = a_started_server(pin_dir.path(), b"the build the pin holds");
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(
+            package.path().join("zellij"),
+            b"the newer build the package manager installed",
+        )
+        .unwrap();
+        let path = [pin_dir.path().to_path_buf(), package.path().to_path_buf()];
+        assert!(build_superseded_since(&build, Some(&pin), &path));
+        assert_eq!(
+            installed_beside_in(&pin, &path).map(|found| found.path),
+            Some(package.path().join("zellij").canonicalize().unwrap())
+        );
+    }
+
+    /// A PATH that leads only to the pin, directly or through a symlink, has nothing to compare
+    /// the pin with, and says nothing.
+    #[test]
+    #[cfg(unix)]
+    fn a_path_that_leads_only_to_the_pin_says_nothing() {
+        let pin_dir = tempfile::tempdir().unwrap();
+        let (pin, build) = a_started_server(pin_dir.path(), b"the build the pin holds");
+        let bin = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&pin, bin.path().join("zellij")).unwrap();
+        let path = [pin_dir.path().to_path_buf(), bin.path().to_path_buf()];
+        assert_eq!(installed_beside_in(&pin, &path), None);
+        assert!(!build_superseded_since(&build, Some(&pin), &path));
     }
 
     #[test]
