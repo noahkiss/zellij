@@ -426,15 +426,16 @@ fn check_drift(
             "drift",
             "the installed unit is what this config would write",
         )),
-        Ok(UnitDrift::Drifted { paths }) => {
+        Ok(UnitDrift::Drifted { files }) => {
             let mut finding = Finding::needs_you(
                 "drift",
                 format!("`zellij session enable {}` would rewrite the install", name),
             );
-            for path in paths {
+            for file in files {
                 finding = finding.note(format!(
-                    "{} is not what this config writes now",
-                    path.display()
+                    "{} is not what this config writes now: {}",
+                    file.path.display(),
+                    file.differing_keys()
                 ));
             }
             if kind == ServiceKind::Launchd {

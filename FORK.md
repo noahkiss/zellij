@@ -1693,8 +1693,10 @@ and `systemd { service "Environment=PATH=…" }` each still replace it and are n
 it. A machine that wants to state its own `PATH` is unaffected by any of this.
 
 **The rollout caveat: a recorded value is a snapshot.** A unit enabled before this change carries
-the old narrow `PATH`, and nothing rewrites it in place — [the drift
-check](#the-config-and-the-installed-unit-are-compared) reports it, and the remedy is what it always
+the old narrow `PATH`, and nothing rewrites it in place. From nkmk.25 [the drift
+check](#the-config-and-the-installed-unit-are-compared) no longer reports it: drift reads the
+recorded `PATH` back rather than comparing it with the asking shell's (see [the read-back
+entry](#the-recorded-xdg_state_home-is-read-back-not-re-derived)). The remedy is what it always
 is:
 
 ```
@@ -1705,9 +1707,10 @@ zellij session restart <name>    # the server keeps the PATH it was created with
 Both halves are needed. A server's `PATH` is fixed for the life of the server, so rewriting the unit
 changes nothing until the session is created again. And the snapshot goes stale the same way
 afterwards: install a new package prefix, and the unit learns about it at the next `session enable`,
-not before. Drift is the mechanism that says so — regenerating from a shell whose `PATH` differs
-from the recorded one reports drift, and following that report is safe, because the rewrite records
-a real shell's `PATH`.
+not before. Until nkmk.25 drift said so, by regenerating from the asking shell's `PATH`. That was
+not safe: an SSH shell's thinner `PATH` read as drift, and following the report recorded it. Now
+`session enable` prints each key it changes, `PATH` among them, so a re-record is seen when it is
+made.
 
 ### The generated unit's `PATH` leads with the pin directory
 
@@ -2212,7 +2215,7 @@ pinned path the launcher does not run, and it is reported the same way.
 `status` gains a `drift` line, and drift counts against its exit code:
 
 ```
-drift     ~/.config/systemd/user/zellij-session-my-session.service is NOT what this config would write now
+drift     ~/.config/systemd/user/zellij-session-my-session.service is NOT what this config would write now: ExecStart differs
 drift     run `zellij session enable my-session` to rewrite and reload it
 ```
 
@@ -5316,6 +5319,33 @@ replaces was an `enable` silently dropping it.
 
 `zellij setup --generate-service` prints the same thing `enable` would install, so it reads the
 recorded value too.
+
+**nkmk.25, 2026-09-29: PATH and the launchd log paths are read back too.** The fix above covered
+one caller-derived value and left two. `session doctor` and `session status` run over SSH on a Mac
+reported the launch agent as "not what this config writes now". The same commands with the plist's
+own PATH said `drift none`. The comparison rendered PATH from the asking shell, and
+`StandardOutPath` and `StandardErrorPath` from its state directory. Following the report recorded
+the SSH shell's thinner PATH for the next server. With `managed_session` set, `session up` would
+have made that rewrite silently.
+
+Drift is now judged by `comparison_files`. It renders the unit from the config as before, but takes
+PATH and the two log paths from the unit already on disk, where it records them. The recorded PATH
+goes through the same hoist rule as a fresh one, so the same binary gives the same bytes and a new
+binary still leads with its own directory. `ProgramArguments`, TERM, the scheduling keys and every
+config extra are still rendered from the config, so a real change still reads as drift. `status`,
+`doctor`, `up`'s warning and `managed_session` all use it. systemd logs to the journal, so PATH is
+the only value it gains.
+
+Drift now names what differs. Doctor's note and the `status` line end in `ProgramArguments differs`
+or `PATH and TERM differ`, and `only its comments differ` when no key does. The key compare is
+line-based over the two formats this code writes: a systemd `Name=value` line, keyed by variable
+for `Environment=`, and a plist `<key>` with the element lines under it.
+
+An explicit `session enable` still records the calling shell's PATH. When it rewrites an existing
+unit it now prints each changed key, and PATH as `PATH: 14 entries -> 6 entries, first: <dir>`. A
+rewrite from a poor shell is visible when it happens. Cost: a new public `comparison_files`, a
+`files` field in place of `paths` on `UnitDrift::Drifted`, and a `changed` field on
+`EnableOutcome::Enabled`. All three are CLI-side; no contract or protobuf moves.
 
 ### `session disable` can finish over a half-install
 
