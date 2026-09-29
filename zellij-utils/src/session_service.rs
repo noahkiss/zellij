@@ -1414,9 +1414,29 @@ pub fn service_unit(
     extras: Option<&SessionServiceOptions>,
     state_home: Option<&Path>,
 ) -> String {
+    render_unit(
+        kind,
+        exe,
+        session,
+        extras,
+        state_home,
+        &RecordedEnv::default(),
+    )
+}
+
+/// [`service_unit`], with the environment values an installed unit already records put in place of
+/// this process's own. See [`RecordedEnv`].
+fn render_unit(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+    state_home: Option<&Path>,
+    recorded: &RecordedEnv,
+) -> String {
     match kind {
-        ServiceKind::Systemd => systemd_unit(exe, session, extras, state_home),
-        ServiceKind::Launchd => launchd_plist(exe, session, extras, state_home),
+        ServiceKind::Systemd => systemd_unit(exe, session, extras, state_home, recorded),
+        ServiceKind::Launchd => launchd_plist(exe, session, extras, state_home, recorded),
     }
 }
 
@@ -1618,17 +1638,38 @@ const PLATFORM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 ///
 /// It is a SNAPSHOT, so it goes stale: a PATH that changes after the install is not the one the
 /// unit carries until the next `session enable`. That is the same trade [`recorded_state_home`]
-/// makes and it is the reason `status` and `doctor` can report drift here - regenerating from a
-/// shell with a different PATH writes a different unit. Following that report is safe, because the
-/// rewrite records a real shell's PATH.
+/// makes. A shell with a different PATH would write a different unit, so drift is NOT judged from
+/// this: [`comparison_files`] re-reads the PATH the installed unit records. Judging it from the
+/// asking shell made an SSH shell report drift on a correct install, and following that report
+/// recorded the SSH shell's thinner PATH for the next server.
 fn service_path(exe: &Path) -> String {
+    service_path_from(exe, &path_dirs())
+}
+
+/// [`service_path`] over a given installing PATH, with this machine's pin directory.
+fn service_path_from(exe: &Path, installing: &[PathBuf]) -> String {
     // A machine that cannot say where its own data directory is has no pin directory to compare
     // against, and then every exe directory takes the second rule. That is the same trade
     // `configured_pinned_exe` makes: no pin, rather than a refused command.
     let pin_dir = canonical_pinned_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    service_path_over(exe, &path_dirs(), pin_dir.as_deref())
+    service_path_over(exe, installing, pin_dir.as_deref())
+}
+
+/// The PATH a unit rendered now carries: the one the installed unit records, else this process's.
+///
+/// The recorded one goes through the same rule as a fresh one. For the same `exe` that returns it
+/// unchanged, because the rule is idempotent over its own output. For a new `exe` it leads with the
+/// new directory, so a real change of binary still reads as drift in PATH as well as in the command.
+fn path_for_unit(exe: &Path, recorded: &RecordedEnv) -> String {
+    match &recorded.path {
+        Some(path) => {
+            let dirs: Vec<PathBuf> = path.split(':').map(PathBuf::from).collect();
+            service_path_from(exe, &dirs)
+        },
+        None => service_path(exe),
+    }
 }
 
 /// [`service_path`] over a given PATH and pin directory, so the rule is provable without touching
@@ -1693,25 +1734,89 @@ pub fn recorded_state_home() -> Option<PathBuf> {
 ///
 /// Pure, over the file's own bytes, so it is the same answer from any process.
 pub fn state_home_in_unit(kind: ServiceKind, contents: &str) -> Option<String> {
+    env_in_unit(kind, contents, "XDG_STATE_HOME")
+}
+
+/// The value a unit ALREADY ON DISK records for the environment variable `name`.
+///
+/// Pure, over the file's own bytes, so it is the same answer from any process. The systemd side
+/// undoes exactly what [`unit_quote`] does, and the launchd side what [`xml_escape`] does.
+pub fn env_in_unit(kind: ServiceKind, contents: &str, name: &str) -> Option<String> {
     match kind {
         ServiceKind::Systemd => contents.lines().find_map(|line| {
-            // `Environment=XDG_STATE_HOME=<path>`, with or without the quotes systemd accepts
+            // `Environment=NAME=<value>`, with or without the quotes systemd accepts
             let assignment = line.trim().strip_prefix("Environment=")?.trim();
-            let assignment = assignment
+            let assignment = match assignment
                 .strip_prefix('"')
                 .and_then(|rest| rest.strip_suffix('"'))
-                .unwrap_or(assignment);
-            Some(assignment.strip_prefix("XDG_STATE_HOME=")?.to_owned())
+            {
+                Some(quoted) => unit_unquote(quoted),
+                None => assignment.to_owned(),
+            };
+            Some(assignment.strip_prefix(name)?.strip_prefix('=')?.to_owned())
         }),
-        ServiceKind::Launchd => {
-            let after_key = contents.split("<key>XDG_STATE_HOME</key>").nth(1)?;
-            let value = after_key
-                .split("<string>")
-                .nth(1)?
-                .split("</string>")
-                .next()?;
-            Some(xml_unescape(value))
-        },
+        ServiceKind::Launchd => plist_string_after_key(contents, name),
+    }
+}
+
+/// The inverse of [`unit_quote`] for the text between its quotes: `\x` is `x`.
+fn unit_unquote(quoted: &str) -> String {
+    let mut unquoted = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                unquoted.push(escaped);
+            }
+        } else {
+            unquoted.push(c);
+        }
+    }
+    unquoted
+}
+
+/// The `<string>` that directly follows `<key>{key}</key>` in a plist this module wrote.
+///
+/// Only whitespace may sit between the two. A key whose value is not a string answers nothing,
+/// rather than the first string found further down the file.
+fn plist_string_after_key(contents: &str, key: &str) -> Option<String> {
+    let after_key = contents
+        .split(&format!("<key>{}</key>", xml_escape(key)))
+        .nth(1)?;
+    let value = after_key.trim_start().strip_prefix("<string>")?;
+    Some(xml_unescape(value.split("</string>").next()?))
+}
+
+/// The values an installed unit records about the shell that ran `session enable`.
+///
+/// Drift is judged against these, not against the shell that asks. A unit generated from an SSH
+/// shell's PATH differs from one generated from a terminal's, and neither is the unit being wrong.
+/// Each is `None` when the unit records nothing, and the renderer then falls back to this process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedEnv {
+    /// `PATH`, on both platforms.
+    pub path: Option<String>,
+    /// launchd's `StandardOutPath` and `StandardErrorPath`. They hang off the caller's state
+    /// directory, so a caller with another `XDG_STATE_HOME` renders other paths. systemd logs to
+    /// the journal and has no equivalent.
+    pub out_log: Option<String>,
+    pub err_log: Option<String>,
+}
+
+impl RecordedEnv {
+    /// Read the recorded values back out of a unit's own bytes.
+    pub fn in_unit(kind: ServiceKind, contents: &str) -> Self {
+        match kind {
+            ServiceKind::Systemd => RecordedEnv {
+                path: env_in_unit(kind, contents, "PATH"),
+                ..RecordedEnv::default()
+            },
+            ServiceKind::Launchd => RecordedEnv {
+                path: env_in_unit(kind, contents, "PATH"),
+                out_log: plist_string_after_key(contents, "StandardOutPath"),
+                err_log: plist_string_after_key(contents, "StandardErrorPath"),
+            },
+        }
     }
 }
 
@@ -1790,12 +1895,17 @@ fn systemd_unit(
     session: &str,
     extras: Option<&SessionServiceOptions>,
     state_home: Option<&Path>,
+    recorded: &RecordedEnv,
 ) -> String {
     let extras = extras.cloned().unwrap_or_default();
     // Defaults, not decisions: a config that sets its own TERM or PATH replaces these lines rather
     // than adding a second assignment of the same variable.
     let term = env_default(&extras.systemd.service, "TERM", crate::shared::DEFAULT_TERM);
-    let path = env_default(&extras.systemd.service, "PATH", &service_path(exe));
+    let path = env_default(
+        &extras.systemd.service,
+        "PATH",
+        &path_for_unit(exe, recorded),
+    );
     let state_home = state_home_directive(&extras.systemd.service, state_home);
     format!(
         "\
@@ -2003,6 +2113,7 @@ fn launchd_plist(
     session: &str,
     extras: Option<&SessionServiceOptions>,
     state_home: Option<&Path>,
+    recorded: &RecordedEnv,
 ) -> String {
     let mut extras = extras.cloned().unwrap_or_default();
     // Read before `launchd` is moved out below, and kept as the default `StartInterval` rather than
@@ -2028,13 +2139,17 @@ fn launchd_plist(
     let keyed_path = take_default_key(&mut keys, "PATH");
     let path = take_env_value(&mut env, "PATH")
         .or(keyed_path)
-        .unwrap_or_else(|| service_path(exe));
+        .unwrap_or_else(|| path_for_unit(exe, recorded));
     let working_directory =
         take_default_key(&mut keys, "WorkingDirectory").unwrap_or_else(launchd_working_directory);
     let (default_out, default_err) = launchd_log_paths(session);
+    // The config first, then what the installed plist records, then this process's state
+    // directory - which is the caller's `XDG_STATE_HOME`, and so not the same from every shell.
     let out_path = take_default_key(&mut keys, "StandardOutPath")
+        .or_else(|| recorded.out_log.clone())
         .unwrap_or_else(|| default_out.display().to_string());
     let err_path = take_default_key(&mut keys, "StandardErrorPath")
+        .or_else(|| recorded.err_log.clone())
         .unwrap_or_else(|| default_err.display().to_string());
     // The scheduling keys, which are defaults and not parts of the plist the generator owns: a
     // watchdog that should tick every five minutes rather than every minute is a local fact, and
@@ -2334,7 +2449,41 @@ pub fn service_files(
     session: &str,
     extras: Option<&SessionServiceOptions>,
 ) -> Result<Vec<ServiceFile>, String> {
+    rendered_files(kind, exe, session, extras, false)
+}
+
+/// The files to judge drift against: [`service_files`], except that a file already on disk lends
+/// the new rendering the environment values it records. See [`RecordedEnv`].
+///
+/// Everything the config decides is still rendered from the config, so a real change - another
+/// binary, another interval, an added directive - still reads as drift. What stops reading as drift
+/// is the asking shell's own PATH and state directory. Only an explicit `session enable` records
+/// those, and it names what it changed when it does.
+pub fn comparison_files(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> Result<Vec<ServiceFile>, String> {
+    rendered_files(kind, exe, session, extras, true)
+}
+
+fn rendered_files(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+    as_recorded: bool,
+) -> Result<Vec<ServiceFile>, String> {
     let dir = service_dir(kind)?;
+    let recorded = |path: &Path| -> RecordedEnv {
+        if !as_recorded {
+            return RecordedEnv::default();
+        }
+        std::fs::read_to_string(path)
+            .map(|on_disk| RecordedEnv::in_unit(kind, &on_disk))
+            .unwrap_or_default()
+    };
     // Resolved once, here, so that WRITING a unit and COMPARING against one both see the same
     // state root - and so that neither depends on whether the calling shell exports one.
     let state_home = state_home_for_unit(kind, session);
@@ -2343,11 +2492,13 @@ pub fn service_files(
         ServiceKind::Systemd => {
             let unit = systemd_service_name(session);
             let timer = systemd_timer_name(session);
+            let path = dir.join(&unit);
+            let recorded = recorded(&path);
             vec![
                 ServiceFile {
                     role: "service",
-                    path: dir.join(&unit),
-                    contents: service_unit(kind, exe, session, extras, state_home),
+                    path,
+                    contents: render_unit(kind, exe, session, extras, state_home, &recorded),
                     unit,
                 },
                 ServiceFile {
@@ -2360,11 +2511,12 @@ pub fn service_files(
         },
         ServiceKind::Launchd => {
             let label = launchd_label(session);
-            let file = format!("{}.plist", label);
+            let path = dir.join(format!("{}.plist", label));
+            let recorded = recorded(&path);
             vec![ServiceFile {
                 role: "agent",
-                path: dir.join(&file),
-                contents: service_unit(kind, exe, session, extras, state_home),
+                path,
+                contents: render_unit(kind, exe, session, extras, state_home, &recorded),
                 unit: label,
             }]
         },
@@ -2383,6 +2535,9 @@ pub enum EnableOutcome {
     AlreadyEnabled,
     Enabled {
         written: Vec<PathBuf>,
+        /// What changed in each file that was rewritten over an existing one, by key. Printed, so
+        /// that a rewrite from a shell with a thinner PATH is seen at the moment it is made.
+        changed: Vec<DriftedFile>,
         /// Jobs under another name that already keep this session up, installed beside all the
         /// same because `--force` said so. Never non-empty without it.
         beside: Vec<InstalledJob>,
@@ -2500,18 +2655,236 @@ pub enum UnitDrift {
     NotInstalled,
     /// Every file present is byte-for-byte what `session enable` would write now.
     Current,
-    /// A file present is not. Named, because the remedy is to rewrite exactly these.
-    Drifted { paths: Vec<PathBuf> },
+    /// A file present is not. Named, with the keys that differ, because the remedy is to rewrite
+    /// exactly these and the reader should see why first.
+    Drifted { files: Vec<DriftedFile> },
+}
+
+/// One file whose installed bytes differ from the rendering, and the keys that differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftedFile {
+    pub path: PathBuf,
+    /// Empty when only text outside any key differs - a comment a newer build words differently.
+    pub changes: Vec<KeyChange>,
+}
+
+impl DriftedFile {
+    /// The file compared as keys: what is on disk against what would be written.
+    fn between(path: &Path, on_disk: &str, rendered: &str) -> Self {
+        DriftedFile {
+            path: path.to_path_buf(),
+            changes: key_changes(on_disk, rendered),
+        }
+    }
+
+    /// "ProgramArguments differs", "PATH and TERM differ", or what differs when no key does.
+    pub fn differing_keys(&self) -> String {
+        let keys: Vec<&str> = self
+            .changes
+            .iter()
+            .map(|change| change.key.as_str())
+            .collect();
+        match keys.as_slice() {
+            [] => "only its comments differ".to_owned(),
+            [key] => format!("{} differs", key),
+            [rest @ .., last] => format!("{} and {} differ", rest.join(", "), last),
+        }
+    }
+}
+
+/// One key whose value differs between two renderings of a unit. `None` is a key that is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChange {
+    pub key: String,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+impl KeyChange {
+    /// One line for a person: `KEY: old -> new`, or `added` / `removed`.
+    ///
+    /// PATH is summarised, because two whole PATHs side by side are unreadable and the two facts
+    /// worth seeing are how long each is and what leads the new one.
+    pub fn describe(&self) -> String {
+        match (&self.old, &self.new) {
+            (Some(old), Some(new)) if self.key == "PATH" => format!(
+                "PATH: {} entries -> {} entries, first: {}",
+                old.split(':').count(),
+                new.split(':').count(),
+                new.split(':').next().unwrap_or_default()
+            ),
+            (Some(old), Some(new)) => format!("{}: {} -> {}", self.key, old, new),
+            (None, Some(new)) => format!("{}: added, {}", self.key, new),
+            (Some(old), None) => format!("{}: removed, was {}", self.key, old),
+            (None, None) => format!("{}: unchanged", self.key),
+        }
+    }
+}
+
+/// The keys of a unit this module wrote, in file order, each with its value as a person reads it.
+///
+/// Line-based, not a real parser, and that is enough because both formats are the ones
+/// [`systemd_unit`] and [`launchd_plist`] write: one directive or one plist element per line.
+///
+/// - **systemd**: every `Name=value` line outside a comment. `Environment=` is keyed by the
+///   variable it sets, so PATH, TERM and XDG_STATE_HOME are keys of their own.
+/// - **launchd**: every `<key>`, with the element lines up to the next key as its value. Inside
+///   `EnvironmentVariables` the variable name is the key; any other nested key is `Parent.Key`.
+///   A string's value is its text, and an array's is its strings joined by spaces.
+///
+/// A key that repeats keeps every value, so a directive written twice compares as a list.
+fn unit_keys(contents: &str) -> Vec<(String, String)> {
+    let is_plist = contents.trim_start().starts_with("<?xml") || contents.contains("<plist");
+    if is_plist {
+        plist_keys(contents)
+    } else {
+        contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with(';'))
+            .filter_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                if name == "Environment" {
+                    let assignment = match value
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.strip_suffix('"'))
+                    {
+                        Some(quoted) => unit_unquote(quoted),
+                        None => value.to_owned(),
+                    };
+                    let (var, value) = assignment.split_once('=')?;
+                    Some((var.to_owned(), value.to_owned()))
+                } else {
+                    Some((name.to_owned(), value.to_owned()))
+                }
+            })
+            .collect()
+    }
+}
+
+fn plist_keys(contents: &str) -> Vec<(String, String)> {
+    let mut keys: Vec<(String, Vec<String>)> = Vec::new();
+    // the key whose value the next element lines belong to
+    let mut current: Option<usize> = None;
+    // the key each open `<dict>` is the value of, `None` for the top-level one
+    let mut parents: Vec<Option<String>> = Vec::new();
+    let mut in_comment = false;
+    for line in contents.lines().map(str::trim) {
+        if in_comment {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if line.starts_with("<!--") {
+            in_comment = !line.contains("-->");
+            continue;
+        }
+        if line.starts_with("<?xml")
+            || line.starts_with("<!DOCTYPE")
+            || line.starts_with("<plist")
+            || line == "</plist>"
+            || line.is_empty()
+        {
+            continue;
+        }
+        if let Some(name) = line
+            .strip_prefix("<key>")
+            .and_then(|rest| rest.strip_suffix("</key>"))
+        {
+            let name = xml_unescape(name);
+            let name = match parents.last() {
+                Some(Some(parent)) if parent != "EnvironmentVariables" => {
+                    format!("{}.{}", parent, name)
+                },
+                _ => name,
+            };
+            keys.push((name, Vec::new()));
+            current = Some(keys.len() - 1);
+            continue;
+        }
+        if line == "<dict>" {
+            parents.push(current.map(|index| keys[index].0.clone()));
+            current = None;
+            continue;
+        }
+        if line == "</dict>" {
+            // back to the key that owns the dictionary, for a dictionary inside an array
+            let owner = parents.pop().flatten();
+            current = owner.and_then(|owner| keys.iter().rposition(|(name, _)| *name == owner));
+            continue;
+        }
+        if let Some(index) = current {
+            if let Some(text) = line
+                .strip_prefix("<string>")
+                .and_then(|rest| rest.strip_suffix("</string>"))
+            {
+                keys[index].1.push(xml_unescape(text));
+            } else if let Some(number) = line
+                .strip_prefix("<integer>")
+                .and_then(|rest| rest.strip_suffix("</integer>"))
+            {
+                keys[index].1.push(number.to_owned());
+            } else if line == "<true/>" || line == "<false/>" {
+                keys[index]
+                    .1
+                    .push(line.trim_matches(&['<', '/', '>'][..]).to_owned());
+            }
+            // `<array>` and `</array>` carry nothing of their own
+        }
+    }
+    keys.into_iter()
+        .map(|(name, values)| (name, values.join(" ")))
+        .collect()
+}
+
+/// The keys whose values differ between two renderings of a unit, in the order the new one has
+/// them, then any key only the old one has.
+pub fn key_changes(old: &str, new: &str) -> Vec<KeyChange> {
+    let collect = |contents: &str| {
+        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+        for (key, value) in unit_keys(contents) {
+            match grouped.iter_mut().find(|(name, _)| *name == key) {
+                Some((_, values)) => values.push(value),
+                None => grouped.push((key, vec![value])),
+            }
+        }
+        grouped
+    };
+    let old = collect(old);
+    let new = collect(new);
+    let lookup = |grouped: &[(String, Vec<String>)], key: &str| {
+        grouped
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, values)| values.join("; "))
+    };
+    let mut changes: Vec<KeyChange> = Vec::new();
+    for (key, _) in new.iter().chain(old.iter()) {
+        if changes.iter().any(|change| change.key == *key) {
+            continue;
+        }
+        let (was, now) = (lookup(&old, key), lookup(&new, key));
+        if was != now {
+            changes.push(KeyChange {
+                key: key.clone(),
+                old: was,
+                new: now,
+            });
+        }
+    }
+    changes
 }
 
 /// Compare the installed files against the ones this config would generate.
+///
+/// Against [`comparison_files`], so the answer is the same from any shell: the environment values
+/// the installed unit records are not judged against the asking shell's own.
 pub fn unit_drift(
     kind: ServiceKind,
     exe: &Path,
     session: &str,
     extras: Option<&SessionServiceOptions>,
 ) -> Result<UnitDrift, String> {
-    Ok(drift_of(&service_files(kind, exe, session, extras)?))
+    Ok(drift_of(&comparison_files(kind, exe, session, extras)?))
 }
 
 /// The comparison itself, over files that already carry both halves: what is on disk, and what
@@ -2521,15 +2894,18 @@ pub fn drift_of(files: &[ServiceFile]) -> UnitDrift {
     if present.is_empty() {
         return UnitDrift::NotInstalled;
     }
-    let paths: Vec<PathBuf> = present
+    let drifted: Vec<DriftedFile> = present
         .iter()
-        .filter(|file| !file.is_current())
-        .map(|file| file.path.clone())
+        .filter_map(|file| {
+            let on_disk = std::fs::read_to_string(&file.path).ok()?;
+            (on_disk != file.contents)
+                .then(|| DriftedFile::between(&file.path, &on_disk, &file.contents))
+        })
         .collect();
-    if paths.is_empty() {
+    if drifted.is_empty() {
         UnitDrift::Current
     } else {
-        UnitDrift::Drifted { paths }
+        UnitDrift::Drifted { files: drifted }
     }
 }
 
@@ -2566,9 +2942,13 @@ pub fn enable(
     }
 
     let mut written = Vec::new();
+    let mut changed = Vec::new();
     for file in &files {
         if file.is_current() {
             continue;
+        }
+        if let Ok(on_disk) = std::fs::read_to_string(&file.path) {
+            changed.push(DriftedFile::between(&file.path, &on_disk, &file.contents));
         }
         ensure_dir(file.path.parent())?;
         std::fs::write(&file.path, &file.contents)
@@ -2576,7 +2956,11 @@ pub fn enable(
         written.push(file.path.clone());
     }
     load_job(&files)?;
-    Ok(EnableOutcome::Enabled { written, beside })
+    Ok(EnableOutcome::Enabled {
+        written,
+        changed,
+        beside,
+    })
 }
 
 /// Make sure launchd can open the log paths the plist names.
@@ -2676,7 +3060,8 @@ pub fn status(
     session: &str,
     extras: Option<&SessionServiceOptions>,
 ) -> Result<ServiceStatus, String> {
-    let files = service_files(kind, exe, session, extras)?;
+    // The comparison rendering, so `stale` agrees with the drift line printed beside it.
+    let files = comparison_files(kind, exe, session, extras)?;
     let installed_as = jobs_under_another_name(kind, session);
     let timer_installed_as = timer_under_another_name(kind, session, installed_as.first());
     let (loaded, load_detail) = job_load_state(&files, &installed_as, timer_installed_as.as_ref());
@@ -3178,7 +3563,148 @@ mod tests {
         // job is internally fine, and only the comparison says anything
         let dir = tempfile::TempDir::new().unwrap();
         let files = installed_unit(&dir, Some("[Service]\nNice=-5\n"), "[Service]\n");
-        assert!(matches!(drift_of(&files), UnitDrift::Drifted { .. }));
+        match drift_of(&files) {
+            UnitDrift::Drifted { files } => {
+                assert_eq!(files[0].differing_keys(), "Nice differs");
+                assert_eq!(files[0].changes[0].describe(), "Nice: removed, was -5");
+            },
+            other => panic!("expected drift, got {:?}", other),
+        }
+    }
+
+    /// An install whose file on disk is `on_disk`, compared the way [`comparison_files`] compares
+    /// it: rendered for `exe` with the environment values that file records.
+    fn compared_install(
+        dir: &tempfile::TempDir,
+        kind: ServiceKind,
+        exe: &Path,
+        on_disk: &str,
+    ) -> Vec<ServiceFile> {
+        let path = dir.path().join("unit");
+        std::fs::write(&path, on_disk).unwrap();
+        vec![ServiceFile {
+            role: "service",
+            unit: "unit".to_owned(),
+            path,
+            contents: render_unit(
+                kind,
+                exe,
+                "work",
+                None,
+                None,
+                &RecordedEnv::in_unit(kind, on_disk),
+            ),
+        }]
+    }
+
+    /// The fault found on a real Mac: doctor over SSH said the agent "is not what this config
+    /// writes now", and the same command with the plist's own PATH said `drift none`. The unit was
+    /// right. Only the asking shell differed, and following the report would have recorded the SSH
+    /// shell's PATH for the next server.
+    #[test]
+    fn a_unit_recording_another_shells_path_has_not_drifted() {
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let recorded = RecordedEnv {
+                path: Some("/opt/terminal-only/bin:/usr/bin:/bin".to_owned()),
+                ..RecordedEnv::default()
+            };
+            let on_disk = render_unit(kind, &exe(), "work", None, None, &recorded);
+            // the asking process renders another PATH, so the old whole-file compare said drift
+            assert_ne!(on_disk, service_unit(kind, &exe(), "work", None, None));
+            let files = compared_install(&dir, kind, &exe(), &on_disk);
+            assert_eq!(drift_of(&files), UnitDrift::Current, "{:?}", kind);
+        }
+    }
+
+    #[test]
+    fn a_unit_recording_other_log_paths_has_not_drifted() {
+        // launchd's log paths hang off the caller's state directory, so a shell with another
+        // XDG_STATE_HOME rendered other paths and reported drift on a correct install
+        let dir = tempfile::TempDir::new().unwrap();
+        let recorded = RecordedEnv {
+            path: None,
+            out_log: Some("/elsewhere/state/zellij/session-work.out.log".to_owned()),
+            err_log: Some("/elsewhere/state/zellij/session-work.err.log".to_owned()),
+        };
+        let on_disk = render_unit(ServiceKind::Launchd, &exe(), "work", None, None, &recorded);
+        let files = compared_install(&dir, ServiceKind::Launchd, &exe(), &on_disk);
+        assert_eq!(drift_of(&files), UnitDrift::Current);
+        assert_eq!(
+            RecordedEnv::in_unit(ServiceKind::Launchd, &on_disk).out_log,
+            recorded.out_log
+        );
+    }
+
+    #[test]
+    fn another_binary_is_still_drift_and_names_the_key() {
+        // the recorded environment is reused and nothing else is: a unit that execs another build
+        // is a real change, and the drift line says which key
+        let dir = tempfile::TempDir::new().unwrap();
+        let recorded = RecordedEnv {
+            path: Some("/usr/bin:/bin".to_owned()),
+            ..RecordedEnv::default()
+        };
+        let old_exe = PathBuf::from("/opt/old/zellij");
+        let on_disk = render_unit(
+            ServiceKind::Launchd,
+            &old_exe,
+            "work",
+            None,
+            None,
+            &recorded,
+        );
+        let files = compared_install(&dir, ServiceKind::Launchd, &exe(), &on_disk);
+        let UnitDrift::Drifted { files } = drift_of(&files) else {
+            panic!("a changed binary must read as drift");
+        };
+        let keys: Vec<&str> = files[0].changes.iter().map(|c| c.key.as_str()).collect();
+        assert!(keys.contains(&"ProgramArguments"), "{:?}", keys);
+        assert!(files[0].differing_keys().contains("ProgramArguments"));
+        let arguments = files[0]
+            .changes
+            .iter()
+            .find(|change| change.key == "ProgramArguments")
+            .unwrap();
+        assert_eq!(
+            arguments.describe(),
+            "ProgramArguments: /opt/old/zellij session up work -> /usr/local/bin/zellij session up work"
+        );
+    }
+
+    #[test]
+    fn a_systemd_exec_change_is_named_by_directive() {
+        let old = "# a comment\n[Service]\nEnvironment=\"PATH=/a:/b\"\nExecStart=\"/old/zellij\" session up \"work\"\n";
+        let new = "# another comment\n[Service]\nEnvironment=\"PATH=/c:/a:/b\"\nExecStart=\"/new/zellij\" session up \"work\"\n";
+        let changes = key_changes(old, new);
+        let keys: Vec<&str> = changes.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, ["PATH", "ExecStart"]);
+        assert_eq!(
+            changes[0].describe(),
+            "PATH: 2 entries -> 3 entries, first: /c"
+        );
+    }
+
+    #[test]
+    fn a_comment_only_difference_names_no_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = installed_unit(&dir, Some("# old\n[Service]\n"), "# new\n[Service]\n");
+        let UnitDrift::Drifted { files } = drift_of(&files) else {
+            panic!("bytes differ, so it is drift");
+        };
+        assert_eq!(files[0].differing_keys(), "only its comments differ");
+    }
+
+    #[test]
+    fn a_recorded_value_survives_systemd_quoting() {
+        let unit = format!(
+            "Environment={}\n",
+            unit_quote("PATH=/opt/a \"b\"\\c:/usr/bin")
+        );
+        assert_eq!(
+            env_in_unit(ServiceKind::Systemd, &unit, "PATH").as_deref(),
+            Some("/opt/a \"b\"\\c:/usr/bin")
+        );
     }
 
     #[test]

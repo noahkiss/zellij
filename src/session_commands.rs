@@ -353,9 +353,26 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
             println!("ok    service for '{}' is already enabled", name);
             Ok(())
         },
-        Ok(EnableOutcome::Enabled { written, beside }) => {
+        Ok(EnableOutcome::Enabled {
+            written,
+            changed,
+            beside,
+        }) => {
             for path in written {
                 println!("      wrote {}", path.display());
+            }
+            // Named key by key, because this command records the CALLING shell's PATH and state
+            // directory. A rewrite from a shell with a thinner PATH is visible here, when it is
+            // made, rather than later as a command the server can no longer find.
+            for file in changed {
+                println!(
+                    "      {} changed: {}",
+                    file.path.display(),
+                    file.differing_keys()
+                );
+                for change in &file.changes {
+                    println!("        {}", change.describe());
+                }
             }
             // only reachable with --force: two launchers for one session race at login, and the
             // one that loses is left failed. Say so where the person who typed --force sees it.
@@ -694,12 +711,13 @@ fn print_unit_drift<W: Write + ?Sized>(
             )?;
             Ok(true)
         },
-        Ok(UnitDrift::Drifted { paths }) => {
-            for path in paths {
+        Ok(UnitDrift::Drifted { files }) => {
+            for file in files {
                 writeln!(
                     out,
-                    "drift     {} is NOT what this config would write now",
-                    path.display()
+                    "drift     {} is NOT what this config would write now: {}",
+                    file.path.display(),
+                    file.differing_keys()
                 )?;
             }
             writeln!(
@@ -743,17 +761,18 @@ fn warn_if_unit_drifted(name: &str, opts: &CliArgs) {
         let pinned = configured_pinned_exe(extras.as_ref());
         let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
         let exe = resolve_service_exe(None, pinned, &current_exe, &path_dirs());
-        let Ok(UnitDrift::Drifted { paths }) =
+        let Ok(UnitDrift::Drifted { files }) =
             session_service::unit_drift(kind, exe.path(), name, extras.as_ref())
         else {
             return;
         };
-        for path in paths {
+        for file in files {
             eprintln!(
-                "warning: {} is not what `zellij session enable` would write now, so the loaded\n         \
-                 job is running an older definition. Run `zellij session enable {}` to bring\n         \
+                "warning: {} is not what `zellij session enable` would write now ({}), so the\n         \
+                 loaded job is running an older definition. Run `zellij session enable {}` to bring\n         \
                  them back together - a config edit does not reach a unit that was not rewritten.",
-                path.display(),
+                file.path.display(),
+                file.differing_keys(),
                 name
             );
         }
@@ -790,6 +809,9 @@ pub(crate) fn manage_the_unit(name: &str, opts: &CliArgs) {
         let pinned = configured_pinned_exe(extras.as_ref());
         let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
         let exe = resolve_service_exe(None, pinned, &current_exe, &path_dirs());
+        // `unit_drift` judges against what the installed unit records, not this shell's PATH or
+        // state directory. So an environment-only difference is not drift here, and this silent,
+        // automatic path never records a thinner PATH from whatever shell happened to run `up`.
         let reason = match session_service::unit_drift(kind, exe.path(), name, extras.as_ref()) {
             Ok(UnitDrift::NotInstalled) => "it has no unit",
             Ok(UnitDrift::Drifted { .. }) => "its unit is not what this config would write",
