@@ -550,6 +550,10 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
         );
         return;
     };
+    // doctor run from the pin cannot refresh it: the copy would be the pin onto itself
+    let doctor_is_the_pin = std::env::current_exe()
+        .ok()
+        .map_or(false, |exe| is_the_pin(&exe, pinned));
     match pin_state_of(name, pinned) {
         // and therefore `session up` runs FROM the pin, which is the state finding 2 is about: a
         // watchdog comparing the pin with itself. Said here because it reads as a clean bill of
@@ -560,10 +564,13 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
                     "so `session up` from the launcher compares the pin with itself and the \
                      watchdog cannot see a newer build",
                 )
-                .note(
+                .note(if doctor_is_the_pin {
                     "an upgrade reaches the pin from a zellij run off another path - an \
-                     interactive launch, or this command with --fix",
-                ),
+                     interactive launch, or `session doctor --fix` run from the installed build"
+                } else {
+                    "an upgrade reaches the pin from a zellij run off another path - an \
+                     interactive launch, or this command with --fix"
+                }),
         ),
         PinState::Unrecorded(path) => report.push(
             Finding::ok(
@@ -589,7 +596,73 @@ fn check_pin(report: &mut Report, name: &str, pinned: Option<&Path>, mode: Docto
         ),
     }
     check_pin_temps(report, pinned, mode);
-    check_pin_freshness(report, pinned, mode);
+    check_pin_freshness(report, name, pinned, mode);
+}
+
+/// Whether `exe` is the pinned copy itself, for paths that both exist.
+fn is_the_pin(exe: &Path, pinned: &Path) -> bool {
+    match (exe.canonicalize(), pinned.canonicalize()) {
+        (Ok(exe), Ok(pinned)) => exe == pinned,
+        _ => false,
+    }
+}
+
+/// The pin line for doctor run from the pin, which cannot compare the pin with this build.
+///
+/// The build to compare with is the one installed past the pin on `PATH`. The launcher puts the pin
+/// directory first, so the first `zellij` on `PATH` is the pin itself and says nothing.
+#[cfg(unix)]
+fn pin_judged_from_itself(name: &str, pinned: &Path, path_dirs: &[PathBuf]) -> Finding {
+    use zellij_utils::session_lifecycle::{
+        compare_builds, identify_executable, installed_beside_in, BuildMatch,
+    };
+
+    let pin = identify_executable(pinned.to_path_buf());
+    let Some(installed) = installed_beside_in(pinned, path_dirs) else {
+        return Finding::ok(
+            "pin",
+            format!(
+                "{} is this binary, so it cannot be judged from itself",
+                pinned.display()
+            ),
+        )
+        .note("no other `zellij` on PATH to compare it with");
+    };
+    match compare_builds(Some(&pin), Some(&installed)) {
+        BuildMatch::Different => Finding::needs_you(
+            "pin",
+            format!(
+                "{} holds an older build than the one installed at {}",
+                pinned.display(),
+                installed.path.display()
+            ),
+        )
+        .note(format!(
+            "`{} session restart {}` refreshes the pin from that build",
+            installed.path.display(),
+            name
+        ))
+        .note("this command runs from the pin, so --fix here would copy the pin onto itself"),
+        BuildMatch::Same => Finding::ok(
+            "pin",
+            format!(
+                "{} holds the build installed at {}",
+                pinned.display(),
+                installed.path.display()
+            ),
+        ),
+        BuildMatch::Unknown => Finding::ok(
+            "pin",
+            format!(
+                "{} is this binary, so it cannot be judged from itself",
+                pinned.display()
+            ),
+        )
+        .note(format!(
+            "the zellij at {} could not be told apart from it",
+            installed.path.display()
+        )),
+    }
 }
 
 /// The 40 MB copies a refresh that was killed part-way left in the pin directory.
@@ -683,7 +756,7 @@ fn megabytes(bytes: u64) -> String {
 /// pin is signed it differs from its source on purpose, and a comparison of the two files calls a
 /// signed pin stale forever.
 #[cfg(unix)]
-fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
+fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: DoctorMode) {
     use zellij_utils::session_lifecycle::{
         install_pinned_exe, pin_needs_refresh, this_build_is_a_release_candidate, PinOutcome,
     };
@@ -703,6 +776,11 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
         ));
         return;
     };
+    // run from the pin, "was made from this build" would be the pin compared with itself
+    if is_the_pin(&current_exe, pinned) {
+        report.push(pin_judged_from_itself(name, pinned, &path_dirs()));
+        return;
+    }
     // A missing pin is not a `Needs you` on either path. With `--fix` this run writes it, and a
     // report that both wrote the file and exited non-zero would be telling a script that somebody
     // still has to act; without `--fix` the line below already says the copy would be made.
@@ -790,7 +868,7 @@ fn check_pin_freshness(report: &mut Report, pinned: &Path, mode: DoctorMode) {
 }
 
 #[cfg(not(unix))]
-fn check_pin_freshness(_report: &mut Report, _pinned: &Path, _mode: DoctorMode) {}
+fn check_pin_freshness(_report: &mut Report, _name: &str, _pinned: &Path, _mode: DoctorMode) {}
 
 /// Whether the pin refresh belongs to the macOS signing transaction rather than to this step.
 ///
@@ -874,6 +952,66 @@ fn platform_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Doctor run from the pin, after the package upgraded and before the pin was refreshed. The
+    /// first `zellij` on PATH is the pin; the installed build is the one past it.
+    #[test]
+    #[cfg(unix)]
+    fn doctor_run_from_the_pin_names_the_newer_build_past_it() {
+        let pin_dir = tempfile::tempdir().unwrap();
+        let pin = write(pin_dir.path(), "zellij", "the build the pin holds");
+        let package = tempfile::tempdir().unwrap();
+        let installed = write(
+            package.path(),
+            "zellij",
+            "the newer build the package installed",
+        );
+        let path = [pin_dir.path().to_path_buf(), package.path().to_path_buf()];
+
+        let finding = pin_judged_from_itself("mysession", &pin, &path);
+        assert_eq!(
+            finding.status,
+            zellij_utils::session_doctor::Status::NeedsYou,
+            "{:?}",
+            finding
+        );
+        let installed = installed.canonicalize().unwrap();
+        assert!(
+            finding.message.contains(&installed.display().to_string()),
+            "{:?}",
+            finding
+        );
+        assert!(
+            finding
+                .notes
+                .iter()
+                .any(|note| note.contains("session restart mysession")),
+            "{:?}",
+            finding
+        );
+    }
+
+    /// With nothing past the pin on PATH there is nothing to judge it by, and doctor says so
+    /// rather than calling it fresh.
+    #[test]
+    #[cfg(unix)]
+    fn doctor_run_from_the_pin_with_nothing_past_it_does_not_call_it_fresh() {
+        let pin_dir = tempfile::tempdir().unwrap();
+        let pin = write(pin_dir.path(), "zellij", "the build the pin holds");
+        let finding = pin_judged_from_itself("mysession", &pin, &[pin_dir.path().to_path_buf()]);
+        assert_eq!(
+            finding.status,
+            zellij_utils::session_doctor::Status::AlreadyCorrect,
+            "{:?}",
+            finding
+        );
+        assert!(
+            finding.message.contains("cannot be judged"),
+            "{:?}",
+            finding
+        );
+        assert!(is_the_pin(&pin, &pin));
+    }
 
     fn write(directory: &Path, name: &str, contents: &str) -> PathBuf {
         let path = directory.join(name);

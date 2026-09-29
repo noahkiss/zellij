@@ -3088,6 +3088,26 @@ which rung produced the signature — and it is also the reason the first two we
 asked whether the requirement *read* correctly, which is a question a broken signature answers
 yes to.
 
+**Doctor run from the pin looks past the pin (nkmk.25, 2026-09-29).** With `pin_exe` on, the pin
+directory is first on `PATH`, so a bare `zellij session doctor` usually runs the pin itself. The
+`pin` line then compared the pin with itself and said it "was made from this build", which is true
+of every pin. After a package upgrade that line read as clean while the pin held the old build.
+
+Run from the pin, the line now asks the first `zellij` on `PATH` that is not the pin and not in the
+pin's directory, the same lookup the tab-bar badge uses:
+
+```
+Needs you
+  pin       <pin> holds an older build than the one installed at <package path>
+            `<package path> session restart mysession` refreshes the pin from that build
+            this command runs from the pin, so --fix here would copy the pin onto itself
+```
+
+With no such `zellij`, it says the pin cannot be judged from itself, and exits zero. The note on
+the launcher line no longer offers "this command with --fix" as the way to reach the pin when this
+command IS the pin, because that copy would be the pin onto itself. Two unit tests, on a scratch
+`PATH`: a newer build past the pin, and a `PATH` that holds only the pin.
+
 ### A missing `TMPDIR` is an error, not a panic
 
 ```
