@@ -376,6 +376,8 @@ async fn plan_in(
     {
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?));
     }
+    // before the session is asked anything: a handle the CLI would refuse is refused for free
+    chosen_handle(&read)?;
     let (tab, placement) = agent_tab(env, ambient_session).await;
     let argv = argv_in(tool, args, ambient_session, env, Some((&tab, placement)))?;
     if placement == TabPlacement::Existing {
@@ -388,6 +390,20 @@ async fn plan_in(
         name,
     });
     Ok(Call::MakingAgentTab { argv, rename })
+}
+
+/// The handle a create asked for, refused here by the rule the CLI's `--handle` applies.
+///
+/// The CLI would refuse it too, but only after a process was spawned to ask - and for an
+/// `agent_tab` create, after the session was asked about the tab first.
+fn chosen_handle(args: &Args) -> Result<Option<String>, String> {
+    match args.string("handle") {
+        Some(handle) => match zellij_utils::pane_handle::chosen_handle_error(&handle) {
+            Some(reason) => Err(reason),
+            None => Ok(Some(handle)),
+        },
+        None => Ok(None),
+    }
 }
 
 /// The name a created pane is given: the caller's own, or the command it runs.
@@ -594,7 +610,7 @@ fn argv_in(
                             rest.push(flag_value("--name", &name));
                         }
                     }
-                    if let Some(handle) = args.string("handle") {
+                    if let Some(handle) = chosen_handle(&args)? {
                         rest.push(flag_value("--handle", &handle));
                     }
                     if let Some(command) = command {
@@ -613,7 +629,7 @@ fn argv_in(
                     if let Some(name) = pane_name(&args) {
                         rest.push(flag_value("--name", &name));
                     }
-                    if let Some(handle) = args.string("handle") {
+                    if let Some(handle) = chosen_handle(&args)? {
                         rest.push(flag_value("--handle", &handle));
                     }
                     if args.flag("floating") {
@@ -1032,10 +1048,10 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_write_input",
-                json!({"pane": "3", "keys": "C-c"}),
+                json!({"pane": "3", "keys": "Ctrl c"}),
                 None
             ),
-            "action send-keys --pane-id 3 -- C-c"
+            "action send-keys --pane-id 3 -- Ctrl c"
         );
         assert_eq!(
             line(
@@ -1111,6 +1127,44 @@ mod tests {
             "-s work action new-pane --near-current-pane --name=cargo test --handle=test-run -- \
              /bin/zsh -c cargo test"
         );
+    }
+
+    #[test]
+    fn a_handle_the_cli_would_refuse_is_refused_before_anything_runs() {
+        // lowercase words joined by dashes, and still not a handle: it reads as plugin_1
+        let refused = refusal(
+            "zellij_create",
+            json!({"kind": "pane", "handle": "plugin-check"}),
+        );
+        assert!(
+            refused.contains("too close to the pane id"),
+            "got: {}",
+            refused
+        );
+        assert!(
+            refusal("zellij_create", json!({"kind": "pane", "handle": "Build"}))
+                .contains("lowercase")
+        );
+        assert!(line(
+            "zellij_create",
+            json!({"kind": "pane", "handle": "check-plugin"}),
+            None
+        )
+        .contains("--handle=check-plugin"));
+    }
+
+    #[tokio::test]
+    async fn an_agent_tab_create_refuses_a_bad_handle_before_asking_the_session() {
+        // `agent_tab` asks the session which tab it is in; a handle the CLI would refuse is
+        // refused first, so no process is spawned to find out what the answer already is
+        let call = plan_in(
+            "zellij_create",
+            &args(json!({"handle": "terminal-1"})),
+            Some("no-such-session-mcp-test"),
+            &a_shell_env(),
+        )
+        .await;
+        assert!(matches!(call, Err(reason) if reason.contains("too close to the pane id")));
     }
 
     #[test]
