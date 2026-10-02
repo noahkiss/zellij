@@ -676,8 +676,10 @@ pub enum Sessions {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself:
-        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// The handle to give the pane, instead of the two-word one it would name itself: up to
+        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
+        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
+        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
         /// error, and nothing is created
         #[clap(
             long,
@@ -745,8 +747,10 @@ pub enum Sessions {
         /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself:
-        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// The handle to give the pane, instead of the two-word one it would name itself: up to
+        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
+        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
+        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
         /// error, and nothing is created
         #[clap(long, value_parser = chosen_handle)]
         handle: Option<String>,
@@ -817,8 +821,10 @@ pub enum Sessions {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself:
-        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// The handle to give the pane, instead of the two-word one it would name itself: up to
+        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
+        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
+        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
         /// error, and nothing is created
         #[clap(long, value_parser = chosen_handle)]
         handle: Option<String>,
@@ -1584,8 +1590,11 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         name: Option<String>,
 
-        /// The handle to give the pane, instead of the two-word one it would name itself: lowercase
-        /// words joined by dashes, eg. build. A handle another live pane holds is an error
+        /// The handle to give the pane, instead of the two-word one it would name itself: up to
+        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
+        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
+        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
+        /// error, and nothing is created
         #[clap(
             long,
             value_parser = chosen_handle,
@@ -1800,8 +1809,10 @@ pub enum CliAction {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself:
-        /// lowercase words joined by dashes, eg. build. A handle another live pane holds is an
+        /// The handle to give the pane, instead of the two-word one it would name itself: up to
+        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
+        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
+        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
         /// error, and nothing is created
         #[clap(long, value_parser = chosen_handle)]
         handle: Option<String>,

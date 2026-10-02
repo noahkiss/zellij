@@ -264,7 +264,7 @@ pub const TOOLS: &[ToolSpec] = &[
         // `keys` presses keys and `text` writes characters, which are two verbs, not one with a
         // flag: a tool that multiplexes says what each of its commands returns
         reports: &["action send-keys", "action write-chars"],
-        tips: "keys goes through the key parser, so `Enter`, `C-c` and `Escape` mean those keys; \
+        tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
                text is written literally and presses nothing. Pass one or the other. This is the \
                cheap way to do more work in a pane you already made: reach for it before \
                zellij_create.",
@@ -285,8 +285,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action send-keys", "keys")),
-                describe: "The keys to press, space separated, each a modifier chain: `Enter`, \
-                           `C-c`, `Ctrl a`, `F1`.",
+                describe: "One key to press, after any modifiers, space separated: `Enter`, \
+                           `Ctrl c`, `Alt Shift x`, `F1`. Modifiers are Ctrl, Alt, Shift and Super; \
+                           `C-c` and `Ctrl-c` are not keys. One key per call.",
                 default: None,
             },
             ParamSpec {
@@ -1103,5 +1104,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_key_the_write_input_tool_names_is_one_the_key_parser_takes() {
+        use std::str::FromStr;
+        use zellij_utils::data::KeyWithModifier;
+        // the description used to teach `C-c` and `Escape`, and the CLI refused both. Every
+        // backticked span in what the tool says about keys is a key, except the spellings it
+        // names to warn against, which have to stay refused for the warning to be true
+        let not_keys = ["C-c", "Ctrl-c"];
+        let tool = TOOLS
+            .iter()
+            .find(|tool| tool.name == "zellij_write_input")
+            .unwrap();
+        let keys = tool.params.iter().find(|p| p.name == "keys").unwrap();
+        let said = format!("{} {}", tool.tips, param_description(keys));
+        let spans: Vec<&str> = said.split('`').skip(1).step_by(2).collect();
+        assert!(spans.len() >= 4, "found no examples in: {}", said);
+        for span in spans {
+            let parsed = KeyWithModifier::from_str(span);
+            if not_keys.contains(&span) {
+                assert!(
+                    parsed.is_err(),
+                    "`{}` is named as not a key, but parses",
+                    span
+                );
+            } else {
+                assert!(
+                    parsed.is_ok(),
+                    "`{}` is offered as a key, but does not parse",
+                    span
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_handle_flag_states_the_whole_rule_and_the_create_tool_carries_it() {
+        // `zellij_create` takes its `handle` text from `action new-pane --handle`, and that one
+        // flag kept the short help after the other four were fixed - so `plugin-check` still
+        // looked valid in the one place an agent reads it. Every `--handle` says the same thing.
+        let handles: Vec<(&str, &str)> = cli_surface::surface_commands()
+            .iter()
+            .filter_map(|command| {
+                command
+                    .arg("--handle")
+                    .map(|arg| (command.path.as_str(), arg.about.as_str()))
+            })
+            .collect();
+        assert!(handles.len() >= 5, "found only {:?}", handles);
+        for (path, about) in &handles {
+            assert!(
+                about.contains("cannot be terminal or plugin"),
+                "`zellij {} --handle` does not state the whole rule: {}",
+                path,
+                about
+            );
+        }
+        let create = TOOLS
+            .iter()
+            .find(|tool| tool.name == "zellij_create")
+            .unwrap();
+        let handle = create.params.iter().find(|p| p.name == "handle").unwrap();
+        assert!(param_description(handle).contains("cannot be terminal or plugin"));
     }
 }
