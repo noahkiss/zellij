@@ -1590,6 +1590,25 @@ lock's own 90 seconds with room to spare — the longest legitimate hold is a 10
 30-second wait for the server. Raise `--wait-timeout` past about a minute and a waiting `up` can
 give up on a restart that is only slow, which is the race put back by hand.
 
+**The lock could not carry the shape across a handover (nkmk.26, 2026-10-02).** When a launch agent
+is loaded, or a managed session's unit is known, the restart's inner `up` does not create the
+session: it releases the lock and asks launchd or systemd to. The job it wakes runs a bare
+`session up`, and a bare `up` resumes — so `restart --fresh` came back from the snapshot its own
+teardown had just archived, and `restart.log` reported success. On a Mac with an agent this was not
+a race but every time. `restart` now writes its shape to `<socket-dir>/.<name>.up.pending` before
+the teardown, and again once the teardown is done. Whichever `up` creates the session next takes the
+file and builds that shape; an explicit `--fresh` or `--restore` on that `up` still wins, and an
+`up` that hands over leaves the file for the job it woke. The socket directory, beside the lock,
+because the restart and the job are two environments and that is the one path both resolve the same
+way. A file older than two minutes is removed and ignored: the age runs from the end of the
+teardown, the job reaches its `up` in 15 to 20 seconds, and nothing waits on the lock past 90, so an
+older file belongs to a restart that died. After its `up`, `restart` reads the file once more. Gone
+means the shape was built, and it says `ok '<name>' came back fresh from the layout`. Still there
+means whatever created the session never took it — a build older than this one, or a session that
+was already up — so it removes the file, says the session did not come back as asked, and exits 1.
+Unit tests: the marker's round trip, garbage refused, take-once, expiry, the precedence between the
+marker and an explicit flag, and that the marker sits beside the lock.
+
 ### `zellij setup --generate-service <systemd|launchd>`
 
 Writes a user-level systemd unit or launchd plist whose only job is to call `zellij session up`.
@@ -4810,7 +4829,9 @@ same as `attach --no-resurrect`. The archived snapshot survives that, so a shape
 The three states are an enum (`Resume`, `Fresh`, `Snapshot(id)`), and that is load-bearing rather
 than tidy. `session restart --fresh` used to say "come back from no snapshot" by passing `None`,
 which under a resuming default is now indistinguishable from "come back from whatever you find".
-The enum is what keeps `restart --fresh` on the layout.
+The enum is what keeps `restart --fresh` on the layout. When the restart hands creation to a launch
+agent or unit, whose `up` is a bare one, a marker carries the shape across instead — see "The lock
+could not carry the shape across a handover" above.
 
 Two behaviours follow from the difference between a shape somebody **named** and a shape `up`
 **derived**:
