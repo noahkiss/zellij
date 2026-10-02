@@ -4796,6 +4796,16 @@ restarted the server. Calls now spawn `own_exe_for_spawn()`: the same path witho
 when the versioned directory is gone, the first `zellij` on `PATH`. A call after an upgrade runs the
 new build. Two unit tests cover the suffix and the fallback.
 
+**The key and handle docs say what the CLI accepts (2026-10-02).** `zellij_write_input` taught
+`C-c` and `Escape`, and the key parser refuses both: it takes `Ctrl c` and `Esc`. It also said
+`keys` took several keys, but the whole string is one `send-keys` argument, so it is one key per
+call. A test now parses every backticked key in the tool's text. `zellij_create`'s `handle`
+carried the `--handle` help, which said only "lowercase words joined by dashes" — so
+`plugin-check` looked valid and the CLI refused it as too close to `plugin_1`. The help on all
+four `--handle` flags now states the whole rule, and `zellij_create` checks a handle with the
+CLI's own `chosen_handle_error` before it runs anything, including the tab lookup an `agent_tab`
+create makes first.
+
 ### `session up` comes back with the shape the session had
 
 ```

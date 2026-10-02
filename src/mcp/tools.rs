@@ -264,7 +264,7 @@ pub const TOOLS: &[ToolSpec] = &[
         // `keys` presses keys and `text` writes characters, which are two verbs, not one with a
         // flag: a tool that multiplexes says what each of its commands returns
         reports: &["action send-keys", "action write-chars"],
-        tips: "keys goes through the key parser, so `Enter`, `C-c` and `Escape` mean those keys; \
+        tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
                text is written literally and presses nothing. Pass one or the other. This is the \
                cheap way to do more work in a pane you already made: reach for it before \
                zellij_create.",
@@ -285,8 +285,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action send-keys", "keys")),
-                describe: "The keys to press, space separated, each a modifier chain: `Enter`, \
-                           `C-c`, `Ctrl a`, `F1`.",
+                describe: "One key to press, after any modifiers, space separated: `Enter`, \
+                           `Ctrl c`, `Alt Shift x`, `F1`. Modifiers are Ctrl, Alt, Shift and Super; \
+                           `C-c` and `Ctrl-c` are not keys. One key per call.",
                 default: None,
             },
             ParamSpec {
@@ -1100,6 +1101,40 @@ mod tests {
                     !tool.destructive,
                     "{} claims to change nothing and to destroy something",
                     tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_key_the_write_input_tool_names_is_one_the_key_parser_takes() {
+        use std::str::FromStr;
+        use zellij_utils::data::KeyWithModifier;
+        // the description used to teach `C-c` and `Escape`, and the CLI refused both. Every
+        // backticked span in what the tool says about keys is a key, except the spellings it
+        // names to warn against, which have to stay refused for the warning to be true
+        let not_keys = ["C-c", "Ctrl-c"];
+        let tool = TOOLS
+            .iter()
+            .find(|tool| tool.name == "zellij_write_input")
+            .unwrap();
+        let keys = tool.params.iter().find(|p| p.name == "keys").unwrap();
+        let said = format!("{} {}", tool.tips, param_description(keys));
+        let spans: Vec<&str> = said.split('`').skip(1).step_by(2).collect();
+        assert!(spans.len() >= 4, "found no examples in: {}", said);
+        for span in spans {
+            let parsed = KeyWithModifier::from_str(span);
+            if not_keys.contains(&span) {
+                assert!(
+                    parsed.is_err(),
+                    "`{}` is named as not a key, but parses",
+                    span
+                );
+            } else {
+                assert!(
+                    parsed.is_ok(),
+                    "`{}` is offered as a key, but does not parse",
+                    span
                 );
             }
         }
