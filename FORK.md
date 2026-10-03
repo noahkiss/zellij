@@ -4796,7 +4796,7 @@ restarted the server. Calls now spawn `own_exe_for_spawn()`: the same path witho
 when the versioned directory is gone, the first `zellij` on `PATH`. A call after an upgrade runs the
 new build. Two unit tests cover the suffix and the fallback.
 
-**The key and handle docs say what the CLI accepts (2026-10-02).** `zellij_write_input` taught
+**The key and handle docs say what the CLI accepts (nkmk.26, 2026-10-02).** `zellij_write_input` taught
 `C-c` and `Escape`, and the key parser refuses both: it takes `Ctrl c` and `Esc`. It also said
 `keys` took several keys, but the whole string is one `send-keys` argument, so it is one key per
 call. A test now parses every backticked key in the tool's text. `zellij_create`'s `handle`
