@@ -1139,4 +1139,34 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_handle_flag_states_the_whole_rule_and_the_create_tool_carries_it() {
+        // `zellij_create` takes its `handle` text from `action new-pane --handle`, and that one
+        // flag kept the short help after the other four were fixed - so `plugin-check` still
+        // looked valid in the one place an agent reads it. Every `--handle` says the same thing.
+        let handles: Vec<(&str, &str)> = cli_surface::surface_commands()
+            .iter()
+            .filter_map(|command| {
+                command
+                    .arg("--handle")
+                    .map(|arg| (command.path.as_str(), arg.about.as_str()))
+            })
+            .collect();
+        assert!(handles.len() >= 5, "found only {:?}", handles);
+        for (path, about) in &handles {
+            assert!(
+                about.contains("cannot be terminal or plugin"),
+                "`zellij {} --handle` does not state the whole rule: {}",
+                path,
+                about
+            );
+        }
+        let create = TOOLS
+            .iter()
+            .find(|tool| tool.name == "zellij_create")
+            .unwrap();
+        let handle = create.params.iter().find(|p| p.name == "handle").unwrap();
+        assert!(param_description(handle).contains("cannot be terminal or plugin"));
+    }
 }
