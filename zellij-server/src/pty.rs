@@ -7,7 +7,7 @@ use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
-    resurrect_hints::{claude_sessions_dir, ProcessTree},
+    resurrect_hints::{claude_session_record, claude_sessions_dir, ProcessTree},
     screen::{ScreenInstruction, TabOverrideResult},
     session_layout_metadata::SessionLayoutMetadata,
     thread_bus::{Bus, ThreadSenders},
@@ -16,7 +16,7 @@ use crate::{
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::task::JoinHandle;
 use zellij_utils::agent_detect::{self, AgentHarness};
@@ -234,6 +234,20 @@ pub const DETECT_AGENTS_DEFAULT: bool = true;
 /// a harness which exports its id after a slow start-up is still picked up while the pane is young.
 const AGENT_ENV_RETRY_TICKS: u32 = 30;
 
+/// The harness whose live session is read from its own record rather than its environment.
+const CLAUDE: &str = "claude";
+
+/// The key claude's live session is filed under among a pane's identity variables: the first one
+/// `agent_detect` asks for, so detection takes it over anything the environment said.
+fn claude_identity_key(harness: &AgentHarness) -> String {
+    harness
+        .identity_env
+        .first()
+        .copied()
+        .unwrap_or("CLAUDE_CODE_SESSION_ID")
+        .to_owned()
+}
+
 /// What the last identity walk of a pane found, and what would make another one worth doing.
 ///
 /// The walk is the expensive half of agent detection, and its answer is stable: a pane is one
@@ -249,6 +263,13 @@ struct AgentEnvProbe {
     found: bool,
     /// Ticks since the walk, counted only while `found` is false.
     ticks_since_probe: u32,
+    /// The claude process whose session record answered the walk, if one did.
+    ///
+    /// Claude moves to another session on `/clear` without becoming another process, so the
+    /// walk's answer goes stale while the pid stays the same. This record is re-read every tick
+    /// instead - one small file, not a walk - and a record that is gone sends the pane back to
+    /// the walk.
+    claude_record_pid: Option<u32>,
 }
 
 impl AgentEnvProbe {
@@ -258,6 +279,12 @@ impl AgentEnvProbe {
     fn needs_another_walk(&self, child_pid: u32) -> bool {
         self.child_pid != child_pid
             || (!self.found && self.ticks_since_probe >= AGENT_ENV_RETRY_TICKS)
+    }
+
+    /// The session the claude this walk found holds now, re-read from its record. `None` when
+    /// the walk found no claude record, or that claude has since exited.
+    fn live_claude_session(&self, sessions_dir: Option<&Path>) -> Option<String> {
+        claude_session_record(sessions_dir?, self.claude_record_pid?)
     }
 }
 
@@ -2498,13 +2525,29 @@ impl Pty {
         self.agent_env_probes
             .retain(|terminal_id, _| is_agent_pane(terminal_id));
 
+        let sessions_dir = agent_panes
+            .iter()
+            .any(|(_, _, harness)| harness.kind == CLAUDE)
+            .then(claude_sessions_dir)
+            .flatten();
+
         // the panes worth a walk this tick, and a tick counted against the ones that are not
         let mut to_probe: Vec<(u32, u32, &'static AgentHarness)> = Vec::new();
         for (terminal_id, child_pid, harness) in &agent_panes {
             if let Some(probe) = self.agent_env_probes.get_mut(terminal_id) {
                 if !probe.needs_another_walk(*child_pid) {
                     probe.ticks_since_probe = probe.ticks_since_probe.saturating_add(1);
-                    continue;
+                    if probe.claude_record_pid.is_none() {
+                        continue;
+                    }
+                    if let Some(session_id) = probe.live_claude_session(sessions_dir.as_deref()) {
+                        self.terminal_agent_envs
+                            .entry(*terminal_id)
+                            .or_default()
+                            .insert(claude_identity_key(harness), session_id);
+                        continue;
+                    }
+                    // that claude has exited: whatever the pane runs now is a new question
                 }
             }
             to_probe.push((*terminal_id, *child_pid, *harness));
@@ -2529,13 +2572,24 @@ impl Pty {
         }
         for (terminal_id, child_pid, harness) in to_probe {
             let identity_vars = agent_detect::identity_env_names_for(harness);
-            let found = process_tree.find_all_envs(child_pid, &identity_vars);
+            let mut found = process_tree.find_all_envs(child_pid, &identity_vars);
+            // claude's variable is frozen in each child at its spawn, so after a `/clear` it
+            // names the first session; claude's own record names the one it holds now, and wins
+            let live_session = sessions_dir
+                .as_deref()
+                .filter(|_| harness.kind == CLAUDE)
+                .and_then(|dir| process_tree.claude_live_session(child_pid, dir));
+            let claude_record_pid = live_session.map(|(record_pid, session_id)| {
+                found.insert(claude_identity_key(harness), session_id);
+                record_pid
+            });
             self.agent_env_probes.insert(
                 terminal_id,
                 AgentEnvProbe {
                     child_pid,
                     found: !found.is_empty(),
                     ticks_since_probe: 0,
+                    claude_record_pid,
                 },
             );
             if found.is_empty() {

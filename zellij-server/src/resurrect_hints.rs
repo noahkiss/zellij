@@ -149,27 +149,38 @@ impl ProcessTree {
     /// runs: an agent it started sits deeper. A record whose `pid` is not the file's own is
     /// ignored. Every miss is `None`, and the caller falls back to what it would have recorded.
     pub fn claude_live_session_id(&self, root: u32, sessions_dir: &Path) -> Option<String> {
-        for pid in self.descendants(root) {
-            let Ok(record) = std::fs::read(sessions_dir.join(format!("{}.json", pid))) else {
-                continue;
-            };
-            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&record) else {
-                log::debug!(
-                    "resurrect_commands: unreadable claude session record for {}",
-                    pid
-                );
-                continue;
-            };
-            if record.get("pid").and_then(|p| p.as_u64()) != Some(pid as u64) {
-                continue;
-            }
-            match record.get("sessionId").and_then(|id| id.as_str()) {
-                Some(id) if !id.is_empty() => return Some(id.to_owned()),
-                _ => continue,
-            }
-        }
-        None
+        self.claude_live_session(root, sessions_dir)
+            .map(|(_pid, session_id)| session_id)
     }
+
+    /// [`Self::claude_live_session_id`], and the pid of the claude process whose record answered,
+    /// so a caller can re-read that one record later without walking the tree again.
+    pub fn claude_live_session(&self, root: u32, sessions_dir: &Path) -> Option<(u32, String)> {
+        self.descendants(root).into_iter().find_map(|pid| {
+            claude_session_record(sessions_dir, pid).map(|session_id| (pid, session_id))
+        })
+    }
+}
+
+/// The `sessionId` in Claude Code's record for `pid`, or `None` when there is no record, it does
+/// not parse, it names another pid, or it holds no session.
+pub fn claude_session_record(sessions_dir: &Path, pid: u32) -> Option<String> {
+    let record = std::fs::read(sessions_dir.join(format!("{}.json", pid))).ok()?;
+    let Ok(record) = serde_json::from_slice::<serde_json::Value>(&record) else {
+        log::debug!(
+            "resurrect_commands: unreadable claude session record for {}",
+            pid
+        );
+        return None;
+    };
+    if record.get("pid").and_then(|p| p.as_u64()) != Some(pid as u64) {
+        return None;
+    }
+    record
+        .get("sessionId")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_owned())
 }
 
 /// Where Claude Code keeps its per-process session records: `$CLAUDE_CONFIG_DIR/sessions`, or
@@ -490,6 +501,22 @@ mod tests {
 
     /// The pane's shell is 10, claude is 20, and 30 is an agent claude started. The live session
     /// is the one in 20's record, whatever 30's says.
+    #[test]
+    fn the_live_claude_session_names_the_process_whose_record_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_record(dir.path(), 20, 20, "live");
+        let tree = tree(&[(10, &[20]), (20, &[30])]);
+        assert_eq!(
+            tree.claude_live_session(10, dir.path()),
+            Some((20, "live".to_owned()))
+        );
+        assert_eq!(
+            claude_session_record(dir.path(), 20).as_deref(),
+            Some("live")
+        );
+        assert_eq!(claude_session_record(dir.path(), 30), None);
+    }
+
     #[test]
     fn the_live_claude_session_is_the_nearest_record() {
         let dir = tempfile::tempdir().unwrap();
