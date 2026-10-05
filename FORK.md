@@ -3954,7 +3954,7 @@ The process-group lookup stays first and unchanged, so nothing about a job-contr
 resurrect_commands "prefill"   // or "agents", or "all" (the default)
 ```
 
-Three reports after `zellij session restart`, with the shipped `claude` hint in place:
+From nkmk.28. Three reports after `zellij session restart`, with the shipped `claude` hint in place:
 
 1. A claude pane offered `claude --resume <id>` for the FIRST session that pane ever ran, not the
    one live at the restart.
