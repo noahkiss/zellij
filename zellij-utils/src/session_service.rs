@@ -2449,7 +2449,104 @@ pub fn service_files(
     session: &str,
     extras: Option<&SessionServiceOptions>,
 ) -> Result<Vec<ServiceFile>, String> {
-    rendered_files(kind, exe, session, extras, false)
+    rendered_files(kind, exe, session, extras, Recording::Fresh)
+}
+
+/// The files `enable` writes: [`service_files`], except that a thinner shell does not shrink the
+/// installed unit's PATH. See [`path_to_keep`].
+fn enable_files(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> Result<Vec<ServiceFile>, String> {
+    rendered_files(kind, exe, session, extras, Recording::KeepingPath)
+}
+
+/// Which values a rendering takes from the unit already on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recording {
+    /// None: everything comes from this process. What `setup --generate-service` prints.
+    Fresh,
+    /// Every recorded environment value. What drift is judged against.
+    AsRecorded,
+    /// Only the recorded PATH, and only when this process's PATH is a thinner view of it. What
+    /// `enable` writes.
+    KeepingPath,
+}
+
+/// Whether `enable` keeps the PATH an installed unit records, and if so, what this shell drops.
+///
+/// **An SSH shell is a thinner view of the same machine, not a new PATH.** A non-interactive SSH
+/// shell skips most of the rc chain, so its PATH lacks `/usr/local/bin`, version-manager shims and
+/// the like. The release runbook runs `session enable` over SSH, and every release re-recorded
+/// that PATH: 17 entries became 13, and the next server could not resolve what the 4 named. An
+/// interactive `enable` put them back, until the next release.
+///
+/// So a shell whose PATH ADDS nothing to the recorded one and DROPS a directory that still exists
+/// keeps the recorded PATH whole. `Some` is the directories it drops. Every other shell re-records,
+/// as before:
+///
+/// - one that adds a directory - a new package prefix, a version manager's per-shell directory - is
+///   the operator's current PATH, and recording it is the point of `enable`;
+/// - one that drops only directories that are gone from the disk is cleaning up, not shrinking.
+///
+/// A directory that still exists and should go is dropped by `session disable` and an `enable`
+/// from the shell that lacks it: a unit that is not installed has no PATH to keep.
+pub fn path_to_keep(
+    recorded: &str,
+    fresh: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<Vec<String>> {
+    let recorded: Vec<&str> = recorded.split(':').filter(|dir| !dir.is_empty()).collect();
+    let fresh: Vec<&str> = fresh.split(':').filter(|dir| !dir.is_empty()).collect();
+    if fresh.iter().any(|dir| !recorded.contains(dir)) {
+        return None;
+    }
+    let dropped: Vec<String> = recorded
+        .iter()
+        .filter(|dir| !fresh.contains(dir) && exists(Path::new(dir)))
+        .map(|dir| (*dir).to_owned())
+        .collect();
+    (!dropped.is_empty()).then_some(dropped)
+}
+
+/// What an `enable` renders with, out of what the installed unit records: its PATH when
+/// [`path_to_keep`] keeps it, and nothing otherwise - every other value is re-recorded as before.
+fn recorded_for_enable(
+    on_disk: RecordedEnv,
+    fresh_path: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> RecordedEnv {
+    match on_disk.path {
+        Some(path) if path_to_keep(&path, fresh_path, exists).is_some() => RecordedEnv {
+            path: Some(path),
+            ..RecordedEnv::default()
+        },
+        _ => RecordedEnv::default(),
+    }
+}
+
+/// What `enable` will keep of the installed unit's PATH rather than re-record: the directories
+/// this shell's PATH drops, when the kept PATH changes the files written. `None` when this shell's
+/// PATH is the one recorded, or when the config states its own PATH and neither is written.
+///
+/// Asked BEFORE `enable`, so the caller can say so beside what `enable` reports.
+pub fn path_kept_on_enable(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+) -> Option<Vec<String>> {
+    let fresh = service_files(kind, exe, session, extras).ok()?;
+    let kept = enable_files(kind, exe, session, extras).ok()?;
+    if fresh == kept {
+        return None;
+    }
+    let file = kept.first()?;
+    let on_disk = std::fs::read_to_string(&file.path).ok()?;
+    let recorded = RecordedEnv::in_unit(kind, &on_disk).path?;
+    path_to_keep(&recorded, &service_path(exe), |dir| dir.is_dir())
 }
 
 /// The files to judge drift against: [`service_files`], except that a file already on disk lends
@@ -2465,7 +2562,7 @@ pub fn comparison_files(
     session: &str,
     extras: Option<&SessionServiceOptions>,
 ) -> Result<Vec<ServiceFile>, String> {
-    rendered_files(kind, exe, session, extras, true)
+    rendered_files(kind, exe, session, extras, Recording::AsRecorded)
 }
 
 fn rendered_files(
@@ -2473,16 +2570,20 @@ fn rendered_files(
     exe: &Path,
     session: &str,
     extras: Option<&SessionServiceOptions>,
-    as_recorded: bool,
+    recording: Recording,
 ) -> Result<Vec<ServiceFile>, String> {
     let dir = service_dir(kind)?;
     let recorded = |path: &Path| -> RecordedEnv {
-        if !as_recorded {
+        if recording == Recording::Fresh {
             return RecordedEnv::default();
         }
-        std::fs::read_to_string(path)
+        let on_disk = std::fs::read_to_string(path)
             .map(|on_disk| RecordedEnv::in_unit(kind, &on_disk))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if recording == Recording::AsRecorded {
+            return on_disk;
+        }
+        recorded_for_enable(on_disk, &service_path(exe), |dir| dir.is_dir())
     };
     // Resolved once, here, so that WRITING a unit and COMPARING against one both see the same
     // state root - and so that neither depends on whether the calling shell exports one.
@@ -2932,7 +3033,7 @@ pub fn enable(
             return Err(refusal);
         }
     }
-    let files = service_files(kind, exe, session, extras)?;
+    let files = enable_files(kind, exe, session, extras)?;
     // Before the short-circuit below, and that placement is the whole of it - see
     // `ensure_launchd_log_dir`.
     ensure_launchd_log_dir(kind, session)?;
@@ -3614,6 +3715,90 @@ mod tests {
             assert_ne!(on_disk, service_unit(kind, &exe(), "work", None, None));
             let files = compared_install(&dir, kind, &exe(), &on_disk);
             assert_eq!(drift_of(&files), UnitDrift::Current, "{:?}", kind);
+        }
+    }
+
+    /// The m1p PATH, cut down: what an interactive shell recorded, and the thinner PATH a
+    /// non-interactive SSH shell has.
+    const INTERACTIVE_PATH: &str =
+        "/pin:/opt/homebrew/bin:/usr/local/bin:/home/u/.rbenv/shims:/usr/bin:/bin:/usr/sbin:/sbin";
+    const SSH_PATH: &str = "/pin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+    #[test]
+    fn a_thinner_shell_keeps_the_recorded_path() {
+        let everything_exists = |_: &Path| true;
+        assert_eq!(
+            path_to_keep(INTERACTIVE_PATH, SSH_PATH, everything_exists),
+            Some(vec![
+                "/usr/local/bin".to_owned(),
+                "/home/u/.rbenv/shims".to_owned()
+            ])
+        );
+        // the same PATH, or the same set in another order, drops nothing: re-recorded as before
+        assert_eq!(
+            path_to_keep(INTERACTIVE_PATH, INTERACTIVE_PATH, everything_exists),
+            None
+        );
+        // a shell that adds a directory is the operator's current PATH, even if it drops one too -
+        // a version manager's per-shell directory changes with every shell
+        assert_eq!(
+            path_to_keep(
+                INTERACTIVE_PATH,
+                "/pin:/opt/homebrew/bin:/new/bin:/usr/bin:/bin",
+                everything_exists
+            ),
+            None
+        );
+        // a dropped directory that is gone from the disk is a cleanup, not a shrink
+        assert_eq!(
+            path_to_keep(INTERACTIVE_PATH, SSH_PATH, |dir: &Path| {
+                dir != Path::new("/usr/local/bin") && dir != Path::new("/home/u/.rbenv/shims")
+            }),
+            None
+        );
+        // and only the dropped directories that exist are named
+        assert_eq!(
+            path_to_keep(INTERACTIVE_PATH, SSH_PATH, |dir: &Path| {
+                dir != Path::new("/home/u/.rbenv/shims")
+            }),
+            Some(vec!["/usr/local/bin".to_owned()])
+        );
+    }
+
+    /// The release runbook's `enable` over SSH, end to end: the unit it writes carries the PATH
+    /// the interactive shell recorded, and drift judges it current - so nothing asks for another
+    /// `enable` that would record the SSH PATH after all.
+    #[test]
+    fn an_enable_from_a_thinner_shell_writes_the_recorded_path_and_no_drift() {
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let interactive = RecordedEnv {
+                path: Some(INTERACTIVE_PATH.to_owned()),
+                ..RecordedEnv::default()
+            };
+            let on_disk = render_unit(kind, &exe(), "work", None, None, &interactive);
+            let kept = recorded_for_enable(
+                RecordedEnv::in_unit(kind, &on_disk),
+                SSH_PATH,
+                |_: &Path| true,
+            );
+            let written = render_unit(kind, &exe(), "work", None, None, &kept);
+            assert_eq!(
+                RecordedEnv::in_unit(kind, &written).path,
+                RecordedEnv::in_unit(kind, &on_disk).path,
+                "{:?}",
+                kind
+            );
+            let files = compared_install(&dir, kind, &exe(), &written);
+            assert_eq!(drift_of(&files), UnitDrift::Current, "{:?}", kind);
+
+            // a shell that adds a directory still records its own PATH, as before
+            let added = recorded_for_enable(
+                RecordedEnv::in_unit(kind, &on_disk),
+                "/pin:/new/bin:/usr/bin",
+                |_: &Path| true,
+            );
+            assert_eq!(added, RecordedEnv::default(), "{:?}", kind);
         }
     }
 

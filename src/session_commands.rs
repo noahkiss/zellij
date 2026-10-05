@@ -351,8 +351,11 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
         pin_before_writing_the_unit(pinned)?;
     }
     let exe = service_exe(exe, pinned);
+    // asked before `enable` writes, while the installed unit is still the one it judges
+    let kept_path = session_service::path_kept_on_enable(kind, &exe, name, extras.as_ref());
     match session_service::enable(kind, &exe, name, extras.as_ref(), force) {
         Ok(EnableOutcome::AlreadyEnabled) => {
+            print_kept_path(kept_path);
             println!("ok    service for '{}' is already enabled", name);
             Ok(())
         },
@@ -361,6 +364,7 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
             changed,
             beside,
         }) => {
+            print_kept_path(kept_path);
             for path in written {
                 println!("      wrote {}", path.display());
             }
@@ -395,6 +399,29 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
             Err(())
         },
     }
+}
+
+/// Say that `enable` kept the installed unit's PATH, and which directories this shell lacks.
+///
+/// Said every time it happens, so an `enable` over SSH does not read as one that recorded the SSH
+/// shell's PATH. See [`session_service::path_to_keep`].
+fn print_kept_path(dropped: Option<Vec<String>>) {
+    let Some(dropped) = dropped else {
+        return;
+    };
+    println!(
+        "      kept the installed PATH: this shell's PATH adds nothing to it and lacks {} {} that exist",
+        dropped.len(),
+        if dropped.len() == 1 {
+            "directory"
+        } else {
+            "directories"
+        }
+    );
+    for dir in dropped {
+        println!("        {}", dir);
+    }
+    println!("      to record a new PATH, run `session enable` from a shell that adds to it");
 }
 
 /// Name the two answers to "where do this user's units live", when they differ.
