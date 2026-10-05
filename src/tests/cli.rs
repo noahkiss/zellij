@@ -241,6 +241,19 @@ fn session_doctor_takes_its_negations_and_the_short_dry_run() {
     }
 }
 
+/// `--regranted` is off unless typed: it records a re-grant as made, which only a person can know.
+#[test]
+fn session_doctor_takes_regranted_and_defaults_to_not() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "work"]) {
+        SessionLifecycleCli::Doctor { regranted, .. } => assert!(!regranted),
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--fix", "--regranted"]) {
+        SessionLifecycleCli::Doctor { regranted, .. } => assert!(regranted),
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}
+
 #[test]
 fn a_session_name_is_optional_everywhere() {
     // it falls back to the config's session_name at run time

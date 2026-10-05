@@ -400,6 +400,99 @@ pub fn judge_fall(
     }
 }
 
+/// Whether a designated requirement names this certificate by its hash.
+///
+/// That is the anchor `codesign` derives for a certificate we minted - `certificate leaf =
+/// H"<sha1>"` - and the hash `security find-identity` prints is the same SHA-1, in upper case.
+pub fn requirement_names_certificate(requirement: &str, hash: &str) -> bool {
+    !hash.is_empty()
+        && requirement
+            .to_ascii_lowercase()
+            .contains(&format!("h\"{}\"", hash.to_ascii_lowercase()))
+}
+
+/// The rungs a signing walk may try, given the requirement the grants were made against.
+///
+/// **The certificate the grants name comes before the best certificate on offer.** The walk used
+/// to drop our own certificate whenever an Apple one was offered, whatever the pin was anchored
+/// on. So a pin anchored on our certificate, refreshed on a Mac that had since gained an Apple
+/// Development identity, was re-signed with the Apple one, and every grant on the machine was
+/// owed again (m1p, nkmk.26). Our certificate was still there and would have kept them all.
+///
+/// So when the granted requirement names one of the offered certificates by hash, that rung is
+/// the ONLY one tried. A refusal from it is a `Needs you`, not a fall to a certificate whose
+/// requirement macOS never recorded - the same rule the Apple rungs follow in
+/// [`sign_down_the_ladder`].
+///
+/// Otherwise the old order stands: our certificate is the rung a machine with no Apple one lands
+/// on, and only that. A pin anchored on a certificate the keychain no longer offers is switched to
+/// the best one left, and the switch is reported and recorded - see [`judge_grants`].
+pub fn ladder_for_the_anchor(ladder: Vec<Rung>, granted: Option<&str>) -> Vec<Rung> {
+    let anchor = granted.and_then(|granted| {
+        ladder.iter().find(|rung| {
+            matches!(rung, Rung::SelfSigned(identity)
+                if requirement_names_certificate(granted, &identity.hash))
+        })
+    });
+    if let Some(anchor) = anchor {
+        return vec![anchor.clone()];
+    }
+    let apple_offered = ladder
+        .iter()
+        .any(|rung| !matches!(rung, Rung::SelfSigned(_)));
+    if apple_offered {
+        ladder
+            .into_iter()
+            .filter(|rung| !matches!(rung, Rung::SelfSigned(_)))
+            .collect()
+    } else {
+        ladder
+    }
+}
+
+/// What a signing run does to the record of an owed re-grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantRecord {
+    /// No grant is at stake: the pin was never anchored, or the new signature satisfies the
+    /// requirement the grants name and nothing was owed.
+    Nothing,
+    /// The new signature does not satisfy the requirement the grants name. Record it.
+    Owe(String),
+    /// An earlier run already recorded the debt, and this signature does not pay it either.
+    StillOwed,
+    /// The pin is back on what the grants name, so the recorded debt is gone.
+    Paid,
+}
+
+/// Decide [`GrantRecord`] from the requirement the grants name, and what was just signed.
+///
+/// Pure, so the decision is tested here and not only on a Mac. `granted` is the recorded
+/// requirement when there is one, else the requirement the pin carried before this run. `holds` is
+/// whether the new signature satisfies `granted`, as `codesign --verify -R` answered it - the same
+/// test macOS makes when it reads a grant.
+pub fn judge_grants(
+    granted: Option<&str>,
+    recorded: bool,
+    after: &str,
+    holds: bool,
+) -> GrantRecord {
+    let Some(granted) = granted else {
+        return GrantRecord::Nothing;
+    };
+    if granted == after || holds {
+        return if recorded {
+            GrantRecord::Paid
+        } else {
+            GrantRecord::Nothing
+        };
+    }
+    if recorded {
+        GrantRecord::StillOwed
+    } else {
+        GrantRecord::Owe(granted.to_owned())
+    }
+}
+
 /// The first rung of the ladder this keychain can reach.
 ///
 /// Order is the whole design. A Developer ID signature is accepted anywhere and survives its own
@@ -696,6 +789,10 @@ pub struct PinSigningPolicy {
     /// run resolved. Doctor and `session up` pass the one they were given, so both flows put the
     /// backup in the same place.
     pub backup_dir: Option<PathBuf>,
+    /// `true` only for `zellij session doctor --regranted`: the operator says the grants were made
+    /// again against the signature the pin carries now, so the re-grant doctor recorded as owed is
+    /// paid. See [`SigningDir::regrant_owed`].
+    pub regranted: bool,
 }
 
 impl Default for PinSigningPolicy {
@@ -703,6 +800,7 @@ impl Default for PinSigningPolicy {
         PinSigningPolicy {
             allowed: true,
             backup_dir: crate::home::find_default_config_dir(),
+            regranted: false,
         }
     }
 }
@@ -747,6 +845,7 @@ pub fn signing_context(
         keychain_password: std::env::var("ZELLIJ_KEYCHAIN_PASSWORD").ok(),
         refresh_from,
         backup_dir: config_dir,
+        regranted: pin_signing_policy().regranted,
     })
 }
 
@@ -889,6 +988,10 @@ pub fn sign_pin(
         },
     };
 
+    if context.regranted {
+        findings.push(confirm_regrant(context, mode));
+    }
+
     // An anchored-LOOKING pin is not a healthy pin, and reading the requirement is not checking it.
     // A pin signed with a requirement the binary does not satisfy reads exactly like a good one -
     // same identifier, same anchored text, no code hash anywhere - and doctor called that state
@@ -914,6 +1017,14 @@ pub fn sign_pin(
     {
         match verify_signature(commander, &pin_display) {
             Ok(_) => {
+                // A pin always satisfies its own requirement, so that alone says nothing about a
+                // grant made against an earlier one. The record of a switch does.
+                if let Some(owed) =
+                    owed_on_a_signed_pin(commander, &pin_display, designated, context, mode)
+                {
+                    findings.push(owed);
+                    return SigningRun { findings };
+                }
                 findings.push(
                     Finding::ok(
                         "signing",
@@ -1164,11 +1275,10 @@ fn sign_down_the_ladder(
     let apple_offered = ladder
         .iter()
         .any(|rung| !matches!(rung, Rung::SelfSigned(_)));
-    if apple_offered {
-        // the certificate we mint is not a rung below an Apple one. It is the rung a machine with
-        // no Apple certificate lands on, and only that.
-        ladder.retain(|rung| !matches!(rung, Rung::SelfSigned(_)));
-    }
+    // the certificate we mint is not a rung below an Apple one - unless it is the certificate the
+    // grants name, and then it is the only rung
+    let granted = granted_requirement(context, before);
+    ladder = ladder_for_the_anchor(ladder, granted.as_deref());
     let mut index = 0;
     // the rung this one is a fall FROM, resolved, so the team check has both sides in hand
     let mut fell_from: Option<Rung> = None;
@@ -1193,10 +1303,7 @@ fn sign_down_the_ladder(
             let verdict = judge_fall(
                 team_of(commander, &context.keychain, above).as_deref(),
                 team_of(commander, &context.keychain, &rung).as_deref(),
-                match before {
-                    PinSignature::Anchored { designated, .. } => Some(designated.as_str()),
-                    PinSignature::CodeHashed { .. } | PinSignature::Unsigned => None,
-                },
+                granted.as_deref(),
             );
             if let FallVerdict::ChangesTheTeam { granted, candidate } = verdict {
                 findings.push(
@@ -1363,6 +1470,121 @@ fn requirement_changed(before: &PinSignature, after: &str) -> Option<String> {
     }
 }
 
+/// The requirement an earlier run recorded the grants against, unless this run was told the
+/// re-grant is made (`--regranted`).
+fn recorded_grant(context: &SigningContext) -> Option<String> {
+    if context.regranted {
+        return None;
+    }
+    std::fs::read_to_string(context.signing_dir.regrant_owed())
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+/// The requirement the grants on this machine were made against, as far as doctor can know it:
+/// the recorded one, else the one the pin carried before this run.
+fn granted_requirement(context: &SigningContext, before: &PinSignature) -> Option<String> {
+    recorded_grant(context).or_else(|| match before {
+        PinSignature::Anchored { designated, .. } => Some(designated.clone()),
+        PinSignature::CodeHashed { .. } | PinSignature::Unsigned => None,
+    })
+}
+
+/// Whether `target` satisfies a designated requirement it may not carry itself.
+///
+/// `codesign --verify -R` is the test macOS makes when it reads a grant: does this code satisfy
+/// the requirement recorded with it. Anything but a clean pass counts as `false`, so a check that
+/// could not run reports the re-grant as owed rather than as paid.
+fn satisfies(commander: &dyn Commander, target: &str, designated: &str) -> bool {
+    let designated = designated.trim();
+    let expression = designated
+        .strip_prefix("designated =>")
+        .map(str::trim)
+        .unwrap_or(designated);
+    // `-R=<text>` hands `codesign` the value `=<text>`, its inline form - see `sign_arguments`
+    let requirement = format!("-R={}", expression);
+    matches!(
+        commander.run("codesign", &["--verify", &requirement, target], None),
+        Ok(output) if output.success
+    )
+}
+
+/// `--regranted`: the operator says the grants were made again, so forget the recorded debt.
+///
+/// Taken on the operator's word. Doctor cannot read the grants themselves - they live in a TCC
+/// database only a process holding Full Disk Access can open - so the flag is the proof.
+fn confirm_regrant(context: &SigningContext, mode: DoctorMode) -> Finding {
+    let path = context.signing_dir.regrant_owed();
+    let Some(granted) = std::fs::read_to_string(&path)
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+    else {
+        return Finding::ok(
+            "signing",
+            "--regranted: no re-grant was owed, so there was nothing to record",
+        );
+    };
+    if !mode.fix {
+        return Finding::changed(
+            "signing",
+            mode.describe("record the owed re-grant as made (--regranted)"),
+        )
+        .note(format!("it is owed against: {}", granted));
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => Finding::changed(
+            "signing",
+            "recorded the owed re-grant as made, on your word (--regranted)",
+        )
+        .note(format!("it was owed against: {}", granted)),
+        Err(error) => Finding::needs_you(
+            "signing",
+            format!("could not remove {}: {}", path.display(), error),
+        ),
+    }
+}
+
+/// The re-grant an earlier run recorded, when the pin it judges still does not pay it.
+///
+/// `None` when nothing is recorded, or when the pin satisfies the recorded requirement again - in
+/// which case a run that may act forgets the record.
+fn owed_on_a_signed_pin(
+    commander: &dyn Commander,
+    pin: &str,
+    designated: &str,
+    context: &SigningContext,
+    mode: DoctorMode,
+) -> Option<Finding> {
+    let granted = recorded_grant(context)?;
+    if granted == designated || satisfies(commander, pin, &granted) {
+        if mode.fix {
+            let _ = std::fs::remove_file(context.signing_dir.regrant_owed());
+        }
+        return None;
+    }
+    Some(
+        Finding::needs_you(
+            "signing",
+            format!(
+                "{} is signed as {}, and the grants were made against another requirement",
+                pin, PIN_IDENTIFIER
+            ),
+        )
+        .note(format!("now:     {}", designated))
+        .note(format!("granted: {}", granted))
+        .note("an earlier run re-signed it with another certificate, and macOS still evaluates")
+        .note("every grant against the requirement it recorded, which this pin does not satisfy")
+        .note(format!(
+            "1. re-grant Full Disk Access, Accessibility and Screen Recording for {}",
+            pin
+        ))
+        .note("2. `zellij session doctor --fix --regranted`, so doctor records it as made")
+        .note("3. THEN `zellij session restart`"),
+    )
+}
+
 /// Everything the ladder needs that only the platform can name.
 ///
 /// Carried in rather than derived here so that this whole file stays testable on a machine with no
@@ -1392,6 +1614,8 @@ pub struct SigningContext {
     /// Where to keep a second copy of the minted identity. zellij's own resolved config directory,
     /// so it lands wherever `ZELLIJ_CONFIG_DIR` or XDG says the user's config lives.
     pub backup_dir: Option<PathBuf>,
+    /// The operator confirmed the owed re-grant (`--regranted`). See [`PinSigningPolicy::regranted`].
+    pub regranted: bool,
 }
 
 /// What the keychain will offer, or nothing if it cannot be asked.
@@ -1734,10 +1958,59 @@ fn perform_signing(
             .note(format!("  {}", the_complaint(&refusal)));
     }
     findings.push(done);
-    findings.push(follow_up(
-        &pin_display,
-        requirement_changed(before, after.designated().unwrap_or_default()),
-    ));
+    let after = after.designated().unwrap_or_default();
+    let recorded = recorded_grant(context);
+    let granted = granted_requirement(context, before);
+    let holds = match granted.as_deref() {
+        Some(granted) if granted != after => satisfies(commander, &pin_display, granted),
+        _ => true,
+    };
+    let verdict = judge_grants(granted.as_deref(), recorded.is_some(), after, holds);
+    let owed = matches!(verdict, GrantRecord::Owe(_) | GrantRecord::StillOwed);
+    let changed = match verdict {
+        GrantRecord::Owe(granted) => {
+            let path = context.signing_dir.regrant_owed();
+            let written = std::fs::create_dir_all(&context.signing_dir.root)
+                .and_then(|()| std::fs::write(&path, format!("{}\n", granted)));
+            if let Err(error) = written {
+                findings.push(
+                    Finding::needs_you(
+                        "signing",
+                        format!(
+                            "could not record the owed re-grant at {}: {}",
+                            path.display(),
+                            error
+                        ),
+                    )
+                    .note("the next doctor run cannot see that a re-grant is owed; make it now"),
+                );
+            }
+            requirement_changed(before, after)
+        },
+        GrantRecord::StillOwed => Some(String::from(
+            "an earlier run already moved this pin off the requirement the grants were made \
+             against, and this signature does not satisfy it either",
+        )),
+        GrantRecord::Paid => {
+            let _ = std::fs::remove_file(context.signing_dir.regrant_owed());
+            None
+        },
+        // a pin that was never anchored held no grant a rebuild could keep, so this is the first
+        // requirement worth granting against; an anchored one whose grants ride through needs none
+        GrantRecord::Nothing => match before {
+            PinSignature::Anchored { .. } => None,
+            PinSignature::CodeHashed { .. } | PinSignature::Unsigned => {
+                requirement_changed(before, after)
+            },
+        },
+    };
+    let mut next = follow_up(&pin_display, changed);
+    if owed {
+        next = next
+            .note("doctor keeps asking until `zellij session doctor --fix --regranted` records")
+            .note("the re-grant as made");
+    }
+    findings.push(next);
     SignAttempt {
         findings,
         refusal: None,
@@ -1968,6 +2241,17 @@ impl SigningDir {
 
     pub fn openssl_config_file(&self) -> PathBuf {
         self.root.join("self-signed.cnf")
+    }
+
+    /// The requirement the grants were made against, kept once a signature stopped satisfying it.
+    ///
+    /// **Without this file a switch is visible for exactly one run.** The run that signs compares
+    /// the requirement before with the one after and says "re-grant". The next run has only the
+    /// pin, and a pin always satisfies its own requirement - so it reported that the grants
+    /// "still hold" seven minutes after doctor had asked for them to be made again (m1p, nkmk.26).
+    /// The file is that missing "before". It holds one designated requirement and nothing else.
+    pub fn regrant_owed(&self) -> PathBuf {
+        self.root.join("regrant-owed")
     }
 }
 
@@ -2580,6 +2864,7 @@ Signature=adhoc
             keychain_password: None,
             refresh_from: None,
             backup_dir: None,
+            regranted: false,
         }
     }
 
@@ -5207,5 +5492,366 @@ Signature=adhoc
             "left alone"
         );
         assert_eq!(refusal_from(&[]), "the signing step said nothing");
+    }
+
+    /// The designated requirement a certificate of ours writes, as `SELF_SIGNED` carries it.
+    const OURS_REQUIREMENT: &str = "designated => identifier \"org.zellij.nkmk\" and certificate leaf = H\"7f8c0b1a2d3e4f5061728394a5b6c7d8e9f00112\"";
+
+    /// The one an Apple Development certificate writes, as `APPLE_DEVELOPMENT` carries it.
+    const APPLE_REQUIREMENT: &str = "designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate leaf[subject.OU] = \"A1B2C3D4E5\"";
+
+    /// The m1p keychain after Xcode: an Apple Development identity, and our own still beside it.
+    const ONLY_APPLE_DEVELOPMENT: &str = "\
+  1) A1B2C3D4E5F60718293A4B5C6D7E8F9001122334 \"Apple Development: someone@example.com (F6G7H8I9J0)\"
+     1 valid identities found
+";
+
+    /// What `satisfies` runs to test `target` against a requirement it may not carry.
+    fn test_requirement(requirement: &str, target: &Path) -> String {
+        format!(
+            "codesign --verify -R={} {}",
+            requirement.trim_start_matches("designated =>").trim(),
+            target.display()
+        )
+    }
+
+    #[test]
+    fn a_requirement_names_our_certificate_by_its_hash_in_either_case() {
+        let hash = "7F8C0B1A2D3E4F5061728394A5B6C7D8E9F00112";
+        assert!(requirement_names_certificate(OURS_REQUIREMENT, hash));
+        assert!(requirement_names_certificate(
+            OURS_REQUIREMENT,
+            &hash.to_lowercase()
+        ));
+        assert!(!requirement_names_certificate(
+            OURS_REQUIREMENT,
+            "A1B2C3D4E5F60718293A4B5C6D7E8F9001122334"
+        ));
+        assert!(!requirement_names_certificate(APPLE_REQUIREMENT, hash));
+        assert!(!requirement_names_certificate(OURS_REQUIREMENT, ""));
+    }
+
+    /// The m1p fault, as a decision: an Apple certificate on offer no longer pushes aside the
+    /// certificate of ours that the grants name.
+    #[test]
+    fn the_certificate_the_grants_name_is_the_only_rung_when_it_is_offered() {
+        let ladder = rung_ladder(&parse_identities(APPLE_AND_OURS));
+        let kept = ladder_for_the_anchor(ladder.clone(), Some(OURS_REQUIREMENT));
+        assert_eq!(kept.len(), 1, "{:?}", kept);
+        assert!(matches!(kept[0], Rung::SelfSigned(_)), "{:?}", kept);
+
+        // anchored on the Apple team, or never anchored: the old order, ours left out
+        for granted in [Some(APPLE_REQUIREMENT), None] {
+            let kept = ladder_for_the_anchor(ladder.clone(), granted);
+            assert!(
+                kept.iter().all(|rung| !matches!(rung, Rung::SelfSigned(_))),
+                "{:?}",
+                kept
+            );
+            assert!(!kept.is_empty());
+        }
+
+        // ours is not offered at all: nothing to keep, the Apple rung is what is left
+        let apple_only = rung_ladder(&parse_identities(ONLY_APPLE_DEVELOPMENT));
+        let kept = ladder_for_the_anchor(apple_only, Some(OURS_REQUIREMENT));
+        assert!(
+            matches!(kept.as_slice(), [Rung::AppleDevelopment { .. }]),
+            "{:?}",
+            kept
+        );
+
+        // and a machine with only ours keeps it whatever the grants name
+        let ours_only = rung_ladder(&parse_identities(ONLY_OURS));
+        assert_eq!(ladder_for_the_anchor(ours_only.clone(), None), ours_only);
+    }
+
+    #[test]
+    fn the_record_of_an_owed_re_grant_follows_what_the_grants_name() {
+        // never anchored: nothing a grant could hold
+        assert_eq!(
+            judge_grants(None, false, APPLE_REQUIREMENT, false),
+            GrantRecord::Nothing
+        );
+        // same requirement, or a new one the old requirement still accepts: nothing owed
+        assert_eq!(
+            judge_grants(Some(APPLE_REQUIREMENT), false, APPLE_REQUIREMENT, false),
+            GrantRecord::Nothing
+        );
+        assert_eq!(
+            judge_grants(Some(APPLE_REQUIREMENT), false, "designated => other", true),
+            GrantRecord::Nothing
+        );
+        // a switch the old requirement does not accept is recorded, against the OLD one
+        assert_eq!(
+            judge_grants(Some(OURS_REQUIREMENT), false, APPLE_REQUIREMENT, false),
+            GrantRecord::Owe(String::from(OURS_REQUIREMENT))
+        );
+        // a recorded debt stays until the pin satisfies it again
+        assert_eq!(
+            judge_grants(Some(OURS_REQUIREMENT), true, APPLE_REQUIREMENT, false),
+            GrantRecord::StillOwed
+        );
+        assert_eq!(
+            judge_grants(Some(OURS_REQUIREMENT), true, OURS_REQUIREMENT, false),
+            GrantRecord::Paid
+        );
+        assert_eq!(
+            judge_grants(Some(OURS_REQUIREMENT), true, "designated => other", true),
+            GrantRecord::Paid
+        );
+    }
+
+    /// m1p at nkmk.26, end to end: a pin anchored on our certificate, a pending refresh, and an
+    /// Apple Development identity now in the keychain beside ours. The refresh is signed with ours,
+    /// the requirement does not move, and nothing is owed.
+    #[test]
+    fn a_refresh_keeps_our_certificate_when_an_apple_one_appears_beside_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(SELF_SIGNED),
+            ),
+            (FIND_IDENTITY, recorded(APPLE_AND_OURS)),
+            ("security set-key-partition-list", recorded("")),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(SELF_SIGNED)),
+            ("codesign --verify --strict", recorded("")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build);
+        let run = sign_pin(&commander, &pin, DoctorMode::default(), &context);
+
+        assert!(
+            commander.called_with("codesign -s 7F8C0B1A2D3E4F5061728394A5B6C7D8E9F00112"),
+            "{:?}",
+            commander.calls()
+        );
+        assert!(
+            !commander.called_with("codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334"),
+            "the Apple certificate signed a pin anchored on ours: {:?}",
+            commander.calls()
+        );
+        assert_eq!(std::fs::read(&pin).unwrap(), b"the new build".to_vec());
+        assert!(!context.signing_dir.regrant_owed().exists());
+        let follow = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("one thing left"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            follow
+                .notes
+                .iter()
+                .any(|note| note.contains("carries over")),
+            "{:?}",
+            follow.notes
+        );
+    }
+
+    /// A refusal from the certificate the grants name is a `Needs you`. It is not a fall to the
+    /// Apple certificate, which would write a requirement macOS never recorded.
+    #[test]
+    fn a_refusal_from_the_granted_certificate_does_not_fall_to_an_apple_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(SELF_SIGNED),
+            ),
+            (FIND_IDENTITY, recorded(APPLE_AND_OURS)),
+            ("security set-key-partition-list", recorded("")),
+            ("codesign -s ", recorded_failure("errSecInternalComponent")),
+        ]);
+        let scratch = tempfile::tempdir().unwrap();
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build);
+        let run = sign_pin(&commander, &pin, DoctorMode::default(), &context);
+
+        assert!(
+            !commander.called_with("codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334"),
+            "{:?}",
+            commander.calls()
+        );
+        assert_eq!(std::fs::read(&pin).unwrap(), b"the OLD build".to_vec());
+        assert!(
+            run.findings.iter().any(|finding| {
+                finding.status == Status::NeedsYou && finding.message.contains("refused to sign")
+            }),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// The switch doctor still makes - our certificate is gone from the keychain - and the reason
+    /// the record exists: the run that switches asks for the re-grant, and so does every run after
+    /// it, until the operator says it is made.
+    #[test]
+    fn a_switch_stays_owed_on_later_runs_until_the_operator_says_it_is_made() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the new build").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+
+        // 1. the switching run
+        let switching = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(SELF_SIGNED),
+            ),
+            (FIND_IDENTITY, recorded(ONLY_APPLE_DEVELOPMENT)),
+            ("security find-certificate", recorded_failure("not found")),
+            ("codesign -s ", recorded("")),
+            ("codesign -d --verbose=2 -r- ", recorded(APPLE_DEVELOPMENT)),
+            ("codesign --verify --strict", recorded("")),
+            (
+                test_requirement(OURS_REQUIREMENT, &pin).as_str(),
+                recorded_failure(
+                    "test-requirement: code failed to satisfy specified code requirement(s)",
+                ),
+            ),
+        ]);
+        let mut first = context(scratch.path());
+        first.refresh_from = Some(build);
+        let run = sign_pin(&switching, &pin, DoctorMode::default(), &first);
+        assert!(
+            switching.called_with("codesign -s A1B2C3D4E5F60718293A4B5C6D7E8F9001122334"),
+            "{:?}",
+            switching.calls()
+        );
+        let follow = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("two things left"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            follow.notes.iter().any(|note| note.contains("--regranted")),
+            "{:?}",
+            follow.notes
+        );
+        let owed_path = first.signing_dir.regrant_owed();
+        assert_eq!(
+            std::fs::read_to_string(&owed_path).unwrap().trim(),
+            OURS_REQUIREMENT,
+            "the record must name the requirement the grants were made against, not the new one"
+        );
+
+        // 2. a later dry run: the pin satisfies its own requirement, and that is not enough
+        let later = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(APPLE_DEVELOPMENT),
+            ),
+            ("codesign --verify --strict", recorded("")),
+            (
+                test_requirement(OURS_REQUIREMENT, &pin).as_str(),
+                recorded_failure(
+                    "test-requirement: code failed to satisfy specified code requirement(s)",
+                ),
+            ),
+        ]);
+        let dry = DoctorMode::from_flags(true, false, false);
+        let run = sign_pin(&later, &pin, dry, &context(scratch.path()));
+        let owed = run
+            .findings
+            .iter()
+            .find(|finding| finding.status == Status::NeedsYou)
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(owed.message.contains("another requirement"), "{:?}", owed);
+        assert!(
+            !run.findings
+                .iter()
+                .any(|finding| finding.notes.iter().any(|note| note.contains("still hold"))),
+            "a later run called the grants held again: {:?}",
+            run.findings
+        );
+
+        // 3. --regranted in a dry run says what it would do and keeps the record
+        let mut confirming = context(scratch.path());
+        confirming.regranted = true;
+        let run = sign_pin(&later, &pin, dry, &confirming);
+        assert!(owed_path.exists());
+        assert!(
+            run.findings.iter().any(|finding| finding
+                .message
+                .starts_with("would record the owed re-grant")),
+            "{:?}",
+            run.findings
+        );
+
+        // 4. --fix --regranted pays it, and the pin reads as holding its grants again
+        let run = sign_pin(&later, &pin, DoctorMode::default(), &confirming);
+        assert!(!owed_path.exists());
+        assert!(
+            run.findings
+                .iter()
+                .all(|finding| finding.status != Status::NeedsYou),
+            "{:?}",
+            run.findings
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.notes.iter().any(|note| note.contains("still hold"))),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// A pin that satisfies the recorded requirement again - signed back onto our certificate -
+    /// pays the debt without being told. Only a run that may act forgets the record.
+    #[test]
+    fn a_pin_back_on_the_granted_requirement_pays_the_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the build").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let context = context(scratch.path());
+        std::fs::create_dir_all(&context.signing_dir.root).unwrap();
+        let owed_path = context.signing_dir.regrant_owed();
+        std::fs::write(&owed_path, format!("{}\n", APPLE_REQUIREMENT)).unwrap();
+
+        let commander = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(DEVELOPER_ID),
+            ),
+            ("codesign --verify --strict", recorded("")),
+            // a Developer ID of the same team satisfies the Apple Development requirement
+            (
+                test_requirement(APPLE_REQUIREMENT, &pin).as_str(),
+                recorded(""),
+            ),
+        ]);
+        let run = sign_pin(
+            &commander,
+            &pin,
+            DoctorMode::from_flags(true, false, false),
+            &context,
+        );
+        assert!(
+            run.findings
+                .iter()
+                .all(|finding| finding.status != Status::NeedsYou),
+            "{:?}",
+            run.findings
+        );
+        assert!(owed_path.exists(), "a dry run removed the record");
+
+        sign_pin(&commander, &pin, DoctorMode::default(), &context);
+        assert!(!owed_path.exists());
     }
 }
