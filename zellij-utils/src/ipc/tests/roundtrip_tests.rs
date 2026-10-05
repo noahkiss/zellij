@@ -474,6 +474,7 @@ fn test_client_messages() {
                 session_service: None,
                 pane_privacy: None,
                 resurrect_command_hints: None,
+                resurrect_commands: None,
                 default_floating_size: None,
                 input_while_scrolled: None,
                 command_pane_on_clean_exit: None,

@@ -3911,6 +3911,12 @@ has it wins: `/proc/<pid>/environ` on Linux, `sysctl(KERN_PROCARGS2)` on macOS â
 `ps -E` makes, which the kernel serves for a process of the same uid â€” and nothing at all on any
 other platform. One process-table read serves the whole pass.
 
+Two later changes narrow the rules above. For `claude`, `codex`, `opencode` and `pi`, a hint now
+REPLACES the session the argv picked rather than appending beside it, so the command picks exactly
+one. And for `claude`, the id no longer comes from the variable when Claude Code's own session
+record is there. Both are in [A restored session offers to resume its agents, and only its
+agents](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents).
+
 Best-effort throughout: no hint, no variable, or no platform each record the command unchanged, at
 debug log level. Nothing here can fail a serialization.
 
@@ -3941,6 +3947,109 @@ idle shell has no children and still records nothing; a shell running something 
 shell has several, the newest wins: the one a user is looking at is the one they started last.
 
 The process-group lookup stays first and unchanged, so nothing about a job-controlled shell changes.
+
+### A restored session offers to resume its agents, and only its agents
+
+```kdl
+resurrect_commands "prefill"   // or "agents", or "all" (the default)
+```
+
+Three reports after `zellij session restart`, with the shipped `claude` hint in place:
+
+1. A claude pane offered `claude --resume <id>` for the FIRST session that pane ever ran, not the
+   one live at the restart.
+2. Panes offered commands that are not agents at all: the starship prompt, linuxbrew, other
+   short-lived processes.
+3. A pane offered `claude --dangerously-skip-permissions --continue --resume <id>`: two session
+   choices on one line.
+
+**Why the claude id was the first one.** The claude process does not carry
+`CLAUDE_CODE_SESSION_ID` in its own environment. Its children do, each with the value from the
+moment it was spawned, and an environment never changes after `exec`. The hint walks the pane's
+processes breadth first in pid order, so it answers from the oldest child: an MCP server claude
+started with, still naming the session from before every `/clear`. Verified on a live machine: a
+claude whose own record named its current session, with every MCP child still naming the first.
+A pane restored once made it worse: its argv carried the old `--resume <id>`, the hint's "already
+resumes" guard saw `--resume` and added nothing, and the old id survived every later restart.
+
+**The fix reads Claude Code's own record.** Claude Code keeps `sessions/<pid>.json` under its
+config directory (`$CLAUDE_CONFIG_DIR`, else `~/.claude`), and rewrites `sessionId` in it whenever
+the process moves to another session. The serialization pass takes the first process under the
+pane that has a record whose `pid` is its own, and records `--resume <sessionId>` in place of any
+session the argv picked. It runs AFTER the configured hints, so the live id replaces one a hint
+read from a stale environment, and a pane with no record keeps what the hint recorded. It runs
+when `resurrect_commands` is `"agents"` or `"prefill"`, or when a configured hint matches
+`claude`, so the shipped hint is fixed with no config change and a config with neither is
+untouched.
+
+**Exactly one session choice.** For a harness this build knows, a recorded command keeps every
+flag except the words that pick a session, and then gets exactly one. A configured hint for one of
+these REPLACES the session the argv picked instead of appending beside it; a hint for any other
+command keeps the old append-only rule, because this build does not know that tool's words. The
+words, each from the CLI's own `--help`:
+
+| agent | session words removed | newest-session resume added | source |
+|---|---|---|---|
+| `claude` | `-c`/`--continue`, `-r`/`--resume [id]`, `--session-id <id>`, `--fork-session`, `--from-pr [n]` | `--continue` | `claude --help` |
+| `codex` | `resume [id]`, `fork [id]`, `--last`, `--all` | `resume --last`, straight after argv0 | `codex resume --help` |
+| `opencode` | `-c`/`--continue`, `-s`/`--session <id>`, `--fork` | `--continue` | opencode's CLI reference; not installed where this was built |
+| `pi` | `-c`/`--continue`, `-r`/`--resume`, `--session <id>`, `--session-id <id>`, `--fork <id>`, `--no-session` | `--continue` | `pi --help` |
+
+A value that may be left out (`--resume`) is taken only when the next word is not a flag; a
+`--flag=value` form is removed whole. The newest-session resume is used only when nothing else
+named a session, and it resumes the newest session in the pane's directory, where the restored
+pane starts. `codex resume` takes the same options as `codex`, so the observed flags still apply;
+a codex started with a prompt on its command line is not verified.
+
+**Why non-agents came back.** On a pane whose foreground process group is the shell's own,
+discovery records the shell's NEWEST CHILD ([the job-control fallback
+above](#what-a-pane-is-running-when-the-shell-has-no-job-control)). A prompt is drawn by a command
+substitution, which runs in the shell's own group, so a tick that lands while a prompt redraws -
+on a resize, on the detach a restart starts with - records `starship prompt`. A shell init step
+such as `brew shellenv` is caught the same way. And upstream records every long-lived foreground
+command anyway: `htop`, `tail -f`, an editor.
+
+**`resurrect_commands` picks what a restored session offers.**
+
+| value | serialized | restored |
+|---|---|---|
+| `"all"`, or unset | every command, as upstream | a command pane, `Waiting to run` |
+| `"agents"` | agents only, with their resume | a command pane, `Waiting to run` |
+| `"prefill"` | agents only, with their resume | a plain shell with the resume typed at its prompt, not run |
+
+An agent is a harness `list-agents` already knows - `claude`, `codex`, `opencode`, `pi`, by
+basename - or a command a `resurrect_command_hints` entry names. In `"agents"` and `"prefill"`
+every other terminal pane is recorded with no command, editors included, so it comes back as a
+shell in its directory.
+
+**How `"prefill"` types the command.** Only a pane the session layout brought back is touched: its
+`RunCommand::resurrected` mark (see [the entry on clean
+exits](#a-resurrected-command-pane-drops-to-the-shell-when-its-command-exits-cleanly)) is the
+test. The pty thread opens the default shell in the command's directory instead of a held pane, and
+hands the quoted command line to the screen right after the layout, before any byte of that pane
+is read. The screen writes it to the pane as one bracketed paste - `ESC[200~`, the line,
+`ESC[201~`, no newline - the first time the pane's terminal has turned bracketed paste on. A paste
+and not keystrokes, because a line editor binds widgets to plain keys: an abbreviation expander on
+space would rewrite a typed line, and inside a paste ZLE and readline insert it literally. Control
+characters are dropped from the line, so it can neither end its paste early nor run itself. A line editor - zsh's ZLE, bash's readline, fish - turns it on when it
+starts reading a line, so that is the moment the shell sits at a prompt. Bytes written earlier
+would sit in a cooked-mode tty: the kernel echoes them above the prompt, and a shell that flushes
+input at start drops them. A shell that never turns bracketed paste on gets nothing typed and is
+still a working shell.
+
+No pane is held, so none of this goes near the held-pane path, and Enter runs the line the way any
+typed command runs. The screen builds the pane from a layout that names the shell, not the
+command, so the pane is not titled or listed as running something it is not. A non-agent command
+in an older snapshot comes back as a shell with nothing typed. A pane whose line is never run is
+recorded as a shell at the next serialization, the same cost the ESC on a held pane paid. A
+layout override (`override-layout`) reaches the screen batched with other work, so it types
+nothing.
+
+**A top-level key, not one inside `resurrect_command_hints`.** Every child of that block is parsed
+as a hint, and a hint with no children fails the whole config on every build. A top-level key is
+ignored by a build that does not know it; nkmk.25 reports a config carrying one as well defined.
+A value this build does not know, or one that is not a string, is warned about and ignored, which
+means `"all"`. So the key can go into a shared config before every machine has the binary.
 
 ### Tabs come back in the order they were left in
 

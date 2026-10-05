@@ -89,6 +89,31 @@ impl ResurrectCommandHint {
         }
         Some(words)
     }
+
+    /// The whole argument list to record for a pane running `command`, or `None` to leave the
+    /// pane as it was.
+    ///
+    /// For a harness this build knows - `claude`, `codex`, `opencode`, `pi` - the hint REPLACES
+    /// whatever session the observed argv picked: every session word is dropped and the hint's
+    /// words are added, so the command picks exactly one. Appending instead recorded
+    /// `claude --continue --resume <id>`. For any other command the hint only appends, by the
+    /// rule in [`Self::resume_args_for`], because this build does not know that tool's words.
+    pub fn args_for(
+        &self,
+        command: &str,
+        observed_args: &[String],
+        env_value: &str,
+    ) -> Option<Vec<String>> {
+        if let Some(mut args) = strip_session_words(command, observed_args) {
+            let words = self.resume_args_for(&[], env_value)?;
+            args.extend(words);
+            return Some(args);
+        }
+        let words = self.resume_args_for(observed_args, env_value)?;
+        let mut args = observed_args.to_vec();
+        args.extend(words);
+        Some(args)
+    }
 }
 
 /// The `resurrect_command_hints` block: hints in the order they were configured.
@@ -152,6 +177,261 @@ impl ResurrectCommandHints {
     /// The first hint that applies to `command`, if any.
     pub fn hint_for(&self, command: &str) -> Option<&ResurrectCommandHint> {
         self.hints.iter().find(|hint| hint.matches(command))
+    }
+}
+
+/// What a restored session does with the commands its panes were recorded running: the
+/// top-level `resurrect_commands` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResurrectCommands {
+    /// Every recorded command comes back as a command pane waiting to run. Upstream's behaviour,
+    /// and what an unset key means.
+    All,
+    /// Only coding agents keep their command, recorded with how to resume it, and come back as a
+    /// command pane waiting to run. Every other pane comes back as a plain shell.
+    Agents,
+    /// Only coding agents keep their command, and a restored agent pane is a plain shell with the
+    /// resume command typed at its prompt, not run. Every other pane is a plain shell.
+    Prefill,
+}
+
+impl ResurrectCommands {
+    /// The value as the config spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResurrectCommands::All => "all",
+            ResurrectCommands::Agents => "agents",
+            ResurrectCommands::Prefill => "prefill",
+        }
+    }
+    /// The mode a config value names, or `None` for a value this build does not know.
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(ResurrectCommands::All),
+            "agents" => Some(ResurrectCommands::Agents),
+            "prefill" => Some(ResurrectCommands::Prefill),
+            _ => None,
+        }
+    }
+    /// Whether a serialized pane keeps its command only if it is an agent's.
+    pub fn agents_only(&self) -> bool {
+        !matches!(self, ResurrectCommands::All)
+    }
+}
+
+/// Whether a word that picks a session takes the argument after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionValue {
+    /// A bare flag: `--continue`.
+    None,
+    /// A value that may be left out: `claude --resume` alone opens a picker. The next word is
+    /// taken as the value only when it is not itself a flag.
+    Optional,
+    /// A value that is always there: `--session-id <id>`.
+    Required,
+}
+
+/// How a coding agent picks a session, and how it picks its newest one back up.
+pub struct AgentResume {
+    /// The harness, as [`crate::agent_detect::AgentHarness::kind`] names it.
+    pub kind: &'static str,
+    /// The arguments that resume the newest session. Every one of them needs no id: it asks the
+    /// agent for its newest session in the pane's directory, which the restored pane is in.
+    pub resume_args: &'static [&'static str],
+    /// Whether `resume_args` is a subcommand, which goes straight after argv0 instead of last.
+    /// `codex resume --last` is one; its subcommand takes the same options the bare command does.
+    pub is_subcommand: bool,
+    /// Every word that picks a session, and whether it takes a value. A recorded command keeps
+    /// exactly one session choice, so these are removed before one is added.
+    pub session_words: &'static [(&'static str, SessionValue)],
+}
+
+/// The session words of every harness [`crate::agent_detect::HARNESSES`] knows, from each CLI's
+/// own `--help` (`opencode` from its published CLI reference).
+pub const AGENT_RESUMES: &[AgentResume] = &[
+    AgentResume {
+        kind: "claude",
+        resume_args: &["--continue"],
+        is_subcommand: false,
+        session_words: &[
+            ("--continue", SessionValue::None),
+            ("-c", SessionValue::None),
+            ("--resume", SessionValue::Optional),
+            ("-r", SessionValue::Optional),
+            ("--session-id", SessionValue::Required),
+            ("--fork-session", SessionValue::None),
+            ("--from-pr", SessionValue::Optional),
+        ],
+    },
+    AgentResume {
+        kind: "opencode",
+        resume_args: &["--continue"],
+        is_subcommand: false,
+        session_words: &[
+            ("--continue", SessionValue::None),
+            ("-c", SessionValue::None),
+            ("--session", SessionValue::Required),
+            ("-s", SessionValue::Required),
+            ("--fork", SessionValue::None),
+        ],
+    },
+    AgentResume {
+        kind: "codex",
+        resume_args: &["resume", "--last"],
+        is_subcommand: true,
+        session_words: &[
+            ("resume", SessionValue::Optional),
+            ("fork", SessionValue::Optional),
+            ("--last", SessionValue::None),
+            ("--all", SessionValue::None),
+        ],
+    },
+    AgentResume {
+        kind: "pi",
+        resume_args: &["--continue"],
+        is_subcommand: false,
+        session_words: &[
+            ("--continue", SessionValue::None),
+            ("-c", SessionValue::None),
+            ("--resume", SessionValue::None),
+            ("-r", SessionValue::None),
+            ("--session", SessionValue::Required),
+            ("--session-id", SessionValue::Required),
+            ("--fork", SessionValue::Required),
+            ("--no-session", SessionValue::None),
+        ],
+    },
+];
+
+/// The resume table entry for the harness `command` runs, if this build knows one.
+fn agent_resume_for(command: &str) -> Option<&'static AgentResume> {
+    let harness = crate::agent_detect::harness_for_command(command)?;
+    AGENT_RESUMES
+        .iter()
+        .find(|resume| resume.kind == harness.kind)
+}
+
+/// The session word `arg` is, and whether its value is glued on with `=`.
+fn session_word<'a>(resume: &'a AgentResume, arg: &str) -> Option<(&'a SessionValue, bool)> {
+    resume.session_words.iter().find_map(|(word, value)| {
+        if arg == *word {
+            Some((value, false))
+        } else if arg.starts_with(word) && arg[word.len()..].starts_with('=') {
+            Some((value, true))
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `command` is a coding agent that an agents-only mode keeps: a harness this build
+/// knows, or a command a configured hint names.
+pub fn is_resurrectable_agent(command: &str, hints: Option<&ResurrectCommandHints>) -> bool {
+    crate::agent_detect::harness_for_command(command).is_some()
+        || hints.map_or(false, |hints| hints.hint_for(command).is_some())
+}
+
+/// Whether `observed_args` already pick a session for the harness `command` runs.
+pub fn picks_a_session(command: &str, observed_args: &[String]) -> bool {
+    agent_resume_for(command).map_or(false, |resume| {
+        observed_args
+            .iter()
+            .any(|arg| session_word(resume, arg).is_some())
+    })
+}
+
+/// `observed_args` without any word that picks a session, for the harness `command` runs.
+/// `None` when `command` is not a harness this build knows.
+///
+/// A restored command must pick exactly one session. Appending a resume to an argv that already
+/// carried one recorded `claude --continue --resume <id>`, and a previously restored pane carried
+/// its old `--resume <id>` into every later restart. Everything else in the argv is kept.
+pub fn strip_session_words(command: &str, observed_args: &[String]) -> Option<Vec<String>> {
+    let resume = agent_resume_for(command)?;
+    let mut args = Vec::with_capacity(observed_args.len());
+    let mut words = observed_args.iter().peekable();
+    while let Some(word) = words.next() {
+        match session_word(resume, word) {
+            None => args.push(word.clone()),
+            Some((_, true)) | Some((SessionValue::None, false)) => {},
+            Some((SessionValue::Required, false)) => {
+                words.next();
+            },
+            Some((SessionValue::Optional, false)) => {
+                if words.peek().map_or(false, |next| !next.starts_with('-')) {
+                    words.next();
+                }
+            },
+        }
+    }
+    Some(args)
+}
+
+/// The arguments an agent pane is recorded with when nothing named its session: `observed_args`
+/// with the agent's built-in resume of its newest session added. `None` when `command` is not an
+/// agent this build knows how to resume, or when the observed arguments already pick a session.
+pub fn builtin_resume_args(command: &str, observed_args: &[String]) -> Option<Vec<String>> {
+    let resume = agent_resume_for(command)?;
+    if picks_a_session(command, observed_args) {
+        return None;
+    }
+    let resume_args = resume.resume_args.iter().map(|arg| (*arg).to_owned());
+    let args = if resume.is_subcommand {
+        resume_args.chain(observed_args.iter().cloned()).collect()
+    } else {
+        observed_args.iter().cloned().chain(resume_args).collect()
+    };
+    Some(args)
+}
+
+/// `observed_args` with whatever session they pick replaced by `session_id`, the session the
+/// claude process holds NOW.
+///
+/// The argv names the session the process STARTED with. `/clear`, `/resume` and a new
+/// conversation each move a running claude to another session and leave the argv as it was, so
+/// for this one case the argv is the stale answer and the process's own record is the live one.
+pub fn claude_args_for_live_session(observed_args: &[String], session_id: &str) -> Vec<String> {
+    let mut args =
+        strip_session_words("claude", observed_args).unwrap_or_else(|| observed_args.to_vec());
+    args.push("--resume".to_owned());
+    args.push(session_id.to_owned());
+    args
+}
+
+/// A command line as a person would type it at a POSIX shell prompt: every word that is not
+/// plainly safe is single-quoted. `resurrect_commands "prefill"` types this into a restored pane.
+pub fn command_line_for_prompt(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(|arg| arg.as_str()))
+        .map(quote_for_prompt)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The bytes that put `command_line` at a prompt: one bracketed paste, with no newline.
+///
+/// A paste, not keystrokes, because a line editor binds widgets to plain keys - an abbreviation
+/// expander on space, a completion menu on a character - and typed keys would run them. Inside a
+/// paste ZLE and readline insert the text literally. It is only sent once the line editor has
+/// turned bracketed paste on, so the editor is reading the markers it asked for.
+///
+/// Control characters are dropped from the text: an ESC would end the paste early and a newline
+/// would run the line, and a recorded argument carries neither on purpose.
+pub fn prefill_as_paste(command_line: &str) -> Vec<u8> {
+    let text: String = command_line.chars().filter(|c| !c.is_control()).collect();
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn quote_for_prompt(word: &str) -> String {
+    let is_safe = |c: char| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c);
+    if !word.is_empty() && word.chars().all(is_safe) {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -298,5 +578,191 @@ mod tests {
             Some(&"--continue".to_owned())
         );
         assert!(hints.hint_for("bash").is_none());
+    }
+
+    #[test]
+    fn only_known_agents_and_hinted_commands_are_resurrectable() {
+        for agent in ["claude", "/opt/homebrew/bin/codex", "opencode", "pi"] {
+            assert!(is_resurrectable_agent(agent, None), "{}", agent);
+        }
+        for other in [
+            "starship",
+            "/home/linuxbrew/.linuxbrew/bin/brew",
+            "htop",
+            "vim",
+        ] {
+            assert!(!is_resurrectable_agent(other, None), "{}", other);
+        }
+        let mut hints = ResurrectCommandHints::default();
+        hints.push(hint("aider", "--restore-chat-history"));
+        assert!(is_resurrectable_agent("aider", Some(&hints)));
+    }
+
+    #[test]
+    fn a_builtin_resume_is_appended_to_the_observed_arguments() {
+        let observed = args(&["--dangerously-skip-permissions"]);
+        assert_eq!(
+            builtin_resume_args("claude", &observed),
+            Some(args(&["--dangerously-skip-permissions", "--continue"]))
+        );
+        assert_eq!(
+            builtin_resume_args("/usr/bin/pi", &[]),
+            Some(args(&["--continue"]))
+        );
+        assert_eq!(
+            builtin_resume_args("opencode", &[]),
+            Some(args(&["--continue"]))
+        );
+    }
+
+    /// `codex resume` is a subcommand: it goes straight after argv0, and the observed options
+    /// follow it, which the subcommand accepts.
+    #[test]
+    fn a_subcommand_resume_goes_first() {
+        let observed = args(&["-m", "o3"]);
+        assert_eq!(
+            builtin_resume_args("codex", &observed),
+            Some(args(&["resume", "--last", "-m", "o3"]))
+        );
+    }
+
+    #[test]
+    fn a_builtin_resume_adds_nothing_when_the_argv_already_resumes() {
+        assert_eq!(
+            builtin_resume_args("codex", &args(&["resume", "abc"])),
+            None
+        );
+        assert_eq!(builtin_resume_args("pi", &args(&["-c"])), None);
+        assert_eq!(builtin_resume_args("htop", &[]), None);
+    }
+
+    #[test]
+    fn the_live_session_replaces_the_one_the_argv_started_with() {
+        let observed = args(&[
+            "--dangerously-skip-permissions",
+            "--resume",
+            "first-session",
+        ]);
+        assert_eq!(
+            claude_args_for_live_session(&observed, "live-session"),
+            args(&["--dangerously-skip-permissions", "--resume", "live-session"])
+        );
+    }
+
+    #[test]
+    fn every_session_picking_word_is_dropped_for_the_live_session() {
+        let observed = args(&[
+            "-c",
+            "--resume",
+            "--model",
+            "opus",
+            "--session-id",
+            "x",
+            "--resume=y",
+        ]);
+        assert_eq!(
+            claude_args_for_live_session(&observed, "live"),
+            args(&["--model", "opus", "--resume", "live"])
+        );
+    }
+
+    #[test]
+    fn every_agents_session_words_are_stripped() {
+        assert_eq!(
+            strip_session_words("codex", &args(&["-m", "o3", "resume", "abc", "--last"])),
+            Some(args(&["-m", "o3"]))
+        );
+        assert_eq!(
+            strip_session_words(
+                "opencode",
+                &args(&["-s", "x", "--continue", "--model", "m"])
+            ),
+            Some(args(&["--model", "m"]))
+        );
+        assert_eq!(
+            strip_session_words(
+                "pi",
+                &args(&["--session=x", "-r", "--fork", "y", "--thinking", "high"])
+            ),
+            Some(args(&["--thinking", "high"]))
+        );
+        assert_eq!(strip_session_words("htop", &args(&["-d", "5"])), None);
+    }
+
+    #[test]
+    fn a_hint_for_a_known_agent_replaces_the_argvs_session() {
+        let observed = args(&["--dangerously-skip-permissions", "--continue"]);
+        assert_eq!(
+            hint("claude", "--resume {}").args_for("claude", &observed, "fced3e97"),
+            Some(args(&[
+                "--dangerously-skip-permissions",
+                "--resume",
+                "fced3e97"
+            ]))
+        );
+        let restored = args(&["-r", "old", "--resume", "older"]);
+        assert_eq!(
+            hint("claude", "--resume {}").args_for("/usr/bin/claude", &restored, "new"),
+            Some(args(&["--resume", "new"]))
+        );
+    }
+
+    /// A tool this build has no session words for keeps the append-only rule.
+    #[test]
+    fn a_hint_for_another_tool_still_only_appends() {
+        let observed = args(&["--restore"]);
+        assert_eq!(
+            hint("aider", "--restore").args_for("aider", &observed, "x"),
+            None
+        );
+        assert_eq!(
+            hint("aider", "--id {}").args_for("aider", &args(&["-v"]), "x"),
+            Some(args(&["-v", "--id", "x"]))
+        );
+    }
+
+    #[test]
+    fn a_prompt_command_line_quotes_what_a_shell_would_split() {
+        assert_eq!(
+            command_line_for_prompt(
+                "claude",
+                &args(&["--dangerously-skip-permissions", "--resume", "fced3e97-31"])
+            ),
+            "claude --dangerously-skip-permissions --resume fced3e97-31"
+        );
+        assert_eq!(
+            command_line_for_prompt("codex", &args(&["it's here", "$HOME", ""])),
+            "codex 'it'\\''s here' '$HOME' ''"
+        );
+    }
+
+    #[test]
+    fn a_resurrect_commands_value_round_trips() {
+        for mode in [
+            ResurrectCommands::All,
+            ResurrectCommands::Agents,
+            ResurrectCommands::Prefill,
+        ] {
+            assert_eq!(ResurrectCommands::from_config(mode.as_str()), Some(mode));
+        }
+        assert_eq!(ResurrectCommands::from_config("never"), None);
+        assert!(!ResurrectCommands::All.agents_only());
+        assert!(ResurrectCommands::Prefill.agents_only());
+    }
+
+    #[test]
+    fn a_prefill_is_one_bracketed_paste_with_no_newline() {
+        assert_eq!(
+            prefill_as_paste("claude --resume abc"),
+            b"\x1b[200~claude --resume abc\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_prefill_cannot_end_its_paste_or_run_its_line() {
+        assert_eq!(
+            prefill_as_paste("x \x1b[201~y\nz\r"),
+            b"\x1b[200~x [201~yz\x1b[201~".to_vec()
+        );
     }
 }

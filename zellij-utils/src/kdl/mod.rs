@@ -20,7 +20,9 @@ use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
 use crate::pane_privacy::{MatchField, OnUnknownCwd, PanePrivacyOptions, TabRule};
-use crate::resurrect_command_hints::{ResurrectCommandHint, ResurrectCommandHints};
+use crate::resurrect_command_hints::{
+    ResurrectCommandHint, ResurrectCommandHints, ResurrectCommands,
+};
 #[cfg(test)]
 use crate::session_service::LaunchdKey;
 use crate::session_service::{PinnedExe, PlistValue, SessionServiceOptions};
@@ -3061,6 +3063,7 @@ impl Options {
             Some(kdl_hints) => Some(Self::resurrect_command_hints_from_kdl(kdl_hints)?),
             None => None,
         };
+        let resurrect_commands = Self::resurrect_commands_from_kdl(kdl_options);
         let default_floating_size = match kdl_options.get("default_floating_size") {
             Some(kdl_default_floating_size) => Some(Self::default_floating_size_from_kdl(
                 kdl_default_floating_size,
@@ -3302,6 +3305,7 @@ impl Options {
             session_service,
             pane_privacy,
             resurrect_command_hints,
+            resurrect_commands,
             default_floating_size,
             styled_underlines,
             serialization_interval,
@@ -3741,6 +3745,34 @@ impl Options {
         for name in names {
             node.push(KdlValue::String(name.to_owned()));
         }
+        Some(node)
+    }
+    /// The `resurrect_commands` key: which recorded commands a restored session offers.
+    ///
+    /// A value this build does not know is WARNED about and ignored, never an error: a config
+    /// error fails the whole file, and a later build may add a mode a shared config names before
+    /// every machine has it. Ignored means unset, which is upstream's behaviour.
+    fn resurrect_commands_from_kdl(kdl_options: &KdlDocument) -> Option<ResurrectCommands> {
+        let node = kdl_options.get("resurrect_commands")?;
+        let value = node
+            .entries()
+            .iter()
+            .next()
+            .and_then(|entry| entry.value().as_string());
+        let mode = value.and_then(ResurrectCommands::from_config);
+        if mode.is_none() {
+            log::warn!(
+                "resurrect_commands {:?} is not a mode this build knows, ignored (expected \"all\", \"agents\" or \"prefill\")",
+                node.entries().iter().next().map(|entry| entry.value().to_string())
+            );
+        }
+        mode
+    }
+    /// The `resurrect_commands` node.
+    fn resurrect_commands_to_kdl(&self) -> Option<KdlNode> {
+        let mode = self.resurrect_commands?;
+        let mut node = KdlNode::new("resurrect_commands");
+        node.push(KdlValue::String(mode.as_str().to_owned()));
         Some(node)
     }
     /// The `detect_agents` node: whether panes are checked for a coding agent at all.
@@ -5986,6 +6018,9 @@ impl Options {
         }
         if let Some(resurrect_command_hints) = self.resurrect_command_hints_to_kdl() {
             nodes.push(resurrect_command_hints);
+        }
+        if let Some(resurrect_commands) = self.resurrect_commands_to_kdl() {
+            nodes.push(resurrect_commands);
         }
         if let Some(default_floating_size) = self.default_floating_size_to_kdl() {
             nodes.push(default_floating_size);
@@ -10146,6 +10181,43 @@ fn report_pane_env_config_parsing() {
             "MY_TOOL_ID".to_string()
         ])
     );
+}
+
+#[test]
+fn resurrect_commands_config_parsing_and_round_trip() {
+    assert_eq!(
+        Config::from_kdl("", None)
+            .unwrap()
+            .options
+            .resurrect_commands,
+        None
+    );
+    for (value, mode) in [
+        ("all", ResurrectCommands::All),
+        ("agents", ResurrectCommands::Agents),
+        ("prefill", ResurrectCommands::Prefill),
+    ] {
+        let config = Config::from_kdl(&format!("resurrect_commands \"{}\"", value), None).unwrap();
+        assert_eq!(config.options.resurrect_commands, Some(mode));
+        let written: String = config
+            .options
+            .to_kdl(false)
+            .iter()
+            .map(|node| node.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reparsed = Config::from_kdl(&written, None).unwrap();
+        assert_eq!(reparsed.options.resurrect_commands, Some(mode));
+    }
+}
+
+/// A mode this build does not know must not fail the config: the key is ignored.
+#[test]
+fn an_unknown_resurrect_commands_mode_is_ignored() {
+    for config in ["resurrect_commands \"someday\"", "resurrect_commands true"] {
+        let config = Config::from_kdl(config, None).unwrap();
+        assert_eq!(config.options.resurrect_commands, None);
+    }
 }
 
 /// The environment holds secrets, so nothing is reported that was not asked for by name.

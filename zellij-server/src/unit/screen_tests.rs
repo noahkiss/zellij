@@ -18611,3 +18611,50 @@ fn the_session_keeps_the_size_of_the_last_client_to_leave() {
     screen.remove_client(3).expect("TEST");
     assert_eq!(screen.size_for_client(None), last_terminal);
 }
+
+/// `resurrect_commands "prefill"`: nothing is written while the shell is still starting, and the
+/// first output that turns bracketed paste on gets the command line once, as one paste with no
+/// newline - so a line editor inserts it literally, with no key bindings run on it.
+#[test]
+pub fn a_prefill_is_pasted_once_when_the_line_editor_turns_bracketed_paste_on() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let pty_writer_receiver = mock_screen.pty_writer_receiver.take().unwrap();
+    let screen_thread = mock_screen.run(None, vec![]);
+    let received_pty_instructions = Arc::new(Mutex::new(vec![]));
+    let pty_writer_thread = log_actions_in_thread!(
+        received_pty_instructions,
+        PtyWriteInstruction::Exit,
+        pty_writer_receiver
+    );
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PrefillPane(
+        0,
+        "claude --resume abc".to_owned(),
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        0,
+        b"shell init output\r\n".to_vec(),
+    ));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(0, b"\x1b[?2004h$ ".to_vec()));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        0,
+        b"\x1b[?2004l\x1b[?2004h$ ".to_vec(),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![pty_writer_thread, screen_thread]);
+    let writes: Vec<Vec<u8>> = received_pty_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i {
+            PtyWriteInstruction::Write(bytes, 0, _) => Some(bytes.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        vec![b"\x1b[200~claude --resume abc\x1b[201~".to_vec()]
+    );
+}

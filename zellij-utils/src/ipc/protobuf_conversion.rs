@@ -1046,6 +1046,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             session_service: None,
             pane_privacy: None,
             resurrect_command_hints: None,
+            resurrect_commands: None,
             default_floating_size: None,
             input_while_scrolled: None,
             command_pane_on_clean_exit: None,
