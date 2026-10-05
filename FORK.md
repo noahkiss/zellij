@@ -7845,7 +7845,7 @@ that proves the other team's certificate is never handed to `codesign`.
 
 ### Doctor keeps the certificate the grants name, and remembers a switch until the re-grant is made
 
-Seen on a Mac at nkmk.26. The pin was anchored on our own minted certificate. The user then added
+Fixed in nkmk.27; seen on a Mac at nkmk.26. The pin was anchored on our own minted certificate. The user then added
 an Apple Development identity to the keychain. The next `session doctor --fix` refreshed the pin and
 signed it with the Apple identity, and asked for Full Disk Access, Accessibility and Screen
 Recording to be granted again. Seven minutes later a `--dry-run` said the grants "still hold". Two
