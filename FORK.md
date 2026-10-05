@@ -1729,7 +1729,8 @@ afterwards: install a new package prefix, and the unit learns about it at the ne
 not before. Until nkmk.25 drift said so, by regenerating from the asking shell's `PATH`. That was
 not safe: an SSH shell's thinner `PATH` read as drift, and following the report recorded it. Now
 `session enable` prints each key it changes, `PATH` among them, so a re-record is seen when it is
-made.
+made. From nkmk.27 an `enable` from a thinner shell keeps the recorded `PATH` instead; see [the
+entry below](#session-enable-from-a-thinner-shell-keeps-the-recorded-path).
 
 ### The generated unit's `PATH` leads with the pin directory
 
@@ -1771,6 +1772,52 @@ drift check](#the-config-and-the-installed-unit-are-compared) reports it and `se
 re-records it — and then `session restart`, because a server keeps the `PATH` it was created with.
 Only a machine that pins its binary *and* whose shell names the pin directory somewhere other than
 first sees that drift. Everywhere else the generated value is byte-identical and nothing is reported.
+
+### `session enable` from a thinner shell keeps the recorded `PATH`
+
+The release runbook runs `zellij session enable` over SSH on each Mac. A non-interactive SSH shell
+skips most of the rc chain, so its `PATH` is thinner than a terminal's. On one Mac at nkmk.26,
+`enable` rewrote the launch agent's `PATH` from 17 entries to 13. It dropped `/usr/local/bin`,
+`~/.rbenv/shims`, fnm's per-shell directory, `~/.orbstack/bin`, `/System/Cryptexes/…` and
+`/Library/Apple/usr/bin`. An `enable` from a terminal put them back, until the next release. The
+change was printed (`PATH: 17 entries -> 13 entries`), and `enable` went on all the same.
+
+A server resolves commands against the `PATH` it was created with, so each release left the next
+server unable to find what those directories hold.
+
+`enable` now keeps the `PATH` the installed unit records when this shell's `PATH`:
+
+- **adds nothing** to the recorded one, and
+- **drops at least one directory that still exists** on the disk.
+
+Every other shell re-records, as before. A shell that adds a directory is the operator's current
+`PATH` — a new package prefix, or the per-shell directory a version manager such as fnm makes for
+each shell. A shell that drops only directories gone from the disk is cleaning up, not shrinking.
+
+```
+$ ssh mac zellij session enable mysession
+      kept the installed PATH: this shell's PATH adds nothing to it and lacks 2 directories that exist
+        /usr/local/bin
+        /Users/user/.rbenv/shims
+      to record a new PATH, run `session enable` from a shell that adds to it
+ok    service for 'mysession' is already enabled
+```
+
+Only the `PATH` is kept. Everything else in the unit is rendered as before, so a new binary or a
+changed config is still written. Drift reads the `PATH` back from the installed unit, so a kept
+`PATH` compares as current and nothing asks for another `enable`. A config that states its own
+`PATH` (`launchd { env { PATH … } }`, the `keys` hatch, `systemd { service "Environment=PATH=…" }`)
+writes that value whatever the shell, and nothing is reported.
+
+To drop a directory that still exists on purpose, `session disable` and then `session enable` from
+the shell that lacks it. A unit that is not installed has no `PATH` to keep. The state root moves
+the same way.
+
+`zellij-utils/src/session_service.rs` (`path_to_keep`, `recorded_for_enable`, and an
+`enable_files` rendering mode beside `service_files` and `comparison_files`) and
+`src/session_commands.rs` for the message. Two tests: the decision table for `path_to_keep`, and an
+`enable` from the SSH `PATH` rendered over an interactive unit on both platforms, which keeps the
+recorded `PATH` and reports no drift.
 
 ### `session up` will not create a session in the wrong macOS session domain
 
