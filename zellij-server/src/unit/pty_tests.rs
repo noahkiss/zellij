@@ -932,6 +932,7 @@ fn a_pane_whose_identity_is_known_is_never_walked_again() {
         child_pid: 42,
         found: true,
         ticks_since_probe: 10_000,
+        claude_record_pid: None,
     };
     assert!(!probe.needs_another_walk(42));
 }
@@ -944,6 +945,7 @@ fn a_new_process_in_the_pane_is_a_new_question() {
         child_pid: 42,
         found: true,
         ticks_since_probe: 0,
+        claude_record_pid: None,
     };
     assert!(probe.needs_another_walk(43));
 }
@@ -954,6 +956,7 @@ fn a_pane_with_no_identity_yet_is_retried_but_not_every_tick() {
         child_pid: 42,
         found: false,
         ticks_since_probe: 0,
+        claude_record_pid: None,
     };
     assert!(!probe.needs_another_walk(42));
     probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS - 1;
@@ -1031,4 +1034,51 @@ fn a_shell_pane_is_still_serialized_as_the_job_it_runs() {
         panic!("expected a command, got {:?}", meta.terminal_run(2));
     };
     assert_eq!(run_command.command, PathBuf::from("htop"));
+}
+
+fn write_claude_record(dir: &std::path::Path, pid: u32, session_id: &str) {
+    std::fs::write(
+        dir.join(format!("{}.json", pid)),
+        format!(r#"{{"pid":{},"sessionId":"{}"}}"#, pid, session_id),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_known_claude_follows_its_session_without_another_walk() {
+    // `/clear` moves claude to another session in the same process: the pid the walk was keyed
+    // on does not change, so only re-reading claude's own record can see it
+    let dir = tempfile::tempdir().unwrap();
+    write_claude_record(dir.path(), 77, "first-session");
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        found: true,
+        ticks_since_probe: 0,
+        claude_record_pid: Some(77),
+    };
+    assert!(!probe.needs_another_walk(42));
+    assert_eq!(
+        probe.live_claude_session(Some(dir.path())).as_deref(),
+        Some("first-session")
+    );
+    write_claude_record(dir.path(), 77, "second-session");
+    assert_eq!(
+        probe.live_claude_session(Some(dir.path())).as_deref(),
+        Some("second-session")
+    );
+    std::fs::remove_file(dir.path().join("77.json")).unwrap();
+    assert_eq!(probe.live_claude_session(Some(dir.path())), None);
+}
+
+#[test]
+fn a_pane_with_no_claude_record_reads_none() {
+    let dir = tempfile::tempdir().unwrap();
+    write_claude_record(dir.path(), 77, "first-session");
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        found: true,
+        ticks_since_probe: 0,
+        claude_record_pid: None,
+    };
+    assert_eq!(probe.live_claude_session(Some(dir.path())), None);
 }

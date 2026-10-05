@@ -4905,6 +4905,25 @@ governs, and a config reload flips it in either direction without a restart.
 Being top-level, it is ignored by a binary that predates it, so it can go into a shared config ahead
 of the upgrade.
 
+### `list-agents` names the session claude holds now
+
+`AGENT_ID` for a claude pane came from `CLAUDE_CODE_SESSION_ID`. The claude process does not carry
+that variable; its children do, each frozen at its spawn. So after a `/clear` the column still named
+the first session, for as long as the pane lived. The cause is the one [the resume
+entry](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents) describes.
+
+The walk now also reads Claude Code's own record, `sessions/<pid>.json` under `$CLAUDE_CONFIG_DIR`
+(else `~/.claude`), with the same code serialization uses. A record's `sessionId` wins over the
+variable; a pane with no record keeps the variable's value. `SOURCE` stays `command+env`.
+
+The walk still runs once per pane. It remembers which claude pid's record answered, and every tick
+re-reads that one file: a few hundred bytes, not a process-table read. That is how a `/clear` is
+seen without a new process. When the record is gone, that claude has exited, and the pane is walked
+again.
+
+`agent_id` is a field of the CLI-only `PaneListEntry` and `AgentListEntry`. Only its value
+changes: no protobuf tag, no plugin API, no client/server contract.
+
 ### `zellij mcp`: the CLI served over the Model Context Protocol
 
 ```json
