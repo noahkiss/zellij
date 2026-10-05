@@ -420,6 +420,19 @@ pub trait ServerOsApi: Send + Sync {
     ) -> HashMap<u32, Vec<String>> {
         HashMap::new()
     }
+    /// The same question as [`Self::get_foreground_cmds`], for `(terminal_id, pid)` panes whose
+    /// own process is the pane's command rather than a shell - a command pane, or an editor.
+    ///
+    /// Such a process leads its own process group, so the terminal names it whenever it has not
+    /// handed the terminal to a job of its own. Its children are its helpers, not a job a user
+    /// started, so that case records the process's own argv instead of its newest child.
+    fn get_foreground_cmds_of_commands(
+        &self,
+        _panes: &[(u32, u32)],
+        _post_hook: &Option<String>,
+    ) -> HashMap<u32, Vec<String>> {
+        HashMap::new()
+    }
     /// Writes the given buffer to a string
     fn write_to_file(&mut self, buf: String, file: Option<String>) -> Result<()>;
 
@@ -704,6 +717,25 @@ impl ServerOsApi for ServerOsInputOutput {
         let mut cmds = foreground_cmds_by_pid(&terminal_to_fg_pid, post_hook);
         cmds.extend(foreground_cmds_by_child(&panes_to_scan, post_hook));
         cmds
+    }
+
+    #[cfg(unix)]
+    fn get_foreground_cmds_of_commands(
+        &self,
+        panes: &[(u32, u32)],
+        post_hook: &Option<String>,
+    ) -> HashMap<u32, Vec<String>> {
+        let terminal_to_fg_pid: HashMap<u32, u32> = panes
+            .iter()
+            .map(|&(terminal_id, pid)| {
+                let fg_pid = match self.pty_backend.tcgetpgrp(terminal_id) {
+                    Some(fpgid) if fpgid > 0 => fpgid as u32,
+                    _ => pid,
+                };
+                (terminal_id, fg_pid)
+            })
+            .collect();
+        foreground_cmds_by_pid(&terminal_to_fg_pid, post_hook)
     }
 
     #[cfg(not(unix))]

@@ -4051,6 +4051,31 @@ ignored by a build that does not know it; nkmk.25 reports a config carrying one 
 A value this build does not know, or one that is not a string, is warned about and ignored, which
 means `"all"`. So the key can go into a shared config before every machine has the binary.
 
+### A command pane is recorded as its own command, not its newest child
+
+A pane can run an agent directly: a layout's `command "claude"`, or a restored pane after Enter.
+Then the pane's own process IS the agent. It leads its own process group, so the terminal names the
+pane's pid as the foreground group, and discovery treated it like an idle shell: it recorded the
+newest child ([the job-control fallback](#what-a-pane-is-running-when-the-shell-has-no-job-control)).
+For an agent that is an MCP server, a tool shell or a `sleep`. In `"agents"` and `"prefill"` mode
+the filter then dropped the pane as a non-agent; in `"all"` mode it came back running the child.
+
+The screen already knows which panes run their own command: a command pane or an editor pane was
+opened with `Run::Command` or `Run::EditFile`. Serialization now asks about those panes separately.
+When the terminal names another process group, that group is recorded as before. When it names
+the pane's own process, the pane records that process's own argv. Shell panes are asked exactly as
+before, so the job-control fallback is unchanged for them.
+
+| pane | recorded before | recorded now |
+|---|---|---|
+| `command "claude"` with MCP children | the newest child | `claude ...`, then the agent resume |
+| an editor pane with a language server | the language server | the editor and its file |
+| a shell, idle or running a job | unchanged | unchanged |
+
+This changes `"all"` snapshots too: a command pane with children comes back running its command.
+The live pane list (`list-panes`, `list-agents`) still asks the old way and can show such a pane's
+newest child.
+
 ### Tabs come back in the order they were left in
 
 A session restored from a snapshot got its tabs back in **creation** order, so every tab that had

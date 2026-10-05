@@ -1,6 +1,7 @@
 use super::*;
 use crate::os_input_output::ServerOsApi;
 use crate::plugins::PluginInstruction;
+use crate::session_layout_metadata::PaneLayoutMetadata;
 use crate::thread_bus::Bus;
 use interprocess::local_socket::Stream as LocalSocketStream;
 use std::collections::HashMap;
@@ -165,6 +166,17 @@ impl ServerOsApi for MockOsApi {
                     .get(&shell_pid.to_string())
                     .map(|cmd| (*terminal_id, cmd.clone()))
             })
+            .collect()
+    }
+    fn get_foreground_cmds_of_commands(
+        &self,
+        panes: &[(u32, u32)],
+        _: &Option<String>,
+    ) -> HashMap<u32, Vec<String>> {
+        let cmds = self.cmds.lock().unwrap();
+        panes
+            .iter()
+            .filter_map(|(terminal_id, pid)| cmds.get(pid).map(|cmd| (*terminal_id, cmd.clone())))
             .collect()
     }
     fn write_to_file(&mut self, _: String, _: Option<String>) -> anyhow::Result<()> {
@@ -948,4 +960,75 @@ fn a_pane_with_no_identity_yet_is_retried_but_not_every_tick() {
     assert!(!probe.needs_another_walk(42));
     probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS;
     assert!(probe.needs_another_walk(42));
+}
+
+fn pane_running(terminal_id: u32, run: Option<Run>) -> PaneLayoutMetadata {
+    PaneLayoutMetadata::new(
+        PaneId::Terminal(terminal_id),
+        Default::default(),
+        false,
+        run,
+        None,
+        false,
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+#[test]
+fn a_command_pane_is_serialized_as_its_own_command_not_its_newest_child() {
+    // an agent run as a command pane IS the pane's process, and its children are its MCP servers
+    // and tool shells - the newest of them is not what the pane runs
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    mock.set_foreground_cmd(100, vec!["sleep".into(), "30".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.id_to_child_pid.insert(1, 100);
+    let mut meta = SessionLayoutMetadata::default();
+    meta.add_tab(
+        "tab1".to_owned(),
+        true,
+        false,
+        vec![pane_running(
+            1,
+            Some(Run::Command(RunCommand::new(PathBuf::from("claude")))),
+        )],
+        vec![],
+    );
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(run_command.command, PathBuf::from("claude"));
+    assert_eq!(run_command.args, vec!["--continue".to_owned()]);
+}
+
+#[test]
+fn a_shell_pane_is_still_serialized_as_the_job_it_runs() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(200, vec!["/bin/bash".into()]);
+    mock.set_foreground_cmd(200, vec!["htop".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.id_to_child_pid.insert(2, 200);
+    let mut meta = SessionLayoutMetadata::default();
+    meta.add_tab(
+        "tab1".to_owned(),
+        true,
+        false,
+        vec![pane_running(2, None)],
+        vec![],
+    );
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(2) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(2));
+    };
+    assert_eq!(run_command.command, PathBuf::from("htop"));
 }

@@ -2279,11 +2279,23 @@ impl Pty {
             .iter()
             .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
             .collect();
+        // a pane whose process is its own command is asked about that process, not about the
+        // newest of its children: an agent run as a command pane would otherwise be recorded as
+        // one of its MCP servers or tool shells
+        let command_terminal_ids = session_layout_metadata.command_terminal_ids();
+        let (command_panes, shell_panes): (Vec<(u32, u32)>, Vec<(u32, u32)>) = panes
+            .iter()
+            .partition(|(id, _)| command_terminal_ids.contains(id));
         let foreground_cmds = self
             .bus
             .os_input
             .as_ref()
-            .map(|os_input| os_input.get_foreground_cmds(&panes, &self.post_command_discovery_hook))
+            .map(|os_input| {
+                let post_hook = &self.post_command_discovery_hook;
+                let mut cmds = os_input.get_foreground_cmds(&shell_panes, post_hook);
+                cmds.extend(os_input.get_foreground_cmds_of_commands(&command_panes, post_hook));
+                cmds
+            })
             .unwrap_or_default();
 
         for terminal_id in terminal_ids {
