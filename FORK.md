@@ -2684,7 +2684,7 @@ Since nkmk.25, a client with no pin recorded starts a server from `own_exe_for_s
 ### `zellij session doctor`
 
 ```
-zellij session doctor [NAME] [-n|--dry-run] [--fix|--no-fix] [--sign|--no-sign] [--exe PATH]
+zellij session doctor [NAME] [-n|--dry-run] [--fix|--no-fix] [--sign|--no-sign] [--regranted] [--exe PATH]
 ```
 
 Everything that has to hold for one session to come up and stay up, checked in one pass. It repairs
@@ -2921,7 +2921,10 @@ always the certificate's fault: `errSecInternalComponent`, a keychain locked ove
 the key-access dialog. Each is transient, and each would otherwise demote the pin permanently —
 permanently, because a self-signed signature *is* anchored, so the next doctor run reads the pin as
 already correct and never climbs back. So rung 3 is reached only when the keychain offers no Apple
-certificate at all. A machine that holds one and cannot use it gets a `Needs you` naming what each
+certificate at all, or when the grants were made against rung 3's own certificate — then it is the
+only rung tried (see [the entry
+below](#doctor-keeps-the-certificate-the-grants-name-and-remembers-a-switch-until-the-re-grant-is-made)).
+A machine that holds one and cannot use it gets a `Needs you` naming what each
 certificate said, and nothing is minted that the machine would never otherwise have had.
 
 Nothing is ever signed ad-hoc: that anchors on the code hash, which is the fault under a new name.
@@ -7792,6 +7795,69 @@ and only when a fall is actually being weighed, because the question costs two k
 Three tests, all of which run on a machine with no keychain: the team read out of the requirement each rung
 writes, the seven-case verdict table, and a two-team keychain driven through `sign_pin`
 that proves the other team's certificate is never handed to `codesign`.
+
+### Doctor keeps the certificate the grants name, and remembers a switch until the re-grant is made
+
+Seen on a Mac at nkmk.26. The pin was anchored on our own minted certificate. The user then added
+an Apple Development identity to the keychain. The next `session doctor --fix` refreshed the pin and
+signed it with the Apple identity, and asked for Full Disk Access, Accessibility and Screen
+Recording to be granted again. Seven minutes later a `--dry-run` said the grants "still hold". Two
+faults, one in each run.
+
+**The ladder dropped our certificate whenever an Apple one was offered.** `sign_down_the_ladder`
+removed the self-signed rung if any Apple rung existed, whatever the pin was anchored on. That rule
+is right for a pin that was never anchored. It is wrong for a pin whose grants name our certificate:
+our certificate still signs, and signing with it keeps every grant. `ladder_for_the_anchor` now
+reads the requirement the grants were made against. When that requirement names an offered
+certificate by hash (`certificate leaf = H"<sha1>"`, the same SHA-1 `find-identity` prints), that
+rung is the only one tried. A refusal from it is a `Needs you`. It is not a fall to the Apple
+certificate, by the same rule that stops a fall to another team. When the keychain no longer offers
+that certificate, doctor still switches to the best rung left, and says so.
+
+**Nothing recorded the switch, so the next run compared the pin with itself.** The run that signed
+compared the requirement before and after, and asked for the re-grant. The next run had only the
+pin. A pin always satisfies its own requirement, so doctor called the grants held. Now a switch is
+written to `~/Library/Application Support/zellij/signing/regrant-owed`. The file holds the
+requirement the grants were made against: the old one, not the new one. Every later run that finds
+the file reports `Needs you` with both requirements and the three steps:
+
+```
+Needs you
+  signing   <pin> is signed as org.zellij.nkmk, and the grants were made against another requirement
+            now:     designated => identifier "org.zellij.nkmk" and anchor apple generic and ...
+            granted: designated => identifier "org.zellij.nkmk" and certificate leaf = H"..."
+            ...
+            1. re-grant Full Disk Access, Accessibility and Screen Recording for <pin>
+            2. `zellij session doctor --fix --regranted`, so doctor records it as made
+            3. THEN `zellij session restart`
+```
+
+Two things clear the record:
+
+- **`zellij session doctor --fix --regranted`.** The operator says the grants were made again.
+  Doctor takes the flag as the proof, because the grants live in a TCC database that only a process
+  with Full Disk Access can read. With `--dry-run` the flag reports what it would clear and clears
+  nothing.
+- **A pin that satisfies the recorded requirement again.** Doctor asks `codesign --verify
+  -R=<requirement> <pin>`, which is the test macOS makes when it reads a grant. A later refresh
+  signed back onto the granted certificate passes it, and the record goes.
+
+The same `-R` test now decides whether a change of requirement owes a re-grant at all. A Developer
+ID and an Apple Development certificate of one team write different texts, and both satisfy the
+team requirement. A run that switched between them asked for a re-grant on the text alone. It now
+asks only when the new signature fails the old requirement. A test that cannot run counts as a
+failure, so doubt reports the re-grant as owed.
+
+A pin that was never anchored (ad-hoc or unsigned) writes no record. Its first anchored signature
+still asks for the grants once, as before.
+
+`zellij-utils/src/session_signing.rs`, plus the `--regranted` flag through `cli.rs`,
+`session_commands.rs` and `session_doctor_command.rs` into `PinSigningPolicy`. The decisions are
+pure functions (`requirement_names_certificate`, `ladder_for_the_anchor`, `judge_grants`) with their
+own tests. Four `sign_pin` tests drive the Mac's flow with a recorded `codesign`: the nkmk.26
+keychain keeps our certificate; a refusal from it does not fall to the Apple one; a forced
+switch stays owed through a later dry run until `--fix --regranted`; and a pin back on the granted
+requirement clears the record, but only in a run that may act.
 
 ## Assessed and deliberately not built
 

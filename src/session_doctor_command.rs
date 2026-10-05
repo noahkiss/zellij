@@ -37,12 +37,13 @@ pub(crate) fn session_doctor_command(
     dry_run: bool,
     no_fix: bool,
     no_sign: bool,
+    regranted: bool,
     exe: Option<PathBuf>,
     opts: CliArgs,
 ) -> ! {
     let name = resolve_session_name(session_name, &opts, false);
     let mode = DoctorMode::from_flags(dry_run, no_fix, no_sign);
-    let report = examine(&name, exe, mode, &opts);
+    let report = examine(&name, exe, mode, regranted, &opts);
     print!("{}", report.render());
     std::process::exit(report.exit_code());
 }
@@ -53,7 +54,13 @@ pub(crate) fn session_doctor_command(
 /// is, what the config says, where the sockets are, what is installed to keep the session up, and
 /// only then the session and the build serving it. A reader who stops at the first `Needs you` has
 /// usually stopped at the cause.
-fn examine(name: &str, exe: Option<PathBuf>, mode: DoctorMode, opts: &CliArgs) -> Report {
+fn examine(
+    name: &str,
+    exe: Option<PathBuf>,
+    mode: DoctorMode,
+    regranted: bool,
+    opts: &CliArgs,
+) -> Report {
     let mut report = Report::new();
     // Said before any check can write the pin. `--no-sign` is the case that matters: without it
     // the pin's writer would sign an anchored pin this run was told to leave alone, and the run
@@ -63,6 +70,7 @@ fn examine(name: &str, exe: Option<PathBuf>, mode: DoctorMode, opts: &CliArgs) -
         zellij_utils::session_signing::PinSigningPolicy {
             allowed: mode.sign,
             backup_dir: opts.config_dir.clone().or_else(find_default_config_dir),
+            regranted,
         },
     );
     let extras = configured_extras(opts);

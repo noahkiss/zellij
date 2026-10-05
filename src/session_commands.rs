@@ -112,12 +112,14 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             no_fix,
             sign: _,
             no_sign,
+            regranted,
             exe,
         } => crate::session_doctor_command::session_doctor_command(
             session_name,
             dry_run,
             no_fix,
             no_sign,
+            regranted,
             exe,
             opts,
         ),
@@ -296,6 +298,7 @@ fn assert_pinned_exe(name: &str, extras: Option<&SessionServiceOptions>, opts: &
                 .config_dir
                 .clone()
                 .or_else(zellij_utils::home::find_default_config_dir),
+            regranted: false,
         },
     );
     let installed = session_service::installed_session_exe(name);

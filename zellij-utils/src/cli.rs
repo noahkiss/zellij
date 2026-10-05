@@ -1009,6 +1009,12 @@ pub enum SessionLifecycleCli {
         #[clap(long)]
         no_sign: bool,
 
+        /// Say that Full Disk Access, Accessibility and Screen Recording were granted again for
+        /// the pinned copy's current signature, so doctor stops reporting the re-grant as owed.
+        /// macOS only
+        #[clap(long)]
+        regranted: bool,
+
         /// The binary path to compare the installed unit against, as `status` takes it
         #[clap(long, value_name = "PATH", value_parser)]
         exe: Option<PathBuf>,
