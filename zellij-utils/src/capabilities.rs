@@ -80,6 +80,7 @@ pub const CAPABILITIES: &[&str] = &[
     "bell-clear-delay",        // bell_clear_delay_ms
     "default-floating-size",   // default_floating_size
     "resurrect-command-hints", // resurrect_command_hints
+    "resurrect-commands",      // resurrect_commands "all" | "agents" | "prefill"
     "session-drop-env",        // session_restart_drop_env
     "snapshot-dir-config",     // snapshot_dir, session_snapshot_limit
     "session-service-config",  // session_service, pin_exe

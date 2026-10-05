@@ -772,6 +772,12 @@ pub trait Pane {
     fn take_program_title_changed(&mut self) -> bool {
         false
     }
+    /// Whether the program in this pane has turned bracketed paste on. A shell's line editor - zsh's
+    /// ZLE, bash's readline, fish - turns it on when it starts reading a line, so the first time it
+    /// is on, the shell is sitting at a prompt.
+    fn bracketed_paste_enabled(&self) -> bool {
+        false
+    }
     /// The uuid given to this pane when it was created. Unlike the pane id, it is never reused.
     fn pane_uuid(&self) -> Uuid;
     /// The uuid of the pane this one continues, when it was built from a serialized session.
@@ -4412,6 +4418,20 @@ impl Tab {
     }
     /// Whether the program in terminal pane `pid` renamed itself (OSC 0/2) since this was last
     /// asked, clearing the flag. The caller reports the change to plugins.
+    /// See `Pane::bracketed_paste_enabled`. `false` for a pane this tab does not have.
+    pub fn bracketed_paste_enabled(&mut self, pid: u32) -> bool {
+        self.tiled_panes
+            .get_pane_mut(PaneId::Terminal(pid))
+            .or_else(|| self.floating_panes.get_pane_mut(PaneId::Terminal(pid)))
+            .or_else(|| {
+                self.suppressed_panes
+                    .values_mut()
+                    .find(|s_p| s_p.1.pid() == PaneId::Terminal(pid))
+                    .map(|s_p| &mut s_p.1)
+            })
+            .map(|pane| pane.bracketed_paste_enabled())
+            .unwrap_or(false)
+    }
     pub fn take_program_title_changed(&mut self, pid: u32) -> bool {
         self.tiled_panes
             .get_pane_mut(PaneId::Terminal(pid))

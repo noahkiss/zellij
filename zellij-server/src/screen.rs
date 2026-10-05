@@ -63,6 +63,7 @@ use zellij_utils::ipc::{
     MobileSizePayload, MobileStatePayload, MobileTabPayload, ServerToClientMsg,
 };
 use zellij_utils::pane_size::{PaneGeom, Size, SizeInPixels};
+use zellij_utils::resurrect_command_hints::prefill_as_paste;
 use zellij_utils::shared::{clean_string_from_control_and_linebreak, detect_theme_hue};
 use zellij_utils::{
     consts::{session_info_folder_for_session, ZELLIJ_SOCK_DIR},
@@ -360,6 +361,9 @@ pub struct TabOverrideResult {
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
     PtyBytes(u32, VteBytes),
+    /// `resurrect_commands "prefill"`: put this command line at the restored pane's prompt, once
+    /// its shell is at one, as a bracketed paste. Never run - no newline is sent.
+    PrefillPane(u32, String),
     /// The pty thread's once-a-second report of what each terminal pane is running, keyed by
     /// terminal id. Screen keeps it only to stamp `PaneInfo`.
     ///
@@ -1049,6 +1053,7 @@ impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
             ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::PrefillPane(..) => ScreenContext::PrefillPane,
             ScreenInstruction::UpdatePaneProcessInfo { .. } => ScreenContext::UpdatePaneProcessInfo,
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
@@ -1783,6 +1788,9 @@ pub(crate) struct Screen {
     /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
     /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
     pane_process_info: HashMap<u32, PaneProcessInfo>,
+    /// terminal_id -> the command line to type at that pane's first prompt; see
+    /// `ScreenInstruction::PrefillPane`.
+    pending_prefills: HashMap<u32, String>,
     /// Whether this session answers "which panes run a coding agent" at all. `detect_agents`,
     /// default true, owned by the pty thread and told to Screen with the process info it gates.
     detect_agents: bool,
@@ -2081,6 +2089,7 @@ impl Screen {
             last_mobile_state_sent: HashMap::new(),
             pane_output_activity: HashMap::new(),
             pane_process_info: HashMap::new(),
+            pending_prefills: HashMap::new(),
             detect_agents: DETECT_AGENTS_DEFAULT,
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
@@ -9573,6 +9582,9 @@ pub(crate) fn screen_thread_main(
         let _resize_cache = ResizeCache::new(thread_senders.clone());
 
         match event {
+            ScreenInstruction::PrefillPane(terminal_id, prefill) => {
+                screen.pending_prefills.insert(terminal_id, prefill);
+            },
             ScreenInstruction::UpdatePaneProcessInfo {
                 process_info,
                 detect_agents,
@@ -9585,14 +9597,32 @@ pub(crate) fn screen_thread_main(
                 let all_tabs = screen.get_tabs_mut();
                 let mut vte_bytes = Some(vte_bytes);
                 let mut program_title_changed = false;
+                let mut at_a_prompt = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_terminal_pid(pid) {
                         if let Some(bytes) = vte_bytes.take() {
                             tab.handle_pty_bytes(pid, bytes)
                                 .context("failed to process pty bytes")?;
                             program_title_changed = tab.take_program_title_changed(pid);
+                            at_a_prompt = tab.bracketed_paste_enabled(pid);
                         }
                         break;
+                    }
+                }
+                // typed only once the line editor is reading: bytes written before it starts sit
+                // in a cooked-mode tty, where the kernel echoes them above the prompt and a shell
+                // that flushes input on start drops them
+                if at_a_prompt {
+                    if let Some(prefill) = screen.pending_prefills.remove(&pid) {
+                        screen
+                            .bus
+                            .senders
+                            .send_to_pty_writer(PtyWriteInstruction::Write(
+                                prefill_as_paste(&prefill),
+                                pid,
+                                None,
+                            ))
+                            .context("failed to type a prefill")?;
                     }
                 }
                 if let Some(vte_bytes) = vte_bytes {

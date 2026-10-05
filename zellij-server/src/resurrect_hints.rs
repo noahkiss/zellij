@@ -20,6 +20,7 @@
 //! preserve what it can - a hint that cannot be resolved must cost the snapshot nothing.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -133,6 +134,52 @@ impl ProcessTree {
         }
         found
     }
+}
+
+impl ProcessTree {
+    /// The session a claude process under `root` holds NOW, from Claude Code's own record of it.
+    ///
+    /// `CLAUDE_CODE_SESSION_ID` cannot answer this. The claude process does not carry it; its
+    /// children do, each with the value from the moment it was spawned. The oldest children are
+    /// the MCP servers claude starts with, so after a `/clear` the variable still names the
+    /// first session. Claude Code keeps `sessions/<pid>.json` under its config directory instead,
+    /// and rewrites `sessionId` in it whenever the process moves to another session.
+    ///
+    /// The first process under `root`, breadth first, that has a record is the claude the pane
+    /// runs: an agent it started sits deeper. A record whose `pid` is not the file's own is
+    /// ignored. Every miss is `None`, and the caller falls back to what it would have recorded.
+    pub fn claude_live_session_id(&self, root: u32, sessions_dir: &Path) -> Option<String> {
+        for pid in self.descendants(root) {
+            let Ok(record) = std::fs::read(sessions_dir.join(format!("{}.json", pid))) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&record) else {
+                log::debug!(
+                    "resurrect_commands: unreadable claude session record for {}",
+                    pid
+                );
+                continue;
+            };
+            if record.get("pid").and_then(|p| p.as_u64()) != Some(pid as u64) {
+                continue;
+            }
+            match record.get("sessionId").and_then(|id| id.as_str()) {
+                Some(id) if !id.is_empty() => return Some(id.to_owned()),
+                _ => continue,
+            }
+        }
+        None
+    }
+}
+
+/// Where Claude Code keeps its per-process session records: `$CLAUDE_CONFIG_DIR/sessions`, or
+/// `~/.claude/sessions`. Read from the server's own environment, which is the user's.
+pub fn claude_sessions_dir() -> Option<PathBuf> {
+    let config_dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
+    };
+    Some(config_dir.join("sessions"))
 }
 
 /// One process's environment in the form this platform serves it, ready for `env_from_environ`.
@@ -428,5 +475,45 @@ mod tests {
     fn a_truncated_procargs2_blob_finds_nothing() {
         assert_eq!(env_from_procargs2(&[1, 0], "ANY"), None);
         assert_eq!(env_from_procargs2(&[], "ANY"), None);
+    }
+
+    fn claude_record(dir: &Path, file_pid: u32, record_pid: u32, session_id: &str) {
+        std::fs::write(
+            dir.join(format!("{}.json", file_pid)),
+            format!(
+                r#"{{"pid":{},"sessionId":"{}","cwd":"/x"}}"#,
+                record_pid, session_id
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The pane's shell is 10, claude is 20, and 30 is an agent claude started. The live session
+    /// is the one in 20's record, whatever 30's says.
+    #[test]
+    fn the_live_claude_session_is_the_nearest_record() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_record(dir.path(), 20, 20, "live");
+        claude_record(dir.path(), 30, 30, "nested");
+        let tree = tree(&[(10, &[20]), (20, &[30])]);
+        assert_eq!(
+            tree.claude_live_session_id(10, dir.path()),
+            Some("live".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_record_for_another_pid_is_not_the_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        claude_record(dir.path(), 20, 99, "stale");
+        let tree = tree(&[(10, &[20])]);
+        assert_eq!(tree.claude_live_session_id(10, dir.path()), None);
+    }
+
+    #[test]
+    fn no_record_is_no_live_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = tree(&[(10, &[20])]);
+        assert_eq!(tree.claude_live_session_id(10, dir.path()), None);
     }
 }

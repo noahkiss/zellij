@@ -3,7 +3,7 @@ use crate::cli::Command;
 use crate::data::{FloatingPaneCoordinates, InputMode, ThemeHue, WebSharing};
 use crate::input::layout::PercentOrFixed;
 use crate::pane_privacy::PanePrivacyOptions;
-use crate::resurrect_command_hints::ResurrectCommandHints;
+use crate::resurrect_command_hints::{ResurrectCommandHints, ResurrectCommands};
 use crate::session_service::SessionServiceOptions;
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -481,6 +481,16 @@ pub struct Options {
     #[serde(default)]
     pub resurrect_command_hints: Option<ResurrectCommandHints>,
 
+    /// Which recorded commands a restored session offers, and how: "all" (default) offers every
+    /// command as a pane waiting to run; "agents" offers only coding agents - `claude`, `codex`,
+    /// `opencode`, `pi`, or a command a `resurrect_command_hints` entry names - with how to resume
+    /// them; "prefill" offers the same agents as a shell with the resume command typed at the
+    /// prompt, not run. In "agents" and "prefill" every other pane comes back as a plain shell.
+    /// config.kdl only - it is read by the server when it serializes and restores a session.
+    #[clap(skip)]
+    #[serde(default)]
+    pub resurrect_commands: Option<ResurrectCommands>,
+
     /// Environment variables to report on every pane, by exact name, so that a consumer of the
     /// pane list can tell what a pane is - which harness owns it, which session id it holds. The
     /// environment holds secrets, so this is an allowlist and nothing else: unset means report
@@ -855,6 +865,7 @@ impl Options {
         let resurrect_command_hints = other
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
+        let resurrect_commands = other.resurrect_commands.or(self.resurrect_commands);
         let report_pane_env = other
             .report_pane_env
             .clone()
@@ -967,6 +978,7 @@ impl Options {
             session_service,
             pane_privacy,
             resurrect_command_hints,
+            resurrect_commands,
             report_pane_env,
             detect_agents,
             session_up_resume,
@@ -1090,6 +1102,7 @@ impl Options {
         let resurrect_command_hints = other
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
+        let resurrect_commands = other.resurrect_commands.or(self.resurrect_commands);
         let report_pane_env = other
             .report_pane_env
             .clone()
@@ -1202,6 +1215,7 @@ impl Options {
             session_service,
             pane_privacy,
             resurrect_command_hints,
+            resurrect_commands,
             report_pane_env,
             detect_agents,
             session_up_resume,

@@ -8,11 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use zellij_utils::common_path::common_path_all;
 use zellij_utils::pane_size::{PaneGeom, Size};
 use zellij_utils::{
+    agent_detect::harness_for_command,
     data::{ClientInfo, LayoutMetadata, PaneMetadata, TabMetadata},
     input::command::RunCommand,
     input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
     input::plugins::PluginAliases,
-    resurrect_command_hints::ResurrectCommandHints,
+    resurrect_command_hints::{
+        builtin_resume_args, claude_args_for_live_session, is_resurrectable_agent,
+        ResurrectCommandHints,
+    },
     session_serialization::{
         extract_command_and_args, extract_edit_and_line_number, extract_plugin_and_config,
         GlobalLayoutManifest, PaneLayoutManifest, TabLayoutManifest,
@@ -583,8 +587,9 @@ impl SessionLayoutMetadata {
     /// entry applies to, so that the resurrected pane offers to resume the tool's session instead
     /// of starting a new one.
     ///
-    /// The observed command line is kept whole - path, arguments and all. A hint only adds, so a
-    /// resurrected pane always offers a command the pane really ran.
+    /// The observed command line is kept - path, flags and all. For a harness this build knows, a
+    /// hint replaces the session the argv picked, so the command picks exactly one; for any other
+    /// command it only adds. See `ResurrectCommandHint::args_for`.
     ///
     /// `read_env` is the seam over the platform: it is handed a terminal id and a variable name and
     /// returns the value found in that pane's processes. Everything the hints decide is here;
@@ -622,7 +627,8 @@ impl SessionLayoutMetadata {
                 let Some(env_value) = read_env(terminal_id, &hint.env) else {
                     continue;
                 };
-                let Some(extra_args) = hint.resume_args_for(&run_command.args, &env_value) else {
+                let command = run_command.command.display().to_string();
+                let Some(args) = hint.args_for(&command, &run_command.args, &env_value) else {
                     log::debug!(
                         "resurrect_command_hints {:?}: resume_args {:?} add nothing to the observed \
                          command of terminal {}",
@@ -633,7 +639,7 @@ impl SessionLayoutMetadata {
                     continue;
                 };
                 let mut rewritten = run_command.clone();
-                rewritten.args.extend(extra_args);
+                rewritten.args = args;
                 log::debug!(
                     "resurrect_command_hints {:?}: recording {:?} {:?} for terminal {}",
                     hint.name,
@@ -642,6 +648,85 @@ impl SessionLayoutMetadata {
                     terminal_id
                 );
                 pane.run = Some(Run::Command(rewritten));
+            }
+        }
+    }
+    /// Records every claude pane with `--resume` and the session its claude process holds NOW,
+    /// in place of whatever session its argv named.
+    ///
+    /// `live_session_id` is the seam over the platform: handed a terminal id, it returns the
+    /// session the claude in that pane holds, or `None`. A pane it has no answer for is left as
+    /// the hints recorded it. It runs AFTER the hints, so the live session is the one that stays.
+    pub fn pin_live_claude_sessions<F>(&mut self, mut live_session_id: F)
+    where
+        F: FnMut(u32) -> Option<String>,
+    {
+        for tab in self.tabs.iter_mut() {
+            for pane in tab
+                .tiled_panes
+                .iter_mut()
+                .chain(tab.floating_panes.iter_mut())
+            {
+                let PaneId::Terminal(terminal_id) = pane.id else {
+                    continue;
+                };
+                let Some(Run::Command(run_command)) = pane.run.as_mut() else {
+                    continue;
+                };
+                let is_claude = harness_for_command(&run_command.command.display().to_string())
+                    .map_or(false, |harness| harness.kind == "claude");
+                if !is_claude {
+                    continue;
+                }
+                let Some(session_id) = live_session_id(terminal_id) else {
+                    continue;
+                };
+                run_command.args = claude_args_for_live_session(&run_command.args, &session_id);
+                log::debug!(
+                    "resurrect: terminal {} records claude's live session {}",
+                    terminal_id,
+                    session_id
+                );
+            }
+        }
+    }
+    /// `resurrect_commands "agents"` or `"prefill"`: keeps the command of every pane running a
+    /// coding agent and drops
+    /// every other one, so a restored session offers to resume its agents and nothing else.
+    ///
+    /// An agent is a harness this build knows - `claude`, `codex`, `opencode`, `pi` - or a command
+    /// one of `hints` names. A known harness is recorded with its built-in resume added, unless
+    /// its arguments already resume. Any other terminal pane loses its `run` and comes back as a
+    /// plain shell in its directory: a long-lived tool, an editor, and a short-lived process that
+    /// happened to be the newest child of an idle shell when the tick ran - a prompt being drawn,
+    /// a shell init step.
+    pub fn keep_only_agent_commands(&mut self, hints: Option<&ResurrectCommandHints>) {
+        for tab in self.tabs.iter_mut() {
+            for pane in tab
+                .tiled_panes
+                .iter_mut()
+                .chain(tab.floating_panes.iter_mut())
+            {
+                if !matches!(pane.id, PaneId::Terminal(_)) {
+                    continue;
+                }
+                match pane.run.as_mut() {
+                    Some(Run::Command(run_command)) => {
+                        let command = run_command.command.display().to_string();
+                        if !is_resurrectable_agent(&command, hints) {
+                            log::debug!(
+                                "resurrect_commands: {:?} is not an agent, recording a shell",
+                                command
+                            );
+                            pane.run = None;
+                        } else if let Some(args) = builtin_resume_args(&command, &run_command.args)
+                        {
+                            run_command.args = args;
+                        }
+                    },
+                    Some(Run::EditFile(..)) => pane.run = None,
+                    _ => {},
+                }
             }
         }
     }
@@ -1942,6 +2027,164 @@ mod tests {
             before,
             meta.serialization_fingerprint(),
             "a client arriving changes nothing the resurrection cache holds"
+        );
+    }
+
+    fn command_line(meta: &SessionLayoutMetadata, index: usize) -> Option<(String, Vec<String>)> {
+        match meta.tabs[0].tiled_panes[index].run.as_ref() {
+            Some(Run::Command(rc)) => Some((rc.command.display().to_string(), rc.args.clone())),
+            _ => None,
+        }
+    }
+
+    fn owned(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| w.to_string()).collect()
+    }
+
+    /// The operator's report: a restored pane offered `starship` and `brew`. With the switch on,
+    /// a pane that is not an agent comes back with no command at all.
+    #[test]
+    fn only_agents_survive_and_the_rest_become_shells() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "claude", vec!["--dangerously-skip-permissions"]),
+            make_command_pane(2, "starship", vec!["prompt"]),
+            make_command_pane(3, "/home/linuxbrew/.linuxbrew/bin/brew", vec!["shellenv"]),
+            make_command_pane(4, "/opt/bin/codex", vec!["-m", "o3"]),
+            make_command_pane(5, "htop", vec![]),
+        ]);
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "claude".to_owned(),
+                owned(&["--dangerously-skip-permissions", "--continue"])
+            ))
+        );
+        assert_eq!(command_line(&meta, 1), None);
+        assert_eq!(command_line(&meta, 2), None);
+        assert_eq!(
+            command_line(&meta, 3),
+            Some((
+                "/opt/bin/codex".to_owned(),
+                owned(&["resume", "--last", "-m", "o3"])
+            ))
+        );
+        assert_eq!(command_line(&meta, 4), None);
+    }
+
+    #[test]
+    fn a_hinted_command_is_an_agent_too() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "aider", vec![])]);
+        let hints = hints(&[("aider", "AIDER_ID", "--restore-chat-history")]);
+        meta.keep_only_agent_commands(Some(&hints));
+        assert_eq!(command_line(&meta, 0), Some(("aider".to_owned(), vec![])));
+    }
+
+    #[test]
+    fn an_editor_pane_becomes_a_shell_when_only_agents_survive() {
+        let mut meta = session_with_editor("nvim", vec![make_command_pane(1, "nvim", vec!["f"])]);
+        meta.detect_editor_panes();
+        meta.keep_only_agent_commands(None);
+        assert_eq!(get_first_tiled_run(&meta), None);
+    }
+
+    /// The operator's other report: the hint offered the FIRST session the pane's claude ran.
+    /// The live record names the current one, and it replaces whatever the argv said.
+    #[test]
+    fn a_claude_pane_records_its_live_session() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "claude", vec!["--resume", "first"]),
+            make_command_pane(2, "htop", vec![]),
+        ]);
+        meta.pin_live_claude_sessions(|_| Some("live".to_owned()));
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume", "live"])))
+        );
+        assert_eq!(command_line(&meta, 1), Some(("htop".to_owned(), vec![])));
+    }
+
+    /// The order the pty thread runs them in: hints, then the live session, then the filter. The
+    /// live session replaces the id the hint read from a stale environment.
+    #[test]
+    fn the_live_session_replaces_the_hints_stale_id() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["--continue"])]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            env_always(Some("first")),
+        );
+        meta.pin_live_claude_sessions(|_| Some("live".to_owned()));
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume", "live"])))
+        );
+    }
+
+    #[test]
+    fn no_live_session_leaves_the_claude_pane_alone() {
+        let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["-c"])]);
+        meta.pin_live_claude_sessions(|_| None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["-c"])))
+        );
+    }
+
+    /// The operator's third report: `claude --dangerously-skip-permissions --continue --resume
+    /// <id>`. A hint for a known agent replaces the session the argv picked instead of stacking
+    /// a second one on it.
+    #[test]
+    fn a_hint_replaces_the_session_the_argv_picked() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(
+                1,
+                "claude",
+                vec!["--dangerously-skip-permissions", "--continue"],
+            ),
+            make_command_pane(2, "claude", vec!["--resume", "old-id", "--model", "opus"]),
+        ]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            env_always(Some("new-id")),
+        );
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "claude".to_owned(),
+                owned(&["--dangerously-skip-permissions", "--resume", "new-id"])
+            ))
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some((
+                "claude".to_owned(),
+                owned(&["--model", "opus", "--resume", "new-id"])
+            ))
+        );
+    }
+
+    /// A pane restored once carries its old `--resume <id>` into the next restart. Recording it
+    /// again must leave exactly one resume, naming the live session.
+    #[test]
+    fn a_second_restart_keeps_one_resume() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "claude",
+            vec!["--dangerously-skip-permissions", "--resume", "first"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            env_always(Some("first")),
+        );
+        meta.pin_live_claude_sessions(|_| Some("second".to_owned()));
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "claude".to_owned(),
+                owned(&["--dangerously-skip-permissions", "--resume", "second"])
+            ))
         );
     }
 }

@@ -7,7 +7,7 @@ use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
-    resurrect_hints::ProcessTree,
+    resurrect_hints::{claude_sessions_dir, ProcessTree},
     screen::{ScreenInstruction, TabOverrideResult},
     session_layout_metadata::SessionLayoutMetadata,
     thread_bus::{Bus, ThreadSenders},
@@ -36,7 +36,9 @@ use zellij_utils::{
         },
     },
     pane_size::Size,
-    resurrect_command_hints::ResurrectCommandHints,
+    resurrect_command_hints::{
+        command_line_for_prompt, is_resurrectable_agent, ResurrectCommandHints, ResurrectCommands,
+    },
     session_serialization,
 };
 
@@ -153,6 +155,7 @@ pub enum PtyInstruction {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        resurrect_commands: Option<ResurrectCommands>,
         report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
     },
@@ -293,6 +296,12 @@ pub(crate) struct Pty {
     default_editor: Option<PathBuf>,
     post_command_discovery_hook: Option<String>,
     resurrect_command_hints: Option<ResurrectCommandHints>,
+    /// `resurrect_commands`: which recorded commands a serialized session keeps, and how a
+    /// restored agent pane offers its command.
+    resurrect_commands: ResurrectCommands,
+    /// terminal_id -> command line, set aside by `prefill_for_resurrected` until the layout that
+    /// opens those panes has reached the screen
+    pending_prefills: Vec<(u32, String)>,
     /// The exact env var names `report_pane_env` asks for. Empty means report nothing, which is
     /// the default and the only safe one - an environment is full of secrets.
     report_pane_env: Vec<String>,
@@ -998,6 +1007,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 default_editor,
                 post_command_discovery_hook,
                 resurrect_command_hints,
+                resurrect_commands,
                 report_pane_env,
                 detect_agents,
                 client_id: _,
@@ -1006,6 +1016,7 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                     default_editor,
                     post_command_discovery_hook,
                     resurrect_command_hints,
+                    resurrect_commands,
                     report_pane_env,
                     detect_agents,
                 );
@@ -1066,6 +1077,7 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        resurrect_commands: Option<ResurrectCommands>,
         report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
     ) -> Self {
@@ -1079,6 +1091,8 @@ impl Pty {
             originating_plugins: HashMap::new(),
             post_command_discovery_hook,
             resurrect_command_hints,
+            resurrect_commands: resurrect_commands.unwrap_or(ResurrectCommands::All),
+            pending_prefills: Vec::new(),
             report_pane_env: report_pane_env.unwrap_or_default(),
             terminal_envs: HashMap::new(),
             detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
@@ -1405,10 +1419,21 @@ impl Pty {
         }
 
         let extracted_run_instructions = layout.extract_run_instructions();
-        let extracted_floating_run_instructions = floating_panes_layout
+        let extracted_floating_run_instructions: Vec<Option<Run>> = floating_panes_layout
             .iter()
             .filter(|f| !f.already_running)
-            .map(|f| f.run.clone());
+            .map(|f| f.run.clone())
+            .collect();
+        // `resurrect_commands "prefill"`: the instructions above still name the commands, which
+        // is what `prefill_for_resurrected` types; the layout the screen builds panes from names
+        // a shell, so a pane is not titled or listed as running a command it is not running
+        let mut floating_panes_layout = floating_panes_layout;
+        if self.resurrect_commands == ResurrectCommands::Prefill {
+            layout.recursively_open_resurrected_as_shells();
+            for floating_pane_layout in floating_panes_layout.iter_mut() {
+                floating_pane_layout.open_resurrected_as_shell();
+            }
+        }
         let mut new_pane_pids: Vec<(u32, bool, Option<RunCommand>, Result<Box<dyn AsyncReader>>)> =
             vec![]; // (terminal_id,
                     // starts_held,
@@ -1525,6 +1550,7 @@ impl Pty {
                 blocking_terminal,
             ))
             .with_context(err_context)?;
+        self.send_pending_prefills()?;
         let mut terminals_to_start = vec![];
 
         terminals_to_start.append(&mut new_pane_pids);
@@ -1702,6 +1728,9 @@ impl Pty {
             new_floating_pane_pids: new_tab_floating_pane_ids,
             plugin_ids,
         };
+        // an override reaches the screen batched with others, later, so there is no point at
+        // which a prefill is known to arrive before its pane's bytes; the panes stay plain shells
+        self.pending_prefills.clear();
 
         let mut terminals_to_start = vec![];
 
@@ -1790,6 +1819,13 @@ impl Pty {
         // starts_held,
         // command
         // successfully opened
+        if let Some((shell_run, prefill)) = self.prefill_for_resurrected(&run_instruction) {
+            let spawned = self.apply_run_instruction(shell_run, default_shell)?;
+            if let (Some(prefill), Some((terminal_id, ..))) = (prefill, spawned.as_ref()) {
+                self.pending_prefills.push((*terminal_id, prefill));
+            }
+            return Ok(spawned);
+        }
         let err_context = || format!("failed to apply run instruction");
         let quit_cb = Box::new({
             let senders = self.bus.senders.clone();
@@ -2016,6 +2052,45 @@ impl Pty {
             Some(Run::Plugin(_)) => Ok(None),
         }
     }
+    /// `resurrect_commands "prefill"`: the plain shell a resurrected command pane is opened as
+    /// instead, and the command line to type at that shell's prompt.
+    ///
+    /// `None` for anything else - another mode, a command a person's layout names, a pane that is
+    /// not a command - which is opened exactly as before. A resurrected command is opened as the
+    /// default shell in the command's directory; only an agent's command is typed, so any other
+    /// command a snapshot recorded comes back as a shell with nothing typed.
+    ///
+    /// No pane is ever held, so nothing here goes near the held-pane exit path.
+    fn prefill_for_resurrected(
+        &self,
+        run_instruction: &Option<Run>,
+    ) -> Option<(Option<Run>, Option<String>)> {
+        if self.resurrect_commands != ResurrectCommands::Prefill {
+            return None;
+        }
+        let Some(Run::Command(command)) = run_instruction else {
+            return None;
+        };
+        if !command.resurrected {
+            return None;
+        }
+        let program = command.command.display().to_string();
+        let prefill = is_resurrectable_agent(&program, self.resurrect_command_hints.as_ref())
+            .then(|| command_line_for_prompt(&program, &command.args));
+        Some((command.cwd.clone().map(Run::Cwd), prefill))
+    }
+    /// The commands `prefill_for_resurrected` set aside, handed to the screen once the panes
+    /// they belong to exist. Called right after `ApplyLayout` is sent, which is before any byte
+    /// from those panes is read, so the screen holds the text before the shell can draw a prompt.
+    fn send_pending_prefills(&mut self) -> Result<()> {
+        for (terminal_id, prefill) in self.pending_prefills.drain(..) {
+            self.bus
+                .senders
+                .send_to_screen(ScreenInstruction::PrefillPane(terminal_id, prefill))
+                .context("failed to hand a prefill to the screen")?;
+        }
+        Ok(())
+    }
     /// Forget the pid of a child that has been reaped while its pane stays open.
     ///
     /// Only a `hold_on_close` pane gets here: its process exits and the pane waits to be re-run.
@@ -2233,31 +2308,53 @@ impl Pty {
         self.apply_resurrect_command_hints(session_layout_metadata, &panes);
     }
     /// Rewrites the commands `resurrect_command_hints` applies to, once the commands themselves
-    /// have been discovered.
+    /// have been discovered, and in an agents-only `resurrect_commands` mode drops every command
+    /// that is not an agent's.
     ///
     /// It runs here, in the pty thread, because this is the thread that knows a pane's pid - and
     /// last, after the rest of discovery, so that it decides against the command that would
     /// otherwise have been recorded.
+    ///
+    /// Three passes, in this order. The configured hints run first, as they always have. A
+    /// claude pane is then pinned to its live session, when either setting asks for claude, so
+    /// the live id replaces whatever the hint read from a stale environment. The agents-only
+    /// filter runs last, on the commands the first two produced.
     fn apply_resurrect_command_hints(
         &self,
         session_layout_metadata: &mut SessionLayoutMetadata,
         panes: &[(u32, u32)],
     ) {
-        let Some(hints) = self
+        let hints = self
             .resurrect_command_hints
             .as_ref()
-            .filter(|hints| !hints.is_empty())
-        else {
+            .filter(|hints| !hints.is_empty());
+        let agents_only = self.resurrect_commands.agents_only();
+        if hints.is_none() && !agents_only {
             return;
-        };
+        }
         let terminal_ids_to_pids: HashMap<u32, u32> = panes.iter().copied().collect();
         // one process-table read for the whole session, not one per pane
         let process_tree = ProcessTree::read();
-        session_layout_metadata.apply_resurrect_command_hints(hints, |terminal_id, var| {
-            terminal_ids_to_pids
-                .get(&terminal_id)
-                .and_then(|pid| process_tree.find_env(*pid, var))
-        });
+        if let Some(hints) = hints {
+            session_layout_metadata.apply_resurrect_command_hints(hints, |terminal_id, var| {
+                terminal_ids_to_pids
+                    .get(&terminal_id)
+                    .and_then(|pid| process_tree.find_env(*pid, var))
+            });
+        }
+        let hints_name_claude = hints.map_or(false, |hints| hints.hint_for("claude").is_some());
+        if agents_only || hints_name_claude {
+            if let Some(sessions_dir) = claude_sessions_dir() {
+                session_layout_metadata.pin_live_claude_sessions(|terminal_id| {
+                    terminal_ids_to_pids
+                        .get(&terminal_id)
+                        .and_then(|pid| process_tree.claude_live_session_id(*pid, &sessions_dir))
+                });
+            }
+        }
+        if agents_only {
+            session_layout_metadata.keep_only_agent_commands(hints);
+        }
     }
     pub fn fill_plugin_cwd(
         &self,
@@ -2624,12 +2721,14 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
+        resurrect_commands: Option<ResurrectCommands>,
         report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
     ) {
         self.default_editor = default_editor;
         self.post_command_discovery_hook = post_command_discovery_hook;
         self.resurrect_command_hints = resurrect_command_hints;
+        self.resurrect_commands = resurrect_commands.unwrap_or(ResurrectCommands::All);
         self.report_pane_env = report_pane_env.unwrap_or_default();
         self.detect_agents = detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT);
     }
