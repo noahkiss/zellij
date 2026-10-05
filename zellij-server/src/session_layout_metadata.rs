@@ -1,7 +1,7 @@
 use crate::panes::PaneId;
 use crate::ClientId;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -332,6 +332,15 @@ impl SessionLayoutMetadata {
             .map(|tab| tab.name.clone().unwrap_or_default())
             .collect()
     }
+    /// What the serialized layout would record for this terminal pane.
+    #[cfg(test)]
+    pub fn terminal_run(&self, terminal_id: u32) -> Option<&Run> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+            .find(|pane| pane.id == PaneId::Terminal(terminal_id))
+            .and_then(|pane| pane.run.as_ref())
+    }
     pub fn add_tab(
         &mut self,
         name: String,
@@ -363,6 +372,20 @@ impl SessionLayoutMetadata {
             }
         }
         terminal_ids
+    }
+    /// The terminal panes whose own process is the command they were opened with - a command
+    /// pane or an editor - rather than a shell. Their children are the command's helpers, not jobs
+    /// a user started, so discovery must not mistake the newest of them for what the pane runs.
+    pub fn command_terminal_ids(&self) -> HashSet<u32> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+            .filter(|pane| matches!(pane.run, Some(Run::Command(_)) | Some(Run::EditFile(..))))
+            .filter_map(|pane| match pane.id {
+                PaneId::Terminal(id) => Some(id),
+                PaneId::Plugin(_) => None,
+            })
+            .collect()
     }
     pub fn all_plugin_ids(&self) -> Vec<u32> {
         let mut plugin_ids = vec![];
@@ -1145,6 +1168,26 @@ mod tests {
         meta.default_editor = Some(PathBuf::from(editor));
         meta.add_tab("tab1".to_string(), true, false, panes, vec![]);
         meta
+    }
+
+    #[test]
+    fn command_and_editor_panes_run_their_own_command() {
+        let mut meta = SessionLayoutMetadata::default();
+        let mut editor = make_plain_pane(3);
+        editor.run = Some(Run::EditFile(PathBuf::from("file.txt"), None, None));
+        let floating_command = make_command_pane(4, "claude", vec![]);
+        meta.add_tab(
+            "tab1".to_string(),
+            true,
+            false,
+            vec![
+                make_command_pane(1, "claude", vec![]),
+                make_plain_pane(2),
+                editor,
+            ],
+            vec![floating_command],
+        );
+        assert_eq!(meta.command_terminal_ids(), HashSet::from([1, 3, 4]));
     }
 
     fn get_first_tiled_run(meta: &SessionLayoutMetadata) -> Option<&Run> {
