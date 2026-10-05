@@ -4053,7 +4053,7 @@ means `"all"`. So the key can go into a shared config before every machine has t
 
 ### A command pane is recorded as its own command, not its newest child
 
-A pane can run an agent directly: a layout's `command "claude"`, or a restored pane after Enter.
+From nkmk.29. A pane can run an agent directly: a layout's `command "claude"`, or a restored pane after Enter.
 Then the pane's own process IS the agent. It leads its own process group, so the terminal names the
 pane's pid as the foreground group, and discovery treated it like an idle shell: it recorded the
 newest child ([the job-control fallback](#what-a-pane-is-running-when-the-shell-has-no-job-control)).
@@ -4907,7 +4907,7 @@ of the upgrade.
 
 ### `list-agents` names the session claude holds now
 
-`AGENT_ID` for a claude pane came from `CLAUDE_CODE_SESSION_ID`. The claude process does not carry
+From nkmk.29. `AGENT_ID` for a claude pane came from `CLAUDE_CODE_SESSION_ID`. The claude process does not carry
 that variable; its children do, each frozen at its spawn. So after a `/clear` the column still named
 the first session, for as long as the pane lived. The cause is the one [the resume
 entry](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents) describes.
