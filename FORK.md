@@ -8127,6 +8127,17 @@ targets — `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` — and attach
 creating the release if it does not exist. Nothing else is published: no musl, no linux arm64, no
 intel mac, no Windows.
 
+**The macOS binary is signed and notarized by CI.** The `aarch64-apple-darwin` leg signs it as
+`Developer ID Application: NKMK Digital Co. (2Z88BYP37C)` with identifier `org.zellij.nkmk` and the
+hardened runtime, submits it to Apple's notary service, and fails unless the verdict is `Accepted`.
+Then it packages the signed file; the tarball's name and layout do not change. A bare binary cannot
+be stapled, so Gatekeeper fetches the ticket online. RC tags take the same path, so a candidate
+proved on a Mac carries the real signature. The secrets live in the Actions environment `release`,
+whose policy admits `v*` tags only: `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`, `ASC_KEY_P8`,
+`ASC_KEY_ID` and `ASC_ISSUER_ID`. Only the macOS leg enters that environment, and only its signing
+steps read them. From nkmk.30, a pin refresh installs a build that already carries this signature
+as-is, with no local re-signing, so TCC grants hold across releases.
+
 **`Rust` runs on the branch, not only on main.** Its push trigger lists the conventional-commit
 prefixes this fork names branches after — `feat/`, `fix/`, `ci/`, `chore/`, `docs/`, `perf/`,
 `refactor/`, `style/`, `test/`, `rc/` — so a patch goes green where it is written rather than after
@@ -8192,8 +8203,13 @@ instead, it fell through to a source build because `brew` read a **stale local t
 The release job builds only the two targets above. Intel macOS was dropped deliberately; if it is
 ever restored, the runner label is `macos-15-intel` — GitHub retired `macos-13` in December 2025.
 
-To rebuild an existing tag (workflow changes, a lost asset):
+To rebuild an existing tag (a lost asset, a notary outage), dispatch it **on the tag**:
 
 ```
-gh workflow run release.yml -R noahkiss/zellij -f tag=v0.45.0-nkmk.1
+gh workflow run release.yml -R noahkiss/zellij --ref v0.45.0-nkmk.1 -f tag=v0.45.0-nkmk.1
 ```
+
+The `release` environment admits tags only, so a dispatch from `main` fails the macOS leg and leaves
+the release a draft. A dispatch on the tag runs the workflow file at that tag, not main's: a
+workflow fix reaches a release through a new tag. `tap_only` skips the build, so it still works from
+`main`.
