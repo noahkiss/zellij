@@ -1,8 +1,20 @@
 name: Release
 
 # Fork release pipeline. Builds only the targets this fork is installed on
-# (glibc linux x86_64, macOS arm64 and x86_64) and publishes the bare `zellij`
-# binary as a tarball for the homebrew tap to pour.
+# (glibc linux x86_64, macOS arm64) and publishes the bare `zellij` binary as a
+# tarball for the homebrew tap to pour.
+#
+# The MACOS BINARY IS SIGNED AND NOTARIZED before it is packaged: Developer ID
+# Application for team 2Z88BYP37C, identifier `org.zellij.nkmk`, hardened
+# runtime, submitted to Apple's notary service and required to come back
+# `Accepted`. A candidate goes through the same steps as a final tag — there is
+# no unsigned path — so the binary proved on a Mac is signed the way the release
+# will be. The secrets live in the Actions environment `release`, whose
+# deployment policy admits `v*` tags only. Only the macOS leg enters it, and only
+# the signing steps see the secrets. A rebuild by `workflow_dispatch` therefore
+# has to run ON the tag (`gh workflow run release.yml --ref <tag> -f tag=<tag>`);
+# dispatched from main, the environment refuses the macOS leg and the release
+# stays a draft.
 #
 # A RELEASE CANDIDATE is any tag carrying `-rc.` — `v0.45.0-nkmk.12-rc.1`, pushed
 # from the patch branch rather than from main. It builds and publishes exactly
@@ -63,14 +75,25 @@ jobs:
     needs: create-release
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Only the macOS leg names an environment; the linux leg's is empty, which
+    # runs it outside any environment, so it never waits on the tag policy and
+    # never has the signing secrets in reach.
+    environment: ${{ matrix.environment }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            environment: ''
           - os: macos-14
             target: aarch64-apple-darwin
+            environment: release
+    # Not secrets: the identity the macOS steps sign with and then assert.
+    env:
+      SIGNING_IDENTITY: 'Developer ID Application: NKMK Digital Co. (2Z88BYP37C)'
+      SIGNING_TEAM: 2Z88BYP37C
+      SIGNING_ID: org.zellij.nkmk
     steps:
       - name: Resolve tag
         run: |
@@ -152,8 +175,126 @@ jobs:
         env:
           OPENSSL_NO_VENDOR: '1'
         run: |
-          export ZELLIJ_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          ZELLIJ_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          export ZELLIJ_BUILD_DATE
           cargo build --release --locked --bin zellij --target ${{ matrix.target }}
+
+      # A throwaway keychain, so the identity never lands in the runner's login
+      # keychain and dies with the cleanup step below. Its password is random and
+      # used only inside this step. `set-key-partition-list` lets codesign use the
+      # key without a GUI prompt, which would otherwise hang the job.
+      # `security import` takes the p12 password on argv only; on an ephemeral
+      # runner nobody else can read `ps`.
+      - name: Import the signing identity (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$MACOS_CERT_P12" ] && [ -n "$MACOS_CERT_PASSWORD" ] \
+            || { echo "::error::MACOS_CERT_P12 / MACOS_CERT_PASSWORD are empty — is the job in the release environment?"; exit 1; }
+
+          kc="${RUNNER_TEMP}/signing.keychain-db"
+          p12="${RUNNER_TEMP}/signing.p12"
+          echo "SIGNING_KEYCHAIN=${kc}" >> "$GITHUB_ENV"
+          kc_pw="$(openssl rand -base64 24)"
+
+          security create-keychain -p "$kc_pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kc_pw" "$kc"
+
+          ( umask 077; printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$p12" )
+          security import "$p12" -k "$kc" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$kc" >/dev/null
+          # shellcheck disable=SC2046 # one keychain path per word, by design
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+
+          security find-identity -v -p codesigning "$kc" | grep -qF "$SIGNING_IDENTITY" \
+            || { echo "::error::the imported p12 does not hold ${SIGNING_IDENTITY}"; exit 1; }
+
+      # Hardened runtime (`--options runtime`) and a secure timestamp are what
+      # the notary service requires. The identifier is fixed rather than left to
+      # default to the file name, so the designated requirement every TCC grant
+      # records is the same on every release. `codesign -dv` prints no secret —
+      # it is left in the log so a run shows the Authority chain it produced.
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/zellij"
+          codesign --force --options runtime --timestamp --identifier "$SIGNING_ID" \
+            --keychain "$SIGNING_KEYCHAIN" --sign "$SIGNING_IDENTITY" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          info="$(codesign -dv --verbose=4 "$bin" 2>&1)"
+          printf '%s\n' "$info"
+          printf '%s\n' "$info" | grep -qx "TeamIdentifier=${SIGNING_TEAM}" \
+            || { echo "::error::signature does not carry TeamIdentifier=${SIGNING_TEAM}"; exit 1; }
+          printf '%s\n' "$info" | grep -qx "Identifier=${SIGNING_ID}" \
+            || { echo "::error::signature does not carry Identifier=${SIGNING_ID}"; exit 1; }
+          printf '%s\n' "$info" | grep -q 'flags=.*runtime' \
+            || { echo "::error::signature lacks the hardened runtime flag"; exit 1; }
+
+      # The notary service takes a zip, pkg or dmg, never a bare Mach-O, so the
+      # binary goes up wrapped in a zip and the zip is thrown away. The ticket
+      # cannot be stapled to a bare binary either: Gatekeeper fetches it online
+      # the first time the binary runs. So nothing about the binary changes here,
+      # and `Package` tars the same signed file `Sign` produced.
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          [ -n "$ASC_KEY_P8" ] && [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] \
+            || { echo "::error::ASC_KEY_P8 / ASC_KEY_ID / ASC_ISSUER_ID are empty — is the job in the release environment?"; exit 1; }
+
+          bin="target/${{ matrix.target }}/release/zellij"
+          key="${RUNNER_TEMP}/AuthKey.p8"
+          zip="${RUNNER_TEMP}/notarize.zip"
+          ( umask 077; printf '%s\n' "$ASC_KEY_P8" > "$key" )
+          auth=(--key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID")
+
+          ditto -c -k --keepParent "$bin" "$zip"
+          # notarytool exits non-zero for an `Invalid` verdict as well as for a
+          # transport failure; either way the JSON, if any, says which.
+          out="$(xcrun notarytool submit "$zip" "${auth[@]}" --wait --timeout 30m --output-format json)" || true
+          printf '%s\n' "$out"
+          id="$(printf '%s' "$out" | jq -r '.id // empty' 2>/dev/null || true)"
+          status="$(printf '%s' "$out" | jq -r '.status // empty' 2>/dev/null || true)"
+
+          if [ "$status" != 'Accepted' ]; then
+            echo "::error::notarization ${id:-<no submission id>} ended '${status:-<no status>}', not Accepted"
+            [ -z "$id" ] || xcrun notarytool log "$id" "${auth[@]}" || true
+            exit 1
+          fi
+          echo "notarized: submission ${id}"
+
+      # The final check runs against the file `Package` is about to tar. spctl's
+      # verdict is printed, not gated: for a bare command-line binary it depends
+      # on whether Gatekeeper reached the ticket online, which a runner does not
+      # promise. codesign's check is local and is the gate.
+      - name: Verify the signed binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/zellij"
+          codesign --verify --strict --verbose=2 "$bin"
+          spctl -a -vv -t install "$bin" || echo "spctl did not accept ${bin}; not gating on it (see the step comment)"
+
+      # Runs whatever happened above, so a failed sign or notarize still takes
+      # the keychain and the decoded secrets with it.
+      - name: Clean up the signing keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          rm -f "${RUNNER_TEMP}/signing.p12" "${RUNNER_TEMP}/AuthKey.p8" "${RUNNER_TEMP}/notarize.zip"
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi
 
       - name: Package
         run: |
