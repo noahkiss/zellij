@@ -180,6 +180,9 @@ pub enum PtyInstruction {
     },
     UpdateAndReportCwds,
     NotifyCwdFromOsc7(u32, PathBuf),
+    /// An agent in this terminal reported its own session with `OSC 1337
+    /// SetUserVar=agent_session=`. An empty id clears it.
+    AgentSessionFromOsc(u32, String),
     Exit,
 }
 
@@ -215,6 +218,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::GetPaneCwd { .. } => PtyContext::GetPaneCwd,
             PtyInstruction::UpdateAndReportCwds => PtyContext::UpdateAndReportCwds,
             PtyInstruction::NotifyCwdFromOsc7(..) => PtyContext::NotifyCwdFromOsc7,
+            PtyInstruction::AgentSessionFromOsc(..) => PtyContext::AgentSessionFromOsc,
             PtyInstruction::Exit => PtyContext::Exit,
         }
     }
@@ -246,6 +250,38 @@ fn claude_identity_key(harness: &AgentHarness) -> String {
         .copied()
         .unwrap_or("CLAUDE_CODE_SESSION_ID")
         .to_owned()
+}
+
+/// The session an agent reported for itself on its own pane, with `OSC 1337
+/// SetUserVar=agent_session=<base64 id>`: the first thing serialization and `list-agents` believe.
+///
+/// The report is pane-scoped by construction - it arrived on that pane's pty - but it outlives
+/// the agent that printed it unless something clears it. It is cleared when the pane's process is
+/// replaced or the pane closes, and when the pane stops running an agent after having been seen
+/// running one: the agent exited and the shell came back. "Seen running one" matters because the
+/// hook fires at the agent's start-up, usually before the once-a-second tick has noticed the agent
+/// is the pane's command; clearing on "not an agent right now" would drop every fresh report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OscAgentSession {
+    session_id: String,
+    /// The pane's child pid when the report arrived. A different one is a different program.
+    child_pid: Option<u32>,
+    /// Whether the pane has been seen running an agent since the report.
+    seen_agent: bool,
+}
+
+impl OscAgentSession {
+    /// Whether this report still describes the pane, given what the pane is now.
+    fn still_holds(&mut self, child_pid: Option<u32>, runs_an_agent: bool) -> bool {
+        if child_pid.is_none() || child_pid != self.child_pid {
+            return false;
+        }
+        if runs_an_agent {
+            self.seen_agent = true;
+            return true;
+        }
+        !self.seen_agent
+    }
 }
 
 /// What the last identity walk of a pane found, and what would make another one worth doing.
@@ -315,6 +351,10 @@ pub struct PaneProcessInfo {
     /// Where the harness's own session id in `agent_env` was found, when the pty found it itself:
     /// `record` or `open-file`. `None` when the id, if any, came from the environment.
     pub agent_session_source: Option<String>,
+    /// The session the pane's agent reported itself with `OSC 1337`, which beats both. Carried
+    /// apart from `agent_env` because the pane may be detected as an agent from the line it was
+    /// STARTED with while its live argv is something else, and the report belongs to the pane.
+    pub osc_agent_session: Option<String>,
 }
 
 pub(crate) struct Pty {
@@ -346,6 +386,8 @@ pub(crate) struct Pty {
     /// terminal_id -> when that pane was last walked for an identity, and what came of it. This is
     /// what keeps the walk off the tick for a pane whose answer is already known.
     agent_env_probes: HashMap<u32, AgentEnvProbe>,
+    /// terminal_id -> the session the pane's agent reported itself with `OSC 1337`.
+    osc_agent_sessions: HashMap<u32, OscAgentSession>,
     /// terminal_id -> why the last serialization found no session id for that agent pane. Kept so
     /// the reason is logged when it changes, not every serialization.
     resume_misses: HashMap<u32, String>,
@@ -1102,6 +1144,9 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::NotifyCwdFromOsc7(terminal_id, path) => {
                 pty.notify_cwd_from_osc7(terminal_id, path);
             },
+            PtyInstruction::AgentSessionFromOsc(terminal_id, session_id) => {
+                pty.note_agent_session_from_osc(terminal_id, session_id);
+            },
             PtyInstruction::Exit => break,
         }
     }
@@ -1137,6 +1182,7 @@ impl Pty {
             terminal_agent_envs: HashMap::new(),
             agent_env_probes: HashMap::new(),
             resume_misses: HashMap::new(),
+            osc_agent_sessions: HashMap::new(),
             last_reported_detect_agents: None,
             last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
@@ -2410,13 +2456,30 @@ impl Pty {
         // for it; one with no session found is left as the hints recorded it, and the
         // agents-only pass below then gives it its picker - never its newest session
         let claude_dir = claude_sessions_dir();
+        let osc_sessions: HashMap<u32, String> = self
+            .osc_agent_sessions
+            .iter()
+            .map(|(terminal_id, report)| (*terminal_id, report.session_id.clone()))
+            .collect();
         let mut misses: HashMap<u32, String> = HashMap::new();
         session_layout_metadata.pin_live_agent_sessions(|terminal_id, kind, command| {
             let hinted = hints.map_or(false, |hints| hints.hint_for(command).is_some());
             if !(agents_only || hinted) {
                 return None;
             }
-            let pid = terminal_ids_to_pids.get(&terminal_id)?;
+            if let Some(session_id) = osc_sessions.get(&terminal_id) {
+                log::debug!(
+                    "resurrect: terminal {} records {}'s session {} (session_source: osc)",
+                    terminal_id,
+                    kind,
+                    session_id
+                );
+                return Some(Some(session_id.clone()));
+            }
+            let Some(pid) = terminal_ids_to_pids.get(&terminal_id) else {
+                misses.insert(terminal_id, format!("the pane has no process ({})", kind));
+                return Some(None);
+            };
             match process_tree.own_session(
                 *pid,
                 kind,
@@ -2432,19 +2495,20 @@ impl Pty {
                         own.id,
                         own.live.source().as_str()
                     );
-                    Some(own.id)
+                    Some(Some(own.id))
                 },
                 Err(miss) => {
                     misses.insert(terminal_id, format!("{} ({})", miss, kind));
-                    None
+                    Some(None)
                 },
             }
         });
         for (terminal_id, miss) in &misses {
             if self.resume_misses.get(terminal_id) != Some(miss) {
                 log::warn!(
-                    "resurrect: terminal {} has no session id: {}; it is recorded with the \
-                     session its argv picked, or its picker (session_source: picker-fallback)",
+                    "resurrect: terminal {} has no session id: {}; it is recorded with its \
+                     picker unless its argv names a session by id (session_source: \
+                     picker-fallback)",
                     terminal_id,
                     miss
                 );
@@ -2535,6 +2599,7 @@ impl Pty {
     /// The once-a-second tick: refresh what the active panes are doing, then tell Screen.
     pub fn update_and_report_cwds(&mut self) {
         self.refresh_cwds_and_commands();
+        self.expire_osc_agent_sessions();
         self.refresh_pane_envs();
         self.report_pane_process_info();
     }
@@ -2704,6 +2769,17 @@ impl Pty {
             .copied()
             .map(|terminal_id| {
                 let command = self.reported_command_for(terminal_id).cloned();
+                let agent_env = self
+                    .terminal_agent_envs
+                    .get(&terminal_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let agent_session_source = self
+                    .agent_env_probes
+                    .get(&terminal_id)
+                    .and_then(|probe| probe.live_session.as_ref())
+                    .map(|live| live.source().as_str().to_owned());
+                let osc_agent_session = self.osc_agent_session(terminal_id).map(str::to_owned);
                 (
                     terminal_id,
                     PaneProcessInfo {
@@ -2715,16 +2791,9 @@ impl Pty {
                             .get(&terminal_id)
                             .cloned()
                             .unwrap_or_default(),
-                        agent_env: self
-                            .terminal_agent_envs
-                            .get(&terminal_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        agent_session_source: self
-                            .agent_env_probes
-                            .get(&terminal_id)
-                            .and_then(|probe| probe.live_session.as_ref())
-                            .map(|live| live.source().as_str().to_owned()),
+                        agent_env,
+                        agent_session_source,
+                        osc_agent_session,
                     },
                 )
             })
@@ -2887,6 +2956,61 @@ impl Pty {
         self.resurrect_commands = resurrect_commands.unwrap_or(ResurrectCommands::All);
         self.report_pane_env = report_pane_env.unwrap_or_default();
         self.detect_agents = detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT);
+    }
+
+    /// An agent told us its session directly, on its own pane. An empty id clears the report.
+    pub fn note_agent_session_from_osc(&mut self, terminal_id: u32, session_id: String) {
+        if session_id.is_empty() {
+            self.osc_agent_sessions.remove(&terminal_id);
+            return;
+        }
+        log::debug!(
+            "agents: terminal {} reported its agent session {} (session_source: osc)",
+            terminal_id,
+            session_id
+        );
+        self.osc_agent_sessions.insert(
+            terminal_id,
+            OscAgentSession {
+                session_id,
+                child_pid: self.id_to_child_pid.get(&terminal_id).copied(),
+                seen_agent: false,
+            },
+        );
+    }
+
+    /// Drops every `OSC 1337` report whose pane closed, was respawned, or went back to its shell
+    /// after running an agent. See [`OscAgentSession`].
+    fn expire_osc_agent_sessions(&mut self) {
+        let mut sessions = std::mem::take(&mut self.osc_agent_sessions);
+        sessions.retain(|terminal_id, report| {
+            let runs_an_agent = self
+                .reported_command_for(*terminal_id)
+                .and_then(|command| command.first())
+                .map_or(false, |argv0| {
+                    agent_detect::harness_for_command(argv0).is_some()
+                });
+            let holds = report.still_holds(
+                self.id_to_child_pid.get(terminal_id).copied(),
+                runs_an_agent,
+            );
+            if !holds {
+                log::debug!(
+                    "agents: terminal {} no longer runs the agent that reported session {}",
+                    terminal_id,
+                    report.session_id
+                );
+            }
+            holds
+        });
+        self.osc_agent_sessions = sessions;
+    }
+
+    /// The session the pane's agent reported over `OSC 1337`, if that report still holds.
+    fn osc_agent_session(&self, terminal_id: u32) -> Option<&str> {
+        self.osc_agent_sessions
+            .get(&terminal_id)
+            .map(|report| report.session_id.as_str())
     }
 
     /// A shell told us its cwd directly, so we do not have to read it off the process.

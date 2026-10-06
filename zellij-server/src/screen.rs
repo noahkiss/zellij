@@ -5976,12 +5976,20 @@ impl Screen {
         // and where its session id came from - the pty's own find, the environment, the argv - or
         // that nothing named it and a restore would offer the agent's picker
         let live_source = process_info.and_then(|info| info.agent_session_source.as_deref());
+        // the agent's own `OSC 1337` report on this pane beats anything the walk found
+        let osc_session = process_info.and_then(|info| info.osc_agent_session.clone());
         agent_detect::detect_in_pane(
             pane_info.pane_command.as_deref(),
             pane_info.terminal_command.as_deref(),
             &agent_env,
         )
-        .map(|(agent, command)| agent_detect::with_session_source(agent, live_source, command))
+        .map(|(mut agent, command)| match osc_session {
+            Some(session_id) => {
+                agent.agent_id = Some(session_id);
+                agent_detect::with_session_source(agent, Some("osc"), command)
+            },
+            None => agent_detect::with_session_source(agent, live_source, command),
+        })
     }
 
     /// Gives a live pane the handle its creator chose for it.

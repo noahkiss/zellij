@@ -81,6 +81,7 @@ pub const CAPABILITIES: &[&str] = &[
     "default-floating-size",   // default_floating_size
     "resurrect-command-hints", // resurrect_command_hints
     "resurrect-commands",      // resurrect_commands "all" | "agents" | "prefill"
+    "agent-session-osc",       // OSC 1337 SetUserVar=agent_session, setup --agent-hooks
     "session-drop-env",        // session_restart_drop_env
     "snapshot-dir-config",     // snapshot_dir, session_snapshot_limit
     "session-service-config",  // session_service, pin_exe

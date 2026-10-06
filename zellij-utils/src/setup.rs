@@ -265,6 +265,11 @@ pub struct Setup {
     #[clap(long, value_parser)]
     pub dump_surface: bool,
 
+    /// Print, for each coding agent, the hook that tells zellij which session its pane holds,
+    /// and the file it goes in. Prints only; writes nothing
+    #[clap(long, value_parser)]
+    pub agent_hooks: bool,
+
     /// With `--check`, report the version and this build's capabilities as JSON on stdout, and
     /// nothing else. Gate on the capability names: the fork counter resets when the upstream
     /// version moves, so it cannot be compared across an upgrade. With `--dump-surface`, print the
@@ -413,6 +418,11 @@ impl Setup {
 
         if self.dump_config {
             dump_default_config()?;
+            std::process::exit(0);
+        }
+
+        if self.agent_hooks {
+            let _ = std::io::stdout().write_all(crate::agent_hooks::agent_hooks_text().as_bytes());
             std::process::exit(0);
         }
 

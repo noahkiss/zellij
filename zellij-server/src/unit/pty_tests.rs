@@ -1156,3 +1156,134 @@ fn a_pane_with_no_live_session_reads_none() {
     };
     assert_eq!(probe.live_session_id(), None);
 }
+
+fn agent_pane_meta(terminal_id: u32, command: &str, args: &[&str]) -> SessionLayoutMetadata {
+    let mut run_command = RunCommand::new(PathBuf::from(command));
+    run_command.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let mut meta = SessionLayoutMetadata::default();
+    meta.add_tab(
+        "tab1".to_owned(),
+        true,
+        false,
+        vec![pane_running(terminal_id, Some(Run::Command(run_command)))],
+        vec![],
+    );
+    meta
+}
+
+/// The agent's own `OSC 1337` report is the first thing serialization believes: a claude pane
+/// is recorded with the id it reported, in place of its `--continue`.
+#[test]
+fn an_osc_reported_session_is_what_a_pane_is_recorded_with() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::Agents;
+    pty.id_to_child_pid.insert(1, 100);
+    pty.note_agent_session_from_osc(1, "osc-session".to_owned());
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        run_command.args,
+        vec!["--resume".to_owned(), "osc-session".to_owned()]
+    );
+}
+
+/// With no report, no record and no open file, a `--continue` the operator typed is recorded as
+/// the picker: never the newest session.
+#[test]
+fn with_nothing_found_a_typed_latest_flag_is_recorded_as_the_picker() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::Agents;
+    // a pid no process has: the walk finds nothing under it
+    pty.id_to_child_pid.insert(1, u32::MAX - 7);
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(run_command.args, vec!["--resume".to_owned()]);
+    assert!(pty.resume_misses.contains_key(&1));
+}
+
+#[test]
+fn an_empty_osc_report_clears_the_pane_and_a_closed_pane_loses_its_report() {
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.id_to_child_pid.insert(1, 100);
+    pty.id_to_child_pid.insert(2, 200);
+    pty.note_agent_session_from_osc(1, "one".to_owned());
+    pty.note_agent_session_from_osc(2, "two".to_owned());
+    assert_eq!(pty.osc_agent_session(1), Some("one"));
+    pty.note_agent_session_from_osc(1, String::new());
+    assert_eq!(pty.osc_agent_session(1), None);
+    pty.id_to_child_pid.remove(&2);
+    pty.expire_osc_agent_sessions();
+    assert_eq!(pty.osc_agent_session(2), None);
+}
+
+/// A report outlives a tick on which the agent is not yet the pane's command - the hook fires at
+/// start-up - but not the agent: once the pane has run an agent and is back at its shell, the
+/// report is gone. A respawned pane is a new program and loses it too.
+#[test]
+fn an_osc_report_lasts_as_long_as_the_agent_that_made_it() {
+    let mut report = OscAgentSession {
+        session_id: "s".to_owned(),
+        child_pid: Some(100),
+        seen_agent: false,
+    };
+    assert!(
+        report.still_holds(Some(100), false),
+        "before the tick sees the agent"
+    );
+    assert!(report.still_holds(Some(100), true));
+    assert!(report.seen_agent);
+    assert!(!report.still_holds(Some(100), false), "the agent exited");
+    let mut report = OscAgentSession {
+        session_id: "s".to_owned(),
+        child_pid: Some(100),
+        seen_agent: true,
+    };
+    assert!(
+        !report.still_holds(Some(101), true),
+        "the pane was respawned"
+    );
+    assert!(
+        !report.still_holds(None, true),
+        "the pane's process is gone"
+    );
+}
+
+/// The live list believes the agent's own report too, and says so: `session_source: osc`. Once
+/// the agent exits and the pane is back at its shell, the report is gone.
+#[test]
+fn the_live_list_reports_an_osc_session_while_its_agent_runs() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cmd(child_pid, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.note_agent_session_from_osc(1, "osc-session".to_owned());
+
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("a report")[&1];
+    assert_eq!(info.osc_agent_session.as_deref(), Some("osc-session"));
+
+    // claude exits; the pane's process is its shell again
+    mock.set_cmd(child_pid, vec!["/bin/bash".into()]);
+    pty.pane_activity_flags
+        .get(&1)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    assert_eq!(pty.osc_agent_session(1), None);
+}

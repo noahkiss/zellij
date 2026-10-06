@@ -540,6 +540,28 @@ fn subtract_isize_from_usize(u: usize, i: isize) -> usize {
     }
 }
 
+/// The id in `SetUserVar=agent_session=<base64>`, the payload of an `OSC 1337` an agent hook
+/// prints. `Some("")` for an empty value, which clears the pane's reported session.
+///
+/// `None` for any other user variable, a value that is not base64, or an id that is not a plain
+/// token: the id ends up as a word of a recorded command line, so only letters, digits and
+/// `-_.:` are accepted, at most 128 of them.
+pub fn parse_agent_session_user_var(raw: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let s = std::str::from_utf8(raw).ok()?;
+    let value = s.strip_prefix("SetUserVar=agent_session=")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()?;
+    let id = String::from_utf8(decoded).ok()?;
+    let id = id.trim();
+    let is_token = id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    is_token.then(|| id.to_owned())
+}
+
 pub fn parse_osc7_path(raw: &[u8]) -> Option<std::path::PathBuf> {
     let s = std::str::from_utf8(raw).ok()?;
     let rest = s.strip_prefix("file://")?;
@@ -853,6 +875,9 @@ pub struct Grid {
     pub search_results: SearchResult,
     pub pending_clipboard_update: Option<String>,
     pub pending_osc7_cwd: Option<std::path::PathBuf>,
+    /// The session id an agent reported for itself with `OSC 1337 SetUserVar=agent_session=`,
+    /// waiting for the tab to hand it to the pty thread. `Some("")` is an explicit clear.
+    pub pending_agent_session: Option<String>,
     pub pending_desktop_notifications: Vec<PendingNotification>,
     notification_tracker: NotificationTracker,
     /// Whitelisted host-terminal queries intercepted from the app running
@@ -1240,6 +1265,7 @@ impl Grid {
             sixel_host_support: true,
             pending_clipboard_update: None,
             pending_osc7_cwd: None,
+            pending_agent_session: None,
             pending_desktop_notifications: Vec::new(),
             notification_tracker: NotificationTracker::default(),
             pending_forwarded_queries: Vec::new(),
@@ -4631,6 +4657,17 @@ impl Perform for Grid {
                 }
             },
 
+            // iTerm2 / WezTerm user variables. Only `agent_session` is read: a coding agent's own
+            // hook reports the session it holds, so a restore can resume exactly that one
+            b"1337" => {
+                if let Some(id) = params
+                    .get(1)
+                    .and_then(|raw| parse_agent_session_user_var(raw))
+                {
+                    self.pending_agent_session = Some(id);
+                }
+            },
+
             b"7" => {
                 if let Some(raw) = params.get(1) {
                     if let Some(path) = parse_osc7_path(raw) {
@@ -6283,6 +6320,44 @@ fn is_selection_boundary_character(character: char, word_separators: &str) -> bo
 #[cfg(test)]
 #[path = "./unit/grid_tests.rs"]
 mod grid_tests;
+
+#[cfg(test)]
+mod agent_session_osc_tests {
+    use super::parse_agent_session_user_var;
+
+    #[test]
+    fn reads_the_agent_session_user_var() {
+        // base64("01a112dd-5b0e-7db3-964b-68a8a71304b1")
+        let raw = b"SetUserVar=agent_session=MDFhMTEyZGQtNWIwZS03ZGIzLTk2NGItNjhhOGE3MTMwNGIx";
+        assert_eq!(
+            parse_agent_session_user_var(raw).as_deref(),
+            Some("01a112dd-5b0e-7db3-964b-68a8a71304b1")
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_a_clear() {
+        assert_eq!(
+            parse_agent_session_user_var(b"SetUserVar=agent_session=").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn other_user_vars_and_bad_values_are_ignored() {
+        assert_eq!(parse_agent_session_user_var(b"SetUserVar=other=YWJj"), None);
+        assert_eq!(parse_agent_session_user_var(b"File=inline=1:AAAA"), None);
+        assert_eq!(
+            parse_agent_session_user_var(b"SetUserVar=agent_session=not base64!"),
+            None
+        );
+        // base64("a b;rm -rf") - not a plain token
+        assert_eq!(
+            parse_agent_session_user_var(b"SetUserVar=agent_session=YSBiO3JtIC1yZg=="),
+            None
+        );
+    }
+}
 
 #[cfg(test)]
 mod osc7_parser_tests {

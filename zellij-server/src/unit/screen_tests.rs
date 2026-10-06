@@ -16190,6 +16190,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
             env: Default::default(),
             agent_env: Default::default(),
             agent_session_source: None,
+            osc_agent_session: None,
         },
     );
     let _ = mock_screen
@@ -16318,6 +16319,7 @@ fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
             env: Default::default(),
             agent_env: Default::default(),
             agent_session_source: None,
+            osc_agent_session: None,
         },
     )
 }
@@ -16389,6 +16391,7 @@ pub fn an_agent_row_says_where_its_session_id_came_from() {
             .into_iter()
             .collect(),
             agent_session_source: Some("open-file".to_owned()),
+            osc_agent_session: None,
         },
     );
     let agent = pane_list
@@ -16708,6 +16711,7 @@ pub fn pane_info_carries_the_allowlisted_environment() {
                 .collect(),
             agent_env: Default::default(),
             agent_session_source: None,
+            osc_agent_session: None,
         },
     );
     let _ = mock_screen
@@ -18706,4 +18710,34 @@ pub fn a_prefill_is_pasted_once_when_the_line_editor_turns_bracketed_paste_on() 
         writes,
         vec![b"\x1b[200~claude --resume abc\x1b[201~".to_vec()]
     );
+}
+
+/// The agent's own `OSC 1337` report on its pane beats what the walk found, and the pane is
+/// matched from the line it was started with even when its live argv is something else.
+#[test]
+pub fn an_agents_own_osc_report_wins_in_the_agent_row() {
+    let pane_list = pane_list_for_an_agent_pane(
+        true,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: None,
+            command: Some(vec!["claude".to_owned(), "--continue".to_owned()]),
+            env: Default::default(),
+            agent_env: [(
+                "CLAUDE_CODE_SESSION_ID".to_owned(),
+                "from-record".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            agent_session_source: Some("record".to_owned()),
+            osc_agent_session: Some("from-osc".to_owned()),
+        },
+    );
+    let agent = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .and_then(|entry| entry.agent.as_ref())
+        .expect("a pane running claude is an agent");
+    assert_eq!(agent.agent_id.as_deref(), Some("from-osc"));
+    assert_eq!(agent.session_source.as_deref(), Some("osc"));
 }

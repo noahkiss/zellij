@@ -582,6 +582,10 @@ pub trait Pane {
     fn drain_osc7_cwd(&mut self) -> Option<std::path::PathBuf> {
         None
     }
+    /// The session id the pane's agent reported with `OSC 1337 SetUserVar=agent_session=`.
+    fn drain_agent_session(&mut self) -> Option<String> {
+        None
+    }
     fn render_full_viewport(&mut self) {}
     fn relative_position(&self, position_on_screen: &Position) -> Position {
         position_on_screen.relative_to(self.get_content_y(), self.get_content_x())
@@ -4561,6 +4565,7 @@ impl Tab {
             let clipboard_update = terminal_output.drain_clipboard_update();
             let desktop_notifications = terminal_output.drain_desktop_notifications();
             let osc7_cwd = terminal_output.drain_osc7_cwd();
+            let agent_session = terminal_output.drain_agent_session();
             for message in messages_to_pty {
                 self.write_to_pane_id_without_preprocessing(message, PaneId::Terminal(pid))
                     .with_context(err_context)?;
@@ -4597,6 +4602,11 @@ impl Tab {
                 let _ = self
                     .senders
                     .send_to_pty(PtyInstruction::NotifyCwdFromOsc7(pid, path));
+            }
+            if let Some(session_id) = agent_session {
+                let _ = self
+                    .senders
+                    .send_to_pty(PtyInstruction::AgentSessionFromOsc(pid, session_id));
             }
         }
         Ok(())

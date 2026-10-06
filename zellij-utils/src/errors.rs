@@ -536,6 +536,7 @@ pub enum PtyContext {
     GetPaneCwd,
     UpdateAndReportCwds,
     NotifyCwdFromOsc7,
+    AgentSessionFromOsc,
     ChildProcessExited,
     Exit,
 }

@@ -3706,8 +3706,8 @@ agents](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents).
 From nkmk.31, every known agent is pinned to its own session the same way, not only `claude`, and
 an agent with no session found is never recorded with `--continue` or `resume --last`. See the
 nkmk.31 paragraphs in that entry. A configured hint still appends what it says; the shipped
-`claude` hint's `--continue` is replaced by the record's `--resume <id>` whenever the record is
-there.
+`claude` hint's `--continue` is replaced by the agent's own id whenever one is found, and by the
+picker when none is.
 
 Best-effort throughout: no hint, no variable, or no platform each record the command unchanged, at
 debug log level. Nothing here can fail a serialization.
@@ -3796,7 +3796,11 @@ a codex started with a prompt on its command line is not verified.
 **From nkmk.31, each pane resumes its own session, and never the newest.** The newest-session
 resume was wrong whenever two agent panes shared a directory: both came back holding whichever
 session was newest. Operator report of 2026-10-06. Every known agent is now pinned to the session
-its own process holds, in that agent's own form, and the fallback is the agent's picker:
+its own process holds, in that agent's own form, and the fallback is the agent's picker.
+
+The sources, in order of preference: the agent's own report on its pane (`osc`, below), the
+session file its process holds open (`open-file`), claude's per-process record (`record`), an id
+already in the argv (`argv`, kept as run), and last the picker (`picker-fallback`).
 
 | agent | own session found from | recorded with an id | recorded with no id |
 |---|---|---|---|
@@ -3823,10 +3827,45 @@ process, an npm wrapper puts the native `codex` one level down, and a subagent s
   `PI_SESSION_ID` only to its bash-tool children while a tool runs. Both get their picker unless
   an identity variable or a configured hint names the session.
 
-An argv that already picks a session is still kept as run when nothing better is found: the
-operator's own `claude --resume` (a picker) or `claude --continue`. The bare `--resume` of the
-report came from exactly that: the operator's shell abbreviations run `claude --resume` and
-`claude --continue`, and nkmk.27 recorded them verbatim.
+**Never the newest session, without exceptions.** With no id found, an argv that carries a
+newest-session flag - `claude --continue`/`-c`, `codex resume --last`, `opencode --continue`/`-c`,
+`pi --continue`/`-c` - is recorded with the agent's picker instead; it is not kept as run. Only an
+argv that names its session by id is kept. The same holds for a configured hint whose
+`resume_args` add `--continue`: with no id found, the pane still ends at the picker. The bare
+`--resume` and `--continue` of the report were the operator's own: shell abbreviations run
+`claude --resume` and `claude --continue`, and nkmk.27 recorded them verbatim.
+
+**The agent's own report: `OSC 1337 SetUserVar=agent_session=<base64 id>`.** The iTerm2 and
+WezTerm user-variable convention, printed by a hook in the agent to its pane's terminal. The grid
+had no `OSC 1337` arm before; it now reads this one user variable and ignores every other. The id
+must be a plain token - letters, digits, `-_.:`, at most 128 - because it becomes a word of a
+recorded command line; an empty value clears the report. The pty thread keeps it on that pane and
+drops it when the pane closes or is respawned, and when the pane has been seen running an agent
+and then is back at its shell. Not "when the pane is not running an agent right now": the hook
+fires at start-up, usually before the once-a-second tick has seen the agent, and that rule would
+drop every fresh report. A new report from the next agent replaces the old one.
+
+`zellij setup --agent-hooks` prints the hook for each agent and the file it goes in. It prints
+only; nothing is written. Every snippet returns at once unless `ZELLIJ` is set. A build that
+reads the report lists `agent-session-osc` in `zellij setup --check --json`, so dotfiles can
+install the hooks only where they do something.
+
+| agent | where | event |
+|---|---|---|
+| `claude` | `settings.json`, calling a shared `~/.config/zellij/agent-session.sh` | `SessionStart` (start-up, `/clear`, `/resume`, compaction) |
+| `codex` | `config.toml` `[[hooks.SessionStart]]`, the same script | `SessionStart`; codex asks once to trust a new hook |
+| `opencode` | `~/.config/opencode/plugins/zellij-agent-session.js` | `session.updated`, top-level sessions only |
+| `pi` | `~/.pi/agent/extensions/zellij-agent-session.ts` | `session_start` (start-up, `/new`, `/resume`, `/fork`) |
+
+**A claude hook has no controlling terminal.** Verified with Claude Code 2.1 under a pty: inside
+the hook `tty` says "not a tty" and `ps -o tty=` prints `?`, so a write to `/dev/tty` fails, and
+the hook's stdout is claude's, not the terminal. The shared script walks up from itself to the
+first ancestor that has a terminal - the agent - and writes the report to that device. Proven end
+to end on Linux: the pty received the sequence carrying the hook's `session_id`. opencode and pi
+run the snippet inside the agent's own process, which owns the terminal, so they write to
+`/dev/tty`. The codex and opencode snippets are unproven: codex auth was expired and opencode not
+installed where this was written, and if an interactive codex runs its hooks in its app-server
+daemon, the hook has no pane terminal to find.
 
 A miss is logged at `warn` once per pane, when its reason changes, with the pid, the agent and the
 reason, so the server log answers "why did this pane come back with a picker". The serialized
@@ -4759,8 +4798,9 @@ again.
 `agent_id` is a field of the CLI-only `PaneListEntry` and `AgentListEntry`. Only its value
 changes: no protobuf tag, no plugin API, no client/server contract.
 
-From nkmk.31, the same walk finds codex's session from the rollout file it holds open, and every
-agent row in `list-agents --json` carries `session_source`: `record`, `open-file`, `env`, `argv`
+From nkmk.31, the same walk finds codex's session from the rollout file it holds open, an agent's
+own `OSC 1337` report beats both, and every agent row in `list-agents --json` carries
+`session_source`: `osc`, `record`, `open-file`, `env`, `argv`
 (the id the agent was started with, when nothing live named one), or `picker-fallback` (nothing
 named the session, and a restore would offer the agent's picker). The codex handle is re-read
 every tick like claude's record, so a `/new` is seen without a new process. `session_source` is a

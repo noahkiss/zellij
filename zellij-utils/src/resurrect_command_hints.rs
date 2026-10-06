@@ -262,6 +262,9 @@ pub struct AgentResume {
 /// tell "resumes its own session" from "opens the picker because nothing named one".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSource {
+    /// The agent said so itself, on its own pane: `OSC 1337 SetUserVar=agent_session=<base64>`,
+    /// printed by a hook `zellij setup --agent-hooks` describes. Preferred over everything else.
+    Osc,
     /// The agent's own per-process record: claude's `sessions/<pid>.json`.
     Record,
     /// A session file the agent's process holds open: codex's `rollout-*-<uuid>.jsonl`.
@@ -278,6 +281,7 @@ pub enum SessionSource {
 impl SessionSource {
     pub fn as_str(&self) -> &'static str {
         match self {
+            SessionSource::Osc => "osc",
             SessionSource::Record => "record",
             SessionSource::OpenFile => "open-file",
             SessionSource::Env => "env",
@@ -420,21 +424,24 @@ pub fn strip_session_words(command: &str, observed_args: &[String]) -> Option<Ve
 }
 
 /// The arguments an agent pane is recorded with when nothing named its session: `observed_args`
-/// with the agent's picker added. `None` when `command` is not an agent this build knows how to
-/// resume, or when the observed arguments already pick a session.
+/// with every session word replaced by the agent's picker. `None` when `command` is not an agent
+/// this build knows, or when the observed arguments name a session by id, which is kept as run.
 ///
-/// Never the newest session: before nkmk.31 this added `--continue` or `resume --last`, and two
-/// panes in one directory then both came back holding whichever session was newest.
+/// Never the newest session, without exceptions: before nkmk.31 this added `--continue` or
+/// `resume --last`, and kept an argv that already carried one. Two panes in one directory then
+/// both came back holding whichever session was newest. From nkmk.31 a `--continue`, `-c` or
+/// `resume --last` in the argv is replaced by the picker too; only an explicit id survives.
 pub fn builtin_resume_args(command: &str, observed_args: &[String]) -> Option<Vec<String>> {
     let resume = agent_resume_for(command)?;
-    if picks_a_session(command, observed_args) {
+    if argv_session_id(command, observed_args).is_some() {
         return None;
     }
+    let args = strip_session_words(command, observed_args)?;
     let picker_args = resume.picker_args.iter().map(|arg| (*arg).to_owned());
     let args = if resume.is_subcommand {
-        picker_args.chain(observed_args.iter().cloned()).collect()
+        picker_args.chain(args).collect()
     } else {
-        observed_args.iter().cloned().chain(picker_args).collect()
+        args.into_iter().chain(picker_args).collect()
     };
     Some(args)
 }
@@ -740,14 +747,46 @@ mod tests {
         );
     }
 
-    /// An argv that already picks a session is kept as run - including the operator's own
-    /// bare `--resume` (a picker) or `--continue`.
+    /// Only an argv that names its session by id is kept as run. A latest flag the operator
+    /// typed - `claude --continue`, `codex resume --last`, `opencode -c`, `pi --continue` - is
+    /// replaced by the picker, and a bare picker stays one picker.
     #[test]
-    fn an_argv_that_already_picks_a_session_is_kept_as_run() {
-        let bare = args(&["--dangerously-skip-permissions", "--resume"]);
-        assert_eq!(builtin_resume_args("claude", &bare), None);
+    fn a_latest_flag_in_the_argv_becomes_the_picker_and_an_id_is_kept() {
         let latest = args(&["--dangerously-skip-permissions", "--continue"]);
-        assert_eq!(builtin_resume_args("claude", &latest), None);
+        assert_eq!(
+            builtin_resume_args("claude", &latest),
+            Some(args(&["--dangerously-skip-permissions", "--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("claude", &args(&["-c", "--model", "m"])),
+            Some(args(&["--model", "m", "--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("claude", &args(&["--resume"])),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            builtin_resume_args("codex", &args(&["resume", "--last", "-m", "o3"])),
+            Some(args(&["resume", "-m", "o3"]))
+        );
+        assert_eq!(
+            builtin_resume_args("opencode", &args(&["--continue"])),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            builtin_resume_args("pi", &args(&["-c"])),
+            Some(args(&["--resume"]))
+        );
+        let with_id = args(&["--dangerously-skip-permissions", "--resume", "abc"]);
+        assert_eq!(builtin_resume_args("claude", &with_id), None);
+        assert_eq!(
+            builtin_resume_args("codex", &args(&["resume", "abc"])),
+            None
+        );
+        assert_eq!(
+            builtin_resume_args("pi", &args(&["--session", "abc"])),
+            None
+        );
     }
 
     #[test]
@@ -807,7 +846,6 @@ mod tests {
             builtin_resume_args("codex", &args(&["resume", "abc"])),
             None
         );
-        assert_eq!(builtin_resume_args("pi", &args(&["-c"])), None);
         assert_eq!(builtin_resume_args("htop", &[]), None);
     }
 

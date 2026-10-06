@@ -951,6 +951,10 @@ impl Pane for TerminalPane {
         self.grid.pending_osc7_cwd.take()
     }
 
+    fn drain_agent_session(&mut self) -> Option<String> {
+        self.grid.pending_agent_session.take()
+    }
+
     fn set_selection_options(&mut self, osc133_command_selection: bool, word_separators: &str) {
         self.grid
             .set_selection_options(osc133_command_selection, word_separators);

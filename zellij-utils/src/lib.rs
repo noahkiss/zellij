@@ -1,4 +1,5 @@
 pub mod agent_detect;
+pub mod agent_hooks;
 pub mod capabilities;
 pub mod cli;
 pub mod cli_surface;
