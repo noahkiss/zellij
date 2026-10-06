@@ -28,6 +28,29 @@ use crate::session_doctor::{Commander, DoctorMode, Finding};
 /// a value nobody can set wrongly.
 pub const PIN_IDENTIFIER: &str = "org.zellij.nkmk";
 
+/// The team whose Developer ID the release signs the macOS binary with, in `release.yml`.
+///
+/// A build carrying this team's Developer ID for [`PIN_IDENTIFIER`] is pinned exactly as it
+/// arrived - see [`install_signed_build`]. Any other team's is not ours, whatever it is signed as,
+/// and goes down the ladder like a local build.
+pub const RELEASE_TEAM_ID: &str = "2Z88BYP37C";
+
+/// What a release build has to satisfy before it is pinned as-is: Apple's Developer ID chain, the
+/// Developer ID Application leaf, our identifier and our team.
+///
+/// The two `field` markers are the Developer ID intermediate and leaf, and they are what tell this
+/// certificate from an Apple Development one of the same team - which carries neither, and which a
+/// requirement naming only the team would accept. The text is what `codesign` derives for a
+/// Developer ID signature, without the `/* exists */` comments it prints.
+pub fn release_requirement() -> String {
+    format!(
+        "designated => identifier \"{}\" and anchor apple generic and certificate \
+         1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] \
+         and certificate leaf[subject.OU] = \"{}\"",
+        PIN_IDENTIFIER, RELEASE_TEAM_ID
+    )
+}
+
 /// The common name of the certificate we mint when the machine has no Apple one.
 pub const SELF_SIGNED_COMMON_NAME: &str = "zellij self-signed code signing";
 
@@ -992,6 +1015,17 @@ pub fn sign_pin(
         findings.push(confirm_regrant(context, mode));
     }
 
+    // A release build arrives already signed with our Developer ID, and re-signing it here could
+    // only make it worse: a local rung writes a local requirement, and needs a keychain and a
+    // password the release never did. So a refresh from such a build puts it in place as it came,
+    // and the ladder below is for every build that is not one - see `install_signed_build`.
+    if let (true, Some(source)) = (mode.fix, context.refresh_from.as_deref()) {
+        if let Some(installed) = install_signed_build(commander, pin, source, context, &signature) {
+            findings.extend(installed);
+            return SigningRun { findings };
+        }
+    }
+
     // An anchored-LOOKING pin is not a healthy pin, and reading the requirement is not checking it.
     // A pin signed with a requirement the binary does not satisfy reads exactly like a good one -
     // same identifier, same anchored text, no code hash anywhere - and doctor called that state
@@ -1227,6 +1261,170 @@ pub fn sign_pin(
         commander, pin, context, &signature, ladder,
     ));
     SigningRun { findings }
+}
+
+/// The signature `source` carries, when it is the release's own Developer ID for our identifier.
+///
+/// The same verification a freshly signed pin gets - [`verify_signature`], which reads the
+/// requirement and then checks the binary satisfies it - and then [`release_requirement`], asked of
+/// `codesign` rather than of the text. The team is read off the requirement first so that a local
+/// build, or anybody else's Developer ID, is turned away before the one question that costs a
+/// `codesign` run of its own.
+///
+/// `None` is "not ours", and it is never an error. A local `cargo build`, a stock upstream binary
+/// and a source-formula build all land here, and all of them go down the ladder exactly as before.
+fn build_carries_our_developer_id(
+    commander: &dyn Commander,
+    source: &Path,
+) -> Option<(String, String)> {
+    let source_display = source.display().to_string();
+    let PinSignature::Anchored {
+        identifier,
+        designated,
+    } = verify_signature(commander, &source_display).ok()?
+    else {
+        return None;
+    };
+    if identifier != PIN_IDENTIFIER
+        || team_id_from_requirement(&designated).as_deref() != Some(RELEASE_TEAM_ID)
+    {
+        return None;
+    }
+    satisfies(commander, &source_display, &release_requirement())
+        .then_some((identifier, designated))
+}
+
+/// Put a release build at the pin's path with the signature it arrived with, and sign nothing.
+///
+/// **The release signs, so this machine does not have to.** `release.yml` signs the macOS binary
+/// with our Developer ID - hardened runtime, timestamped, notarized - and Homebrew installs it
+/// byte for byte. Running the ladder over it threw that signature away and put a local one in its
+/// place: an Apple Development certificate on one Mac, a minted one on another, each its own
+/// requirement and each needing the login keychain. Over SSH that keychain is locked, so the
+/// refresh asked for `ZELLIJ_KEYCHAIN_PASSWORD` to replace a signature that was already the best
+/// one the ladder could have written.
+///
+/// So when the build being pinned already carries it, this takes the place of the ladder: a copy
+/// into a temp beside the pin, the same verification a freshly signed copy gets, and the same
+/// `rename(2)`. No `codesign -s`, no keychain, no password. Every other build goes down the ladder
+/// exactly as before, which is why `None` means "not mine" and the caller carries on.
+///
+/// **The first such pin owes a re-grant, once.** A pin that was anchored on another requirement -
+/// Apple Development under another team, or our own certificate's hash - held grants this signature
+/// does not satisfy, so the switch is recorded through [`settle_the_grants`] exactly as a ladder
+/// switch is, and doctor asks on every run until `--fix --regranted`. A pin already on this
+/// requirement owes nothing, and neither does one that was never anchored.
+///
+/// A copy or rename that fails is the filesystem's fault, not the build's. It is reported with the
+/// pin left as it was, and the ladder is not tried: it would write the same file to the same
+/// directory and meet the same error.
+fn install_signed_build(
+    commander: &dyn Commander,
+    pin: &Path,
+    source: &Path,
+    context: &SigningContext,
+    before: &PinSignature,
+) -> Option<Vec<Finding>> {
+    let (identifier, designated) = build_carries_our_developer_id(commander, source)?;
+    let mut findings = Vec::new();
+    let pin_display = pin.display().to_string();
+    let directory = pin.parent().unwrap_or_else(|| Path::new("."));
+    let refused = |findings: &mut Vec<Finding>, reason: String| {
+        findings.push(what_became_of_the_pin(
+            Finding::needs_you("signing", reason),
+            context,
+        ));
+    };
+
+    let swept = sweep_stale_temps(directory);
+    if !swept.is_empty() {
+        findings.push(Finding::changed(
+            "signing",
+            format!(
+                "removed {} leftover temp {} from earlier signing runs",
+                swept.len(),
+                if swept.len() == 1 { "file" } else { "files" }
+            ),
+        ));
+    }
+    // the signing run's own temp name, so its sweep covers this one too - see `perform_signing`
+    let pin_before = pin_identity(pin);
+    let temporary = directory.join(format!("{}{}.tmp", sign_temp_prefix(), std::process::id()));
+    let temporary_display = temporary.display().to_string();
+    if let Err(error) = std::fs::copy(source, &temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        refused(
+            &mut findings,
+            format!("could not copy {} to pin it: {}", source.display(), error),
+        );
+        return Some(findings);
+    }
+    // the copy is what gets renamed, so the copy is what is verified - a short write would carry a
+    // signature that no longer covers its own bytes
+    if let Err(reason) = verify_signature(commander, &temporary_display) {
+        let _ = std::fs::remove_file(&temporary);
+        refused(
+            &mut findings,
+            format!(
+                "{} carries our Developer ID, and the copy of it did not verify: {}",
+                source.display(),
+                reason
+            ),
+        );
+        return Some(findings);
+    }
+    if let Err(reason) = crate::session_lifecycle::flush_pin_temp(&temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        refused(&mut findings, reason);
+        return Some(findings);
+    }
+    if !pin_unchanged_since(pin, &pin_before) {
+        let _ = std::fs::remove_file(&temporary);
+        refused(
+            &mut findings,
+            format!(
+                "{} was replaced while the new build was being copied, so the copy was discarded \
+                 rather than written over the newer one - run `zellij session doctor --fix` again",
+                pin_display
+            ),
+        );
+        return Some(findings);
+    }
+    if let Err(error) = std::fs::rename(&temporary, pin) {
+        let _ = std::fs::remove_file(&temporary);
+        refused(
+            &mut findings,
+            format!("could not put the new build at {}: {}", pin_display, error),
+        );
+        return Some(findings);
+    }
+    crate::session_lifecycle::flush_pin_directory(directory);
+    crate::session_lifecycle::record_pin_refreshed_from(source, pin);
+
+    findings.push(
+        Finding::changed(
+            "signing",
+            format!(
+                "refreshed {} with the build's own Developer ID signature; nothing was signed here",
+                pin_display
+            ),
+        )
+        .note(format!(
+            "identifier {}, team {}",
+            identifier, RELEASE_TEAM_ID
+        ))
+        .note(designated.clone())
+        .note("the release signed and notarized it, and it was copied into place unchanged,")
+        .note("so no certificate, keychain or password was needed on this machine"),
+    );
+    findings.extend(settle_the_grants(
+        commander,
+        &pin_display,
+        context,
+        before,
+        &designated,
+    ));
+    Some(findings)
 }
 
 /// Sign with the best rung that will actually sign, and say which ones would not.
@@ -1958,11 +2156,38 @@ fn perform_signing(
             .note(format!("  {}", the_complaint(&refusal)));
     }
     findings.push(done);
-    let after = after.designated().unwrap_or_default();
+    findings.extend(settle_the_grants(
+        commander,
+        &pin_display,
+        context,
+        before,
+        after.designated().unwrap_or_default(),
+    ));
+    SignAttempt {
+        findings,
+        refusal: None,
+        fatal: false,
+    }
+}
+
+/// What a new signature at the pin's path does to the grants, recorded and said.
+///
+/// The tail of a signing run, and of a build installed with its own signature - see
+/// [`install_signed_build`]. Both put a requirement at the pin that the grants may not name, and
+/// the record of an owed re-grant has to be written the same way whichever one did it, or the next
+/// run reads two kinds of switch two ways.
+fn settle_the_grants(
+    commander: &dyn Commander,
+    pin_display: &str,
+    context: &SigningContext,
+    before: &PinSignature,
+    after: &str,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
     let recorded = recorded_grant(context);
     let granted = granted_requirement(context, before);
     let holds = match granted.as_deref() {
-        Some(granted) if granted != after => satisfies(commander, &pin_display, granted),
+        Some(granted) if granted != after => satisfies(commander, pin_display, granted),
         _ => true,
     };
     let verdict = judge_grants(granted.as_deref(), recorded.is_some(), after, holds);
@@ -2004,18 +2229,14 @@ fn perform_signing(
             },
         },
     };
-    let mut next = follow_up(&pin_display, changed);
+    let mut next = follow_up(pin_display, changed);
     if owed {
         next = next
             .note("doctor keeps asking until `zellij session doctor --fix --regranted` records")
             .note("the re-grant as made");
     }
     findings.push(next);
-    SignAttempt {
-        findings,
-        refusal: None,
-        fatal: false,
-    }
+    findings
 }
 
 /// The first line of a tool's complaint, which is the part worth quoting in a report.
@@ -5853,5 +6074,257 @@ Signature=adhoc
 
         sign_pin(&commander, &pin, DoctorMode::default(), &context);
         assert!(!owed_path.exists());
+    }
+
+    /// Recorded from the release binary: our Developer ID, signed in `release.yml`.
+    const RELEASE_SIGNED: &str = "\
+designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2Z88BYP37C\"
+Executable=/opt/homebrew/Cellar/zellij-nkmk/0.45.1-nkmk.30/bin/zellij
+Identifier=org.zellij.nkmk
+Signature=Developer ID Application: NKMK Digital Co. (2Z88BYP37C)
+TeamIdentifier=2Z88BYP37C
+";
+
+    /// A pin signed with Apple Development under another team, with our own requirement.
+    const OTHER_TEAM_APPLE_DEVELOPMENT: &str = "\
+designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate leaf[subject.OU] = \"U2VEDWFUF3\"
+Identifier=org.zellij.nkmk
+Signature=Apple Development: someone@example.com (DY7JA3K8QZ)
+";
+
+    const OTHER_TEAM_REQUIREMENT: &str = "designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate leaf[subject.OU] = \"U2VEDWFUF3\"";
+
+    /// Apple Development under the RELEASE team: the team matches and the certificate is not a
+    /// Developer ID, so it is not the release's signature.
+    const RELEASE_TEAM_APPLE_DEVELOPMENT: &str = "\
+designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate leaf[subject.OU] = \"2Z88BYP37C\"
+Identifier=org.zellij.nkmk
+Signature=Apple Development: someone@example.com (F6G7H8I9J0)
+";
+
+    /// The pin, its directory, a release build to refresh from, and a scratch signing dir.
+    fn a_pin_and_a_release_build() -> (tempfile::TempDir, PathBuf, PathBuf, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let pin = directory.path().join("zellij");
+        std::fs::write(&pin, b"the OLD build").unwrap();
+        let build = directory.path().join("new-zellij");
+        std::fs::write(&build, b"the release build").unwrap();
+        (directory, pin, build, tempfile::tempdir().unwrap())
+    }
+
+    /// A commander for a refresh from a release build, over a pin carrying `before`.
+    fn refreshing_from_the_release(
+        pin: &Path,
+        build: &Path,
+        before: &str,
+        extra: &[(&str, CommandOutput)],
+    ) -> RecordedCommander {
+        let pin_described = format!("codesign -d --verbose=2 -r- {}", pin.display());
+        let release_tested = test_requirement(&release_requirement(), build);
+        let mut answers = vec![
+            (pin_described.as_str(), recorded(before)),
+            // the build, and then the copy of it beside the pin
+            ("codesign -d --verbose=2 -r- ", recorded(RELEASE_SIGNED)),
+            ("codesign --verify --strict", recorded("")),
+            (release_tested.as_str(), recorded("")),
+        ];
+        answers.extend(extra.iter().map(|(line, output)| (*line, output.clone())));
+        RecordedCommander::new(&answers)
+    }
+
+    /// (a) A release build goes in as it came. No `codesign -s`, no keychain, and the pin is the
+    /// build's own bytes, which is what keeps its signature.
+    #[test]
+    fn a_release_build_is_pinned_as_it_came_and_nothing_is_signed() {
+        let (_directory, pin, build, scratch) = a_pin_and_a_release_build();
+        let commander = refreshing_from_the_release(&pin, &build, DEVELOPER_ID, &[]);
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build.clone());
+        let run = sign_pin(&commander, &pin, DoctorMode::default(), &context);
+
+        assert_eq!(std::fs::read(&pin).unwrap(), b"the release build".to_vec());
+        assert!(
+            !commander.called_with("codesign -s"),
+            "a release build was signed again: {:?}",
+            commander.calls()
+        );
+        assert!(
+            !commander.called_with("security"),
+            "the keychain was asked: {:?}",
+            commander.calls()
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.message.contains("nothing was signed here")),
+            "{:?}",
+            run.findings
+        );
+        // the copy is verified before it is renamed, exactly as a signed copy is
+        assert!(
+            commander.called_with(&format!(
+                "codesign -d --verbose=2 -r- {}",
+                pin.parent().unwrap().join(sign_temp_prefix()).display()
+            )),
+            "{:?}",
+            commander.calls()
+        );
+        // the stamp names the build, so the next pass does not refresh it again
+        #[cfg(unix)]
+        assert!(!crate::session_lifecycle::pin_needs_refresh(&build, &pin));
+    }
+
+    /// (b) The first release over a pin anchored on another requirement owes the re-grant, and it
+    /// is recorded once: a second release over it leaves the record as it was, and a later run
+    /// with nothing to refresh still asks.
+    #[test]
+    fn the_first_release_over_another_requirement_records_the_re_grant_once() {
+        let (_directory, pin, build, scratch) = a_pin_and_a_release_build();
+        let other_team_tested = test_requirement(OTHER_TEAM_REQUIREMENT, &pin);
+        let unsatisfied = recorded_failure(
+            "test-requirement: code failed to satisfy specified code requirement(s)",
+        );
+        let commander = refreshing_from_the_release(
+            &pin,
+            &build,
+            OTHER_TEAM_APPLE_DEVELOPMENT,
+            &[(other_team_tested.as_str(), unsatisfied.clone())],
+        );
+        let mut first = context(scratch.path());
+        first.refresh_from = Some(build.clone());
+        let run = sign_pin(&commander, &pin, DoctorMode::default(), &first);
+        assert!(!commander.called_with("codesign -s"));
+        let owed_path = first.signing_dir.regrant_owed();
+        assert_eq!(
+            std::fs::read_to_string(&owed_path).unwrap().trim(),
+            OTHER_TEAM_REQUIREMENT,
+            "the record must name the requirement the grants were made against"
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.message.contains("two things left")),
+            "{:?}",
+            run.findings
+        );
+
+        // a second release: the pin now carries the release's own requirement, and the debt is
+        // still the one recorded, not a new one
+        std::fs::write(&build, b"the next release build").unwrap();
+        let second = refreshing_from_the_release(
+            &pin,
+            &build,
+            RELEASE_SIGNED,
+            &[(other_team_tested.as_str(), unsatisfied.clone())],
+        );
+        sign_pin(&second, &pin, DoctorMode::default(), &first);
+        assert_eq!(
+            std::fs::read_to_string(&owed_path).unwrap().trim(),
+            OTHER_TEAM_REQUIREMENT
+        );
+
+        // and a run with nothing to refresh keeps asking until `--regranted`
+        let later = RecordedCommander::new(&[
+            (
+                format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                recorded(RELEASE_SIGNED),
+            ),
+            ("codesign --verify --strict", recorded("")),
+            (other_team_tested.as_str(), unsatisfied),
+        ]);
+        let run = sign_pin(
+            &later,
+            &pin,
+            DoctorMode::default(),
+            &context(scratch.path()),
+        );
+        assert!(
+            run.findings
+                .iter()
+                .any(|finding| finding.status == Status::NeedsYou
+                    && finding.message.contains("another requirement")),
+            "{:?}",
+            run.findings
+        );
+    }
+
+    /// (c) A pin already on the release's requirement - the second release since the switch, with
+    /// the re-grant made - owes nothing and records nothing.
+    #[test]
+    fn a_release_over_a_pin_of_the_same_team_records_nothing() {
+        let (_directory, pin, build, scratch) = a_pin_and_a_release_build();
+        let commander = refreshing_from_the_release(&pin, &build, RELEASE_SIGNED, &[]);
+        let mut context = context(scratch.path());
+        context.refresh_from = Some(build);
+        let run = sign_pin(&commander, &pin, DoctorMode::default(), &context);
+
+        assert!(!commander.called_with("codesign -s"));
+        assert!(!context.signing_dir.regrant_owed().exists());
+        let follow = run
+            .findings
+            .iter()
+            .find(|finding| finding.message.contains("one thing left"))
+            .unwrap_or_else(|| panic!("{:?}", run.findings));
+        assert!(
+            follow
+                .notes
+                .iter()
+                .any(|note| note.contains("nothing to re-grant")),
+            "{:?}",
+            follow.notes
+        );
+    }
+
+    /// (d) Anything that is not the release's Developer ID goes down the ladder as before: another
+    /// team's Developer ID, and an Apple Development certificate that names the release team but
+    /// is not a Developer ID at all.
+    #[test]
+    fn a_build_that_is_not_the_releases_is_signed_down_the_ladder_as_before() {
+        for (build_signature, why) in [
+            (DEVELOPER_ID, "another team's Developer ID"),
+            (
+                RELEASE_TEAM_APPLE_DEVELOPMENT,
+                "the release team without the Developer ID markers",
+            ),
+            (AD_HOC, "an ad-hoc local build"),
+        ] {
+            let (_directory, pin, build, scratch) = a_pin_and_a_release_build();
+            let commander = RecordedCommander::new(&[
+                (
+                    format!("codesign -d --verbose=2 -r- {}", pin.display()).as_str(),
+                    recorded(DEVELOPER_ID),
+                ),
+                (
+                    format!("codesign -d --verbose=2 -r- {}", build.display()).as_str(),
+                    recorded(build_signature),
+                ),
+                (FIND_IDENTITY, recorded(TWO_IDENTITIES)),
+                ("security find-certificate", recorded_failure("not found")),
+                ("codesign -s ", recorded("")),
+                ("codesign -d --verbose=2 -r- ", recorded(DEVELOPER_ID)),
+                // only `--strict`: the release requirement is not recorded, so asking it fails,
+                // as it does on a Mac for every build the release did not sign
+                ("codesign --verify --strict", recorded("")),
+            ]);
+            let mut context = context(scratch.path());
+            context.refresh_from = Some(build);
+            let run = sign_pin(&commander, &pin, DoctorMode::default(), &context);
+
+            assert!(
+                commander.called_with("codesign -s "),
+                "{}: {:?}",
+                why,
+                commander.calls()
+            );
+            assert!(
+                !run.findings
+                    .iter()
+                    .any(|finding| finding.message.contains("nothing was signed here")),
+                "{}: {:?}",
+                why,
+                run.findings
+            );
+            assert_eq!(std::fs::read(&pin).unwrap(), b"the release build".to_vec());
+        }
     }
 }

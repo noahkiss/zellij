@@ -3076,7 +3076,9 @@ which is a symptom that surfaces later and somewhere else. Measured on a real Ma
 where the requirement a dry run had confirmed sixty seconds earlier was simply gone.
 
 So when the pin is **anchored** and out of date, the copy is handed to the signing step: it writes
-the new build into its own temp, signs THAT, verifies it, and renames only on success. A refusal
+the new build into its own temp, signs THAT, verifies it, and renames only on success. A new build
+that already carries the release's Developer ID is not signed again: the step copies it into the
+temp as it came, verifies it, and renames it the same way. A refusal
 leaves the previous signed pin exactly where it was — previous build, signature intact, grants
 intact — and says so. The deferral is decided by one function that both steps ask, because a
 disagreement in the "skip" direction would drop the refresh with nothing reporting it. A pin that is
@@ -3104,9 +3106,10 @@ overwrite an existing pin, and there is no parameter with which a caller can ask
 |---|---|
 | current, or ad-hoc, or unsigned | the plain copy, unchanged |
 | anchored and stale, signing works | refreshed and signed as one transaction (`PinOutcome::Signed`) |
+| anchored and stale, the new build is the release's own Developer ID | installed as it came, nothing signed (`PinOutcome::Signed`) — see [A release build is pinned with its own Developer ID](#a-release-build-is-pinned-with-its-own-developer-id-and-nothing-re-signs-it) |
 | anchored and stale, signing refuses | **nothing is written**; the existing pin's path is returned (`PinOutcome::Kept`) |
 
-The third row is the point. A locked keychain is every unattended launchd run, and there the session
+The last row is the point. A locked keychain is every unattended launchd run, and there the session
 comes up on the PREVIOUS build with its grants intact, and says so in the signing step's own words
 — quoted rather than summarised, so the line matches what `zellij session doctor` says next. An
 older build that can still read the files beats a newer one whose grants can only be given back
@@ -5440,6 +5443,68 @@ zellij-titled certificate that is not ours, doctor prints its name and hash besi
 certificate" line, so the reader is told they have the wrong certificate rather than none — the
 version of this that sent a real machine off to Xcode over a certificate that was never going to
 work.
+
+### A release build is pinned with its own Developer ID, and nothing re-signs it
+
+```
+Changed
+  signing   refreshed <pin> with the build's own Developer ID signature; nothing was signed here
+            identifier org.zellij.nkmk, team 2Z88BYP37C
+            designated => identifier "org.zellij.nkmk" and anchor apple generic and certificate 1[...
+            the release signed and notarized it, and it was copied into place unchanged,
+            so no certificate, keychain or password was needed on this machine
+```
+
+From nkmk.30. `release.yml` signs the macOS binary with the fork's Developer ID: team `2Z88BYP37C`,
+identifier `org.zellij.nkmk`, hardened runtime, timestamped, notarized. A candidate is signed the
+same way. Homebrew installs that binary byte for byte, so the keg binary already carries the
+signature. The pin refresh then threw it away. It re-signed the build with a local rung: Apple
+Development on one Mac, the minted certificate on another. Each rung wrote its own requirement and
+needed the login keychain, which is locked over SSH. So an upgrade asked for
+`ZELLIJ_KEYCHAIN_PASSWORD` to replace the best signature the ladder could have written.
+
+Now a refresh first asks whether the new build is the release's own:
+
+1. `verify_signature`, the same two-step check a freshly signed pin gets. The requirement must be
+   anchored, and the binary must satisfy it under `codesign --verify --strict`.
+2. The identifier must be `org.zellij.nkmk`, and `team_id_from_requirement` must read
+   `2Z88BYP37C`. A local build or another team's Developer ID stops here.
+3. `codesign --verify -R=<release_requirement()>`: Apple's Developer ID intermediate and leaf
+   markers, the identifier and the team. The markers tell a Developer ID from an Apple Development
+   certificate of the same team, which carries neither.
+
+A build that passes is copied into a temp beside the pin (the signing run's `.zellij.sign.` name, so
+the same sweep covers it). The copy is verified again, flushed, checked against a pin replaced
+meanwhile, and renamed into place. The stamp records the build. Nothing runs `codesign -s` or
+`security`, and no password is read. A copy or rename that fails leaves the previous pin in place
+and does not fall to the ladder, because the ladder would meet the same filesystem.
+
+Any other build goes down the ladder exactly as before: a local `cargo build`, a stock upstream
+binary, a source-formula build. An anchored pin with no refresh pending is still left alone.
+
+**The first release pin owes a re-grant, once.** The mini's pin is anchored on Apple Development
+under another team, and m1p's on our minted certificate (`certificate leaf = H"…"`). The release
+signature satisfies neither, so the switch is written to `signing/regrant-owed` through the nkmk.27
+machinery. Every doctor run then asks for the re-grant until `doctor --fix --regranted`. A second
+release over a pin already on the release requirement owes nothing and records nothing, and a
+record already owed stays as it was. An unsigned or ad-hoc pin owes nothing, as before.
+
+Every door into an anchored pin's refresh reaches this through the shared transaction.
+`session up`, `session enable` and the interactive launch's `pin_exe` refresh go through
+`install_pinned_exe` → `guard_anchored_pin` → `refresh_pin_through_signing` → `sign_pin`.
+`doctor --fix` hands the refresh to its signing check, which calls `sign_pin` directly. Their pin
+lines still say "refreshed and signed", because the outcome is `PinOutcome::Signed`; the signing
+finding says what happened. A pin that is not anchored gets the plain copy, as before, and a plain
+copy of a release build keeps its signature too.
+
+`zellij-utils/src/session_signing.rs` only. `install_signed_build` and
+`build_carries_our_developer_id` sit beside the ladder, and the grants tail of `perform_signing`
+moved unchanged into `settle_the_grants` so both paths write the record the same way. Four
+`sign_pin` tests, all on a machine with no keychain: a release build is pinned with no `codesign -s`
+and no `security` call; the first release over another team's pin records the re-grant once and a
+later run still asks; a release over a pin on the release requirement records nothing; and another
+team's Developer ID, an Apple Development certificate of the release team, and an ad-hoc build all
+still go down the ladder.
 
 ### `connect_to_server` gives up on a session that answers to no server
 
