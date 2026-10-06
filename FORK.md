@@ -8208,7 +8208,8 @@ proved on a Mac carries the real signature. The secrets live in the Actions envi
 whose policy admits `v*` tags only: `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`, `ASC_KEY_P8`,
 `ASC_KEY_ID` and `ASC_ISSUER_ID`. Only the macOS leg enters that environment, and only its signing
 steps read them. From nkmk.30, a pin refresh installs a build that already carries this signature
-as-is, with no local re-signing, so TCC grants hold across releases.
+as-is, with no local re-signing. After the one re-grant each Mac owes at the switch, TCC grants hold
+across releases.
 
 **`Rust` runs on the branch, not only on main.** Its push trigger lists the conventional-commit
 prefixes this fork names branches after — `feat/`, `fix/`, `ci/`, `chore/`, `docs/`, `perf/`,
