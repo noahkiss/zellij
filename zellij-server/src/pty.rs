@@ -7,7 +7,7 @@ use crate::terminal_bytes::TerminalBytes;
 use crate::{
     panes::PaneId,
     plugins::{DumpSessionLayoutResponse, PluginId, PluginInstruction},
-    resurrect_hints::{claude_session_record, claude_sessions_dir, ProcessTree},
+    resurrect_hints::{claude_sessions_dir, open_files_of, process_env, LiveSession, ProcessTree},
     screen::{ScreenInstruction, TabOverrideResult},
     session_layout_metadata::SessionLayoutMetadata,
     thread_bus::{Bus, ThreadSenders},
@@ -16,7 +16,7 @@ use crate::{
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 use tokio::task::JoinHandle;
 use zellij_utils::agent_detect::{self, AgentHarness};
@@ -237,8 +237,8 @@ const AGENT_ENV_RETRY_TICKS: u32 = 30;
 /// The harness whose live session is read from its own record rather than its environment.
 const CLAUDE: &str = "claude";
 
-/// The key claude's live session is filed under among a pane's identity variables: the first one
-/// `agent_detect` asks for, so detection takes it over anything the environment said.
+/// The key a harness's own live session is filed under among a pane's identity variables: the
+/// first one `agent_detect` asks for, so detection takes it over anything the environment said.
 fn claude_identity_key(harness: &AgentHarness) -> String {
     harness
         .identity_env
@@ -263,13 +263,14 @@ struct AgentEnvProbe {
     found: bool,
     /// Ticks since the walk, counted only while `found` is false.
     ticks_since_probe: u32,
-    /// The claude process whose session record answered the walk, if one did.
+    /// Where the walk found the pane's own session, if it did: claude's record, or the rollout
+    /// file a codex holds open.
     ///
-    /// Claude moves to another session on `/clear` without becoming another process, so the
-    /// walk's answer goes stale while the pid stays the same. This record is re-read every tick
-    /// instead - one small file, not a walk - and a record that is gone sends the pane back to
-    /// the walk.
-    claude_record_pid: Option<u32>,
+    /// An agent moves to another session on `/clear` or `/new` without becoming another process,
+    /// so the walk's answer goes stale while the pid stays the same. This is re-read every tick
+    /// instead - one small file or one process's fd list, not a walk - and one that is gone sends
+    /// the pane back to the walk.
+    live_session: Option<LiveSession>,
 }
 
 impl AgentEnvProbe {
@@ -281,10 +282,10 @@ impl AgentEnvProbe {
             || (!self.found && self.ticks_since_probe >= AGENT_ENV_RETRY_TICKS)
     }
 
-    /// The session the claude this walk found holds now, re-read from its record. `None` when
-    /// the walk found no claude record, or that claude has since exited.
-    fn live_claude_session(&self, sessions_dir: Option<&Path>) -> Option<String> {
-        claude_session_record(sessions_dir?, self.claude_record_pid?)
+    /// The session the agent this walk found holds now, re-read from where the walk found it.
+    /// `None` when the walk found none, or that agent has since exited or moved on.
+    fn live_session_id(&self) -> Option<String> {
+        self.live_session.as_ref()?.reread(open_files_of)
     }
 }
 
@@ -311,6 +312,9 @@ pub struct PaneProcessInfo {
     /// and these were never asked for by the `report_pane_env` allowlist that governs it; this map
     /// goes no further than the CLI-only pane list.
     pub agent_env: BTreeMap<String, String>,
+    /// Where the harness's own session id in `agent_env` was found, when the pty found it itself:
+    /// `record` or `open-file`. `None` when the id, if any, came from the environment.
+    pub agent_session_source: Option<String>,
 }
 
 pub(crate) struct Pty {
@@ -342,6 +346,9 @@ pub(crate) struct Pty {
     /// terminal_id -> when that pane was last walked for an identity, and what came of it. This is
     /// what keeps the walk off the tick for a pane whose answer is already known.
     agent_env_probes: HashMap<u32, AgentEnvProbe>,
+    /// terminal_id -> why the last serialization found no session id for that agent pane. Kept so
+    /// the reason is logged when it changes, not every serialization.
+    resume_misses: HashMap<u32, String>,
     plugin_cwds: HashMap<u32, PathBuf>,   // plugin_id -> cwd
     terminal_cwds: HashMap<u32, PathBuf>, // terminal_id -> cwd
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1129,6 +1136,7 @@ impl Pty {
             detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
             terminal_agent_envs: HashMap::new(),
             agent_env_probes: HashMap::new(),
+            resume_misses: HashMap::new(),
             last_reported_detect_agents: None,
             last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
@@ -2376,7 +2384,7 @@ impl Pty {
     /// the live id replaces whatever the hint read from a stale environment. The agents-only
     /// filter runs last, on the commands the first two produced.
     fn apply_resurrect_command_hints(
-        &self,
+        &mut self,
         session_layout_metadata: &mut SessionLayoutMetadata,
         panes: &[(u32, u32)],
     ) {
@@ -2398,16 +2406,51 @@ impl Pty {
                     .and_then(|pid| process_tree.find_env(*pid, var))
             });
         }
-        let hints_name_claude = hints.map_or(false, |hints| hints.hint_for("claude").is_some());
-        if agents_only || hints_name_claude {
-            if let Some(sessions_dir) = claude_sessions_dir() {
-                session_layout_metadata.pin_live_claude_sessions(|terminal_id| {
-                    terminal_ids_to_pids
-                        .get(&terminal_id)
-                        .and_then(|pid| process_tree.claude_live_session_id(*pid, &sessions_dir))
-                });
+        // every known agent is pinned to the session it holds now, when either setting asks
+        // for it; one with no session found is left as the hints recorded it, and the
+        // agents-only pass below then gives it its picker - never its newest session
+        let claude_dir = claude_sessions_dir();
+        let mut misses: HashMap<u32, String> = HashMap::new();
+        session_layout_metadata.pin_live_agent_sessions(|terminal_id, kind, command| {
+            let hinted = hints.map_or(false, |hints| hints.hint_for(command).is_some());
+            if !(agents_only || hinted) {
+                return None;
+            }
+            let pid = terminal_ids_to_pids.get(&terminal_id)?;
+            match process_tree.own_session(
+                *pid,
+                kind,
+                claude_dir.as_deref(),
+                open_files_of,
+                process_env,
+            ) {
+                Ok(own) => {
+                    log::debug!(
+                        "resurrect: terminal {} records {}'s session {} (session_source: {})",
+                        terminal_id,
+                        kind,
+                        own.id,
+                        own.live.source().as_str()
+                    );
+                    Some(own.id)
+                },
+                Err(miss) => {
+                    misses.insert(terminal_id, format!("{} ({})", miss, kind));
+                    None
+                },
+            }
+        });
+        for (terminal_id, miss) in &misses {
+            if self.resume_misses.get(terminal_id) != Some(miss) {
+                log::warn!(
+                    "resurrect: terminal {} has no session id: {}; it is recorded with the \
+                     session its argv picked, or its picker (session_source: picker-fallback)",
+                    terminal_id,
+                    miss
+                );
             }
         }
+        self.resume_misses = misses;
         if agents_only {
             session_layout_metadata.keep_only_agent_commands(hints);
         }
@@ -2554,17 +2597,17 @@ impl Pty {
             if let Some(probe) = self.agent_env_probes.get_mut(terminal_id) {
                 if !probe.needs_another_walk(*child_pid) {
                     probe.ticks_since_probe = probe.ticks_since_probe.saturating_add(1);
-                    if probe.claude_record_pid.is_none() {
+                    if probe.live_session.is_none() {
                         continue;
                     }
-                    if let Some(session_id) = probe.live_claude_session(sessions_dir.as_deref()) {
+                    if let Some(session_id) = probe.live_session_id() {
                         self.terminal_agent_envs
                             .entry(*terminal_id)
                             .or_default()
                             .insert(claude_identity_key(harness), session_id);
                         continue;
                     }
-                    // that claude has exited: whatever the pane runs now is a new question
+                    // that agent has exited or moved on: what the pane runs now is a new question
                 }
             }
             to_probe.push((*terminal_id, *child_pid, *harness));
@@ -2590,23 +2633,38 @@ impl Pty {
         for (terminal_id, child_pid, harness) in to_probe {
             let identity_vars = agent_detect::identity_env_names_for(harness);
             let mut found = process_tree.find_all_envs(child_pid, &identity_vars);
-            // claude's variable is frozen in each child at its spawn, so after a `/clear` it
-            // names the first session; claude's own record names the one it holds now, and wins
-            let live_session = sessions_dir
-                .as_deref()
-                .filter(|_| harness.kind == CLAUDE)
-                .and_then(|dir| process_tree.claude_live_session(child_pid, dir));
-            let claude_record_pid = live_session.map(|(record_pid, session_id)| {
-                found.insert(claude_identity_key(harness), session_id);
-                record_pid
-            });
+            // an identity variable is frozen in each child at its spawn, so after a `/clear` it
+            // names the first session; the agent's own record or open session file names the one
+            // it holds now, and wins
+            let live_session = match process_tree.own_session(
+                child_pid,
+                harness.kind,
+                sessions_dir.as_deref(),
+                open_files_of,
+                process_env,
+            ) {
+                Ok(own) => {
+                    found.insert(claude_identity_key(harness), own.id);
+                    Some(own.live)
+                },
+                Err(miss) => {
+                    log::debug!(
+                        "agents: no {} session for terminal {} (pid {}): {}",
+                        harness.kind,
+                        terminal_id,
+                        child_pid,
+                        miss
+                    );
+                    None
+                },
+            };
             self.agent_env_probes.insert(
                 terminal_id,
                 AgentEnvProbe {
                     child_pid,
                     found: !found.is_empty(),
                     ticks_since_probe: 0,
-                    claude_record_pid,
+                    live_session,
                 },
             );
             if found.is_empty() {
@@ -2662,6 +2720,11 @@ impl Pty {
                             .get(&terminal_id)
                             .cloned()
                             .unwrap_or_default(),
+                        agent_session_source: self
+                            .agent_env_probes
+                            .get(&terminal_id)
+                            .and_then(|probe| probe.live_session.as_ref())
+                            .map(|live| live.source().as_str().to_owned()),
                     },
                 )
             })

@@ -5973,12 +5973,15 @@ impl Screen {
         // it produces output and a harness that has printed nothing has no live argv to match.
         // `list-agents` re-asks which of the two answered, to fill its COMMAND column, so the rule
         // lives in one place rather than in two that could disagree
+        // and where its session id came from - the pty's own find, the environment, the argv - or
+        // that nothing named it and a restore would offer the agent's picker
+        let live_source = process_info.and_then(|info| info.agent_session_source.as_deref());
         agent_detect::detect_in_pane(
             pane_info.pane_command.as_deref(),
             pane_info.terminal_command.as_deref(),
             &agent_env,
         )
-        .map(|(agent, _command)| agent)
+        .map(|(agent, command)| agent_detect::with_session_source(agent, live_source, command))
     }
 
     /// Gives a live pane the handle its creator chose for it.

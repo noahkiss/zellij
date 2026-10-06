@@ -932,7 +932,7 @@ fn a_pane_whose_identity_is_known_is_never_walked_again() {
         child_pid: 42,
         found: true,
         ticks_since_probe: 10_000,
-        claude_record_pid: None,
+        live_session: None,
     };
     assert!(!probe.needs_another_walk(42));
 }
@@ -945,7 +945,7 @@ fn a_new_process_in_the_pane_is_a_new_question() {
         child_pid: 42,
         found: true,
         ticks_since_probe: 0,
-        claude_record_pid: None,
+        live_session: None,
     };
     assert!(probe.needs_another_walk(43));
 }
@@ -956,7 +956,7 @@ fn a_pane_with_no_identity_yet_is_retried_but_not_every_tick() {
         child_pid: 42,
         found: false,
         ticks_since_probe: 0,
-        claude_record_pid: None,
+        live_session: None,
     };
     assert!(!probe.needs_another_walk(42));
     probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS - 1;
@@ -1131,31 +1131,28 @@ fn a_known_claude_follows_its_session_without_another_walk() {
         child_pid: 42,
         found: true,
         ticks_since_probe: 0,
-        claude_record_pid: Some(77),
+        live_session: Some(LiveSession::ClaudeRecord {
+            pid: 77,
+            dir: dir.path().to_path_buf(),
+        }),
     };
     assert!(!probe.needs_another_walk(42));
-    assert_eq!(
-        probe.live_claude_session(Some(dir.path())).as_deref(),
-        Some("first-session")
-    );
+    assert_eq!(probe.live_session_id().as_deref(), Some("first-session"));
     write_claude_record(dir.path(), 77, "second-session");
-    assert_eq!(
-        probe.live_claude_session(Some(dir.path())).as_deref(),
-        Some("second-session")
-    );
+    assert_eq!(probe.live_session_id().as_deref(), Some("second-session"));
     std::fs::remove_file(dir.path().join("77.json")).unwrap();
-    assert_eq!(probe.live_claude_session(Some(dir.path())), None);
+    assert_eq!(probe.live_session_id(), None);
 }
 
 #[test]
-fn a_pane_with_no_claude_record_reads_none() {
+fn a_pane_with_no_live_session_reads_none() {
     let dir = tempfile::tempdir().unwrap();
     write_claude_record(dir.path(), 77, "first-session");
     let probe = AgentEnvProbe {
         child_pid: 42,
         found: true,
         ticks_since_probe: 0,
-        claude_record_pid: None,
+        live_session: None,
     };
-    assert_eq!(probe.live_claude_session(Some(dir.path())), None);
+    assert_eq!(probe.live_session_id(), None);
 }

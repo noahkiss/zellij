@@ -92,6 +92,12 @@ pub struct PaneAgent {
     /// A reader that needs to know whether `agent_id: null` means "not exported" or "not looked
     /// for" reads this rather than guessing.
     pub source: String,
+    /// Where `agent_id` came from, from nkmk.31: `record` (claude's own session record),
+    /// `open-file` (the session file codex holds open), `env` (an identity variable), `argv` (the
+    /// id the agent was started with), or `picker-fallback` when nothing named the session and a
+    /// restored pane would open the agent's picker. See [`with_session_source`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_source: Option<String>,
 }
 
 /// The harness a recorded command belongs to, or `None` for a command that is not one.
@@ -144,7 +150,42 @@ pub fn detect(command: &[String], env: &BTreeMap<String, String>) -> Option<Pane
         kind: harness.kind.to_owned(),
         agent_id,
         source: source.to_owned(),
+        session_source: None,
     })
+}
+
+/// `agent` with [`PaneAgent::session_source`] filled in, and `agent_id` taken from the argv when
+/// nothing else named the session.
+///
+/// `live_source` is what the pty tick said about the id it found - `record` or `open-file` - and
+/// is believed only when an id was found. An id with no such word came from an identity variable.
+/// With no id at all, the command line that answered is asked: `--resume <id>` names the session
+/// the agent was started on. Failing that the pane is `picker-fallback`, which is what a restore
+/// would record for it.
+pub fn with_session_source(
+    mut agent: PaneAgent,
+    live_source: Option<&str>,
+    command_line: &str,
+) -> PaneAgent {
+    use crate::resurrect_command_hints::{argv_session_id, SessionSource};
+    let source = if agent.agent_id.is_some() {
+        live_source
+            .map(|source| source.to_owned())
+            .unwrap_or_else(|| SessionSource::Env.as_str().to_owned())
+    } else {
+        let mut words = command_line.split_whitespace().map(|word| word.to_owned());
+        let argv0 = words.next().unwrap_or_default();
+        let args: Vec<String> = words.collect();
+        match argv_session_id(&argv0, &args) {
+            Some(id) => {
+                agent.agent_id = Some(id);
+                SessionSource::Argv.as_str().to_owned()
+            },
+            None => SessionSource::PickerFallback.as_str().to_owned(),
+        }
+    };
+    agent.session_source = Some(source);
+    agent
 }
 
 /// The agent running in a pane, from the command line the pane was STARTED with.
@@ -510,5 +551,66 @@ mod tests {
                 seen.push(command);
             }
         }
+    }
+
+    #[test]
+    fn a_found_id_keeps_the_source_the_tick_named() {
+        let agent = detect(
+            &argv(&["claude"]),
+            &env(&[("CLAUDE_CODE_SESSION_ID", "from-record")]),
+        )
+        .unwrap();
+        let agent = with_session_source(agent, Some("record"), "claude");
+        assert_eq!(agent.agent_id.as_deref(), Some("from-record"));
+        assert_eq!(agent.session_source.as_deref(), Some("record"));
+    }
+
+    #[test]
+    fn an_id_with_no_named_source_came_from_the_environment() {
+        let agent = detect(&argv(&["pi"]), &env(&[("PI_SESSION_ID", "p-1")])).unwrap();
+        let agent = with_session_source(agent, None, "pi");
+        assert_eq!(agent.session_source.as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn with_no_live_id_the_argv_names_the_session() {
+        let agent = detect(&argv(&["claude"]), &BTreeMap::new()).unwrap();
+        let agent = with_session_source(agent, None, "claude --resume abc --model m");
+        assert_eq!(agent.agent_id.as_deref(), Some("abc"));
+        assert_eq!(agent.session_source.as_deref(), Some("argv"));
+    }
+
+    #[test]
+    fn with_nothing_naming_the_session_the_pane_falls_back_to_the_picker() {
+        for line in [
+            "claude --resume",
+            "claude --continue",
+            "codex",
+            "codex resume --last",
+        ] {
+            let argv0 = line.split_whitespace().next().unwrap();
+            let agent = detect(&argv(&[argv0]), &BTreeMap::new()).unwrap();
+            let agent = with_session_source(agent, Some("record"), line);
+            assert_eq!(agent.agent_id, None, "{}", line);
+            assert_eq!(
+                agent.session_source.as_deref(),
+                Some("picker-fallback"),
+                "{}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn a_pane_agent_without_a_session_source_omits_the_key() {
+        let agent = detect(&argv(&["claude"]), &BTreeMap::new()).unwrap();
+        let json = serde_json::to_string(&agent).unwrap();
+        assert!(!json.contains("session_source"), "{}", json);
+        let json = serde_json::to_string(&with_session_source(agent, None, "claude")).unwrap();
+        assert!(
+            json.contains(r#""session_source":"picker-fallback""#),
+            "{}",
+            json
+        );
     }
 }

@@ -3703,6 +3703,12 @@ one. And for `claude`, the id no longer comes from the variable when Claude Code
 record is there. Both are in [A restored session offers to resume its agents, and only its
 agents](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents).
 
+From nkmk.31, every known agent is pinned to its own session the same way, not only `claude`, and
+an agent with no session found is never recorded with `--continue` or `resume --last`. See the
+nkmk.31 paragraphs in that entry. A configured hint still appends what it says; the shipped
+`claude` hint's `--continue` is replaced by the record's `--resume <id>` whenever the record is
+there.
+
 Best-effort throughout: no hint, no variable, or no platform each record the command unchanged, at
 debug log level. Nothing here can fail a serialization.
 
@@ -3786,6 +3792,46 @@ A value that may be left out (`--resume`) is taken only when the next word is no
 named a session, and it resumes the newest session in the pane's directory, where the restored
 pane starts. `codex resume` takes the same options as `codex`, so the observed flags still apply;
 a codex started with a prompt on its command line is not verified.
+
+**From nkmk.31, each pane resumes its own session, and never the newest.** The newest-session
+resume was wrong whenever two agent panes shared a directory: both came back holding whichever
+session was newest. Operator report of 2026-10-06. Every known agent is now pinned to the session
+its own process holds, in that agent's own form, and the fallback is the agent's picker:
+
+| agent | own session found from | recorded with an id | recorded with no id |
+|---|---|---|---|
+| `claude` | `sessions/<pid>.json` (`record`) | `--resume <id>` | `--resume`, which opens the picker |
+| `codex` | the `rollout-*-<uuid>.jsonl` it holds open (`open-file`) | `resume <id>`, after argv0 | `resume`, which opens the picker |
+| `opencode` | nothing | `--session <id>` | the bare command: it has no picker flag |
+| `pi` | nothing | `--session <id>` | `--resume`, which opens the picker |
+
+The pid rule: walk breadth first from the pane's own child and take the NEAREST process that
+answers. A shell pane's agent is the shell's child, a command pane's agent is the pane's own
+process, an npm wrapper puts the native `codex` one level down, and a subagent sits deeper.
+
+- **claude**: the server's own config directory first. Then each process under the pane is asked
+  for its own `CLAUDE_CONFIG_DIR` or `HOME`, because a launcher-started server never sees what a
+  pane's rc file exports. On Linux a record whose `procStart` is not the live process's start time
+  (field 22 of `/proc/<pid>/stat`) is a crashed claude's record on a reused pid, and is ignored.
+- **codex**: the open files of each process under the pane. Linux reads `/proc/<pid>/fd`; macOS asks
+  libproc (`PROC_PIDLISTFDS`, then `PROC_PIDFDVNODEPATHINFO` per vnode), the calls `lsof` is built
+  on, in-process: no subprocess, no half-second `lsof` start-up, no privacy prompt for a process of
+  the same user. codex creates the file on the first message, so a codex nobody has talked to yet
+  has no session to resume and gets the picker.
+- **opencode, pi**: no per-process handle exists. opencode keeps every session in one shared
+  sqlite database; pi appends with a call that closes the file at once, and exports
+  `PI_SESSION_ID` only to its bash-tool children while a tool runs. Both get their picker unless
+  an identity variable or a configured hint names the session.
+
+An argv that already picks a session is still kept as run when nothing better is found: the
+operator's own `claude --resume` (a picker) or `claude --continue`. The bare `--resume` of the
+report came from exactly that: the operator's shell abbreviations run `claude --resume` and
+`claude --continue`, and nkmk.27 recorded them verbatim.
+
+A miss is logged at `warn` once per pane, when its reason changes, with the pid, the agent and the
+reason, so the server log answers "why did this pane come back with a picker". The serialized
+layout carries the id in the pane's arguments and no new key: the layout parser rejects a pane
+property it does not know, so a key here would make a nkmk.31 snapshot unrestorable on a rollback.
 
 **Why non-agents came back.** On a pane whose foreground process group is the shell's own,
 discovery records the shell's NEWEST CHILD ([the job-control fallback
@@ -4712,6 +4758,14 @@ again.
 
 `agent_id` is a field of the CLI-only `PaneListEntry` and `AgentListEntry`. Only its value
 changes: no protobuf tag, no plugin API, no client/server contract.
+
+From nkmk.31, the same walk finds codex's session from the rollout file it holds open, and every
+agent row in `list-agents --json` carries `session_source`: `record`, `open-file`, `env`, `argv`
+(the id the agent was started with, when nothing live named one), or `picker-fallback` (nothing
+named the session, and a restore would offer the agent's picker). The codex handle is re-read
+every tick like claude's record, so a `/new` is seen without a new process. `session_source` is a
+new field on the CLI-only `PaneAgent`, omitted when unset: still no protobuf tag, no plugin API,
+no client/server contract. The table keeps its columns.
 
 ### `zellij mcp`: the CLI served over the Model Context Protocol
 

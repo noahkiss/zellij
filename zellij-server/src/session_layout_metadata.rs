@@ -14,8 +14,7 @@ use zellij_utils::{
     input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
     input::plugins::PluginAliases,
     resurrect_command_hints::{
-        builtin_resume_args, claude_args_for_live_session, is_resurrectable_agent,
-        ResurrectCommandHints,
+        args_for_session, builtin_resume_args, is_resurrectable_agent, ResurrectCommandHints,
     },
     session_serialization::{
         extract_command_and_args, extract_edit_and_line_number, extract_plugin_and_config,
@@ -674,15 +673,17 @@ impl SessionLayoutMetadata {
             }
         }
     }
-    /// Records every claude pane with `--resume` and the session its claude process holds NOW,
-    /// in place of whatever session its argv named.
+    /// Records every agent pane with the session its agent process holds NOW, in place of
+    /// whatever session its argv named: `claude --resume <id>`, `codex resume <id>`,
+    /// `opencode --session <id>`, `pi --session <id>`.
     ///
-    /// `live_session_id` is the seam over the platform: handed a terminal id, it returns the
-    /// session the claude in that pane holds, or `None`. A pane it has no answer for is left as
-    /// the hints recorded it. It runs AFTER the hints, so the live session is the one that stays.
-    pub fn pin_live_claude_sessions<F>(&mut self, mut live_session_id: F)
+    /// `live_session_id` is the seam over the platform: handed a terminal id, the harness kind and
+    /// the recorded command, it returns the session the agent in that pane holds, or `None`. A
+    /// pane it has no answer for is left as the hints recorded it. It runs AFTER the hints, so the
+    /// live session is the one that stays.
+    pub fn pin_live_agent_sessions<F>(&mut self, mut live_session_id: F)
     where
-        F: FnMut(u32) -> Option<String>,
+        F: FnMut(u32, &str, &str) -> Option<String>,
     {
         for tab in self.tabs.iter_mut() {
             for pane in tab
@@ -696,18 +697,21 @@ impl SessionLayoutMetadata {
                 let Some(Run::Command(run_command)) = pane.run.as_mut() else {
                     continue;
                 };
-                let is_claude = harness_for_command(&run_command.command.display().to_string())
-                    .map_or(false, |harness| harness.kind == "claude");
-                if !is_claude {
-                    continue;
-                }
-                let Some(session_id) = live_session_id(terminal_id) else {
+                let command = run_command.command.display().to_string();
+                let Some(harness) = harness_for_command(&command) else {
                     continue;
                 };
-                run_command.args = claude_args_for_live_session(&run_command.args, &session_id);
+                let Some(session_id) = live_session_id(terminal_id, harness.kind, &command) else {
+                    continue;
+                };
+                let Some(args) = args_for_session(&command, &run_command.args, &session_id) else {
+                    continue;
+                };
+                run_command.args = args;
                 log::debug!(
-                    "resurrect: terminal {} records claude's live session {}",
+                    "resurrect: terminal {} records {}'s live session {}",
                     terminal_id,
+                    harness.kind,
                     session_id
                 );
             }
@@ -2100,19 +2104,79 @@ mod tests {
             command_line(&meta, 0),
             Some((
                 "claude".to_owned(),
-                owned(&["--dangerously-skip-permissions", "--continue"])
+                owned(&["--dangerously-skip-permissions", "--resume"])
             ))
         );
         assert_eq!(command_line(&meta, 1), None);
         assert_eq!(command_line(&meta, 2), None);
         assert_eq!(
             command_line(&meta, 3),
-            Some((
-                "/opt/bin/codex".to_owned(),
-                owned(&["resume", "--last", "-m", "o3"])
-            ))
+            Some(("/opt/bin/codex".to_owned(), owned(&["resume", "-m", "o3"])))
         );
         assert_eq!(command_line(&meta, 4), None);
+    }
+
+    /// The operator's report of 2026-10-06: several panes in one directory all resumed the same
+    /// session, because each was recorded with the agent's "newest session" flag. Each agent pane
+    /// is recorded with the session its own process holds, in that agent's own form.
+    #[test]
+    fn every_agent_pane_records_its_own_session_in_its_own_form() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(
+                1,
+                "claude",
+                vec!["--dangerously-skip-permissions", "--resume"],
+            ),
+            make_command_pane(2, "/opt/bin/codex", vec!["-m", "o3"]),
+            make_command_pane(3, "opencode", vec!["--continue"]),
+            make_command_pane(4, "pi", vec![]),
+            make_command_pane(5, "htop", vec![]),
+        ]);
+        let mut asked = Vec::new();
+        meta.pin_live_agent_sessions(|terminal_id, kind, _command| {
+            asked.push(kind.to_owned());
+            Some(format!("{}-{}", kind, terminal_id))
+        });
+        meta.keep_only_agent_commands(None);
+        assert_eq!(asked, owned(&["claude", "codex", "opencode", "pi"]));
+        assert_eq!(
+            command_line(&meta, 0).unwrap().1,
+            owned(&["--dangerously-skip-permissions", "--resume", "claude-1"])
+        );
+        assert_eq!(
+            command_line(&meta, 1).unwrap().1,
+            owned(&["resume", "codex-2", "-m", "o3"])
+        );
+        assert_eq!(
+            command_line(&meta, 2).unwrap().1,
+            owned(&["--session", "opencode-3"])
+        );
+        assert_eq!(
+            command_line(&meta, 3).unwrap().1,
+            owned(&["--session", "pi-4"])
+        );
+        assert_eq!(command_line(&meta, 4), None);
+    }
+
+    /// With no session found, no agent pane is recorded with a "newest session" flag: it gets
+    /// its picker, or keeps what the operator's own argv picked.
+    #[test]
+    fn with_no_session_found_no_agent_is_recorded_resuming_its_newest_session() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "claude", vec!["--dangerously-skip-permissions"]),
+            make_command_pane(2, "codex", vec![]),
+            make_command_pane(3, "opencode", vec![]),
+            make_command_pane(4, "pi", vec![]),
+        ]);
+        meta.pin_live_agent_sessions(|_, _, _| None);
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0).unwrap().1,
+            owned(&["--dangerously-skip-permissions", "--resume"])
+        );
+        assert_eq!(command_line(&meta, 1).unwrap().1, owned(&["resume"]));
+        assert_eq!(command_line(&meta, 2).unwrap().1, Vec::<String>::new());
+        assert_eq!(command_line(&meta, 3).unwrap().1, owned(&["--resume"]));
     }
 
     #[test]
@@ -2139,7 +2203,7 @@ mod tests {
             make_command_pane(1, "claude", vec!["--resume", "first"]),
             make_command_pane(2, "htop", vec![]),
         ]);
-        meta.pin_live_claude_sessions(|_| Some("live".to_owned()));
+        meta.pin_live_agent_sessions(|_, _, _| Some("live".to_owned()));
         assert_eq!(
             command_line(&meta, 0),
             Some(("claude".to_owned(), owned(&["--resume", "live"])))
@@ -2156,7 +2220,7 @@ mod tests {
             &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
             env_always(Some("first")),
         );
-        meta.pin_live_claude_sessions(|_| Some("live".to_owned()));
+        meta.pin_live_agent_sessions(|_, _, _| Some("live".to_owned()));
         meta.keep_only_agent_commands(None);
         assert_eq!(
             command_line(&meta, 0),
@@ -2167,7 +2231,7 @@ mod tests {
     #[test]
     fn no_live_session_leaves_the_claude_pane_alone() {
         let mut meta = session_with_panes(vec![make_command_pane(1, "claude", vec!["-c"])]);
-        meta.pin_live_claude_sessions(|_| None);
+        meta.pin_live_agent_sessions(|_, _, _| None);
         assert_eq!(
             command_line(&meta, 0),
             Some(("claude".to_owned(), owned(&["-c"])))
@@ -2220,7 +2284,7 @@ mod tests {
             &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
             env_always(Some("first")),
         );
-        meta.pin_live_claude_sessions(|_| Some("second".to_owned()));
+        meta.pin_live_agent_sessions(|_, _, _| Some("second".to_owned()));
         meta.keep_only_agent_commands(None);
         assert_eq!(
             command_line(&meta, 0),

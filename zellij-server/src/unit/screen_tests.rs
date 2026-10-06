@@ -16189,6 +16189,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
             command: Some(vec!["claude".to_owned(), "--resume".to_owned()]),
             env: Default::default(),
             agent_env: Default::default(),
+            agent_session_source: None,
         },
     );
     let _ = mock_screen
@@ -16308,21 +16309,29 @@ pub fn an_osc_title_change_reports_a_pane_update() {
 /// The whole point of the pair below is the `detect_agents` argument, so the setup is shared and
 /// only that value differs between them.
 fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
-    let size = Size { cols: 80, rows: 10 };
-    let mut mock_screen = MockScreen::new(size);
-    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
-
-    let mut process_info = HashMap::new();
-    process_info.insert(
-        1,
+    pane_list_for_an_agent_pane(
+        detect_agents,
         crate::pty::PaneProcessInfo {
             pid: Some(90210),
             cwd: None,
             command: Some(vec!["claude".to_owned()]),
             env: Default::default(),
             agent_env: Default::default(),
+            agent_session_source: None,
         },
-    );
+    )
+}
+
+fn pane_list_for_an_agent_pane(
+    detect_agents: bool,
+    pane_process_info: crate::pty::PaneProcessInfo,
+) -> ListPanesResponse {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+
+    let mut process_info = HashMap::new();
+    process_info.insert(1, pane_process_info);
     let _ = mock_screen
         .to_screen
         .send(ScreenInstruction::UpdatePaneProcessInfo {
@@ -16354,6 +16363,45 @@ pub fn a_pane_running_a_harness_is_reported_as_an_agent() {
         .expect("a pane running claude is an agent");
     assert_eq!(agent.kind, "claude");
     assert_eq!(agent.source, "command");
+    // nothing named its session, so a restore would offer claude's picker, and the row says so
+    assert_eq!(agent.agent_id, None);
+    assert_eq!(agent.session_source.as_deref(), Some("picker-fallback"));
+}
+
+/// `list-agents --json` names the session a codex holds open, and says where that came from.
+#[test]
+pub fn an_agent_row_says_where_its_session_id_came_from() {
+    let pane_list = pane_list_for_an_agent_pane(
+        true,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: None,
+            command: Some(vec![
+                "codex".to_owned(),
+                "resume".to_owned(),
+                "--last".to_owned(),
+            ]),
+            env: Default::default(),
+            agent_env: [(
+                "CODEX_SESSION_ID".to_owned(),
+                "01a112dd-5b0e-7db3-964b-68a8a71304b1".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            agent_session_source: Some("open-file".to_owned()),
+        },
+    );
+    let agent = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .and_then(|entry| entry.agent.as_ref())
+        .expect("a pane running codex is an agent");
+    assert_eq!(agent.kind, "codex");
+    assert_eq!(
+        agent.agent_id.as_deref(),
+        Some("01a112dd-5b0e-7db3-964b-68a8a71304b1")
+    );
+    assert_eq!(agent.session_source.as_deref(), Some("open-file"));
 }
 
 #[test]
@@ -16659,6 +16707,7 @@ pub fn pane_info_carries_the_allowlisted_environment() {
                 .into_iter()
                 .collect(),
             agent_env: Default::default(),
+            agent_session_source: None,
         },
     );
     let _ = mock_screen
