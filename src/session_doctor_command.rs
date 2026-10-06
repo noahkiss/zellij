@@ -127,18 +127,40 @@ fn check_path(report: &mut Report) {
                 "path",
                 format!("{} leads to this binary", first.display()),
             )),
-        Some(first) => report.push(
-            Finding::needs_you(
-                "path",
-                format!("{} is a DIFFERENT build from this one", first.display()),
-            )
-            .note(format!("this binary: {}", resolved.display()))
-            .note(
-                "a `zellij` typed in a shell runs the first one, so the two disagree about the \
-                 same session",
-            ),
-        ),
+        Some(first) => report.push(another_file_first_on_path(&first, &resolved)),
     }
+}
+
+/// The path finding when the first `zellij` on PATH is a different FILE from this binary.
+///
+/// A different file is not yet a different build: the pin is a copy of the package's binary, so
+/// doctor run from the pin finds the package's file first. The build is compared the way the pin
+/// check compares it, and only a build that differs, or cannot be told apart, is reported as one.
+fn another_file_first_on_path(first: &Path, resolved: &Path) -> Finding {
+    use zellij_utils::session_lifecycle::{compare_builds, identify_executable, BuildMatch};
+
+    let ours = identify_executable(resolved.to_path_buf());
+    let theirs = identify_executable(first.to_path_buf());
+    if compare_builds(Some(&ours), Some(&theirs)) == BuildMatch::Same {
+        return Finding::ok(
+            "path",
+            format!("{} is the same build as this binary", first.display()),
+        )
+        .note(format!(
+            "two copies of one build: {} and {}",
+            first.display(),
+            resolved.display()
+        ));
+    }
+    Finding::needs_you(
+        "path",
+        format!("{} is a DIFFERENT build from this one", first.display()),
+    )
+    .note(format!("this binary: {}", resolved.display()))
+    .note(
+        "a `zellij` typed in a shell runs the first one, so the two disagree about the \
+         same session",
+    )
 }
 
 /// Whether the config this binary would load actually loads.
@@ -1041,6 +1063,48 @@ mod tests {
             finding
         );
         assert!(is_the_pin(&pin, &pin));
+    }
+
+    /// Doctor run from the pin finds the package's binary first on PATH. That is another file
+    /// holding the same build, and the path check must not call it a different one.
+    #[test]
+    #[cfg(unix)]
+    fn a_copy_of_this_build_first_on_path_is_the_same_build() {
+        // the test binary carries a linker stamp, so a copy of it is one build in two files
+        let this_build = std::env::current_exe().unwrap();
+        let package = tempfile::tempdir().unwrap();
+        let pin_dir = tempfile::tempdir().unwrap();
+        let installed = package.path().join("zellij");
+        let pin = pin_dir.path().join("zellij");
+        std::fs::copy(&this_build, &installed).unwrap();
+        std::fs::copy(&this_build, &pin).unwrap();
+
+        let finding = another_file_first_on_path(&installed, &pin);
+        assert_eq!(
+            finding.status,
+            zellij_utils::session_doctor::Status::AlreadyCorrect,
+            "{:?}",
+            finding
+        );
+        assert!(finding.message.contains("same build"), "{:?}", finding);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn another_build_first_on_path_is_still_a_different_build() {
+        let package = tempfile::tempdir().unwrap();
+        let pin_dir = tempfile::tempdir().unwrap();
+        let installed = write(package.path(), "zellij", "the newer build");
+        let pin = write(pin_dir.path(), "zellij", "the build the pin holds");
+
+        let finding = another_file_first_on_path(&installed, &pin);
+        assert_eq!(
+            finding.status,
+            zellij_utils::session_doctor::Status::NeedsYou,
+            "{:?}",
+            finding
+        );
+        assert!(finding.message.contains("DIFFERENT build"), "{:?}", finding);
     }
 
     fn write(directory: &Path, name: &str, contents: &str) -> PathBuf {
