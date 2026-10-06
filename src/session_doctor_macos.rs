@@ -1,4 +1,4 @@
-//! What only macOS can answer, and the only place doctor writes to a keychain.
+//! What only macOS can answer.
 //!
 //! Four things, and each of them is invisible from every other angle. The temp directory a shell
 //! exports decides which socket directory zellij resolves, so a shell whose `TMPDIR` disagrees
@@ -34,14 +34,13 @@ pub(crate) fn checks(
     name: &str,
     pinned: Option<&Path>,
     mode: DoctorMode,
-    config_dir: Option<PathBuf>,
     session_is_up: bool,
 ) {
     let commander = SystemCommander;
     check_tmpdir(report, &commander);
     check_launch_agent(report, name);
     check_from_inside_a_pane(report, name, session_is_up);
-    check_signature(report, &commander, pinned, mode, config_dir);
+    check_signature(report, &commander, pinned, mode);
 }
 
 /// Whether this shell's `TMPDIR` is the one the system hands out.
@@ -402,25 +401,22 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Bring the pinned copy's signature to something that outlives the build.
+/// Judge the pinned copy's signature, and refresh it from a release build when one is pending.
 ///
 /// Everything about how that is done lives in
-/// [`session_signing`](zellij_utils::session_signing); what is here is only the three paths that
-/// module cannot know: where our own certificate is kept, which keychain to put it in, and where
-/// to leave a second copy of it.
+/// [`session_signing`](zellij_utils::session_signing); what is here is only the glue that hands it
+/// the pin and the pending refresh.
 fn check_signature(
     report: &mut Report,
     commander: &SystemCommander,
     pinned: Option<&Path>,
     mode: DoctorMode,
-    config_dir: Option<PathBuf>,
 ) {
     let Some(pinned) = pinned else {
         // `check_pin` has already said that the pin is off, and everything below it is skipped
         return;
     };
-    let Some(context) = signing_context(commander, config_dir, deferred_refresh(pinned, mode))
-    else {
+    let Some(context) = signing_context(deferred_refresh(pinned, mode)) else {
         report.push(Finding::needs_you("signing", NO_HOME));
         return;
     };

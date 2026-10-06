@@ -1000,12 +1000,12 @@ pub enum SessionLifecycleCli {
         #[clap(long)]
         no_fix: bool,
 
-        /// Whether the signing ladder may sign the pinned copy, minting a certificate of our own
-        /// if the machine has no Apple one. macOS only, and nothing on any other platform
+        /// Whether a release build may replace a signed pinned copy. The default. macOS only, and
+        /// nothing on any other platform
         #[clap(long, overrides_with("no_sign"))]
         sign: bool,
 
-        /// Leave the pinned copy's signature alone, whatever state it is in
+        /// Leave a signed pinned copy exactly as it is, even for a release build
         #[clap(long)]
         no_sign: bool,
 

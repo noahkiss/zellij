@@ -11,9 +11,9 @@
 //! what makes doctor usable from a script without parsing its output.
 //!
 //! Everything a check learns from outside this process comes through [`Commander`], which exists
-//! so the checks can be tested. `codesign`, `security` and `launchctl` cannot run on the machine
-//! that runs the test suite, and a signing ladder nobody can test is a signing ladder that is
-//! wrong on the machine it finally runs on.
+//! so the checks can be tested. `codesign` and `launchctl` cannot run on the machine that runs the
+//! test suite, and a signing check nobody can test is a signing check that is wrong on the machine
+//! it finally runs on.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -186,8 +186,8 @@ pub struct DoctorMode {
     /// Whether to act at all. `--dry-run` forces this off, which is the whole of what dry-run
     /// means: the checks are identical, only the acting is withheld.
     pub fix: bool,
-    /// Whether the signing ladder may reach for a certificate. Signing is the one fix that writes
-    /// to the user's keychain, which is why it has its own switch on top of `fix`.
+    /// Whether a signed pin may be replaced, by the release build the refresh brings. `--no-sign`
+    /// clears it, which leaves an anchored pin exactly as it is. Nothing on this machine signs.
     pub sign: bool,
     /// Only so the report can say `--dry-run` was asked for. The tense comes off `fix`, which
     /// `--dry-run` clears, so nothing has to branch on this.
@@ -266,8 +266,8 @@ impl CommandOutput {
 ///
 /// A trait and not a function because the machine that runs the tests has no `codesign`, no
 /// keychain and no `launchctl`, and the parts of doctor most worth testing are the ones that read
-/// those tools' output. With this, a test hands the ladder a recorded transcript and checks which
-/// rung it picked; without it, the ladder is proven only on the Mac it eventually breaks on.
+/// those tools' output. With this, a test hands the signing check a recorded transcript and checks
+/// what it decided; without it, the check is proven only on the Mac it eventually breaks on.
 pub trait Commander {
     /// Run `program` with `args`, optionally writing `stdin` to it, and report what came back.
     ///
@@ -341,13 +341,9 @@ impl Commander for SystemCommander {
             .spawn()
             .map_err(|e| format!("could not run {}: {}", program, e))?;
         if let Some(stdin) = stdin {
-            // One caller writes here: `session_signing::team_id_from_keychain` pipes a
-            // certificate into `openssl`. It is also the pipe a secret would go down instead of
-            // argv, where `ps` shows it to every other process on the machine - and the one secret
-            // doctor handles, the keychain password, cannot use it: `security
-            // set-key-partition-list` reads its password from `-k` and from nowhere else. See
-            // `session_signing::allow_codesign_to_reach_the_key`, which says the same thing from
-            // the other end.
+            // No caller writes here since the signing ladder went (nkmk.30), which piped a
+            // certificate into `openssl`. It is kept because it is the pipe a secret would go down
+            // instead of argv, where `ps` shows it to every other process on the machine.
             let mut pipe = child
                 .stdin
                 .take()
@@ -368,10 +364,10 @@ impl Commander for SystemCommander {
 
 /// A `Commander` that answers from a script and remembers what it was asked.
 ///
-/// Both halves matter. The answers let a test drive the ladder down a rung it could not reach on
-/// this machine; the record lets it assert the ORDER - that the pin was verified before it was
-/// renamed over, that nothing was signed before the stale temp files were swept. Those are the
-/// properties that a wrong signing flow breaks, and neither shows up in a return value.
+/// Both halves matter. The answers let a test drive a signing check down a path it could not reach
+/// on this machine; the record lets it assert what was and was NOT run - that the copy was
+/// verified before it was renamed over, that nothing ran `codesign -s`. Those are the properties
+/// that a wrong signing flow breaks, and neither shows up in a return value.
 pub struct RecordedCommander {
     answers: HashMap<String, CommandOutput>,
     fallback: CommandOutput,
