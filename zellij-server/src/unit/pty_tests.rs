@@ -1036,6 +1036,83 @@ fn a_shell_pane_is_still_serialized_as_the_job_it_runs() {
     assert_eq!(run_command.command, PathBuf::from("htop"));
 }
 
+#[test]
+fn a_command_pane_is_listed_as_its_own_command_not_its_newest_child() {
+    // the live pane list asks the same question serialization does, and must get the same answer
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    mock.set_foreground_cmd(100, vec!["sleep".into(), "30".into()]);
+    let (mut pty, rx) = make_pty_with_plugin_receiver(mock);
+    let (terminal_id, _) = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(RunCommand::new(PathBuf::from(
+                "claude",
+            )))),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .expect("the mock spawns a terminal");
+    let _ = collect_command_changed_events(&rx);
+    pty.pane_activity_flags
+        .get(&terminal_id)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+
+    pty.update_and_report_cwds();
+
+    let claude = vec!["claude".to_owned(), "--continue".to_owned()];
+    assert_eq!(pty.reported_command_for(terminal_id), Some(&claude));
+    let events = collect_command_changed_events(&rx);
+    assert_eq!(events, vec![(PaneId::Terminal(terminal_id), claude, true)]);
+}
+
+#[test]
+fn a_shell_pane_is_still_listed_as_the_job_it_runs() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["/bin/bash".into()]);
+    mock.set_foreground_cmd(100, vec!["htop".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    let (terminal_id, _) = pty
+        .spawn_terminal(None, ClientTabIndexOrPaneId::TabIndex(0))
+        .expect("the mock spawns a terminal");
+    pty.pane_activity_flags
+        .get(&terminal_id)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+
+    pty.update_and_report_cwds();
+
+    assert_eq!(
+        pty.reported_command_for(terminal_id),
+        Some(&vec!["htop".to_owned()])
+    );
+}
+
+#[test]
+fn a_held_command_pane_stays_a_command_pane_until_it_closes() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    let held_command = RunCommand {
+        command: PathBuf::from("claude"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let (terminal_id, _) = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(held_command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .expect("the mock spawns a terminal");
+    assert!(pty.command_terminal_ids.contains(&terminal_id));
+
+    // its command exits and the pane waits to be re-run: still a command pane
+    pty.forget_child_pid(terminal_id);
+    assert!(pty.command_terminal_ids.contains(&terminal_id));
+
+    pty.close_pane(PaneId::Terminal(terminal_id))
+        .expect("the mock closes the pane");
+    assert!(!pty.command_terminal_ids.contains(&terminal_id));
+}
+
 fn write_claude_record(dir: &std::path::Path, pid: u32, session_id: &str) {
     std::fs::write(
         dir.join(format!("{}.json", pid)),
