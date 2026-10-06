@@ -15,7 +15,7 @@ use crate::{
 };
 use std::sync::Arc;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 use tokio::task::JoinHandle;
@@ -347,6 +347,10 @@ pub(crate) struct Pty {
     pane_activity_flags: HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     terminal_cmds: HashMap<u32, Vec<String>>,
     terminal_foreground_cmds: HashMap<u32, Vec<String>>,
+    /// The terminal panes whose own process is the command they were opened with - a command
+    /// pane or an editor - rather than a shell. Discovery asks these about their own process, not
+    /// about the newest of their children, which are the command's helpers.
+    command_terminal_ids: HashSet<u32>,
     /// The `detect_agents` value last sent to Screen, so a config flip reaches it even on a
     /// session whose process info has not changed. `None` until the first report.
     last_reported_detect_agents: Option<bool>,
@@ -1132,6 +1136,7 @@ impl Pty {
             pane_activity_flags: HashMap::new(),
             terminal_cmds: HashMap::new(),
             terminal_foreground_cmds: HashMap::new(),
+            command_terminal_ids: HashSet::new(),
             pending_layout_serialization: true,
             last_serialized_layout_fingerprint: None,
         }
@@ -1256,6 +1261,9 @@ impl Pty {
         // bool is starts_held
         let err_context = || format!("failed to spawn terminal for {:?}", client_or_tab_index);
 
+        // an explicit action is the pane's own command or editor; none means the default shell -
+        // the same rule Screen applies when it records what the pane was invoked with
+        let runs_its_own_command = terminal_action.is_some();
         // returns the terminal id
         let terminal_action = match client_or_tab_index {
             ClientTabIndexOrPaneId::ClientId(client_id)
@@ -1392,6 +1400,9 @@ impl Pty {
 
         self.task_handles.insert(terminal_id, terminal_bytes);
         self.pane_activity_flags.insert(terminal_id, activity_flag);
+        if runs_its_own_command {
+            self.command_terminal_ids.insert(terminal_id);
+        }
         if let Some(child_pid) = child_pid {
             self.id_to_child_pid.insert(terminal_id, child_pid);
             self.capture_initial_cwd(terminal_id, child_pid);
@@ -1966,6 +1977,7 @@ impl Pty {
                         .with_context(err_context)
                     {
                         Ok((terminal_id, reader, child_pid)) => {
+                            self.command_terminal_ids.insert(terminal_id);
                             if let Some(child_pid) = child_pid {
                                 self.id_to_child_pid.insert(terminal_id, child_pid);
                                 self.capture_initial_cwd(terminal_id, child_pid);
@@ -2035,6 +2047,7 @@ impl Pty {
                     .with_context(err_context)
                 {
                     Ok((terminal_id, reader, child_pid)) => {
+                        self.command_terminal_ids.insert(terminal_id);
                         if let Some(child_pid) = child_pid {
                             self.id_to_child_pid.insert(terminal_id, child_pid);
                             self.capture_initial_cwd(terminal_id, child_pid);
@@ -2127,6 +2140,7 @@ impl Pty {
     pub fn forget_child_pid(&mut self, terminal_id: u32) {
         self.id_to_child_pid.remove(&terminal_id);
         self.terminal_foreground_cmds.remove(&terminal_id);
+        // `command_terminal_ids` keeps the pane: it is still a command pane, waiting to re-run
     }
     pub fn close_pane(&mut self, id: PaneId) -> Result<()> {
         let err_context = || format!("failed to close for pane {id:?}");
@@ -2151,6 +2165,7 @@ impl Pty {
                 self.terminal_cmds.remove(&id);
                 self.terminal_envs.remove(&id);
                 self.terminal_foreground_cmds.remove(&id);
+                self.command_terminal_ids.remove(&id);
                 self.bus
                     .os_input
                     .as_ref()
@@ -2264,6 +2279,8 @@ impl Pty {
 
                 self.task_handles.insert(id, terminal_bytes);
                 self.pane_activity_flags.insert(id, activity_flag);
+                // a re-run is always a command, including one that started held and never ran
+                self.command_terminal_ids.insert(id);
                 if let Some(child_pid) = child_pid {
                     self.id_to_child_pid.insert(id, child_pid);
                     self.capture_initial_cwd(id, child_pid);
@@ -2732,11 +2749,21 @@ impl Pty {
             .iter()
             .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
             .collect();
+        // the same split serialization makes: a command pane is asked about its own process, so
+        // an agent run as one is reported as itself, not as one of its MCP servers or tool shells
+        let (command_panes, shell_panes): (Vec<(u32, u32)>, Vec<(u32, u32)>) = panes
+            .iter()
+            .partition(|(id, _)| self.command_terminal_ids.contains(id));
         let foreground_cmds = self
             .bus
             .os_input
             .as_ref()
-            .map(|os_input| os_input.get_foreground_cmds(&panes, &self.post_command_discovery_hook))
+            .map(|os_input| {
+                let post_hook = &self.post_command_discovery_hook;
+                let mut cmds = os_input.get_foreground_cmds(&shell_panes, post_hook);
+                cmds.extend(os_input.get_foreground_cmds_of_commands(&command_panes, post_hook));
+                cmds
+            })
             .unwrap_or_default();
 
         for terminal_id in &active_terminal_ids {

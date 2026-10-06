@@ -4076,8 +4076,8 @@ before, so the job-control fallback is unchanged for them.
 | a shell, idle or running a job | unchanged | unchanged |
 
 This changes `"all"` snapshots too: a command pane with children comes back running its command.
-The live pane list (`list-panes`, `list-agents`) still asks the old way and can show such a pane's
-newest child.
+From nkmk.30, the live pane list (`list-panes`, `list-agents`) asks the same way too, so such a
+pane is listed as its own command.
 
 ### Tabs come back in the order they were left in
 
@@ -4918,6 +4918,9 @@ entry](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents) desc
 The walk now also reads Claude Code's own record, `sessions/<pid>.json` under `$CLAUDE_CONFIG_DIR`
 (else `~/.claude`), with the same code serialization uses. A record's `sessionId` wins over the
 variable; a pane with no record keeps the variable's value. `SOURCE` stays `command+env`.
+From nkmk.30, a layout `command "claude"` pane gets an `AGENT_ID` too: the live list reports it as
+its own command, [not its newest child](#a-command-pane-is-recorded-as-its-own-command-not-its-newest-child),
+so detection matches it.
 
 The walk still runs once per pane. It remembers which claude pid's record answered, and every tick
 re-reads that one file: a few hundred bytes, not a process-table read. That is how a `/clear` is
