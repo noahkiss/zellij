@@ -1780,12 +1780,14 @@ pub enum PinOutcome {
     /// The pinned path already holds this build. The common case, and the reason the build is
     /// identified at all: copying 40 MB on every `session up` for nothing.
     UpToDate(PathBuf),
-    /// The pinned path held an anchored signature and a different build, and now holds this build
-    /// signed with the same certificate. Refreshing and signing were one transaction; see
+    /// The pinned path held an anchored signature and a different build, and now holds this
+    /// release build with the Developer ID signature it arrived with - nothing was signed here.
+    /// Copying, verifying and renaming were one transaction; see
     /// [`refresh_pin_through_signing`](crate::session_signing::refresh_pin_through_signing).
-    Signed(PathBuf),
+    AsReleased(PathBuf),
     /// The pinned path holds an anchored signature and a DIFFERENT build, and it was left exactly
-    /// as it was because this run could not sign. The caller gets the path anyway: the previous
+    /// as it was: the build is not a release build, or this run was told to leave the signed pin
+    /// alone, or the copy did not verify. The caller gets the path anyway: the previous
     /// signed copy is a working server that still holds its macOS grants, and starting it beats
     /// replacing it with a new build that holds none. The refusal has already been reported.
     Kept(PathBuf),
@@ -1802,7 +1804,7 @@ impl PinOutcome {
             PinOutcome::Installed(path)
             | PinOutcome::Refreshed(path)
             | PinOutcome::UpToDate(path)
-            | PinOutcome::Signed(path)
+            | PinOutcome::AsReleased(path)
             | PinOutcome::Kept(path)
             | PinOutcome::Candidate(path) => path,
         }
@@ -1819,9 +1821,9 @@ enum PinRefresh {
     /// Nothing to protect: no signature, or an ad-hoc one that a rebuild voids anyway. The
     /// ordinary copy proceeds.
     Copy,
-    /// The signing transaction put this build at the pin's path and signed it. Nothing more to do,
-    /// and nothing to re-stamp - the transaction wrote the stamp itself.
-    Signed,
+    /// The transaction put this release build at the pin's path with its own signature. Nothing
+    /// more to do, and nothing to re-stamp - the transaction wrote the stamp itself.
+    AsReleased,
     /// The pin carries a signature this run cannot replace, so it was not touched. The reason, for
     /// the one line that says so.
     Kept(String),
@@ -1829,11 +1831,11 @@ enum PinRefresh {
 
 /// The decision, with the two facts it turns on supplied by the caller.
 ///
-/// Pure and injectable so that the rule can be tested where the macOS ladder cannot run: an
-/// anchored pin is never overwritten, a signing run that works owns the refresh, and a signing run
-/// that refuses leaves the pin alone rather than falling through to the copy.
+/// Pure and injectable so that the rule can be tested where `codesign` cannot run: an anchored pin
+/// is never overwritten, a transaction that lands a release build owns the refresh, and one that
+/// refuses leaves the pin alone rather than falling through to the copy.
 #[cfg(unix)]
-fn decide_pin_refresh<A, S>(anchored: A, sign: S) -> PinRefresh
+fn decide_pin_refresh<A, S>(anchored: A, install: S) -> PinRefresh
 where
     A: FnOnce() -> bool,
     S: FnOnce() -> Result<(), String>,
@@ -1841,8 +1843,8 @@ where
     if !anchored() {
         return PinRefresh::Copy;
     }
-    match sign() {
-        Ok(()) => PinRefresh::Signed,
+    match install() {
+        Ok(()) => PinRefresh::AsReleased,
         Err(reason) => PinRefresh::Kept(reason),
     }
 }
@@ -1904,9 +1906,8 @@ static PIN_REFUSALS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec:
 /// Ask the decision, and report a refusal ONCE per pin per process.
 ///
 /// Once is the requirement, not a nicety. `zellij session up` asserts the pin and then launches a
-/// client, which resolves the server binary through the pin again - so a machine that cannot sign
-/// reaches this twice in one command. Saying it twice would read as two faults, and asking the
-/// keychain twice would mean two dialogs on a machine that is going to refuse either way.
+/// client, which resolves the server binary through the pin again - so a machine whose refresh is
+/// refused reaches this twice in one command. Saying it twice would read as two faults.
 #[cfg(unix)]
 fn guard_anchored_pin(source: &Path, target: &Path) -> PinRefresh {
     if pin_refusal_already_said(target) {
@@ -1933,14 +1934,14 @@ fn pin_refusal_already_said(target: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The one line a machine that cannot sign is told, and the only place it is written.
+/// The one line a machine whose refresh was refused is told, and the only place it is written.
 #[cfg(unix)]
 fn say_the_pin_was_not_refreshed(reason: &str) {
     eprintln!("warning: the pin was NOT refreshed: {}", reason);
     eprintln!("         the previously signed copy is still in place, on the previous build,");
     eprintln!("         and that is the build this session starts. Every grant it holds is");
-    eprintln!("         intact. Run `zellij session doctor --fix` from a desktop terminal to");
-    eprintln!("         finish the upgrade.");
+    eprintln!("         intact. Install the brew release to finish the upgrade: its build is");
+    eprintln!("         pinned with its own signature.");
 }
 
 /// Put this build at `target`, if it is not there already.
@@ -1983,15 +1984,16 @@ fn say_the_pin_was_not_refreshed(reason: &str) {
 /// `PATH` then reads its unchanged package binary as stale and copies it over the signature,
 /// taking every macOS grant with it. Nothing upstream of here can tell the two paths apart.
 ///
-/// **THE ONE WRITER, and it never replaces an anchored signature without signing.** Every path
+/// **THE ONE WRITER, and it never replaces an anchored signature with anything but a release.** Every path
 /// that puts a build at the pin comes through here - `session up`, `session enable`, doctor's
 /// `--fix`, and `server_exe_for_interactive_launch` on every interactive launch - and the last of
 /// those is why the rule lives here rather than in a caller. It was added to ONE caller first,
 /// and the caller that had not been told copied an unsigned build over an Apple Development
 /// signature on the very next launch, while the other caller's refusal was still on the screen. A
 /// rule a caller can be written without is a rule that will be written without. So: an existing
-/// pin that carries an anchored signature is refreshed through the signing transaction or not at
-/// all, and a caller cannot ask for anything else, because there is no parameter to ask with.
+/// pin that carries an anchored signature is refreshed through the signing transaction - which
+/// takes only a release build, as it arrived - or not at all, and a caller cannot ask for anything
+/// else, because there is no parameter to ask with.
 #[cfg(unix)]
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
     if is_the_same_file(source, target) {
@@ -2011,8 +2013,8 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     let refreshing = target.exists();
     // The SECOND guard on the one writer, and it is asked first because it is the cheaper refusal:
     // a candidate must not reach the pin at all, so it must not reach the signing transaction
-    // either - that would put a keychain dialog in front of a build that is not going to be
-    // installed whatever the answer. Asked here rather than at the top so that a candidate whose
+    // either - that would run `codesign` over a build that is not going to be installed whatever
+    // the answer. Asked here rather than at the top so that a candidate whose
     // build already IS the pin still reports `UpToDate` and says nothing: the line is for a write
     // that was prevented, not for every command an RC runs.
     if release_candidate_must_not_be_pinned(target) {
@@ -2025,7 +2027,7 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     if refreshing {
         match guard_anchored_pin(source, target) {
             PinRefresh::Copy => {},
-            PinRefresh::Signed => return Ok(PinOutcome::Signed(target.to_path_buf())),
+            PinRefresh::AsReleased => return Ok(PinOutcome::AsReleased(target.to_path_buf())),
             PinRefresh::Kept(_) => return Ok(PinOutcome::Kept(target.to_path_buf())),
         }
     }
@@ -3110,26 +3112,29 @@ mod tests {
         assert_eq!(decision, PinRefresh::Copy);
     }
 
-    /// An anchored pin is only ever replaced by the transaction that signs it, so a run that CAN
-    /// sign hands the whole refresh over - copy, sign and rename are one step, and nothing after
-    /// this writes the pin again.
+    /// An anchored pin is only ever replaced by the transaction that installs a release build, so a
+    /// run that lands one hands the whole refresh over - copy, verify and rename are one step, and
+    /// nothing after this writes the pin again.
     #[cfg(unix)]
     #[test]
     fn an_anchored_pin_is_refreshed_through_the_signing_transaction() {
         let decision = decide_pin_refresh(|| true, || Ok(()));
-        assert_eq!(decision, PinRefresh::Signed);
+        assert_eq!(decision, PinRefresh::AsReleased);
     }
 
-    /// The case the guard exists for. A locked keychain refuses the key, and the answer is to
-    /// leave the signed pin exactly where it is and say so - NOT to fall through to the plain
-    /// copy, which is what voided an Apple Development signature on a real machine.
+    /// The case the guard exists for. A build that is not the release is refused, and the answer
+    /// is to leave the signed pin exactly where it is and say so - NOT to fall through to the
+    /// plain copy, which is what voided an Apple Development signature on a real machine.
     #[cfg(unix)]
     #[test]
     fn an_anchored_pin_that_cannot_be_signed_is_left_alone() {
-        let decision = decide_pin_refresh(|| true, || Err("the keychain is locked".to_owned()));
+        let decision = decide_pin_refresh(
+            || true,
+            || Err("the new build is not a release build".to_owned()),
+        );
         assert_eq!(
             decision,
-            PinRefresh::Kept("the keychain is locked".to_owned())
+            PinRefresh::Kept("the new build is not a release build".to_owned())
         );
     }
 

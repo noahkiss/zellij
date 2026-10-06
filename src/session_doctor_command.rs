@@ -63,13 +63,12 @@ fn examine(
 ) -> Report {
     let mut report = Report::new();
     // Said before any check can write the pin. `--no-sign` is the case that matters: without it
-    // the pin's writer would sign an anchored pin this run was told to leave alone, and the run
-    // that is told not to sign must leave it BOTH unsigned and unreplaced - copying the new build
-    // over the signature is not the other option, it is the fault the guard exists to stop.
+    // the pin's writer would replace an anchored pin this run was told to leave alone, and
+    // copying the new build over the signature is not the other option, it is the fault the guard
+    // exists to stop.
     zellij_utils::session_signing::set_pin_signing_policy(
         zellij_utils::session_signing::PinSigningPolicy {
             allowed: mode.sign,
-            backup_dir: opts.config_dir.clone().or_else(find_default_config_dir),
             regranted,
         },
     );
@@ -814,11 +813,11 @@ fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: Doc
     };
 
     if refresh_is_deferred(pinned, mode) {
-        // Not skipped: handed on. The macOS signing step copies the new build into its own temp,
-        // signs THAT, and renames it over the pin only once it verifies - so a run that cannot
-        // sign leaves the previous signed pin in place instead of replacing it with an ad-hoc
-        // copy of the new build and reporting that it had touched nothing. It reports both halves
-        // when it is done, which is why nothing is pushed here.
+        // Not skipped: handed on. The macOS signing step copies a release build into its own
+        // temp, verifies THAT, and renames it over the pin only once it does - so any other build
+        // leaves the previous signed pin in place instead of replacing it with an ad-hoc copy and
+        // reporting that it had touched nothing. It reports both halves when it is done, which is
+        // why nothing is pushed here.
         return;
     }
     let Ok(current_exe) = std::env::current_exe() else {
@@ -877,10 +876,13 @@ fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: Doc
             "pin",
             format!("pinned this build at {}", path.display()),
         )),
-        Ok(PinOutcome::Signed(path)) => report.push(
+        Ok(PinOutcome::AsReleased(path)) => report.push(
             Finding::changed(
                 "pin",
-                format!("refreshed and signed the pinned copy at {}", path.display()),
+                format!(
+                    "refreshed the pinned copy with the release's own signature at {}",
+                    path.display()
+                ),
             )
             .note("the running session keeps the old copy until it is restarted"),
         ),
@@ -902,7 +904,7 @@ fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: Doc
         Ok(PinOutcome::Kept(path)) => report.push(Finding::needs_you(
             "pin",
             format!(
-                "{} still holds the previous build: its signature could not be replaced",
+                "{} still holds the previous build: the signed pin was not replaced",
                 path.display()
             ),
         )),
@@ -974,20 +976,10 @@ fn platform_checks(
     name: &str,
     pinned: Option<&Path>,
     mode: DoctorMode,
-    opts: &CliArgs,
+    _opts: &CliArgs,
     facts: &SessionFacts,
 ) {
-    // the same resolution `setup` makes, so a machine with ZELLIJ_CONFIG_DIR or an unusual XDG
-    // layout gets its backup beside its own config rather than beside somebody's default
-    let config_dir = opts.config_dir.clone().or_else(find_default_config_dir);
-    crate::session_doctor_macos::checks(
-        report,
-        name,
-        pinned,
-        mode,
-        config_dir,
-        facts.assert_up().is_ok(),
-    );
+    crate::session_doctor_macos::checks(report, name, pinned, mode, facts.assert_up().is_ok());
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

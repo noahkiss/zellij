@@ -2756,8 +2756,8 @@ Needs you
 Exit 0 when `Needs you` is empty, 1 otherwise. That is the whole of the contract, so a script can
 call doctor and read the answer without parsing it. There is no `--json`; no `session` verb has one.
 
-**It never takes the session down.** A pin refresh, a signature and a rewritten plist all take
-effect at the next start, so doctor makes the change and *says* a restart is needed. `zellij session
+**It never takes the session down.** A pin refresh and a rewritten plist both take effect at the
+next start, so doctor makes the change and *says* a restart is needed. `zellij session
 restart` is that command and it belongs to the person whose panes are in there. For the same reason
 a drifted unit is reported rather than rewritten: on launchd a rewrite means `bootout` then
 `bootstrap`, which stops the job.
@@ -2860,350 +2860,129 @@ probe's five-second deadline: a client talking to a wedged server never returns 
 `--dry-run` withholds every fix, and the pane probe is the one thing it still does: it is a
 question, not a repair, and the answer cannot be had any other way. Expect a floating pane to
 appear and close itself on a `-n` run against a live session. Nothing else on that path writes —
-the pin is compared and not copied, the keychain is not touched, and no certificate is minted.
+the pin is compared and not copied, and nothing is signed.
 
 #### Signing the pinned copy (macOS)
 
 macOS keys a grant for a non-bundled program to an absolute path plus a code requirement. An
 unsigned or ad-hoc-signed binary has no identity to name, so the requirement is a hash of the
 *code* — and the next build voids every grant, silently, until a pane fails in a directory that
-worked yesterday. A signature anchored on a certificate ends that, and it runs by default;
-`--no-sign` opts out.
+worked yesterday. A signature anchored on a certificate ends that.
 
-Four rungs, best first — and a rung that **refuses** is walked past, not stopped on:
+**From nkmk.30 the release is signed once, in CI, and nothing on a Mac signs.** `release.yml`
+signs the macOS binary with the fork's Developer ID (see [Releasing](#releasing)). Doctor and the
+pin's writer only judge signatures and copy builds:
 
-1. **Developer ID Application** — `codesign` already anchors it on the team id. Timestamped.
-2. **Apple Development** — the requirement is written by hand, anchored on `subject.OU`. Never on
-   the CN: the CN carries an email that changes on reissue and differs between two of one person's
-   machines, while the OU is the team id and is the same everywhere that Apple ID is. Timestamped.
-   The text is a requirement **set** — `designated => identifier "…" and anchor apple generic and
-   certificate leaf[subject.OU] = "…"` — and the `designated =>` is not decoration. `codesign -r`
-   parses what it is handed as a set of `tag => expression` pairs, so a text opening with
-   `identifier` puts a reserved word where a tag belongs and the whole rung is refused before
-   signing starts, with `Requirement syntax error(s): line 1:1: unexpected token: identifier`. It
-   reaches `codesign` as one argv, `-r=<text>`: the leading `=` is what makes the value inline
-   text rather than a path to a file.
+| The build being pinned | What happens |
+|---|---|
+| a release build, carrying our Developer ID | pinned as it arrived: copy, verify, rename — see [A release build is pinned with its own Developer ID](#a-release-build-is-pinned-with-its-own-developer-id-and-nothing-re-signs-it) |
+| anything else (a local `cargo build`, a source-formula build) over an ad-hoc or unsigned pin | a plain copy, with whatever signature the linker gave it |
+| anything else over an anchored pin | refused; the signed pin stays, on the previous build |
 
-   **The team id is read off the CERTIFICATE, and reading it off the identity's NAME was a bug
-   that shipped twice.** `security find-certificate -c "<name>" -p` piped into `openssl x509
-   -noout -subject` gives the subject, and the `OU` in it is the team. The parenthesised code in
-   the CN is *not*: on a Developer ID Application certificate the two are the same string, which
-   is what let the mistake through, and on an Apple Development certificate they are not. A real
-   subject, off the machine this was found on:
+And what doctor says about the pin it finds:
 
-   ```text
-   UID=7472L5G3Y6/CN=Apple Development: someone (DY7JA3K8QZ)/OU=U2VEDWFUF3/O=Someone/C=US
-   ```
+| The pin | Doctor |
+|---|---|
+| anchored, and it verifies | `Already correct` — unless a re-grant is owed, see [the entry below](#doctor-keeps-the-certificate-the-grants-name-and-remembers-a-switch-until-the-re-grant-is-made) |
+| anchored, and it does not verify | `Needs you`: it holds no grant; remove the pin and run `doctor --fix` from the brew release |
+| ad-hoc or unsigned | `Needs you`: not a release build, so the pin holds no grants; install the brew release |
 
-   Both spellings of that line are parsed, because both are in play: LibreSSL is `/usr/bin/openssl`
-   and writes `/OU=VALUE/`, while a Homebrew OpenSSL 3 may be first on `PATH` and writes
-   `OU = VALUE,`.
+The `Needs you` for a build the release did not sign reads:
 
-   The lookup asks the **default keychain only** — the one `codesign` itself looks in. An Apple
-   identity that `find-identity` sees on the search list but that lives in another keychain yields
-   no team id, and degrades to the no-requirement case below rather than to a wrong one.
-
-   A certificate that cannot be read gives **no** team id, and a rung with no team id writes no
-   requirement at all and takes the CN-anchored one `codesign` derives. That is the lesser of two
-   evils by a wide margin: the derived requirement survives every rebuild, which is what a grant
-   actually needs, and only breaks when the certificate is reissued — whereas a requirement built
-   from the wrong field is one the signed binary does not satisfy, which voids the grant
-   immediately while looking correct. Writing a wrong requirement is worse than writing none.
-3. **One we mint**, kept 0700/0600 in `~/Library/Application Support/zellij/signing/`, with a copy
-   of `id.p12` in zellij's resolved config directory — and a copy that could not be written is a
-   `Needs you`, because the bundle cannot be minted a second time. Minted
-   **once**: its own hash is the requirement, so a second certificate voids every grant recorded
-   against the first — a keychain that lost it is re-imported from the bundle rather than given a
-   new one. The one exception is a bundle that **will not import**: it is moved to
-   `id.p12.broken-<epoch>` and a new one is minted — but only behind **two** gates, and both are
-   needed. The import error has to name the proven case (`MAC verification failed` / `wrong
-   password`), and `security find-certificate -c "<our CN>" <keychain>` has to find nothing. Any
-   other failure is reported and mints nothing. That is what keeps "mint once" true rather than
-   weakening it: a bundle that never imported was never signed with, so no grant on the machine
-   names it, whereas a locked keychain or a run with no dialog to answer fails the import while
-   holding the certificate every grant does name.
-
-   `find-identity` cannot be the second gate, and the first cut of this used it. It lists
-   identities the keychain calls *valid*, so it folds "never imported" together with "imported but
-   untrusted" and with "the keychain will not answer right now" — and it has just been asked, by
-   the only caller, and answered nothing. `find-certificate` asks about the certificate itself,
-   needing neither a trust decision nor access to the private key, which is exactly the distinction
-   the gate needs. Never timestamped: Apple's server needs a real chain and
-   would only refuse. The `.p12`
-   is written with a SHA-1 MAC and `PBE-SHA1-3DES` for both key and certificate, because that is
-   what `security import` reads — OpenSSL 3 defaults to neither and macOS reports the MAC it
-   cannot verify as a password it was not given: `SecKeychainItemImport: MAC verification failed
-   during PKCS12 import (wrong password?)`. `-legacy` is what lets OpenSSL 3 write those
-   algorithms, and it is tried first and dropped on failure rather than decided from a version
-   string: macOS ships LibreSSL as `/usr/bin/openssl` and LibreSSL has no such flag, while a
-   Homebrew OpenSSL 3 may be first on `PATH` instead.
-
-   **The bundle also needs a non-empty passphrase, and that is a format requirement rather than a
-   security one.** The algorithms above are necessary and not sufficient: Apple's importer cannot
-   verify the MAC of a PKCS#12 written with an empty password either, and reports it with the same
-   misleading `wrong password?`. Proven on a real Mac by changing nothing else — same key, same
-   certificate, same algorithms, same LibreSSL — `-passout pass:` fails and `-passout pass:zellij`
-   with `security import -P zellij` reports `1 identity imported.` So the passphrase is the
-   constant `zellij`, written in the source beside the file it opens. It protects nothing and is
-   not meant to: the protection is still the 0700 directory and the 0600 file. A passphrase nobody
-   could look up would instead be a way to lose the one certificate the machine may ever have.
-4. **Nothing** — the Xcode steps, as a `Needs you`.
-
-A certificate the keychain OFFERS is not a certificate that SIGNS, so the two Apple rungs are
-walked and not merely sampled. When one refuses, the other is tried, and the signature that lands
-says which rung above it would not sign. Stopping on the first refusal was the old behaviour and it
-was the worse of two outcomes: `session up` refreshes the pin ad-hoc-signed and doctor is what
-makes it anchored, so a doctor that gave up left the machine in exactly the state this rung exists
-to remove, with a working certificate standing one step below. Only a failure the certificate
-cannot explain — a copy or a rename that the filesystem refused — stops the walk, because another
-rung would write the same error a second time.
-
-**The walk stops at the Apple rungs, and that boundary is the point.** Falling from a Developer ID
-to an Apple Development certificate of the same team keeps the requirement: `codesign` derives the
-same `identifier … and anchor apple generic and certificate leaf[subject.OU] = "TEAM"` for the
-first that we write by hand for the second — which holds only while that team id comes off the
-certificate, and not at all for a rung that fell back to the derived CN-anchored requirement. That
-fall is allowed rather than blocked, because an anchored requirement that survives every rebuild
-still beats leaving the pin ad-hoc; what it must not be is silent, so the follow-up names the team
-id it could not read as the reason the re-grant is needed. The certificate we mint does **not** —
-its requirement
-is its own hash — so walking into it would void every grant on the machine. And a refusal is not
-always the certificate's fault: `errSecInternalComponent`, a keychain locked over SSH, a "Deny" on
-the key-access dialog. Each is transient, and each would otherwise demote the pin permanently —
-permanently, because a self-signed signature *is* anchored, so the next doctor run reads the pin as
-already correct and never climbs back. So rung 3 is reached only when the keychain offers no Apple
-certificate at all, or when the grants were made against rung 3's own certificate — then it is the
-only rung tried (see [the entry
-below](#doctor-keeps-the-certificate-the-grants-name-and-remembers-a-switch-until-the-re-grant-is-made)).
-A machine that holds one and cannot use it gets a `Needs you` naming what each
-certificate said, and nothing is minted that the machine would never otherwise have had.
-
-Nothing is ever signed ad-hoc: that anchors on the code hash, which is the fault under a new name.
-No trusted root is ever added — requirement evaluation does not consult trust unless the requirement
-says `trusted`, and ours never does. What signing needs is keychain ACL access, and
-`ZELLIJ_KEYCHAIN_PASSWORD` is how a run gets it without a person present. It is read from the
-environment when it is set, and doctor never asks for it.
-
-**That variable is not an SSH-only escape hatch, and calling it one was wrong twice over.**
-`security(1)` writes its password prompt to the **controlling terminal** — not through the window
-server, and not to stdin — so being inside a graphical session buys nothing. At 0.45.0-nkmk.8
-`security set-key-partition-list` with no `-k` blocked forever in a pane on a real Mac: no
-SecurityAgent process, no dialog, no timeout, an empty report, and one line on the pane's terminal:
-
-```text
-(deprecated) password to unlock /Users/…/login.keychain-db:
+```
+Needs you
+  signing   <pin> is not a release build, so the pin holds no grants
+            its signature is ad-hoc: the requirement names its own code hash
+            nothing is signed on this machine; the release is signed once, in CI
+            install the brew release to get a signed pin, then `zellij session doctor --fix`
 ```
 
-So every child doctor runs is now started with `setsid(2)`, in a session of its own with no
-controlling terminal. A tool that would have prompted fails fast and says why instead. A null stdin
-had always been set and does not help — the prompt never goes there.
-
-`set-key-partition-list` runs before **every** signature made with our own certificate, and not
-only on the run that minted it. The ACL it grants belongs to the keychain, not to the certificate,
-and a certificate is minted once and signed with for years — so granting it at minting time meant
-the very next run found a ready rung, signed with it, and was refused by a key nothing had ever
-approved. Proven on a real Mac: running the partition list by hand made the identical `codesign`
-succeed. It is cheap and idempotent when the ACL is already there. It is never run for an Apple
-certificate, which comes with its own.
-
-`set-key-partition-list` is also no longer allowed to end the run. It decides whether macOS asks
-for the key once per signature or never; `codesign` raises that dialog itself, and a person at the
-desktop can answer it with **Always Allow**, once. So a refusal is reported and signing continues,
-and a `codesign` that then refuses too names both remedies: run doctor from a terminal in the
-desktop session and click Always Allow, or set `ZELLIJ_KEYCHAIN_PASSWORD`.
-
-**The password unlocks the keychain on the Apple rungs too, and until now it did not.** It reached
-`security` only as `-k` on `set-key-partition-list`, and that command runs only for the certificate
-we mint — so a machine signing with an Apple Development or Developer ID certificate ran no
-`security` command at all before `codesign`, and `ZELLIJ_KEYCHAIN_PASSWORD` did nothing on it. A
-locked keychain — every launchd run, and every machine reached over SSH that nobody has typed into —
-then refused the key with `errSecInternalComponent`, while the remedy printed beside the refusal
-told the reader to set the one variable the run had ignored. The workaround was a
-`security unlock-keychain -p` typed by hand before each doctor run. Doctor now takes that step
-itself: on the first rung that is not ours, and only when the variable is set, it runs
-`security unlock-keychain -p <password> <keychain>` against the same default keychain it signs from.
-Once per run and not once per rung — a password the keychain rejected is rejected again one rung
-down, and saying so twice is noise. A refusal there is survivable in the same way the partition
-list's is: it is a `Needs you`, and the run goes on to sign. Our own rung is untouched, because `-k`
-already unlocks the keychain on its way past. The password stays out of every finding; what is
-quoted is `security`'s own stderr, which names the keychain and not the password. The remedy now
-says what setting the variable buys — it unlocks the keychain, whichever certificate the run signs
-with — because on the rungs that most needed it, that sentence used to be a lie.
-
-That rule has a consequence in the *discovery* step, and it is not obvious. `security find-identity
--v -p codesigning` lists valid identities, and validity there is a **trust** decision — so a
-certificate we minted, which chains to nothing, is reported as `(CSSMERR_TP_NOT_TRUSTED)` and the
-listing ends `0 valid identities found` on a machine that holds it, holds its key, and signs with it
-without complaint. Seen on a real Mac. The answer is a second listing without `-v`, filtered to our
-own common name, and **not** `add-trusted-cert`: adding a trusted root would change what Gatekeeper
-accepts across the whole machine, need an administrator, and buy a grant nothing it does not already
-have. The filter matters too — an Apple certificate the keychain calls invalid is invalid for a
-reason, and taking it off that listing would put the ladder on a rung that cannot sign.
+**A pin anchored on a retired local certificate is left as it is.** Until nkmk.30 doctor signed
+every refreshed pin itself (see the nkmk.30 ledger entry for what went). Those pins still verify,
+and doctor does not fight them: the next release build refreshes the pin as it arrived, and that
+switch records the owed re-grant through the same record.
 
 The identifier is the constant `org.zellij.nkmk`. **Changing it voids every grant on every machine**,
 because it is part of the requirement macOS recorded — which is why it is a constant and not a
-setting.
+setting. The release signs with that identifier.
 
-On the two timestamped rungs the attempt can still fail — an offline machine has no timestamp
-server — and the signature is then made without one and the report says so, quoting the refusal. A
-signature that silently carries no timestamp looks exactly like one that was never asked for.
+**Verification runs `codesign --verify --strict --verbose=2`, and the verbosity is load-bearing.**
+Plain `codesign -v <path>` returned 0 on a pin that `codesign -v --verbose=2 <path>` rejected with
+`does not satisfy its designated Requirement` and exit 3: the designated-requirement check is what
+the second verbosity level adds. The message is matched as well as the exit status, because the
+exit status is the half already observed reporting success wrongly. Two questions are asked
+because they fail apart: a signature can verify while its requirement still names the code hash,
+and a requirement can read perfectly while the binary does not satisfy it. The same verification
+is run on the pin before it is called healthy, and on the copy of a release build before it is
+renamed into place.
 
-The round trip is a copy, a sign, two verifications and a rename. `codesign` writes in place and a
-running server holds the pin open, so an in-place sign fails `ETXTBSY` exactly when a session is up.
-The two verifications are two questions because they fail apart: a signature can verify while its
-requirement still names the code hash, which is a run that reported success and fixed nothing — and
-a requirement can read perfectly while the binary does not satisfy it, which is worse, because the
-first question is the one a text search answers and it says yes.
+**`codesign --verify` exiting 0 says nothing about whether a grant survived.** It answers "is this
+signature intact", not "is this the requirement macOS recorded" — an ad-hoc pin verifies perfectly
+and holds nothing past its next rebuild. The requirement is what doctor prints and compares.
 
-**The verification runs `codesign --verify --strict --verbose=2`, and the verbosity is
-load-bearing.** Plain `codesign -v <path>` returned 0 on a pin that `codesign -v --verbose=2 <path>`
-rejected with `does not satisfy its designated Requirement` and exit 3: the designated-requirement
-check is what the second verbosity level adds. The message is matched as well as the exit status,
-because the exit status is the half already observed reporting success wrongly.
+Every child doctor runs is started with `setsid(2)`, in a session of its own with no controlling
+terminal. `security(1)` writes its password prompt to the controlling terminal, not to stdin, so at
+0.45.0-nkmk.8 a `security` call blocked forever in a pane with one line on the pane's terminal. No
+signing step runs `security` any more, but a tool that would prompt still fails fast and says why.
 
-**The same verification is run on a pin doctor did not sign**, before it is called healthy. Reading
-a requirement is not checking it: an anchored-looking pin has an identifier, an anchored text and no
-code hash anywhere whether or not the binary satisfies it, and a pin that fails verification is
-signed again rather than reported as `Already correct`.
-Anything that goes wrong leaves the working pin untouched, and a run that reached the bottom of the
-ladder reports a `Needs you` naming every rung that refused and what each one said — a machine that
-cannot sign is still a machine worth reporting on. The Xcode steps come with it only when the
-keychain held no Apple certificate; a machine whose certificate merely refused is pointed at the
-key and the keychain instead, which is what refuses like that.
+**The refresh and the verification are one transaction, and they have to be.** Doctor once
+refreshed the pin first and signed it second, so a run that could not sign had already replaced a
+properly anchored pin with a fresh ad-hoc copy, and then reported `the pinned copy is untouched`.
+Measured on a real Mac at 0.45.0-nkmk.9. So when the pin is **anchored** and out of date, the copy
+is handed to the signing step: it copies a release build into its own temp, verifies it, and
+renames only on success. Any other build is refused there. A refusal leaves the previous signed
+pin exactly where it was — previous build, signature intact, grants intact — and says so. The
+deferral is decided by one function that both steps ask, because a disagreement in the "skip"
+direction would drop the refresh with nothing reporting it. A pin that is already **ad-hoc** is
+refreshed first, by the plain copy: it holds no grant a rebuild could keep.
 
-**The refresh and the signature are one transaction, and they have to be.** Doctor used to refresh
-the pin first and sign it second. A run where every rung refused — a locked keychain, which is
-*every* unattended launchd run — had therefore already replaced a properly anchored pin with a fresh
-ad-hoc copy of the new build, and then reported `the pinned copy is untouched`. Both halves were
-wrong: the pin had been replaced, and every grant on the machine was void from the next restart,
-which is a symptom that surfaces later and somewhere else. Measured on a real Mac at 0.45.0-nkmk.9,
-where the requirement a dry run had confirmed sixty seconds earlier was simply gone.
-
-So when the pin is **anchored** and out of date, the copy is handed to the signing step: it writes
-the new build into its own temp, signs THAT, verifies it, and renames only on success. A new build
-that already carries the release's Developer ID is not signed again: the step copies it into the
-temp as it came, verifies it, and renames it the same way. A refusal
-leaves the previous signed pin exactly where it was — previous build, signature intact, grants
-intact — and says so. The deferral is decided by one function that both steps ask, because a
-disagreement in the "skip" direction would drop the refresh with nothing reporting it. A pin that is
-already **ad-hoc** is refreshed first as before: it holds no grant a rebuild could keep, so pinning
-the new build is worth more than protecting a signature that was never load-bearing.
-
-**One writer, and it never replaces an anchored signature without signing.** The pin used to be
-written by the plain `install_pinned_exe` copy → rename with no signing step, so an upgrade whose
-first command was `session up` — rather than `session doctor` — put an ad-hoc pin in place exactly
-as the old doctor did, and the grants went with it. That is the one path an upgraded machine
-actually takes: the watchdog runs `session up` every minute, so it wins the race with any shell.
-
-The rule was first written into `assert_pinned_exe`, the caller `session up` goes through. **There
-is a second caller**, and it is the one that runs on every interactive launch:
-`server_exe_for_interactive_launch` (`zellij-utils/src/session_service.rs`) resolves the server
-binary for `start_client`, and it called the copy directly. On a real machine the refusal from the
-first caller printed, and the second caller then overwrote the Apple Development signature with an
-ad-hoc copy of the new build in the same command.
-
-So the rule lives at the write. `install_pinned_exe` asks `pin_is_anchored` — the same predicate
-`refresh_belongs_to_signing` asks, so the two cannot disagree — the moment it knows it is about to
-overwrite an existing pin, and there is no parameter with which a caller can ask for anything else:
+**One writer, and it never replaces an anchored signature with anything but a release.** The rule
+lives at the write, in `install_pinned_exe`, because the pin has two callers: `assert_pinned_exe`
+(`session up`) and `server_exe_for_interactive_launch`, which runs on every interactive launch. The
+rule was first written into one caller, and on a real machine the other overwrote an Apple
+Development signature in the same command. `install_pinned_exe` asks `pin_is_anchored` — the same
+predicate `refresh_belongs_to_signing` asks — the moment it is about to overwrite an existing pin,
+and there is no parameter with which a caller can ask for anything else:
 
 | What the pin is | What ANY caller gets |
 |---|---|
 | current, or ad-hoc, or unsigned | the plain copy, unchanged |
-| anchored and stale, signing works | refreshed and signed as one transaction (`PinOutcome::Signed`) |
-| anchored and stale, the new build is the release's own Developer ID | installed as it came, nothing signed (`PinOutcome::Signed`) — see [A release build is pinned with its own Developer ID](#a-release-build-is-pinned-with-its-own-developer-id-and-nothing-re-signs-it) |
-| anchored and stale, signing refuses | **nothing is written**; the existing pin's path is returned (`PinOutcome::Kept`) |
+| anchored and stale, the new build is the release's own Developer ID | installed as it came, nothing signed (`PinOutcome::AsReleased`) |
+| anchored and stale, any other build, or `--no-sign` | **nothing is written**; the existing pin's path is returned (`PinOutcome::Kept`) |
 
-The last row is the point. A locked keychain is every unattended launchd run, and there the session
-comes up on the PREVIOUS build with its grants intact, and says so in the signing step's own words
-— quoted rather than summarised, so the line matches what `zellij session doctor` says next. An
-older build that can still read the files beats a newer one whose grants can only be given back
-through a GUI dialog. The socket is scoped by contract version rather than by version string, so a
-client one build ahead still speaks to that server.
+`session up` and doctor print the second row as `refreshed the pinned copy with the release's own
+signature at <pin>`. In the last row the session comes up on the PREVIOUS build with its grants
+intact, and the writer says so in the signing step's own words — quoted rather than summarised, so
+the line matches what `zellij session doctor` says next. An older build that can still read the
+files beats a newer one whose grants can only be given back through a GUI dialog. The refusal is
+said ONCE per pin per process: `session up` asserts the pin and then launches a client that
+resolves the server binary through the pin again.
 
-The refusal is said ONCE per pin per process, by the writer. `session up` asserts the pin and then
-launches a client that resolves the server binary through the pin again, so the same refusal is
-reached twice in one command; the second call answers from the first one's decision and never asks
-the keychain again.
+What the writer cannot work out for itself is stated once per run instead of passed as a parameter:
+`PinSigningPolicy` carries whether a signed pin may be replaced (`false` only for `session doctor
+--no-sign`) and whether the operator confirmed an owed re-grant (`--regranted`). A run that states
+no policy — a plain `zellij` launch — lets a release replace the pin. **`--sign` and `--no-sign`
+stay**, with the meaning narrowed: nothing signs, so `--no-sign` means "leave a signed pin exactly
+as it is, even for a release build". `--sign` is the default and is accepted so that scripts which
+pass it keep working.
 
-What the writer cannot work out for itself is stated once per run instead of passed as a parameter,
-which would put the decision back in the callers' hands: `PinSigningPolicy` carries whether this run
-may sign at all (`false` only for `session doctor --no-sign`) and which config directory holds the
-certificate backup. A run that states no policy — a plain `zellij` launch — signs, which is exactly
-the caller that must. `--no-sign` now leaves an anchored pin BOTH unsigned and unreplaced; it used
-to fall through to the copy and destroy the signature.
+On Linux and anywhere without `codesign`, nothing changes: no pin reads as anchored, and the copy
+runs as it always did.
 
-The cost is that a machine stuck in the third row runs the signing ladder on every watchdog tick and
-warns every minute. That is deliberate: the state ends the moment somebody runs
-`zellij session doctor --fix` at the machine, and a warning nobody sees is how the old fault lasted
-two releases.
-
-On Linux and anywhere without a signing context, nothing changes: `codesign` cannot answer, no pin
-reads as anchored, and the copy runs as it always did.
-
-**The rename is still not coordinated with `session up`, but it no longer loses quietly.** Signing
-is copy → sign → verify → `rename`, and `install_pinned_exe` does its own copy → rename. A
-`session up` that lands a newer pin while doctor is mid-run used to be undone by doctor's signed
-copy of the older one, and a rename over a file says nothing about what was there, so the machine
-went back a build in silence.
-
-The pin's length and mtime are now read before the copy and compared immediately before the rename.
-A pin that was replaced underneath — or removed, or created where there was none — makes the run
-discard its signed temp and refuse, naming `zellij session doctor --fix` as the way to finish.
-Deliberately a comparison and not a lock: ordering two renames into one directory would need a lock
-that both commands take, and that is new machinery with new ways to wedge, for a race that needs the
-two commands typed seconds apart. What is bought is that the silent half is gone — the run that
-would have clobbered says so, and the recovery is the same one command it always was.
-
-**The same-team assumption is checked and no longer assumed.** Falling from a Developer ID to an
-Apple Development certificate keeps the requirement only while both carry the same team, and until
-nkmk.23 the walk compared neither the team id nor the requirement it would derive — so a keychain
-holding certificates from two teams fell to a different `certificate leaf[subject.OU]` and dropped
-every grant exactly as a demotion would. It is now refused; see [the entry
-below](#a-fall-to-another-teams-certificate-is-refused-instead-of-dropping-every-grant).
+**The rename is not coordinated with `session up`, but it does not lose quietly.** The pin's length
+and mtime are read before the copy and compared immediately before the rename. A pin that was
+replaced underneath — or removed, or created where there was none — makes the run discard its temp
+and refuse, naming `zellij session doctor --fix` as the way to finish. Deliberately a comparison
+and not a lock: ordering two renames into one directory would need a lock both commands take, for
+a race that needs the two commands typed seconds apart.
 
 **A re-grant is asked for only when the requirement actually changed**, and the question is put to
-the two requirement TEXTS — the one read off the pin before signing and the one read off the signed
-copy after. It used to be inferred from the state of the machine: a bundle sitting in the signing
-directory meant "this machine has signed with a certificate of its own". On a Mac that had never
-used that rung, but carried leftovers from an older shell script, that sent the user into System
-Settings to redo three permissions against a requirement that was character-for-character the one
-already there. A pin re-signed with the same certificate carries the same requirement — that is the
-entire premise of this feature — so the ordinary case, a rebuild on a machine already set up, needs
-only the restart.
-
-**`codesign --verify` exiting 0 says nothing about whether a grant survived.** It answers "is this
-signature intact", not "is this the requirement macOS recorded" — an ad-hoc pin verifies perfectly
-and holds nothing past its next rebuild. The requirement is what doctor prints and compares, and
-verification is a second question asked alongside it, never instead of it.
-
-**A refusal quotes `codesign`'s error and not its first line.** `-f` makes it announce
-`<path>: replacing existing signature` before anything else on every run after the first, so a
-report that quoted line 1 told the user their run had failed with the one thing that had gone
-right — hiding, on a real Mac, a key ACL that had never been granted. The informational line is
-dropped and the rest is kept, joined and capped.
-
-After a signing, the follow-up is given in the order that makes it one pass: re-grant Full Disk
-Access, Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
+the two requirement TEXTS — the one read off the pin before and the one the new build carries. A
+release over a pin already on the release's requirement carries the same requirement, so the
+ordinary case, an upgrade on a machine already set up, needs only the restart. When it did change,
+the follow-up is given in the order that makes it one pass: re-grant Full Disk Access,
+Accessibility and Screen Recording for the pin's exact path **first**, then `zellij session
 restart`, so the new server comes up already holding them.
-
-**What 0.45.0-nkmk.7 actually did on two real Macs, since the ledger should say.** It fixed the two
-faults it set out to fix and shipped three more, and every one of them was a rung no test machine
-had reached before. On the machine with an Apple Development certificate the rung signed — and the
-signature failed its own designated requirement, because the team id came off the identity's name;
-doctor did not verify what it had written, so the next run read the requirement's text, called the
-pin healthy and exited 0. It reported success, told the user to re-grant three permissions against a
-requirement the binary fails, and would never have signed again. On the machine with none, the
-minted rung still could not import: the algorithms were right and the empty passphrase was not, and
-because a bundle on disk was re-imported rather than re-minted, the code that fixed the algorithms
-never ran there at all.
-
-The lesson is narrower than "test more". **A signing flow is not proven by the rung the developer's
-machine happens to hold**, and each of the three had been sitting behind one: the requirement bug
-behind the Apple Development rung, the passphrase behind the minted one, the reuse behind a machine
-that had already failed once. The verification step is the general guard, because it does not care
-which rung produced the signature — and it is also the reason the first two were invisible: doctor
-asked whether the requirement *read* correctly, which is a question a broken signature answers
-yes to.
 
 **Doctor run from the pin looks past the pin (nkmk.25, 2026-09-29).** With `pin_exe` on, the pin
 directory is first on `PATH`, so a bare `zellij session doctor` usually runs the pin itself. The
@@ -5423,6 +5202,11 @@ the property that function's doc comment already claimed.
 
 ### Doctor sets aside a signing bundle that is not its own
 
+**Removed in nkmk.30.** Doctor no longer imports, mints or sets aside a signing bundle, so this
+behaviour went with the ladder. A `.foreign-` or `.broken-` bundle an older doctor set aside is left
+where it is. See [The per-Mac signing ladder is
+gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
+
 `zellij session doctor --sign` re-imports `signing/id.p12` rather than minting a second
 certificate, because the certificate's hash **is** the requirement every grant on the machine
 records. That rule is right and stays. What was missing is that a clean import proves the file was
@@ -5486,8 +5270,10 @@ meanwhile, and renamed into place. The stamp records the build. Nothing runs `co
 `security`, and no password is read. A copy or rename that fails leaves the previous pin in place
 and does not fall to the ladder, because the ladder would meet the same filesystem.
 
-Any other build goes down the ladder exactly as before: a local `cargo build`, a stock upstream
+Any other build went down the ladder exactly as before: a local `cargo build`, a stock upstream
 binary, a source-formula build. An anchored pin with no refresh pending is still left alone.
+(Superseded later in nkmk.30: the ladder is gone, and such a build is refused over an anchored
+pin. See the next entry.)
 
 **The first release pin owes a re-grant, once.** The mini's pin is anchored on Apple Development
 under another team, and m1p's on our minted certificate (`certificate leaf = H"…"`). The release
@@ -5500,8 +5286,8 @@ Every door into an anchored pin's refresh reaches this through the shared transa
 `session up`, `session enable` and the interactive launch's `pin_exe` refresh go through
 `install_pinned_exe` → `guard_anchored_pin` → `refresh_pin_through_signing` → `sign_pin`.
 `doctor --fix` hands the refresh to its signing check, which calls `sign_pin` directly. Their pin
-lines still say "refreshed and signed", because the outcome is `PinOutcome::Signed`; the signing
-finding says what happened. A pin that is not anchored gets the plain copy, as before, and a plain
+lines said "refreshed and signed", because the outcome was `PinOutcome::Signed`; the next entry
+renames it `PinOutcome::AsReleased` and fixes the wording. A pin that is not anchored gets the plain copy, as before, and a plain
 copy of a release build keeps its signature too.
 
 `zellij-utils/src/session_signing.rs` only. `install_signed_build` and
@@ -5512,6 +5298,84 @@ and no `security` call; the first release over another team's pin records the re
 later run still asks; a release over a pin on the release requirement records nothing; and another
 team's Developer ID, an Apple Development certificate of the release team, and an ad-hoc build all
 still go down the ladder.
+
+### The per-Mac signing ladder is gone; a release is signed once, in CI
+
+```
+Needs you
+  signing   <pin> is not a release build, so the pin holds no grants
+            its signature is ad-hoc: the requirement names its own code hash
+            nothing is signed on this machine; the release is signed once, in CI
+            install the brew release to get a signed pin, then `zellij session doctor --fix`
+```
+
+From nkmk.30. The entry above pins a release build as it arrived. That left the per-Mac ladder
+doing one job: re-signing every build that was NOT a release. Nothing on the fleet needs that, and
+the ladder was the largest single block of divergence in the fork: about 4,000 lines of
+`session_signing.rs`, its tests, and the keychain handling around it. It is removed.
+
+What went, from `zellij-utils/src/session_signing.rs` and its callers:
+
+- the rungs: Apple Development (`requirement_for`, the team read off the certificate with
+  `team_id_from_keychain` and `team_id_from_subject`), the minted self-signed certificate
+  (`ensure_self_signed`, `mint_self_signed`, `pkcs12_arguments`, `import_bundle`, `set_aside`,
+  `back_up_identity`) and the Developer ID rung that signed locally;
+- the walk: `rung_ladder`, `choose_rung`, `sign_down_the_ladder`, `perform_signing`,
+  `ladder_for_the_anchor`, `judge_fall`, `find_identities`, `parse_identities`,
+  `foreign_zellij_identities`, `judge_reimport`, `sign_arguments`, `xcode_steps`;
+- the keychain: `ZELLIJ_KEYCHAIN_PASSWORD`, `security unlock-keychain`,
+  `security set-key-partition-list`, `default_keychain`, and the key-access remedies;
+- the signing bundle: doctor no longer creates, imports, backs up or sets aside anything under
+  `~/Library/Application Support/zellij/signing/` except `regrant-owed`. Any `id.p12`, `cert.pem`,
+  `key.pem` or `zellij-signing-id.p12` an older doctor left is ignored, and left in place.
+  `PinSigningPolicy::backup_dir` and `SigningContext`'s `keychain`, `keychain_password` and
+  `backup_dir` went with it.
+
+What stayed: the pin and its one writer, the RC refusal, `verify_signature`, `read_signature`,
+`team_id_from_requirement`, the as-is install (`build_carries_our_developer_id`,
+`install_signed_build`, `settle_the_grants`), the `regrant-owed` record and `--regranted`, the
+leave-alone branch for an anchored pin that verifies, and the domain, launch-agent and
+Full Disk Access checks.
+
+What a build that is not a release gets now:
+
+| Where | Before | Now |
+|---|---|---|
+| over an ad-hoc or unsigned pin | plain copy, then doctor signed it with the best rung | plain copy; doctor reports the `Needs you` above and signs nothing |
+| over an anchored pin | signed into place by the ladder | refused: the signed pin stays, on the previous build (`PinOutcome::Kept`) |
+| an anchored pin that does not verify | signed again | `Needs you`: remove the pin and run `doctor --fix` from the brew release |
+
+**A pin on a retired rung is not fought.** One Mac's pin is anchored on Apple Development under
+another team, and another's on the minted certificate. Both still verify, so doctor leaves them alone
+and reports them `Already correct`. The next release build refreshes each pin as it arrived, and the
+switch records the owed re-grant (see the entry above).
+
+**`--sign` and `--no-sign` stay, with a narrower meaning.** Nothing signs, so `--no-sign` now means
+"leave a signed pin exactly as it is, even for a release build". `--sign` is the default and is
+still accepted, because older setup scripts pass it.
+
+Two wording fixes from the rc.1 Mac proof:
+
+- `session up`, `session enable` and doctor's `pin` line said "refreshed and signed the pinned
+  copy" after an as-is install, because the outcome was `PinOutcome::Signed`. The outcome is now
+  `PinOutcome::AsReleased`, and they say "refreshed the pinned copy with the release's own
+  signature at <pin>". `PinOutcome::Signed` and `PinRefresh::Signed` are gone; nothing returns them.
+- The owed re-grant said "an earlier run re-signed it with another certificate". After an as-is
+  install it now says "an earlier run switched this pin to the release's Developer ID requirement,
+  and the grants were made against the old one". A record from any other switch says "moved this
+  pin to another requirement".
+
+The warning a refused refresh prints on stderr now ends "Install the brew release to finish the
+upgrade" instead of sending the reader to `doctor --fix` from a desktop terminal, which could no
+longer sign anything.
+
+Tests: about 90 tests of removed code went with it. Kept and adjusted: the signature parsing, the
+re-grant record (`a_switch_stays_owed_on_later_runs_until_the_operator_says_it_is_made` now switches
+through a release install), the refresh deferral, the temp sweep and the four as-is tests. New or
+rewritten: an ad-hoc or unsigned pin is reported as not a release build with nothing run but
+`codesign -d`; an anchored pin that does not verify is a `Needs you` and nothing signs it; and
+another team's Developer ID, an Apple Development certificate of the release team and an ad-hoc
+build are each refused over a signed pin, leaving its bytes and recording nothing.
 
 ### `connect_to_server` gives up on a session that answers to no server
 
@@ -5822,6 +5686,9 @@ behaviour itself is still worth a run on a Mac.
 
 ### A certificate that was minted is reported and backed up, whatever the import did
 
+**Removed in nkmk.30.** Nothing is minted or backed up any more. See [The per-Mac signing ladder is
+gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
+
 `ensure_self_signed` mints once in the life of a machine, and the certificate it makes cannot be
 made again: its hash **is** the requirement every grant on the machine records. The import that
 follows the mint was a `?`.
@@ -5893,6 +5760,9 @@ upgrading reports drift and asks for a `session enable`. That is the intended pa
 one-time cost.
 
 ### The key ACL grant names our own key
+
+**Removed in nkmk.30.** Doctor runs no `security set-key-partition-list` any more. See [The per-Mac
+signing ladder is gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
 
 `security set-key-partition-list -S apple-tool:,apple:,codesign: -s <keychain>` was passed no match
 term. `-s` selects every private key in the named keychain that can sign, and the keychain named is
@@ -6076,6 +5946,9 @@ the same session never reaches the loader.
 
 ### A keychain that will not answer is not a keychain with nothing in it
 
+**Removed in nkmk.30.** Doctor asks the keychain nothing any more. See [The per-Mac signing ladder
+is gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
+
 `find_identities` read `security find-identity` and returned a list. Both ways that command can fail
 came back as an empty one. The `Err` arm — the command not running at all — was mapped to
 `Vec::new()` outright, and the `Ok` arm never looked at `success`, which is where the real failure
@@ -6098,6 +5971,9 @@ would have set aside the bundle that had just imported perfectly well, so a fail
 leaves the file where it is and says so.
 
 ### A dry run's "would sign" is a repair, not a reassurance
+
+**Removed in nkmk.30.** Nothing signs, so no dry run says "would sign". See [The per-Mac signing
+ladder is gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
 
 `session doctor --dry-run` reaching a rung it could sign with filed the finding as `Already
 correct`. The branch is only reached because the pin's signature is wrong — unsigned, ad-hoc, or
@@ -8022,6 +7898,9 @@ pane that still holds still names its command, because that one can be re-run wi
 
 ### A fall to another team's certificate is refused instead of dropping every grant
 
+**Removed in nkmk.30.** There is no walk to fall down. See [The per-Mac signing ladder is
+gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
+
 ```
 signing  Needs you   ~/.local/share/zellij/bin/zellij holds grants recorded against team
                      A1B2C3D4E5, and the certificate below belongs to team Z9Y8X7W6V5
@@ -8069,6 +7948,10 @@ writes, the seven-case verdict table, and a two-team keychain driven through `si
 that proves the other team's certificate is never handed to `codesign`.
 
 ### Doctor keeps the certificate the grants name, and remembers a switch until the re-grant is made
+
+**Removed in nkmk.30.** The certificate half went with the ladder. The `regrant-owed` record and
+`--regranted` stay, and the as-is release install writes it. See [The per-Mac signing ladder is
+gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
 
 Fixed in nkmk.27; seen on a Mac at nkmk.26. The pin was anchored on our own minted certificate. The user then added
 an Apple Development identity to the keychain. The next `session doctor --fix` refreshed the pin and
