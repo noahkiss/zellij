@@ -8246,7 +8246,9 @@ prefixes this fork names branches after — `feat/`, `fix/`, `ci/`, `chore/`, `d
 `refactor/`, `style/`, `test/`, `rc/` — so a patch goes green where it is written rather than after
 it lands, which is what "prove it on the branch" needs. The list is enumerated rather than `**` so
 that `backup/` snapshots and `rebase/` scratch branches do not each burn a full matrix, and a
-`rust-${{ github.ref }}` concurrency group cancels a superseded push. `e2e.yml` is deliberately not
+`rust-${{ github.ref }}` concurrency group cancels a superseded push. From nkmk.31 that applies to
+topic branches only: a run on `main` or a tag is never cancelled, in `rust.yml` or `e2e.yml`,
+because a release needs green runs on the exact tagged commit. `e2e.yml` is deliberately not
 on that list — it builds a binary and drives it through a docker terminal, and it is the slowest
 thing here — but it now has a `workflow_dispatch`, so it can be aimed at a branch on demand.
 
