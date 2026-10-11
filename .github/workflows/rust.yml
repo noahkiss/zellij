@@ -55,10 +55,12 @@ env:
 
 # A superseded push cancels its stale run. This matters more now that every topic
 # branch triggers: without it, a branch pushed three times in a minute holds three
-# full matrices. Same group shape as e2e.yml.
+# full matrices. Same group shape as e2e.yml. A push to main or a tag is never
+# cancelled: the release rule needs a green run on the exact commit that was
+# tagged, and a second push to main must not erase the first one's verdict.
 concurrency:
   group: rust-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
