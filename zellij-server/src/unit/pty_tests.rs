@@ -25,6 +25,10 @@ struct MockOsApi {
     quit_cb: Arc<Mutex<Option<QuitCb>>>,
     /// Every signal this api was asked to deliver, as (pid, signal name).
     signals: Arc<Mutex<Vec<(u32, &'static str)>>>,
+    /// terminal_id -> what that pane's pty fd answers as its foreground command, whatever pid the
+    /// pane is asked about. Stands in for `tcgetpgrp` on a fd number another pane's pty reused.
+    /// `clear_terminal_id` forgets the fd, as the real one does.
+    foreground_by_terminal: Arc<Mutex<HashMap<u32, Vec<String>>>>,
 }
 
 impl MockOsApi {
@@ -35,7 +39,20 @@ impl MockOsApi {
             cmds_by_ppid: Arc::new(Mutex::new(HashMap::new())),
             quit_cb: Arc::new(Mutex::new(None)),
             signals: Arc::new(Mutex::new(Vec::new())),
+            foreground_by_terminal: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+    fn set_terminal_foreground(&self, terminal_id: u32, cmd: Vec<String>) {
+        self.foreground_by_terminal
+            .lock()
+            .unwrap()
+            .insert(terminal_id, cmd);
+    }
+    fn knows_terminal_fd(&self, terminal_id: u32) -> bool {
+        self.foreground_by_terminal
+            .lock()
+            .unwrap()
+            .contains_key(&terminal_id)
     }
     /// Make the process behind the last spawned pane exit with this status.
     fn exit_last_spawned_pane(&self, pane_id: PaneId, exit_status: Option<i32>) {
@@ -174,9 +191,15 @@ impl ServerOsApi for MockOsApi {
         _: &Option<String>,
     ) -> HashMap<u32, Vec<String>> {
         let cmds = self.cmds.lock().unwrap();
+        let by_terminal = self.foreground_by_terminal.lock().unwrap();
         panes
             .iter()
-            .filter_map(|(terminal_id, pid)| cmds.get(pid).map(|cmd| (*terminal_id, cmd.clone())))
+            .filter_map(|(terminal_id, pid)| {
+                by_terminal
+                    .get(terminal_id)
+                    .or_else(|| cmds.get(pid))
+                    .map(|cmd| (*terminal_id, cmd.clone()))
+            })
             .collect()
     }
     fn write_to_file(&mut self, _: String, _: Option<String>) -> anyhow::Result<()> {
@@ -190,7 +213,11 @@ impl ServerOsApi for MockOsApi {
     ) -> anyhow::Result<(Box<dyn AsyncReader>, Option<u32>)> {
         unimplemented!()
     }
-    fn clear_terminal_id(&self, _: u32) -> anyhow::Result<()> {
+    fn clear_terminal_id(&self, terminal_id: u32) -> anyhow::Result<()> {
+        self.foreground_by_terminal
+            .lock()
+            .unwrap()
+            .remove(&terminal_id);
         Ok(())
     }
 }
@@ -207,18 +234,58 @@ fn make_pty_with_plugin_receiver(
     (pty, plugin_rx)
 }
 
+/// The other ends of the channels a real pty bus sends on, kept open so its sends land.
+struct PtyBusReceivers {
+    pty: channels::Receiver<(PtyInstruction, ErrorContext)>,
+    _screen: channels::Receiver<(ScreenInstruction, ErrorContext)>,
+    _plugin: channels::Receiver<(PluginInstruction, ErrorContext)>,
+    _server: channels::Receiver<(crate::ServerInstruction, ErrorContext)>,
+    _pty_writer: channels::Receiver<(crate::pty_writer::PtyWriteInstruction, ErrorContext)>,
+    _background_jobs: channels::Receiver<(crate::background_jobs::BackgroundJob, ErrorContext)>,
+}
+
+/// The bus a real server gives the pty thread, built by the function the server builds it with.
+fn real_pty_bus(mock: MockOsApi) -> (Bus<PtyInstruction>, PtyBusReceivers) {
+    let (_, pty_receiver_of_bus) = channels::unbounded::<(PtyInstruction, ErrorContext)>();
+    let (pty_tx, pty_rx) = channels::unbounded();
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let (plugin_tx, plugin_rx) = channels::unbounded();
+    let (server_tx, server_rx) = channels::unbounded();
+    let (pty_writer_tx, pty_writer_rx) = channels::unbounded();
+    let (background_jobs_tx, background_jobs_rx) = channels::unbounded();
+    let bus = crate::pty_thread_bus(
+        pty_receiver_of_bus,
+        &SenderWithContext::new(screen_tx),
+        &SenderWithContext::new(pty_tx),
+        &SenderWithContext::new(plugin_tx),
+        &SenderWithContext::new(server_tx),
+        &SenderWithContext::new(pty_writer_tx),
+        &SenderWithContext::new(background_jobs_tx),
+        Box::new(mock),
+    );
+    let receivers = PtyBusReceivers {
+        pty: pty_rx,
+        _screen: screen_rx,
+        _plugin: plugin_rx,
+        _server: server_rx,
+        _pty_writer: pty_writer_rx,
+        _background_jobs: background_jobs_rx,
+    };
+    (bus, receivers)
+}
+
 /// A pty whose own instruction channel a test can read, to see what a quit callback sent back.
+///
+/// Its bus is the one a real server builds, so a test that reads the pty channel tests the wiring
+/// too, not a channel the test added.
 fn make_pty_with_pty_receiver(
     mock: MockOsApi,
 ) -> (Pty, channels::Receiver<(PtyInstruction, ErrorContext)>) {
-    let (plugin_tx, _plugin_rx) = channels::unbounded();
-    let (pty_tx, pty_rx) = channels::unbounded();
-    let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
-    bus.os_input = Some(Box::new(mock));
-    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
-    bus.senders.to_pty = Some(SenderWithContext::new(pty_tx));
+    let (mut bus, receivers) = real_pty_bus(mock);
+    // the other receivers go with `receivers`; their sends are not what these tests read
+    bus.senders.should_silently_fail = true;
     let pty = Pty::new(bus, false, None, None, None, None, None, None);
-    (pty, pty_rx)
+    (pty, receivers.pty)
 }
 
 /// A pty whose screen channel a test can read, to see what each tick told Screen.
@@ -1286,4 +1353,223 @@ fn the_live_list_reports_an_osc_session_while_its_agent_runs() {
         .store(true, Ordering::Relaxed);
     pty.update_and_report_cwds();
     assert_eq!(pty.osc_agent_session(1), None);
+}
+
+/// A real server's pty thread can hear from the thread that reaped a held pane's child. Its bus
+/// once had no sender to itself, so this message was dropped and the held pane kept its dead pid.
+#[test]
+fn the_pty_threads_own_bus_can_tell_it_a_child_was_reaped() {
+    let mock = MockOsApi::new();
+    let (bus, receivers) = real_pty_bus(mock.clone());
+    let mut pty = Pty::new(bus, false, None, None, None, None, None, None);
+    let held_command = RunCommand {
+        command: PathBuf::from("/bin/does-not-matter"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(held_command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .expect("the mock spawns a terminal");
+
+    mock.exit_last_spawned_pane(PaneId::Terminal(1), Some(0));
+
+    let mut forgotten = vec![];
+    while let Ok((instruction, _)) = receivers.pty.try_recv() {
+        if let PtyInstruction::ChildProcessExited(terminal_id) = instruction {
+            forgotten.push(terminal_id);
+        }
+    }
+    assert_eq!(
+        forgotten,
+        vec![1],
+        "the pty thread's own bus should carry the reaper's message back to it"
+    );
+}
+
+fn command_pane(terminal_id: u32, argv: &[&str]) -> PaneLayoutMetadata {
+    let mut run_command = RunCommand::new(PathBuf::from(argv[0]));
+    run_command.args = argv[1..].iter().map(|arg| (*arg).to_owned()).collect();
+    pane_running(terminal_id, Some(Run::Command(run_command)))
+}
+
+fn two_command_panes_meta() -> SessionLayoutMetadata {
+    let mut meta = SessionLayoutMetadata::default();
+    meta.add_tab(
+        "tab1".to_owned(),
+        true,
+        false,
+        vec![
+            command_pane(1, &["sh", "-c", "sleep 1"]),
+            command_pane(2, &["sleep", "999"]),
+        ],
+        vec![],
+    );
+    meta
+}
+
+/// A held pane's pty fd closed with its process, and the next pane's pty may be handed the same
+/// number. Asked about that fd, the OS answers for the other pane. Once the pid is forgotten the
+/// held pane is not asked at all, and it is serialized as its own command.
+#[test]
+fn a_held_pane_is_serialized_as_its_own_command_not_the_pane_that_took_its_fd() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["sh".into(), "-c".into(), "sleep 1".into()]);
+    mock.set_cmd(200, vec!["sleep".into(), "999".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock.clone());
+    pty.id_to_child_pid.insert(1, 100);
+    pty.id_to_child_pid.insert(2, 200);
+    pty.command_terminal_ids.insert(1);
+    pty.command_terminal_ids.insert(2);
+    // pane 1's command exits; pane 2's pty reuses its fd number
+    mock.set_terminal_foreground(1, vec!["sleep".into(), "999".into()]);
+
+    // the leak, while the pid is still held
+    let mut meta = two_command_panes_meta();
+    pty.populate_session_layout_metadata(&mut meta);
+    let Some(Run::Command(leaked)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        leaked.command,
+        PathBuf::from("sleep"),
+        "the leak this guards"
+    );
+
+    pty.forget_child_pid(1);
+    assert!(
+        !mock.knows_terminal_fd(1),
+        "the held pane's fd is forgotten with its pid"
+    );
+
+    let mut meta = two_command_panes_meta();
+    pty.populate_session_layout_metadata(&mut meta);
+    let Some(Run::Command(own)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(own.command, PathBuf::from("sh"));
+    assert_eq!(own.args, vec!["-c".to_owned(), "sleep 1".to_owned()]);
+    let Some(Run::Command(other)) = meta.terminal_run(2) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(2));
+    };
+    assert_eq!(other.command, PathBuf::from("sleep"));
+}
+
+/// A held agent pane keeps the session its agent last reported, and serializes with it.
+#[test]
+fn a_held_agent_pane_is_recorded_with_the_session_it_reported() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::Agents;
+    pty.id_to_child_pid.insert(1, 100);
+    pty.note_agent_session_from_osc(1, "osc-held".to_owned());
+
+    pty.forget_child_pid(1);
+    pty.expire_osc_agent_sessions();
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        run_command.args,
+        vec!["--resume".to_owned(), "osc-held".to_owned()]
+    );
+    assert!(!pty.resume_misses.contains_key(&1));
+}
+
+/// The id the last tick found - claude's own record, here - is frozen with where it came from.
+#[test]
+fn a_held_agent_pane_keeps_the_session_the_tick_found_and_its_source() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::Agents;
+    pty.id_to_child_pid.insert(1, 100);
+    pty.terminal_cmds.insert(1, vec!["claude".into()]);
+    let harness = agent_detect::harness_for_command("claude").unwrap();
+    let mut found = BTreeMap::new();
+    found.insert(claude_identity_key(harness), "record-held".to_owned());
+    found.insert(AGENT_KIND.to_owned(), "claude".to_owned());
+    pty.terminal_agent_envs.insert(1, found);
+    pty.agent_env_probes.insert(
+        1,
+        AgentEnvProbe {
+            child_pid: 100,
+            found: true,
+            ticks_since_probe: 0,
+            live_session: Some(LiveSession::ClaudeRecord {
+                pid: 100,
+                dir: PathBuf::from("/nonexistent"),
+            }),
+        },
+    );
+
+    pty.forget_child_pid(1);
+    let held = pty.held_panes.get(&1).expect("the held pane is kept");
+    assert_eq!(held.agent_session_id.as_deref(), Some("record-held"));
+    assert_eq!(held.session_source(), "record");
+
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+    pty.populate_session_layout_metadata(&mut meta);
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        run_command.args,
+        vec!["--resume".to_owned(), "record-held".to_owned()]
+    );
+}
+
+/// A held agent pane whose session was never found is recorded with its picker, as before.
+#[test]
+fn a_held_agent_pane_with_no_session_is_recorded_with_its_picker() {
+    let mock = MockOsApi::new();
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::Agents;
+    pty.id_to_child_pid.insert(1, 100);
+
+    pty.forget_child_pid(1);
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(run_command.args, vec!["--resume".to_owned()]);
+    assert!(pty.resume_misses.contains_key(&1));
+}
+
+/// A held pane is still in the pane list, with no pid and no command - its process is gone -
+/// but with its cwd and its agent's session.
+#[test]
+fn a_held_pane_is_listed_with_no_pid_and_no_command() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into()]);
+    mock.set_cwd(100, PathBuf::from("/work"));
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock);
+    set_active_terminal(&mut pty, 1, 100);
+    pty.note_agent_session_from_osc(1, "osc-held".to_owned());
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    assert_eq!(reports.last().expect("a report")[&1].pid, Some(100));
+
+    pty.forget_child_pid(1);
+    pty.update_and_report_cwds();
+
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("a report")[&1];
+    assert_eq!(info.pid, None);
+    assert_eq!(info.command, None);
+    assert_eq!(info.cwd, Some(PathBuf::from("/work")));
+    assert_eq!(info.osc_agent_session.as_deref(), Some("osc-held"));
+
+    // closed, it is gone from the list
+    pty.close_pane(PaneId::Terminal(1)).expect("TEST");
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    assert!(!reports.last().expect("a report").contains_key(&1));
 }

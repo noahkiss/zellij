@@ -2695,6 +2695,35 @@ fn serialize_session_before_exit(session_data: &Arc<RwLock<Option<SessionMetaDat
     }
 }
 
+/// The pty thread's bus.
+///
+/// It carries a sender to the pty thread itself: the reaper of a held pane's child runs on
+/// another thread and tells this one to forget the pid (`PtyInstruction::ChildProcessExited`).
+/// Upstream's bus had no such sender, so that message was dropped and a held pane kept its dead
+/// pid. Built here, not inline, so a test can build the bus a real server runs on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pty_thread_bus(
+    pty_receiver: channels::Receiver<(PtyInstruction, zellij_utils::errors::ErrorContext)>,
+    to_screen: &SenderWithContext<ScreenInstruction>,
+    to_pty: &SenderWithContext<PtyInstruction>,
+    to_plugin: &SenderWithContext<PluginInstruction>,
+    to_server: &SenderWithContext<ServerInstruction>,
+    to_pty_writer: &SenderWithContext<PtyWriteInstruction>,
+    to_background_jobs: &SenderWithContext<BackgroundJob>,
+    os_input: Box<dyn ServerOsApi>,
+) -> Bus<PtyInstruction> {
+    Bus::new(
+        vec![pty_receiver],
+        Some(to_screen),
+        Some(to_pty), // the held-pane reaper tells this thread to forget the pid
+        Some(to_plugin),
+        Some(to_server),
+        Some(to_pty_writer),
+        Some(to_background_jobs),
+        Some(os_input),
+    )
+}
+
 fn init_session(
     os_input: Box<dyn ServerOsApi>,
     to_server: SenderWithContext<ServerInstruction>,
@@ -2767,15 +2796,15 @@ fn init_session(
         .spawn({
             let layout = layout.clone();
             let pty = Pty::new(
-                Bus::new(
-                    vec![pty_receiver],
-                    Some(&to_screen_bounded),
-                    None,
-                    Some(&to_plugin),
-                    Some(&to_server),
-                    Some(&to_pty_writer),
-                    Some(&to_background_jobs),
-                    Some(os_input.clone()),
+                pty_thread_bus(
+                    pty_receiver,
+                    &to_screen_bounded,
+                    &to_pty,
+                    &to_plugin,
+                    &to_server,
+                    &to_pty_writer,
+                    &to_background_jobs,
+                    os_input.clone(),
                 ),
                 cli_assets.is_debug,
                 config_options.scrollback_editor.clone(),

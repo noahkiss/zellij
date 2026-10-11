@@ -3910,7 +3910,9 @@ to its own `OPENCODE_SESSION_ID`). Unproven: the
 interactive codex TUI, which stopped at sign-in and never started a session.
 
 A miss is logged at `warn` once per pane, when its reason changes, with the pid, the agent and the
-reason, so the server log answers "why did this pane come back with a picker". The serialized
+reason, so the server log answers "why did this pane come back with a picker". A pane held open
+after its agent exited is recorded with the id its agent last held, not its picker: see [A held
+pane forgets its dead pid](#a-held-pane-forgets-its-dead-pid). The serialized
 layout carries the id in the pane's arguments and no new key: the layout parser rejects a pane
 property it does not know, so a key here would make a nkmk.31 snapshot unrestorable on a rollback.
 
@@ -4613,7 +4615,9 @@ has turned off canonical input, or a pane whose reader has wedged, will not do. 
 happens to be focused, and requiring it makes the command safe in a detached session. Naming a pane
 that does not exist, or a plugin pane, which runs no process, fails with the reason on stderr rather
 than warning into the log. A pane held open after its command exited fails the same way: its child
-was reaped, and the pid it ran with may since have been given to an unrelated process.
+was reaped, and the pid it ran with may since have been given to an unrelated process. Until
+nkmk.31 that refusal never fired in a running server, and the signal went to the dead pid: see [A
+held pane forgets its dead pid](#a-held-pane-forgets-its-dead-pid).
 
 The signal goes to the process zellij spawned for the pane — the pane's shell — which is what the
 plugin API has always done. A shell without job control runs its command in that same process, so
@@ -8154,6 +8158,63 @@ own tests. Four `sign_pin` tests drive the Mac's flow with a recorded `codesign`
 keychain keeps our certificate; a refusal from it does not fall to the Apple one; a forced
 switch stays owed through a later dry run until `--fix --regranted`; and a pin back on the granted
 requirement clears the record, but only in a run that may act.
+
+### A held pane forgets its dead pid
+
+```
+$ zellij run -- sh -c 'sleep 1'     # exits, and the pane is held
+$ zellij run -- sleep 999           # its pty takes the held pane's fd number
+$ zellij action list-panes --json | jq -c '.[] | select(.is_held) | {terminal_command, pane_pid}'
+{"terminal_command":"sh -c sleep 1","pane_pid":null}
+$ zellij action dump-layout | grep -A1 'name="sh -c sleep 1"'
+pane command="sleep" name="sh -c sleep 1" ... {             # before: the other pane's program
+    args "999"
+pane command="sh" name="sh -c sleep 1" ... {                # after: its own
+    args "-c" "sleep 1"
+```
+
+From nkmk.31. Seen on a Mac at nkmk.31-rc.1: a held claude pane serialized as another pane's
+program, and `list-agents` still listed it with its dead pid. A restore would have brought the
+pane back running the wrong command.
+
+**The held pane never forgot its pid.** The thread that reaps a held pane's child tells the pty
+thread to forget the pid (`PtyInstruction::ChildProcessExited`, since `19542ba8b`). It sends on the
+pty thread's own bus, and that bus had no sender to the pty thread: upstream's wiring, because
+upstream's pty thread never messaged itself. The send failed, the failure was ignored, and
+`forget_child_pid` never ran outside a unit test. nkmk.30 had the same fault.
+
+**What the stale pid leaked.**
+
+- **Another pane's command into a restore.** Serialization still counted the held pane as live and
+  asked its pty fd for the foreground process group. That fd had closed with the process, and the
+  next pane's pty reuses the lowest free fd number - so the held pane answered with the newer
+  pane's argv. A pane with no later pane did not leak, which is why this hid.
+- **A signal to a recycled pid.** `close-pane` sent SIGHUP to the dead pid, session teardown sent
+  SIGHUP then SIGKILL to its group, and `signal-pane` signalled it instead of refusing. Once the OS
+  hands that pid out again, any of the three can kill an unrelated process.
+
+**The fix.** The pty thread's bus carries a sender to itself (`pty_thread_bus` in `lib.rs`, built
+in one place so a test builds the same bus). On `ChildProcessExited` the pane also forgets its pty
+fd, so a reused fd number is never read as the held pane. A resize of a held pane then logs one
+non-fatal line; a re-run records a fresh fd.
+
+**The held pane keeps its agent's session.** With no process, a held agent pane would serialize
+with its picker. The pty thread now freezes, per pane, the session id it last resolved while the
+process lived - the `OSC 1337` report, claude's record, the open file, or an identity variable -
+with its source. Serialization records `--resume <that id>`. The picker remains the answer only
+when nothing was ever resolved. The frozen id goes when the pane re-runs or closes.
+
+**Visible change.** A held pane reports `pane_pid` null and no `pane_command`; `pane_cwd` stays.
+`list-agents` still lists a held agent pane, by the command it was started with, with `pid: null`
+and the frozen `agent_id` and `session_source` as they were. No new JSON field: `pid: null` already
+says the pane is held.
+
+`zellij-server` only: `lib.rs` (the bus) and `pty.rs` (`HeldPane`, `forget_child_pid`, the pin pass,
+the process report). Six `pty_tests`: the bus from `pty_thread_bus` delivers the reaper's message,
+and the existing forget test now runs on that bus; a held pane serializes its own command when its
+fd answers for another pane; a held agent pane records its reported session, its tick-found
+session with its source, or its picker when it had none; and a held pane lists with no pid and no
+command.
 
 ## Assessed and deliberately not built
 

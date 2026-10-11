@@ -286,6 +286,33 @@ impl OscAgentSession {
     }
 }
 
+/// What a held pane keeps of the agent it ran, once its process has exited.
+///
+/// The pid goes, because the OS may hand it to another process; the session the agent held does
+/// not. Without this a held agent pane would serialize with its picker and lose the session it
+/// was on. Frozen by `Pty::forget_child_pid`, dropped when the pane re-runs or closes.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct HeldPane {
+    /// The session id last resolved for the pane's agent while it ran: its `OSC 1337` report, or
+    /// the id its own record, open file or identity variable gave the last tick.
+    agent_session_id: Option<String>,
+    /// The agent half of the pane's last [`PaneProcessInfo`], as it was.
+    agent_env: BTreeMap<String, String>,
+    agent_session_source: Option<String>,
+    osc_agent_session: Option<String>,
+}
+
+impl HeldPane {
+    /// Where `agent_session_id` came from, in `session_source`'s words.
+    fn session_source(&self) -> &str {
+        if self.osc_agent_session.is_some() {
+            "osc"
+        } else {
+            self.agent_session_source.as_deref().unwrap_or("env")
+        }
+    }
+}
+
 /// What the last identity walk of a pane found, and what would make another one worth doing.
 ///
 /// The walk is the expensive half of agent detection, and its answer is stable: a pane is one
@@ -390,6 +417,9 @@ pub(crate) struct Pty {
     agent_env_probes: HashMap<u32, AgentEnvProbe>,
     /// terminal_id -> the session the pane's agent reported itself with `OSC 1337`.
     osc_agent_sessions: HashMap<u32, OscAgentSession>,
+    /// terminal_id -> what a held pane kept of its agent when its pid was forgotten. See
+    /// [`HeldPane`].
+    held_panes: HashMap<u32, HeldPane>,
     /// terminal_id -> why the last serialization found no session id for that agent pane. Kept so
     /// the reason is logged when it changes, not every serialization.
     resume_misses: HashMap<u32, String>,
@@ -1185,6 +1215,7 @@ impl Pty {
             agent_env_probes: HashMap::new(),
             resume_misses: HashMap::new(),
             osc_agent_sessions: HashMap::new(),
+            held_panes: HashMap::new(),
             last_reported_detect_agents: None,
             last_reported_process_info: HashMap::new(),
             plugin_cwds: HashMap::new(),
@@ -2193,10 +2224,52 @@ impl Pty {
     /// The OS is free to hand that pid number to an unrelated process the moment it is reaped, so
     /// a held pane must neither report it as `pane_pid` nor let `signal-pane` deliver to it. A
     /// re-run spawns a fresh process and records the new pid.
+    ///
+    /// The session its agent held is kept, so the held pane still serializes and lists with it:
+    /// see [`HeldPane`]. The pane's pty fd is forgotten too. It closed with the process, and the
+    /// next pane opened may be handed the same number - asking it for a foreground process group
+    /// would then answer for that pane. A re-run records a fresh fd.
     pub fn forget_child_pid(&mut self, terminal_id: u32) {
+        let held = self.freeze_held_pane(terminal_id);
+        self.held_panes.insert(terminal_id, held);
         self.id_to_child_pid.remove(&terminal_id);
         self.terminal_foreground_cmds.remove(&terminal_id);
+        if let Some(os_input) = self.bus.os_input.as_ref() {
+            os_input
+                .clear_terminal_id(terminal_id)
+                .with_context(|| format!("failed to forget the pty fd of held pane {terminal_id}"))
+                .non_fatal();
+        }
         // `command_terminal_ids` keeps the pane: it is still a command pane, waiting to re-run
+    }
+    /// What a pane's agent was last known to hold, taken out of the maps that only describe a
+    /// live process.
+    fn freeze_held_pane(&mut self, terminal_id: u32) -> HeldPane {
+        let osc_agent_session = self
+            .osc_agent_sessions
+            .remove(&terminal_id)
+            .map(|report| report.session_id);
+        let agent_env = self
+            .terminal_agent_envs
+            .remove(&terminal_id)
+            .unwrap_or_default();
+        let agent_session_source = self
+            .agent_env_probes
+            .remove(&terminal_id)
+            .and_then(|probe| probe.live_session)
+            .map(|live| live.source().as_str().to_owned());
+        // the id the last tick wrote down, read the way detection reads it - not re-read from the
+        // record or the open file, which went with the process
+        let env_session_id = self
+            .reported_command_for(terminal_id)
+            .and_then(|command| agent_detect::detect(command, &agent_env))
+            .and_then(|agent| agent.agent_id);
+        HeldPane {
+            agent_session_id: osc_agent_session.clone().or(env_session_id),
+            agent_env,
+            agent_session_source,
+            osc_agent_session,
+        }
     }
     pub fn close_pane(&mut self, id: PaneId) -> Result<()> {
         let err_context = || format!("failed to close for pane {id:?}");
@@ -2217,6 +2290,7 @@ impl Pty {
                         .non_fatal();
                 }
                 self.pane_activity_flags.remove(&id);
+                self.held_panes.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
                 self.terminal_envs.remove(&id);
@@ -2263,6 +2337,8 @@ impl Pty {
                 }
                 let _ = self.task_handles.remove(&id); // if all is well, this shouldn't be here
                 let _ = self.id_to_child_pid.remove(&id); // if all is wlel, this shouldn't be here
+                                                          // a re-run is a new process with a session of its own
+                self.held_panes.remove(&id);
 
                 let hold_on_close = run_command.hold_on_close;
                 let originating_plugin = Arc::new(run_command.originating_plugin.clone());
@@ -2463,6 +2539,15 @@ impl Pty {
             .iter()
             .map(|(terminal_id, report)| (*terminal_id, report.session_id.clone()))
             .collect();
+        // a held pane has no process to ask, but keeps the session its agent held
+        let held_sessions: HashMap<u32, (String, String)> = self
+            .held_panes
+            .iter()
+            .filter_map(|(terminal_id, held)| {
+                let session_id = held.agent_session_id.clone()?;
+                Some((*terminal_id, (session_id, held.session_source().to_owned())))
+            })
+            .collect();
         let mut misses: HashMap<u32, String> = HashMap::new();
         session_layout_metadata.pin_live_agent_sessions(|terminal_id, kind, command| {
             let hinted = hints.map_or(false, |hints| hints.hint_for(command).is_some());
@@ -2479,6 +2564,16 @@ impl Pty {
                 return Some(Some(session_id.clone()));
             }
             let Some(pid) = terminal_ids_to_pids.get(&terminal_id) else {
+                if let Some((session_id, source)) = held_sessions.get(&terminal_id) {
+                    log::debug!(
+                        "resurrect: held terminal {} records {}'s session {} (session_source: {})",
+                        terminal_id,
+                        kind,
+                        session_id,
+                        source
+                    );
+                    return Some(Some(session_id.clone()));
+                }
                 misses.insert(terminal_id, format!("the pane has no process ({})", kind));
                 return Some(None);
             };
@@ -2766,7 +2861,7 @@ impl Pty {
     /// alongside it, because a config reload that flips the option changes nothing in the map and
     /// would otherwise never reach Screen on an idle session.
     fn report_pane_process_info(&mut self) {
-        let process_info: HashMap<u32, PaneProcessInfo> = self
+        let mut process_info: HashMap<u32, PaneProcessInfo> = self
             .id_to_child_pid
             .keys()
             .copied()
@@ -2801,6 +2896,24 @@ impl Pty {
                 )
             })
             .collect();
+        // a held pane has no process: no pid and no command, but its cwd and its agent's session
+        for (terminal_id, held) in &self.held_panes {
+            if self.id_to_child_pid.contains_key(terminal_id) {
+                continue;
+            }
+            process_info.insert(
+                *terminal_id,
+                PaneProcessInfo {
+                    pid: None,
+                    cwd: self.terminal_cwds.get(terminal_id).cloned(),
+                    command: None,
+                    env: BTreeMap::new(),
+                    agent_env: held.agent_env.clone(),
+                    agent_session_source: held.agent_session_source.clone(),
+                    osc_agent_session: held.osc_agent_session.clone(),
+                },
+            );
+        }
         if process_info == self.last_reported_process_info
             && self.last_reported_detect_agents == Some(self.detect_agents)
         {
