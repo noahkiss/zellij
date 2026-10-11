@@ -133,10 +133,22 @@ impl SharedPtys {
     pub(crate) fn rerun(&self, terminal_id: u32, quit_cb: QuitCb) -> Box<dyn AsyncReader> {
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         self.mutate(|fake_pty_registry| {
+            // a held pane forgets its pty (`clear_terminal_id`) when its process exits, as the
+            // real backend forgets the fd; a re-run then opens a fresh one
             let fake_pty_state = fake_pty_registry
                 .fake_pty_states
-                .get_mut(&terminal_id)
-                .expect("re-run for unknown terminal id");
+                .entry(terminal_id)
+                .or_insert_with(|| FakePtyState {
+                    terminal_action: None,
+                    output_tx: None,
+                    stdin: Vec::new(),
+                    size: None,
+                    size_history: Vec::new(),
+                    quit_cb: None,
+                    exited: false,
+                    echo: true,
+                    stdin_tap: None,
+                });
             fake_pty_state.output_tx = Some(output_tx);
             fake_pty_state.quit_cb = Some(quit_cb);
             fake_pty_state.exited = false;
