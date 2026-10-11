@@ -107,8 +107,17 @@ upstream `main` between tags is allowed when it is small — it is still a named
 **Reordered history does not bisect.** A logically grouped series (one commit per ledger entry,
 reordered) cannot keep every intermediate compiling — a file lands with its group, and a definition
 can sit in a group placed after one of its callers. That is accepted: the tip and the last commit
-of each release build, the middle may not. The last chronological, bisectable series is kept at
-`backup/main-pre-squash-2026-08-16`; when a bug needs `git bisect`, bisect there.
+of each release build, the middle may not. The chronological, bisectable series is kept on two
+backup branches: `backup/main-pre-squash-2026-08-16` for everything up to that squash, and
+`backup/main-pre-condense-2026-10-06` (old tip `8eb95917c`) for everything landed after it, up to
+v0.45.1-nkmk.30. When a bug needs `git bisect`, bisect there.
+
+The 2026-10-06 condense kept the base (`v0.45.1`, `efd8fd5a8`) and the tip tree, and folded docs
+follow-ups, test and snapshot touch-ups and later amendments into the commit of the ledger entry
+they amend: 185 commits became 160. Each folded commit is named on an `Also:` line in its target's
+body. Release bumps, changelogs and the `chore(upstream)` pick were not touched, and a fold that
+would have needed a conflict resolution was left as its own commit. Every release tag up to
+v0.45.1-nkmk.30 points into the pre-condense branch, not into `main`; the trees are identical.
 
 **After any history rewrite, check the series before you trust it.** Every latent bug a rewrite
 has shipped so far was visible in the series itself on the day of the rewrite. Nobody looked. Two

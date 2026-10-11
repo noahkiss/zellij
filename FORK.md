@@ -5337,6 +5337,11 @@ What stayed: the pin and its one writer, the RC refusal, `verify_signature`, `re
 leave-alone branch for an anchored pin that verifies, and the domain, launch-agent and
 Full Disk Access checks.
 
+The decision behind it, recorded 2026-10-06 at the operator's direction: from nkmk.30 the only
+supported pin is the published, CI-signed build — a release or a release candidate poured by brew.
+Nothing on a Mac signs anything, so a local `cargo build` can hold no grant, and doctor says so
+plainly instead of trying to earn one.
+
 What a build that is not a release gets now:
 
 | Where | Before | Now |
@@ -8075,6 +8080,12 @@ prebuilt assets checked into `zellij-utils/assets/plugins/`.
 Each release gets a changelog at `changelogs/v<version>.md` — the commit range plus authored notes
 saying what changed and why. Write it before tagging; it is the single source of truth the `zellij`
 skill's references point at.
+
+A release tag is never moved. The series on `main` was condensed on 2026-10-06 (AGENTS.md,
+"Reordered history does not bisect"), so every tag up to `v0.45.1-nkmk.30` points at a commit on
+`backup/main-pre-condense-2026-10-06` rather than on `main`. The tree at each tag is the tree
+`main` had at that release; `git diff v0.45.1-nkmk.30 <condensed tip>` was empty when the rewrite
+was pushed.
 
 `.github/workflows/release.yml` replaces upstream's release job. Pushing a `v*` tag builds two
 targets — `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` — and attaches
