@@ -10,11 +10,13 @@
 //! processes, and if it is there record the observed command line with `--continue` appended. The
 //! restored pane then holds a command that picks the session back up.
 //!
-//! The observed command line is the ground truth and is never replaced. A hint only ADDS
-//! arguments, and adds nothing when the observed arguments already say how to resume - a pane
-//! started as `claude --continue` is recorded exactly as it ran. The variable is a detector, not a
-//! source: it says the pane really is running that tool. Its value reaches the recorded command
-//! only through an explicit `{}` in `resume_args`.
+//! For a command this build has no session words for, the observed command line is the ground
+//! truth and is never replaced. A hint only ADDS arguments, and adds nothing when the observed
+//! arguments already say how to resume. For a harness this build knows - `claude`, `codex`,
+//! `opencode`, `pi` - the recorded command is the bare resume instead: argv0 and the hint's
+//! words, nothing else. A launch prompt kept in the argv would be sent again as a new turn on
+//! Enter. The variable is a detector, not a source: it says the pane really is running that tool.
+//! Its value reaches the recorded command only through an explicit `{}` in `resume_args`.
 //!
 //! Every part of this is best-effort. A hint that does not match, a variable that is not set, a
 //! platform that cannot read another process's environment - each records the command unchanged.
@@ -93,21 +95,20 @@ impl ResurrectCommandHint {
     /// The whole argument list to record for a pane running `command`, or `None` to leave the
     /// pane as it was.
     ///
-    /// For a harness this build knows - `claude`, `codex`, `opencode`, `pi` - the hint REPLACES
-    /// whatever session the observed argv picked: every session word is dropped and the hint's
-    /// words are added, so the command picks exactly one. Appending instead recorded
-    /// `claude --continue --resume <id>`. For any other command the hint only appends, by the
-    /// rule in [`Self::resume_args_for`], because this build does not know that tool's words.
+    /// For a harness this build knows - `claude`, `codex`, `opencode`, `pi` - the hint's words
+    /// REPLACE the whole observed argv: the pane is recorded as the bare resume, argv0 and the
+    /// hint's words. Launch flags and a positional prompt are dropped with the old session words;
+    /// a kept prompt is sent again as a new turn when Enter re-runs the pane. For any other
+    /// command the hint only appends, by the rule in [`Self::resume_args_for`], because this build
+    /// does not know that tool's words.
     pub fn args_for(
         &self,
         command: &str,
         observed_args: &[String],
         env_value: &str,
     ) -> Option<Vec<String>> {
-        if let Some(mut args) = strip_session_words(command, observed_args) {
-            let words = self.resume_args_for(&[], env_value)?;
-            args.extend(words);
-            return Some(args);
+        if agent_resume_for(command).is_some() {
+            return self.resume_args_for(&[], env_value);
         }
         let words = self.resume_args_for(observed_args, env_value)?;
         let mut args = observed_args.to_vec();
@@ -245,11 +246,8 @@ pub struct AgentResume {
     pub picker_args: &'static [&'static str],
     /// The arguments that resume one session by id, with `{}` standing for the id.
     pub session_args: &'static [&'static str],
-    /// Whether these arguments are a subcommand, which goes straight after argv0 instead of last.
-    /// `codex resume <id>` is one; its subcommand takes the same options the bare command does.
-    pub is_subcommand: bool,
-    /// Every word that picks a session, and whether it takes a value. A recorded command keeps
-    /// exactly one session choice, so these are removed before one is added.
+    /// Every word that picks a session, and whether it takes a value. Read by
+    /// [`picks_a_session`].
     pub session_words: &'static [(&'static str, SessionValue)],
     /// The session words whose value names the session the process was started on, as opposed
     /// to one it forks from. Read by [`argv_session_id`].
@@ -301,7 +299,6 @@ pub const AGENT_RESUMES: &[AgentResume] = &[
         kind: "claude",
         picker_args: &["--resume"],
         session_args: &["--resume", HINT_PLACEHOLDER],
-        is_subcommand: false,
         session_words: &[
             ("--continue", SessionValue::None),
             ("-c", SessionValue::None),
@@ -317,7 +314,6 @@ pub const AGENT_RESUMES: &[AgentResume] = &[
         kind: "opencode",
         picker_args: &[],
         session_args: &["--session", HINT_PLACEHOLDER],
-        is_subcommand: false,
         session_words: &[
             ("--continue", SessionValue::None),
             ("-c", SessionValue::None),
@@ -331,7 +327,6 @@ pub const AGENT_RESUMES: &[AgentResume] = &[
         kind: "codex",
         picker_args: &["resume"],
         session_args: &["resume", HINT_PLACEHOLDER],
-        is_subcommand: true,
         session_words: &[
             ("resume", SessionValue::Optional),
             ("fork", SessionValue::Optional),
@@ -344,7 +339,6 @@ pub const AGENT_RESUMES: &[AgentResume] = &[
         kind: "pi",
         picker_args: &["--resume"],
         session_args: &["--session", HINT_PLACEHOLDER],
-        is_subcommand: false,
         session_words: &[
             ("--continue", SessionValue::None),
             ("-c", SessionValue::None),
@@ -396,36 +390,30 @@ pub fn picks_a_session(command: &str, observed_args: &[String]) -> bool {
     })
 }
 
-/// `observed_args` without any word that picks a session, for the harness `command` runs.
-/// `None` when `command` is not a harness this build knows.
-///
-/// A restored command must pick exactly one session. Appending a resume to an argv that already
-/// carried one recorded `claude --continue --resume <id>`, and a previously restored pane carried
-/// its old `--resume <id>` into every later restart. Everything else in the argv is kept.
-pub fn strip_session_words(command: &str, observed_args: &[String]) -> Option<Vec<String>> {
-    let resume = agent_resume_for(command)?;
-    let mut args = Vec::with_capacity(observed_args.len());
-    let mut words = observed_args.iter().peekable();
-    while let Some(word) = words.next() {
-        match session_word(resume, word) {
-            None => args.push(word.clone()),
-            Some((_, true)) | Some((SessionValue::None, false)) => {},
-            Some((SessionValue::Required, false)) => {
-                words.next();
-            },
-            Some((SessionValue::Optional, false)) => {
-                if words.peek().map_or(false, |next| !next.starts_with('-')) {
-                    words.next();
-                }
-            },
-        }
+/// The bare resume for `resume`: its arguments for `session_id`, or its picker when there is
+/// none. Nothing from the observed argv is carried over.
+fn bare_resume(resume: &AgentResume, session_id: Option<&str>) -> Vec<String> {
+    match session_id {
+        Some(session_id) => resume
+            .session_args
+            .iter()
+            .map(|arg| arg.replace(HINT_PLACEHOLDER, session_id))
+            .collect(),
+        None => resume
+            .picker_args
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect(),
     }
-    Some(args)
 }
 
-/// The arguments an agent pane is recorded with when nothing named its session: `observed_args`
-/// with every session word replaced by the agent's picker. `None` when `command` is not an agent
-/// this build knows, or when the observed arguments name a session by id, which is kept as run.
+/// The arguments an agent pane is recorded with when nothing live named its session: the bare
+/// resume of the session id the argv names, or the agent's picker when it names none. `None`
+/// when `command` is not an agent this build knows.
+///
+/// Bare means only the session words: `claude --resume <id>`, `codex resume <id>`, `pi --resume`,
+/// a bare `opencode`. Every other observed word is dropped - launch flags and a positional prompt
+/// alike. A kept prompt was sent again as a new turn when Enter re-ran the restored pane.
 ///
 /// Never the newest session, without exceptions: before nkmk.31 this added `--continue` or
 /// `resume --last`, and kept an argv that already carried one. Two panes in one directory then
@@ -433,52 +421,20 @@ pub fn strip_session_words(command: &str, observed_args: &[String]) -> Option<Ve
 /// `resume --last` in the argv is replaced by the picker too; only an explicit id survives.
 pub fn builtin_resume_args(command: &str, observed_args: &[String]) -> Option<Vec<String>> {
     let resume = agent_resume_for(command)?;
-    if argv_session_id(command, observed_args).is_some() {
-        return None;
-    }
-    let args = strip_session_words(command, observed_args)?;
-    let picker_args = resume.picker_args.iter().map(|arg| (*arg).to_owned());
-    let args = if resume.is_subcommand {
-        picker_args.chain(args).collect()
-    } else {
-        args.into_iter().chain(picker_args).collect()
-    };
-    Some(args)
+    let session_id = argv_session_id(command, observed_args);
+    Some(bare_resume(resume, session_id.as_deref()))
 }
 
-/// `observed_args` with whatever session they pick replaced by `session_id`, for the harness
-/// `command` runs. `None` when `command` is not a harness this build knows.
+/// The bare resume of `session_id` for the harness `command` runs: `claude --resume <id>`,
+/// `codex resume <id>`, `opencode --session <id>`, `pi --session <id>`. `None` when `command` is
+/// not a harness this build knows.
 ///
 /// The argv names the session the process STARTED with, or none. `/clear`, `/resume` and a new
 /// conversation each move a running agent to another session and leave the argv as it was, so
 /// the session the process holds now is the one recorded.
-pub fn args_for_session(
-    command: &str,
-    observed_args: &[String],
-    session_id: &str,
-) -> Option<Vec<String>> {
+pub fn args_for_session(command: &str, session_id: &str) -> Option<Vec<String>> {
     let resume = agent_resume_for(command)?;
-    let args = strip_session_words(command, observed_args)?;
-    let session_args = resume
-        .session_args
-        .iter()
-        .map(|arg| arg.replace(HINT_PLACEHOLDER, session_id));
-    Some(if resume.is_subcommand {
-        session_args.chain(args).collect()
-    } else {
-        args.into_iter().chain(session_args).collect()
-    })
-}
-
-/// `observed_args` with whatever session they pick replaced by `session_id`, the session the
-/// claude process holds NOW. [`args_for_session`] for claude, kept for its callers.
-pub fn claude_args_for_live_session(observed_args: &[String], session_id: &str) -> Vec<String> {
-    args_for_session("claude", observed_args, session_id).unwrap_or_else(|| {
-        let mut args = observed_args.to_vec();
-        args.push("--resume".to_owned());
-        args.push(session_id.to_owned());
-        args
-    })
+    Some(bare_resume(resume, Some(session_id)))
 }
 
 /// The session id the argv itself names: the value of `--resume <id>`, `--session <id>`,
@@ -705,14 +661,14 @@ mod tests {
         assert!(is_resurrectable_agent("aider", Some(&hints)));
     }
 
-    /// With no session id, every agent gets its picker, never its newest session: two panes in
-    /// one directory would otherwise both resume the same one.
+    /// With no session id, every agent gets its bare picker, never its newest session: two panes
+    /// in one directory would otherwise both resume the same one.
     #[test]
     fn with_no_session_id_an_agent_gets_its_picker_not_its_newest_session() {
         let observed = args(&["--dangerously-skip-permissions"]);
         assert_eq!(
             builtin_resume_args("claude", &observed),
-            Some(args(&["--dangerously-skip-permissions", "--resume"]))
+            Some(args(&["--resume"]))
         );
         assert_eq!(
             builtin_resume_args("/usr/bin/pi", &[]),
@@ -721,7 +677,7 @@ mod tests {
         // opencode has no picker flag: the bare command, not `--continue`
         assert_eq!(
             builtin_resume_args("opencode", &args(&["--model", "m"])),
-            Some(args(&["--model", "m"]))
+            Some(Vec::new())
         );
         for command in ["claude", "pi", "opencode", "codex"] {
             let recorded = builtin_resume_args(command, &[]).unwrap();
@@ -736,30 +692,30 @@ mod tests {
         }
     }
 
-    /// `codex resume` is a subcommand: it goes straight after argv0, and the observed options
-    /// follow it, which the subcommand accepts. With no id it opens codex's picker.
+    /// `codex resume` is a subcommand. With no id it opens codex's picker, and the observed
+    /// options are dropped with everything else.
     #[test]
-    fn a_subcommand_resume_goes_first() {
+    fn codex_gets_its_bare_resume_subcommand() {
         let observed = args(&["-m", "o3"]);
         assert_eq!(
             builtin_resume_args("codex", &observed),
-            Some(args(&["resume", "-m", "o3"]))
+            Some(args(&["resume"]))
         );
     }
 
-    /// Only an argv that names its session by id is kept as run. A latest flag the operator
-    /// typed - `claude --continue`, `codex resume --last`, `opencode -c`, `pi --continue` - is
-    /// replaced by the picker, and a bare picker stays one picker.
+    /// A latest flag the operator typed - `claude --continue`, `codex resume --last`,
+    /// `opencode -c`, `pi --continue` - becomes the bare picker. An id the argv names becomes the
+    /// bare resume of that id.
     #[test]
-    fn a_latest_flag_in_the_argv_becomes_the_picker_and_an_id_is_kept() {
+    fn a_latest_flag_becomes_the_picker_and_an_argv_id_the_bare_resume() {
         let latest = args(&["--dangerously-skip-permissions", "--continue"]);
         assert_eq!(
             builtin_resume_args("claude", &latest),
-            Some(args(&["--dangerously-skip-permissions", "--resume"]))
+            Some(args(&["--resume"]))
         );
         assert_eq!(
             builtin_resume_args("claude", &args(&["-c", "--model", "m"])),
-            Some(args(&["--model", "m", "--resume"]))
+            Some(args(&["--resume"]))
         );
         assert_eq!(
             builtin_resume_args("claude", &args(&["--resume"])),
@@ -767,7 +723,7 @@ mod tests {
         );
         assert_eq!(
             builtin_resume_args("codex", &args(&["resume", "--last", "-m", "o3"])),
-            Some(args(&["resume", "-m", "o3"]))
+            Some(args(&["resume"]))
         );
         assert_eq!(
             builtin_resume_args("opencode", &args(&["--continue"])),
@@ -778,37 +734,70 @@ mod tests {
             Some(args(&["--resume"]))
         );
         let with_id = args(&["--dangerously-skip-permissions", "--resume", "abc"]);
-        assert_eq!(builtin_resume_args("claude", &with_id), None);
         assert_eq!(
-            builtin_resume_args("codex", &args(&["resume", "abc"])),
-            None
+            builtin_resume_args("claude", &with_id),
+            Some(args(&["--resume", "abc"]))
         );
         assert_eq!(
-            builtin_resume_args("pi", &args(&["--session", "abc"])),
-            None
+            builtin_resume_args("codex", &args(&["-m", "o3", "resume", "abc"])),
+            Some(args(&["resume", "abc"]))
         );
+        assert_eq!(
+            builtin_resume_args("pi", &args(&["--thinking", "high", "--session", "abc"])),
+            Some(args(&["--session", "abc"]))
+        );
+        assert_eq!(
+            builtin_resume_args("opencode", &args(&["-s", "ses_1", "--model", "m"])),
+            Some(args(&["--session", "ses_1"]))
+        );
+        assert_eq!(builtin_resume_args("htop", &[]), None);
     }
 
     #[test]
-    fn a_known_session_id_is_recorded_in_each_agents_own_form() {
-        let observed = args(&["--model", "m", "--continue"]);
+    fn a_known_session_id_is_recorded_in_each_agents_own_bare_form() {
         assert_eq!(
-            args_for_session("claude", &observed, "id-1"),
-            Some(args(&["--model", "m", "--resume", "id-1"]))
+            args_for_session("claude", "id-1"),
+            Some(args(&["--resume", "id-1"]))
         );
         assert_eq!(
-            args_for_session("opencode", &observed, "id-1"),
-            Some(args(&["--model", "m", "--session", "id-1"]))
+            args_for_session("opencode", "id-1"),
+            Some(args(&["--session", "id-1"]))
         );
         assert_eq!(
-            args_for_session("pi", &observed, "id-1"),
-            Some(args(&["--model", "m", "--session", "id-1"]))
+            args_for_session("pi", "id-1"),
+            Some(args(&["--session", "id-1"]))
         );
         assert_eq!(
-            args_for_session("codex", &args(&["resume", "--last", "-m", "o3"]), "id-1"),
-            Some(args(&["resume", "id-1", "-m", "o3"]))
+            args_for_session("/opt/homebrew/bin/codex", "id-1"),
+            Some(args(&["resume", "id-1"]))
         );
-        assert_eq!(args_for_session("htop", &observed, "id-1"), None);
+        assert_eq!(args_for_session("htop", "id-1"), None);
+    }
+
+    /// The flightdeck pane: launch flags and a positional launch prompt, then a live session.
+    /// Keeping the prompt made Enter on the restored pane resume AND send the brief again.
+    #[test]
+    fn a_launch_prompt_and_flags_are_not_recorded_with_the_live_session() {
+        let observed = args(&[
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions",
+            "Read X and do it.",
+        ]);
+        let recorded = args_for_session("claude", "live").unwrap();
+        assert_eq!(recorded, args(&["--resume", "live"]));
+        assert_eq!(
+            command_line_for_prompt("claude", &recorded),
+            "claude --resume live"
+        );
+        assert_eq!(
+            builtin_resume_args("claude", &observed),
+            Some(args(&["--resume"]))
+        );
+        assert_eq!(
+            hint("claude", "--resume {}").args_for("claude", &observed, "live"),
+            Some(args(&["--resume", "live"]))
+        );
     }
 
     #[test]
@@ -841,82 +830,21 @@ mod tests {
     }
 
     #[test]
-    fn a_builtin_resume_adds_nothing_when_the_argv_already_resumes() {
-        assert_eq!(
-            builtin_resume_args("codex", &args(&["resume", "abc"])),
-            None
-        );
-        assert_eq!(builtin_resume_args("htop", &[]), None);
-    }
-
-    #[test]
-    fn the_live_session_replaces_the_one_the_argv_started_with() {
-        let observed = args(&[
-            "--dangerously-skip-permissions",
-            "--resume",
-            "first-session",
-        ]);
-        assert_eq!(
-            claude_args_for_live_session(&observed, "live-session"),
-            args(&["--dangerously-skip-permissions", "--resume", "live-session"])
-        );
-    }
-
-    #[test]
-    fn every_session_picking_word_is_dropped_for_the_live_session() {
-        let observed = args(&[
-            "-c",
-            "--resume",
-            "--model",
-            "opus",
-            "--session-id",
-            "x",
-            "--resume=y",
-        ]);
-        assert_eq!(
-            claude_args_for_live_session(&observed, "live"),
-            args(&["--model", "opus", "--resume", "live"])
-        );
-    }
-
-    #[test]
-    fn every_agents_session_words_are_stripped() {
-        assert_eq!(
-            strip_session_words("codex", &args(&["-m", "o3", "resume", "abc", "--last"])),
-            Some(args(&["-m", "o3"]))
-        );
-        assert_eq!(
-            strip_session_words(
-                "opencode",
-                &args(&["-s", "x", "--continue", "--model", "m"])
-            ),
-            Some(args(&["--model", "m"]))
-        );
-        assert_eq!(
-            strip_session_words(
-                "pi",
-                &args(&["--session=x", "-r", "--fork", "y", "--thinking", "high"])
-            ),
-            Some(args(&["--thinking", "high"]))
-        );
-        assert_eq!(strip_session_words("htop", &args(&["-d", "5"])), None);
-    }
-
-    #[test]
-    fn a_hint_for_a_known_agent_replaces_the_argvs_session() {
+    fn a_hint_for_a_known_agent_records_only_its_own_words() {
         let observed = args(&["--dangerously-skip-permissions", "--continue"]);
         assert_eq!(
             hint("claude", "--resume {}").args_for("claude", &observed, "fced3e97"),
-            Some(args(&[
-                "--dangerously-skip-permissions",
-                "--resume",
-                "fced3e97"
-            ]))
+            Some(args(&["--resume", "fced3e97"]))
         );
         let restored = args(&["-r", "old", "--resume", "older"]);
         assert_eq!(
             hint("claude", "--resume {}").args_for("/usr/bin/claude", &restored, "new"),
             Some(args(&["--resume", "new"]))
+        );
+        // an empty value gives the hint nothing to record; the pane is left for the live pass
+        assert_eq!(
+            hint("opencode", "--session {}").args_for("opencode", &observed, ""),
+            None
         );
     }
 

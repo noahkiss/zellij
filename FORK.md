@@ -3666,6 +3666,11 @@ nothing when any of its words is already in the observed arguments: a pane start
 `claude --continue`, or as `claude --resume <id>`, already says how it resumes, and the argv beats
 anything a hint could reconstruct.
 
+That holds for a command this build has no session words for. For a known harness - `claude`,
+`codex`, `opencode`, `pi` - a hint's words replace the whole observed argv from nkmk.32: the pane
+holds argv0 and the hint's words, nothing else. See [A restored session offers to resume its
+agents, and only its agents](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents).
+
 That is also why the variable is a **detector**, not a source. It proves the pane is running the
 tool; its value reaches the command only through an explicit `{}`. `CLAUDE_CODE_SESSION_ID` in
 particular is not the id `claude --resume` takes — the resumable id is the transcript file name, and
@@ -3788,7 +3793,8 @@ when `resurrect_commands` is `"agents"` or `"prefill"`, or when a configured hin
 untouched.
 
 **Exactly one session choice.** For a harness this build knows, a recorded command keeps every
-flag except the words that pick a session, and then gets exactly one. A configured hint for one of
+flag except the words that pick a session, and then gets exactly one. (From nkmk.32 it keeps no
+flag at all: see "only the bare resume" below.) A configured hint for one of
 these REPLACES the session the argv picked instead of appending beside it; a hint for any other
 command keeps the old append-only rule, because this build does not know that tool's words. The
 words, each from the CLI's own `--help`:
@@ -3803,8 +3809,8 @@ words, each from the CLI's own `--help`:
 A value that may be left out (`--resume`) is taken only when the next word is not a flag; a
 `--flag=value` form is removed whole. The newest-session resume is used only when nothing else
 named a session, and it resumes the newest session in the pane's directory, where the restored
-pane starts. `codex resume` takes the same options as `codex`, so the observed flags still apply;
-a codex started with a prompt on its command line is not verified.
+pane starts. `codex resume` takes the same options as `codex`, so the observed flags still applied
+until nkmk.32 dropped them.
 
 **From nkmk.31, each pane resumes its own session, and never the newest.** The newest-session
 resume was wrong whenever two agent panes shared a directory: both came back holding whichever
@@ -3813,7 +3819,8 @@ its own process holds, in that agent's own form, and the fallback is the agent's
 
 The sources, in order of preference: the agent's own report on its pane (`osc`, below), the
 session file its process holds open (`open-file`), claude's per-process record (`record`), an id
-already in the argv (`argv`, kept as run), and last the picker (`picker-fallback`).
+already in the argv (`argv`, recorded as the bare resume of that id from nkmk.32), and last the
+picker (`picker-fallback`).
 
 | agent | own session found from | recorded with an id | recorded with no id |
 |---|---|---|---|
@@ -3843,10 +3850,31 @@ process, an npm wrapper puts the native `codex` one level down, and a subagent s
 **Never the newest session, without exceptions.** With no id found, an argv that carries a
 newest-session flag - `claude --continue`/`-c`, `codex resume --last`, `opencode --continue`/`-c`,
 `pi --continue`/`-c` - is recorded with the agent's picker instead; it is not kept as run. Only an
-argv that names its session by id is kept. The same holds for a configured hint whose
+id the argv names survives, as the bare resume of that id. The same holds for a configured hint whose
 `resume_args` add `--continue`: with no id found, the pane still ends at the picker. The bare
 `--resume` and `--continue` of the report were the operator's own: shell abbreviations run
 `claude --resume` and `claude --continue`, and nkmk.27 recorded them verbatim.
+
+**From nkmk.32, a restored agent pane holds only the bare resume.** Operator report of
+2026-10-11: a pane launched as `claude --model opus --dangerously-skip-permissions '<launch
+prompt>'` came back as `claude --model opus --dangerously-skip-permissions '<launch prompt>'
+--resume <id>`. Only the session words were stripped, so the positional prompt survived, and Enter
+would have resumed the session AND sent the prompt again as a new turn. A known harness is now
+recorded as argv0, path and all, plus its session words and nothing else:
+
+| what named the session | recorded |
+|---|---|
+| the live session (`osc`, `record`, `open-file`, `env`) | `claude --resume <id>`, `codex resume <id>`, `opencode --session <id>`, `pi --session <id>` |
+| an id in the argv, nothing live | the same form, with the argv's id |
+| nothing | the picker: `claude --resume`, `codex resume`, `pi --resume`, bare `opencode` |
+| a configured hint | argv0 and the hint's words |
+
+Launch flags (`--model`, `--dangerously-skip-permissions`) are dropped with the prompt. The
+operator chose that over a per-harness table of which flags take a value, which is what telling a
+flag's value from a prompt would need. A hint for a command this build does not know still only
+appends, because this build does not know that tool's words. `"prefill"` also types the bare
+resume of whatever a snapshot holds, so a snapshot written before nkmk.32 does not type its old
+prompt either.
 
 **The agent's own report: `OSC 1337 SetUserVar=agent_session=<base64 id>`.** The iTerm2 and
 WezTerm user-variable convention, printed by a hook in the agent to its pane's terminal. The grid

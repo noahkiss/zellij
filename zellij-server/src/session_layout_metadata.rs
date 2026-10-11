@@ -609,9 +609,9 @@ impl SessionLayoutMetadata {
     /// entry applies to, so that the resurrected pane offers to resume the tool's session instead
     /// of starting a new one.
     ///
-    /// The observed command line is kept - path, flags and all. For a harness this build knows, a
-    /// hint replaces the session the argv picked, so the command picks exactly one; for any other
-    /// command it only adds. See `ResurrectCommandHint::args_for`.
+    /// The recorded argv0 is kept, path and all. For a harness this build knows, the hint's words
+    /// replace the whole observed argv, so the pane holds only the bare resume; for any other
+    /// command the hint only appends to the observed argv. See `ResurrectCommandHint::args_for`.
     ///
     /// `read_env` is the seam over the platform: it is handed a terminal id and a variable name and
     /// returns the value found in that pane's processes. Everything the hints decide is here;
@@ -673,18 +673,19 @@ impl SessionLayoutMetadata {
             }
         }
     }
-    /// Records every agent pane with the session its agent process holds NOW, in place of
-    /// whatever session its argv named: `claude --resume <id>`, `codex resume <id>`,
-    /// `opencode --session <id>`, `pi --session <id>`.
+    /// Records every agent pane with the bare resume of the session its agent process holds NOW,
+    /// in place of its whole observed argv: `claude --resume <id>`, `codex resume <id>`,
+    /// `opencode --session <id>`, `pi --session <id>`. Launch flags and a launch prompt are
+    /// dropped; a kept prompt is sent again as a new turn when Enter re-runs the pane.
     ///
     /// `live_session_id` is the seam over the platform: handed a terminal id, the harness kind and
     /// the recorded command, it returns `Some(Some(id))` for the session the agent in that pane
     /// holds, `Some(None)` when it looked and found none, and `None` when this pane is not to be
     /// asked. It runs AFTER the hints, so the live session is the one that stays.
     ///
-    /// A pane that was asked and has no session is recorded with the agent's picker unless its
-    /// arguments name a session by id - never with a "newest session" flag, whether the argv or a
-    /// configured hint put it there.
+    /// A pane that was asked and has no session is recorded with the bare resume of the id its
+    /// arguments name, or with the agent's bare picker when they name none - never with a "newest
+    /// session" flag, whether the argv or a configured hint put it there.
     pub fn pin_live_agent_sessions<F>(&mut self, mut live_session_id: F)
     where
         F: FnMut(u32, &str, &str) -> Option<Option<String>>,
@@ -714,7 +715,7 @@ impl SessionLayoutMetadata {
                     }
                     continue;
                 };
-                let Some(args) = args_for_session(&command, &run_command.args, &session_id) else {
+                let Some(args) = args_for_session(&command, &session_id) else {
                     continue;
                 };
                 run_command.args = args;
@@ -732,8 +733,8 @@ impl SessionLayoutMetadata {
     /// every other one, so a restored session offers to resume its agents and nothing else.
     ///
     /// An agent is a harness this build knows - `claude`, `codex`, `opencode`, `pi` - or a command
-    /// one of `hints` names. A known harness is recorded with its built-in resume added, unless
-    /// its arguments already resume. Any other terminal pane loses its `run` and comes back as a
+    /// one of `hints` names. A known harness is recorded as its bare resume: the id its arguments
+    /// name, or its picker. A hinted command keeps its argv. Any other terminal pane loses its `run` and comes back as a
     /// plain shell in its directory: a long-lived tool, an editor, and a short-lived process that
     /// happened to be the newest child of an idle shell when the tick ran - a prompt being drawn,
     /// a shell init step.
@@ -1408,61 +1409,59 @@ mod tests {
         }
     }
 
-    /// The regression: a hint used to REPLACE the command line, so the recorded command lost the
-    /// path and every flag the pane really ran. What comes back must be the observed argv plus the
-    /// resume flag, and nothing else.
+    /// A hint used to REPLACE the command line, so the recorded command lost its path. The path
+    /// is kept. For a tool this build has no session words for, so is every observed argument:
+    /// the observed argv plus the resume flag, and nothing else.
     #[test]
-    fn keeps_the_observed_path_and_arguments() {
-        let mut meta = session_with_panes(vec![make_command_pane(
-            1,
-            "/opt/homebrew/bin/claude",
-            vec!["--dangerously-skip-permissions"],
-        )]);
+    fn keeps_the_observed_path_and_an_unknown_tools_arguments() {
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "/opt/homebrew/bin/claude", vec!["--model", "opus"]),
+            make_command_pane(2, "/opt/bin/aider", vec!["--model", "opus"]),
+        ]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            &hints(&[
+                ("claude", "CLAUDE_CODE_SESSION_ID", "--continue"),
+                ("aider", "AIDER_ID", "--restore-chat-history"),
+            ]),
             env_always(Some("abc-123")),
         );
-        match get_first_tiled_run(&meta) {
-            Some(Run::Command(rc)) => {
-                assert_eq!(rc.command, PathBuf::from("/opt/homebrew/bin/claude"));
-                assert_eq!(
-                    rc.args,
-                    vec![
-                        "--dangerously-skip-permissions".to_owned(),
-                        "--continue".to_owned()
-                    ]
-                );
-            },
-            other => panic!("expected Command, got {:?}", other),
-        }
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "/opt/homebrew/bin/claude".to_owned(),
+                owned(&["--continue"])
+            ))
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some((
+                "/opt/bin/aider".to_owned(),
+                owned(&["--model", "opus", "--restore-chat-history"])
+            ))
+        );
     }
 
-    /// A pane that already ran a resume flag is recorded exactly as it ran. The environment value
-    /// is a detector here, and must not become a second, contradictory resume argument.
+    /// A pane of a tool this build has no session words for, that already ran the hint's resume
+    /// flag, is recorded exactly as it ran. The environment value is a detector here, and must
+    /// not become a second, contradictory resume argument.
     #[test]
     fn observed_arguments_that_already_resume_are_left_alone() {
         let mut meta = session_with_panes(vec![make_command_pane(
             1,
-            "claude",
-            vec!["--dangerously-skip-permissions", "--continue"],
+            "aider",
+            vec!["--model", "opus", "--restore-chat-history"],
         )]);
         meta.apply_resurrect_command_hints(
-            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            &hints(&[("aider", "AIDER_ID", "--restore-chat-history")]),
             env_always(Some("an-internal-session-id")),
         );
-        match get_first_tiled_run(&meta) {
-            Some(Run::Command(rc)) => {
-                assert_eq!(rc.command, PathBuf::from("claude"));
-                assert_eq!(
-                    rc.args,
-                    vec![
-                        "--dangerously-skip-permissions".to_owned(),
-                        "--continue".to_owned()
-                    ]
-                );
-            },
-            other => panic!("expected Command, got {:?}", other),
-        }
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "aider".to_owned(),
+                owned(&["--model", "opus", "--restore-chat-history"])
+            ))
+        );
     }
 
     #[test]
@@ -2112,16 +2111,13 @@ mod tests {
         meta.keep_only_agent_commands(None);
         assert_eq!(
             command_line(&meta, 0),
-            Some((
-                "claude".to_owned(),
-                owned(&["--dangerously-skip-permissions", "--resume"])
-            ))
+            Some(("claude".to_owned(), owned(&["--resume"])))
         );
         assert_eq!(command_line(&meta, 1), None);
         assert_eq!(command_line(&meta, 2), None);
         assert_eq!(
             command_line(&meta, 3),
-            Some(("/opt/bin/codex".to_owned(), owned(&["resume", "-m", "o3"])))
+            Some(("/opt/bin/codex".to_owned(), owned(&["resume"])))
         );
         assert_eq!(command_line(&meta, 4), None);
     }
@@ -2151,11 +2147,11 @@ mod tests {
         assert_eq!(asked, owned(&["claude", "codex", "opencode", "pi"]));
         assert_eq!(
             command_line(&meta, 0).unwrap().1,
-            owned(&["--dangerously-skip-permissions", "--resume", "claude-1"])
+            owned(&["--resume", "claude-1"])
         );
         assert_eq!(
-            command_line(&meta, 1).unwrap().1,
-            owned(&["resume", "codex-2", "-m", "o3"])
+            command_line(&meta, 1),
+            Some(("/opt/bin/codex".to_owned(), owned(&["resume", "codex-2"])))
         );
         assert_eq!(
             command_line(&meta, 2).unwrap().1,
@@ -2169,7 +2165,7 @@ mod tests {
     }
 
     /// With no session found, no agent pane is recorded with a "newest session" flag: it gets
-    /// its picker, or keeps what the operator's own argv picked.
+    /// its bare picker, or the bare resume of the id its own argv named.
     #[test]
     fn with_no_session_found_no_agent_is_recorded_resuming_its_newest_session() {
         let mut meta = session_with_panes(vec![
@@ -2177,16 +2173,61 @@ mod tests {
             make_command_pane(2, "codex", vec![]),
             make_command_pane(3, "opencode", vec![]),
             make_command_pane(4, "pi", vec![]),
+            make_command_pane(5, "pi", vec!["--thinking", "high", "--session", "argv-id"]),
         ]);
         meta.pin_live_agent_sessions(|_, _, _| Some(None));
         meta.keep_only_agent_commands(None);
-        assert_eq!(
-            command_line(&meta, 0).unwrap().1,
-            owned(&["--dangerously-skip-permissions", "--resume"])
-        );
+        assert_eq!(command_line(&meta, 0).unwrap().1, owned(&["--resume"]));
         assert_eq!(command_line(&meta, 1).unwrap().1, owned(&["resume"]));
         assert_eq!(command_line(&meta, 2).unwrap().1, Vec::<String>::new());
         assert_eq!(command_line(&meta, 3).unwrap().1, owned(&["--resume"]));
+        assert_eq!(
+            command_line(&meta, 4).unwrap().1,
+            owned(&["--session", "argv-id"])
+        );
+    }
+
+    /// The flightdeck pane of 2026-10-11: launch flags and a positional launch prompt. It came back
+    /// holding the prompt, and Enter would have resumed AND sent the brief again as a new turn.
+    /// Every path records only the bare resume.
+    #[test]
+    fn a_launch_prompt_never_reaches_the_restored_pane() {
+        let launched = vec![
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions",
+            "Read X and do it.",
+        ];
+        let mut meta = session_with_panes(vec![
+            make_command_pane(1, "/usr/local/bin/claude", launched.clone()),
+            make_command_pane(2, "claude", launched.clone()),
+            make_command_pane(3, "claude", launched.clone()),
+        ]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--resume {}")]),
+            |terminal_id, _var| (terminal_id == 3).then(|| "hinted".to_owned()),
+        );
+        meta.pin_live_agent_sessions(|terminal_id, _, _| match terminal_id {
+            1 => Some(Some("live".to_owned())),
+            2 => Some(None),
+            _ => None,
+        });
+        meta.keep_only_agent_commands(None);
+        assert_eq!(
+            command_line(&meta, 0),
+            Some((
+                "/usr/local/bin/claude".to_owned(),
+                owned(&["--resume", "live"])
+            ))
+        );
+        assert_eq!(
+            command_line(&meta, 1),
+            Some(("claude".to_owned(), owned(&["--resume"])))
+        );
+        assert_eq!(
+            command_line(&meta, 2),
+            Some(("claude".to_owned(), owned(&["--resume", "hinted"])))
+        );
     }
 
     #[test]
@@ -2264,16 +2305,13 @@ mod tests {
         meta.pin_live_agent_sessions(|_, _, _| Some(None));
         assert_eq!(
             command_line(&meta, 0),
-            Some((
-                "claude".to_owned(),
-                owned(&["--dangerously-skip-permissions", "--resume"])
-            ))
+            Some(("claude".to_owned(), owned(&["--resume"])))
         );
     }
 
     /// The operator's third report: `claude --dangerously-skip-permissions --continue --resume
-    /// <id>`. A hint for a known agent replaces the session the argv picked instead of stacking
-    /// a second one on it.
+    /// <id>`. A hint for a known agent replaces the whole argv with its own words instead of
+    /// stacking a second session on it.
     #[test]
     fn a_hint_replaces_the_session_the_argv_picked() {
         let mut meta = session_with_panes(vec![
@@ -2290,17 +2328,11 @@ mod tests {
         );
         assert_eq!(
             command_line(&meta, 0),
-            Some((
-                "claude".to_owned(),
-                owned(&["--dangerously-skip-permissions", "--resume", "new-id"])
-            ))
+            Some(("claude".to_owned(), owned(&["--resume", "new-id"])))
         );
         assert_eq!(
             command_line(&meta, 1),
-            Some((
-                "claude".to_owned(),
-                owned(&["--model", "opus", "--resume", "new-id"])
-            ))
+            Some(("claude".to_owned(), owned(&["--resume", "new-id"])))
         );
     }
 
@@ -2321,10 +2353,7 @@ mod tests {
         meta.keep_only_agent_commands(None);
         assert_eq!(
             command_line(&meta, 0),
-            Some((
-                "claude".to_owned(),
-                owned(&["--dangerously-skip-permissions", "--resume", "second"])
-            ))
+            Some(("claude".to_owned(), owned(&["--resume", "second"])))
         );
     }
 }

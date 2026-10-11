@@ -37,7 +37,8 @@ use zellij_utils::{
     },
     pane_size::Size,
     resurrect_command_hints::{
-        command_line_for_prompt, is_resurrectable_agent, ResurrectCommandHints, ResurrectCommands,
+        builtin_resume_args, command_line_for_prompt, is_resurrectable_agent,
+        ResurrectCommandHints, ResurrectCommands,
     },
     session_serialization,
 };
@@ -2187,6 +2188,9 @@ impl Pty {
     /// default shell in the command's directory; only an agent's command is typed, so any other
     /// command a snapshot recorded comes back as a shell with nothing typed.
     ///
+    /// A known harness is typed as its bare resume, whatever the snapshot recorded: a snapshot
+    /// written before nkmk.32 can still hold a launch prompt, which Enter would send again.
+    ///
     /// No pane is ever held, so nothing here goes near the held-pane exit path.
     fn prefill_for_resurrected(
         &self,
@@ -2202,8 +2206,12 @@ impl Pty {
             return None;
         }
         let program = command.command.display().to_string();
-        let prefill = is_resurrectable_agent(&program, self.resurrect_command_hints.as_ref())
-            .then(|| command_line_for_prompt(&program, &command.args));
+        let prefill =
+            is_resurrectable_agent(&program, self.resurrect_command_hints.as_ref()).then(|| {
+                let args = builtin_resume_args(&program, &command.args)
+                    .unwrap_or_else(|| command.args.clone());
+                command_line_for_prompt(&program, &args)
+            });
         Some((command.cwd.clone().map(Run::Cwd), prefill))
     }
     /// The commands `prefill_for_resurrected` set aside, handed to the screen once the panes

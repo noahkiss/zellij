@@ -1282,6 +1282,85 @@ fn with_nothing_found_a_typed_latest_flag_is_recorded_as_the_picker() {
     assert!(pty.resume_misses.contains_key(&1));
 }
 
+/// The flightdeck pane: launch flags and a positional launch prompt, then a session the agent
+/// reported. It is recorded as the bare resume; a kept prompt would be sent again on Enter.
+#[test]
+fn a_launch_prompt_is_not_recorded_with_the_reported_session() {
+    let launched = [
+        "--model",
+        "opus",
+        "--dangerously-skip-permissions",
+        "Read X and do it.",
+    ];
+    let mock = MockOsApi::new();
+    mock.set_cmd(
+        100,
+        std::iter::once("claude")
+            .chain(launched)
+            .map(|word| word.to_owned())
+            .collect(),
+    );
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::Prefill;
+    pty.id_to_child_pid.insert(1, 100);
+    pty.note_agent_session_from_osc(1, "osc-session".to_owned());
+    let mut meta = agent_pane_meta(1, "claude", &launched);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        run_command.args,
+        vec!["--resume".to_owned(), "osc-session".to_owned()]
+    );
+}
+
+/// A snapshot written before the bare resume can still hold a launch prompt. The prefill types
+/// only the bare resume of the id it names; a hinted tool this build does not know keeps its
+/// argv.
+#[test]
+fn a_prefill_types_only_the_bare_resume_of_an_old_snapshot() {
+    let mut pty = make_bare_pty();
+    pty.resurrect_commands = ResurrectCommands::Prefill;
+    let mut hints = ResurrectCommandHints::default();
+    hints.push(
+        zellij_utils::resurrect_command_hints::ResurrectCommandHint {
+            name: "aider".to_owned(),
+            match_command: "aider".to_owned(),
+            env: "AIDER_ID".to_owned(),
+            resume_args: "--restore-chat-history".to_owned(),
+        },
+    );
+    pty.resurrect_command_hints = Some(hints);
+    let resurrected = |command: &str, args: &[&str]| {
+        let mut run_command = RunCommand::new(PathBuf::from(command));
+        run_command.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+        run_command.cwd = Some(PathBuf::from("/work"));
+        run_command.resurrected = true;
+        Some(Run::Command(run_command))
+    };
+
+    let old = resurrected(
+        "/usr/local/bin/claude",
+        &["--model", "opus", "Read X and do it.", "--resume", "old-id"],
+    );
+    assert_eq!(
+        pty.prefill_for_resurrected(&old),
+        Some((
+            Some(Run::Cwd(PathBuf::from("/work"))),
+            Some("/usr/local/bin/claude --resume old-id".to_owned())
+        ))
+    );
+    let hinted = resurrected("aider", &["--model", "opus", "--restore-chat-history"]);
+    assert_eq!(
+        pty.prefill_for_resurrected(&hinted)
+            .and_then(|(_, line)| line),
+        Some("aider --model opus --restore-chat-history".to_owned())
+    );
+}
+
 #[test]
 fn an_empty_osc_report_clears_the_pane_and_a_closed_pane_loses_its_report() {
     let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
