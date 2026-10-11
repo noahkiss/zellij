@@ -1351,3 +1351,42 @@ pub fn dump_screen_returns_logical_lines_not_the_wrapped_grid() {
         "dump-screen already unwraps: it breaks a line only where the grid says the line began"
     );
 }
+
+#[test]
+pub fn a_trzsz_trigger_lands_on_the_grid_marked_as_multiplexed() {
+    let mut fake_win_size = PaneGeom::default();
+    fake_win_size.cols.set_inner(80);
+    fake_win_size.rows.set_inner(10);
+
+    let mut terminal_pane = TerminalPane::new(
+        1,
+        fake_win_size,
+        Style::default(),
+        0,
+        String::new(),
+        Rc::new(RefCell::new(LinkHandler::new())),
+        Rc::new(RefCell::new(None)),
+        Rc::new(RefCell::new(SixelImageStore::default())),
+        Rc::new(RefCell::new(KittyImageStore::default())),
+        Rc::new(RefCell::new(Palette::default())),
+        Rc::new(RefCell::new(HashMap::new())),
+        None,
+        None,
+        false,
+        true,
+        true,
+        true,
+        false,
+        None,
+    );
+
+    terminal_pane
+        .handle_pty_bytes(b"\x1b[s::TRZSZ:TRANSFER:R:1.2.0:1760180000000:41235\r\n".to_vec());
+
+    let dump = terminal_pane.dump_screen(false, None);
+    assert!(
+        dump.contains("::TRZSZ:TRANSFER:R:1.2.0:1760180000020:41235"),
+        "a redraw of this row sends an id the client starts only once, got {:?}",
+        dump
+    );
+}

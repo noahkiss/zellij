@@ -8304,6 +8304,38 @@ the host times the bar out.
 tests and two screen tests: the focused pane's report reaches the client and a quiet render sends
 nothing; a report in another tab waits until that tab is focused, and focusing back clears the bar.
 
+### `trz` and `tsz` work through zellij behind `tssh`
+
+```
+::TRZSZ:TRANSFER:R:1.2.0:1760180000000:41235    # what trz prints
+::TRZSZ:TRANSFER:R:1.2.0:1760180000020:41235    # what the pane's grid holds
+```
+
+From nkmk.32. [trzsz](https://github.com/trzsz/trzsz-go) starts a transfer with a plain-text
+trigger, not an escape sequence: `ESC[s::TRZSZ:TRANSFER:<mode>:<version>:<id>:<port>`. The
+client - `tssh`, or a trzsz-aware terminal - watches its output for it and opens a transfer.
+
+**zellij re-sent the trigger.** It prints the trigger onto the grid like any other text, so every
+later redraw of that row sends it to the client again. The file arrived, then the next redraw
+started a second transfer, and the client typed its failure (`#fail:...`) into the shell. This is
+trzsz-ssh issue #135.
+
+**trzsz already knows a multiplexer's mark.** The client starts a transfer for an id ending `00`
+every time it appears, and starts any other id once. Inside tmux, `trz` adds 20 to its id, and the
+trzsz relay rewrites a trailing `00` to `20` (`rewriteTrzszTrigger` in trzsz-go's `comm.go`).
+zellij now does the same rewrite on a pane's output, before the parser sees it, with the same
+pattern: `::TRZSZ:TRANSFER:[SRDF]:<x.y.z>:<13 or more digits>`. The tunnel handshake drops the
+id's last two digits, so the rewritten id still connects. An id ending `20` or `10` is left alone.
+
+Not covered: a trigger split across two pty reads is not rewritten. `trz` writes it in one call.
+A transfer with no tunnel - `trzsz ssh`, or a terminal's own trigger - still fails with "Receive
+data timeout"; that needs a raw byte channel through the client/server contract, which is not
+worth its cost.
+
+`zellij-server` only: `trzsz.rs` (new) and the call at the top of `TerminalPane::handle_pty_bytes`.
+Six `trzsz` tests, and a terminal-pane test that the trigger lands on the grid with the rewritten
+id.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

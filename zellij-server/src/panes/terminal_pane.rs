@@ -240,7 +240,10 @@ impl Pane for TerminalPane {
         self.geom_override = Some(pane_geom);
         self.reflow_lines();
     }
-    fn handle_pty_bytes(&mut self, bytes: VteBytes) {
+    fn handle_pty_bytes(&mut self, mut bytes: VteBytes) {
+        // fork addition: a trzsz trigger is marked as passing through a multiplexer, so a redraw
+        // of its row does not start the transfer again
+        crate::trzsz::mark_trzsz_triggers(&mut bytes);
         self.set_should_render(true);
         if self.forward_paused {
             // A host-forward initiated by this pane is outstanding.

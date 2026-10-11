@@ -35,6 +35,7 @@ mod session_warnings;
 mod terminal_bytes;
 pub mod terminal_progress;
 mod thread_bus;
+mod trzsz;
 mod ui;
 
 use background_jobs::{background_jobs_main, BackgroundJob};
