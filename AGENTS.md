@@ -139,9 +139,17 @@ the next release pass; it is the `<old-tip>` those commands need, and the only p
 
 ```
 cargo check                                  # while editing
-cargo test -p zellij-utils --profile quick   # the loop
-cargo build --release                        # once, before committing
+cargo fmt && cargo xtask format --check      # before every commit
+cargo test -p zellij-utils --profile quick   # the loop: the area you changed
 ```
+
+Local runs the quick loop. The branch push runs the full gate: `rust.yml` triggers on every
+`feat/**`, `fix/**`, `rc/**` (and the other prefixes it lists) push and runs `cargo xtask build`
+(the plugins from source, so wasm is covered), `cargo xtask test` on every crate, `cargo xtask
+integration-test`, the `--no-web` pass and the assets check, on Linux and macOS. The pull request
+adds the Docker e2e suite. Do not repeat that locally; read it with `gh run list` and
+`gh run view --log-failed`. Local release builds are not a gate either: `release.yml` builds the
+artifact that ships.
 
 `rust-toolchain.toml` pins the toolchain; rustup installs it on the first cargo call.
 
@@ -159,31 +167,31 @@ nothing a test run can observe.
 
 Two things to know before reaching for it. `quick` gets its own `target/` subtree, so the first
 build after switching is cold and slower than the release build it replaces — it pays back from
-the second. And it is not what ships: build `--release` once before you commit, and never measure
-runtime performance against `quick`.
+the second. And it is not what ships: never measure runtime performance against `quick`.
 
 Whole-binary builds are the expensive ones, because they pull in `zellij-server` and its embedded
-`wasmtime`. Prefer `cargo check` and a `-p <crate>` test while iterating, and keep the full
-`cargo build --release` for the end.
+`wasmtime`. Prefer `cargo check` and a `-p <crate>` test while iterating, and leave the whole
+binary to CI.
 
-**Three test surfaces, and a release must run all of them.** The nextest suites (`-p zellij-utils
+**Three test surfaces, and a release must see all of them green.** The nextest suites (`-p zellij-utils
 -p zellij-server -p zellij-client`, plus `-p zellij` after a plugins-only build) are the fast loop.
 `cargo xtask integration-test` is the whole-app suite the `Rust` workflow runs — snapshot changes
 that touch pane titles or handles land here, and nothing in the fast loop covers it. The Docker
-e2e suite (`src/tests/e2e`, the `End to End tests` workflow) runs only on pushes to `main` and
-test branches — **an `rc/**` push never exercises it**, so a green RC does not prove it. Before
-cutting any release: run the nextest suites and the integration suite locally, and account for
-e2e either by running it locally (Docker) or by the fact that the exact tree already went green on
-a `main` push. The v16 release shipped with four stale integration snapshots and two stale e2e
-snapshots because local gates covered only the first surface. v19 reached `main` with six stale
-plugin-system snapshots for the same reason, fixed in `5fef6e6b1` before the tag.
+e2e suite (`src/tests/e2e`, the `End to End tests` workflow) runs on pushes to `main` and on pull
+requests — **an `rc/**` push never exercises it**, which is why the RC opens a pull request. The
+release gate is a green `Rust` run on the RC branch and green `Rust` and `End to End tests` runs
+on its pull request, on the exact commit to be tagged, checked with `gh run list`. Run the
+integration suite locally only when you expect a snapshot to change, because accepting a snapshot
+needs a local run. The v16 release shipped with four stale integration snapshots and two stale
+e2e snapshots because local gates covered only the first surface. v19 reached `main` with six
+stale plugin-system snapshots for the same reason, fixed in `5fef6e6b1` before the tag.
 
 **That e2e job is also the only runner of zellij-server's `--ignored` plugin-system suite.**
 `cargo xtask ci e2e --test` runs the Docker e2e tests, then runs `cargo test -- --ignored` inside
 `zellij-server` (`xtask/src/ci.rs:195-221`). Nothing else passes `--ignored` — not `cargo xtask
 test`, not the nextest suites — so the fast loop never compiles those tests, let alone runs them.
 Their snapshots capture `RunCommand`'s derived `Debug`, so a new field on it lands here and in no
-other surface. To run them locally, without Docker:
+other surface. Run them locally only when `RunCommand`'s `Debug` changes; without Docker:
 
 ```
 cargo xtask ci e2e --build                                  # builds the fixture plugin
