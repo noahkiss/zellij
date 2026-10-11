@@ -8216,6 +8216,12 @@ fd answers for another pane; a held agent pane records its reported session, its
 session with its source, or its picker when it had none; and a held pane lists with no pid and no
 command.
 
+The integration harness's fake pty modelled a cleared terminal as a gone one: its
+`clear_terminal_id` drops the terminal's whole state, so a held pane's re-run panicked with
+"re-run for unknown terminal id" (`send_command_through_the_cli`). A real pty only forgets the fd
+and records a fresh one on the re-run, so the fake's re-run now makes the state again from the
+command it is given.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
