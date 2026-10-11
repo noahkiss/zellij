@@ -8319,6 +8319,12 @@ because a release needs green runs on the exact tagged commit. `e2e.yml` is deli
 on that list — it builds a binary and drives it through a docker terminal, and it is the slowest
 thing here — but it now has a `workflow_dispatch`, so it can be aimed at a branch on demand.
 
+**Dependabot opens no pull requests.** Upstream's `.github/dependabot.yml` is kept, with
+`open-pull-requests-limit: 0` on every entry. A bot commit does not fit a patch series: dependencies
+move when the base moves to a newer upstream tag. The file is edited rather than deleted, so an
+upstream change to it conflicts on one line instead of on the whole file. Vulnerability alerts stay
+on; automated security fixes are off in the repository settings.
+
 A patch is proved as a **release candidate** before it lands. On its branch, bump the version it is
 heading for, then tag `v<version>-rc.1` and push the tag. The pipeline runs exactly as below, with
 three differences: the workspace version is patched to the whole tag before the build, the GitHub
