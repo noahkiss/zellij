@@ -13,6 +13,7 @@ use crate::panes::{
 use crate::pty::VteBytes;
 use crate::route::NotificationEnd;
 use crate::tab::{AdjustedInput, GuestChoiceIndicator, Pane};
+use crate::terminal_progress::TerminalProgress;
 use crate::ClientId;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -947,6 +948,10 @@ impl Pane for TerminalPane {
         self.grid.pending_desktop_notifications.drain(..).collect()
     }
 
+    fn progress(&self) -> (Option<TerminalProgress>, u64) {
+        (self.grid.progress, self.grid.progress_seq)
+    }
+
     fn drain_osc7_cwd(&mut self) -> Option<std::path::PathBuf> {
         self.grid.pending_osc7_cwd.take()
     }
@@ -1146,6 +1151,8 @@ impl Pane for TerminalPane {
             }
         }
         self.is_held = Some((exit_status, is_first_run, run_command));
+        // fork addition: a program that exits mid-task never sends its own clear
+        self.grid.clear_progress();
         if let Some(notification_end) = self.notification_end.as_mut() {
             if let Some(exit_status) = exit_status {
                 notification_end.set_exit_status(exit_status);

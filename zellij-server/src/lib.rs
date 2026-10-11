@@ -33,6 +33,7 @@ mod screen;
 mod session_layout_metadata;
 mod session_warnings;
 mod terminal_bytes;
+pub mod terminal_progress;
 mod thread_bus;
 mod ui;
 

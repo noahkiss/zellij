@@ -8263,6 +8263,47 @@ The integration harness's fake pty modelled a cleared terminal as a gone one: it
 and records a fresh one on the re-run, so the fake's re-run now makes the state again from the
 command it is given.
 
+### `OSC 9;4` progress reaches the terminal, for the pane you are looking at
+
+```
+$ printf '\e]9;4;3\a'; sleep 5; printf '\e]9;4;0\a'   # Ghostty draws its bar, then clears it
+```
+
+From nkmk.32. A program reports progress with ConEmu's `OSC 9;4;<state>[;<value>]`: 0 clear,
+1 a value from 0 to 100, 2 error, 3 indeterminate, 4 paused. Claude Code sends it, and Ghostty,
+Windows Terminal and ConEmu draw it as a bar. Upstream drops it on purpose: the `OSC 9` arm treats
+every ConEmu subcommand as unsupported, so the bar never showed, not even locally.
+
+**One bar per window, many panes per client.** Each terminal pane keeps the last report it got,
+and a counter of reports. After each render the server sends every client the report of the pane
+that client has focused:
+
+- **A new report from the focused pane** is forwarded, a repeat of the same state included. A
+  program refreshes its report to keep a bar alive, and a host may drop a bar that is not
+  refreshed.
+- **Focus moves to another pane or tab:** the client gets that pane's report, or `9;4;0` when it
+  has none.
+- **The pane's program exits:** the pane drops its report, as if the program had sent its own clear.
+  A closed pane takes its report with it, and focus moving off it does the rest.
+
+**A clear is sent only over a bar.** A client is sent `9;4;0` only when it was last sent a bar. A
+client whose panes never report progress is never sent an `OSC 9` from this path, because some
+terminals show any `OSC 9` as a desktop notification.
+
+**The render path, not the contract.** The report rides the render output as a post-render
+instruction, the way a forwarded bell and a desktop notification do. Nothing crosses the
+client/server contract, and watcher clients are left out.
+
+Not covered: a client that detaches leaves its host with whatever bar it was last sent, until
+the host times the bar out.
+
+`zellij-server` only: `terminal_progress.rs` (new: the parse and the per-client decision),
+`panes/grid.rs` (the `9;4` arm, `set_progress`, `clear_progress`), `panes/terminal_pane.rs`
+(`Pane::progress`, the clear on `hold`), `tab/mod.rs` (the trait default) and `screen.rs`
+(`sync_progress_to_clients` in `render_to_clients`). Eight `terminal_progress` tests, four grid
+tests and two screen tests: the focused pane's report reaches the client and a quiet render sends
+nothing; a report in another tab waits until that tab is focused, and focusing back clears the bar.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

@@ -58,6 +58,7 @@ use crate::{
     panes::{LinkHandler, PaneId, PluginPane, TerminalPane, EMPTY_TERMINAL_CHARACTER},
     plugins::PluginInstruction,
     pty::{ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
+    terminal_progress::TerminalProgress,
     thread_bus::ThreadSenders,
     ClientId, ServerInstruction,
 };
@@ -581,6 +582,10 @@ pub trait Pane {
     }
     fn drain_osc7_cwd(&mut self) -> Option<std::path::PathBuf> {
         None
+    }
+    /// fork addition: the pane's last `OSC 9;4` progress and its report counter.
+    fn progress(&self) -> (Option<TerminalProgress>, u64) {
+        (None, 0)
     }
     /// The session id the pane's agent reported with `OSC 1337 SetUserVar=agent_session=`.
     fn drain_agent_session(&mut self) -> Option<String> {

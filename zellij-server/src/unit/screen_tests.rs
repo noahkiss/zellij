@@ -15432,6 +15432,75 @@ fn screen_with_a_client_for_notifications(
     (screen, server_receiver)
 }
 
+fn screen_with_two_tabs_for_progress() -> (Screen, ServerReceiver) {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut screen, _tty_stdin_bytes, server_receiver) =
+        create_new_screen_with_capture(size, true, true, true, true);
+    new_tab(&mut screen, 1, 0);
+    new_tab(&mut screen, 2, 1);
+    screen.go_to_tab(1, 1).expect("TEST");
+    screen.render_to_clients().expect("TEST");
+    while server_receiver.try_recv().is_ok() {}
+    (screen, server_receiver)
+}
+
+fn progress_from_pane(screen: &mut Screen, tab_index: usize, pid: u32, bytes: &[u8]) {
+    screen
+        .tabs
+        .get_mut(&tab_index)
+        .unwrap()
+        .handle_pty_bytes(pid, bytes.to_vec())
+        .unwrap();
+}
+
+#[test]
+fn osc_9_4_progress_from_the_focused_pane_reaches_the_client() {
+    let (mut screen, server_receiver) = screen_with_two_tabs_for_progress();
+
+    progress_from_pane(&mut screen, 0, 1, b"\x1b]9;4;1;30\x07");
+    screen.render_to_clients().expect("TEST");
+
+    assert!(
+        collect_forwarded_notifications(&server_receiver).contains("\u{1b}]9;4;1;30\u{7}"),
+        "the focused pane's progress is forwarded"
+    );
+
+    screen.render_to_clients().expect("TEST");
+    assert!(
+        !collect_forwarded_notifications(&server_receiver).contains("\u{1b}]9;4;"),
+        "a render with no new report sends nothing"
+    );
+}
+
+#[test]
+fn osc_9_4_progress_from_an_unfocused_tab_is_held_until_that_tab_is_focused() {
+    let (mut screen, server_receiver) = screen_with_two_tabs_for_progress();
+
+    progress_from_pane(&mut screen, 1, 2, b"\x1b]9;4;3\x07");
+    screen.render_to_clients().expect("TEST");
+    assert!(
+        !collect_forwarded_notifications(&server_receiver).contains("\u{1b}]9;4;"),
+        "a pane in another tab does not reach the client"
+    );
+
+    screen.go_to_tab(2, 1).expect("TEST");
+    screen.render_to_clients().expect("TEST");
+    assert!(
+        collect_forwarded_notifications(&server_receiver).contains("\u{1b}]9;4;3\u{7}"),
+        "focusing the tab re-emits its pane's progress"
+    );
+
+    screen.go_to_tab(1, 1).expect("TEST");
+    screen.render_to_clients().expect("TEST");
+    assert!(
+        collect_forwarded_notifications(&server_receiver).contains("\u{1b}]9;4;0\u{7}"),
+        "a tab whose pane reports nothing clears the bar"
+    );
+}
+
 fn kitty_env() -> BTreeMap<String, String> {
     [("TERM".to_owned(), "xterm-kitty".to_owned())]
         .into_iter()

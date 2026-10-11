@@ -89,6 +89,7 @@ use crate::panes::terminal_pane::{BRACKETED_PASTE_BEGIN, BRACKETED_PASTE_END};
 use crate::session_layout_metadata::{PaneLayoutMetadata, SessionLayoutMetadata};
 use zellij_utils::data::SessionWarning;
 
+use crate::terminal_progress::ClientProgress;
 use crate::{
     nested_guest::NestedGuestTracker,
     output::{HostKittyState, Output},
@@ -1797,6 +1798,8 @@ pub(crate) struct Screen {
     mobile_web_prefs: HashMap<ClientId, MobileWebPrefs>,
     client_host_focused: HashMap<ClientId, bool>,
     client_notification_protocols: HashMap<ClientId, NotificationProtocol>,
+    /// fork addition: the `OSC 9;4` progress each client was last sent. See `terminal_progress`.
+    client_progress: HashMap<ClientId, ClientProgress>,
     host_notification_protocol: HostNotificationProtocol,
     client_host_terminal_env: HashMap<ClientId, BTreeMap<String, String>>,
     bell_dwell: BellDwellTracker,
@@ -2094,6 +2097,7 @@ impl Screen {
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
             client_notification_protocols: HashMap::new(),
+            client_progress: HashMap::new(),
             host_notification_protocol: HostNotificationProtocol::default(),
             client_host_terminal_env: HashMap::new(),
             bell_dwell: {
@@ -4630,7 +4634,9 @@ impl Screen {
                 }
             }
 
-            if non_watcher_output_was_dirty || bells.has_bell {
+            let progress_sent = self.sync_progress_to_clients(&mut output);
+
+            if non_watcher_output_was_dirty || bells.has_bell || progress_sent {
                 let serialized_output = output.serialize().context(err_context)?;
                 if !serialized_output.is_empty() {
                     let _ = self
@@ -4966,6 +4972,39 @@ impl Screen {
             .unwrap_or_else(|| {
                 NotificationProtocol::resolve(self.host_notification_protocol, &BTreeMap::new())
             })
+    }
+
+    /// fork addition: sends each client the `OSC 9;4` progress of the pane it has focused, when
+    /// that pane reported, or when the client's focus moved to another pane or tab. Returns
+    /// whether anything was added to `output`.
+    fn sync_progress_to_clients(&mut self, output: &mut Output) -> bool {
+        let mut sent = false;
+        for (client_id, tab_index) in &self.active_tab_ids {
+            if self.watcher_clients.contains_key(client_id) {
+                continue;
+            }
+            let focused = self
+                .tabs
+                .get(tab_index)
+                .and_then(|tab| tab.get_active_pane_id(*client_id));
+            let (progress, seq) = focused
+                .and_then(|pane_id| {
+                    self.tabs
+                        .get(tab_index)
+                        .and_then(|tab| tab.get_pane_with_id(pane_id))
+                })
+                .map(|pane| pane.progress())
+                .unwrap_or((None, 0));
+            let client_progress = self.client_progress.entry(*client_id).or_default();
+            if let Some(raw) = client_progress.update(focused, progress, seq) {
+                output.add_post_vte_instruction_to_multiple_clients(
+                    std::iter::once(*client_id),
+                    &raw,
+                );
+                sent = true;
+            }
+        }
+        sent
     }
 
     fn forward_desktop_notifications(
@@ -5636,6 +5675,7 @@ impl Screen {
         self.pane_render_subscribers.remove(&client_id);
         self.client_host_focused.remove(&client_id);
         self.client_notification_protocols.remove(&client_id);
+        self.client_progress.remove(&client_id);
         self.client_host_terminal_env.remove(&client_id);
         self.revert_fit_disabled_without_reference_client()
             .with_context(err_context)?;
