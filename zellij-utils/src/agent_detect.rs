@@ -46,6 +46,16 @@ pub struct AgentHarness {
     pub identity_env: &'static [&'static str],
 }
 
+/// The shared variable every harness's start hook exports, from nkmk.31: the harness's own native
+/// session id. Read first, for every harness. See the agent-session contract (`zellij setup
+/// --agent-hooks`).
+pub const AGENT_SESSION_ID: &str = "AGENT_SESSION_ID";
+
+/// The harness that exported [`AGENT_SESSION_ID`]: `claude`, `codex`, `pi` or `opencode`. When it
+/// names another harness than the one detected - a pane running codex whose process tree carries
+/// a nested claude's variables - the shared id is not this pane's and is ignored.
+pub const AGENT_KIND: &str = "AGENT_KIND";
+
 /// Every harness this build recognises.
 ///
 /// Order matters only in that the first match wins, and the commands do not overlap.
@@ -53,17 +63,21 @@ pub const HARNESSES: &[AgentHarness] = &[
     AgentHarness {
         kind: "claude",
         match_commands: &["claude"],
-        identity_env: &["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"],
+        identity_env: &[
+            AGENT_SESSION_ID,
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_SESSION_ID",
+        ],
     },
     AgentHarness {
         kind: "opencode",
         match_commands: &["opencode"],
-        identity_env: &["OPENCODE_SESSION_ID", "OPENCODE_SESSION"],
+        identity_env: &[AGENT_SESSION_ID, "OPENCODE_SESSION_ID", "OPENCODE_SESSION"],
     },
     AgentHarness {
         kind: "codex",
         match_commands: &["codex"],
-        identity_env: &["CODEX_SESSION_ID", "CODEX_THREAD_ID"],
+        identity_env: &[AGENT_SESSION_ID, "CODEX_SESSION_ID", "CODEX_THREAD_ID"],
     },
     // `pi` is a short name that something else could plausibly own. It is matched anyway - a false
     // positive costs a wrong row in `list-agents`, which the command column makes obvious - but it
@@ -71,7 +85,7 @@ pub const HARNESSES: &[AgentHarness] = &[
     AgentHarness {
         kind: "pi",
         match_commands: &["pi"],
-        identity_env: &["PI_SESSION_ID"],
+        identity_env: &[AGENT_SESSION_ID, "PI_SESSION_ID"],
     },
 ];
 
@@ -121,6 +135,7 @@ pub fn identity_env_names_for(harness: &AgentHarness) -> Vec<String> {
     let mut names: Vec<String> = harness
         .identity_env
         .iter()
+        .chain(std::iter::once(&AGENT_KIND))
         .map(|name| (*name).to_owned())
         .collect();
     names.sort();
@@ -134,11 +149,16 @@ pub fn identity_env_names_for(harness: &AgentHarness) -> Vec<String> {
 /// identity variables - never the pane's whole environment, which is not read.
 pub fn detect(command: &[String], env: &BTreeMap<String, String>) -> Option<PaneAgent> {
     let harness = harness_for_command(command.first()?)?;
+    // the shared id belongs to whichever harness AGENT_KIND names; another harness's is not ours
+    let kind_disowns_shared_id = env
+        .get(AGENT_KIND)
+        .map_or(false, |kind| !kind.is_empty() && kind != harness.kind);
     // an exported but empty variable is not an identity: it proves nothing a reader can use, and
     // reporting `agent_id: ""` would read as a real answer
     let agent_id = harness
         .identity_env
         .iter()
+        .filter(|name| !(kind_disowns_shared_id && **name == AGENT_SESSION_ID))
         .find_map(|name| env.get(*name).filter(|value| !value.is_empty()))
         .cloned();
     let source = if agent_id.is_some() {
@@ -534,7 +554,9 @@ mod tests {
         // codex's variables would mean never stopping
         let claude = harness_for_command("claude").expect("claude is a harness");
         let asked = identity_env_names_for(claude);
-        assert_eq!(asked.len(), claude.identity_env.len());
+        // its own names, and AGENT_KIND to check the shared id against
+        assert_eq!(asked.len(), claude.identity_env.len() + 1);
+        assert!(asked.contains(&AGENT_KIND.to_owned()));
         assert!(!asked.iter().any(|name| name.starts_with("CODEX_")));
     }
 
@@ -612,5 +634,81 @@ mod tests {
             "{}",
             json
         );
+    }
+
+    #[test]
+    fn the_shared_variable_is_read_first_for_every_harness() {
+        for harness in HARNESSES {
+            assert_eq!(harness.identity_env.first(), Some(&AGENT_SESSION_ID));
+            let argv0 = harness.match_commands[0];
+            let found = detect(
+                &argv(&[argv0]),
+                &env(&[
+                    (AGENT_SESSION_ID, "shared"),
+                    (harness.identity_env[1], "native"),
+                ]),
+            )
+            .unwrap();
+            assert_eq!(
+                found.agent_id.as_deref(),
+                Some("shared"),
+                "{}",
+                harness.kind
+            );
+        }
+    }
+
+    #[test]
+    fn a_matching_agent_kind_keeps_the_shared_id() {
+        let found = detect(
+            &argv(&["codex"]),
+            &env(&[(AGENT_SESSION_ID, "thread-1"), (AGENT_KIND, "codex")]),
+        )
+        .unwrap();
+        assert_eq!(found.agent_id.as_deref(), Some("thread-1"));
+    }
+
+    /// A codex pane whose process tree carries a nested claude's variables: the shared id is
+    /// claude's, not this pane's. codex's own name still answers.
+    #[test]
+    fn another_harnesss_agent_kind_disowns_the_shared_id() {
+        let found = detect(
+            &argv(&["codex"]),
+            &env(&[(AGENT_SESSION_ID, "claude-id"), (AGENT_KIND, "claude")]),
+        )
+        .unwrap();
+        assert_eq!(found.agent_id, None);
+        let found = detect(
+            &argv(&["codex"]),
+            &env(&[
+                (AGENT_SESSION_ID, "claude-id"),
+                (AGENT_KIND, "claude"),
+                ("CODEX_THREAD_ID", "own"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(found.agent_id.as_deref(), Some("own"));
+    }
+
+    /// opencode's bash tool passes on its parent claude's variables when nested. A pane detected
+    /// as opencode never takes claude's: neither its native name nor a shared id claude exported.
+    #[test]
+    fn an_inherited_claude_identity_never_names_an_opencode_pane() {
+        let inherited = env(&[
+            ("CLAUDE_CODE_SESSION_ID", "parent-claude"),
+            (AGENT_SESSION_ID, "parent-claude"),
+            (AGENT_KIND, "claude"),
+        ]);
+        let found = detect(&argv(&["opencode"]), &inherited).unwrap();
+        assert_eq!(found.agent_id, None);
+        let mut own = inherited.clone();
+        own.insert("OPENCODE_SESSION_ID".to_owned(), "ses_own".to_owned());
+        let found = detect(&argv(&["opencode"]), &own).unwrap();
+        assert_eq!(found.agent_id.as_deref(), Some("ses_own"));
+        // once opencode's own hook has run, the shared pair is its own
+        own.insert(AGENT_SESSION_ID.to_owned(), "ses_own".to_owned());
+        own.insert(AGENT_KIND.to_owned(), "opencode".to_owned());
+        let found = detect(&argv(&["opencode"]), &own).unwrap();
+        assert_eq!(found.agent_id.as_deref(), Some("ses_own"));
     }
 }

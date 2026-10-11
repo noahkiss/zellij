@@ -3846,26 +3846,68 @@ fires at start-up, usually before the once-a-second tick has seen the agent, and
 drop every fresh report. A new report from the next agent replaces the old one.
 
 `zellij setup --agent-hooks` prints the hook for each agent and the file it goes in. It prints
-only; nothing is written. Every snippet returns at once unless `ZELLIJ` is set. A build that
-reads the report lists `agent-session-osc` in `zellij setup --check --json`, so dotfiles can
-install the hooks only where they do something.
+only; nothing is written. A build that reads the report lists `agent-session-osc` in
+`zellij setup --check --json`, so dotfiles can install the hooks only where they do something.
 
-| agent | where | event |
-|---|---|---|
-| `claude` | `settings.json`, calling a shared `~/.config/zellij/agent-session.sh` | `SessionStart` (start-up, `/clear`, `/resume`, compaction) |
-| `codex` | `config.toml` `[[hooks.SessionStart]]`, the same script | `SessionStart`; codex asks once to trust a new hook |
-| `opencode` | `~/.config/opencode/plugins/zellij-agent-session.js` | `session.updated`, top-level sessions only |
-| `pi` | `~/.pi/agent/extensions/zellij-agent-session.ts` | `session_start` (start-up, `/new`, `/resume`, `/fork`) |
+**The hooks follow the shared agent-session contract.** On every session start - a claude
+`/clear` or a pi `/new` starts a new id in the same process - each hook does three things, and
+only the last is limited to zellij:
+
+1. exports `AGENT_SESSION_ID` (the harness's own native id) and `AGENT_KIND` to the commands the
+   agent runs, where the harness can;
+2. runs `agent-sessions register --id <id> --kind <kind>` when that command exists, and
+   `agent-sessions unregister --id <id>` from an end hook where the harness has one. The registry
+   CLI and its file format belong to another tool on these machines, not to zellij;
+3. inside zellij only (`ZELLIJ` set), prints the `OSC 1337` report.
+
+| agent | file | export | register / unregister | report |
+|---|---|---|---|---|
+| `claude` | `settings.json` `SessionStart`, calling `~/.config/zellij/agent-session.sh claude osc` | not here | not here | yes |
+| `codex` | `config.toml` `[[hooks.SessionStart]]` and `[[hooks.SessionEnd]]`, the same script | none: codex 0.160 has no way | `SessionStart` / `SessionEnd` | yes |
+| `opencode` (v2) | `~/.config/opencode/plugins/agent-session-env.ts` (server) and `~/.config/opencode/agent-session/tui.ts`, a CLI plugin named in `cli.json` | the server plugin | session opened in the TUI / TUI exit | yes |
+| `pi` | `~/.pi/agent/extensions/agent-session.ts` | its own `process.env`, which every command it runs inherits | `session_start` / `session_shutdown` | yes |
+
+claude's export, register and unregister are owned for now by bm's SessionStart hook; the zellij
+snippet prints a note and does not duplicate them. A move into the zellij hook is agreed with
+that hook's owner first, so there is always exactly one.
+
+On the reading side, `AGENT_SESSION_ID` is the first identity variable for every harness, before
+its native names. When `AGENT_KIND` names another harness than the one detected - a codex pane
+whose process tree carries a nested claude's variables - the shared id is ignored for that pane.
+The pty files its own live id with `AGENT_KIND` set to the detected harness, so a nested agent's
+variable never disowns it.
 
 **A claude hook has no controlling terminal.** Verified with Claude Code 2.1 under a pty: inside
 the hook `tty` says "not a tty" and `ps -o tty=` prints `?`, so a write to `/dev/tty` fails, and
-the hook's stdout is claude's, not the terminal. The shared script walks up from itself to the
-first ancestor that has a terminal - the agent - and writes the report to that device. Proven end
-to end on Linux: the pty received the sequence carrying the hook's `session_id`. opencode and pi
-run the snippet inside the agent's own process, which owns the terminal, so they write to
-`/dev/tty`. The codex and opencode snippets are unproven: codex auth was expired and opencode not
-installed where this was written, and if an interactive codex runs its hooks in its app-server
-daemon, the hook has no pane terminal to find.
+the hook's stdout is claude's, not the terminal. The shared script walks up to the agent itself -
+the nearest ancestor whose executable or argv0 is named like the agent - and writes the report
+to that agent's terminal. It stops there: a first version took the first ancestor with any
+terminal, and a `codex exec` with none of its own reported into the unrelated pane that started
+it. opencode and pi run the snippet inside the agent's own process, which owns the terminal, so
+they write to `/dev/tty`.
+
+**opencode v2 keeps its sessions in a shared background service**, not in the pane: the TUI in
+the pane is a client, and one service serves every pane (`--standalone` gives a pane a private
+server, as a child of its TUI). So the hook is a CLI plugin, which runs in the TUI, reads the
+session the TUI shows (`context.ui.router.current()`), and reports and registers from the pane's
+own process. A plugin in `plugins/` runs in the service instead, which has no pane and no single
+session, so the env export lives there. Its shell hook (`create.before`) is not told the session,
+and opencode sets its own `OPENCODE_SESSION_ID` only after that hook, so the export pairs two
+hooks: the tool hook (`execute.before`), which does carry the session, remembers it per command,
+and the shell hook sets `AGENT_SESSION_ID` and `AGENT_KIND=opencode` for that command. The pair
+matters: opencode's shell passes on a parent claude's `CLAUDE_CODE_SESSION_ID` when nested, and
+without its own pair a nested opencode reads as its parent. `list-agents` detects the TUI by its
+argv0, `opencode`, and never takes a `CLAUDE_*` name for it.
+
+Proven on Linux, in scratch config directories: claude (the report reaches the pty with the
+hook's `session_id`); pi 1.1 (`session_start` fires with no model call, `register` resolves the
+pi process itself, `/quit` unregisters); `codex exec` 0.160 (`SessionStart` and `SessionEnd`
+fire even with no auth, `register` resolves the codex process, no report without a terminal);
+opencode 2.0.25 (`--standalone --session <id>` on a session made without a model call: the
+report carries the id, `register` resolves the TUI process, quitting unregisters; and in
+`opencode run --standalone` its bash tool printed `AGENT=<id> KIND=opencode` with the id equal
+to its own `OPENCODE_SESSION_ID`). Unproven: the
+interactive codex TUI, which stopped at sign-in and never started a session.
 
 A miss is logged at `warn` once per pane, when its reason changes, with the pid, the agent and the
 reason, so the server log answers "why did this pane come back with a picker". The serialized

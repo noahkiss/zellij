@@ -241,6 +241,8 @@ const AGENT_ENV_RETRY_TICKS: u32 = 30;
 /// The harness whose live session is read from its own record rather than its environment.
 const CLAUDE: &str = "claude";
 
+use zellij_utils::agent_detect::AGENT_KIND;
+
 /// The key a harness's own live session is filed under among a pane's identity variables: the
 /// first one `agent_detect` asks for, so detection takes it over anything the environment said.
 fn claude_identity_key(harness: &AgentHarness) -> String {
@@ -2666,10 +2668,9 @@ impl Pty {
                         continue;
                     }
                     if let Some(session_id) = probe.live_session_id() {
-                        self.terminal_agent_envs
-                            .entry(*terminal_id)
-                            .or_default()
-                            .insert(claude_identity_key(harness), session_id);
+                        let envs = self.terminal_agent_envs.entry(*terminal_id).or_default();
+                        envs.insert(claude_identity_key(harness), session_id);
+                        envs.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
                         continue;
                     }
                     // that agent has exited or moved on: what the pane runs now is a new question
@@ -2710,6 +2711,8 @@ impl Pty {
             ) {
                 Ok(own) => {
                     found.insert(claude_identity_key(harness), own.id);
+                    // the id is this harness's: a nested agent's AGENT_KIND must not disown it
+                    found.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
                     Some(own.live)
                 },
                 Err(miss) => {
