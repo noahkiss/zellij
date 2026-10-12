@@ -2484,6 +2484,21 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// With --json, answer with {"agents": [...], "withheld": n} instead of the bare array
         #[clap(long, value_parser)]
         report_withheld: bool,
+
+        /// Ask every live session, not one. Each row gains `session` (a SESSION column, last).
+        /// A session that does not answer is named on stderr and skipped
+        #[clap(long, value_parser)]
+        all_sessions: bool,
+
+        /// Keep running, and print one JSON line whenever an agent appears, changes state or
+        /// identity, or goes: {"event": "agent", ...row} or {"event": "gone", ...}. The first
+        /// lines are every agent there is now. The session is asked again every --interval-ms
+        #[clap(long, value_parser)]
+        watch: bool,
+
+        /// With --watch: how often to ask, in milliseconds (at least 100)
+        #[clap(long, value_parser, default_value = "1000")]
+        interval_ms: u64,
     },
     /// Get information about the currently active tab
     ///

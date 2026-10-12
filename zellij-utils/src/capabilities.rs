@@ -74,15 +74,17 @@ pub const CAPABILITIES: &[&str] = &[
     "background-plugin-dispatch", // a background plugin gets updates with no client attached
     "web-request-timeout", // web_request times out, and reports the kind in x-zellij-error-kind
     // configuration this fork adds
-    "config-path-expansion",   // ~ and $VAR in config paths
-    "terminal-title-template", // terminal_title_template, session_aliases
-    "pane-frame-top-only",     // pane_frame_style "top_only"
-    "bell-clear-delay",        // bell_clear_delay_ms
-    "default-floating-size",   // default_floating_size
-    "resurrect-command-hints", // resurrect_command_hints
-    "resurrect-commands",      // resurrect_commands "all" | "agents" | "prefill"
-    "agent-session-osc",       // OSC 1337 SetUserVar=agent_session, setup --agent-hooks
+    "config-path-expansion",    // ~ and $VAR in config paths
+    "terminal-title-template",  // terminal_title_template, session_aliases
+    "pane-frame-top-only",      // pane_frame_style "top_only"
+    "bell-clear-delay",         // bell_clear_delay_ms
+    "default-floating-size",    // default_floating_size
+    "resurrect-command-hints",  // resurrect_command_hints
+    "resurrect-commands",       // resurrect_commands "all" | "agents" | "prefill"
+    "agent-session-osc",        // OSC 1337 SetUserVar=agent_session, setup --agent-hooks
     "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
+    "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
+    "list-agents-watch",  // list-agents --watch, one JSON line per agent change
     "session-drop-env",   // session_restart_drop_env
     "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
     "session-service-config", // session_service, pin_exe

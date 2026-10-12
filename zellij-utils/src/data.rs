@@ -2854,6 +2854,10 @@ pub struct AgentListEntry {
     /// `state_at` and the rest of [`PaneProgramStatus`]. Absent when it has said nothing.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<PaneProgramStatus>,
+    /// The session the agent runs in. Only `list-agents --all-sessions` and `--watch` fill it:
+    /// a one-session list is about the session it was asked of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 pub type ListAgentsResponse = Vec<AgentListEntry>;

@@ -309,6 +309,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
                 cwd: entry.pane_info.pane_cwd.as_deref().map(PathBuf::from),
                 pid: entry.pane_info.pane_pid,
                 program_status: entry.program_status.clone(),
+                session: None,
             })
         })
         .collect()
@@ -327,10 +328,22 @@ pub const AGENT_TABLE_KEYS: &str =
 /// An empty list prints the header alone, the way a query that found nothing says so rather than
 /// printing nothing and leaving the reader to wonder whether it ran.
 pub fn agent_table(agents: &ListAgentsResponse) -> Vec<String> {
-    let header: Vec<&str> = AGENT_TABLE_KEYS.split(' ').collect();
+    table_of(agents, false)
+}
+
+/// The agent table of `list-agents --all-sessions`: the same columns, and `SESSION` after them.
+pub fn agent_table_with_sessions(agents: &ListAgentsResponse) -> Vec<String> {
+    table_of(agents, true)
+}
+
+fn table_of(agents: &ListAgentsResponse, with_session: bool) -> Vec<String> {
+    let mut header: Vec<&str> = AGENT_TABLE_KEYS.split(' ').collect();
+    if with_session {
+        header.push("SESSION");
+    }
     let mut rows: Vec<Vec<String>> = vec![header.iter().map(|h| (*h).to_owned()).collect()];
     for agent in agents {
-        rows.push(vec![
+        let mut row = vec![
             agent.tab_id.to_string(),
             dashed(Some(agent.tab_name.clone())),
             agent.pane_id.to_string(),
@@ -342,7 +355,11 @@ pub fn agent_table(agents: &ListAgentsResponse) -> Vec<String> {
             dashed(agent.command.clone()),
             dashed(agent.cwd.as_ref().map(|cwd| cwd.display().to_string())),
             dashed(agent.program_status.as_ref().map(state_cell)),
-        ]);
+        ];
+        if with_session {
+            row.push(dashed(agent.session.clone()));
+        }
+        rows.push(row);
     }
     let widths: Vec<usize> = (0..header.len())
         .map(|column| {
@@ -369,6 +386,100 @@ pub fn agent_table(agents: &ListAgentsResponse) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// One line of `list-agents --watch`.
+///
+/// `agent` carries the whole row, so a reader keeps one map keyed by session and pane and
+/// replaces the entry; `gone` names the row to drop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AgentWatchEvent {
+    Agent(AgentListEntry),
+    Gone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        pane_id: u32,
+        handle: String,
+    },
+}
+
+/// Where a watched agent lives: its session, when the watch spans several, and its pane.
+pub type AgentWatchKey = (Option<String>, u32);
+
+/// What `--watch` remembers of one agent: the parts whose change is worth a line.
+///
+/// The identity and the state, not the whole row. The title is left out on purpose: several
+/// harnesses animate it, and a watch that printed every spinner frame would bury the change a
+/// reader is waiting for.
+fn watched_part(agent: &AgentListEntry) -> String {
+    serde_json::to_string(&(
+        &agent.handle,
+        &agent.agent.kind,
+        &agent.agent.agent_id,
+        &agent.program_status,
+    ))
+    .unwrap_or_default()
+}
+
+/// What a watch remembers of one agent between looks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchedAgent {
+    part: String,
+    handle: String,
+    /// Looks in a row this agent was missing from. One miss is not enough to call it gone.
+    misses: u8,
+}
+
+/// The lines one more look at the agents is worth, and what to remember for the next look.
+///
+/// An agent that is new, or whose identity or state changed, is an `agent` line. One that is
+/// missing from two looks in a row is a `gone` line: a pane list taken while a pane is being made
+/// or moved can miss it once, and a `gone` followed by the same `agent` is noise a reader would
+/// have to filter. Nothing else prints: an unchanged agent says nothing.
+pub fn agent_watch_events(
+    previous: &BTreeMap<AgentWatchKey, WatchedAgent>,
+    current: ListAgentsResponse,
+) -> (Vec<AgentWatchEvent>, BTreeMap<AgentWatchKey, WatchedAgent>) {
+    let mut events = Vec::new();
+    let mut seen: BTreeMap<AgentWatchKey, WatchedAgent> = BTreeMap::new();
+    for agent in current {
+        let key = (agent.session.clone(), agent.pane_id);
+        let part = watched_part(&agent);
+        let changed = previous.get(&key).map(|old| &old.part) != Some(&part);
+        seen.insert(
+            key,
+            WatchedAgent {
+                part,
+                handle: agent.handle.clone(),
+                misses: 0,
+            },
+        );
+        if changed {
+            events.push(AgentWatchEvent::Agent(agent));
+        }
+    }
+    for (key, old) in previous {
+        if seen.contains_key(key) {
+            continue;
+        }
+        if old.misses == 0 {
+            seen.insert(
+                key.clone(),
+                WatchedAgent {
+                    misses: 1,
+                    ..old.clone()
+                },
+            );
+        } else {
+            events.push(AgentWatchEvent::Gone {
+                session: key.0.clone(),
+                pane_id: key.1,
+                handle: old.handle.clone(),
+            });
+        }
+    }
+    (events, seen)
 }
 
 /// The `STATE` cell: the state, and a blocked program's reason after a colon.
@@ -648,6 +759,108 @@ mod tests {
         let back: PaneListEntry = serde_json::from_value(quiet_json).unwrap();
         assert_eq!(back.program_status, None);
         assert!(agent_table(&agents_from_pane_list(vec![quiet]))[1].ends_with('-'));
+    }
+
+    fn watched(pane_id: u32, session: Option<&str>, state: Option<&str>) -> AgentListEntry {
+        AgentListEntry {
+            handle: format!("pane-{pane_id}"),
+            pane_id,
+            tab_id: 0,
+            tab_position: 0,
+            tab_name: "t".to_owned(),
+            title: "spinner 1".to_owned(),
+            agent: detect_command_line("claude", &env(&[])).unwrap(),
+            command: None,
+            cwd: None,
+            pid: None,
+            program_status: state.map(|state| crate::data::PaneProgramStatus {
+                state: state.to_owned(),
+                at: 1,
+                ..Default::default()
+            }),
+            session: session.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_watch_prints_what_changed_and_nothing_else() {
+        let (events, seen) = agent_watch_events(
+            &BTreeMap::new(),
+            vec![
+                watched(1, Some("a"), Some("working")),
+                watched(1, Some("b"), None),
+            ],
+        );
+        assert_eq!(events.len(), 2, "the first look reports every agent");
+        // same pane id in two sessions is two agents
+        assert_eq!(seen.len(), 2);
+
+        // a new title alone is not a change; a new state is
+        let mut retitled = watched(1, Some("a"), Some("working"));
+        retitled.title = "spinner 2".to_owned();
+        let (events, seen) = agent_watch_events(
+            &seen,
+            vec![retitled, watched(1, Some("b"), Some("blocked"))],
+        );
+        assert_eq!(
+            events,
+            vec![AgentWatchEvent::Agent(watched(
+                1,
+                Some("b"),
+                Some("blocked")
+            ))]
+        );
+
+        // missing once is not gone: a pane list can miss a pane that is being made
+        let (events, seen) =
+            agent_watch_events(&seen, vec![watched(1, Some("b"), Some("blocked"))]);
+        assert!(events.is_empty());
+        // and coming back after one miss, unchanged, says nothing either
+        let (events, _) = agent_watch_events(
+            &seen,
+            vec![
+                watched(1, Some("a"), Some("working")),
+                watched(1, Some("b"), Some("blocked")),
+            ],
+        );
+        assert!(events.is_empty());
+        let (events, seen) =
+            agent_watch_events(&seen, vec![watched(1, Some("b"), Some("blocked"))]);
+        assert_eq!(
+            events,
+            vec![AgentWatchEvent::Gone {
+                session: Some("a".to_owned()),
+                pane_id: 1,
+                handle: "pane-1".to_owned(),
+            }]
+        );
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn a_watch_line_is_tagged_and_carries_the_row_flat() {
+        let line =
+            serde_json::to_value(AgentWatchEvent::Agent(watched(3, None, Some("done")))).unwrap();
+        assert_eq!(line["event"], "agent");
+        assert_eq!(line["pane_id"], 3);
+        assert_eq!(line["state"], "done");
+        assert!(line.get("session").is_none());
+        let gone = serde_json::to_value(AgentWatchEvent::Gone {
+            session: Some("work".to_owned()),
+            pane_id: 3,
+            handle: "pane-3".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(gone["event"], "gone");
+        assert_eq!(gone["session"], "work");
+    }
+
+    #[test]
+    fn the_all_sessions_table_puts_session_last() {
+        let table = agent_table_with_sessions(&vec![watched(1, Some("work"), Some("idle"))]);
+        assert!(table[0].ends_with("STATE  SESSION"));
+        assert!(table[1].ends_with("idle   work"));
+        assert!(agent_table_with_sessions(&vec![])[0].ends_with("SESSION"));
     }
 
     #[test]

@@ -5097,6 +5097,58 @@ the host keeps one set of records per window, and a client shows many panes.
 
 Capability: `program-status-osc`.
 
+### `list-agents --all-sessions` and `list-agents --watch`
+
+From nkmk.33. `list-agents` answered for one session, once. A controller that drives agents across
+sessions had to run `ls --json`, ask each session in turn, and poll the lot to see a state change.
+
+```
+$ zellij action list-agents --all-sessions
+TAB_ID  TAB_NAME  PANE_ID  HANDLE       KIND    ...  STATE               SESSION
+1       develop   3        sunny-otter  claude  ...  blocked:permission  work
+0       Tab #1    1        brisk-heron  codex   ...  working             notes
+
+$ zellij action list-agents --watch
+{"event":"agent","handle":"sunny-otter","pane_id":3,...,"state":"working","state_at":1760000000000}
+{"event":"agent","handle":"sunny-otter","pane_id":3,...,"state":"blocked","state_kind":"permission",...}
+{"event":"gone","pane_id":3,"handle":"sunny-otter"}
+```
+
+**`--all-sessions`** asks every live session in the socket directory, in name order, and each row
+gains `session`. The table puts `SESSION` after `STATE`, last, as the append-only rule says. It is
+answered before a session is chosen, so it needs no `-s`, ignores one, and with no session running
+prints the header alone and exits 0. A session that does not answer is named on stderr and left
+out: one wedged server should not hide every other agent on the machine. It exits 1 only when there
+were sessions and none answered. `--report-withheld` sums the withheld panes of every session.
+
+**`--watch`** keeps running and prints one JSON line whenever an agent appears, changes, or goes:
+
+- `{"event": "agent", ...}` carries the whole `list-agents --json` row. A reader keeps one map keyed
+  by `session` and `pane_id` and replaces the entry.
+- `{"event": "gone", "pane_id": ..., "handle": ...}` names the row to drop. Its `session` is there
+  when the watch spans sessions. An agent is gone once it is missing from **two** looks in a row: a
+  pane list taken while a pane is being made can miss it once, which the live proof caught, and a
+  `gone` followed by the same `agent` is noise a reader would have to filter.
+- The first lines are every agent there is now, so a reader needs no separate first call.
+- A change is a change of identity or state: `handle`, `kind`, `agent_id`, or any `state` key. The
+  title is not one. Several harnesses animate their title, and a line per spinner frame would bury
+  the change a reader waits for.
+
+It combines with `--all-sessions`, which re-reads the live sessions on every look: a session that
+starts or ends shows up as its agents coming or going. A one-session watch ends with exit 2 when its
+session stops answering. Any watch ends with exit 0 when its reader closes the pipe.
+
+**The push is in the client.** A watch asks the same `list-panes --json` every `--interval-ms`
+(default 1000, at least 100) and prints the difference. That is one pane-list build per session per
+second on the server. It adds no `Action`, no server-side subscription and nothing to the
+client/server contract, which a server-pushed agent event would have needed. The cost is latency:
+a state change reaches the reader within one interval, not at once.
+
+`AgentListEntry` gains `session`, absent outside these two modes. Still CLI-only: no protobuf tag,
+no plugin API.
+
+Capabilities: `list-agents-all-sessions`, `list-agents-watch`.
+
 ### `zellij mcp`: the CLI served over the Model Context Protocol
 
 ```json

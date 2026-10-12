@@ -15,8 +15,8 @@ use zellij_utils::{
     agent_detect,
     cli::{SubscribeCli, SubscribeFormat},
     data::{
-        ListAgentsEnvelope, ListPanesEnvelope, PaneCommandState, PaneDump, PaneId, PaneListEntry,
-        PaneTarget,
+        ListAgentsEnvelope, ListAgentsResponse, ListPanesEnvelope, PaneCommandState, PaneDump,
+        PaneId, PaneListEntry, PaneTarget,
     },
     errors::prelude::*,
     input::actions::Action,
@@ -986,7 +986,93 @@ pub fn start_list_agents_client(
     output_json: bool,
     report_withheld: bool,
 ) -> i32 {
-    let lines = match ask(
+    let (agents, withheld) = match agents_of_session(os_input, session_name) {
+        Ok(answer) => answer,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    print_agents(&agents, withheld, output_json, report_withheld, false)
+}
+
+/// `zellij action list-agents --all-sessions`: the same rows, from every live session, each
+/// carrying the session it came from.
+///
+/// One `list-panes --json` per session, each on its own connection. A session that does not
+/// answer is named on stderr and left out rather than failing the rest: the question is about
+/// the machine, and one wedged server should not hide every other agent on it. Exit 1 only when
+/// there were sessions and none of them answered.
+pub fn start_list_agents_all_sessions_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_names: &[String],
+    output_json: bool,
+    report_withheld: bool,
+) -> i32 {
+    let (agents, withheld, answered) = agents_of_sessions(make_os_input, session_names);
+    if answered == 0 && !session_names.is_empty() {
+        return 1;
+    }
+    print_agents(&agents, withheld, output_json, report_withheld, true)
+}
+
+/// `zellij action list-agents --watch`: one JSON line whenever an agent appears, changes, or
+/// goes, until the reader stops reading.
+///
+/// It asks the same `list-panes --json` every `interval` and prints the difference, so it adds
+/// nothing to the server or the contract: the push is in the client. `sessions` is `None` for one
+/// session, which ends the watch with exit 2 when it stops answering; `Some` re-reads the live
+/// sessions on every look, so a session that starts or ends shows up as its agents coming or
+/// going.
+pub fn start_list_agents_watch_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    all_sessions: Option<&dyn Fn() -> Vec<String>>,
+    interval: Duration,
+) -> i32 {
+    let mut seen = BTreeMap::new();
+    let stdout = io::stdout();
+    loop {
+        let agents = match all_sessions {
+            Some(live_sessions) => agents_of_sessions(make_os_input, &live_sessions()).0,
+            None => match agents_of_session(make_os_input(), session_name) {
+                Ok((agents, _)) => agents,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    return 2;
+                },
+            },
+        };
+        let (events, next) = agent_detect::agent_watch_events(&seen, agents);
+        seen = next;
+        let mut out = stdout.lock();
+        for event in events {
+            let line = match serde_json::to_string(&event) {
+                Ok(line) => line,
+                Err(e) => {
+                    eprintln!("Could not write a watch line as JSON: {}", e);
+                    return 1;
+                },
+            };
+            // a reader that has gone away is how a watch is meant to end
+            if writeln!(out, "{}", line).is_err() {
+                return 0;
+            }
+        }
+        if out.flush().is_err() {
+            return 0;
+        }
+        drop(out);
+        std::thread::sleep(interval);
+    }
+}
+
+/// The agents of one session, and how many of its panes a privacy policy withheld.
+fn agents_of_session(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<(ListAgentsResponse, usize), String> {
+    let lines = ask(
         os_input,
         session_name,
         Action::ListPanes {
@@ -1001,32 +1087,61 @@ pub fn start_list_agents_client(
             report_withheld: true,
         },
         "the panes of this session",
-    ) {
-        Ok(lines) => lines,
-        Err(message) => {
-            eprintln!("{}", message);
-            return 1;
-        },
-    };
-    let envelope: ListPanesEnvelope = match serde_json::from_str(&lines.join("\n")) {
-        Ok(envelope) => envelope,
-        // a session that answered with something other than a pane list is a bug rather than a
-        // miss, so it is an error and says what it could not read
-        Err(e) => {
-            eprintln!(
-                "Could not read the pane list this session answered with: {}",
-                e
-            );
-            return 1;
-        },
-    };
-    let withheld = envelope.withheld;
-    let agents = agent_detect::agents_from_pane_list(envelope.panes);
+    )?;
+    // a session that answered with something other than a pane list is a bug rather than a
+    // miss, so it is an error and says what it could not read
+    let envelope: ListPanesEnvelope = serde_json::from_str(&lines.join("\n")).map_err(|e| {
+        format!(
+            "Could not read the pane list session '{}' answered with: {}",
+            session_name, e
+        )
+    })?;
+    Ok((
+        agent_detect::agents_from_pane_list(envelope.panes),
+        envelope.withheld,
+    ))
+}
+
+/// The agents of several sessions, each row naming its session; the withheld panes summed; and
+/// how many sessions answered. A session that did not answer is named on stderr.
+fn agents_of_sessions(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_names: &[String],
+) -> (ListAgentsResponse, usize, usize) {
+    let mut agents = Vec::new();
+    let mut withheld = 0;
+    let mut answered = 0;
+    for session_name in session_names {
+        match agents_of_session(make_os_input(), session_name) {
+            Ok((session_agents, session_withheld)) => {
+                answered += 1;
+                withheld += session_withheld;
+                agents.extend(session_agents.into_iter().map(|mut agent| {
+                    agent.session = Some(session_name.clone());
+                    agent
+                }));
+            },
+            Err(message) => eprintln!("session '{}': {}", session_name, message),
+        }
+    }
+    (agents, withheld, answered)
+}
+
+fn print_agents(
+    agents: &ListAgentsResponse,
+    withheld: usize,
+    output_json: bool,
+    report_withheld: bool,
+    with_session: bool,
+) -> i32 {
     if output_json {
         let json = if report_withheld {
-            serde_json::to_string_pretty(&ListAgentsEnvelope { agents, withheld })
+            serde_json::to_string_pretty(&ListAgentsEnvelope {
+                agents: agents.clone(),
+                withheld,
+            })
         } else {
-            serde_json::to_string_pretty(&agents)
+            serde_json::to_string_pretty(agents)
         };
         match json {
             Ok(json) => println!("{}", json),
@@ -1036,7 +1151,12 @@ pub fn start_list_agents_client(
             },
         }
     } else {
-        for line in agent_detect::agent_table(&agents) {
+        let table = if with_session {
+            agent_detect::agent_table_with_sessions(agents)
+        } else {
+            agent_detect::agent_table(agents)
+        };
+        for line in table {
             println!("{}", line);
         }
         // the walk this answer is filtered from was itself partial, and a reader looking for an
