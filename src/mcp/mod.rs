@@ -8,7 +8,7 @@
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
 //! * **Eight tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
-//!   fails if it grows past eight or if a tool asks for more than eight parameters.
+//!   fails if it grows past eight or if a tool asks for more than nine parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
 //! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so
@@ -78,11 +78,16 @@ impl ZellijMcp {
             // told what was missing rather than being handed an empty result
             Err(message) => return failed(message, json!({"reason": "bad_arguments"})),
         };
-        let (argv, outcome) = match self.run_plan(plan).await {
+        let then_type = plan.then_type;
+        let (argv, mut outcome) = match self.run_plan(plan.call).await {
             Ok(ran) => ran,
             Err(message) => return failed(message, json!({"reason": "not_run"})),
         };
-        self.report(&argv, outcome)
+        let input_sent = match then_type {
+            Some(then_type) => Some(type_into_created_pane(then_type, &mut outcome).await),
+            None => None,
+        };
+        self.report(&argv, outcome, input_sent)
     }
 
     /// Run whatever the plan turned out to be, and say which command line answered.
@@ -117,11 +122,70 @@ impl ZellijMcp {
     }
 
     /// What the CLI said, as the protocol carries it.
-    fn report(&self, argv: &[String], outcome: invoke::Outcome) -> CallToolResult {
+    ///
+    /// `input_sent` is a shell-mode create's second half: whether its command was typed into the
+    /// pane. `None` for every call that had nothing to type.
+    fn report(
+        &self,
+        argv: &[String],
+        outcome: invoke::Outcome,
+        input_sent: Option<bool>,
+    ) -> CallToolResult {
         let mut structured = Map::new();
         structured.insert("exit_code".to_owned(), json!(outcome.code));
         for (key, value) in invoke::call_context(argv) {
             structured.insert(key, json!(value));
+        }
+        // a create that waited for its pane says how it ended, whichever way that was: the two
+        // lines the CLI added, and `ready` itself, since a pane that never got them is not ready
+        let waited = argv.iter().any(|word| word == "--wait-ready");
+        if waited {
+            let ready_by = report_value(&outcome.stdout, "ready_by");
+            structured.insert("ready".to_owned(), json!(ready_by.is_some()));
+            if let Some(ready_by) = ready_by {
+                structured.insert("ready_by".to_owned(), json!(ready_by));
+            }
+            if let Some(ready_ms) = report_value(&outcome.stdout, "ready_ms")
+                .and_then(|ready_ms| ready_ms.parse::<u64>().ok())
+            {
+                structured.insert("ready_ms".to_owned(), json!(ready_ms));
+            }
+        }
+        if let Some(input_sent) = input_sent {
+            structured.insert("input_sent".to_owned(), json!(input_sent));
+        }
+        // a create that waited, missed, and still named its pane made a pane whose shell was not
+        // ready in time. That is not the "nothing matched" every other miss is: the pane is there,
+        // and the caller made it and has to close it
+        if waited && outcome.is_miss() && invoke::reported_pane_id(&outcome.stdout).is_some() {
+            // nothing was typed into a shell that had not said it was listening
+            structured.insert("reason".to_owned(), json!("not_ready"));
+            if let Some(pane_id) = report_value(&outcome.stdout, "pane_id") {
+                structured.insert("pane_id".to_owned(), json!(pane_id));
+            }
+            if let Some(handle) = report_value(&outcome.stdout, "handle") {
+                structured.insert("handle".to_owned(), json!(handle));
+            }
+            structured.insert("output".to_owned(), json!(outcome.stdout));
+            if !outcome.stderr.trim().is_empty() {
+                structured.insert("diagnostics".to_owned(), json!(outcome.stderr.trim()));
+            }
+            let message = format!(
+                "The pane was made, but its shell was not ready within {} seconds{}. {} Write to \
+                 the pane once it is ready, or close it.\n{}",
+                invoke::READY_TIMEOUT_DEFAULT_S,
+                if input_sent.is_some() {
+                    ", so the command was not typed into it"
+                } else {
+                    ""
+                },
+                first_words(&outcome.stderr, ""),
+                outcome.stdout.trim()
+            );
+            return with_structure(
+                CallToolResult::error(vec![ContentBlock::text(message)]),
+                structured,
+            );
         }
         // the CLI's JSON answers are parsed back so that a client gets structure rather than a
         // string holding structure; anything else is carried as the lines it printed
@@ -171,6 +235,44 @@ impl ZellijMcp {
             structured,
         )
     }
+}
+
+/// Type a shell-mode create's command into the pane the create made, and say whether it was.
+///
+/// Only into a pane the create reported, and only when the create succeeded - which, with
+/// `--wait-ready`, is when the pane's shell said it was ready. A create that was not ready in time
+/// exits 2 and still names its pane, and nothing is typed into it. A write that fails leaves a pane
+/// with nothing running in it, so its failure becomes the call's.
+async fn type_into_created_pane(
+    then_type: invoke::TypeAfter,
+    outcome: &mut invoke::Outcome,
+) -> bool {
+    let Some(pane) = invoke::reported_pane_id(&outcome.stdout) else {
+        return false;
+    };
+    if outcome.is_error() {
+        return false;
+    }
+    for argv in then_type.argvs(&pane) {
+        let failure = match invoke::run(&argv).await {
+            Ok(said) if said.is_error() => (said.code, said.stderr),
+            Ok(_) => continue,
+            Err(message) => (1, message),
+        };
+        outcome.code = failure.0;
+        also_said(&mut outcome.stderr, &failure.1);
+        return false;
+    }
+    true
+}
+
+/// The value of one `key: value` line of a CLI report.
+fn report_value(stdout: &str, key: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(key)?.strip_prefix(':'))
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 /// How long a client may treat the tool list as fresh, in milliseconds.
@@ -356,6 +458,109 @@ mod tests {
         let wire = serde_json::to_value(&result).expect("the tool list serializes");
         assert!(wire["ttlMs"].is_number(), "ttlMs missing: {}", wire);
         assert_eq!(wire["cacheScope"], json!("private"), "{}", wire);
+    }
+
+    fn outcome(code: i32, stdout: &str, stderr: &str) -> invoke::Outcome {
+        invoke::Outcome {
+            code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    fn create_argv() -> Vec<String> {
+        "action new-pane --near-current-pane --wait-ready --ready-timeout=10"
+            .split(' ')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn nothing_is_typed_into_a_pane_whose_shell_was_not_ready() {
+        // the create named its pane and exited 2: the shell never said it was listening. Nothing
+        // runs here - a write would spawn a child, and this returns before one could
+        let plan = invoke::plan(
+            "zellij_create",
+            json!({"kind": "pane", "command": "make"})
+                .as_object()
+                .unwrap(),
+            None,
+        )
+        .await
+        .expect("a plan");
+        let mut missed = outcome(
+            2,
+            "pane_id: terminal_7\nhandle: sunny-otter\n",
+            "terminal_7 was not ready when the wait timed out.\n",
+        );
+        let sent = type_into_created_pane(plan.then_type.unwrap(), &mut missed).await;
+        assert!(!sent);
+        assert_eq!(missed.code, 2, "the create's own answer stands");
+    }
+
+    #[test]
+    fn a_pane_that_was_not_ready_is_reported_by_handle_and_as_not_ready() {
+        let server = ZellijMcp::default();
+        let result = server.report(
+            &create_argv(),
+            outcome(
+                2,
+                "pane_id: terminal_7\nhandle: sunny-otter\n",
+                "terminal_7 was not ready when the wait timed out.\n",
+            ),
+            Some(false),
+        );
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["reason"], json!("not_ready"));
+        assert_eq!(structured["ready"], json!(false));
+        assert_eq!(structured["input_sent"], json!(false));
+        assert_eq!(structured["handle"], json!("sunny-otter"));
+        assert_eq!(structured["pane_id"], json!("terminal_7"));
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("not typed"), "{}", text);
+        assert!(text.contains("sunny-otter"), "{}", text);
+        // the negative control: a miss that made no pane is still the ordinary miss
+        let result = server.report(
+            &create_argv(),
+            outcome(2, "", "No tab answers to 'x'.\n"),
+            None,
+        );
+        assert_eq!(result.structured_content.unwrap()["reason"], json!("miss"));
+    }
+
+    #[test]
+    fn a_ready_pane_says_how_and_how_long_and_whether_its_command_was_typed() {
+        let result = ZellijMcp::default().report(
+            &create_argv(),
+            outcome(
+                0,
+                "pane_id: terminal_7\nhandle: sunny-otter\nready_by: prompt\nready_ms: 212\n",
+                "",
+            ),
+            Some(true),
+        );
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["ready"], json!(true));
+        assert_eq!(structured["ready_by"], json!("prompt"));
+        assert_eq!(structured["ready_ms"], json!(212));
+        assert_eq!(structured["input_sent"], json!(true));
+        // a call that typed nothing carries no `input_sent` at all
+        let result = ZellijMcp::default().report(
+            &create_argv(),
+            outcome(
+                0,
+                "pane_id: terminal_7\nready_by: quiet\nready_ms: 300\n",
+                "",
+            ),
+            None,
+        );
+        assert!(result
+            .structured_content
+            .unwrap()
+            .get("input_sent")
+            .is_none());
     }
 
     #[test]

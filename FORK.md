@@ -4990,8 +4990,8 @@ machine), `zellij_read_pane`, `zellij_wait_for`, `zellij_write_input`, `zellij_c
 `zellij_arrange`, `zellij_close`, `zellij_snapshot`. `zellij_close` is the one that cannot be
 undone, kept apart from the moves so a client can allow one without the other. Session lifecycle -
 `up`, `down`, `restart`, `enable` - is deliberately not among them: those start and stop the thing
-the server is talking to. A test fails if the surface grows past eight tools, or a tool past eight
-parameters.
+the server is talking to. A test fails if the surface grows past eight tools, or a tool past nine
+parameters (eight until nkmk.32, when `zellij_create` took `run_in` and `wait_ready`).
 
 **The descriptions are generated from the surface map.** A tool's `Returns:` line is built from the
 same `OUTPUTS` row `--dump-surface` prints, and each input-schema property that stands for a real
@@ -7995,6 +7995,51 @@ under.
 CLI-side only: `src/mcp/`, and one row of `zellij-utils/src/cli_surface.rs`. No protobuf, no
 contract change, and no CLI flag added - every flag this uses (`--in-tab`, `--new-tab`,
 `--no-focus`, `--near-current-pane`) already shipped.
+
+### `zellij_create` types its command into a ready interactive shell
+
+```
+# before - zellij_create {"command": "opsearch --read op://…"}
+action new-pane --in-tab=work-zj --no-focus --name=… -- /bin/zsh -c 'opsearch …'
+  # `zsh -c` reads .zshenv only: no .zshrc, no aliases, no `mise activate`
+
+# after
+action new-pane --in-tab=work-zj --no-focus --name=… --wait-ready --ready-timeout=10
+action write-chars --pane-id=terminal_7 -- 'opsearch …'
+action send-keys --pane-id=terminal_7 -- Enter
+  # result: ready: true, ready_by: prompt, ready_ms: 212, input_sent: true
+```
+
+**A command now runs where a person would run it.** `$SHELL -c` is non-interactive, so a
+command from the MCP tool missed everything the interactive rc chain sets up, and a command typed
+by hand in the pane beside it did not. Two parameters change that, and the default is the new
+behaviour:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `run_in` | `shell` | `shell` makes a plain shell pane, waits for it to be ready, then types `command` and presses Enter through the same two verbs `zellij_write_input` uses. The pane stays a shell when the command ends. `exec` is the old behaviour, `$SHELL -c`, for a one-shot command whose exit status the caller wants from `zellij_wait_for until=exit`. |
+| `wait_ready` | `true` | Passes `--wait-ready --ready-timeout=10` to the create. Applies in `shell` mode, with or without a `command`. `false` types at once, into a shell that may not be listening yet. |
+
+- **A readiness timeout types nothing.** The create exits 2 and still names its pane; the tool
+  reports `reason: not_ready`, `ready: false`, `input_sent: false` and the pane's `pane_id` and
+  `handle`, so the caller can write to it later or close it. It is not reported as the ordinary
+  "nothing matched" miss, because the pane is there.
+- **A write that fails is the call's failure.** A pane that is ready and empty is not a command
+  that ran.
+- A created pane that waited carries `ready`, `ready_by` and `ready_ms` in the structured result;
+  one that had a command to type also carries `input_sent`.
+- `exec` ignores `wait_ready`: a one-shot command can end before it ever looks ready, which the wait
+  would report as a miss.
+
+The 10-second bound sits well under the request deadline an MCP client keeps. The tool cap went
+from eight parameters to nine to make room; the alternative was folding `floating` into `kind`,
+which breaks every caller that passes it.
+
+`src/mcp/invoke.rs` (`Plan`, `TypeAfter`, `run_in`, the `finish` step of the create),
+`src/mcp/mod.rs` (`type_into_created_pane`, the readiness fields in `report`) and
+`src/mcp/tools.rs` (the two parameters, the tips, and a boolean default written as a boolean).
+Tests: the shell-mode command lines for each `kind`; `exec` unchanged with either `wait_ready`; the
+plan's write and Enter; nothing typed after a timeout; the `not_ready` and ready result shapes.
 
 ### A refreshed pin is no longer mistaken for the build the server is running
 

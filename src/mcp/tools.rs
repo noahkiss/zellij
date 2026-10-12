@@ -319,11 +319,17 @@ pub const TOOLS: &[ToolSpec] = &[
         // doing so. A tool that multiplexes says what each of its commands returns
         reports: &["action new-pane", "action new-tab"],
         tips:
-            "Success here means the pane was MADE, not that the command worked: exit_code 0 says \
-               nothing about what ran in it. Follow with zellij_wait_for until=exit and read \
-               `exit_status`. The handle in the answer is the pane's address and survives a \
-               session restore; use it, not the integer id, and pass `handle` yourself when you \
-               want to find the pane again by a name you chose.",
+            "By default the pane runs your interactive shell, with your full rc files, and the \
+               call waits until that shell is ready before it types `command` and presses Enter - \
+               what you would get by typing it yourself. The pane stays a shell after the command \
+               ends. Success means the pane was MADE and the command typed, not that it worked: \
+               follow with zellij_wait_for until=match or until=quiet, or zellij_read_pane. For a \
+               one-shot command whose exit status you want, pass run_in=exec and follow with \
+               zellij_wait_for until=exit, then read `exit_status`. A shell that is not ready in \
+               time is reported as `ready: false` with the pane's handle, and nothing is typed. \
+               The handle in the answer is the pane's address and survives a session restore; \
+               use it, not the integer id, and pass `handle` yourself when you want to find the \
+               pane again by a name you chose.",
         params: &[
             SESSION,
             ParamSpec {
@@ -347,6 +353,31 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "The command to run in the pane, through your shell: quotes, pipes, \
                            `&&`, `~` and `$VAR` all work. Without one the pane runs your shell.",
                 default: None,
+            },
+            ParamSpec {
+                name: "run_in",
+                kind: ParamKind::Enum(&["shell", "exec"]),
+                required: false,
+                from: None,
+                describe: "How `command` runs. shell, the default, types it into your interactive \
+                           shell once the pane is ready, so your rc files, aliases and PATH all \
+                           apply, and the pane stays a shell afterwards. exec runs it as \
+                           `$SHELL -c`, which reads no interactive rc file, ends the pane's \
+                           command when it ends, and keeps its exit status for zellij_wait_for \
+                           until=exit.",
+                default: Some(invoke::RUN_IN_DEFAULT),
+            },
+            ParamSpec {
+                name: "wait_ready",
+                kind: ParamKind::Bool,
+                required: false,
+                from: Some(("action new-pane", "--wait-ready")),
+                describe: "Wait until the new pane's shell is ready for input - it drew a prompt, \
+                           or drew something and fell quiet - before answering and before typing \
+                           `command`. The answer says `ready_by` (prompt or quiet) and \
+                           `ready_ms`. Gives up after 10 seconds. Applies when run_in is shell; \
+                           false types at once, into a shell that may not be listening yet.",
+                default: Some("true"),
             },
             ParamSpec {
                 name: "cwd",
@@ -777,6 +808,10 @@ fn property(param: &ParamSpec) -> Value {
                 .parse::<i64>()
                 .map(|number| json!(number))
                 .unwrap_or_else(|_| json!(default)),
+            ParamKind::Bool => default
+                .parse::<bool>()
+                .map(|flag| json!(flag))
+                .unwrap_or_else(|_| json!(default)),
             _ => json!(default),
         };
         property.insert("default".to_owned(), default);
@@ -1059,8 +1094,9 @@ mod tests {
                 "{} is not namespaced by its service",
                 tool.name
             );
+            // nine, for `zellij_create`: `run_in` and `wait_ready` joined its seven at nkmk.32
             assert!(
-                tool.params.len() <= 8,
+                tool.params.len() <= 9,
                 "{} asks for more parameters than an agent can be expected to get right",
                 tool.name
             );
