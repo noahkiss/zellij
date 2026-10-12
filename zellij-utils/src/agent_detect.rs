@@ -308,14 +308,19 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
                 command,
                 cwd: entry.pane_info.pane_cwd.as_deref().map(PathBuf::from),
                 pid: entry.pane_info.pane_pid,
+                program_status: entry.program_status.clone(),
             })
         })
         .collect()
 }
 
 /// The columns `list-agents` prints, in order. Append-only, like every other table in the fork.
+///
+/// `STATE` came last, in nkmk.33, because a column is never inserted before one a reader may
+/// already count to. It is the `OSC 7501` state, with a blocked program's reason after a colon:
+/// `blocked:permission`.
 pub const AGENT_TABLE_KEYS: &str =
-    "TAB_ID TAB_NAME PANE_ID HANDLE KIND AGENT_ID SOURCE TITLE COMMAND CWD";
+    "TAB_ID TAB_NAME PANE_ID HANDLE KIND AGENT_ID SOURCE TITLE COMMAND CWD STATE";
 
 /// The agent list as the fork's table: an UPPER_SNAKE header row and one line per agent.
 ///
@@ -336,6 +341,7 @@ pub fn agent_table(agents: &ListAgentsResponse) -> Vec<String> {
             dashed(Some(agent.title.clone())),
             dashed(agent.command.clone()),
             dashed(agent.cwd.as_ref().map(|cwd| cwd.display().to_string())),
+            dashed(agent.program_status.as_ref().map(state_cell)),
         ]);
     }
     let widths: Vec<usize> = (0..header.len())
@@ -363,6 +369,14 @@ pub fn agent_table(agents: &ListAgentsResponse) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// The `STATE` cell: the state, and a blocked program's reason after a colon.
+fn state_cell(status: &crate::data::PaneProgramStatus) -> String {
+    match &status.kind {
+        Some(kind) => format!("{}:{}", status.state, kind),
+        None => status.state.clone(),
+    }
 }
 
 /// `-` is how the fork's output says a field has no value, rather than printing an empty column.
@@ -569,10 +583,71 @@ mod tests {
             agent: detect_command_line("/opt/bin/claude", &env(&[])),
             command_state: None,
             last_command_exit_code: None,
+            program_status: None,
         };
         let agents = agents_from_pane_list(vec![entry]);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].command.as_deref(), Some("/opt/bin/claude"));
+    }
+
+    /// The OSC 7501 state rides on both rows flattened, under `state` and `state_*` keys, and is
+    /// absent - not null - when nothing was reported.
+    #[test]
+    fn program_status_is_flattened_onto_both_rows_and_the_table() {
+        use crate::data::PaneProgramStatus;
+        let status = PaneProgramStatus {
+            state: "blocked".to_owned(),
+            kind: Some("permission".to_owned()),
+            app: Some("claude-code".to_owned()),
+            title: None,
+            msg: Some("Allow Bash?".to_owned()),
+            progress: None,
+            at: 1_760_000_000_000,
+        };
+        let entry = PaneListEntry {
+            pane_info: PaneInfo {
+                id: 3,
+                handle: "sunny-otter".to_owned(),
+                pane_command: Some("claude".to_owned()),
+                ..Default::default()
+            },
+            tab_position: 0,
+            tab_name: "develop".to_owned(),
+            agent: detect_command_line("claude", &env(&[])),
+            command_state: None,
+            last_command_exit_code: None,
+            program_status: Some(status.clone()),
+        };
+        let pane_json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(pane_json["state"], "blocked");
+        assert_eq!(pane_json["state_kind"], "permission");
+        assert_eq!(pane_json["state_msg"], "Allow Bash?");
+        assert_eq!(pane_json["state_at"], 1_760_000_000_000u64);
+        assert!(pane_json.get("state_title").is_none());
+        let back: PaneListEntry = serde_json::from_value(pane_json).unwrap();
+        assert_eq!(back.program_status, Some(status));
+
+        let agents = agents_from_pane_list(vec![entry.clone()]);
+        let agent_json = serde_json::to_value(&agents[0]).unwrap();
+        assert_eq!(agent_json["state"], "blocked");
+        assert_eq!(agent_json["state_app"], "claude-code");
+        assert_eq!(
+            agent_json["kind"], "claude",
+            "the harness keeps its own key"
+        );
+        let table = agent_table(&agents);
+        assert!(table[0].ends_with("CWD  STATE"));
+        assert!(table[1].ends_with("blocked:permission"));
+
+        let quiet = PaneListEntry {
+            program_status: None,
+            ..entry
+        };
+        let quiet_json = serde_json::to_value(&quiet).unwrap();
+        assert!(quiet_json.get("state").is_none());
+        let back: PaneListEntry = serde_json::from_value(quiet_json).unwrap();
+        assert_eq!(back.program_status, None);
+        assert!(agent_table(&agents_from_pane_list(vec![quiet]))[1].ends_with('-'));
     }
 
     #[test]

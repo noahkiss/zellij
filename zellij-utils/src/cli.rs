@@ -2472,6 +2472,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     /// claude, opencode, codex, pi - with the harness's own session id where it exports one.
     /// `SOURCE` says what the row rests on: `command` when only the pane's command matched,
     /// `command+env` when an identity variable was found in the pane's processes as well.
+    /// `STATE` is what the agent last reported over OSC 7501 (`state`, `state_msg`, `state_at`
+    /// and the other `state_*` keys in --json): working, blocked, done, idle or error.
     ///
     /// Returns: a table, or the same rows with --json. No agents prints the header alone.
     ListAgents {

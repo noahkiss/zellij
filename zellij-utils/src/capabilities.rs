@@ -82,10 +82,11 @@ pub const CAPABILITIES: &[&str] = &[
     "resurrect-command-hints", // resurrect_command_hints
     "resurrect-commands",      // resurrect_commands "all" | "agents" | "prefill"
     "agent-session-osc",       // OSC 1337 SetUserVar=agent_session, setup --agent-hooks
-    "session-drop-env",        // session_restart_drop_env
-    "snapshot-dir-config",     // snapshot_dir, session_snapshot_limit
-    "session-service-config",  // session_service, pin_exe
-    "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
+    "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
+    "session-drop-env",   // session_restart_drop_env
+    "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
+    "session-service-config", // session_service, pin_exe
+    "session-warnings",   // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
 ];
 
 /// The version, split into the parts that can actually be compared.

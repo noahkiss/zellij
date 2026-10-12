@@ -47,15 +47,27 @@ pub const SESSION_SCRIPT_PATH: &str = "~/.config/zellij/agent-session.sh";
 /// device. It stops at the agent: a `codex exec` with no terminal of its own climbed past it, in a
 /// test, to the terminal of an unrelated pane further up.
 pub const SESSION_SCRIPT: &str = r#"#!/bin/sh
-# Agent session hook (zellij setup --agent-hooks). Usage: sh agent-session.sh KIND start|end|osc
+# Agent session hook (zellij setup --agent-hooks).
+# Usage: sh agent-session.sh KIND start|end|osc
+#        sh agent-session.sh KIND state STATE [BLOCKED_KIND]
 #   start: register the session in the agent-sessions registry, then report it to zellij
 #   end:   unregister it
 #   osc:   only report it to zellij
+#   state: only tell zellij what the agent is doing (OSC 7501): idle, working, done, blocked
+#          (with permission, question or auth) or error. For an agent that does not report
+#          it itself; claude and pi do.
 # Reads the hook's JSON on stdin for its "session_id".
 kind=$1
 mode=${2:-start}
-id=$(tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-[ -n "$id" ] || exit 0
+if [ "$mode" = state ]; then
+  cat >/dev/null
+  case "$3" in idle|working|done|blocked|error) ;; *) exit 0 ;; esac
+  report="state=$3:app=$kind"
+  case "$3:$4" in blocked:permission|blocked:question|blocked:auth) report="$report:kind=$4" ;; esac
+else
+  id=$(tr -d '\n' | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] || exit 0
+fi
 case "$mode" in
   start)
     if command -v agent-sessions >/dev/null; then
@@ -86,6 +98,10 @@ while [ "${p:-1}" -gt 1 ]; do
   p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
 done
 case "$t" in ''|'?'|'??') exit 0 ;; esac
+if [ "$mode" = state ]; then
+  { printf '\033]7501;%s\007' "$report" > "/dev/$t"; } 2>/dev/null
+  exit 0
+fi
 b64=$(printf %s "$id" | base64 | tr -d '\n')
 { printf '\033]1337;SetUserVar=agent_session=%s\007' "$b64" > "/dev/$t"; } 2>/dev/null
 exit 0
@@ -117,7 +133,9 @@ pub const AGENT_HOOKS: &[AgentHook] = &[
         kind: "codex",
         file: "~/.codex/config.toml (or $CODEX_HOME/config.toml)",
         how: "append; codex asks once to trust a new hook",
-        covers: "register on SessionStart, unregister on SessionEnd, and the zellij report. No \
+        covers: "register on SessionStart, unregister on SessionEnd, the zellij report, and \
+                 the agent's state (OSC 7501), which codex does not report itself: working on \
+                 UserPromptSubmit and PostToolUse, blocked on PermissionRequest, done on Stop. No \
                  env export: codex 0.160 has no way for a hook to set the environment of the \
                  commands it runs",
         snippet: r#"[[hooks.SessionStart]]
@@ -132,6 +150,34 @@ timeout = 5
 [[hooks.SessionEnd.hooks]]
 type = "command"
 command = "sh ~/.config/zellij/agent-session.sh codex end"
+timeout = 5
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "sh ~/.config/zellij/agent-session.sh codex state working"
+timeout = 5
+
+[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "sh ~/.config/zellij/agent-session.sh codex state blocked permission"
+timeout = 5
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "sh ~/.config/zellij/agent-session.sh codex state working"
+timeout = 5
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "sh ~/.config/zellij/agent-session.sh codex state done"
 timeout = 5"#,
         caveat: Some(
             "not proven in an interactive codex: if codex runs its hooks in its app-server \
@@ -300,6 +346,8 @@ pub fn agent_hooks_text() -> String {
          #   2. runs `agent-sessions register` when that command exists (and unregister at the end)\n\
          #   3. inside zellij only: prints OSC 1337 SetUserVar=agent_session=<base64 id> to the pane\n\
          # zellij keeps the step 3 report on the pane and resumes exactly that session.\n\
+         # claude and pi report their own state (OSC 7501) once zellij answers their query; the\n\
+         # codex hook reports codex's for it, and list-agents --json carries it as `state`.\n\
          # Nothing here is written for you.\n",
     );
     text.push_str(&format!(
@@ -462,6 +510,31 @@ mod tests {
         assert!(codex.snippet.contains("[[hooks.SessionEnd]]"));
         assert!(codex.snippet.contains("agent-session.sh codex end"));
         assert!(codex.covers.contains("No env export"));
+    }
+
+    /// codex does not speak OSC 7501 itself, so its hooks report the state for it.
+    #[test]
+    fn the_codex_hook_reports_its_state() {
+        let codex = hook("codex");
+        for needed in [
+            "[[hooks.UserPromptSubmit]]",
+            "agent-session.sh codex state working",
+            "[[hooks.PermissionRequest]]",
+            "agent-session.sh codex state blocked permission",
+            "[[hooks.Stop]]",
+            "agent-session.sh codex state done",
+        ] {
+            assert!(codex.snippet.contains(needed), "codex lacks {}", needed);
+        }
+        let guard = SESSION_SCRIPT
+            .find(r#"[ -n "$ZELLIJ" ] || exit 0"#)
+            .unwrap();
+        let report = SESSION_SCRIPT.find(r"\033]7501;").unwrap();
+        assert!(guard < report, "the state report is zellij-only");
+        // the state mode must not wait for a session id it is never given
+        let state_mode = SESSION_SCRIPT.find(r#"if [ "$mode" = state ]"#).unwrap();
+        let id_required = SESSION_SCRIPT.find(r#"[ -n "$id" ] || exit 0"#).unwrap();
+        assert!(state_mode < id_required);
     }
 
     #[test]

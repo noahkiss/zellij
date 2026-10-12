@@ -885,6 +885,9 @@ pub struct Grid {
     /// fork addition: counts the `OSC 9;4` reports, so a refresh of an unchanged state is still
     /// forwarded. See `terminal_progress`.
     pub progress_seq: u64,
+    /// fork addition: the `OSC 7501` program status records this pane holds. See
+    /// `program_status`.
+    pub program_status: crate::program_status::ProgramStatusRecords,
     notification_tracker: NotificationTracker,
     /// Whitelisted host-terminal queries intercepted from the app running
     /// in this pane (CSI 14t / 16t pixel-dim queries, OSC 10;? / 11;? /
@@ -1289,6 +1292,7 @@ impl Grid {
             pending_desktop_notifications: Vec::new(),
             progress: None,
             progress_seq: 0,
+            program_status: Default::default(),
             notification_tracker: NotificationTracker::default(),
             pending_forwarded_queries: Vec::new(),
             pending_nested_session_messages: Vec::new(),
@@ -4690,6 +4694,24 @@ impl Perform for Grid {
                 }
             },
 
+            // fork addition: the Program Status Protocol. zellij is this pane's terminal, so it
+            // answers the feature query itself - the answer is what makes claude and pi report -
+            // and keeps the reports on the pane for `list-panes` and `list-agents`
+            b"7501" => match crate::program_status::parse(params) {
+                Some(crate::program_status::Message::Query) => {
+                    let reply = format!(
+                        "\u{1b}]7501;{}{}",
+                        crate::program_status::QUERY_REPLY_BODY,
+                        terminator
+                    );
+                    self.pending_messages_to_pty.push(reply.into_bytes());
+                },
+                Some(message) => self
+                    .program_status
+                    .apply(message, crate::program_status::now_ms()),
+                None => {},
+            },
+
             b"7" => {
                 if let Some(raw) = params.get(1) {
                     if let Some(path) = parse_osc7_path(raw) {
@@ -4836,6 +4858,10 @@ impl Perform for Grid {
                     )),
                     _ => None,
                 });
+                // fork addition: a new prompt (`133;A`) ends the work a program reported over OSC 7501
+                if params.get(1) == Some(&&b"A"[..]) {
+                    self.program_status.drop_unfinished();
+                }
                 if let (Some(marker), Some(row)) = (marker, self.viewport.get_mut(self.cursor.y)) {
                     row.add_osc133_marker(self.cursor.x, marker);
                     self.osc133_markers_seen = true;
@@ -5758,6 +5784,9 @@ impl Perform for Grid {
             },
             (b'c', None) => {
                 self.reset_terminal_state();
+                // fork addition: a full reset (RIS) removes every OSC 7501 record; a soft one
+                // does not, which is why this is here and not in `reset_terminal_state`
+                self.program_status.clear("");
             },
             (b'H', None) => {
                 self.set_horizontal_tabstop();

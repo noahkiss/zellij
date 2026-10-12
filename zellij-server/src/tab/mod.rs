@@ -883,6 +883,11 @@ pub trait Pane {
     fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
         None
     }
+    /// fork addition: the most urgent `OSC 7501` record a program in the pane reported. Only a
+    /// terminal pane holds any.
+    fn program_status(&self) -> Option<zellij_utils::data::PaneProgramStatus> {
+        None
+    }
     fn update_exit_status(&mut self, _exit_status: i32) {}
     fn set_plugin_regex_highlights(
         &mut self,

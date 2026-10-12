@@ -25,6 +25,7 @@ pub mod notifications;
 mod pane_groups;
 pub mod pane_privacy;
 mod plugins;
+pub mod program_status;
 mod pty;
 mod pty_writer;
 mod resurrect_hints;

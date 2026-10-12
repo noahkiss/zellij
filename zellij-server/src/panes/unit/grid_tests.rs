@@ -9487,3 +9487,46 @@ fn clear_progress_counts_only_when_there_was_progress() {
     assert_eq!(grid.progress, None);
     assert_eq!(grid.progress_seq, 2);
 }
+
+#[test]
+fn osc_7501_query_is_answered_with_the_queries_own_terminator() {
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vte::Parser::new();
+    vte_parser.advance(&mut grid, b"\x1b]7501;?\x07");
+    vte_parser.advance(&mut grid, b"\x1b]7501;?\x1b\\");
+    assert_eq!(
+        grid.pending_messages_to_pty,
+        vec![
+            b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07"
+                .to_vec(),
+            b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"
+                .to_vec(),
+        ]
+    );
+    assert!(grid.program_status.is_empty());
+}
+
+#[test]
+fn osc_7501_report_is_kept_on_the_grid_until_a_new_prompt() {
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vte::Parser::new();
+    // "Allow Bash?" in base64
+    vte_parser.advance(
+        &mut grid,
+        b"\x1b]7501;state=blocked:app=claude-code:kind=permission:msg=QWxsb3cgQmFzaD8=\x1b\\",
+    );
+    let status = grid.program_status.summary().expect("a record");
+    assert_eq!(status.state, "blocked");
+    assert_eq!(status.kind.as_deref(), Some("permission"));
+    assert_eq!(status.app.as_deref(), Some("claude-code"));
+    assert_eq!(status.msg.as_deref(), Some("Allow Bash?"));
+    assert!(status.at > 0);
+    assert!(grid.pending_messages_to_pty.is_empty());
+    vte_parser.advance(&mut grid, b"\x1b]7501;state=done:id=build\x07");
+    // the shell came back: blocked goes, the done result stays
+    vte_parser.advance(&mut grid, b"\x1b]133;A\x07");
+    assert_eq!(grid.program_status.summary().unwrap().state, "done");
+    // and a full reset removes everything
+    vte_parser.advance(&mut grid, b"\x1bc");
+    assert!(grid.program_status.is_empty());
+}

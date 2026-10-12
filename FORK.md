@@ -4015,6 +4015,9 @@ only the last is limited to zellij:
 | `opencode` (v1 and v2) | `~/.config/opencode/plugins/agent-session-env.ts` (server) and `~/.config/opencode/plugins/agent-session/tui.ts`, a TUI plugin directory; v1 also names it in `tui.json` | the server plugin | session opened in the TUI / TUI exit | yes |
 | `pi` | `~/.pi/agent/extensions/agent-session.ts` | its own `process.env`, which every command it runs inherits | `session_start` / `session_shutdown` | yes |
 
+From nkmk.33 the codex hook also reports codex's state over `OSC 7501`, from four more hook events;
+see [What an agent says it is doing](#what-an-agent-says-it-is-doing-osc-7501-and-state-on-list-agents).
+
 claude's export, register and unregister are owned for now by bm's SessionStart hook; the zellij
 snippet prints a note and does not duplicate them. A move into the zellij hook is agreed with
 that hook's owner first, so there is always exactly one.
@@ -5024,6 +5027,75 @@ named the session, and a restore would offer the agent's picker). The codex hand
 every tick like claude's record, so a `/new` is seen without a new process. `session_source` is a
 new field on the CLI-only `PaneAgent`, omitted when unset: still no protobuf tag, no plugin API,
 no client/server contract. The table keeps its columns.
+
+### What an agent says it is doing: `OSC 7501`, and `state` on `list-agents`
+
+From nkmk.33. `list-agents` said which pane runs which agent, not whether that agent is working,
+waiting on a person, or finished. A controller had to read the screen and guess.
+
+```
+$ zellij action list-agents --json
+[{"handle": "sunny-otter", "kind": "claude", ..., "state": "blocked",
+  "state_kind": "permission", "state_app": "claude-code",
+  "state_msg": "Allow Bash: cargo test?", "state_at": 1760000000000}]
+```
+
+The answer comes from the agent. The Program Status Protocol (`OSC 7501`,
+[specification](https://www.superlogical.com/rex/docs/build/program-status)) lets a program tell
+its terminal its state: `ESC ] 7501 ; state=blocked:kind=permission:app=claude-code:msg=<base64> ST`.
+
+**zellij answers the protocol's query, and that is the whole switch.** Claude Code (2.1.295 and
+later) and pi (1.1) send `OSC 7501 ; ?` at start-up and report nothing until a terminal answers.
+Before this patch zellij swallowed the query. Verified on nkmk.32: claude's debug log says
+`programStatus=no (probe: no reply to OSC 7501 ; ?)`, and no report follows. zellij is the
+terminal of every pane, so the grid now answers the query itself, in the query's own terminator:
+`ESC ] 7501 ; ?:states=idle,working,done,blocked,error:kinds=permission,question,auth`.
+
+The grid keeps the reports as the specification says a terminal should:
+
+- One record per `id`. A report replaces its record whole. `state=clear` removes the record named
+  and its children, or every record when it names none.
+- A new prompt (`OSC 133;A`) and the pane's process exiting remove `working`, `blocked` and `idle`.
+  A `done` or `error` result stays until the program replaces or clears it.
+- A full reset (`ESC c`) removes every record. A soft reset does not.
+- At most 64 records. Past that the least recently updated goes.
+- A report the specification says to discard is discarded: no state, an unknown state, an id or a
+  text field over its limit, base64 that does not decode, control characters in the text.
+
+**The pane's most urgent record is the one reported**: `blocked`, then `error`, `done`, `working`
+and `idle`, the newest first within one state. That is the rule rootshell applies, so the two read
+one pane the same way. It rides on `list-panes --json` and `list-agents --json`, flattened:
+
+| key | value |
+|---|---|
+| `state` | `idle`, `working`, `done`, `blocked` or `error` |
+| `state_kind` | why a `blocked` program waits: `permission`, `question` or `auth` |
+| `state_app` | the program's name: `claude-code`, `pi`, `codex`. A child record takes its parent's |
+| `state_title` | the task label, decoded |
+| `state_msg` | one line, decoded: the question, the error |
+| `state_progress` | 0-100 for `working` or `blocked`. Absent means indeterminate |
+| `state_at` | when the record was reported, in milliseconds since the epoch - the unit of `last_output_at` |
+
+Every key is absent, not null, when nothing was reported. The keys carry a `state` prefix because
+the row already has a `title`. `zellij_overview` with `scope=agents` reads `list-agents --json`, so
+the MCP answer carries the same keys.
+
+The `list-agents` table gains a `STATE` column, **last**, because a column is never put before one a
+reader already counts to: `blocked:permission`, `working`, `-`.
+
+**Which agents report.** Claude Code and pi report natively once answered. codex 0.162 and
+opencode 2.0 do not speak the protocol. For codex, `zellij setup --agent-hooks` now has
+`agent-session.sh` report for it: `sh agent-session.sh codex state <state> [kind]` prints the
+`OSC 7501` to codex's terminal, from `UserPromptSubmit` and `PostToolUse` (`working`),
+`PermissionRequest` (`blocked`, `permission`) and `Stop` (`done`). Like the session report, it runs
+only inside zellij. opencode has no state source yet.
+
+**It is on the cheap surface.** The records live on the pane's grid in the screen thread, and the
+summary goes onto the CLI-only `PaneListEntry` and `AgentListEntry`. No `PaneInfo` field, no
+protobuf tag, no plugin API, no client/server contract. Nothing is forwarded to the host terminal:
+the host keeps one set of records per window, and a client shows many panes.
+
+Capability: `program-status-osc`.
 
 ### `zellij mcp`: the CLI served over the Model Context Protocol
 

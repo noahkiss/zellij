@@ -5956,6 +5956,12 @@ impl Screen {
                     .map(|(state, exit_code)| (Some(state), exit_code))
                     .unwrap_or((None, None))
             };
+            let program_status = if pane_info.is_plugin {
+                None
+            } else {
+                tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .and_then(|pane| pane.program_status())
+            };
             PaneListEntry {
                 pane_info,
                 tab_position: tab.position,
@@ -5963,6 +5969,7 @@ impl Screen {
                 agent,
                 command_state,
                 last_command_exit_code,
+                program_status,
             }
         }
 

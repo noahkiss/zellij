@@ -2731,6 +2731,57 @@ pub struct PaneListEntry {
     /// one in its end marker. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_command_exit_code: Option<i32>,
+    /// What a program in the pane last said it is doing, over `OSC 7501`: the `state`, `state_*`
+    /// keys of [`PaneProgramStatus`], flattened onto the row. Absent when no program has reported.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<PaneProgramStatus>,
+}
+
+/// What a program in a pane last reported about itself with the Program Status Protocol, `OSC
+/// 7501`: one record, the most urgent the pane holds.
+///
+/// A program sends `ESC ] 7501 ; state=working:app=claude-code ST`, and the pane keeps it until
+/// the program replaces or clears it, or the shell draws a new prompt. Claude Code and pi send it
+/// once the terminal answers their `OSC 7501 ; ?` query, which zellij does for every pane.
+///
+/// CLI-only, like the rest of [`PaneListEntry`]: no protobuf tag, no plugin API. The keys carry a
+/// `state` prefix because the row they are flattened onto already has a `title`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneProgramStatus {
+    /// `idle`, `working`, `done`, `blocked` or `error`.
+    pub state: String,
+    /// Why a `blocked` program is waiting: `permission`, `question` or `auth`.
+    #[serde(
+        rename = "state_kind",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kind: Option<String>,
+    /// The program's stable name, `claude-code`, `pi`, `codex`.
+    #[serde(rename = "state_app", default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    /// A short label for the task, decoded.
+    #[serde(
+        rename = "state_title",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub title: Option<String>,
+    /// One human-readable line, decoded: the question a blocked program asks, the error a failed
+    /// one hit.
+    #[serde(rename = "state_msg", default, skip_serializing_if = "Option::is_none")]
+    pub msg: Option<String>,
+    /// 0-100 for a `working` or `blocked` program that reported one. Absent means indeterminate.
+    #[serde(
+        rename = "state_progress",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub progress: Option<u8>,
+    /// When the record was last reported, in milliseconds since the Unix epoch - the unit of
+    /// `last_output_at`.
+    #[serde(rename = "state_at", default)]
+    pub at: u64,
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;
@@ -2799,6 +2850,10 @@ pub struct AgentListEntry {
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    /// What the agent last said it is doing over `OSC 7501`, flattened: `state`, `state_msg`,
+    /// `state_at` and the rest of [`PaneProgramStatus`]. Absent when it has said nothing.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<PaneProgramStatus>,
 }
 
 pub type ListAgentsResponse = Vec<AgentListEntry>;

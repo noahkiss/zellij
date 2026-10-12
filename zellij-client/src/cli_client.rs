@@ -2040,6 +2040,7 @@ mod tests {
                 agent: None,
                 command_state: None,
                 last_command_exit_code: None,
+                program_status: None,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()

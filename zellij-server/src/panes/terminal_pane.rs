@@ -1156,6 +1156,8 @@ impl Pane for TerminalPane {
         self.is_held = Some((exit_status, is_first_run, run_command));
         // fork addition: a program that exits mid-task never sends its own clear
         self.grid.clear_progress();
+        // and the same for its OSC 7501 records: the work is over, a done or error result stays
+        self.grid.program_status.drop_unfinished();
         if let Some(notification_end) = self.notification_end.as_mut() {
             if let Some(exit_status) = exit_status {
                 notification_end.set_exit_status(exit_status);
@@ -1388,6 +1390,9 @@ impl Pane for TerminalPane {
     }
     fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
         self.grid.osc133_command_state()
+    }
+    fn program_status(&self) -> Option<zellij_utils::data::PaneProgramStatus> {
+        self.grid.program_status.summary()
     }
     fn update_exit_status(&mut self, exit_status: i32) {
         if let Some(notification_end) = self.notification_end.as_mut() {
