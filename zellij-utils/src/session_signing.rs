@@ -257,14 +257,21 @@ pub fn sweep_stale_temps(directory: &Path) -> Vec<PathBuf> {
 /// Also `None` when this run may not act (`--dry-run`) or may not replace a signed pin
 /// (`--no-sign`): in both cases the ordinary refresh has to happen on its own, because nothing is
 /// coming after it.
+///
+/// And `None` when this build is a release candidate the pin refuses (`candidate_refused`, from
+/// [`release_candidate_refused_for`](crate::session_lifecycle::release_candidate_refused_for)).
+/// The signing transaction writes the pin itself, so a deferred refresh never reached the
+/// candidate refusal in `install_pinned_exe`, and `doctor --fix` from an RC put the candidate at an
+/// anchored pin. Not deferred, the refresh goes to that function, which refuses and says so.
 pub fn refresh_belongs_to_signing(
     commander: &dyn Commander,
     pinned: &Path,
     mode: DoctorMode,
     current_exe: Option<PathBuf>,
     needs_refresh: bool,
+    candidate_refused: bool,
 ) -> Option<PathBuf> {
-    if !mode.fix || !mode.sign || !needs_refresh {
+    if !mode.fix || !mode.sign || !needs_refresh || candidate_refused {
         return None;
     }
     let current_exe = current_exe?;
@@ -1327,6 +1334,30 @@ Signature=adhoc
             .any(|note| note.contains("re-grant Full Disk Access")));
     }
 
+    /// `doctor --fix` from a release candidate over an anchored pin: the refresh is not deferred
+    /// to the signing transaction, which would write the candidate at the pin. It goes to the pin's
+    /// writer, which refuses a candidate and says so.
+    #[test]
+    fn a_release_candidate_refresh_is_never_deferred_to_signing() {
+        let acting = DoctorMode {
+            fix: true,
+            ..DoctorMode::default()
+        };
+        let exe = PathBuf::from("/opt/homebrew/bin/zellij");
+        let anchored = RecordedCommander::new(&[("codesign -d ", recorded(DEVELOPER_ID))]);
+        assert_eq!(
+            refresh_belongs_to_signing(
+                &anchored,
+                Path::new("/tmp/pin"),
+                acting,
+                Some(exe),
+                true,
+                true
+            ),
+            None
+        );
+    }
+
     /// Which runs defer and which do not. A pin with no signature to lose is refreshed as before -
     /// pinning the new build is worth more than protecting an ad-hoc signature that no rebuild
     /// could satisfy anyway.
@@ -1346,7 +1377,8 @@ Signature=adhoc
                 Path::new("/tmp/pin"),
                 acting,
                 Some(exe.clone()),
-                true
+                true,
+                false
             ),
             Some(exe.clone())
         );
@@ -1356,7 +1388,8 @@ Signature=adhoc
                 Path::new("/tmp/pin"),
                 acting,
                 Some(exe.clone()),
-                true
+                true,
+                false
             ),
             None
         );
@@ -1367,6 +1400,7 @@ Signature=adhoc
                 Path::new("/tmp/pin"),
                 acting,
                 Some(exe.clone()),
+                false,
                 false
             ),
             None
@@ -1388,7 +1422,8 @@ Signature=adhoc
                     Path::new("/tmp/pin"),
                     mode,
                     Some(exe.clone()),
-                    true
+                    true,
+                    false
                 ),
                 None
             );

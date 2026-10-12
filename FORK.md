@@ -8371,6 +8371,44 @@ This does not make the pin safe from every build. Any unreleased binary that cre
 the pin the same way — a developer's local build included, which is how this was reproduced. The
 guard covers the case the release process actually walks into.
 
+**`doctor --fix` was a door the refusal did not cover, until nkmk.33.** Over an anchored macOS pin,
+doctor hands the refresh to the signing transaction (`refresh_belongs_to_signing`, the deferred
+path). That transaction writes the pin itself and never reaches `install_pinned_exe`, so it never
+asked the candidate question. An RC carries the release's Developer ID, so the transaction took it,
+and `doctor --fix` from an RC put the candidate at the pin. The claim above that doctor is covered
+was wrong for that case.
+
+Now the deferral itself asks. `refresh_belongs_to_signing` takes the candidate answer and does not
+defer for a refused candidate; the refresh goes to `install_pinned_exe`, which refuses it, and
+doctor reports `… was left alone: this build is a release candidate` in `Already correct`. The
+signing check still judges the pin as it is. Both doors ask one predicate,
+`release_candidate_refused_for`, so they cannot disagree again. Doctor's `--dry-run` asks it too.
+
+**One override, for the RC proof's scratch pin.** The release proof refreshes a scratch copy of the
+real pin from the RC, to prove the as-is signature path before a release exists. With the door
+closed that proof needs a way back in, and it is deliberately narrow:
+
+```
+ZELLIJ_PIN_ALLOW_RC=1 zellij session doctor --fix proof-session   # with pin_exe "/tmp/…/zellij"
+warning: pinning release candidate 0.45.1-nkmk.33-rc.1 at /tmp/…/zellij: ZELLIJ_PIN_ALLOW_RC=1 is
+         set and the pin is outside this account's home directory.
+```
+
+- It needs `ZELLIJ_PIN_ALLOW_RC=1` **and** a pin outside the account's home directory.
+- The home directory comes from the passwd database, not from `HOME`: a proof points `HOME` at a
+  scratch directory, and the real pin lives under the real home.
+- Every spelling is checked, as given and resolved through symlinks. A link outside the home that
+  leads into it is the home, and so is a link inside the home that leads out of it: a `~/.cache`
+  or `~/.local/share` on another disk still holds the account's own paths.
+- It applies at every door, `session up` included, and says so once per pin per process.
+
+`zellij-utils/src/session_lifecycle.rs` (`release_candidate_refused_for`, `candidate_may_pin`,
+`PIN_ALLOW_RC_ENV`), `zellij-utils/src/session_signing.rs` (`refresh_belongs_to_signing`'s new
+`candidate_refused`), `src/session_doctor_macos.rs` (`deferred_refresh`) and
+`src/session_doctor_command.rs` (the dry-run line). Tests: a candidate is never deferred to signing
+over an anchored pin; the override's rule (told or not, a scratch pin, the real pin, no known home,
+a link into the home, a link out of it).
+
 ### A pane that dropped to the shell stops naming the command that exited
 
 ```

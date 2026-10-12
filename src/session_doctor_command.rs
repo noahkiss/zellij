@@ -809,7 +809,7 @@ fn megabytes(bytes: u64) -> String {
 #[cfg(unix)]
 fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: DoctorMode) {
     use zellij_utils::session_lifecycle::{
-        install_pinned_exe, pin_needs_refresh, this_build_is_a_release_candidate, PinOutcome,
+        install_pinned_exe, pin_needs_refresh, release_candidate_refused_for, PinOutcome,
     };
 
     if refresh_is_deferred(pinned, mode) {
@@ -838,7 +838,7 @@ fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: Doc
     if !mode.fix {
         // asked of the same function the fix asks, so a dry run reports the decision the fix would
         // make rather than a condition under which it might make one
-        if this_build_is_a_release_candidate() {
+        if release_candidate_refused_for(pinned) {
             report.push(
                 Finding::ok(
                     "pin",

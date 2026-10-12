@@ -435,5 +435,12 @@ pub fn deferred_refresh(pinned: &Path, mode: DoctorMode) -> Option<PathBuf> {
     let needs_refresh = current_exe
         .as_deref()
         .is_some_and(|exe| zellij_utils::session_lifecycle::pin_needs_refresh(exe, pinned));
-    refresh_belongs_to_signing(&SystemCommander, pinned, mode, current_exe, needs_refresh)
+    refresh_belongs_to_signing(
+        &SystemCommander,
+        pinned,
+        mode,
+        current_exe,
+        needs_refresh,
+        zellij_utils::session_lifecycle::release_candidate_refused_for(pinned),
+    )
 }

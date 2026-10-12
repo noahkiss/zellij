@@ -1881,18 +1881,94 @@ fn release_candidate_must_not_be_pinned(target: &Path) -> bool {
     if !this_build_is_a_release_candidate() {
         return false;
     }
+    let refused = release_candidate_refused_for(target);
     if let Ok(mut said) = CANDIDATE_REFUSALS.lock() {
         if !said.iter().any(|pin| pin == target) {
             said.push(target.to_path_buf());
-            eprintln!(
-                "warning: {} was left alone: this build is a release candidate ({}), and the pin \
-                 is the build a restart comes back on.",
-                target.display(),
-                crate::consts::VERSION
-            );
+            if refused {
+                eprintln!(
+                    "warning: {} was left alone: this build is a release candidate ({}), and the \
+                     pin is the build a restart comes back on.",
+                    target.display(),
+                    crate::consts::VERSION
+                );
+            } else {
+                eprintln!(
+                    "warning: pinning release candidate {} at {}: {}=1 is set and the pin is \
+                     outside this account's home directory.",
+                    crate::consts::VERSION,
+                    target.display(),
+                    PIN_ALLOW_RC_ENV
+                );
+            }
         }
     }
-    true
+    refused
+}
+
+/// The variable that lets a release candidate write a pin OUTSIDE the account's home directory:
+/// the scratch pin an RC proof refreshes to prove the as-is signature path. See
+/// [`release_candidate_refused_for`].
+pub const PIN_ALLOW_RC_ENV: &str = "ZELLIJ_PIN_ALLOW_RC";
+
+/// Whether this build may not write the pin at `target` because it is a release candidate.
+///
+/// The one question every door to the pin asks: [`install_pinned_exe`], and doctor's deferred
+/// signing refresh, which writes the pin through the signing transaction and never reaches that
+/// function. Asked of the same predicate, so the two cannot disagree. Prints nothing; the writer
+/// says the line once.
+///
+/// A candidate is refused unless `ZELLIJ_PIN_ALLOW_RC=1` is set AND the pin is outside the
+/// account's home directory, read from the passwd database rather than from `HOME` - a proof sets
+/// `HOME` to a scratch directory, and the real pin lives under the real one. So the override can
+/// reach a scratch pin and never the pin a restart comes back on.
+#[cfg(unix)]
+pub fn release_candidate_refused_for(target: &Path) -> bool {
+    if !this_build_is_a_release_candidate() {
+        return false;
+    }
+    let allowed = std::env::var(PIN_ALLOW_RC_ENV).map_or(false, |value| value == "1");
+    !candidate_may_pin(allowed, target, account_home().as_deref())
+}
+
+/// The override's rule, apart from the environment, so it can be tested. A candidate may write the
+/// pin only when the override is set, the account's home is known, and the pin is not under it.
+#[cfg(unix)]
+fn candidate_may_pin(allowed: bool, target: &Path, account_home: Option<&Path>) -> bool {
+    let Some(home) = account_home else {
+        return false;
+    };
+    if !allowed {
+        return false;
+    }
+    // Both spellings of each, as typed and as the disk resolves them, and a pin is under the home
+    // when ANY spelling is. A link outside the home that leads into it is the home; so is a link
+    // inside the home that leads out of it, such as a `~/.cache` or `~/.local/share` that is a
+    // symlink to another disk - which is exactly where the real pin can live.
+    let homes = [
+        home.to_path_buf(),
+        home.canonicalize().unwrap_or_else(|_| home.to_path_buf()),
+    ];
+    let resolved = match (target.parent(), target.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|_| target.to_path_buf()),
+        _ => target.to_path_buf(),
+    };
+    let under_home = [target.to_path_buf(), resolved]
+        .iter()
+        .any(|spelling| homes.iter().any(|home| spelling.starts_with(home)));
+    !under_home
+}
+
+/// This account's home directory as the passwd database records it, whatever `HOME` says.
+#[cfg(unix)]
+fn account_home() -> Option<PathBuf> {
+    nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|user| user.dir)
 }
 
 /// Pins this process has already left alone for being a candidate, so the line is said once.
@@ -4028,6 +4104,47 @@ dev.zellij.session.mysession = {
     #[test]
     fn the_build_under_test_is_not_a_candidate() {
         assert!(!this_build_is_a_release_candidate());
+    }
+
+    /// The override for an RC proof's scratch pin: only with `ZELLIJ_PIN_ALLOW_RC=1`, only when the
+    /// account's home is known, and never for a pin under it - however the path is spelled.
+    #[cfg(unix)]
+    #[test]
+    fn a_candidate_may_pin_only_a_scratch_pin_and_only_when_told() {
+        let home = tempfile::TempDir::new().unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let home_pin = home.path().join("bin").join("zellij");
+        std::fs::create_dir_all(home_pin.parent().unwrap()).unwrap();
+        let scratch_pin = scratch.path().join("zellij");
+        let home_path = Some(home.path());
+
+        assert!(candidate_may_pin(true, &scratch_pin, home_path));
+        assert!(
+            !candidate_may_pin(false, &scratch_pin, home_path),
+            "not told"
+        );
+        assert!(
+            !candidate_may_pin(true, &home_pin, home_path),
+            "the real pin"
+        );
+        assert!(
+            !candidate_may_pin(true, &scratch_pin, None),
+            "no home to compare"
+        );
+        // a link outside the home that leads into it is still the home
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(home_pin.parent().unwrap(), &link).unwrap();
+        let sneaky = link.join("zellij");
+        assert!(
+            !candidate_may_pin(true, &sneaky, home_path),
+            "{}",
+            sneaky.display()
+        );
+        // and a link inside the home that leads out of it is still the home: a `~/.cache` on
+        // another disk holds paths that are the account's own
+        let outward = home.path().join("cache");
+        std::os::unix::fs::symlink(scratch.path(), &outward).unwrap();
+        assert!(!candidate_may_pin(true, &outward.join("zellij"), home_path));
     }
 
     /// The other half of the rule, and the half that costs something to get wrong: the ordinary
