@@ -510,17 +510,31 @@ fn server_exe() -> io::Result<PathBuf> {
     }
 }
 
+/// The command that starts a server for a new session.
+///
+/// The server hands its own environment to every pane, so this is where a new session's
+/// environment is decided. The agent identity variables are removed here, whatever the config says:
+/// each names the one agent whose pane created the session, and in a new session it would name that
+/// agent for every pane. See [`agent_identity_env_names`](zellij_utils::agent_detect::agent_identity_env_names).
+fn server_command(exe: PathBuf, socket_path: &Path, debug: bool) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.arg("--server").arg(socket_path);
+    if debug {
+        cmd.arg("--debug");
+    }
+    for name in zellij_utils::agent_detect::agent_identity_env_names() {
+        cmd.env_remove(name);
+    }
+    cmd
+}
+
 /// Spawn the Zellij server process.
 ///
 /// On Unix the server daemonizes (double-fork) inside start_server(), so
 /// the intermediate child exits immediately and `cmd.status()` returns.
 #[cfg(not(windows))]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
-    let mut cmd = Command::new(server_exe()?);
-    cmd.arg("--server").arg(socket_path);
-    if debug {
-        cmd.arg("--debug");
-    }
+    let mut cmd = server_command(server_exe()?, socket_path, debug);
     let status = cmd.status()?;
     if status.success() {
         Ok(())
@@ -544,11 +558,7 @@ pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
 #[cfg(windows)]
 pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new(current_exe()?);
-    cmd.arg("--server").arg(socket_path);
-    if debug {
-        cmd.arg("--debug");
-    }
+    let mut cmd = server_command(current_exe()?, socket_path, debug);
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);

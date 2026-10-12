@@ -89,6 +89,29 @@ pub const HARNESSES: &[AgentHarness] = &[
     },
 ];
 
+/// Every variable that names one agent's session: the shared contract's `AGENT_SESSION_ID` and
+/// `AGENT_KIND`, and each harness's own identity variables from [`HARNESSES`].
+///
+/// A session this binary creates drops all of them, whatever the config says. Each one describes
+/// the one agent whose pane created the session, and a new session hands its server's environment
+/// to every pane. The detection reads these from a pane's process tree, the pane's shell first, so
+/// a leaked one would name the creator's session for every agent started in the new session.
+///
+/// Derived from the table, so a harness added to it is dropped too. A variable detection does not
+/// read, such as `CLAUDECODE`, is left to `session_restart_drop_env`.
+pub fn agent_identity_env_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = std::iter::once(AGENT_KIND)
+        .chain(
+            HARNESSES
+                .iter()
+                .flat_map(|harness| harness.identity_env.iter().copied()),
+        )
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// What was found running in a pane.
 ///
 /// Carried on the CLI-only [`crate::data::PaneListEntry`], never on `PaneInfo`: the consumer is the
@@ -375,6 +398,33 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    /// The names a new session drops: the contract's two and every identity variable detection
+    /// reads, each once, and nothing detection does not read.
+    #[test]
+    fn a_new_session_drops_every_identity_detection_reads() {
+        let names = agent_identity_env_names();
+        for name in [
+            "AGENT_SESSION_ID",
+            "AGENT_KIND",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_SESSION_ID",
+            "OPENCODE_SESSION_ID",
+            "OPENCODE_SESSION",
+            "CODEX_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "PI_SESSION_ID",
+        ] {
+            assert!(names.contains(&name), "{} is not dropped", name);
+        }
+        for harness in HARNESSES {
+            for name in identity_env_names_for(harness) {
+                assert!(names.contains(&name.as_str()), "{} is not dropped", name);
+            }
+        }
+        assert_eq!(names.len(), 9, "{:?}", names);
+        assert!(!names.contains(&"CLAUDECODE"));
     }
 
     #[test]

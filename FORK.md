@@ -2124,6 +2124,34 @@ exactly the same problem, and `restart` ends in `up` anyway. Dropped after a res
 daemonized, and in `up` immediately before the server is asked for, which is before the server
 captures the environment it will hand out.
 
+**The agent identity variables are always dropped**, whatever the config says. From nkmk.33 every
+server this binary starts for a new session is started without them:
+
+| Variable | Why |
+|---|---|
+| `AGENT_SESSION_ID`, `AGENT_KIND` | The agent-session contract that `zellij setup --agent-hooks` exports. |
+| `CLAUDE_CODE_SESSION_ID`, `CLAUDE_SESSION_ID` | claude's own identity variables. |
+| `CODEX_SESSION_ID`, `CODEX_THREAD_ID` | codex's. |
+| `OPENCODE_SESSION_ID`, `OPENCODE_SESSION` | opencode's. |
+| `PI_SESSION_ID` | pi's. |
+
+Each one names the one agent whose pane created the session. A server started from a claude pane
+handed that pane's `AGENT_SESSION_ID` to every pane of the new session, and a claude pane in it
+reported the creator's session id. Agent detection reads these variables from a pane's process
+tree, the pane's shell first, so a leaked one attributes every agent in the session to the wrong
+session. The list is the identity variables the detection table reads, plus `AGENT_KIND`, so a
+harness added to that table is dropped too.
+
+The drop is in the client's server spawn, so it covers every way a session is created: `session
+up`, `restart`, `attach --create`, `attach --create-background` and a plain `zellij -s`. It is
+silent: it describes no choice of the operator's. A variable the detection does not read, such as
+`CLAUDECODE` or `CLAUDE_CODE_ENTRYPOINT`, is not on the list; drop it with
+`session_restart_drop_env`, which still adds to this list.
+
+`zellij-utils/src/agent_detect.rs` (`agent_identity_env_names`) and `zellij-client/src/lib.rs`
+(`server_command`). Tests: the list holds the contract's two and every identity variable the
+table reads, and nothing else; the server command removes every one of them.
+
 ### A dangling `SSH_AUTH_SOCK` is dropped when a session is created
 
 A stale agent socket is worse than none. With no `SSH_AUTH_SOCK` at all, `ssh` and `git push` fall
