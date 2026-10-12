@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use crate::screen::{push_action_event, ACTION_RING_SIZE};
 use std::env::set_var;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use zellij_utils::data::ActionEvent;
 
@@ -535,6 +536,21 @@ struct MockScreen {
     pub config: Config,
     advanced_mouse_actions: bool,
     last_opened_tab_index: Option<usize>,
+    /// How many `RenderToClients` the mock background-jobs thread has passed back to the screen.
+    forwarded_renders: Arc<AtomicUsize>,
+    /// Acks from the background-jobs thread, one per settle marker it has reached.
+    settle_marker_acks: Receiver<()>,
+}
+
+/// A job the mock background-jobs thread recognises as `MockScreen::settle`'s marker. The screen
+/// never sends a pane error for no panes, so this cannot collide with a real job.
+fn settle_marker() -> BackgroundJob {
+    BackgroundJob::DisplayPaneError(vec![], "mock-screen-settle-marker".to_owned())
+}
+
+fn is_settle_marker(job: &BackgroundJob) -> bool {
+    matches!(job, BackgroundJob::DisplayPaneError(pane_ids, text)
+        if pane_ids.is_empty() && text == "mock-screen-settle-marker")
 }
 
 impl MockScreen {
@@ -623,6 +639,7 @@ impl MockScreen {
         ));
         self.last_opened_tab_index = Some(tab_index);
         std::thread::sleep(std::time::Duration::from_millis(100)); // give time for the async render
+        self.settle();
         screen_thread
     }
     // same as the above function, but starts a plugin with a plugin alias
@@ -803,6 +820,55 @@ impl MockScreen {
         ));
         self.last_opened_tab_index = Some(tab_index);
     }
+    /// Waits until the screen has handled every instruction sent to it so far, and every render
+    /// those instructions asked for.
+    ///
+    /// A render is two hops: the screen asks the background-jobs thread for one, and that thread
+    /// sends `RenderToClients` back. So one round trip to the screen is not enough. Each pass
+    /// makes a round trip to the screen, then one through the background-jobs thread, which
+    /// then has passed on every render the screen asked for. It stops when a pass passes on no
+    /// new render. A fixed sleep cannot promise this on a loaded machine; this can.
+    ///
+    /// It gives up after a few seconds, or as soon as the screen thread is gone, so a test whose
+    /// screen has exited or is blocked still reaches its assertions.
+    ///
+    /// It does nothing for a test that took `pty_writer_receiver`. The screen sends every
+    /// instruction it handles, the barrier included, to the pty writer as a resize-cache pair, so
+    /// there the barrier would show in what the test records.
+    pub fn settle(&self) {
+        if self.pty_writer_receiver.is_none() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut last_forwarded = None;
+        while std::time::Instant::now() < deadline {
+            let (response_channel, response) = crossbeam::channel::bounded(1);
+            let barrier = ScreenInstruction::GetTabInfo {
+                tab_id: 0,
+                response_channel,
+            };
+            if self.to_screen.send(barrier).is_err()
+                || response
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err()
+            {
+                return;
+            }
+            if self.to_background_jobs.send(settle_marker()).is_err()
+                || self
+                    .settle_marker_acks
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err()
+            {
+                return;
+            }
+            let forwarded = self.forwarded_renders.load(Ordering::SeqCst);
+            if last_forwarded == Some(forwarded) {
+                return;
+            }
+            last_forwarded = Some(forwarded);
+        }
+    }
     pub fn teardown(&mut self, threads: Vec<std::thread::JoinHandle<()>>) {
         let _ = self.to_pty.send(PtyInstruction::Exit);
         let _ = self.to_pty_writer.send(PtyWriteInstruction::Exit);
@@ -895,19 +961,27 @@ impl MockScreen {
         let _ = to_screen.send(ScreenInstruction::RecomputeTabSize(main_client_id, size));
 
         let received_background_jobs = Arc::new(Mutex::new(vec![]));
+        let forwarded_renders = Arc::new(AtomicUsize::new(0));
+        let (settle_marker_ack, settle_marker_acks) = channels::unbounded();
         std::thread::Builder::new()
             .name("background_jobs_thread".to_string())
             .spawn({
                 let to_screen = to_screen.clone();
                 let received_background_jobs = received_background_jobs.clone();
+                let forwarded_renders = forwarded_renders.clone();
                 move || loop {
                     let (event, _err_ctx) = background_jobs_receiver
                         .recv()
                         .expect("failed to receive event on channel");
+                    if is_settle_marker(&event) {
+                        let _ = settle_marker_ack.send(());
+                        continue;
+                    }
                     received_background_jobs.lock().unwrap().push(event.clone());
                     match event {
                         BackgroundJob::RenderToClients => {
                             let _ = to_screen.send(ScreenInstruction::RenderToClients);
+                            forwarded_renders.fetch_add(1, Ordering::SeqCst);
                         },
                         BackgroundJob::Exit => {
                             break;
@@ -939,6 +1013,8 @@ impl MockScreen {
             last_opened_tab_index: None,
             config,
             advanced_mouse_actions: true,
+            forwarded_renders,
+            settle_marker_acks,
         }
     }
     pub fn set_advanced_hover_effects(&mut self, advanced_mouse_actions: bool) {
@@ -3447,11 +3523,15 @@ pub fn send_cli_scroll_up_action() {
         pane_contents.as_bytes().to_vec(),
     ));
     std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.settle();
     // we send two actions here because only the last line in the pane is empty, so one action
     // won't show in a render
     send_cli_action_to_server(&session_metadata, cli_action.clone(), client_id);
+    // the snapshots hold a frame between the two scrolls, so let the first one render
+    mock_screen.settle();
     send_cli_action_to_server(&session_metadata, cli_action.clone(), client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.settle();
     mock_screen.teardown(vec![server_instruction, screen_thread]);
     let snapshots = take_snapshots_and_cursor_coordinates_from_render_events(
         received_server_instructions.lock().unwrap().iter(),
@@ -5733,6 +5813,8 @@ pub fn send_cli_stack_panes_action() {
     };
     send_cli_action_to_server(&session_metadata, stack_panes_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
+    // the second snapshot is the stacked frame, so let it render before the screen exits
+    mock_screen.settle();
     mock_screen.teardown(vec![server_thread, screen_thread]);
     let snapshots = take_snapshots_and_cursor_coordinates_from_render_events(
         received_server_instructions.lock().unwrap().iter(),
