@@ -9563,3 +9563,46 @@ fn osc_7501_report_is_kept_on_the_grid_until_a_new_prompt() {
     vte_parser.advance(&mut grid, b"\x1bc");
     assert!(grid.program_status.is_empty());
 }
+
+#[test]
+fn osc_7501_done_from_the_last_program_is_gone_once_the_next_one_starts() {
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vte::Parser::new();
+    // claude runs and finishes; it writes its own marks around the turn
+    vte_parser.advance(&mut grid, b"\x1b]7501;?\x07");
+    vte_parser.advance(&mut grid, b"\x1b]133;A;redraw=0\x07");
+    vte_parser.advance(&mut grid, b"\x1b]7501;state=working:app=claude-code\x07");
+    vte_parser.advance(&mut grid, b"\x1b]7501;state=done:app=claude-code\x07");
+    vte_parser.advance(&mut grid, b"\x1b]133;C\x07\x1b]133;D\x07");
+    assert_eq!(
+        grid.program_status.summary().unwrap().state,
+        "done",
+        "claude's own turn-end marks keep its result"
+    );
+    // claude exits and the shell draws its prompt: the result stays
+    vte_parser.advance(&mut grid, b"\x1b]133;A\x07$ \x1b]133;B\x07");
+    assert_eq!(grid.program_status.summary().unwrap().state, "done");
+    // the shell runs the next agent: nothing until that agent reports
+    vte_parser.advance(&mut grid, b"\x1b]133;C\x07");
+    assert!(grid.program_status.is_empty());
+    vte_parser.advance(&mut grid, b"\x1b]7501;?\x07");
+    assert!(grid.program_status.is_empty());
+    vte_parser.advance(&mut grid, b"\x1b]7501;state=working:app=pi\x07");
+    let status = grid.program_status.summary().unwrap();
+    assert_eq!(status.state, "working");
+    assert_eq!(status.app.as_deref(), Some("pi"));
+}
+
+#[test]
+fn osc_7501_query_from_a_new_program_drops_the_last_ones_done_without_shell_marks() {
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vte::Parser::new();
+    vte_parser.advance(&mut grid, b"\x1b]7501;state=done:app=claude-code\x07");
+    vte_parser.advance(&mut grid, b"\x1b]7501;?\x07");
+    assert!(grid.program_status.is_empty());
+    assert_eq!(
+        grid.pending_messages_to_pty.len(),
+        1,
+        "the query is still answered"
+    );
+}

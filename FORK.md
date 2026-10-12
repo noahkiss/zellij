@@ -5187,7 +5187,19 @@ The grid keeps the reports as the specification says a terminal should:
 - One record per `id`. A report replaces its record whole. `state=clear` removes the record named
   and its children, or every record when it names none.
 - A new prompt (`OSC 133;A`) and the pane's process exiting remove `working`, `blocked` and `idle`.
-  A `done` or `error` result stays until the program replaces or clears it.
+  A `done` or `error` result stays while that program, or the prompt after it, is in the pane.
+- **A result does not outlive the next program.** The specification leaves this to the terminal,
+  and without it a pane that ran claude to `done` showed that `done` on the next agent started in
+  it, until that agent first reported. Two signals start a new program:
+  - A command start (`OSC 133;C`) removes every record reported before the last `133;A`. A record
+    reported after it stays. So the shell running a new command drops the last program's result,
+    and claude, which writes `133;A` as a turn starts and `133;C` as it ends, keeps its own.
+    Before the first `133;A` a command start removes nothing.
+  - The feature query (`OSC 7501 ; ?`) removes every record. Claude and pi ask once, as they
+    start, so this covers a shell that writes no marks.
+  - A change of the pane's foreground process is not a signal: the grid does not see it. A
+    program that neither asks nor follows a marked prompt (codex through its hooks, under a shell
+    without marks) shows the last result until its first report.
 - A full reset (`ESC c`) removes every record. A soft reset does not.
 - At most 64 records. Past that the least recently updated goes.
 - A report the specification says to discard is discarded: no state, an unknown state, an id or a

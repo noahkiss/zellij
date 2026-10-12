@@ -246,6 +246,9 @@ pub struct Record {
 pub struct ProgramStatusRecords {
     records: BTreeMap<String, Record>,
     seq: u64,
+    /// `seq` at the last new prompt (`OSC 133;A`). A record at or below it was reported before
+    /// that prompt, so by a program that ran earlier. 0 until a prompt is seen.
+    prompt_seq: u64,
 }
 
 impl ProgramStatusRecords {
@@ -298,6 +301,30 @@ impl ProgramStatusRecords {
     /// and `idle` go; a `done` or `error` result stays until something replaces or clears it.
     pub fn drop_unfinished(&mut self) {
         self.records.retain(|_, record| record.state.is_finished());
+    }
+
+    /// A new prompt (`OSC 133;A`). The work reported so far is over, as in `drop_unfinished`, and
+    /// every record left is marked as reported before this prompt.
+    pub fn prompt(&mut self) {
+        self.drop_unfinished();
+        self.prompt_seq = self.seq;
+    }
+
+    /// A command starts (`OSC 133;C`). A result reported before the last prompt belongs to a
+    /// program that ran earlier, not to the one starting now, so it goes. A record reported after
+    /// that prompt stays: an agent that writes its own marks reports after its own `133;A`, and
+    /// claude ends each turn with `133;C`. Nothing goes before the first prompt is seen.
+    pub fn command_started(&mut self) {
+        let prompt_seq = self.prompt_seq;
+        if prompt_seq > 0 {
+            self.records.retain(|_, record| record.seq > prompt_seq);
+        }
+    }
+
+    /// A program asked `OSC 7501 ; ?`. Claude and pi ask once, as they start, so a program is
+    /// starting to report here, and every record in the pane belongs to one that came before it.
+    pub fn program_started(&mut self) {
+        self.records.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -514,6 +541,70 @@ mod tests {
         records.drop_unfinished();
         assert_eq!(records.len(), 2);
         assert_eq!(records.summary().unwrap().state, "error");
+    }
+
+    #[test]
+    fn a_new_program_after_the_prompt_does_not_inherit_the_last_ones_result() {
+        // claude finishes, exits to the shell prompt, then the shell runs the next agent
+        let mut records = ProgramStatusRecords::default();
+        records.apply(osc("state=working:app=claude-code").unwrap(), 1);
+        records.apply(osc("state=done:app=claude-code").unwrap(), 2);
+        records.drop_unfinished(); // claude exits
+        records.prompt(); // the shell draws its prompt
+        assert_eq!(
+            records.summary().unwrap().state,
+            "done",
+            "the result stays while the prompt after it is in the pane"
+        );
+        records.command_started(); // the shell runs the next agent
+        assert_eq!(
+            records.summary(),
+            None,
+            "nothing until the new agent reports"
+        );
+        records.apply(osc("?").unwrap(), 3); // and it asks, which changes nothing
+        assert_eq!(records.summary(), None);
+        records.apply(osc("state=working:app=pi").unwrap(), 4);
+        let summary = records.summary().unwrap();
+        assert_eq!(summary.state, "working");
+        assert_eq!(summary.app.as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn a_command_start_keeps_what_was_reported_after_the_prompt() {
+        // claude writes its own marks: `133;A` as a turn starts, `133;C` and `133;D` as it ends
+        let mut records = ProgramStatusRecords::default();
+        records.prompt();
+        records.apply(osc("state=working:app=claude-code").unwrap(), 1);
+        records.apply(osc("state=done:app=claude-code:id=sub").unwrap(), 2);
+        records.apply(osc("state=done:app=claude-code").unwrap(), 3);
+        records.command_started();
+        assert_eq!(records.len(), 2, "the turn's own results stay");
+        assert_eq!(records.summary().unwrap().state, "done");
+        // the next turn: its prompt marks the results as before it, and they go at its end
+        records.prompt();
+        records.apply(osc("state=working:app=claude-code").unwrap(), 4);
+        records.command_started();
+        assert_eq!(records.len(), 1, "the earlier turn's child result went");
+        assert_eq!(records.summary().unwrap().state, "working");
+    }
+
+    #[test]
+    fn a_command_start_before_any_prompt_keeps_everything() {
+        let mut records = ProgramStatusRecords::default();
+        records.apply(osc("state=done").unwrap(), 1);
+        records.command_started();
+        assert_eq!(records.summary().unwrap().state, "done");
+    }
+
+    #[test]
+    fn a_program_that_asks_starts_from_nothing() {
+        // a shell without marks: only the new program's query says it started
+        let mut records = ProgramStatusRecords::default();
+        records.apply(osc("state=done:app=claude-code").unwrap(), 1);
+        records.apply(osc("state=error:id=build").unwrap(), 2);
+        records.program_started();
+        assert!(records.is_empty());
     }
 
     #[test]

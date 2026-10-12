@@ -4718,6 +4718,8 @@ impl Perform for Grid {
             // and keeps the reports on the pane for `list-panes` and `list-agents`
             b"7501" => match crate::program_status::parse(params) {
                 Some(crate::program_status::Message::Query) => {
+                    // a program asks as it starts, so what the pane holds came before it
+                    self.program_status.program_started();
                     let reply = format!(
                         "\u{1b}]7501;{}{}",
                         crate::program_status::QUERY_REPLY_BODY,
@@ -4877,9 +4879,12 @@ impl Perform for Grid {
                     )),
                     _ => None,
                 });
-                // fork addition: a new prompt (`133;A`) ends the work a program reported over OSC 7501
-                if params.get(1) == Some(&&b"A"[..]) {
-                    self.program_status.drop_unfinished();
+                // fork addition: a new prompt (`133;A`) ends the work a program reported over OSC
+                // 7501, and a command start (`133;C`) drops the results from before that prompt
+                match params.get(1).copied() {
+                    Some(b"A") => self.program_status.prompt(),
+                    Some(b"C") => self.program_status.command_started(),
+                    _ => {},
                 }
                 if let (Some(marker), Some(row)) = (marker, self.viewport.get_mut(self.cursor.y)) {
                     // a prompt drawn now is drawn after everything typed so far
