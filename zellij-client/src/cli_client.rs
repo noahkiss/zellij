@@ -1081,6 +1081,115 @@ pub fn start_list_agents_watch_client(
     }
 }
 
+/// `zellij action drop-file`: store a file on this machine and paste a reference to it into a pane.
+///
+/// Answered by the client: the pane list says what runs in the pane, the file is stored here, and
+/// the reference goes to the session as an ordinary `Paste`. So the verb adds nothing to the
+/// client/server contract. The pane is looked up before anything is stored, so a pane nothing
+/// answers to stores no file and leaves stdin unread.
+///
+/// Returns the process exit status: 0 stored and pasted, 1 an error, 2 a miss or an empty file.
+pub fn start_drop_file_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    source: zellij_utils::drop_file::DropSource,
+    name: Option<&str>,
+    output_json: bool,
+) -> i32 {
+    use zellij_utils::drop_file::{self, ReferenceForm};
+    let PaneId::Terminal(_) = pane else {
+        eprintln!(
+            "{} is a plugin pane, and `drop-file` pastes into a terminal one. \
+             `zellij action list-panes` lists the terminal panes.",
+            pane
+        );
+        return 1;
+    };
+    let lines = match ask(
+        make_os_input(),
+        session_name,
+        Action::ListPanes {
+            show_tab: false,
+            show_command: true,
+            show_state: false,
+            show_geometry: false,
+            show_all: false,
+            output_json: true,
+            report_withheld: true,
+        },
+        "the panes of this session",
+    ) {
+        Ok(lines) => lines,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    let envelope: ListPanesEnvelope = match serde_json::from_str(&lines.join("\n")) {
+        Ok(envelope) => envelope,
+        Err(e) => {
+            eprintln!(
+                "Could not read the pane list session '{}' answered with: {}",
+                session_name, e
+            );
+            return 1;
+        },
+    };
+    // a pane the list does not carry is one a privacy policy withholds, or one that has gone since
+    // it was resolved. Either way nothing is pasted into a pane this caller cannot see
+    let Some(entry) = envelope
+        .panes
+        .into_iter()
+        .find(|entry| !entry.pane_info.is_plugin && PaneId::Terminal(entry.pane_info.id) == pane)
+    else {
+        eprintln!(
+            "No listed pane is {}, so nothing was stored or pasted. \
+             `zellij action list-panes` lists them.",
+            pane
+        );
+        return 2;
+    };
+    let agent = entry.agent.as_ref().map(|agent| agent.kind.clone());
+    let form = ReferenceForm::for_agent(agent.as_deref());
+    let stored = match drop_file::store_drop(&drop_file::drops_dir(), source, name) {
+        Ok(stored) => stored,
+        Err(refusal) => {
+            eprintln!("{}", refusal.message());
+            return refusal.exit_status();
+        },
+    };
+    let reference = drop_file::reference(&stored.path, form);
+    // a space after it, so whatever is typed next is a new word; no Enter, ever
+    if let Err(message) = ask(
+        make_os_input(),
+        session_name,
+        Action::Paste {
+            chars: format!("{} ", reference),
+            pane_id: Some(pane),
+        },
+        "the paste",
+    ) {
+        eprintln!(
+            "The file is stored at {}, but the paste failed: {}",
+            stored.path.display(),
+            message
+        );
+        return 1;
+    }
+    let report = vec![
+        format!("path: {}", stored.path.display()),
+        format!("bytes: {}", stored.bytes),
+        format!("pane_id: {}", pane),
+        format!("handle: {}", entry.pane_info.handle),
+        format!("agent: {}", agent.as_deref().unwrap_or("-")),
+        format!("form: {}", form.as_str()),
+        format!("reference: {}", reference),
+    ];
+    print_report(&report, output_json);
+    0
+}
+
 /// The agents of one session, and how many of its panes a privacy policy withheld.
 fn agents_of_session(
     os_input: Box<dyn ClientOsApi>,

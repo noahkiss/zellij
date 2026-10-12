@@ -1390,6 +1390,39 @@ pub enum CliAction {
         #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
         focused: bool,
     },
+    /// Store a file on the session's machine and paste a reference to it into a pane
+    ///
+    /// Returns: `path`, `bytes`, `pane_id`, `handle`, `agent`, `form` and `reference`.
+    /// `zellij action --json drop-file` prints the same as one JSON object.
+    ///
+    ///   zellij action drop-file --pane-id sunny-otter shot.png
+    ///
+    ///   ssh host zellij action drop-file --pane-id sunny-otter --name shot.png < shot.png
+    ///
+    /// The file is copied into `drops/` in the zellij cache directory under a fresh name that keeps
+    /// only its extension, then the reference is pasted with bracketed paste. Enter is never
+    /// pressed: the pane's user or program submits it. The reference depends on what runs in the
+    /// pane, as `list-agents` reports it: `@/path` for claude, opencode and pi, the bare path for
+    /// codex and any other agent, and a shell-quoted path for anything else. A space follows it.
+    ///
+    /// With no file and something piped in, the bytes are read from stdin to EOF, so one ssh
+    /// command carries the file. Pass `--name` then, or the stored file has no extension.
+    /// The ceiling is 25 MiB; a larger file is an error, exit 1. An empty one stores nothing and
+    /// exits 2. Each call deletes the drops older than seven days.
+    DropFile {
+        /// The file to store. Leave it out, or pass `-`, to read it from stdin instead
+        #[clap(value_parser)]
+        file: Option<PathBuf>,
+        /// The pane: terminal_1, a bare integer (3 means terminal_3), a handle like sunny-otter,
+        /// or a pane uuid. `zellij action list-panes` prints every one of them in its PANE_ID and
+        /// HANDLE columns
+        #[clap(short, long, visible_alias = "pane", value_parser)]
+        pane_id: String,
+        /// The file's name, for its extension: `shot.png` stores `drop-<uuid>.png`. Defaults to
+        /// the file argument's own name
+        #[clap(short, long, value_parser)]
+        name: Option<String>,
+    },
     /// Send named keys to a pane
     ///
     /// Keys by name, not by character: `Enter`, `Esc`, `Tab`, `F1`, `Ctrl a`, `Alt Shift b`. Use

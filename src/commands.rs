@@ -1157,6 +1157,51 @@ fn attach_with_cli_client(
         );
         std::process::exit(exit_status);
     }
+    // `drop-file` never becomes an action of its own. The file is stored on this side, and what
+    // reaches the session is a `Paste` like any other
+    if let zellij_utils::cli::CliAction::DropFile {
+        file,
+        pane_id,
+        name,
+    } = &cli_action
+    {
+        let pane = match resolve_pane_target(pane_id) {
+            Ok(pane) => pane,
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            },
+        };
+        let source = match file {
+            Some(path) if path.as_os_str() != "-" => {
+                zellij_utils::drop_file::DropSource::Path(path.clone())
+            },
+            given => {
+                use std::io::IsTerminal;
+                if given.is_none() && std::io::stdin().is_terminal() {
+                    eprintln!(
+                        "`drop-file` needs a file: pass its path, or pipe it in. \
+                         `drop-file -` reads this terminal."
+                    );
+                    std::process::exit(1);
+                }
+                zellij_utils::drop_file::DropSource::Stdin
+            },
+        };
+        let exit_status = zellij_client::cli_client::start_drop_file_client(
+            &|| {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            },
+            session_name,
+            pane,
+            source,
+            name.as_deref(),
+            structure_report,
+        );
+        std::process::exit(exit_status);
+    }
     // `list-agents` never becomes an action either. It is `list-panes` with a filter and a
     // different table, and doing that in the client is what keeps a whole verb off the
     // client/server contract

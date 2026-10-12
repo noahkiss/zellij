@@ -2315,6 +2315,11 @@ impl Action {
             },
             // `show` is `new-pane` with a command the CLI builds - the viewer this binary carries -
             // and is rewritten into one before it gets here, so no verb is added to the contract
+            // `drop-file` stores the file on this side and is sent as a `Paste`, so the contract
+            // gains no verb
+            CliAction::DropFile { .. } => {
+                Err("`drop-file` is run by the client, not sent as an action".into())
+            },
             CliAction::Show { .. } => {
                 Err("`show` is rewritten into `new-pane` by the client, not sent as itself".into())
             },

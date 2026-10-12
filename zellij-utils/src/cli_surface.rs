@@ -101,6 +101,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "close-pane",
             "close-tab",
             "close-tab-by-id",
+            "drop-file",
             "hide-floating-panes",
             "move-pane",
             "move-pane-backwards",
@@ -254,6 +255,11 @@ const OUTPUTS: &[OutputSpec] = &[
         // new-pane prints the pane alone, into a tab that already existed. `ready_by` and
         // `ready_ms` are `--wait-ready`'s lines, on this verb and the two below
         keys: "tab_id pane_id handle ready_by ready_ms",
+    },
+    OutputSpec {
+        command: "action drop-file",
+        shape: "record",
+        keys: "path bytes pane_id handle agent form reference",
     },
     OutputSpec {
         command: "action show",
