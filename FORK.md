@@ -4117,6 +4117,8 @@ only the last is limited to zellij:
 
 From nkmk.33 the codex hook also reports codex's state over `OSC 7501`, from four more hook events;
 see [What an agent says it is doing](#what-an-agent-says-it-is-doing-osc-7501-and-state-on-list-agents).
+From nkmk.34 the opencode TUI plugin does the same for opencode, from opencode's own events; see
+[opencode reports its state from its TUI plugin](#opencode-reports-its-state-from-its-tui-plugin).
 
 claude's export, register and unregister are owned for now by bm's SessionStart hook; the zellij
 snippet prints a note and does not duplicate them. A move into the zellij hook is agreed with
@@ -5213,7 +5215,7 @@ one pane the same way. It rides on `list-panes --json` and `list-agents --json`,
 |---|---|
 | `state` | `idle`, `working`, `done`, `blocked` or `error` |
 | `state_kind` | why a `blocked` program waits: `permission`, `question` or `auth` |
-| `state_app` | the program's name: `claude-code`, `pi`, `codex`. A child record takes its parent's |
+| `state_app` | the program's name: `claude-code`, `pi`, `codex`, `opencode`. A child record takes its parent's |
 | `state_title` | the task label, decoded |
 | `state_msg` | one line, decoded: the question, the error |
 | `state_progress` | 0-100 for `working` or `blocked`. Absent means indeterminate |
@@ -5231,7 +5233,9 @@ opencode 2.0 do not speak the protocol. For codex, `zellij setup --agent-hooks` 
 `agent-session.sh` report for it: `sh agent-session.sh codex state <state> [kind]` prints the
 `OSC 7501` to codex's terminal, from `UserPromptSubmit` and `PostToolUse` (`working`),
 `PermissionRequest` (`blocked`, `permission`) and `Stop` (`done`). Like the session report, it runs
-only inside zellij. opencode has no state source yet.
+only inside zellij. From nkmk.34 the opencode TUI plugin reports opencode's, from opencode's own
+events: see [opencode reports its state from its TUI
+plugin](#opencode-reports-its-state-from-its-tui-plugin).
 
 **It is on the cheap surface.** The records live on the pane's grid in the screen thread, and the
 summary goes onto the CLI-only `PaneListEntry` and `AgentListEntry`. No `PaneInfo` field, no
@@ -9018,6 +9022,62 @@ MCP surface is nine tools from here, and the cap test says nine. Tests: 25 viewe
 paging, fit and resample arithmetic, the renderer choice, the probe answer, kitty chunking that
 inflates back to the pixels, key parsing, decoding and the `new-pane` the verb parses into. Three
 MCP tests cover the command line, path expansion and the refusals.
+
+### opencode reports its state from its TUI plugin
+
+From nkmk.34. opencode 2.0 and 1.x do not speak `OSC 7501`, so `list-agents` showed no `state` for
+an opencode pane. The opencode TUI plugin from `zellij setup --agent-hooks`
+(`~/.config/opencode/plugins/agent-session/tui.ts`) now reports it, the way the codex hook does for
+codex:
+
+| opencode event | v2 (`context.data.on`, body in `data`) | v1 (`api.event.on`, body in `properties`) | report |
+|---|---|---|---|
+| a turn starts | `session.execution.started` | `session.status` `busy` or `retry` | `working` |
+| a permission is asked | `permission.asked` | `permission.asked` | `blocked`, `permission`, the request as `msg` |
+| a question is asked | `form.created` | `question.asked` | `blocked`, `question`, the question as `msg` |
+| it is answered | `permission.replied`, `form.replied`, `form.cancelled` | `permission.replied`, `question.replied`, `question.rejected` | back to the state under it |
+| the turn ends | `session.execution.succeeded`, `.interrupted` | `session.status` `idle` | `done` |
+| the turn fails | `session.execution.failed` | `session.error` | `error`, the message as `msg` |
+
+**The TUI, not the server.** The v2 server is a background service shared by every pane, with no
+pane terminal of its own. The TUI runs in the pane and already writes the `OSC 1337` session
+report to `/dev/tty`, so it writes the `OSC 7501` there too. Both versions ship a builtin
+notifications plugin in the TUI that listens to the same events; this one mirrors it.
+
+**What the pane shows is the session the TUI shows, with its subagents.** A TUI on a shared
+service hears every session, so each event is filed under its top session (v2:
+`data.session.root`; v1: up the `parentID` chain through `api.state.session.get`). The plugin
+tracks every top session it hears of, not only the one on screen: a first prompt starts its session
+running before the TUI shows it, and a first version that ignored unseen sessions missed a whole
+turn that way. When the TUI moves to another session, the pane gets that session's state, or a
+`clear` for a session that has not run. Within one session `blocked` wins over `working`,
+`working` over `error`, and `error` over `done`. Only the top session's failure is an `error`;
+a user's abort (v2 `interrupted`, v1 `MessageAbortedError`) is `done`.
+
+**A report is sent only when it changes, and only inside zellij.** The protocol's query is not
+needed: zellij takes a report without one, as it does from the codex hook. The text is flattened
+to one line and cut to 400 characters before it is encoded, because zellij discards a whole report
+whose `msg` holds a control character, and a shell command in a permission request often does.
+
+Proven on Linux in a scratch zellij session, with the plugin text from this build installed in
+scratch opencode config directories, with `bash` set to `ask`:
+
+- **opencode 2.0.25** (`--standalone`; its model credentials are reachable only through its own
+  data directory, so that one was the real one, and the test sessions were deleted after):
+  `list-agents --json` went `working`, `blocked` / `permission` / "shell: echo hi", `working` after
+  "Allow once", then `done`, with `state_app` `opencode`.
+- **opencode 1.19.0**, every directory scratch, a free model: the same four states ("bash: echo
+  hi"), then a question-tool prompt gave `working`, `blocked` / `question` / "red or blue?",
+  `working` after the answer, and `done`.
+
+`error` is not proven live. The one live failure, a deprecated default model, came before the
+race fix above and reported nothing. The `error` path is covered by running the plugin against
+fake v1 and v2 hosts.
+
+Only the TUI snippet changes. The server snippet, `agent-session.sh` and the zellij side are as
+they were. A machine picks this up by re-installing the TUI plugin file. Tests: the snippet test
+checks each version's events, the zellij-only guard, the states and kinds, the control-character
+flattening and the per-session tracking.
 
 ## Assessed and deliberately not built
 

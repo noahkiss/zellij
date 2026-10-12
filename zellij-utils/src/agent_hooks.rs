@@ -238,9 +238,12 @@ export default {
               \"./plugins/agent-session\" to \"plugin\" in ~/.config/opencode/tui.json. \
               A TUI plugin runs in the TUI, the process in the pane; the v2 server and the v1 \
               server skip the directory",
-        covers: "register when the TUI opens a session, unregister when the TUI exits, and the \
-                 zellij report. The env export is the server plugin above; a one-shot \
-                 `opencode run` has no TUI and is not registered",
+        covers: "register when the TUI opens a session, unregister when the TUI exits, the \
+                 zellij report, and the agent's state (OSC 7501), which opencode does not report \
+                 itself: working while the shown session or a subagent runs, blocked on a \
+                 permission or a question, error when the session fails, done when it ends. The \
+                 env export is the server plugin above; a one-shot `opencode run` has no TUI and \
+                 is neither registered nor reported",
         snippet: r#"import { execFile, execFileSync } from "node:child_process"
 import { writeFileSync } from "node:fs"
 
@@ -250,12 +253,13 @@ import { writeFileSync } from "node:fs"
 const REGISTRY = 'command -v agent-sessions >/dev/null && exec agent-sessions "$@"'
 
 // Register and report the session the TUI shows, each time it changes. Returns the cleanup.
-function watch(sessionOf: () => string) {
+function watch(sessionOf: () => string, changed: (id: string) => void) {
   let current = ""
   const check = () => {
     const id = sessionOf()
     if (!id || id === current) return
     current = id
+    changed(id)
     execFile("sh", ["-c", REGISTRY, "sh", "register", "--id", id, "--kind", "opencode"], () => {})
     // Only inside zellij: tell the pane which session it holds.
     if (!process.env.ZELLIJ) return
@@ -275,22 +279,176 @@ function watch(sessionOf: () => string) {
   }
 }
 
+// zellij drops a report whose text holds a control character, so flatten it and keep it short.
+function text(msg: string) {
+  const flat = String(msg ?? "").replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim().slice(0, 400)
+  return flat ? `:msg=${Buffer.from(flat).toString("base64")}` : ""
+}
+
+type Tracked = {
+  ran: boolean
+  failed: string
+  busy: Set<string>
+  asks: Map<string, { session: string; kind: string; msg: string }>
+}
+
+// Tell zellij what the agent is doing (OSC 7501), which opencode does not report itself: the
+// state of the session the TUI shows, with the subagents under it. `rootOf` names a session's
+// top. Every top session heard of is tracked, because a new session starts running before the
+// TUI shows it. Blocked beats working, working beats error, and error beats done.
+function status(rootOf: (id: string) => string) {
+  let shown = ""
+  let sent = ""
+  const roots = new Map<string, Tracked>()
+  const of = (root: string) => {
+    let tracked = roots.get(root)
+    if (!tracked) {
+      tracked = { ran: false, failed: "", busy: new Set(), asks: new Map() }
+      roots.set(root, tracked)
+      // keep the newest few: one TUI may hear every session of a shared service
+      for (const old of roots.keys()) if (roots.size > 32 && old !== shown) roots.delete(old)
+    }
+    return tracked
+  }
+  const report = () => {
+    const t = shown ? of(shown) : undefined
+    const ask = t ? [...t.asks.values()].pop() : undefined
+    const next = !t
+      ? ""
+      : ask
+        ? `state=blocked:kind=${ask.kind}${text(ask.msg)}`
+        : t.busy.size
+          ? "state=working"
+          : t.failed
+            ? `state=error${text(t.failed)}`
+            : t.ran
+              ? "state=done"
+              : sent && "state=clear"
+    if (!next || next === sent) return
+    sent = next
+    // Only inside zellij: the pane keeps the record, and list-agents shows it.
+    if (!process.env.ZELLIJ) return
+    try {
+      writeFileSync("/dev/tty", `\x1b]7501;${next}:app=opencode\x07`)
+    } catch {}
+  }
+  // Apply a change to the session's top, and report if that is the one shown.
+  const change = (session: string, apply: (t: Tracked, root: string) => void) => {
+    if (!session) return
+    const root = rootOf(session)
+    apply(of(root), root)
+    if (root === shown) report()
+  }
+  return {
+    // The TUI shows another session. `running` covers one that ran before this plugin started.
+    follow(session: string, running: boolean) {
+      shown = rootOf(session)
+      const t = of(shown)
+      if (running && !t.busy.size) {
+        t.busy.add(session)
+        t.ran = true
+      }
+      report()
+    },
+    start: (session: string) =>
+      change(session, (t, root) => {
+        t.busy.add(session)
+        t.ran = true
+        if (session === root) t.failed = ""
+      }),
+    end: (session: string) =>
+      change(session, (t) => {
+        t.busy.delete(session)
+        for (const [id, ask] of t.asks) if (ask.session === session) t.asks.delete(id)
+      }),
+    // Only the top session's error is the agent's, and a user's abort is not one.
+    fail: (session: string, msg: string) =>
+      change(session, (t, root) => {
+        if (session === root && msg) t.failed = msg
+      }),
+    ask: (session: string, id: string, kind: string, msg: string) =>
+      change(session, (t) => t.asks.set(id, { session, kind, msg })),
+    answer(id: string) {
+      for (const [root, t] of roots) if (t.asks.delete(id) && root === shown) report()
+    },
+  }
+}
+
 export default {
   id: "agent-session",
-  // v2: the route is a function on context.ui.router
+  // v2: the route is a function on context.ui.router, and an event's body is its `data`
   setup(context: any) {
-    return watch(() => {
-      const route = context.ui.router.current()
-      return route?.type === "session" ? route.sessionID : ""
-    })
+    const data = context.data
+    const state = status((id) => data.session.root(id))
+    const stop = watch(
+      () => {
+        const route = context.ui.router.current()
+        return route?.type === "session" ? route.sessionID : ""
+      },
+      (id) => state.follow(id, data.session.status(id) === "running"),
+    )
+    const on = (type: string, handler: (event: any) => void) =>
+      data.on(type, (event: any) => handler(event.data))
+    const off = [
+      on("session.execution.started", (e) => state.start(e.sessionID)),
+      on("session.execution.succeeded", (e) => state.end(e.sessionID)),
+      on("session.execution.interrupted", (e) => state.end(e.sessionID)),
+      on("session.execution.failed", (e) => {
+        state.fail(e.sessionID, e.error?.message ?? "error")
+        state.end(e.sessionID)
+      }),
+      on("permission.asked", (e) =>
+        state.ask(e.sessionID, e.id, "permission", e.message ?? `${e.action}: ${(e.resources ?? []).join(" ")}`),
+      ),
+      on("permission.replied", (e) => state.answer(e.requestID)),
+      on("form.created", (e) => state.ask(e.form.sessionID, e.form.id, "question", e.form.title)),
+      on("form.replied", (e) => state.answer(e.id)),
+      on("form.cancelled", (e) => state.answer(e.id)),
+    ]
+    return () => {
+      for (const unsubscribe of off) unsubscribe()
+      stop()
+    }
   },
-  // v1: the route is a property on api.route
+  // v1: the route is a property on api.route, and an event's body is its `properties`
   async tui(api: any) {
-    const stop = watch(() => {
-      const route = api.route.current
-      return route?.name === "session" ? route.params?.sessionID ?? "" : ""
+    const state = status((id) => {
+      // walk up to the top session
+      for (let depth = 0, parent = api.state.session.get(id)?.parentID; parent && depth < 8; depth++) {
+        id = parent
+        parent = api.state.session.get(id)?.parentID
+      }
+      return id
     })
-    api.lifecycle.onDispose(stop)
+    const stop = watch(
+      () => {
+        const route = api.route.current
+        return route?.name === "session" ? route.params?.sessionID ?? "" : ""
+      },
+      (id) => state.follow(id, ["busy", "retry"].includes(api.state.session.status(id)?.type)),
+    )
+    const on = (type: string, handler: (event: any) => void) =>
+      api.event.on(type, (event: any) => handler(event.properties))
+    const off = [
+      on("session.status", (e) => (e.status?.type === "idle" ? state.end(e.sessionID) : state.start(e.sessionID))),
+      on("session.error", (e) =>
+        state.fail(
+          e.sessionID,
+          e.error?.name === "MessageAbortedError" ? "" : e.error?.data?.message ?? e.error?.name ?? "error",
+        ),
+      ),
+      on("permission.asked", (e) =>
+        state.ask(e.sessionID, e.id, "permission", `${e.permission}: ${(e.patterns ?? []).join(" ")}`),
+      ),
+      on("permission.replied", (e) => state.answer(e.requestID)),
+      on("question.asked", (e) => state.ask(e.sessionID, e.id, "question", e.questions?.[0]?.question ?? "")),
+      on("question.replied", (e) => state.answer(e.requestID)),
+      on("question.rejected", (e) => state.answer(e.requestID)),
+    ]
+    api.lifecycle.onDispose(() => {
+      for (const unsubscribe of off) unsubscribe()
+      stop()
+    })
   },
 }"#,
         caveat: None,
@@ -347,7 +505,8 @@ pub fn agent_hooks_text() -> String {
          #   3. inside zellij only: prints OSC 1337 SetUserVar=agent_session=<base64 id> to the pane\n\
          # zellij keeps the step 3 report on the pane and resumes exactly that session.\n\
          # claude and pi report their own state (OSC 7501) once zellij answers their query; the\n\
-         # codex hook reports codex's for it, and list-agents --json carries it as `state`.\n\
+         # codex hook and the opencode TUI plugin report it for theirs, and list-agents --json\n\
+         # carries it as `state`.\n\
          # Nothing here is written for you.\n",
     );
     text.push_str(&format!(
@@ -500,7 +659,77 @@ mod tests {
         assert!(tui.how.contains("\"./plugins/agent-session\""));
         assert!(tui.how.contains("tui.json"));
         assert!(!tui.how.contains("cli.json"));
-        assert!(tui.snippet.contains("api.lifecycle.onDispose(stop)"));
+        assert!(tui.snippet.contains("api.lifecycle.onDispose(() => {"));
+    }
+
+    /// opencode does not speak OSC 7501 itself, so its TUI plugin reports the state for it, from
+    /// each version's own events: v2 hands an event's body over as `data`, v1 as `properties`.
+    #[test]
+    fn the_opencode_tui_reports_its_state_from_both_versions_events() {
+        let tui = hook("opencode").snippet;
+        for (version, needed) in [
+            (
+                "v2",
+                &[
+                    "data.on(type, (event: any) => handler(event.data))",
+                    "on(\"session.execution.started\"",
+                    "on(\"session.execution.succeeded\"",
+                    "on(\"session.execution.interrupted\"",
+                    "on(\"session.execution.failed\"",
+                    "on(\"permission.asked\"",
+                    "on(\"permission.replied\"",
+                    "on(\"form.created\"",
+                    "on(\"form.replied\"",
+                    "on(\"form.cancelled\"",
+                    "data.session.root(id)",
+                    "data.session.status(id) === \"running\"",
+                ][..],
+            ),
+            (
+                "v1",
+                &[
+                    "api.event.on(type, (event: any) => handler(event.properties))",
+                    "on(\"session.status\"",
+                    "on(\"session.error\"",
+                    "on(\"question.asked\"",
+                    "on(\"question.replied\"",
+                    "on(\"question.rejected\"",
+                    "api.state.session.get(id)?.parentID",
+                    "api.state.session.status(id)?.type",
+                    "\"MessageAbortedError\"",
+                ][..],
+            ),
+        ] {
+            for needed in needed {
+                assert!(tui.contains(needed), "{} lacks {}", version, needed);
+            }
+        }
+        // the report: zellij-only, app=opencode, and only the states and kinds zellij keeps
+        let write = tui.find(r"\x1b]7501;${next}:app=opencode\x07").unwrap();
+        let guard = tui[..write]
+            .rfind("if (!process.env.ZELLIJ) return")
+            .unwrap();
+        assert!(guard < write, "the state report is zellij-only");
+        for state in [
+            "state=blocked:kind=${ask.kind}",
+            "\"state=working\"",
+            "`state=error${text(t.failed)}`",
+            "\"state=done\"",
+            "\"state=clear\"",
+        ] {
+            assert!(tui.contains(state), "lacks {}", state);
+        }
+        for kind in ["\"permission\"", "\"question\""] {
+            assert!(tui.contains(kind), "lacks blocked kind {}", kind);
+        }
+        // zellij drops the whole report for a control character in its text
+        assert!(tui.contains(r"replace(/[\u0000-\u001f\u007f-\u009f]+/g"));
+        // a report is sent only when it changes
+        assert!(tui.contains("if (!next || next === sent) return"));
+        // a new session runs before the TUI shows it, so every top session is tracked, and the
+        // one shown is reported
+        assert!(tui.contains("const roots = new Map<string, Tracked>()"));
+        assert!(tui.contains("if (root === shown) report()"));
     }
 
     #[test]
