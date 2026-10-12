@@ -9183,9 +9183,8 @@ asks one `list-panes --json`, stores the file, and sends an ordinary `Paste`. No
 contract change, no plugin API. If the paste fails after the store, the error names the stored
 path.
 
-**Not on the MCP surface yet.** An MCP caller is an agent on the session's own machine, which
-already has a path it can type with `zellij_write_input`. A `file` mode on that tool is the cheap
-follow-up.
+**On the MCP surface as `zellij_write_input` `file`**, from nkmk.34: see [handing a pane a
+file](#zellij_write_input-file-hand-a-pane-a-file-from-the-mcp).
 
 Proved against a scratch session, with stand-in `claude` and `codex` programs that turn bracketed
 paste on and record the bytes they receive. The claude pane received `ESC[200~@"<path>" ESC[201~`
@@ -9340,6 +9339,49 @@ roots, the find, the tail read and the per-harness walk), `cli_client.rs`
 (narration, tool steps, mid-tool, sidechain, meta), the roots and their variables, the find at each
 harness's depth, the tail read, every miss of `last_reply_of`, the key table and its refusals, the
 row match, and the paste-then-Enter sequence.
+
+### `zellij_write_input` `file`: hand a pane a file from the MCP
+
+From nkmk.34. `drop-file` had no MCP form, so an agent that wanted another agent to read a
+screenshot typed `@<path>` itself, in claude's form whatever the pane ran, and pointed at a file
+that could move or vanish before it was read.
+
+```
+zellij_write_input {"pane": "sunny-otter", "file": "~/shots/ci.png"}
+  # action drop-file --pane-id sunny-otter -- /home/u/shots/ci.png
+path: /home/u/.cache/zellij/drops/drop-<uuid>.png
+bytes: 48213
+pane_id: terminal_3
+handle: sunny-otter
+agent: claude
+form: at
+reference: @/home/u/.cache/zellij/drops/drop-<uuid>.png
+```
+
+- **`file` is a fourth input mode**, beside `keys`, `text` and `agent_action`. It runs `action
+  drop-file` on the path, so the copy, the 25 MiB ceiling, the prune and the per-harness
+  reference form are `drop-file`'s own: `@path` for claude, opencode and pi, the bare path for
+  codex, a shell-quoted path at a shell. The answer is `drop-file`'s record.
+- **Enter is never pressed.** The reference waits at the pane's prompt. The caller follows with
+  `text` and `submit: true` to say what to do with it, in a second call.
+- **The path is this server's.** `~` and `$VAR` are expanded, a relative path is taken from the
+  server's directory, as `zellij_show` takes its paths. `-` is refused: the CLI would read stdin,
+  and the server's child has none.
+- **Refused, nothing stored or pasted:** `file` with `keys` or `text` ("pass it alone"), with
+  `submit` or `agent_action` ("presses nothing"). A path that is not a file and a pane no one
+  answers to are `drop-file`'s own refusals, exit 1 and 2.
+- The tool stays at seven parameters.
+
+Proved over MCP stdio against a scratch session, with stand-in `claude` and `codex` programs that
+turn bracketed paste on and record the bytes they receive. A relative path, a `$PWD` path and an
+absolute path were each stored byte-identical in `drops/`; the claude pane received
+`ESC[200~@<path> ESC[201~`, the codex pane the bare path, and a bash pane's prompt held the path,
+not run. No CR or LF reached any pane. `submit` with `file` and a missing file were refused, and
+an unknown pane answered as a miss.
+
+`src/mcp/tools.rs` (the parameter, the tips, `action drop-file` in `reports`),
+`src/mcp/invoke.rs` (`argv_in`, the refusals in `write_input_call`). Tests: the command line, a
+path beginning with a dash kept behind `--`, and the four refusals.
 
 ## Assessed and deliberately not built
 

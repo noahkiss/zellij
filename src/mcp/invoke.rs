@@ -504,6 +504,13 @@ async fn write_input_call(
 ) -> Result<Option<Call>, String> {
     let submit = args.flag("submit");
     let action = args.string("agent_action");
+    if args.string("file").is_some() && (submit || action.is_some()) {
+        return Err(
+            "`file` pastes a reference and presses nothing: pass it alone, then send the \
+             message about it with text and submit in a second call."
+                .to_owned(),
+        );
+    }
     if !submit && action.is_none() {
         return Ok(None);
     }
@@ -854,6 +861,32 @@ fn argv_in(
         },
         "zellij_write_input" => {
             let pane = args.required("pane")?;
+            if let Some(file) = args.string("file") {
+                if args.string("keys").is_some() || args.string("text").is_some() {
+                    return Err(
+                        "`file` pastes its own reference: pass it alone, without keys \
+                                or text."
+                            .to_owned(),
+                    );
+                }
+                // the CLI reads `-` as stdin, and this server's child has none to give
+                if file.trim() == "-" {
+                    return Err(
+                        "`file` is a path on this server's machine; there is no stdin to read \
+                         one from."
+                            .to_owned(),
+                    );
+                }
+                return Ok(scoped(vec![
+                    "action".to_owned(),
+                    "drop-file".to_owned(),
+                    "--pane-id".to_owned(),
+                    pane,
+                    // the path is a file, whatever its first character
+                    "--".to_owned(),
+                    expand_path(&file, env)?,
+                ]));
+            }
             match (args.string("keys"), args.string("text")) {
                 (Some(_), Some(_)) => Err(
                     "Pass `keys` or `text`, not both: one presses keys and the other writes \
@@ -876,7 +909,7 @@ fn argv_in(
                     "--".to_owned(),
                     text,
                 ])),
-                (None, None) => Err("Nothing to send: pass `keys` or `text`.".to_owned()),
+                (None, None) => Err("Nothing to send: pass `keys`, `text` or `file`.".to_owned()),
             }
         },
         "zellij_create" => {
@@ -1420,6 +1453,43 @@ mod tests {
             json!({"pane": "3", "keys": "Enter", "text": "hi"})
         )
         .contains("not both"));
+    }
+
+    #[test]
+    fn a_file_is_dropped_into_the_pane_and_never_submitted() {
+        assert_eq!(
+            line(
+                "zellij_write_input",
+                json!({"pane": "sunny-otter", "file": "-shot.png"}),
+                Some("work")
+            ),
+            "-s work action drop-file --pane-id sunny-otter -- -shot.png"
+        );
+        for refused in [
+            json!({"pane": "3", "file": "a.png", "text": "look"}),
+            json!({"pane": "3", "file": "a.png", "keys": "Enter"}),
+        ] {
+            assert!(
+                refusal("zellij_write_input", refused.clone()).contains("pass it alone"),
+                "{}",
+                refused
+            );
+        }
+        assert!(refusal("zellij_write_input", json!({"pane": "3", "file": "-"})).contains("stdin"));
+    }
+
+    #[tokio::test]
+    async fn a_file_is_not_submitted_or_mixed_with_an_agent_action() {
+        for refused in [
+            json!({"pane": "3", "file": "a.png", "submit": true}),
+            json!({"pane": "3", "file": "a.png", "agent_action": "approve"}),
+        ] {
+            let said = plan("zellij_write_input", refused.as_object().unwrap(), None)
+                .await
+                .err()
+                .expect("refused");
+            assert!(said.contains("presses nothing"), "{}", said);
+        }
     }
 
     #[test]
