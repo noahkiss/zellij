@@ -3984,7 +3984,7 @@ only the last is limited to zellij:
 |---|---|---|---|---|
 | `claude` | `settings.json` `SessionStart`, calling `~/.config/zellij/agent-session.sh claude osc` | not here | not here | yes |
 | `codex` | `config.toml` `[[hooks.SessionStart]]` and `[[hooks.SessionEnd]]`, the same script | none: codex 0.160 has no way | `SessionStart` / `SessionEnd` | yes |
-| `opencode` (v2) | `~/.config/opencode/plugins/agent-session-env.ts` (server) and `~/.config/opencode/agent-session/tui.ts`, a CLI plugin named in `cli.json` | the server plugin | session opened in the TUI / TUI exit | yes |
+| `opencode` (v1 and v2) | `~/.config/opencode/plugins/agent-session-env.ts` (server) and `~/.config/opencode/plugins/agent-session/tui.ts`, a TUI plugin directory; v1 also names it in `tui.json` | the server plugin | session opened in the TUI / TUI exit | yes |
 | `pi` | `~/.pi/agent/extensions/agent-session.ts` | its own `process.env`, which every command it runs inherits | `session_start` / `session_shutdown` | yes |
 
 claude's export, register and unregister are owned for now by bm's SessionStart hook; the zellij
@@ -4018,6 +4018,30 @@ and the shell hook sets `AGENT_SESSION_ID` and `AGENT_KIND=opencode` for that co
 matters: opencode's shell passes on a parent claude's `CLAUDE_CODE_SESSION_ID` when nested, and
 without its own pair a nested opencode reads as its parent. `list-agents` detects the TUI by its
 argv0, `opencode`, and never takes a `CLAUDE_*` name for it.
+
+**One file per surface serves opencode v1 and v2.** The two versions load a plugin differently,
+but each reads only its own key from the module's default export and ignores the rest: v2 wants
+`id` and `setup` (the server checks a schema that ignores extra keys, the TUI checks for the two
+keys), and v1 wants `server` or `tui`. So each snippet is one object with both keys, `setup` for
+v2 and `server` or `tui` for v1, and imports nothing from opencode, because neither version can
+resolve the other's plugin package. The v1 server sets the pair in `shell.env`, which runs for
+every command and is told its session. The v1 TUI reads `api.route.current`, a property, where v2
+calls `context.ui.router.current()`, and it unregisters from `api.lifecycle.onDispose`.
+
+The TUI package lives in `plugins/agent-session/`, not beside the config. v2's TUI loads every
+directory in `plugins/` by itself, and v2's server skips a directory with no server entry, so v2
+needs no config line at all. v1's server loads only `plugins/*.{ts,js}`, so it skips the
+directory, and v1's TUI loads only what `tui.json` names, so v1 needs `"./plugins/agent-session"`
+in its `plugin` list. The nkmk.31 snippet put the package in `~/.config/opencode/agent-session/`
+and named it in `cli.json`. That file is v2's own: v2 writes it once, migrated from `tui.json`,
+and never again reads `tui.json` after that. So a machine that runs both versions over one config
+directory had to keep two plugin lists in step. The move removes the `cli.json` line.
+
+Proven on Linux, in scratch config, state and data directories: opencode 2.0.25 and 1.19.0, the
+last v1 release. Each `opencode run` bash tool printed `AGENT_SESSION_ID` equal to its session
+and `AGENT_KIND=opencode`. Each TUI, opened on that session in a scratch zellij session,
+registered its own process, reported over `OSC 1337` (`session_source` `osc`), and unregistered on
+exit. v2 found the TUI package with no config line.
 
 Proven on Linux, in scratch config directories: claude (the report reaches the pty with the
 hook's `session_id`); pi 1.1 (`session_start` fires with no model call, `register` resolves the

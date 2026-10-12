@@ -141,25 +141,28 @@ timeout = 5"#,
     },
     AgentHook {
         kind: "opencode",
-        file: "~/.config/opencode/plugins/agent-session-env.ts (opencode v2, runs in the server)",
-        how: "create the file; opencode loads every file in that directory into its server",
+        file: "~/.config/opencode/plugins/agent-session-env.ts (opencode v1 and v2, runs in the server)",
+        how: "create the file; opencode loads every file in that directory into its server. One \
+              file serves both versions: v2 calls `setup`, v1 calls `server`, and each ignores the \
+              other's key",
         covers: "the env export: AGENT_SESSION_ID and AGENT_KIND on every command the agent runs. \
                  Without it a nested opencode carries its parent's variables and reads as its parent",
-        snippet: r#"import { Plugin } from "@opencode/plugin"
-
-// Agent session hook (zellij setup --agent-hooks): export AGENT_SESSION_ID and AGENT_KIND to the
-// commands opencode runs. The shell hook is not told the session, and opencode sets its own
-// OPENCODE_SESSION_ID only after it, so the tool hook that runs first remembers the session per
-// command and the shell hook picks it up.
-export default Plugin.define({
+        snippet: r#"// Agent session hook (zellij setup --agent-hooks): export AGENT_SESSION_ID and AGENT_KIND to the
+// commands opencode runs. One file serves opencode v1 and v2: v2 calls `setup`, v1 calls `server`,
+// and each ignores the other's key. Nothing is imported, because neither version can resolve the
+// other's plugin package.
+export default {
   id: "agent-session-env",
-  async setup(ctx) {
+  // v2: the shell hook is not told the session, and opencode sets its own OPENCODE_SESSION_ID only
+  // after it, so the tool hook that runs first remembers the session per command and the shell
+  // hook picks it up.
+  async setup(ctx: any) {
     const pending = new Map<string, string>()
     await ctx.tool.hook("execute.before", (event: any) => {
       const command = event.input?.command
       if (typeof command === "string" && event.sessionID) pending.set(command, event.sessionID)
     })
-    await ctx.shell.hook("create.before", (event) => {
+    await ctx.shell.hook("create.before", (event: any) => {
       const id = pending.get(event.command)
       if (!id) return
       pending.delete(event.command)
@@ -167,55 +170,83 @@ export default Plugin.define({
       event.env.AGENT_KIND = "opencode"
     })
   },
-})"#,
+  // v1: `shell.env` runs for every command and is told the session.
+  async server() {
+    return {
+      "shell.env": async (input: any, output: any) => {
+        if (!input.sessionID) return
+        output.env.AGENT_SESSION_ID = input.sessionID
+        output.env.AGENT_KIND = "opencode"
+      },
+    }
+  },
+}"#,
         caveat: None,
     },
     AgentHook {
         kind: "opencode",
-        file: "~/.config/opencode/agent-session/tui.ts (opencode v2)",
+        file: "~/.config/opencode/plugins/agent-session/tui.ts (opencode v1 and v2)",
         how: "create the file, and beside it package.json: \
-              {\"name\": \"agent-session\", \"type\": \"module\", \"exports\": {\"./tui\": \"./tui.ts\"}}; \
-              then add {\"package\": \"./agent-session\"} to \"plugins\" in ~/.config/opencode/cli.json. \
-              A CLI plugin runs in the TUI, the process in the pane; a plugin in plugins/ runs in \
-              the shared background service, which serves every pane",
+              {\"name\": \"agent-session\", \"type\": \"module\", \"exports\": {\"./tui\": \"./tui.ts\"}}. \
+              opencode v2 finds a plugin directory in plugins/ by itself; for opencode v1, add \
+              \"./plugins/agent-session\" to \"plugin\" in ~/.config/opencode/tui.json. \
+              A TUI plugin runs in the TUI, the process in the pane; the v2 server and the v1 \
+              server skip the directory",
         covers: "register when the TUI opens a session, unregister when the TUI exits, and the \
                  zellij report. The env export is the server plugin above; a one-shot \
                  `opencode run` has no TUI and is not registered",
         snippet: r#"import { execFile, execFileSync } from "node:child_process"
 import { writeFileSync } from "node:fs"
-import { Plugin } from "@opencode/plugin/tui"
 
-// Agent session hook (zellij setup --agent-hooks). Runs in the TUI, the process in the pane.
+// Agent session hook (zellij setup --agent-hooks). Runs in the TUI, the process in the pane. One
+// file serves opencode v1 and v2: v2 calls `setup`, v1 calls `tui`. Nothing is imported from
+// opencode, because neither version can resolve the other's plugin package.
 const REGISTRY = 'command -v agent-sessions >/dev/null && exec agent-sessions "$@"'
 
-export default Plugin.define({
+// Register and report the session the TUI shows, each time it changes. Returns the cleanup.
+function watch(sessionOf: () => string) {
+  let current = ""
+  const check = () => {
+    const id = sessionOf()
+    if (!id || id === current) return
+    current = id
+    execFile("sh", ["-c", REGISTRY, "sh", "register", "--id", id, "--kind", "opencode"], () => {})
+    // Only inside zellij: tell the pane which session it holds.
+    if (!process.env.ZELLIJ) return
+    const b64 = Buffer.from(id).toString("base64")
+    try {
+      writeFileSync("/dev/tty", `\x1b]1337;SetUserVar=agent_session=${b64}\x07`)
+    } catch {}
+  }
+  const timer = setInterval(check, 1000)
+  check()
+  return () => {
+    clearInterval(timer)
+    if (!current) return
+    try {
+      execFileSync("sh", ["-c", REGISTRY, "sh", "unregister", "--id", current], { stdio: "ignore" })
+    } catch {}
+  }
+}
+
+export default {
   id: "agent-session",
-  setup(context) {
-    let current = ""
-    const check = () => {
+  // v2: the route is a function on context.ui.router
+  setup(context: any) {
+    return watch(() => {
       const route = context.ui.router.current()
-      const id = route?.type === "session" ? route.sessionID : ""
-      if (!id || id === current) return
-      current = id
-      execFile("sh", ["-c", REGISTRY, "sh", "register", "--id", id, "--kind", "opencode"], () => {})
-      // Only inside zellij: tell the pane which session it holds.
-      if (!process.env.ZELLIJ) return
-      const b64 = Buffer.from(id).toString("base64")
-      try {
-        writeFileSync("/dev/tty", `\x1b]1337;SetUserVar=agent_session=${b64}\x07`)
-      } catch {}
-    }
-    const timer = setInterval(check, 1000)
-    check()
-    return () => {
-      clearInterval(timer)
-      if (!current) return
-      try {
-        execFileSync("sh", ["-c", REGISTRY, "sh", "unregister", "--id", current], { stdio: "ignore" })
-      } catch {}
-    }
+      return route?.type === "session" ? route.sessionID : ""
+    })
   },
-})"#,
+  // v1: the route is a property on api.route
+  async tui(api: any) {
+    const stop = watch(() => {
+      const route = api.route.current
+      return route?.name === "session" ? route.params?.sessionID ?? "" : ""
+    })
+    api.lifecycle.onDispose(stop)
+  },
+}"#,
         caveat: None,
     },
     AgentHook {
@@ -367,15 +398,61 @@ mod tests {
         assert!(hook("pi")
             .snippet
             .contains("process.env.AGENT_KIND = \"pi\""));
-        assert!(hook("opencode").snippet.contains("@opencode/plugin/tui"));
-        let server = AGENT_HOOKS
-            .iter()
-            .find(|hook| hook.kind == "opencode" && hook.file.contains("plugins/"))
-            .unwrap();
+        let server = opencode_server();
         assert!(server.snippet.contains("event.env.AGENT_SESSION_ID = id"));
         assert!(server
             .snippet
             .contains("event.env.AGENT_KIND = \"opencode\""));
+        assert!(server
+            .snippet
+            .contains("output.env.AGENT_SESSION_ID = input.sessionID"));
+        assert!(server
+            .snippet
+            .contains("output.env.AGENT_KIND = \"opencode\""));
+    }
+
+    fn opencode_server() -> &'static AgentHook {
+        AGENT_HOOKS
+            .iter()
+            .find(|hook| hook.kind == "opencode" && hook.file.contains("agent-session-env.ts"))
+            .unwrap()
+    }
+
+    /// One file per surface serves opencode v1 and v2. Each version validates only its own key on
+    /// the default export (v2: `id` and `setup`; v1: `server` or `tui`), so both keys sit on one
+    /// object, and nothing is imported from either version's plugin package.
+    #[test]
+    fn the_opencode_hooks_serve_v1_and_v2_from_one_file() {
+        for (hook, v1_key) in [
+            (opencode_server(), "async server()"),
+            (hook("opencode"), "async tui(api"),
+        ] {
+            let snippet = hook.snippet;
+            assert!(snippet.contains("export default {"), "{}", hook.file);
+            assert!(snippet.contains("  id: \""), "{}", hook.file);
+            assert!(
+                snippet.contains("  async setup(ctx: any)")
+                    || snippet.contains("  setup(context: any)"),
+                "{} lacks the v2 setup",
+                hook.file
+            );
+            assert!(snippet.contains(v1_key), "{} lacks {}", hook.file, v1_key);
+            assert!(
+                !snippet.contains("@opencode"),
+                "{} imports opencode",
+                hook.file
+            );
+            assert!(hook.file.contains("v1 and v2"), "{}", hook.file);
+        }
+        // v1 shell.env is told the session; v2 needs the tool hook to pair it with the command
+        assert!(opencode_server().snippet.contains("\"shell.env\""));
+        // v2 finds the TUI package in plugins/ itself; v1 needs it named in tui.json
+        let tui = hook("opencode");
+        assert!(tui.file.contains("plugins/agent-session/"));
+        assert!(tui.how.contains("\"./plugins/agent-session\""));
+        assert!(tui.how.contains("tui.json"));
+        assert!(!tui.how.contains("cli.json"));
+        assert!(tui.snippet.contains("api.lifecycle.onDispose(stop)"));
     }
 
     #[test]
