@@ -1076,7 +1076,9 @@ fn a_command_pane_is_serialized_as_its_own_command_not_its_newest_child() {
         panic!("expected a command, got {:?}", meta.terminal_run(1));
     };
     assert_eq!(run_command.command, PathBuf::from("claude"));
-    assert_eq!(run_command.args, vec!["--continue".to_owned()]);
+    // its own argv, then the bare-resume pass: nothing names a session, so `--continue` is
+    // recorded as the picker, in the default mode too
+    assert_eq!(run_command.args, vec!["--resume".to_owned()]);
 }
 
 #[test]
@@ -1315,6 +1317,94 @@ fn a_launch_prompt_is_not_recorded_with_the_reported_session() {
         run_command.args,
         vec!["--resume".to_owned(), "osc-session".to_owned()]
     );
+}
+
+/// The flightdeck pane again, under the default `resurrect_commands "all"` with no hint: the
+/// mode that recorded every argv whole until nkmk.34. A known agent is recorded as its bare
+/// resume in this mode too, so a restore never sends the launch prompt again.
+#[test]
+fn in_all_mode_a_launch_prompt_is_not_recorded_either() {
+    let launched = [
+        "--model",
+        "opus",
+        "--dangerously-skip-permissions",
+        "Read X and do it.",
+    ];
+    let mock = MockOsApi::new();
+    mock.set_cmd(
+        100,
+        std::iter::once("claude")
+            .chain(launched)
+            .map(|word| word.to_owned())
+            .collect(),
+    );
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_commands = ResurrectCommands::All;
+    pty.id_to_child_pid.insert(1, 100);
+    pty.note_agent_session_from_osc(1, "osc-session".to_owned());
+    let mut meta = agent_pane_meta(1, "claude", &launched);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        run_command.args,
+        vec!["--resume".to_owned(), "osc-session".to_owned()]
+    );
+}
+
+/// `"all"` with no session found: the flightdeck pane and an agent `zellij_create run_in=agent`
+/// started from a brief are each recorded as the picker, without their prompt. A pane that is not
+/// an agent keeps its whole argv, as `"all"` always has.
+#[test]
+fn in_all_mode_an_agent_with_no_session_is_recorded_as_its_picker() {
+    let flightdeck = [
+        "--model",
+        "opus",
+        "--dangerously-skip-permissions",
+        "Read X and do it.",
+    ];
+    let spawned = [
+        "--model",
+        "haiku",
+        "--",
+        "- Reply with one word.\n- Use no tools.",
+    ];
+    let command = |name: &str, args: &[&str]| {
+        let mut run_command = RunCommand::new(PathBuf::from(name));
+        run_command.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+        Some(Run::Command(run_command))
+    };
+    let mut meta = SessionLayoutMetadata::default();
+    meta.add_tab(
+        "tab1".to_owned(),
+        true,
+        false,
+        vec![
+            pane_running(1, command("claude", &flightdeck)),
+            pane_running(2, command("/usr/local/bin/claude", &spawned)),
+            pane_running(3, command("htop", &["-d", "10"])),
+        ],
+        vec![],
+    );
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.resurrect_commands = ResurrectCommands::All;
+    // pids no process has: the walk finds no session under them
+    pty.id_to_child_pid.insert(1, u32::MAX - 7);
+    pty.id_to_child_pid.insert(2, u32::MAX - 8);
+    pty.id_to_child_pid.insert(3, u32::MAX - 9);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let args_of = |terminal_id: u32| match meta.terminal_run(terminal_id) {
+        Some(Run::Command(run_command)) => run_command.args.clone(),
+        other => panic!("expected a command, got {:?}", other),
+    };
+    assert_eq!(args_of(1), vec!["--resume".to_owned()]);
+    assert_eq!(args_of(2), vec!["--resume".to_owned()]);
+    assert_eq!(args_of(3), vec!["-d".to_owned(), "10".to_owned()]);
 }
 
 /// A snapshot written before the bare resume can still hold a launch prompt. The prefill types

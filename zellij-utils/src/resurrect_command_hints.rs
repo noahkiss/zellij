@@ -186,7 +186,8 @@ impl ResurrectCommandHints {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResurrectCommands {
     /// Every recorded command comes back as a command pane waiting to run. Upstream's behaviour,
-    /// and what an unset key means.
+    /// and what an unset key means - except that a known agent is recorded as its bare resume, as
+    /// in the other two modes.
     All,
     /// Only coding agents keep their command, recorded with how to resume it, and come back as a
     /// command pane waiting to run. Every other pane comes back as a plain shell.

@@ -3999,8 +3999,8 @@ pane that has a record whose `pid` is its own, and records `--resume <sessionId>
 session the argv picked. It runs AFTER the configured hints, so the live id replaces one a hint
 read from a stale environment, and a pane with no record keeps what the hint recorded. It runs
 when `resurrect_commands` is `"agents"` or `"prefill"`, or when a configured hint matches
-`claude`, so the shipped hint is fixed with no config change and a config with neither is
-untouched.
+`claude`, so the shipped hint is fixed with no config change. (From nkmk.34 it runs in every
+mode: see "in every mode" below.)
 
 **Exactly one session choice.** For a harness this build knows, a recorded command keeps every
 flag except the words that pick a session, and then gets exactly one. (From nkmk.32 it keeps no
@@ -4085,6 +4085,32 @@ flag's value from a prompt would need. A hint for a command this build does not 
 appends, because this build does not know that tool's words. `"prefill"` also types the bare
 resume of whatever a snapshot holds, so a snapshot written before nkmk.32 does not type its old
 prompt either.
+
+**From nkmk.34, in every mode.** The pass above ran only with `"agents"` or `"prefill"`, or a
+configured hint for the harness. Under the default `"all"` with no hint, a known agent was recorded
+with its whole argv, launch prompt included, so a restore offered to send the prompt again. Found
+on an agent that `zellij_create run_in=agent` started from a brief: `session-layout.kdl` held
+`args "--model" "haiku" "--" "<the brief>"`. The operator's rule is that a restored agent pane
+holds only the bare resume, in any mode, so the live-session pass and the bare resume now run for
+every known harness whatever `resurrect_commands` says. `"all"` still keeps every other command
+whole: only claude, codex, opencode and pi change. A known agent with no session found gets its
+picker in `"all"` too, never its newest session, so a `claude --continue` command pane is recorded
+as `claude --resume`.
+
+What `"all"` does not do: rewrite a snapshot written before nkmk.34 at restore. A pane restored
+from one offers the command that snapshot holds; the next serialization records the bare form.
+Only `"prefill"` types the bare form of an old snapshot.
+
+In the same patch, the `list-panes` table folds a newline, carriage return or tab in any cell to a
+space, as `list-agents` does, so an agent started with a multi-line prompt keeps its row on one
+line. `--json` keeps every value as it is.
+
+Files: `zellij-server/src/pty.rs` (`apply_resurrect_command_hints`),
+`zellij-server/src/session_layout_metadata.rs` (`runs_a_known_agent`, which keeps the process-table
+read off a session with no agent), `zellij-server/src/route.rs` (the table row),
+`zellij-utils/src/resurrect_command_hints.rs` (the mode's doc). Tests: the flightdeck pane under
+`"all"` with a reported session and with none, an agent started from a brief, a non-agent pane
+keeping its argv, a `--continue` command pane, and a multi-line command on one table row.
 
 **The agent's own report: `OSC 1337 SetUserVar=agent_session=<base64 id>`.** The iTerm2 and
 WezTerm user-variable convention, printed by a hook in the agent to its pane's terminal. The grid

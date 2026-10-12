@@ -2504,17 +2504,18 @@ impl Pty {
         self.apply_resurrect_command_hints(session_layout_metadata, &panes);
     }
     /// Rewrites the commands `resurrect_command_hints` applies to, once the commands themselves
-    /// have been discovered, and in an agents-only `resurrect_commands` mode drops every command
-    /// that is not an agent's.
+    /// have been discovered, records every known agent as its bare resume, and in an agents-only
+    /// `resurrect_commands` mode drops every command that is not an agent's.
     ///
     /// It runs here, in the pty thread, because this is the thread that knows a pane's pid - and
     /// last, after the rest of discovery, so that it decides against the command that would
     /// otherwise have been recorded.
     ///
-    /// Three passes, in this order. The configured hints run first, as they always have. A
-    /// claude pane is then pinned to its live session, when either setting asks for claude, so
-    /// the live id replaces whatever the hint read from a stale environment. The agents-only
-    /// filter runs last, on the commands the first two produced.
+    /// Three passes, in this order. The configured hints run first, as they always have. Every
+    /// known agent is then pinned to its live session and recorded as its bare resume, in every
+    /// mode, so the live id replaces whatever the hint read from a stale environment and a launch
+    /// prompt is never recorded. The agents-only filter runs last, on the commands the first two
+    /// produced.
     fn apply_resurrect_command_hints(
         &mut self,
         session_layout_metadata: &mut SessionLayoutMetadata,
@@ -2525,7 +2526,9 @@ impl Pty {
             .as_ref()
             .filter(|hints| !hints.is_empty());
         let agents_only = self.resurrect_commands.agents_only();
-        if hints.is_none() && !agents_only {
+        // a known agent is recorded as its bare resume in every mode, `"all"` included: its argv
+        // can carry a launch prompt, which a restore would send again as a new turn
+        if hints.is_none() && !agents_only && !session_layout_metadata.runs_a_known_agent() {
             return;
         }
         let terminal_ids_to_pids: HashMap<u32, u32> = panes.iter().copied().collect();
@@ -2538,9 +2541,9 @@ impl Pty {
                     .and_then(|pid| process_tree.find_env(*pid, var))
             });
         }
-        // every known agent is pinned to the session it holds now, when either setting asks
-        // for it; one with no session found is left as the hints recorded it, and the
-        // agents-only pass below then gives it its picker - never its newest session
+        // every known agent is pinned to the session it holds now, in every mode; one with no
+        // session found is recorded with the bare resume of the id its argv names, or its
+        // picker - never its newest session
         let claude_dir = claude_sessions_dir();
         let osc_sessions: HashMap<u32, String> = self
             .osc_agent_sessions
@@ -2557,11 +2560,7 @@ impl Pty {
             })
             .collect();
         let mut misses: HashMap<u32, String> = HashMap::new();
-        session_layout_metadata.pin_live_agent_sessions(|terminal_id, kind, command| {
-            let hinted = hints.map_or(false, |hints| hints.hint_for(command).is_some());
-            if !(agents_only || hinted) {
-                return None;
-            }
+        session_layout_metadata.pin_live_agent_sessions(|terminal_id, kind, _command| {
             if let Some(session_id) = osc_sessions.get(&terminal_id) {
                 log::debug!(
                     "resurrect: terminal {} records {}'s session {} (session_source: osc)",

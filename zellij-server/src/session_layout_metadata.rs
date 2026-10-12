@@ -375,6 +375,18 @@ impl SessionLayoutMetadata {
             .find(|pane| pane.id == PaneId::Terminal(terminal_id))
             .and_then(|pane| pane.run.as_ref())
     }
+    /// Whether any terminal pane runs a harness this build knows: claude, codex, opencode or pi.
+    pub fn runs_a_known_agent(&self) -> bool {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.tiled_panes.iter().chain(tab.floating_panes.iter()))
+            .any(|pane| match (&pane.id, pane.run.as_ref()) {
+                (PaneId::Terminal(_), Some(Run::Command(run_command))) => {
+                    harness_for_command(&run_command.command.display().to_string()).is_some()
+                },
+                _ => false,
+            })
+    }
     pub fn add_tab(
         &mut self,
         name: String,

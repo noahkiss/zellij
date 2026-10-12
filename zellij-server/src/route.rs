@@ -4236,7 +4236,12 @@ fn build_table_row(
 
     row.push(format_agent(entry));
 
-    row.join("  ")
+    // a table row is one line: an agent started with a multi-line prompt has newlines in its
+    // command, and they would break the row in two. `--json` keeps every value as it is
+    row.iter()
+        .map(|cell| cell.replace(['\n', '\r', '\t'], " "))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// The harness running in a pane, for the table's `AGENT` column, or `-` for a pane with none.
