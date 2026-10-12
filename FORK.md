@@ -9432,6 +9432,44 @@ for claude and opencode, a path with a quote in it, no brief, the refusals (not 
 command, no file, a brief without `run_in=agent`), the readiness wait, both spellings of a
 floating pane, and a multi-line command on one table row.
 
+### `zellij_overview scope=my_agents`: the supervision view
+
+From nkmk.34, from the agent-orchestration plan. A session that started several agents had no one
+call that said which of them were still working, which were waiting on it, and which had gone
+quiet.
+
+```
+zellij_overview {"scope": "my_agents"}
+  # action list-agents --json --report-withheld, kept to the caller's own tab
+{"agents": [{"handle": "brisk-heron", "kind": "claude", "cwd": "/home/u/src/app",
+             "state": "blocked", "state_kind": "permission", "state_msg": "approve Bash: make",
+             "state_at": 1791821058267, "state_age_s": 42,
+             "last_output_at": 1791821058301, "output_age_s": 42, ...}],
+ "withheld": 0}
+```
+
+- **`list-agents --json` rows gain `last_output_at`**, the pane's own (milliseconds since the
+  epoch), so "how long since this agent drew anything" needs no second walk. A `--watch` does not
+  compare it: it moves with every frame an agent draws, and a watch prints changes of identity and
+  state. The table keeps its columns.
+- **`zellij_overview` adds the ages** to every agent row of `scope=agents`: `state_age_s`, the
+  whole seconds since the agent last reported a state, and `output_age_s`, since its pane last drew
+  anything. A reader asked which agent has stalled should not have to subtract 13-digit numbers.
+  The raw keys stay beside them. A working agent whose `output_age_s` keeps growing has stalled.
+- **`command` is cut to 120 characters there**, on one line. An agent started from a brief carries
+  the whole brief in its command line, and a supervisor polling the view would be handed every
+  brief on every call. `list-agents --json` keeps it whole.
+- **`scope=my_agents`** is the same answer kept to the agents in the caller's own `-zj` tab: the
+  tab `zellij_create` puts every pane in by default, and so every agent the caller started there
+  with `run_in=agent`. It is found the way `zellij_create` finds it, from the tab the server's own
+  pane is in. An agent a person moved out of that tab is no longer counted as the caller's, and
+  one moved in is. `scope=agents` lists every agent in the session.
+
+`zellij_overview` keeps three parameters. Files: `zellij-utils/src/data.rs`, `agent_detect.rs`;
+`src/mcp/invoke.rs` (`AgentsView`, the `my_agents` plan), `src/mcp/mod.rs`, `src/mcp/tools.rs`.
+Tests: the filter, the ages from an envelope and a bare array, the command line, and a watch that
+ignores a moving `last_output_at`.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

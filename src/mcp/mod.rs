@@ -85,6 +85,14 @@ impl ZellijMcp {
             Ok(ran) => ran,
             Err(message) => return failed(message, json!({"reason": "not_run"})),
         };
+        if let (Some(view), false) = (&plan.agents, outcome.is_error()) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64);
+            if let Some(shaped) = view.shape(&outcome.stdout, now_ms) {
+                outcome.stdout = shaped;
+            }
+        }
         let input_sent = match then_type {
             Some(then_type) => Some(type_into_created_pane(then_type, &mut outcome).await),
             None => None,

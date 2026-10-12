@@ -202,6 +202,65 @@ pub struct Plan {
     /// `zellij_create` with `run_in: shell` and a `command`: typed into the pane the create made,
     /// and only once the create has said that pane is ready. `None` for every other call.
     pub then_type: Option<TypeAfter>,
+    /// `zellij_overview` with `scope: agents` or `my_agents`: how the agent list is shaped before
+    /// it is returned. `None` for every other call.
+    pub agents: Option<AgentsView>,
+}
+
+/// How much of an agent's command line `zellij_overview` returns. Enough to tell agents apart.
+pub const AGENT_COMMAND_MAX: usize = 120;
+
+/// What `zellij_overview` adds to, and takes from, the `list-agents --json` answer.
+pub struct AgentsView {
+    /// `my_agents`: only the agents in this tab, the caller's own `-zj` tab, where every agent it
+    /// started with `zellij_create` went. `None` keeps every agent.
+    pub only_tab: Option<String>,
+}
+
+impl AgentsView {
+    /// The answer as the caller gets it: each row with how long ago the agent last reported and
+    /// last drew anything, in whole seconds, and, for `my_agents`, only the caller's own.
+    ///
+    /// Ages rather than the raw epoch milliseconds alone, because a reader asked "which agent has
+    /// stalled" should not have to subtract 13-digit numbers. The raw keys stay beside them.
+    pub fn shape(&self, stdout: &str, now_ms: u64) -> Option<String> {
+        let mut answer: Value = serde_json::from_str(stdout.trim()).ok()?;
+        let rows = match &mut answer {
+            Value::Array(rows) => rows,
+            Value::Object(envelope) => envelope.get_mut("agents")?.as_array_mut()?,
+            _ => return None,
+        };
+        if let Some(tab) = &self.only_tab {
+            rows.retain(|row| row.get("tab_name").and_then(Value::as_str) == Some(tab));
+        }
+        for row in rows.iter_mut() {
+            let Some(row) = row.as_object_mut() else {
+                continue;
+            };
+            // an agent started with a prompt carries the whole prompt in its command line, and a
+            // supervisor polling this view would be handed every brief on every call
+            if let Some(command) = row.get("command").and_then(Value::as_str) {
+                let folded = command.split_whitespace().collect::<Vec<_>>().join(" ");
+                let short = if folded.chars().count() > AGENT_COMMAND_MAX {
+                    let mut cut: String = folded.chars().take(AGENT_COMMAND_MAX - 1).collect();
+                    cut.push('…');
+                    cut
+                } else {
+                    folded
+                };
+                row.insert("command".to_owned(), Value::from(short));
+            }
+            for (from, to) in [
+                ("state_at", "state_age_s"),
+                ("last_output_at", "output_age_s"),
+            ] {
+                if let Some(at) = row.get(from).and_then(Value::as_u64) {
+                    row.insert(to.to_owned(), Value::from(now_ms.saturating_sub(at) / 1000));
+                }
+            }
+        }
+        serde_json::to_string_pretty(&answer).ok()
+    }
 }
 
 impl From<Call> for Plan {
@@ -209,6 +268,7 @@ impl From<Call> for Plan {
         Plan {
             call,
             then_type: None,
+            agents: None,
         }
     }
 }
@@ -465,6 +525,22 @@ async fn plan_in(
             return Ok(call.into());
         }
     }
+    if tool == "zellij_overview" {
+        let scope = read.enumerated("scope", "panes");
+        if scope == "agents" || scope == "my_agents" {
+            let only_tab = if scope == "my_agents" {
+                Some(agent_tab(env, ambient_session).await.0)
+            } else {
+                None
+            };
+            let call = Call::One(argv_in(tool, args, ambient_session, env, None)?);
+            return Ok(Plan {
+                call,
+                then_type: None,
+                agents: Some(AgentsView { only_tab }),
+            });
+        }
+    }
     if tool != "zellij_create" {
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
@@ -477,7 +553,11 @@ async fn plan_in(
     });
     if read.enumerated("kind", CREATE_KIND_DEFAULT) != CREATE_KIND_DEFAULT {
         let call = Call::One(argv_in(tool, args, ambient_session, env, None)?);
-        return Ok(Plan { call, then_type });
+        return Ok(Plan {
+            call,
+            then_type,
+            agents: None,
+        });
     }
     // before the session is asked anything: a handle the CLI would refuse is refused for free
     chosen_handle(&read)?;
@@ -485,14 +565,22 @@ async fn plan_in(
     let argv = argv_in(tool, args, ambient_session, env, Some((&tab, placement)))?;
     if placement == TabPlacement::Existing {
         let call = Call::One(argv);
-        return Ok(Plan { call, then_type });
+        return Ok(Plan {
+            call,
+            then_type,
+            agents: None,
+        });
     }
     let rename = pane_name(&read).map(|name| RenameAfter {
         session: session.clone(),
         name,
     });
     let call = Call::MakingAgentTab { argv, rename };
-    Ok(Plan { call, then_type })
+    Ok(Plan {
+        call,
+        then_type,
+        agents: None,
+    })
 }
 
 /// `zellij_write_input` when it is more than one keystroke or one write: a message to submit, or
@@ -814,7 +902,7 @@ fn argv_in(
             // `--report-withheld` on both walks: an agent that is told a list is complete when it
             // is not will go looking for the missing pane, and the count is the only thing a
             // withheld pane leaves behind
-            "agents" => Ok(scoped(vec![
+            "agents" | "my_agents" => Ok(scoped(vec![
                 "action".to_owned(),
                 "list-agents".to_owned(),
                 "--json".to_owned(),
@@ -833,7 +921,7 @@ fn argv_in(
                 Ok(scoped(rest))
             },
             other => Err(format!(
-                "`scope` must be panes, agents or sessions, not `{}`.",
+                "`scope` must be panes, agents, my_agents or sessions, not `{}`.",
                 other
             )),
         },
@@ -1734,6 +1822,54 @@ mod tests {
                 refused
             );
         }
+    }
+
+    #[test]
+    fn my_agents_is_the_agent_walk_filtered_to_my_tab_with_ages() {
+        assert_eq!(
+            line(
+                "zellij_overview",
+                json!({"scope": "my_agents"}),
+                Some("work")
+            ),
+            "-s work action list-agents --json --report-withheld"
+        );
+        let answer = r#"{"agents": [
+            {"handle": "a", "tab_name": "dev-zj", "state": "working", "state_at": 1000000,
+             "last_output_at": 1055000},
+            {"handle": "b", "tab_name": "dev", "state": "done", "state_at": 1000000}
+        ], "withheld": 0}"#;
+        let mine = AgentsView {
+            only_tab: Some("dev-zj".to_owned()),
+        }
+        .shape(answer, 1_060_000)
+        .unwrap();
+        let mine: Value = serde_json::from_str(&mine).unwrap();
+        let rows = mine["agents"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["handle"], "a");
+        assert_eq!(rows[0]["state_age_s"], 60);
+        assert_eq!(rows[0]["output_age_s"], 5);
+        assert_eq!(mine["withheld"], 0);
+        // every agent, from a bare array too; a row with no output keeps no output age
+        let long = format!("claude -- {}\nmore", "x".repeat(300));
+        let all = AgentsView { only_tab: None }
+            .shape(
+                &json!([{"handle": "b", "state_at": 1000000, "command": long}]).to_string(),
+                1_002_500,
+            )
+            .unwrap();
+        let all: Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(all[0]["state_age_s"], 2);
+        assert!(all[0].get("output_age_s").is_none());
+        let command = all[0]["command"].as_str().unwrap();
+        assert_eq!(command.chars().count(), AGENT_COMMAND_MAX);
+        assert!(
+            command.ends_with('…') && !command.contains('\n'),
+            "{}",
+            command
+        );
+        assert!(AgentsView { only_tab: None }.shape("not json", 0).is_none());
     }
 
     #[test]

@@ -3100,6 +3100,7 @@ mod tests {
             pid: None,
             program_status: None,
             session: None,
+            last_output_at: None,
         }
     }
 

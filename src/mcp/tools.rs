@@ -111,7 +111,12 @@ pub const TOOLS: &[ToolSpec] = &[
         tips: "Call this before zellij_create: a pane you already own is cheaper than a new one, \
                and its handle is in this answer. scope=agents narrows the same walk to the panes \
                running claude, opencode, codex or pi, each with the harness's own session id where \
-               it exports one. scope=sessions answers about the machine rather than about one \
+               it exports one, the state it reports (state, state_kind, state_msg) and how many \
+               seconds ago it last reported (state_age_s) and last drew anything (output_age_s): \
+               the supervision view. scope=my_agents is the same, for only the agents in your own \
+               tab, which is where every agent you started with zellij_create went. A working \
+               agent whose output_age_s keeps growing has stalled. scope=sessions answers about \
+               the machine rather than about one \
                session. A `withheld` count above zero means the session keeps some panes to \
                itself: they are not in this answer, no tool here will reach them, and there is \
                nothing to ask for.",
@@ -119,11 +124,12 @@ pub const TOOLS: &[ToolSpec] = &[
             SESSION,
             ParamSpec {
                 name: "scope",
-                kind: ParamKind::Enum(&["panes", "agents", "sessions"]),
+                kind: ParamKind::Enum(&["panes", "agents", "my_agents", "sessions"]),
                 required: false,
                 from: None,
                 describe: "What to list: every pane of the session, only the panes running a \
-                           coding agent, or the sessions on this machine.",
+                           coding agent, only the agents in your own tab, or the sessions on \
+                           this machine.",
                 default: Some("panes"),
             },
             ParamSpec {

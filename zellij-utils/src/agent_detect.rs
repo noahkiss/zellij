@@ -308,6 +308,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
                 command,
                 cwd: entry.pane_info.pane_cwd.as_deref().map(PathBuf::from),
                 pid: entry.pane_info.pane_pid,
+                last_output_at: entry.pane_info.last_output_at,
                 program_status: entry.program_status.clone(),
                 session: None,
             })
@@ -779,6 +780,7 @@ mod tests {
             command: None,
             cwd: None,
             pid: None,
+            last_output_at: Some(pane_id as u64),
             program_status: state.map(|state| crate::data::PaneProgramStatus {
                 state: state.to_owned(),
                 at: 1,
@@ -799,6 +801,19 @@ mod tests {
             "{}",
             table[1]
         );
+    }
+
+    #[test]
+    fn an_agent_row_carries_when_its_pane_last_drew_and_a_watch_ignores_it() {
+        let mut quiet = watched(1, None, Some("working"));
+        let (_, seen) = agent_watch_events(&BTreeMap::new(), vec![quiet.clone()]);
+        assert!(serde_json::to_string(&quiet)
+            .unwrap()
+            .contains("\"last_output_at\":1"));
+        // a spinner frame moves last_output_at; it is not a change worth a line
+        quiet.last_output_at = Some(99);
+        let (events, _) = agent_watch_events(&seen, vec![quiet]);
+        assert!(events.is_empty(), "{:?}", events);
     }
 
     #[test]
