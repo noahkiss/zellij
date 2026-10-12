@@ -128,6 +128,25 @@ impl<'a> Args<'a> {
     fn enumerated(&self, name: &str, default: &str) -> String {
         self.string(name).unwrap_or_else(|| default.to_owned())
     }
+    /// A required list of non-empty strings. A lone string is taken as a list of one, which is the
+    /// mistake a caller is most likely to make and has only one meaning.
+    fn strings(&self, name: &str) -> Result<Vec<String>, String> {
+        let values = match self.values.get(name) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    Value::String(text) if !text.is_empty() => Ok(text.clone()),
+                    _ => Err(format!("`{}` must hold only non-empty strings.", name)),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(Value::String(text)) if !text.is_empty() => vec![text.clone()],
+            _ => Vec::new(),
+        };
+        if values.is_empty() {
+            return Err(format!("`{}` is required and was not given.", name));
+        }
+        Ok(values)
+    }
 }
 
 /// Where `zellij_create` puts a pane when the caller does not say.
@@ -907,8 +926,41 @@ fn argv_in(
                 )),
             }
         },
+        "zellij_show" => {
+            let mode = args.enumerated("mode", "auto");
+            if !["auto", "kitty", "blocks"].contains(&mode.as_str()) {
+                return Err(format!(
+                    "`mode` must be auto, kitty or blocks, not `{}`.",
+                    mode
+                ));
+            }
+            let mut rest = vec![
+                "action".to_owned(),
+                "show".to_owned(),
+                flag_value("--mode", &mode),
+                // every path after this is a file, whatever its first character
+                "--".to_owned(),
+            ];
+            for path in args.strings("paths")? {
+                rest.push(expand_path(&path, env)?);
+            }
+            Ok(scoped(rest))
+        },
         other => Err(format!("`{}` is not a tool of this server.", other)),
     }
+}
+
+/// A path as a caller writes it, with `~` and `$VAR` expanded against this server's environment.
+/// A relative path stays relative: the CLI resolves it against its own directory, which is this
+/// server's, and refuses one that is not a file.
+fn expand_path(path: &str, env: &CallEnv) -> Result<String, String> {
+    shellexpand::full_with_context(
+        path,
+        || env.home.clone(),
+        |name| Ok::<Option<String>, std::convert::Infallible>((env.var)(name)),
+    )
+    .map(|expanded| expanded.into_owned())
+    .map_err(|e| format!("`{}` could not be expanded: {}", path, e))
 }
 
 /// What the process around a call looks like, read once at the top of it.
@@ -1851,5 +1903,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn showing_images_is_the_show_verb_with_every_path_after_a_double_dash() {
+        assert_eq!(
+            line(
+                "zellij_show",
+                json!({"paths": ["/s/a.png", "-odd name.png"]}),
+                Some("work")
+            ),
+            "-s work action show --mode=auto -- /s/a.png -odd name.png"
+        );
+        // one argv word per path, so a name with a space is not split
+        let argv = built(
+            "zellij_show",
+            json!({"paths": ["two words.png"], "mode": "blocks"}),
+            None,
+            &a_shell_env(),
+        );
+        assert_eq!(
+            argv,
+            vec!["action", "show", "--mode=blocks", "--", "two words.png"]
+        );
+    }
+
+    #[test]
+    fn a_shown_path_is_expanded_against_this_servers_environment() {
+        let env = call_env(
+            None,
+            Some("/home/tester"),
+            Path::new("/"),
+            &[("SHOTS", "/var/shots")],
+        );
+        assert_eq!(
+            built(
+                "zellij_show",
+                json!({"paths": ["~/a.png", "$SHOTS/b.png", "rel/c.png"]}),
+                None,
+                &env
+            )
+            .join(" "),
+            "action show --mode=auto -- /home/tester/a.png /var/shots/b.png rel/c.png"
+        );
+        // a lone string is a list of one
+        assert_eq!(
+            built("zellij_show", json!({"paths": "/a.png"}), None, &env).join(" "),
+            "action show --mode=auto -- /a.png"
+        );
+    }
+
+    #[test]
+    fn showing_nothing_or_in_an_unknown_mode_is_refused() {
+        assert!(refusal("zellij_show", json!({})).contains("`paths` is required"));
+        assert!(refusal("zellij_show", json!({"paths": []})).contains("`paths` is required"));
+        assert!(refusal("zellij_show", json!({"paths": [""]})).contains("non-empty strings"));
+        assert!(
+            refusal("zellij_show", json!({"paths": ["a.png"], "mode": "sixel"}))
+                .contains("`mode` must be auto, kitty or blocks")
+        );
     }
 }

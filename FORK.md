@@ -5254,7 +5254,8 @@ machine), `zellij_read_pane`, `zellij_wait_for`, `zellij_write_input`, `zellij_c
 undone, kept apart from the moves so a client can allow one without the other. Session lifecycle -
 `up`, `down`, `restart`, `enable` - is deliberately not among them: those start and stop the thing
 the server is talking to. A test fails if the surface grows past eight tools, or a tool past nine
-parameters (eight until nkmk.32, when `zellij_create` took `run_in` and `wait_ready`).
+parameters (eight until nkmk.32, when `zellij_create` took `run_in` and `wait_ready`). From nkmk.33
+there are nine tools: `zellij_show` opens an image viewer, and the cap moved to nine with it.
 
 **The descriptions are generated from the surface map.** A tool's `Returns:` line is built from the
 same `OUTPUTS` row `--dump-surface` prints, and each input-schema property that stands for a real
@@ -8854,6 +8855,85 @@ than the zlib payload; not worth keeping a second copy of every image.
 `zellij-server` only: `TransmitPayload` in `kitty_graphics/store.rs`, and `emit_kitty_transmit` in
 `output/mod.rs`. Four output tests: the chunking and its `m=` flags, the header without `o=z`, a
 410x520 image that round-trips through base64 and zlib, and the raw fallback.
+
+### `action show` and `zellij_show`: an image viewer in a floating pane
+
+```
+$ zellij action show shots/before.png shots/after.png
+pane_id: terminal_7
+handle: brave-otter
+```
+
+From nkmk.33. A floating pane over the focused tab, 80% of the screen, takes the focus and shows the
+first file. The top row says `1/2 before.png`. Left and Right flip between the files (so do h, l,
+Space, PageUp and PageDown), Home and End jump to either end, and q, Esc or Ctrl+c closes the pane.
+It reads PNG, JPEG, GIF (the first frame) and WebP.
+
+| Surface | What it is |
+|---|---|
+| `zellij view-images [--mode auto\|kitty\|blocks] <files>` | The viewer. An ordinary program that draws in whatever terminal runs it, inside zellij or not. |
+| `zellij action show [--mode …] [--blocking] <files>` | `new-pane --floating --close-on-exit --name="images: <first> +N"` running this binary's own `view-images`. Prints the new pane's `pane_id:` and `handle:`. |
+| MCP `zellij_show {paths, mode, session}` | Runs `action show`. Returns the pane's handle; `zellij_close` closes it, and `zellij_wait_for until=exit` returns once the person closes it. |
+
+**The viewer is a program in a pane, not a server feature.** zellij already parses kitty graphics
+from every pane and re-sends them to each attached terminal that can draw them
+(`panes/kitty_graphics/`, `output/mod.rs`). So the viewer only speaks kitty graphics to its own
+pty, and the server does the rest. That keeps the patch off the plugin API and the client/server
+contract: `show` is rewritten into a `new-pane` in the CLI before it is sent, the way `wait` and
+`list-agents` are answered in the CLI.
+
+**The image travels in-band.** The viewer sends the pixels in the escape itself (`t=d`), never a
+path, so a session on one machine shows the image on a terminal attached from another over ssh or
+tssh. A path is read only where the session runs. Mosh drops kitty graphics, and so does Blink.
+
+**Kitty graphics, or half-blocks.** In `auto`, the default, the viewer asks the terminal with a
+kitty query followed by a device-attributes request. Inside zellij the session answers the query:
+`OK` when an attached terminal can draw kitty graphics, `ENOTSUPPORTED` when none can. Without an
+`OK` the viewer draws Unicode `▀` cells in 24-bit colour, two pixels to a cell, which any terminal
+draws. `--mode kitty` and `--mode blocks` skip the question. Sixel is not drawn: half-blocks cover
+every terminal that lacks kitty graphics.
+
+- **Kitty:** RGBA, zlib-compressed, in 4096-byte chunks, with `c`/`r` cells and `C=1,q=2`, so no
+  reply lands among the keys. The image is resampled to the pane's pixel size from `TIOCGWINSZ`,
+  or 8x16 cells when the pty does not say. A small image is not scaled up.
+- **Half-blocks:** scaled to fit, up as well as down, because a 16-pixel icon is unreadable as 16
+  cells.
+- **Resize:** `SIGWINCH` redraws at the new size.
+- **Exit:** the viewer deletes its image (`a=d,d=I`) and leaves the alternate screen, so nothing
+  stays in the terminal. The server forwards the delete to each attached terminal.
+
+**A floating pane now learns what the terminals can draw.** `Tab::new_floating_pane` never applied
+the tab's kitty and sixel host support to the pane it made. Every other way of making a pane does.
+A floating pane therefore kept the grid's default, "kitty supported", and answered a kitty query
+`OK` in a session no attached terminal could draw one in. The viewer drew images nobody could see.
+The fix is the same two `if let` lines the other paths have.
+
+Proved against a scratch session, with a pty client that answers the startup queries the way a
+kitty-capable terminal would, and again the way one that is not would:
+
+- **Kitty-capable client:** `action show` printed the pane, and the pane was floating and focused.
+  The client received `a=t,f=32,t=d` and an `a=p` placement for each image. After Right was typed
+  at the client, `dump-screen` of the viewer read `2/3 smiley.jpg`. After q, the pane was gone and
+  the client received `a=d,d=I`.
+- **No kitty:** the viewer chose half-blocks, and the `▀` cells reached the client.
+
+Worth knowing: the server re-sends an image to each terminal as RGBA, zlib-compressed when that is
+smaller (see "An image goes to the client zlib-compressed"). A 410x520 screenshot crop is about
+280 KB of base64 over ssh, whatever the viewer compressed on its own pty.
+
+New dependencies: `zune-jpeg`, `gif` and `image-webp`, all with default features off, which add
+`zune-core`, `weezl`, `byteorder-lite` and `quick-error`. `png`, `flate2` and `base64` were already
+in the tree and are now direct dependencies of the binary, as are `libc` and `signal-hook`. No wasm
+crate depends on any of them.
+
+`src/image_viewer/` (new: `render.rs` for the pure parts, `decode.rs`, `terminal.rs`, `mod.rs` for
+`action show`), the rewrite in `src/main.rs`, `CliAction::Show`, `Sessions::ViewImages` and
+`ImageMode` in `cli.rs`, a refusal arm in `actions.rs`, the `create` band and an `OUTPUTS` row in
+`cli_surface.rs`, `zellij_show` in `src/mcp/`, and the fix in `zellij-server/src/tab/mod.rs`. The
+MCP surface is nine tools from here, and the cap test says nine. Tests: 25 viewer tests cover
+paging, fit and resample arithmetic, the renderer choice, the probe answer, kitty chunking that
+inflates back to the pixels, key parsing, decoding and the `new-pane` the verb parses into. Three
+MCP tests cover the command line, path expansion and the refusals.
 
 ## Assessed and deliberately not built
 

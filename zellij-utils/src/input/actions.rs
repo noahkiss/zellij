@@ -2313,6 +2313,11 @@ impl Action {
             CliAction::ListAgents { .. } => {
                 Err("`list-agents` is run by the client, not sent as an action".into())
             },
+            // `show` is `new-pane` with a command the CLI builds - the viewer this binary carries -
+            // and is rewritten into one before it gets here, so no verb is added to the contract
+            CliAction::Show { .. } => {
+                Err("`show` is rewritten into `new-pane` by the client, not sent as itself".into())
+            },
             CliAction::SetPaneNote {
                 pane_id,
                 note,

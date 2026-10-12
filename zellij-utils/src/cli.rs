@@ -561,6 +561,31 @@ pub enum Sessions {
         wait_timeout: u64,
     },
 
+    /// Show image files in this terminal, one at a time; `q` closes
+    ///
+    /// Left and Right (or h and l, Space, PageUp and PageDown) flip between the files, Home and End
+    /// jump to the first and the last, and q, Esc or Ctrl+c closes. The top row names the file
+    /// and its place in the list, as in `2/5 screenshot.png`. Reads PNG, JPEG, GIF (its first
+    /// frame) and WebP.
+    ///
+    /// The image is sent in-band, inside the terminal stream, so it reaches a terminal on another
+    /// machine over ssh. It is drawn with the kitty graphics protocol when the terminal answers
+    /// that it can draw images, and with Unicode half-blocks when it cannot. Images are deleted
+    /// from the terminal on exit.
+    ///
+    /// `zellij action show` runs this in a floating pane.
+    #[clap(name = "view-images")]
+    ViewImages {
+        /// How to draw: kitty graphics when the terminal can (auto), kitty graphics regardless
+        /// (kitty), or half-blocks (blocks)
+        #[clap(long, value_enum, value_parser, default_value = "auto")]
+        mode: ImageMode,
+
+        /// The image files to show, in order
+        #[clap(required = true, value_parser)]
+        files: Vec<PathBuf>,
+    },
+
     /// Run a command in a new pane
     ///
     /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
@@ -1097,6 +1122,30 @@ pub enum SnapshotCli {
     },
 }
 
+/// How `zellij view-images` draws, and so how `zellij action show` asks it to.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageMode {
+    /// Kitty graphics when the terminal answers that it can draw them, half-blocks otherwise.
+    #[default]
+    Auto,
+    /// Kitty graphics, without asking the terminal first.
+    Kitty,
+    /// Unicode half-blocks in 24-bit colour, which every terminal can draw.
+    Blocks,
+}
+
+impl ImageMode {
+    /// The value as the command line spells it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageMode::Auto => "auto",
+            ImageMode::Kitty => "kitty",
+            ImageMode::Blocks => "blocks",
+        }
+    }
+}
+
 /// The condition a `zellij action wait` blocks on.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1609,6 +1658,38 @@ pub enum CliAction {
         /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
+    },
+    /// Show image files in a floating pane that closes on `q`
+    ///
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>` of the viewer pane, as
+    /// `new-pane` does. `--blocking` prints neither and returns when the pane closes.
+    ///
+    ///   zellij action show screenshot.png
+    ///
+    ///   zellij action show shots/*.png --mode blocks
+    ///
+    /// The pane runs `zellij view-images` over the files: Left and Right flip between them, q or
+    /// Esc closes it, and the top row names the file and its place, as in `2/5 screenshot.png`.
+    /// The pane takes the focus, so the keys reach it.
+    ///
+    /// The files are read on the machine the session runs on, and a relative path is taken from
+    /// the directory this command runs in. A path that is not a file is an error, and no pane is
+    /// made. The image travels inside the terminal stream, so a terminal on another machine draws
+    /// it over ssh: with kitty graphics when the attached terminal can draw them, and with Unicode
+    /// half-blocks when it cannot.
+    Show {
+        /// How to draw: kitty graphics when the terminal can (auto), kitty graphics regardless
+        /// (kitty), or half-blocks (blocks)
+        #[clap(long, value_enum, value_parser, default_value = "auto")]
+        mode: ImageMode,
+
+        /// Wait until the viewer closes before returning. Prints no `pane_id:`
+        #[clap(long)]
+        blocking: bool,
+
+        /// The image files to show, in order
+        #[clap(required = true, value_parser)]
+        files: Vec<PathBuf>,
     },
     /// Open a pane, running a command or your shell
     ///

@@ -87,6 +87,8 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "launch-plugin",
             "new-pane",
             "new-tab",
+            // the viewer it opens is a pane like any other, and it reports the one it made
+            "show",
             "start-or-reload-plugin",
         ],
     },
@@ -252,6 +254,11 @@ const OUTPUTS: &[OutputSpec] = &[
         // new-pane prints the pane alone, into a tab that already existed. `ready_by` and
         // `ready_ms` are `--wait-ready`'s lines, on this verb and the two below
         keys: "tab_id pane_id handle ready_by ready_ms",
+    },
+    OutputSpec {
+        command: "action show",
+        shape: "record",
+        keys: "pane_id handle",
     },
     OutputSpec {
         command: "action edit",

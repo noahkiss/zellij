@@ -3150,6 +3150,15 @@ impl Tab {
                 )) as Box<dyn Pane>
             },
         };
+        // what the attached terminals can draw, as every other new pane is told. Without it a
+        // floating pane kept the grid's default - kitty graphics supported - and answered a kitty
+        // query OK in a session no attached terminal could draw one in
+        if let Some(supported) = self.kitty_host_support {
+            new_pane.update_kitty_host_support(supported);
+        }
+        if let Some(supported) = self.sixel_host_support {
+            new_pane.update_sixel_host_support(supported);
+        }
 
         if start_suppressed {
             // this pane needs to start in the background (suppressed), only accessible if a plugin takes it out

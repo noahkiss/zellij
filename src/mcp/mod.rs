@@ -7,8 +7,8 @@
 //!
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
-//! * **Eight tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
-//!   fails if it grows past eight or if a tool asks for more than nine parameters.
+//! * **Nine tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
+//!   fails if it grows past nine or if a tool asks for more than nine parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
 //! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so
@@ -54,7 +54,9 @@ first time and reused after. It does not take the person's focus. That keeps you
 place and out of the pane they are looking at.
 
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
-each one is - that is how you find the pane to talk to without being told its name.";
+each one is - that is how you find the pane to talk to without being told its name.
+
+zellij_show puts image files in front of the person, in a pop-up pane they close with q.";
 
 /// The server itself. It holds nothing: every answer comes from a child process.
 #[derive(Clone, Debug, Default)]

@@ -33,9 +33,19 @@ suggest = { workspace = true }
 thiserror = { workspace = true }
 isahc = { workspace = true }
 rmcp = { version = "3.1.2", default-features = false, features = ["server", "transport-io"] }
+# `zellij view-images`, the viewer behind `action show`: decoders for the four formats it reads,
+# and the kitty graphics payload encoding. png, flate2 and base64 were already in the tree
+png = { version = "0.17.16", default-features = false }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+gif = { version = "0.14", default-features = false, features = ["std"] }
+image-webp = { version = "0.2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = { workspace = true }
+libc = { workspace = true }
+signal-hook = { workspace = true }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
