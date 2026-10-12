@@ -87,9 +87,15 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             session_name,
             exe,
             force,
+            dry_run,
         } => {
             let name = resolve_session_name(session_name, &opts, false);
-            process::exit(match enable(&name, exe, force, &opts) {
+            let enabled = if dry_run {
+                enable_dry_run(&name, exe, force, &opts)
+            } else {
+                enable(&name, exe, force, &opts)
+            };
+            process::exit(match enabled {
                 Ok(()) => 0,
                 Err(()) => 1,
             });
@@ -393,6 +399,231 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
             Err(())
         },
     }
+}
+
+/// `session enable --dry-run`: say what `enable` would write, where, and with which binary and PATH,
+/// and change nothing.
+///
+/// Nothing is written, no directory is made, no job is loaded and the pin is not refreshed. The
+/// only command it may run is the read-only `systemctl --user show-environment` that `enable` also
+/// asks, to find the directory the user's systemd manager reads units from. It exits non-zero
+/// when `enable` would refuse.
+fn enable_dry_run(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Result<(), ()> {
+    let kind = native_service_kind()?;
+    print_unit_dir_disagreement();
+    let extras = configured_extras(opts);
+    let pinned = configured_pinned_exe(extras.as_ref());
+    println!(
+        "dry run: what `zellij session enable {}` would do. Nothing here was done.",
+        name
+    );
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("zellij"));
+    let chosen = resolve_service_exe(exe, pinned.clone(), &current_exe, &path_dirs());
+    println!("exe   {}", chosen.path().display());
+    println!(
+        "      {}",
+        match &chosen {
+            ServiceExe::Given(_) => "given with --exe",
+            ServiceExe::Pinned(_) => "the pinned copy that `pin_exe` asks for",
+            ServiceExe::Stable(_) => "the stable name on PATH that leads to this binary",
+            ServiceExe::Resolved(_) => {
+                "this binary's own path: no `zellij` on PATH leads to it, so an upgrade can \
+                 break the unit"
+            },
+        }
+    );
+    let mut refused = false;
+    match &pinned {
+        Some(pinned) => {
+            let (said, refuses) = pin_plan(&current_exe, pinned);
+            refused |= refuses;
+            println!("pin   {}", said);
+        },
+        None => println!("pin   off: the config sets no `pin_exe`"),
+    }
+    let plan = match session_service::plan_enable(kind, chosen.path(), name, extras.as_ref(), force)
+    {
+        Ok(plan) => plan,
+        Err(reason) => {
+            eprintln!("session enable: {}", reason);
+            return Err(());
+        },
+    };
+    print_path_decision(&plan);
+    for planned in &plan.files {
+        let file = &planned.file;
+        match &planned.change {
+            session_service::PlannedChange::New => {
+                println!("file  {} (new: would be written)", file.path.display())
+            },
+            session_service::PlannedChange::Unchanged => {
+                println!("file  {} (unchanged)", file.path.display())
+            },
+            session_service::PlannedChange::Rewritten(drift) => {
+                println!(
+                    "file  {} (would be rewritten: {})",
+                    file.path.display(),
+                    drift.differing_keys()
+                );
+                for change in &drift.changes {
+                    println!("        {}", change.describe());
+                }
+            },
+        }
+    }
+    for job in &plan.beside {
+        println!(
+            "      {} also runs `session up {}` ({})",
+            job.name,
+            name,
+            job.path.display()
+        );
+    }
+    println!("load  `enable` would run, unless every file is unchanged and the job is loaded:");
+    for command in &plan.load {
+        println!("        {}", command);
+    }
+    for planned in &plan.files {
+        println!();
+        println!("----- {} -----", planned.file.path.display());
+        print!("{}", planned.file.contents);
+        if !planned.file.contents.ends_with('\n') {
+            println!();
+        }
+    }
+    if let Some(refusal) = &plan.refusal {
+        eprintln!("session enable would refuse: {}", refusal);
+        refused = true;
+    }
+    if refused {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+/// The PATH line of a dry run: where the unit's PATH comes from, and what it keeps.
+fn print_path_decision(plan: &session_service::EnablePlan) {
+    use session_service::PathDecision;
+    let (said, kept): (&str, &[String]) = match &plan.path {
+        PathDecision::Configured => (
+            "pinned by the config: `session_service` states PATH, so it is written as stated",
+            &[],
+        ),
+        PathDecision::Fresh { installed: false } => (
+            "this shell's PATH: no unit is installed to keep one from",
+            &[],
+        ),
+        PathDecision::Fresh { installed: true } => (
+            "this shell's PATH: it drops nothing the installed unit records that still exists",
+            &[],
+        ),
+        PathDecision::Kept { kept } => (
+            "kept: the installed unit's PATH, because this shell adds nothing to it; this shell \
+             lacks",
+            kept,
+        ),
+        PathDecision::Merged { kept } => (
+            "merged: this shell's PATH, then the installed unit's directories it lacks",
+            kept,
+        ),
+    };
+    println!("path  {}", said);
+    for dir in kept {
+        println!("        {}", dir);
+    }
+    if let Some(path) = &plan.path_value {
+        println!("      PATH={}", path);
+    }
+}
+
+/// What `enable` would do to the pinned copy, asked without writing it, and whether `enable` would
+/// stop there. The same questions `install_pinned_exe` asks, in its order.
+#[cfg(unix)]
+fn pin_plan(current_exe: &Path, pinned: &Path) -> (String, bool) {
+    use zellij_utils::session_lifecycle::{pin_needs_refresh, release_candidate_refused_for};
+
+    if !pin_needs_refresh(current_exe, pinned) {
+        return (
+            format!(
+                "{} already holds this build; nothing to copy",
+                pinned.display()
+            ),
+            false,
+        );
+    }
+    if release_candidate_refused_for(pinned) {
+        if pinned.exists() {
+            return (
+                format!(
+                    "{} would be left alone: this build is a release candidate. The unit runs the \
+                     build already there",
+                    pinned.display()
+                ),
+                false,
+            );
+        }
+        return (
+            format!(
+                "nothing is pinned at {}, and this build is a release candidate, so `enable` \
+                 would stop before writing a unit that names a missing binary",
+                pinned.display()
+            ),
+            true,
+        );
+    }
+    if !pinned.exists() {
+        return (
+            format!(
+                "would pin this build ({}) at {}",
+                current_exe.display(),
+                pinned.display()
+            ),
+            false,
+        );
+    }
+    if pin_is_anchored(pinned) {
+        return (
+            format!(
+                "would refresh {} from this build ({}) through the signing transaction: the pin \
+                 is signed, and only a release build replaces it",
+                pinned.display(),
+                current_exe.display()
+            ),
+            false,
+        );
+    }
+    (
+        format!(
+            "would refresh {} from this build ({})",
+            pinned.display(),
+            current_exe.display()
+        ),
+        false,
+    )
+}
+
+#[cfg(not(unix))]
+fn pin_plan(_current_exe: &Path, pinned: &Path) -> (String, bool) {
+    (
+        format!("{} is not pinned on this platform", pinned.display()),
+        false,
+    )
+}
+
+/// Whether the pin carries a signature only a release build may replace. Asks `codesign -d`,
+/// which reads and writes nothing; only macOS has one to ask.
+#[cfg(target_os = "macos")]
+fn pin_is_anchored(pinned: &Path) -> bool {
+    zellij_utils::session_signing::pin_is_anchored(
+        &zellij_utils::session_doctor::SystemCommander,
+        pinned,
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pin_is_anchored(_pinned: &Path) -> bool {
+    false
 }
 
 /// Say which directories of the installed unit's PATH `enable` kept, because this shell lacks them.

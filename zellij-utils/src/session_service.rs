@@ -2626,6 +2626,20 @@ fn rendered_files(
     recording: Recording,
 ) -> Result<Vec<ServiceFile>, String> {
     let dir = service_dir(kind)?;
+    Ok(rendered_files_in(
+        &dir, kind, exe, session, extras, recording,
+    ))
+}
+
+/// [`rendered_files`] into a given unit directory, so a test can render against files it made.
+fn rendered_files_in(
+    dir: &Path,
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+    recording: Recording,
+) -> Vec<ServiceFile> {
     let recorded = |path: &Path| -> RecordedEnv {
         if recording == Recording::Fresh {
             return RecordedEnv::default();
@@ -2642,7 +2656,7 @@ fn rendered_files(
     // state root - and so that neither depends on whether the calling shell exports one.
     let state_home = state_home_for_unit(kind, session);
     let state_home = state_home.as_deref();
-    Ok(match kind {
+    match kind {
         ServiceKind::Systemd => {
             let unit = systemd_service_name(session);
             let timer = systemd_timer_name(session);
@@ -2674,7 +2688,198 @@ fn rendered_files(
                 unit: label,
             }]
         },
-    })
+    }
+}
+
+/// Where the PATH an `enable` writes comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathDecision {
+    /// The config states PATH, so neither this shell's nor the installed unit's is written.
+    Configured,
+    /// This shell's PATH, as it is. `installed` says whether a unit is installed: when it is, this
+    /// shell drops nothing it records that still exists.
+    Fresh { installed: bool },
+    /// The installed unit's PATH, in its own order, because this shell adds nothing to it. `kept`
+    /// is what this shell lacks.
+    Kept { kept: Vec<String> },
+    /// This shell's PATH, then the directories of the installed one that it lacks (`kept`).
+    Merged { kept: Vec<String> },
+}
+
+/// What one file of an install would come to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedChange {
+    /// No file at the path yet.
+    New,
+    /// The file on disk is already these bytes.
+    Unchanged,
+    /// The file on disk differs, by these keys.
+    Rewritten(DriftedFile),
+}
+
+/// One file `enable` would write, and what writing it would change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedFile {
+    pub file: ServiceFile,
+    pub change: PlannedChange,
+}
+
+/// What `session enable` would do, worked out without doing any of it. `session enable --dry-run`
+/// prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnablePlan {
+    pub files: Vec<PlannedFile>,
+    pub path: PathDecision,
+    /// The PATH the unit would carry, read back out of the rendered unit.
+    pub path_value: Option<String>,
+    /// Why `enable` would refuse, when it would. See [`refusal_to_install_beside`].
+    pub refusal: Option<String>,
+    /// Jobs under another name that already keep this session up.
+    pub beside: Vec<InstalledJob>,
+    /// What `enable` would run to load the job, one command per line.
+    pub load: Vec<String>,
+}
+
+/// Work out what [`enable`] would do, and do none of it: no file written, no directory made, no
+/// init-system command run.
+///
+/// The same questions, asked of the same functions, in the same order - the refusal, then the
+/// files `enable` renders - so the plan is the decision the real run makes rather than a guess at
+/// it. What it reads is the unit directory, which is where `enable` reads too.
+pub fn plan_enable(
+    kind: ServiceKind,
+    exe: &Path,
+    session: &str,
+    extras: Option<&SessionServiceOptions>,
+    force: bool,
+) -> Result<EnablePlan, String> {
+    let beside = jobs_under_another_name(kind, session);
+    let refusal = if force {
+        None
+    } else {
+        refusal_to_install_beside(&beside, session)
+    };
+    let files = enable_files(kind, exe, session, extras)?;
+    let mut plan = plan_over(kind, exe, extras, files);
+    plan.refusal = refusal;
+    plan.beside = beside;
+    Ok(plan)
+}
+
+/// The plan for files already rendered: what each would change, and where the PATH comes from.
+fn plan_over(
+    kind: ServiceKind,
+    exe: &Path,
+    extras: Option<&SessionServiceOptions>,
+    files: Vec<ServiceFile>,
+) -> EnablePlan {
+    let path = path_decision(
+        kind,
+        exe,
+        extras,
+        files.first().map(|file| file.path.as_path()),
+    );
+    let path_value = files
+        .first()
+        .and_then(|file| env_in_unit(kind, &file.contents, "PATH"));
+    let load = load_commands(kind, &files);
+    let files = files
+        .into_iter()
+        .map(|file| {
+            let change = match std::fs::read_to_string(&file.path) {
+                Ok(on_disk) if on_disk == file.contents => PlannedChange::Unchanged,
+                Ok(on_disk) => PlannedChange::Rewritten(DriftedFile::between(
+                    &file.path,
+                    &on_disk,
+                    &file.contents,
+                )),
+                Err(_) => PlannedChange::New,
+            };
+            PlannedFile { file, change }
+        })
+        .collect();
+    EnablePlan {
+        files,
+        path,
+        path_value,
+        refusal: None,
+        beside: Vec::new(),
+        load,
+    }
+}
+
+/// Where the PATH `enable` writes comes from, asked of the same rule `enable` renders with: the
+/// config first, then [`path_to_keep`] over the installed unit's PATH and this shell's.
+fn path_decision(
+    kind: ServiceKind,
+    exe: &Path,
+    extras: Option<&SessionServiceOptions>,
+    unit: Option<&Path>,
+) -> PathDecision {
+    if config_states_path(kind, extras) {
+        return PathDecision::Configured;
+    }
+    let Some(on_disk) = unit.and_then(|unit| std::fs::read_to_string(unit).ok()) else {
+        return PathDecision::Fresh { installed: false };
+    };
+    let Some(recorded) = RecordedEnv::in_unit(kind, &on_disk).path else {
+        return PathDecision::Fresh { installed: true };
+    };
+    let fresh = service_path(exe);
+    match path_to_keep(&recorded, &fresh, |dir| dir.is_dir()) {
+        None => PathDecision::Fresh { installed: true },
+        Some(kept) if shell_adds_to(&recorded, &fresh) => PathDecision::Merged { kept: kept.kept },
+        Some(kept) => PathDecision::Kept { kept: kept.kept },
+    }
+}
+
+/// Whether `fresh` names a directory `recorded` does not: the case [`path_to_keep`] merges in.
+fn shell_adds_to(recorded: &str, fresh: &str) -> bool {
+    let recorded: Vec<&str> = recorded.split(':').filter(|dir| !dir.is_empty()).collect();
+    fresh
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .any(|dir| !recorded.contains(&dir))
+}
+
+/// Whether the config states the unit's PATH, which then replaces the generated one.
+fn config_states_path(kind: ServiceKind, extras: Option<&SessionServiceOptions>) -> bool {
+    let Some(extras) = extras else {
+        return false;
+    };
+    match kind {
+        ServiceKind::Systemd => sets_env_var(&extras.systemd.service, "PATH"),
+        ServiceKind::Launchd => {
+            extras.launchd_env.iter().any(|entry| entry.name == "PATH")
+                || extras.launchd.iter().any(|key| key.name == "PATH")
+        },
+    }
+}
+
+/// The init-system commands [`load_job`] runs for these files, as a person would type them.
+fn load_commands(kind: ServiceKind, files: &[ServiceFile]) -> Vec<String> {
+    match kind {
+        ServiceKind::Systemd => std::iter::once("systemctl --user daemon-reload".to_owned())
+            .chain(
+                files
+                    .iter()
+                    .rev()
+                    .map(|file| format!("systemctl --user enable --now {}", file.unit)),
+            )
+            .collect(),
+        ServiceKind::Launchd => files
+            .iter()
+            .flat_map(|file| {
+                [
+                    format!(
+                        "launchctl bootout gui/$UID/{}   (only if launchd holds it)",
+                        file.unit
+                    ),
+                    format!("launchctl bootstrap gui/$UID {}", file.path.display()),
+                ]
+            })
+            .collect(),
+    }
 }
 
 /// What an `enable` did, so the caller can report the difference between doing the work and
@@ -3723,6 +3928,131 @@ mod tests {
                 assert_eq!(files[0].changes[0].describe(), "Nice: removed, was -5");
             },
             other => panic!("expected drift, got {:?}", other),
+        }
+    }
+
+    /// Every file under `dir`, with its bytes and its modification time, in a stable order.
+    fn tree_of(dir: &Path) -> Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> {
+        let mut tree: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path, bytes, modified)
+            })
+            .collect();
+        tree.sort();
+        tree
+    }
+
+    /// `session enable --dry-run` prints this plan, and the plan is the proof that the dry run
+    /// touches nothing: it is worked out over a unit directory holding an installed unit and no
+    /// timer, and the directory is byte-for-byte and mtime-for-mtime what it was before. The same
+    /// plan names the PATH decision the real `enable` would make.
+    #[test]
+    fn an_enable_plan_writes_nothing_and_names_the_path_decision() {
+        let exe = Path::new("/opt/zellij-dry-run-test/bin/zellij");
+        let session = "zellij-dry-run-test-session";
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let unit_dir = dir.path().join("units");
+            std::fs::create_dir(&unit_dir).unwrap();
+            // a directory the installed unit records and this shell's PATH lacks, that still exists
+            let lacking = dir.path().join("only-in-the-unit");
+            std::fs::create_dir(&lacking).unwrap();
+            let lacking = lacking.display().to_string();
+
+            // nothing installed: this shell's PATH, and every file new
+            let files =
+                rendered_files_in(&unit_dir, kind, exe, session, None, Recording::KeepingPath);
+            let plan = plan_over(kind, exe, None, files);
+            assert_eq!(plan.path, PathDecision::Fresh { installed: false });
+            assert!(plan
+                .files
+                .iter()
+                .all(|planned| planned.change == PlannedChange::New));
+            assert!(tree_of(&unit_dir).is_empty(), "the plan wrote a file");
+
+            let unit_path = |files: &[ServiceFile]| files[0].path.clone();
+            let installed_with = |recorded_path: String| {
+                let files =
+                    rendered_files_in(&unit_dir, kind, exe, session, None, Recording::Fresh);
+                let recorded = RecordedEnv {
+                    path: Some(recorded_path),
+                    ..RecordedEnv::default()
+                };
+                let contents = render_unit(kind, exe, session, None, None, &recorded);
+                std::fs::write(unit_path(&files), contents).unwrap();
+            };
+
+            // this shell adds nothing to the installed PATH: the installed one is kept
+            installed_with(format!("{}:{}", service_path(exe), lacking));
+            let before = tree_of(&unit_dir);
+            let files =
+                rendered_files_in(&unit_dir, kind, exe, session, None, Recording::KeepingPath);
+            let plan = plan_over(kind, exe, None, files);
+            assert_eq!(
+                tree_of(&unit_dir),
+                before,
+                "the plan changed the unit directory"
+            );
+            assert_eq!(
+                plan.path,
+                PathDecision::Kept {
+                    kept: vec![lacking.clone()]
+                },
+                "{:?}",
+                kind
+            );
+            assert!(plan.path_value.as_deref().unwrap().contains(&lacking));
+            assert_ne!(plan.files[0].change, PlannedChange::New);
+            if kind == ServiceKind::Systemd {
+                assert_eq!(plan.files[1].change, PlannedChange::New, "the timer");
+                assert_eq!(plan.load[0], "systemctl --user daemon-reload");
+            }
+
+            // this shell adds a directory the installed PATH lacks: the two are merged
+            installed_with(format!("{}:/zellij-dry-run-test-gone", lacking));
+            let before = tree_of(&unit_dir);
+            let files =
+                rendered_files_in(&unit_dir, kind, exe, session, None, Recording::KeepingPath);
+            let plan = plan_over(kind, exe, None, files);
+            assert_eq!(
+                tree_of(&unit_dir),
+                before,
+                "the plan changed the unit directory"
+            );
+            assert_eq!(
+                plan.path,
+                PathDecision::Merged {
+                    kept: vec![lacking.clone()]
+                },
+                "{:?}",
+                kind
+            );
+        }
+
+        // a PATH the config states is written as stated, and no shell's PATH is
+        let mut extras = SessionServiceOptions::default();
+        extras
+            .add_systemd_directive("service", "Environment=PATH=/my/bin")
+            .unwrap();
+        extras.add_launchd_env("PATH", "/my/bin").unwrap();
+        for kind in [ServiceKind::Systemd, ServiceKind::Launchd] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = rendered_files_in(
+                dir.path(),
+                kind,
+                exe,
+                session,
+                Some(&extras),
+                Recording::KeepingPath,
+            );
+            let plan = plan_over(kind, exe, Some(&extras), files);
+            assert_eq!(plan.path, PathDecision::Configured);
+            assert_eq!(plan.path_value.as_deref(), Some("/my/bin"));
+            assert!(tree_of(dir.path()).is_empty(), "the plan wrote a file");
         }
     }
 

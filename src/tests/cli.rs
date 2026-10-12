@@ -241,6 +241,21 @@ fn session_doctor_takes_its_negations_and_the_short_dry_run() {
     }
 }
 
+/// `enable` installs unless `--dry-run` or `-n` is typed.
+#[test]
+fn session_enable_installs_unless_told_to_dry_run() {
+    match session_lifecycle_from(&["zellij", "session", "enable", "work"]) {
+        SessionLifecycleCli::Enable { dry_run, .. } => assert!(!dry_run),
+        other => panic!("Expected `enable`, got {:?}", other),
+    }
+    for flag in ["--dry-run", "-n"] {
+        match session_lifecycle_from(&["zellij", "session", "enable", "work", flag]) {
+            SessionLifecycleCli::Enable { dry_run, .. } => assert!(dry_run),
+            other => panic!("Expected `enable`, got {:?}", other),
+        }
+    }
+}
+
 /// `--regranted` is off unless typed: it records a re-grant as made, which only a person can know.
 #[test]
 fn session_doctor_takes_regranted_and_defaults_to_not() {

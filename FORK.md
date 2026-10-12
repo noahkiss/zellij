@@ -1911,6 +1911,61 @@ directories; the fnm directory), the 20-to-14 vector verbatim but for the home d
 `enable` from the SSH `PATH` rendered over an interactive unit on both platforms, which keeps the
 recorded `PATH` and reports no drift, and a configured `PATH` that is written as stated.
 
+### `session enable --dry-run`
+
+`session enable` acts on the real init system. On macOS it bootstraps into the real `gui/<uid>`
+domain, whatever `HOME` and config the caller set. So an RC proof could not run it, and a rollout
+could not see the unit before it was written. `--dry-run` (`-n`) prints what `enable` would do and
+does none of it:
+
+```
+$ zellij session enable mysession --dry-run
+dry run: what `zellij session enable mysession` would do. Nothing here was done.
+exe   /home/user/.local/share/zellij/bin/zellij
+      the pinned copy that `pin_exe` asks for
+pin   would refresh /home/user/.local/share/zellij/bin/zellij from this build (/usr/local/bin/zellij)
+path  kept: the installed unit's PATH, because this shell adds nothing to it; this shell lacks
+        /home/user/extra-bin
+      PATH=/home/user/.local/share/zellij/bin:/usr/local/bin:/usr/bin:/bin:/home/user/extra-bin
+file  /home/user/.config/systemd/user/zellij-session-mysession.service (would be rewritten: PATH differs)
+        PATH: 4 entries -> 5 entries, first: /home/user/.local/share/zellij/bin
+file  /home/user/.config/systemd/user/zellij-session-mysession.timer (unchanged)
+load  `enable` would run, unless every file is unchanged and the job is loaded:
+        systemctl --user daemon-reload
+        systemctl --user enable --now zellij-session-mysession.timer
+        systemctl --user enable --now zellij-session-mysession.service
+
+----- /home/user/.config/systemd/user/zellij-session-mysession.service -----
+...the whole unit...
+```
+
+| Line | What it says |
+|---|---|
+| `exe` | The binary the unit runs, and why: `--exe`, the pinned copy, the stable name on `PATH`, or this binary's own path. |
+| `pin` | What `enable` would do to the pinned copy: nothing (it already holds this build), pin, refresh, refresh through the signing transaction (an anchored macOS pin), or leave it alone (a release candidate, unless `ZELLIJ_PIN_ALLOW_RC=1` lets it write a pin outside the home). |
+| `path` | Where the unit's `PATH` comes from: pinned by the config, this shell's, kept, or merged. Kept and merged list the directories carried over. Then the `PATH` the unit would carry. |
+| `file` | Each file and its target path: new, unchanged, or rewritten, with the keys that change. |
+| `load` | The init-system commands `enable` would run. |
+
+Then every file, in full.
+
+- **It touches nothing.** No file is written and no directory is made. No `systemctl` or
+  `launchctl` command that changes state runs, and the pin is not refreshed. The one command it may
+  run is `systemctl --user show-environment`, which `enable` also asks, to find the directory the
+  user's manager reads units from. On macOS, the `pin` line may ask `codesign -d`, which only reads.
+- **It exits 1 when `enable` would refuse**: another job already runs `session up` for the session
+  and `--force` is absent, or a release candidate has nothing at the pin to fall back on.
+- **The decisions are the real ones.** The plan renders the files with the same function `enable`
+  writes from, and asks the pin questions in the order the pin's writer asks them.
+
+`zellij-utils/src/session_service.rs` (`plan_enable`, `EnablePlan`, `PathDecision`,
+`PlannedChange`, and `rendered_files_in`, which renders into a given directory),
+`zellij-utils/src/cli.rs` (`--dry-run` on `Enable`) and `src/session_commands.rs`
+(`enable_dry_run`, `pin_plan`). Tests: a plan over a temporary unit directory leaves every file's
+bytes and mtime as they were, and names the PATH decision for nothing installed, a kept `PATH`, a
+merged `PATH`, and a `PATH` the config states, on both platforms. The flag parses as `--dry-run`
+and `-n`.
+
 ### `session up` will not create a session in the wrong macOS session domain
 
 macOS puts every process in a session domain, and only the graphical (`Aqua`) one carries the
@@ -2291,7 +2346,7 @@ API contract, which is far more than a warning is worth.
 ### `zellij session enable|disable|status`
 
 ```
-zellij session enable  [NAME] [--exe PATH] [--force]
+zellij session enable  [NAME] [--exe PATH] [--force] [--dry-run]
 zellij session disable [NAME]
 zellij session status  [NAME]
 ```

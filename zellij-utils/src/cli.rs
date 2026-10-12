@@ -962,6 +962,11 @@ pub enum SessionLifecycleCli {
         /// launchers race at login and one of them ends up failed, so this is refused by default
         #[clap(long)]
         force: bool,
+
+        /// Print the unit, where it would go, and the binary, pin and PATH decisions, and change
+        /// nothing: no file is written, no job is loaded and the pin is not refreshed
+        #[clap(short('n'), long)]
+        dry_run: bool,
     },
 
     /// Unload the init-system unit and remove it. Removing the file without unloading the job
