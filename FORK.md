@@ -561,7 +561,7 @@ That loop is what every agent and every CI wrapper around this fork was writing,
 both directions at once: too slow when the thing finished immediately, and too quick when it did
 not. `wait` blocks until the pane does what you named, and then says how long that took.
 
-Three conditions, and a `--timeout` on all of them:
+Four conditions, and a `--timeout` on all of them:
 
 - **`--for exit`** — the pane's command ends. It prints `exit_status:`, and `-` where the pane
   closed and took its status with it.
@@ -569,6 +569,8 @@ Three conditions, and a `--timeout` on all of them:
   looks like when it has finished printing and is waiting for you again.
 - **`--for match --match <regex>`** — a line the pane delivers matches. Rust regex syntax,
   unanchored.
+- **`--for ready`** — the pane's shell is ready for input. It prints `ready_by:`, and says which
+  signal fired. See [below](#--for-ready-a-shell-that-is-ready-for-input).
 
 **The exit code is about the wait, not about the command.** Met is 0, whatever `exit_status` says;
 a timeout is 2, the fork's miss, and prints nothing on stdout; a regex that does not compile is 1.
@@ -599,6 +601,45 @@ stream. Asking the session is what covers both, and it covers a pane that closed
 
 `wait` is in the `read` band. It changes nothing — the band says what a verb does to the session,
 not how long it takes — which is also why the [audit ring](#list-events) does not record it.
+
+#### `--for ready`: a shell that is ready for input
+
+```
+$ zellij action wait sunny-otter --for ready
+waited_ms: 212
+ready_by: prompt
+```
+
+The question a script asks before it types into a pane it just made: has the shell finished its
+rc files and drawn a prompt? Typing earlier loses keystrokes to a shell that is still starting, or
+hands them to whatever the rc chain runs. Two signals answer it, and the exact one wins:
+
+| `ready_by` | Signal | When |
+|---|---|---|
+| `prompt` | The shell's OSC 133 prompt marker: `command_state: prompt` in `list-panes`. | At once, on the next 250 ms look at the session. |
+| `quiet` | The pane drew a non-blank line, then nothing for `--quiet-ms` (300 by default here). | For a shell that writes no OSC 133 markers. |
+
+- **A command that is running is not ready**, however long it is silent. When `command_state`
+  reads `running`, the quiet fallback is off.
+- **A missing `command_state` does not switch the fallback off.** A clear resets the pane's
+  markers (`grid.rs`, the full reset), so a shell that writes them reads as having none until its
+  next prompt. One that redraws its prompt without running its hooks, as zsh's `clear-screen`
+  widget does, stays that way. The wait keeps both signals in play rather than latching "this shell
+  has markers" and hanging. `done`, an end marker with no prompt after it, is treated the same.
+- **The timeout is 10 seconds unless you say otherwise**, not 300. A shell that has drawn nothing
+  in 10 seconds is a failure to report, and a caller behind an MCP request deadline cannot afford
+  five minutes.
+- **A pane that closes or whose command exits first is a miss**, exit 2, with the exit status when
+  the pane kept one.
+
+The prompt signal needs the shell to write OSC 133. zsh does when a `precmd` hook prints
+`\e]133;A\a`; without one every answer is `quiet`, which is still right for an idle shell and is
+fooled only by an rc file that pauses for longer than the window after printing something.
+
+`zellij-client/src/cli_client.rs` (`ReadyWatch`, `wait_for_ready`, `pane_look`), `WaitFor::Ready`
+in `zellij-utils/src/cli.rs`, and `ready_by` in the surface map. Tests: the decisions from scripted
+renders and looks (prompt at once; output then quiet; a running command never quiet; a clear that
+wiped the markers), the pane-list read, and the defaults.
 
 ### Pane handles
 

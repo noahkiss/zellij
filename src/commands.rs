@@ -1090,6 +1090,9 @@ fn attach_with_cli_client(
             zellij_utils::cli::WaitFor::Match => {
                 zellij_client::cli_client::WaitCondition::Match(pattern.clone().unwrap_or_default())
             },
+            zellij_utils::cli::WaitFor::Ready => {
+                zellij_client::cli_client::WaitCondition::Ready(Duration::from_millis(*quiet_ms))
+            },
         };
         let exit_status = zellij_client::cli_client::start_wait_client(
             &|| {

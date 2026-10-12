@@ -232,12 +232,12 @@ const OUTPUTS: &[OutputSpec] = &[
         shape: "outline",
         keys: "tab_id position name active / handle pane_id title command focused note",
     },
-    // `waited_ms` on every wait; `exit_status` is `--for exit`'s line and `matched` is
-    // `--for match`'s. A wait that missed prints nothing here at all
+    // `waited_ms` on every wait; `exit_status` is `--for exit`'s line, `matched` is
+    // `--for match`'s and `ready_by` is `--for ready`'s. A wait that missed prints nothing here
     OutputSpec {
         command: "action wait",
         shape: "record",
-        keys: "waited_ms exit_status matched",
+        keys: "waited_ms exit_status matched ready_by",
     },
     OutputSpec {
         command: "action set-pane-note",

@@ -1096,6 +1096,9 @@ pub enum WaitFor {
     Quiet,
     /// A line the pane delivers matches `--match`.
     Match,
+    /// The pane's shell is ready for input: it drew a prompt (OSC 133), or it drew something and
+    /// then fell quiet for `--quiet-ms`.
+    Ready,
 }
 
 impl Default for WaitFor {
@@ -1117,6 +1120,15 @@ pub enum CliAction {
     ///   zellij action wait build --for quiet --quiet-ms 2000
     ///
     ///   zellij action wait build --for match --match 'test result:'
+    ///
+    ///   zellij action wait build --for ready
+    ///
+    /// `--for ready` is met when the pane's shell says it drew a prompt - an OSC 133 prompt
+    /// marker, read as `command_state: prompt` in `list-panes` - or, for a shell that writes no
+    /// markers, when the pane has drawn something and then produced nothing for `--quiet-ms`
+    /// (300 by default here). The report's `ready_by:` line names which: `prompt` or `quiet`. A
+    /// pane whose shell says a command is running is not ready, however long it is silent. Its
+    /// timeout defaults to 10 seconds.
     ///
     /// Exit 0 means the condition was met, and the report says how long it took. Exit 2 means it
     /// was not - the timeout ran out, or the pane closed while waiting for something else - and
@@ -1141,8 +1153,8 @@ pub enum CliAction {
         #[clap(value_parser)]
         pane_id: String,
 
-        /// What to wait for: the pane's command to end, the pane to fall quiet, or a line to
-        /// match
+        /// What to wait for: the pane's command to end, the pane to fall quiet, a line to
+        /// match, or the pane's shell to be ready for input
         #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
         wait_for: WaitFor,
 
@@ -1150,13 +1162,25 @@ pub enum CliAction {
         #[clap(long = "match", value_parser, required_if_eq("wait_for", "match"))]
         pattern: Option<String>,
 
-        /// How long a pane must produce nothing to count as quiet, for `--for quiet`
-        #[clap(long, value_parser, default_value = "500")]
+        /// How long a pane must produce nothing to count as quiet, for `--for quiet` (default
+        /// 500) and for the fallback of `--for ready` (default 300)
+        #[clap(
+            long,
+            value_parser,
+            default_value = "500",
+            default_value_if("wait_for", "ready", "300")
+        )]
         quiet_ms: u64,
 
         /// Seconds to wait before giving up and exiting 2. `0` waits forever, which is a hang a
-        /// script has to ask for by name
-        #[clap(short, long, value_parser, default_value = "300")]
+        /// script has to ask for by name. 300 by default, and 10 for `--for ready`
+        #[clap(
+            short,
+            long,
+            value_parser,
+            default_value = "300",
+            default_value_if("wait_for", "ready", "10")
+        )]
         timeout: u64,
     },
     /// List what has changed the session lately, and who changed it
@@ -4140,6 +4164,47 @@ mod tests {
         // the negative control: no other verb has a pipe deadline to give up
         let mut other = parse_action(&["new-pane"]);
         assert_eq!(other.take_pipe_timeout(), None);
+    }
+
+    fn wait_bounds(args: &[&str]) -> (WaitFor, u64, u64) {
+        match parse_action(args) {
+            CliAction::Wait {
+                wait_for,
+                quiet_ms,
+                timeout,
+                ..
+            } => (wait_for, quiet_ms, timeout),
+            other => panic!("not a wait: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_wait_for_ready_has_its_own_short_defaults() {
+        // a shell that has not drawn a prompt in 10 seconds is a failure to report, not a wait
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "ready"]),
+            (WaitFor::Ready, 300, 10)
+        );
+        // both stay the caller's to set
+        assert_eq!(
+            wait_bounds(&[
+                "wait",
+                "build",
+                "--for",
+                "ready",
+                "--timeout",
+                "3",
+                "--quiet-ms",
+                "50"
+            ]),
+            (WaitFor::Ready, 50, 3)
+        );
+        // the negative control: every other wait keeps the defaults it had
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "quiet"]),
+            (WaitFor::Quiet, 500, 300)
+        );
+        assert_eq!(wait_bounds(&["wait", "build"]), (WaitFor::Exit, 500, 300));
     }
 
     #[test]

@@ -14,7 +14,10 @@ use uuid::Uuid;
 use zellij_utils::{
     agent_detect,
     cli::{SubscribeCli, SubscribeFormat},
-    data::{ListAgentsEnvelope, ListPanesEnvelope, PaneDump, PaneId, PaneListEntry, PaneTarget},
+    data::{
+        ListAgentsEnvelope, ListPanesEnvelope, PaneCommandState, PaneDump, PaneId, PaneListEntry,
+        PaneTarget,
+    },
     errors::prelude::*,
     input::actions::Action,
     ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
@@ -786,6 +789,8 @@ pub enum WaitCondition {
     Exit,
     Quiet(Duration),
     Match(String),
+    /// The pane's shell is ready for input. The duration is the quiet window of the fallback.
+    Ready(Duration),
 }
 
 /// Reads `list-panes --json` for the one pane the wait is about.
@@ -793,6 +798,15 @@ pub enum WaitCondition {
 /// A pane missing from the list is `Gone` rather than an error: a wait for an exit that ended in
 /// the pane closing got what it asked for.
 fn pane_state(panes_json: &str, pane: PaneId) -> Result<PaneState, String> {
+    pane_look(panes_json, pane).map(|(state, _)| state)
+}
+
+/// [`pane_state`], and what the pane's shell says it is doing: its OSC 133 `command_state`, absent
+/// for a shell that writes no markers - and for one whose markers a clear has just wiped.
+fn pane_look(
+    panes_json: &str,
+    pane: PaneId,
+) -> Result<(PaneState, Option<PaneCommandState>), String> {
     let panes: Vec<PaneListEntry> =
         serde_json::from_str(panes_json).map_err(|e| format!("Could not read the panes: {}", e))?;
     let found = panes.iter().find(|entry| {
@@ -803,9 +817,11 @@ fn pane_state(panes_json: &str, pane: PaneId) -> Result<PaneState, String> {
         }
     });
     Ok(match found {
-        None => PaneState::Gone,
-        Some(entry) if entry.pane_info.exited => PaneState::Exited(entry.pane_info.exit_status),
-        Some(_) => PaneState::Running,
+        None => (PaneState::Gone, None),
+        Some(entry) if entry.pane_info.exited => {
+            (PaneState::Exited(entry.pane_info.exit_status), None)
+        },
+        Some(entry) => (PaneState::Running, entry.command_state),
     })
 }
 
@@ -878,6 +894,10 @@ pub fn start_wait_client(
                 deadline,
             ),
             Err(e) => Err(WaitMiss::Failed(format!("`--match` is not a regex: {}", e))),
+        },
+        WaitCondition::Ready(quiet) => {
+            wait_for_ready(make_os_input, session_name, pane, quiet, deadline)
+                .map(|ready_by| Some(format!("ready_by: {}", ready_by.as_str())))
         },
     };
     match outcome {
@@ -1306,25 +1326,7 @@ fn wait_on_renders(
     watching: Watching,
     deadline: Option<Instant>,
 ) -> Result<Option<String>, WaitMiss> {
-    let zellij_ipc_pipe = socket_for(session_name).map_err(WaitMiss::Failed)?;
-    os_input
-        .connect_to_server(&zellij_ipc_pipe)
-        .map_err(WaitMiss::Failed)?;
-    os_input.send_to_server(ClientToServerMsg::SubscribeToPaneRenders {
-        pane_ids: vec![pane],
-        scrollback: None,
-        ansi: false,
-        all_panes: false,
-    });
-    let (sender, updates) = mpsc::channel();
-    let reader = os_input.box_clone();
-    std::thread::spawn(move || {
-        while let Some((message, _)) = reader.recv_from_server() {
-            if sender.send(message).is_err() {
-                break;
-            }
-        }
-    });
+    let updates = subscribe_to_renders(&*os_input, session_name, pane)?;
 
     // the viewport as it stood at the last update: the baseline new lines are measured against
     let mut on_screen: Vec<String> = Vec::new();
@@ -1393,6 +1395,213 @@ fn wait_on_renders(
     };
     os_input.send_to_server(ClientToServerMsg::ClientExited);
     answer
+}
+
+/// Which signal said a pane was ready for input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyBy {
+    /// The pane's shell wrote an OSC 133 prompt marker: `command_state` reads `prompt`. Exact.
+    Prompt,
+    /// The pane drew something and then nothing for the quiet window, and its shell wrote no
+    /// marker that says otherwise. A heuristic, for a shell without OSC 133.
+    Quiet,
+}
+
+impl ReadyBy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadyBy::Prompt => "prompt",
+            ReadyBy::Quiet => "quiet",
+        }
+    }
+}
+
+/// The decisions of a `--for ready` wait, apart from the session it asks, so they can be proven
+/// from a scripted sequence of renders and looks.
+///
+/// Two signals, and the exact one wins:
+///
+/// - **The prompt.** A look at the session that reads `command_state: prompt` is ready at once.
+/// - **Quiet after output.** A pane that has drawn a non-blank line and then nothing for the
+///   window is ready - but only when its shell says nothing to the contrary. `running` means a
+///   command is between its output marker and its end, and a silent build is not a ready shell.
+///
+/// A missing `command_state` is NOT taken as "this shell writes no markers, forever". A clear
+/// resets the pane's markers, so a shell that does write them reads as absent until it draws its
+/// next prompt - and one that redraws its prompt without running its hooks, as zsh's
+/// `clear-screen` does, stays absent. Absent and `done` both leave the fallback in play.
+#[derive(Debug)]
+struct ReadyWatch {
+    quiet: Duration,
+    /// When the pane last drew anything, once it has drawn a non-blank line. `None` until then:
+    /// a pane that has said nothing yet is not quiet, it has not started.
+    last_output: Option<Instant>,
+}
+
+impl ReadyWatch {
+    fn new(quiet: Duration) -> Self {
+        ReadyWatch {
+            quiet,
+            last_output: None,
+        }
+    }
+
+    /// A render of the pane's viewport arrived at `now`.
+    fn rendered(&mut self, viewport: &[String], now: Instant) {
+        if self.last_output.is_some() || viewport.iter().any(|line| !line.trim().is_empty()) {
+            self.last_output = Some(now);
+        }
+    }
+
+    /// When the quiet window closes, if the pane has drawn anything.
+    fn quiet_at(&self) -> Option<Instant> {
+        self.last_output.map(|at| at + self.quiet)
+    }
+
+    /// What a look at the session that read `command_state` says, at `now`.
+    fn judge(&self, command_state: Option<PaneCommandState>, now: Instant) -> Option<ReadyBy> {
+        match command_state {
+            Some(PaneCommandState::Prompt) => Some(ReadyBy::Prompt),
+            Some(PaneCommandState::Running) => None,
+            Some(PaneCommandState::Done) | None => self
+                .quiet_at()
+                .filter(|at| now >= *at)
+                .map(|_| ReadyBy::Quiet),
+        }
+    }
+}
+
+/// `--for ready`: the render stream for the fallback, and a poll of `list-panes` for the shell's
+/// own word, on the 250 ms tick `--for exit` uses.
+///
+/// A pane whose command ends or that closes before it is ready is a miss: there is no shell left
+/// to be ready.
+fn wait_for_ready(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    quiet: Duration,
+    deadline: Option<Instant>,
+) -> Result<ReadyBy, WaitMiss> {
+    let os_input = make_os_input();
+    let updates = subscribe_to_renders(&*os_input, session_name, pane)?;
+    let mut watch = ReadyWatch::new(quiet);
+    let mut next_look = Instant::now();
+    let answer = loop {
+        if Instant::now() >= next_look {
+            let look = ask(
+                make_os_input(),
+                session_name,
+                Action::ListPanes {
+                    show_tab: false,
+                    show_command: false,
+                    show_state: false,
+                    show_geometry: false,
+                    show_all: true,
+                    output_json: true,
+                    report_withheld: false,
+                },
+                &pane.to_string(),
+            )
+            .and_then(|lines| pane_look(&lines.join("\n"), pane));
+            match look {
+                Err(message) => break Err(WaitMiss::Failed(message)),
+                Ok((PaneState::Gone, _)) => {
+                    break Err(WaitMiss::Missed(format!(
+                        "{} closed before it was ready.",
+                        pane
+                    )))
+                },
+                Ok((PaneState::Exited(status), _)) => {
+                    break Err(WaitMiss::Missed(format!(
+                        "{} exited before it was ready (exit_status: {}).",
+                        pane,
+                        status.map_or_else(|| "-".to_owned(), |status| status.to_string())
+                    )))
+                },
+                Ok((PaneState::Running, command_state)) => {
+                    if let Some(ready_by) = watch.judge(command_state, Instant::now()) {
+                        break Ok(ready_by);
+                    }
+                },
+            }
+            next_look = Instant::now() + EXIT_POLL_INTERVAL;
+        }
+        let now = Instant::now();
+        if remaining(deadline, now) == Some(Duration::ZERO) {
+            break Err(WaitMiss::Missed(format!(
+                "{} was not ready when the wait timed out.",
+                pane
+            )));
+        }
+        // a quiet window that closes before the next look moves the look up to it, so a quiet
+        // pane is answered when it falls quiet rather than up to a tick later. One that closed
+        // already is judged at the next look, so it cannot spin this loop
+        if let Some(quiet_at) = watch.quiet_at().filter(|at| *at > now) {
+            next_look = next_look.min(quiet_at);
+        }
+        let wake = match deadline {
+            Some(deadline) => next_look.min(deadline),
+            None => next_look,
+        };
+        match updates.recv_timeout(wake.saturating_duration_since(now)) {
+            Ok(ServerToClientMsg::PaneRenderUpdate { viewport, .. }) => {
+                watch.rendered(&viewport, Instant::now());
+            },
+            Ok(ServerToClientMsg::SubscribedPaneClosed { .. }) => {
+                break Err(WaitMiss::Missed(format!(
+                    "{} closed before it was ready.",
+                    pane
+                )))
+            },
+            Ok(ServerToClientMsg::LogError { lines }) => {
+                break Err(WaitMiss::Failed(lines.join("\n")))
+            },
+            Ok(ServerToClientMsg::Exit { .. }) => {
+                break Err(WaitMiss::Missed(
+                    "The session exited before the pane was ready.".to_owned(),
+                ))
+            },
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {},
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(WaitMiss::Failed(
+                    "The session stopped answering while the wait was running.".to_owned(),
+                ))
+            },
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    answer
+}
+
+/// Subscribe to one pane's renders, and hand them over on a channel read by a thread - so that a
+/// deadline is still reachable while nothing is arriving. `recv_from_server` blocks, and a pane
+/// that fell silent is exactly the case where it blocks longest.
+fn subscribe_to_renders(
+    os_input: &dyn ClientOsApi,
+    session_name: &str,
+    pane: PaneId,
+) -> Result<mpsc::Receiver<ServerToClientMsg>, WaitMiss> {
+    let zellij_ipc_pipe = socket_for(session_name).map_err(WaitMiss::Failed)?;
+    os_input
+        .connect_to_server(&zellij_ipc_pipe)
+        .map_err(WaitMiss::Failed)?;
+    os_input.send_to_server(ClientToServerMsg::SubscribeToPaneRenders {
+        pane_ids: vec![pane],
+        scrollback: None,
+        ansi: false,
+        all_panes: false,
+    });
+    let (sender, updates) = mpsc::channel();
+    let reader = os_input.box_clone();
+    std::thread::spawn(move || {
+        while let Some((message, _)) = reader.recv_from_server() {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(updates)
 }
 
 /// The session's socket, which every client here opens the same way.
@@ -1854,6 +2063,122 @@ mod tests {
             wait_report(Duration::from_millis(80), None),
             vec!["waited_ms: 80".to_owned()]
         );
+    }
+
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_ready_wait_reads_the_shells_own_word_from_the_pane_list() {
+        let mut entries: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (1, false, false, None),
+            (2, false, false, None),
+        ]))
+        .unwrap();
+        entries[0].command_state = Some(PaneCommandState::Prompt);
+        let panes = serde_json::to_string(&entries).unwrap();
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(1)).unwrap(),
+            (PaneState::Running, Some(PaneCommandState::Prompt))
+        );
+        // a shell that writes no markers has no state, which is not the same answer as idle
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(2)).unwrap(),
+            (PaneState::Running, None)
+        );
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(9)).unwrap(),
+            (PaneState::Gone, None)
+        );
+    }
+
+    #[test]
+    fn a_prompt_is_ready_at_once_and_says_so() {
+        let watch = ReadyWatch::new(Duration::from_millis(300));
+        let now = Instant::now();
+        // no output has been seen and no window has passed: the shell's word is enough
+        assert_eq!(
+            watch.judge(Some(PaneCommandState::Prompt), now),
+            Some(ReadyBy::Prompt)
+        );
+        assert_eq!(ReadyBy::Prompt.as_str(), "prompt");
+        assert_eq!(ReadyBy::Quiet.as_str(), "quiet");
+    }
+
+    #[test]
+    fn output_then_quiet_is_ready_for_a_shell_without_markers() {
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        // the blank screen a new pane starts with is not output, so no window opens
+        watch.rendered(&screen(&["", "   "]), start);
+        assert_eq!(watch.quiet_at(), None);
+        assert_eq!(watch.judge(None, start + Duration::from_secs(5)), None);
+        // the prompt is drawn
+        let drawn = start + Duration::from_millis(100);
+        watch.rendered(&screen(&["user@host ~ %", ""]), drawn);
+        assert_eq!(watch.judge(None, drawn + quiet / 2), None);
+        // more drawing moves the window on
+        let redrawn = drawn + Duration::from_millis(200);
+        watch.rendered(&screen(&["user@host ~ %", ""]), redrawn);
+        assert_eq!(watch.judge(None, drawn + quiet), None);
+        assert_eq!(watch.judge(None, redrawn + quiet), Some(ReadyBy::Quiet));
+        // `done` - an end marker with no prompt after it - leaves the fallback in play
+        assert_eq!(
+            watch.judge(Some(PaneCommandState::Done), redrawn + quiet),
+            Some(ReadyBy::Quiet)
+        );
+    }
+
+    #[test]
+    fn a_running_command_is_not_ready_however_quiet_it_is() {
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        watch.rendered(&screen(&["$ cargo build", "   Compiling zellij"]), start);
+        assert_eq!(
+            watch.judge(
+                Some(PaneCommandState::Running),
+                start + Duration::from_secs(60)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_shell_whose_markers_a_clear_wiped_is_judged_by_the_fallback() {
+        // a clear resets the pane's markers, so a shell that writes them reads as having none until
+        // its next prompt. The wait neither latches "this shell has markers" and hangs, nor reads
+        // the gap as a prompt
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        assert_eq!(watch.judge(Some(PaneCommandState::Running), start), None);
+        let cleared = start + Duration::from_millis(50);
+        watch.rendered(&screen(&["", ""]), cleared);
+        assert_eq!(watch.judge(None, cleared + quiet), None);
+        let redrawn = cleared + Duration::from_millis(10);
+        watch.rendered(&screen(&["user@host ~ %"]), redrawn);
+        assert_eq!(watch.judge(None, redrawn + quiet), Some(ReadyBy::Quiet));
+        // and the prompt marker, when it comes, still wins at once
+        assert_eq!(
+            watch.judge(Some(PaneCommandState::Prompt), redrawn),
+            Some(ReadyBy::Prompt)
+        );
+    }
+
+    #[test]
+    fn a_wait_for_ready_reports_which_signal_fired() {
+        assert_eq!(
+            wait_report(
+                Duration::from_millis(412),
+                Some(format!("ready_by: {}", ReadyBy::Quiet.as_str()))
+            ),
+            vec!["waited_ms: 412".to_owned(), "ready_by: quiet".to_owned()]
+        );
+        let promised = zellij_utils::cli_surface::promised_output_keys("action wait").unwrap();
+        assert!(promised.split_whitespace().any(|key| key == "ready_by"));
     }
 
     #[test]
