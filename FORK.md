@@ -8914,11 +8914,12 @@ in-place `cp`; a rename with size and mtime kept; a `touch`; no record; a record
 re-stamp; a current pass keeps the record valid. Three signing tests now record their simulated
 signature through `record_pin_refreshed_from`, as the signing transaction does.
 
-### An image goes to the client zlib-compressed
+### An image goes to the client zlib-compressed, or as the PNG the program sent
 
 ```
 \e_Ga=t,q=2,f=32,t=d,i=2000000000,s=410,v=520,m=1;...        # before: raw RGBA, 1,140,720 bytes
-\e_Ga=t,q=2,f=32,t=d,i=2000000000,s=410,v=520,o=z,m=1;...    # now: zlib, 277,554 bytes
+\e_Ga=t,q=2,f=32,t=d,i=2000000000,s=410,v=520,o=z,m=1;...    # nkmk.33: zlib, 277,554 bytes
+\e_Ga=t,q=2,f=100,t=d,i=2000000000,m=1;...                    # nkmk.34: the PNG, 243,527 bytes
 ```
 
 From nkmk.33. zellij decodes every kitty image a pane sends into RGBA, and sends that RGBA on to
@@ -8936,13 +8937,29 @@ Measured with a fake kitty host on a pty, showing a 410x520 crop of a real scree
 `f=100`: the transmit fell from 1,140,720 bytes to 277,554, and the client decoded the same RGBA
 that went in.
 
-Not covered: the PNG a program sent is not passed through. The store keeps only the decoded RGBA,
-and a scaled copy has no PNG at all. On the image above, the PNG would have been about 13% smaller
-than the zlib payload; not worth keeping a second copy of every image.
+From nkmk.34, a PNG a program sent (`f=100`) goes through as that PNG. The parser keeps the PNG
+beside its decode when the PNG is smaller than the RGBA. On the first transmit of the image at its
+own size, the server compares the PNG with the zlib payload and sends the smaller one. A PNG goes as
+`f=100` without `s`/`v`, because a PNG carries its own size. The image above fell from 277,554 bytes
+to 243,527 (-12%), the payload was byte-identical to the program's PNG, and it decoded to the same
+RGBA.
 
-`zellij-server` only: `TransmitPayload` in `kitty_graphics/store.rs`, and `emit_kitty_transmit` in
-`output/mod.rs`. Four output tests: the chunking and its `m=` flags, the header without `o=z`, a
-410x520 image that round-trips through base64 and zlib, and the raw fallback.
+The RGBA stays in the store: placing an image at a cell size (`c`/`r`) crops and scales it, and a
+resize does it again. So a scaled placement still goes as RGBA with `o=z`, and only the image at
+its own size can use the PNG. The PNG is the extra copy, and it is held only until that first
+transmit: the transmit moves it into the cached payload and drops it. While held it counts against
+the store quota. After it, the image costs what it cost in nkmk.33, a little less, because the
+cached base64 is the smaller PNG. An image never sent at its own size keeps its PNG until the image
+is freed.
+
+`zellij-server` only: `DecodedImage.png` in `kitty_graphics/parser.rs`, `source_png` and
+`TransmitPayload::encode_with_png` in `kitty_graphics/store.rs`, and `emit_kitty_transmit` in
+`output/mod.rs`. Output tests: the chunking and its `m=` flags, the header without `o=z`, a 410x520
+image that round-trips through base64 and zlib, the raw fallback, the PNG header without `s`/`v`,
+and a 410x520 PNG that goes in through the parser, comes out as `f=100`, and decodes through the
+parser to the same pixels. Store tests: the PNG counts against the quota until the first unscaled
+transmit, a scaled transmit leaves it, and a PNG larger than the zlib payload loses. A parser test:
+a PNG smaller than its RGBA is kept.
 
 ### `action show` and `zellij_show`: an image viewer in a floating pane
 
@@ -9005,8 +9022,9 @@ kitty-capable terminal would, and again the way one that is not would:
   the client received `a=d,d=I`.
 - **No kitty:** the viewer chose half-blocks, and the `▀` cells reached the client.
 
-Worth knowing: the server re-sends an image to each terminal as RGBA, zlib-compressed when that is
-smaller (see "An image goes to the client zlib-compressed"). A 410x520 screenshot crop is about
+Worth knowing: the server re-sends the viewer's image to each terminal as RGBA, zlib-compressed
+when that is smaller (see "An image goes to the client zlib-compressed, or as the PNG the program
+sent"). The viewer sends RGBA at a cell size, so the PNG pass-through does not apply. A 410x520 screenshot crop is about
 280 KB of base64 over ssh, whatever the viewer compressed on its own pty.
 
 New dependencies: `zune-jpeg`, `gif` and `image-webp`, all with default features off, which add

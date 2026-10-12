@@ -73,6 +73,9 @@ pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub format: KittyFormat,
+    /// The PNG the program sent (`f=100`), kept when it is smaller than the decoded RGBA, so the
+    /// server can pass it through to a kitty client instead of re-encoding the RGBA.
+    pub png: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -627,9 +630,16 @@ fn run_payload_pipeline(
                 width,
                 height,
                 format: command.format,
+                png: None,
             }
         },
-        KittyFormat::Png => decode_png(&data, &echo)?,
+        KittyFormat::Png => {
+            let mut image = decode_png(&data, &echo)?;
+            if data.len() < image.bytes.len() {
+                image.png = Some(data);
+            }
+            image
+        },
     };
     command.image = Some(image);
     Ok(command)
@@ -691,6 +701,7 @@ fn decode_png(data: &[u8], echo: &EchoFields) -> Result<DecodedImage, KittyError
         width: out.width,
         height: out.height,
         format: KittyFormat::Rgba32,
+        png: None,
     })
 }
 

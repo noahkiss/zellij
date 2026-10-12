@@ -6,6 +6,7 @@ fn rgba_image(width: u32, height: u32) -> DecodedImage {
         width,
         height,
         format: KittyFormat::Rgba32,
+        png: None,
     }
 }
 
@@ -138,6 +139,7 @@ fn rgb24_images_are_normalized_to_rgba_at_store_time() {
             width: 2,
             height: 2,
             format: KittyFormat::Rgb24,
+            png: None,
         })
         .unwrap();
     let image = store.get(id).unwrap();
@@ -146,4 +148,73 @@ fn rgb24_images_are_normalized_to_rgba_at_store_time() {
         vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
     );
     assert_eq!(store.total_bytes(), 16);
+}
+
+/// Noise RGBA, which zlib cannot shrink, carrying a stand-in PNG.
+fn noisy_image_with_png(width: u32, height: u32, png: Vec<u8>) -> DecodedImage {
+    let mut state: u32 = 0x1234_5678;
+    let bytes = (0..width * height * 4)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    DecodedImage {
+        bytes,
+        png: Some(png),
+        ..rgba_image(width, height)
+    }
+}
+
+/// Flat RGBA, which zlib shrinks below any stand-in PNG.
+fn flat_image_with_png(width: u32, height: u32, png: Vec<u8>) -> DecodedImage {
+    DecodedImage {
+        png: Some(png),
+        ..rgba_image(width, height)
+    }
+}
+
+#[test]
+fn a_kept_png_counts_against_the_quota_until_the_first_unscaled_transmit() {
+    let mut store = KittyImageStore::default();
+    let id = store
+        .store_image(noisy_image_with_png(10, 10, vec![7; 50]))
+        .unwrap();
+    assert_eq!(store.total_bytes(), 400 + 50);
+    let payload = store.transmit_payload_for(id, None).unwrap();
+    assert!(payload.png);
+    assert!(!payload.zlib);
+    assert_eq!(payload.base64, BASE64_ENCODER.encode(vec![7u8; 50]));
+    assert_eq!(store.total_bytes(), 400);
+    assert_eq!(store.transmit_payload_for(id, None).unwrap(), payload);
+    store.free(id);
+    assert_eq!(store.total_bytes(), 0);
+}
+
+#[test]
+fn a_scaled_transmit_sends_rgba_and_keeps_the_png_for_the_unscaled_one() {
+    let mut store = KittyImageStore::default();
+    let id = store
+        .store_image(noisy_image_with_png(10, 10, vec![7; 50]))
+        .unwrap();
+    store.add_scaled_variant(id, (1, 1), vec![0; 64]);
+    let scaled = store.transmit_payload_for(id, Some((1, 1))).unwrap();
+    assert!(!scaled.png);
+    assert_eq!(store.total_bytes(), 400 + 50 + 64);
+    assert!(store.transmit_payload_for(id, None).unwrap().png);
+    assert_eq!(store.total_bytes(), 400 + 64);
+}
+
+#[test]
+fn a_png_larger_than_the_zlib_payload_is_dropped_for_rgba() {
+    let mut store = KittyImageStore::default();
+    let id = store
+        .store_image(flat_image_with_png(10, 10, vec![7; 300]))
+        .unwrap();
+    let payload = store.transmit_payload_for(id, None).unwrap();
+    assert!(!payload.png);
+    assert!(payload.zlib);
+    assert_eq!(store.total_bytes(), 400);
 }

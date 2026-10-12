@@ -421,6 +421,12 @@ fn emit_kitty_transmit(
 ) -> Result<()> {
     let err_context = "failed to serialize kitty transmit";
     let b64 = payload.base64.as_str();
+    // A PNG carries its own size, so `s`/`v` go only with RGBA.
+    let (format, dimensions) = if payload.png {
+        (100, String::new())
+    } else {
+        (32, format!("s={},v={},", width, height))
+    };
     let compression = if payload.zlib { "o=z," } else { "" };
     let mut parts: Vec<&str> = vec![];
     let mut index = 0;
@@ -437,10 +443,10 @@ fn emit_kitty_transmit(
         if part_index == 0 {
             write!(
                 out,
-                "\u{1b}_Ga=t,q=2,f=32,t=d,i={},s={},v={},{}m={};{}\u{1b}\\",
+                "\u{1b}_Ga=t,q=2,f={},t=d,i={},{}{}m={};{}\u{1b}\\",
+                format,
                 host_image_id,
-                width,
-                height,
+                dimensions,
                 compression,
                 if last == 0 { 0 } else { 1 },
                 part

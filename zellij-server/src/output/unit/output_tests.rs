@@ -1167,6 +1167,7 @@ fn store_test_kitty_image(
             width,
             height,
             format: KittyFormat::Rgba32,
+            png: None,
         })
         .unwrap()
 }
@@ -1708,6 +1709,7 @@ fn kitty_transmit_chunks_payload_into_4096_byte_parts() {
     let payload = TransmitPayload {
         base64: "A".repeat(4096 * 2 + 100),
         zlib: true,
+        png: false,
     };
     let mut out = String::new();
     emit_kitty_transmit(&mut out, 7, 3, 4, &payload).unwrap();
@@ -1729,6 +1731,7 @@ fn kitty_transmit_without_compression_omits_o_flag() {
     let payload = TransmitPayload {
         base64: "AAAA".to_owned(),
         zlib: false,
+        png: false,
     };
     let mut out = String::new();
     emit_kitty_transmit(&mut out, 7, 1, 1, &payload).unwrap();
@@ -1748,6 +1751,7 @@ fn kitty_transmit_payload_is_zlib_compressed_and_round_trips() {
             width,
             height,
             format: KittyFormat::Rgba32,
+            png: None,
         })
         .unwrap();
     let output = run_kitty_frame(&parts, vec![kitty_chunk(internal, 1, 0, 0)], None);
@@ -1763,6 +1767,86 @@ fn kitty_transmit_payload_is_zlib_compressed_and_round_trips() {
         uncompressed_base64_len
     );
     assert_eq!(decode_transmit_payload(control, payload), rgba);
+}
+
+/// A smooth gradient: PNG's row filters shrink it far more than zlib alone does on raw RGBA.
+fn gradient_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.extend_from_slice(&[x as u8, y as u8, (x + y) as u8, 255]);
+        }
+    }
+    rgba
+}
+
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut png = vec![];
+    let mut encoder = png::Encoder::new(&mut png, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(rgba).unwrap();
+    writer.finish().unwrap();
+    png
+}
+
+#[test]
+fn kitty_transmit_passes_a_program_png_through_and_it_decodes_to_the_same_pixels() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::Engine as _;
+    let (width, height) = (410, 520);
+    let rgba = gradient_rgba(width, height);
+    let png = encode_png(width, height, &rgba);
+    let mut parser = KittyCommandParser::new();
+    let incoming = format!("a=T,q=2,f=100;{}", STANDARD.encode(&png));
+    let image = parser
+        .parse(incoming.as_bytes())
+        .unwrap()
+        .unwrap()
+        .image
+        .unwrap();
+    assert_eq!(image.png.as_deref(), Some(png.as_slice()));
+    assert_eq!(image.bytes, rgba);
+    let parts = create_test_kitty_parts();
+    let internal = parts.0.borrow_mut().store_image(image).unwrap();
+    let output = run_kitty_frame(&parts, vec![kitty_chunk(internal, 1, 0, 0)], None);
+    let transmits = kitty_transmits(&output);
+    assert_eq!(transmits.len(), 1);
+    let (control, payload) = &transmits[0];
+    assert_eq!(control, "a=t,q=2,f=100,t=d,i=2000000000,m=1");
+    assert_eq!(STANDARD.decode(payload).unwrap(), png);
+    let zlib_payload = TransmitPayload::encode(&rgba);
+    assert!(
+        payload.len() < zlib_payload.base64.len(),
+        "png payload {} should beat the zlib payload {}",
+        payload.len(),
+        zlib_payload.base64.len()
+    );
+    // What a kitty client does with it: decode the PNG. Run zellij's own decoder over the
+    // client-bound bytes and compare the pixels.
+    let mut client = KittyCommandParser::new();
+    let received = format!("a=T,q=2,f=100;{}", payload);
+    let decoded = client
+        .parse(received.as_bytes())
+        .unwrap()
+        .unwrap()
+        .image
+        .unwrap();
+    assert_eq!((decoded.width, decoded.height), (width, height));
+    assert_eq!(decoded.bytes, rgba);
+}
+
+#[test]
+fn kitty_transmit_of_a_png_omits_size_keys() {
+    let payload = TransmitPayload {
+        base64: "AAAA".to_owned(),
+        zlib: false,
+        png: true,
+    };
+    let mut out = String::new();
+    emit_kitty_transmit(&mut out, 7, 1, 1, &payload).unwrap();
+    assert_eq!(out, "\u{1b}_Ga=t,q=2,f=100,t=d,i=7,m=0;AAAA\u{1b}\\");
 }
 
 #[test]

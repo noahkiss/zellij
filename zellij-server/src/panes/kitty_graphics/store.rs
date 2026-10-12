@@ -20,11 +20,13 @@ pub struct KittyImage {
 }
 
 /// The pixel data of one image, encoded for the server-to-client kitty transmit: base64 of the
-/// zlib-compressed RGBA when that is smaller (`o=z`), base64 of the raw RGBA otherwise.
+/// PNG the program sent (`f=100`) when that is the smallest, else base64 of the zlib-compressed
+/// RGBA when that is smaller (`o=z`), else base64 of the raw RGBA.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransmitPayload {
     pub base64: String,
     pub zlib: bool,
+    pub png: bool,
 }
 
 impl TransmitPayload {
@@ -36,11 +38,27 @@ impl TransmitPayload {
             Some(compressed) if compressed.len() < rgba.len() => TransmitPayload {
                 base64: BASE64_ENCODER.encode(compressed),
                 zlib: true,
+                png: false,
             },
             _ => TransmitPayload {
                 base64: BASE64_ENCODER.encode(rgba),
                 zlib: false,
+                png: false,
             },
+        }
+    }
+    /// The PNG the program sent when it is no larger than the RGBA payload `encode` would make.
+    /// Both decode to the same pixels; the client decodes the PNG itself.
+    pub fn encode_with_png(rgba: &[u8], png: &[u8]) -> Self {
+        let rgba_payload = Self::encode(rgba);
+        if (png.len() + 2) / 3 * 4 <= rgba_payload.base64.len() {
+            TransmitPayload {
+                base64: BASE64_ENCODER.encode(png),
+                zlib: false,
+                png: true,
+            }
+        } else {
+            rgba_payload
         }
     }
 }
@@ -51,6 +69,9 @@ struct StoredImage {
     refcount: usize,
     lru_stamp: u64,
     transmit_cache: HashMap<Option<(u16, u16)>, TransmitPayload>,
+    /// The PNG the program sent, held until the first unscaled transmit encodes it into
+    /// `transmit_cache` and drops it. Counted against the quota while held.
+    source_png: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,9 +106,10 @@ impl KittyImageStore {
         self.next_placement_uid += 1;
         uid
     }
-    pub fn store_image(&mut self, image: DecodedImage) -> Result<InternalImageId, KittyError> {
+    pub fn store_image(&mut self, mut image: DecodedImage) -> Result<InternalImageId, KittyError> {
+        let source_png = image.png.take();
         let (rgba, width, height) = Self::normalize_to_rgba(image);
-        let size = rgba.len();
+        let size = rgba.len() + source_png.as_ref().map(|png| png.len()).unwrap_or(0);
         if size > self.quota_bytes {
             return Err(KittyError {
                 code: KittyErrorCode::Einval,
@@ -114,6 +136,7 @@ impl KittyImageStore {
                 refcount: 0,
                 lru_stamp,
                 transmit_cache: HashMap::new(),
+                source_png,
             },
         );
         self.total_bytes += size;
@@ -167,12 +190,21 @@ impl KittyImageStore {
         if let Some(cached) = stored.transmit_cache.get(&variant) {
             return Some(cached.clone());
         }
-        let bytes = match variant {
-            Some(cells) => stored.image.scaled_variants.get(&cells)?,
-            None => &stored.image.rgba,
+        let (encoded, released_bytes) = match variant {
+            Some(cells) => (
+                TransmitPayload::encode(stored.image.scaled_variants.get(&cells)?),
+                0,
+            ),
+            None => match stored.source_png.take() {
+                Some(png) => (
+                    TransmitPayload::encode_with_png(&stored.image.rgba, &png),
+                    png.len(),
+                ),
+                None => (TransmitPayload::encode(&stored.image.rgba), 0),
+            },
         };
-        let encoded = TransmitPayload::encode(bytes);
         stored.transmit_cache.insert(variant, encoded.clone());
+        self.total_bytes -= released_bytes;
         Some(encoded)
     }
     pub fn add_scaled_variant(&mut self, id: InternalImageId, cells: (u16, u16), bytes: Vec<u8>) {
@@ -214,6 +246,7 @@ impl KittyImageStore {
     }
     fn stored_image_bytes(stored: &StoredImage) -> usize {
         stored.image.rgba.len()
+            + stored.source_png.as_ref().map(|png| png.len()).unwrap_or(0)
             + stored
                 .image
                 .scaled_variants

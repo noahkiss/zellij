@@ -127,6 +127,7 @@ fn embedded_png_fixture_decodes_to_expected_rgba() {
             width: 2,
             height: 2,
             format: KittyFormat::Rgba32,
+            png: None,
         })
     );
 }
@@ -385,4 +386,25 @@ fn temp_file_outside_temp_dir_with_magic_name_is_deleted() {
     .unwrap();
     assert_eq!(command.image.unwrap().bytes, raster);
     assert!(!path.exists());
+}
+
+#[test]
+fn png_smaller_than_its_rgba_is_kept_beside_the_decode() {
+    let (width, height) = (64u32, 64u32);
+    let rgba = vec![200u8; (width * height * 4) as usize];
+    let mut png = vec![];
+    {
+        let mut encoder = png::Encoder::new(&mut png, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&rgba).unwrap();
+    }
+    let mut parser = KittyCommandParser::new();
+    let image = parse_one(&mut parser, &raw_cmd("a=T,f=100", &png))
+        .unwrap()
+        .image
+        .unwrap();
+    assert_eq!(image.bytes, rgba);
+    assert_eq!(image.png, Some(png));
 }
