@@ -2475,61 +2475,114 @@ enum Recording {
     KeepingPath,
 }
 
-/// Whether `enable` keeps the PATH an installed unit records, and if so, what this shell drops.
+/// What `enable` keeps of the PATH an installed unit records: the PATH to write, and the recorded
+/// directories this shell's PATH lacks that it carries over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptPath {
+    /// The PATH `enable` writes.
+    pub path: String,
+    /// The recorded directories this shell lacks that `path` keeps, in recorded order.
+    pub kept: Vec<String>,
+}
+
+/// Whether `enable` keeps directories from the PATH an installed unit records, and if so, which.
 ///
 /// **An SSH shell is a thinner view of the same machine, not a new PATH.** A non-interactive SSH
 /// shell skips most of the rc chain, so its PATH lacks `/usr/local/bin`, version-manager shims and
 /// the like. The release runbook runs `session enable` over SSH, and every release re-recorded
-/// that PATH: 17 entries became 13, and the next server could not resolve what the 4 named. An
-/// interactive `enable` put them back, until the next release.
+/// that PATH: 17 entries became 13, and the next server could not resolve what the 4 named.
 ///
-/// So a shell whose PATH ADDS nothing to the recorded one and DROPS a directory that still exists
-/// keeps the recorded PATH whole. `Some` is the directories it drops. Every other shell re-records,
-/// as before:
+/// The first fix kept the recorded PATH only when this shell's PATH added nothing to it. That read
+/// one addition as permission to drop everything else: a dotfile change put mise's shims on every
+/// shell's PATH, and the next `enable` over SSH turned 20 entries into 14, dropping 7 that exist.
 ///
-/// - one that adds a directory - a new package prefix, a version manager's per-shell directory - is
-///   the operator's current PATH, and recording it is the point of `enable`;
-/// - one that drops only directories that are gone from the disk is cleaning up, not shrinking.
+/// So `enable` MERGES. A recorded directory this shell drops is kept when it still exists:
+///
+/// - a shell that adds nothing keeps the recorded PATH, in its own order;
+/// - a shell that adds a directory - a new package prefix, a version manager's shims - is recorded,
+///   followed by the dropped directories it lacks, in recorded order.
+///
+/// `None` - record this shell's PATH as it is - when it drops nothing worth keeping. A dropped
+/// directory that is gone from the disk is a cleanup, not a shrink, and is not kept. Neither is
+/// one that only ever lives for one shell ([`is_ephemeral_path_dir`]).
 ///
 /// A directory that still exists and should go is dropped by `session disable` and an `enable`
-/// from the shell that lacks it: a unit that is not installed has no PATH to keep.
+/// from the shell that lacks it: a unit that is not installed has no PATH to keep. A PATH the
+/// config states is written as stated, and this never runs on it.
 pub fn path_to_keep(
     recorded: &str,
     fresh: &str,
     exists: impl Fn(&Path) -> bool,
-) -> Option<Vec<String>> {
+) -> Option<KeptPath> {
     let recorded: Vec<&str> = recorded.split(':').filter(|dir| !dir.is_empty()).collect();
     let fresh: Vec<&str> = fresh.split(':').filter(|dir| !dir.is_empty()).collect();
-    if fresh.iter().any(|dir| !recorded.contains(dir)) {
+    let keeps =
+        |dir: &str| !fresh.contains(&dir) && !is_ephemeral_path_dir(dir) && exists(Path::new(dir));
+    let kept: Vec<String> = recorded
+        .iter()
+        .copied()
+        .filter(|dir| keeps(dir))
+        .map(str::to_owned)
+        .collect();
+    if kept.is_empty() {
         return None;
     }
-    let dropped: Vec<String> = recorded
-        .iter()
-        .filter(|dir| !fresh.contains(dir) && exists(Path::new(dir)))
-        .map(|dir| (*dir).to_owned())
-        .collect();
-    (!dropped.is_empty()).then_some(dropped)
+    let adds = fresh.iter().any(|dir| !recorded.contains(dir));
+    let dirs: Vec<&str> = if adds {
+        fresh
+            .iter()
+            .copied()
+            .chain(kept.iter().map(String::as_str))
+            .collect()
+    } else {
+        recorded
+            .iter()
+            .copied()
+            .filter(|dir| fresh.contains(dir) || keeps(dir))
+            .collect()
+    };
+    let mut path: Vec<&str> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        if !path.contains(&dir) {
+            path.push(dir);
+        }
+    }
+    Some(KeptPath {
+        path: path.join(":"),
+        kept,
+    })
 }
 
-/// What an `enable` renders with, out of what the installed unit records: its PATH when
-/// [`path_to_keep`] keeps it, and nothing otherwise - every other value is re-recorded as before.
+/// A PATH directory that exists for one shell and is not worth carrying into a unit: fnm's
+/// per-shell `fnm_multishells/<id>/bin`. It outlives its shell on disk, so "still exists" is no
+/// sign that anything still wants it.
+fn is_ephemeral_path_dir(dir: &str) -> bool {
+    dir.contains("/fnm_multishells/")
+}
+
+/// What an `enable` renders with, out of what the installed unit records: the PATH
+/// [`path_to_keep`] merges, when it keeps a directory, and nothing otherwise - every other value is
+/// re-recorded as before.
 fn recorded_for_enable(
     on_disk: RecordedEnv,
     fresh_path: &str,
     exists: impl Fn(&Path) -> bool,
 ) -> RecordedEnv {
-    match on_disk.path {
-        Some(path) if path_to_keep(&path, fresh_path, exists).is_some() => RecordedEnv {
-            path: Some(path),
+    match on_disk
+        .path
+        .and_then(|path| path_to_keep(&path, fresh_path, exists))
+    {
+        Some(kept) => RecordedEnv {
+            path: Some(kept.path),
             ..RecordedEnv::default()
         },
-        _ => RecordedEnv::default(),
+        None => RecordedEnv::default(),
     }
 }
 
 /// What `enable` will keep of the installed unit's PATH rather than re-record: the directories
-/// this shell's PATH drops, when the kept PATH changes the files written. `None` when this shell's
-/// PATH is the one recorded, or when the config states its own PATH and neither is written.
+/// this shell's PATH drops, when keeping them changes the files written. `None` when this shell's
+/// PATH drops nothing worth keeping, or when the config states its own PATH and neither is written.
 ///
 /// Asked BEFORE `enable`, so the caller can say so beside what `enable` reports.
 pub fn path_kept_on_enable(
@@ -2537,7 +2590,7 @@ pub fn path_kept_on_enable(
     exe: &Path,
     session: &str,
     extras: Option<&SessionServiceOptions>,
-) -> Option<Vec<String>> {
+) -> Option<KeptPath> {
     let fresh = service_files(kind, exe, session, extras).ok()?;
     let kept = enable_files(kind, exe, session, extras).ok()?;
     if fresh == kept {
@@ -3724,29 +3777,27 @@ mod tests {
         "/pin:/opt/homebrew/bin:/usr/local/bin:/home/u/.rbenv/shims:/usr/bin:/bin:/usr/sbin:/sbin";
     const SSH_PATH: &str = "/pin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
+    fn kept(path: &str, kept: &[&str]) -> Option<KeptPath> {
+        Some(KeptPath {
+            path: path.to_owned(),
+            kept: kept.iter().map(|dir| (*dir).to_owned()).collect(),
+        })
+    }
+
     #[test]
     fn a_thinner_shell_keeps_the_recorded_path() {
         let everything_exists = |_: &Path| true;
+        // a shell that adds nothing keeps the recorded PATH whole, in its own order
         assert_eq!(
             path_to_keep(INTERACTIVE_PATH, SSH_PATH, everything_exists),
-            Some(vec![
-                "/usr/local/bin".to_owned(),
-                "/home/u/.rbenv/shims".to_owned()
-            ])
+            kept(
+                INTERACTIVE_PATH,
+                &["/usr/local/bin", "/home/u/.rbenv/shims"]
+            )
         );
         // the same PATH, or the same set in another order, drops nothing: re-recorded as before
         assert_eq!(
             path_to_keep(INTERACTIVE_PATH, INTERACTIVE_PATH, everything_exists),
-            None
-        );
-        // a shell that adds a directory is the operator's current PATH, even if it drops one too -
-        // a version manager's per-shell directory changes with every shell
-        assert_eq!(
-            path_to_keep(
-                INTERACTIVE_PATH,
-                "/pin:/opt/homebrew/bin:/new/bin:/usr/bin:/bin",
-                everything_exists
-            ),
             None
         );
         // a dropped directory that is gone from the disk is a cleanup, not a shrink
@@ -3756,12 +3807,133 @@ mod tests {
             }),
             None
         );
-        // and only the dropped directories that exist are named
+        // and only the dropped directories that exist are kept and named
         assert_eq!(
             path_to_keep(INTERACTIVE_PATH, SSH_PATH, |dir: &Path| {
                 dir != Path::new("/home/u/.rbenv/shims")
             }),
-            Some(vec!["/usr/local/bin".to_owned()])
+            kept(
+                "/pin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                &["/usr/local/bin"]
+            )
+        );
+    }
+
+    /// The decision that went wrong on m1p: a shell that ADDS a directory used to re-record, and
+    /// drop everything else it lacked with it.
+    #[test]
+    fn a_shell_that_adds_a_directory_is_merged_with_the_recorded_path() {
+        let everything_exists = |_: &Path| true;
+        // (a) adds one, drops several that exist: this shell's PATH, then the dropped directories
+        // in recorded order
+        assert_eq!(
+            path_to_keep(
+                INTERACTIVE_PATH,
+                "/pin:/home/u/.local/share/mise/shims:/opt/homebrew/bin:/usr/bin:/bin",
+                everything_exists
+            ),
+            kept(
+                "/pin:/home/u/.local/share/mise/shims:/opt/homebrew/bin:/usr/bin:/bin\
+                 :/usr/local/bin:/home/u/.rbenv/shims:/usr/sbin:/sbin",
+                &[
+                    "/usr/local/bin",
+                    "/home/u/.rbenv/shims",
+                    "/usr/sbin",
+                    "/sbin"
+                ]
+            )
+        );
+        // (b) adds one, drops only directories gone from the disk: this shell's PATH, as before
+        assert_eq!(
+            path_to_keep(
+                INTERACTIVE_PATH,
+                "/pin:/new/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                |dir: &Path| {
+                    dir != Path::new("/usr/local/bin") && dir != Path::new("/home/u/.rbenv/shims")
+                }
+            ),
+            None
+        );
+        // adds one and drops nothing: this shell's PATH, as before
+        assert_eq!(
+            path_to_keep(
+                INTERACTIVE_PATH,
+                &format!("/new/bin:{}", INTERACTIVE_PATH),
+                everything_exists
+            ),
+            None
+        );
+    }
+
+    /// fnm's per-shell directory outlives its shell on disk. Existing is no reason to keep it.
+    #[test]
+    fn a_per_shell_directory_is_not_kept() {
+        let recorded =
+            "/pin:/home/u/.local/state/fnm_multishells/123_456/bin:/usr/local/bin:/usr/bin";
+        assert_eq!(
+            path_to_keep(recorded, "/pin:/usr/bin", |_: &Path| true),
+            kept("/pin:/usr/local/bin:/usr/bin", &["/usr/local/bin"])
+        );
+        assert_eq!(
+            path_to_keep(recorded, "/pin:/mise/shims:/usr/bin", |_: &Path| true),
+            kept(
+                "/pin:/mise/shims:/usr/bin:/usr/local/bin",
+                &["/usr/local/bin"]
+            )
+        );
+        // the per-shell directory alone is nothing worth keeping
+        assert_eq!(
+            path_to_keep(
+                "/pin:/home/u/.local/state/fnm_multishells/123_456/bin:/usr/bin",
+                "/pin:/usr/bin",
+                |_: &Path| true
+            ),
+            None
+        );
+    }
+
+    /// The m1p vector from the nkmk.31 rollout, verbatim but for the home directory: the PATH the
+    /// running server carried (recorded from a Ghostty terminal), and the one an `enable` over SSH
+    /// wrote after mise's shims joined `.profile`. 20 entries became 14.
+    #[test]
+    fn the_m1p_enable_over_ssh_keeps_what_it_dropped() {
+        const RECORDED: &str = "/Users/u/Library/Application Support/zellij/bin\
+            :/Users/u/.local/state/fnm_multishells/50496_1791169579118/bin\
+            :/Users/u/.rbenv/shims:/usr/local/bin:/System/Cryptexes/App/usr/bin\
+            :/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin\
+            :/opt/homebrew/opt/gnu-getopt/bin:/opt/homebrew/opt/gnu-sed/libexec/gnubin\
+            :/opt/homebrew/opt/coreutils/libexec/gnubin:/opt/homebrew/bin\
+            :/Users/u/bin:/Users/u/.local/bin:/Users/u/.cargo/bin:/opt/homebrew/sbin\
+            :/Applications/Ghostty.app/Contents/MacOS:/Users/u/.orbstack/bin";
+        const SSH: &str = "/Users/u/Library/Application Support/zellij/bin\
+            :/Users/u/.local/share/mise/shims\
+            :/opt/homebrew/opt/gnu-getopt/bin:/opt/homebrew/opt/gnu-sed/libexec/gnubin\
+            :/opt/homebrew/opt/coreutils/libexec/gnubin:/opt/homebrew/bin\
+            :/Users/u/bin:/Users/u/.local/bin:/Users/u/.cargo/bin:/opt/homebrew/sbin\
+            :/usr/bin:/bin:/usr/sbin:/sbin";
+        assert_eq!(RECORDED.split(':').count(), 20);
+        assert_eq!(SSH.split(':').count(), 14);
+        // every dropped directory existed on m1p, the stale fnm one included
+        let on_m1p = |_: &Path| true;
+        let merged = path_to_keep(RECORDED, SSH, on_m1p).expect("the merge keeps directories");
+        // six of the seven: the fnm one lived for one shell
+        assert_eq!(
+            merged.kept,
+            [
+                "/Users/u/.rbenv/shims",
+                "/usr/local/bin",
+                "/System/Cryptexes/App/usr/bin",
+                "/Library/Apple/usr/bin",
+                "/Applications/Ghostty.app/Contents/MacOS",
+                "/Users/u/.orbstack/bin",
+            ]
+        );
+        assert_eq!(merged.path, format!("{}:{}", SSH, merged.kept.join(":")));
+        assert_eq!(merged.path.split(':').count(), 20);
+        // and the next `enable` from the same shell keeps the merged PATH as it is
+        assert_eq!(
+            path_to_keep(&merged.path, SSH, on_m1p).map(|again| again.path),
+            Some(merged.path.clone())
         );
     }
 
@@ -3792,13 +3964,54 @@ mod tests {
             let files = compared_install(&dir, kind, &exe(), &written);
             assert_eq!(drift_of(&files), UnitDrift::Current, "{:?}", kind);
 
-            // a shell that adds a directory still records its own PATH, as before
+            // a shell that adds a directory is written, and what it lacks follows it
             let added = recorded_for_enable(
                 RecordedEnv::in_unit(kind, &on_disk),
                 "/pin:/new/bin:/usr/bin",
                 |_: &Path| true,
             );
-            assert_eq!(added, RecordedEnv::default(), "{:?}", kind);
+            let written = render_unit(kind, &exe(), "work", None, None, &added);
+            let path = RecordedEnv::in_unit(kind, &written).path.unwrap();
+            assert!(
+                path.ends_with(
+                    "/pin:/new/bin:/usr/bin:/opt/homebrew/bin:/usr/local/bin\
+                     :/home/u/.rbenv/shims:/bin:/usr/sbin:/sbin"
+                ),
+                "{:?}: {}",
+                kind,
+                path
+            );
+        }
+    }
+
+    /// A PATH the config states is written as stated, whatever `enable` would keep: the merge is a
+    /// rule about the recorded default, not about a machine's stated value.
+    #[test]
+    fn a_configured_path_is_written_as_stated_by_an_enable_that_keeps_directories() {
+        let mut systemd = SessionServiceOptions::default();
+        systemd
+            .add_systemd_directive("service", "Environment=PATH=/my/bin")
+            .unwrap();
+        let mut launchd = SessionServiceOptions::default();
+        launchd.add_launchd_env("PATH", "/my/bin").unwrap();
+        for (kind, extras) in [
+            (ServiceKind::Systemd, &systemd),
+            (ServiceKind::Launchd, &launchd),
+        ] {
+            let interactive = RecordedEnv {
+                path: Some(INTERACTIVE_PATH.to_owned()),
+                ..RecordedEnv::default()
+            };
+            let kept =
+                recorded_for_enable(interactive, "/pin:/mise/shims:/usr/bin", |_: &Path| true);
+            assert!(kept.path.is_some(), "{:?}", kind);
+            let written = render_unit(kind, &exe(), "work", Some(extras), None, &kept);
+            assert_eq!(
+                RecordedEnv::in_unit(kind, &written).path.as_deref(),
+                Some("/my/bin"),
+                "{:?}",
+                kind
+            );
         }
     }
 

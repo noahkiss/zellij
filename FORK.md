@@ -1729,7 +1729,8 @@ afterwards: install a new package prefix, and the unit learns about it at the ne
 not before. Until nkmk.25 drift said so, by regenerating from the asking shell's `PATH`. That was
 not safe: an SSH shell's thinner `PATH` read as drift, and following the report recorded it. Now
 `session enable` prints each key it changes, `PATH` among them, so a re-record is seen when it is
-made. From nkmk.27 an `enable` from a thinner shell keeps the recorded `PATH` instead; see [the
+made. From nkmk.27 an `enable` from a thinner shell keeps the recorded `PATH` instead, and from
+nkmk.32 it merges the recorded directories the shell lacks into the shell's own; see [the
 entry below](#session-enable-from-a-thinner-shell-keeps-the-recorded-path).
 
 ### The generated unit's `PATH` leads with the pin directory
@@ -1785,23 +1786,33 @@ change was printed (`PATH: 17 entries -> 13 entries`), and `enable` went on all 
 A server resolves commands against the `PATH` it was created with, so each release left the next
 server unable to find what those directories hold.
 
-`enable` now keeps the `PATH` the installed unit records when this shell's `PATH`:
+`enable` now **merges**. A directory the installed unit's `PATH` records, that this shell's `PATH`
+lacks, and that still exists on the disk, is kept:
 
-- **adds nothing** to the recorded one, and
-- **drops at least one directory that still exists** on the disk.
-
-Every other shell re-records, as before. A shell that adds a directory is the operator's current
-`PATH` — a new package prefix, or the per-shell directory a version manager such as fnm makes for
-each shell. A shell that drops only directories gone from the disk is cleaning up, not shrinking.
+- A shell that **adds nothing** keeps the recorded `PATH`, in its own order.
+- A shell that **adds a directory** is written first, and the directories it lacks follow it in
+  recorded order.
+- A shell that drops only directories gone from the disk is cleaning up, not shrinking. It
+  re-records, as before.
+- fnm's per-shell `fnm_multishells/<id>/bin` is never kept. It outlives its shell on disk, so
+  "still exists" says nothing about whether anything wants it.
 
 ```
 $ ssh mac zellij session enable mysession
-      kept the installed PATH: this shell's PATH adds nothing to it and lacks 2 directories that exist
+      kept 2 directories from the installed PATH that this shell lacks and that exist:
         /usr/local/bin
         /Users/user/.rbenv/shims
-      to record a new PATH, run `session enable` from a shell that adds to it
+      to drop one, run `session disable`, then `session enable` from a shell without it
 ok    service for 'mysession' is already enabled
 ```
+
+The first version of this rule (nkmk.27) kept the recorded `PATH` only when the shell **added
+nothing**, and re-recorded otherwise. It read one addition as permission to drop everything else.
+At nkmk.31 a dotfile change put mise's shims on every shell's `PATH`. The next `enable` over SSH
+added that one directory, and rewrote one Mac's agent `PATH` from 20 entries to 14. It dropped
+seven that exist, among them `/usr/local/bin` and `~/.orbstack/bin`. Nothing was printed, because
+the rule had stood down. From nkmk.32 the same `enable` writes the 14, then the six it lacks that
+exist; the stale fnm directory is the seventh, and it goes.
 
 Only the `PATH` is kept. Everything else in the unit is rendered as before, so a new binary or a
 changed config is still written. Drift reads the `PATH` back from the installed unit, so a kept
@@ -1813,11 +1824,13 @@ To drop a directory that still exists on purpose, `session disable` and then `se
 the shell that lacks it. A unit that is not installed has no `PATH` to keep. The state root moves
 the same way.
 
-`zellij-utils/src/session_service.rs` (`path_to_keep`, `recorded_for_enable`, and an
-`enable_files` rendering mode beside `service_files` and `comparison_files`) and
-`src/session_commands.rs` for the message. Two tests: the decision table for `path_to_keep`, and an
+`zellij-utils/src/session_service.rs` (`path_to_keep` and its `KeptPath`, `recorded_for_enable`,
+and an `enable_files` rendering mode beside `service_files` and `comparison_files`) and
+`src/session_commands.rs` for the message. Tests: the decision table for `path_to_keep` (a thinner
+shell; a shell that adds one and drops several that exist; one that adds one and drops only missing
+directories; the fnm directory), the 20-to-14 vector verbatim but for the home directory, an
 `enable` from the SSH `PATH` rendered over an interactive unit on both platforms, which keeps the
-recorded `PATH` and reports no drift.
+recorded `PATH` and reports no drift, and a configured `PATH` that is written as stated.
 
 ### `session up` will not create a session in the wrong macOS session domain
 

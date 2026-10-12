@@ -395,27 +395,29 @@ fn enable(name: &str, exe: Option<PathBuf>, force: bool, opts: &CliArgs) -> Resu
     }
 }
 
-/// Say that `enable` kept the installed unit's PATH, and which directories this shell lacks.
+/// Say which directories of the installed unit's PATH `enable` kept, because this shell lacks them.
 ///
 /// Said every time it happens, so an `enable` over SSH does not read as one that recorded the SSH
 /// shell's PATH. See [`session_service::path_to_keep`].
-fn print_kept_path(dropped: Option<Vec<String>>) {
-    let Some(dropped) = dropped else {
+fn print_kept_path(kept: Option<session_service::KeptPath>) {
+    let Some(kept) = kept else {
         return;
     };
     println!(
-        "      kept the installed PATH: this shell's PATH adds nothing to it and lacks {} {} that exist",
-        dropped.len(),
-        if dropped.len() == 1 {
+        "      kept {} {} from the installed PATH that this shell lacks and that exist:",
+        kept.kept.len(),
+        if kept.kept.len() == 1 {
             "directory"
         } else {
             "directories"
         }
     );
-    for dir in dropped {
+    for dir in kept.kept {
         println!("        {}", dir);
     }
-    println!("      to record a new PATH, run `session enable` from a shell that adds to it");
+    println!(
+        "      to drop one, run `session disable`, then `session enable` from a shell without it"
+    );
 }
 
 /// Name the two answers to "where do this user's units live", when they differ.
