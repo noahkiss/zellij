@@ -2714,7 +2714,8 @@ disappears on upgrade.
 required to stay byte-identical to its source: signing it on macOS changes it on purpose. A pin
 judged by its own contents would therefore read stale forever, and `session up` runs from a watchdog
 every minute, so the signature would last about that long. The pin is stale when the stamp is
-missing, unreadable, or names a different source; a source that cannot be hashed at all falls back
+missing, unreadable, or names a different source, or when the pin is no longer the file zellij wrote
+beside it (see [A build copied over the pin no longer reads as current](#a-build-copied-over-the-pin-no-longer-reads-as-current)); a source that cannot be hashed at all falls back
 to [build identity](#a-warning-when-the-running-session-is-a-different-build). Nothing is written on
 every pass but the first after an upgrade, and the binary is around 40 MB. A refresh says so once:
 
@@ -8704,6 +8705,70 @@ worth its cost.
 `zellij-server` only: `trzsz.rs` (new) and the call at the top of `TerminalPane::handle_pty_bytes`.
 Six `trzsz` tests, and a terminal-pane test that the trigger lands on the grid with the rewritten
 id.
+
+### A build copied over the pin no longer reads as current
+
+```
+$ cp <other build> ~/.local/share/zellij/bin/zellij
+$ zellij session status mysession
+pin       /home/<user>/.local/share/zellij/bin/zellij was replaced outside zellij - `zellij
+          session doctor --fix`, run from the installed build, refreshes it
+$ zellij session up mysession
+warning: /home/<user>/.local/share/zellij/bin/zellij was replaced outside zellij: it is not
+         the file zellij wrote from the build its stamp names, so it is treated as stale.
+      refreshed the pinned copy at /home/<user>/.local/share/zellij/bin/zellij
+```
+
+From nkmk.33. The stamp, `<pin>.source-sha256`, says which source build the pin was made from. It
+said nothing about the pin itself. A `cp`, `mv` or `install` of another build over a stamped pin
+left the stamp vouching for the replacement, and `session up`, `session status`, doctor and every
+interactive launch treated that pin as current. The nkmk.33 RC proof hit this: an RC-stamped
+scratch pin with an older build copied over it was never refreshed.
+
+**A third file now records the pin itself: `<pin>.pin-identity`.** Both writers write it after the
+stamp: `install_pinned_exe` and the macOS signing transaction (`record_pin_refreshed_from`). One
+line holds:
+
+- the stamp hash it was recorded beside;
+- the pin's SHA-256;
+- the pin's `stat` identity: device, inode, size, mtime to the nanosecond;
+- the stamp file's own `stat` identity.
+
+**The check costs two `stat`s on nearly every pass.** A pin whose `stat` matches the record is the
+file zellij wrote. Only a pin whose `stat` moved is hashed, once:
+
+| The pin's `stat` | Its bytes | Result |
+|---|---|---|
+| matches | not read | the file zellij wrote |
+| moved | same as recorded (`touch`) | the file zellij wrote; the writer records the new `stat` |
+| moved | different | replaced outside zellij: stale |
+
+`cp` writes in place and moves the mtime. `cp -p` keeps the mtime but moves the size unless both
+builds are one length. `mv` and `install` bring a new inode. The blind spot is the one the source key
+already accepts: a writer that keeps device, inode, size and mtime together.
+
+**A replaced pin is handled like a stale one.** `install_pinned_exe` refreshes it, and still asks
+the release-candidate and anchored-signature guards first. `pin_needs_refresh` reports it, so
+doctor's dry run and the macOS deferred refresh agree with the fix. The writer says the line once
+per pin per process. `session status` reports it and exits 1. Doctor's dry run adds a note.
+
+**An old stamp is unverified, not broken.** The record is believed only when it names the stamp in
+force AND the stamp file's `stat` still matches. Otherwise the stamp alone decides, as before:
+
+- No record: a pin stamped by nkmk.32 or older.
+- A record whose stamp was rewritten since: an older build refreshed the pin, or signed it in place
+  and re-stamped it, without re-recording. Trusting that record would call a pin zellij wrote
+  "replaced" and copy over it.
+
+An unverified pin gets its record at its next write, which is the next release. The writer no
+longer rewrites a stamp that already holds the right line, so a pass that finds the pin current
+keeps the record bound.
+
+`zellij-utils/src/session_lifecycle.rs` (the record, the check, both writers), the status line in
+`src/session_commands.rs`, and the dry-run note in `src/session_doctor_command.rs`. Six tests: an
+in-place `cp`; a rename with size and mtime kept; a `touch`; no record; a record from before a
+re-stamp; a current pass keeps the record valid. Three signing tests now record their simulated
+signature through `record_pin_refreshed_from`, as the signing transaction does.
 
 ## Assessed and deliberately not built
 

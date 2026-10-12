@@ -855,10 +855,20 @@ fn check_pin_freshness(report: &mut Report, name: &str, pinned: &Path, mode: Doc
                 format!("{} was made from this build", pinned.display()),
             ));
         } else if pinned.exists() {
-            report.push(Finding::changed(
+            let finding = Finding::changed(
                 "pin",
                 mode.describe(&format!("refresh the pinned copy at {}", pinned.display())),
-            ));
+            );
+            report.push(
+                if zellij_utils::session_lifecycle::pin_replaced_outside_zellij(pinned) {
+                    finding.note(
+                        "it was replaced outside zellij: it is not the file zellij wrote from \
+                         the build its stamp names",
+                    )
+                } else {
+                    finding
+                },
+            );
         } else {
             report.push(Finding::changed(
                 "pin",

@@ -2076,11 +2076,14 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let key = source_identity(source);
-    if target.exists() && pin_hash_can_be_skipped(target, key.as_ref()) {
+    // the pin's OWN identity, asked before anything below trusts the stamp beside it: a stamp
+    // vouches for the file zellij wrote, not for whatever was copied over it since
+    let replaced = target.exists() && pin_replaced_behind_its_stamp(target);
+    if target.exists() && !replaced && pin_hash_can_be_skipped(target, key.as_ref()) {
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
     }
     let source_hash = sha256_of_file(source);
-    if target.exists() && !pin_is_stale(source, target, source_hash.as_deref()) {
+    if target.exists() && !replaced && !pin_stamp_is_stale(source, target, source_hash.as_deref()) {
         // the pin is current, but nothing here could say so without hashing 40 MB. Record what the
         // source looked like while it was hashed, so the next pass answers from two `stat`s.
         record_pin_source(target, source_hash.as_deref(), key.as_ref());
@@ -2129,6 +2132,7 @@ pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, St
     // post-copy `stat` would instead file the OLD hash under the NEW identity - the next pass
     // matches, skips the hash, and calls the pin current for as long as the source sits still.
     record_pin_source(target, source_hash.as_deref(), key.as_ref());
+    record_pin_identity(target, None);
     Ok(if refreshing {
         PinOutcome::Refreshed(target.to_path_buf())
     } else {
@@ -2152,6 +2156,7 @@ pub fn record_pin_refreshed_from(source: &Path, target: &Path) {
     let key = source_identity(source);
     let source_hash = sha256_of_file(source);
     record_pin_source(target, source_hash.as_deref(), key.as_ref());
+    record_pin_identity(target, None);
 }
 
 /// Signing is a macOS flow, and `session_signing` compiles everywhere. A stub rather than a
@@ -2368,6 +2373,15 @@ fn pin_hash_can_be_skipped(target: &Path, key: Option<&SourceIdentity>) -> bool 
 /// better than refusing to answer.
 #[cfg(unix)]
 fn pin_is_stale(source: &Path, target: &Path, source_hash: Option<&str>) -> bool {
+    pin_stamp_is_stale(source, target, source_hash)
+        || (target.exists() && check_pin_identity(target) == PinIdentity::Replaced)
+}
+
+/// The stamp's half of [`pin_is_stale`]: does the stamp name the source in front of us. It says
+/// nothing about whether the pin is still the file the stamp was written beside - that is
+/// [`check_pin_identity`]'s question.
+#[cfg(unix)]
+fn pin_stamp_is_stale(source: &Path, target: &Path, source_hash: Option<&str>) -> bool {
     let Some(source_hash) = source_hash else {
         let ours = identify_executable(source.to_path_buf());
         let theirs = identify_executable(target.to_path_buf());
@@ -2396,10 +2410,15 @@ fn record_pin_source(target: &Path, source_hash: Option<&str>, key: Option<&Sour
     let key_file = pin_source_key(target);
     match source_hash {
         Some(hash) => {
-            if std::fs::write(stamp, format!("{}\n", hash)).is_err() {
+            // a stamp that already says this is left as it is: the pin's identity record is bound
+            // to the stamp file's own `stat`, and rewriting the same line would unbind it
+            let line = format!("{}\n", hash);
+            let already = std::fs::read_to_string(&stamp).is_ok_and(|stamped| stamped == line);
+            if !already && std::fs::write(&stamp, line).is_err() {
                 // no stamp means no authority, and a cache for an authority that is not there is
                 // the one state that could outlive its stamp and be believed later
                 let _ = std::fs::remove_file(&key_file);
+                let _ = std::fs::remove_file(pin_identity_record(target));
                 return;
             }
             match key {
@@ -2415,7 +2434,167 @@ fn record_pin_source(target: &Path, source_hash: Option<&str>, key: Option<&Sour
         None => {
             let _ = std::fs::remove_file(stamp);
             let _ = std::fs::remove_file(key_file);
+            let _ = std::fs::remove_file(pin_identity_record(target));
         },
+    }
+}
+
+/// The file recording what the PIN itself looked like when zellij wrote it.
+///
+/// The stamp says which build the pin was made from. It cannot say the pin is still that file: a
+/// `cp` of another build over a stamped pin leaves the stamp vouching for the replacement, and
+/// every reader of the stamp - `session up`, doctor, an interactive launch - called it current.
+/// This record closes that. A third file rather than a field in the stamp, for the reason
+/// [`pin_source_key`] gives: an older build reads a one-line stamp and must keep reading it.
+///
+/// One line: the stamp hash it was recorded beside, the pin's SHA-256, the pin's `stat` identity,
+/// and the stamp file's own `stat` identity. See [`check_pin_identity`] for how each is used.
+#[cfg(unix)]
+pub fn pin_identity_record(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".pin-identity");
+    pin_directory(target).join(name)
+}
+
+/// What the pin's identity record says about the file at the pinned path now.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinIdentity {
+    /// The pin looks, to `stat`, exactly as it did when zellij wrote it.
+    Verified,
+    /// The pin's `stat` moved and its bytes did not - a `touch`, or a copy of the very same file.
+    /// The hash is handed back so a writer can record the new `stat` without taking it again.
+    SameBytes(String),
+    /// Nothing to check against: no record, one that does not parse, or one that belongs to
+    /// another stamp - left by a build from before this record existed, or by one that has since
+    /// rewritten the stamp. The stamp is believed, as it always was.
+    Unverified,
+    /// The pin is not the file zellij wrote beside this stamp.
+    Replaced,
+}
+
+/// Whether the file at the pinned path is still the one zellij wrote beside the stamp in force.
+///
+/// **The cost is two `stat`s on nearly every pass.** The pin's `stat` identity - device, inode,
+/// size, mtime - is compared first, and a match settles it. Only a pin whose `stat` moved is
+/// hashed, once, to tell a `touch` from a replacement. `cp` over a pin writes in place and moves
+/// the mtime; `cp -p` keeps the mtime and moves the size unless the two builds are one length; `mv`
+/// and `install` bring a new inode. The blind spot is the one [`pin_hash_can_be_skipped`] already
+/// accepts for the source: a writer that keeps all four.
+///
+/// **A record belongs to one stamp, and to one write of it.** It names the stamp's hash and the
+/// stamp file's own `stat`. A build from before this record re-stamps without re-recording, so a
+/// record it left behind would describe a pin that build has since rewritten - by refreshing it,
+/// or by signing it in place - and calling that "replaced outside zellij" would copy over a pin
+/// zellij wrote itself. A stamp written since the record makes the record say nothing.
+#[cfg(unix)]
+fn check_pin_identity(target: &Path) -> PinIdentity {
+    let Ok(recorded) = std::fs::read_to_string(pin_identity_record(target)) else {
+        return PinIdentity::Unverified;
+    };
+    let fields: Vec<&str> = recorded.split_whitespace().collect();
+    let [stamp_hash, pin_hash, rest @ ..] = fields.as_slice() else {
+        return PinIdentity::Unverified;
+    };
+    if rest.len() != 10 {
+        return PinIdentity::Unverified;
+    }
+    let (Some(pin_then), Some(stamp_then)) = (
+        SourceIdentity::decode(&rest[..5]),
+        SourceIdentity::decode(&rest[5..]),
+    ) else {
+        return PinIdentity::Unverified;
+    };
+    let stamp = pin_source_stamp(target);
+    match std::fs::read_to_string(&stamp) {
+        Ok(stamped) if stamped.trim() == *stamp_hash => {},
+        _ => return PinIdentity::Unverified,
+    }
+    if source_identity(&stamp) != Some(stamp_then) {
+        return PinIdentity::Unverified;
+    }
+    let Some(pin_now) = source_identity(target) else {
+        return PinIdentity::Unverified;
+    };
+    if pin_now == pin_then {
+        return PinIdentity::Verified;
+    }
+    match sha256_of_file(target) {
+        Some(hash) if hash == *pin_hash => PinIdentity::SameBytes(hash),
+        _ => PinIdentity::Replaced,
+    }
+}
+
+/// Whether the pin was replaced behind its stamp's back, asked by a command that only reports:
+/// `session status` and doctor's dry run. Writes nothing and prints nothing.
+#[cfg(unix)]
+pub fn pin_replaced_outside_zellij(target: &Path) -> bool {
+    target.exists() && check_pin_identity(target) == PinIdentity::Replaced
+}
+
+#[cfg(not(unix))]
+pub fn pin_replaced_outside_zellij(_target: &Path) -> bool {
+    false
+}
+
+/// The writer's form of [`pin_replaced_outside_zellij`]. It says a replacement once per pin per
+/// process, and records the new `stat` of a pin whose bytes did not change, so the next pass is two
+/// `stat`s again rather than a hash.
+#[cfg(unix)]
+fn pin_replaced_behind_its_stamp(target: &Path) -> bool {
+    match check_pin_identity(target) {
+        PinIdentity::Verified | PinIdentity::Unverified => false,
+        PinIdentity::SameBytes(hash) => {
+            record_pin_identity(target, Some(hash));
+            false
+        },
+        PinIdentity::Replaced => {
+            if let Ok(mut said) = PIN_REPLACEMENTS.lock() {
+                if !said.iter().any(|pin| pin == target) {
+                    said.push(target.to_path_buf());
+                    eprintln!(
+                        "warning: {} was replaced outside zellij: it is not the file zellij wrote \
+                         from the build its stamp names, so it is treated as stale.",
+                        target.display()
+                    );
+                }
+            }
+            true
+        },
+    }
+}
+
+/// Pins this process has already said were replaced, so the line is said once.
+#[cfg(unix)]
+static PIN_REPLACEMENTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Record what the pin looks like now, beside the stamp in force. The two writers call it right
+/// after the stamp, so the record is bound to the stamp they just wrote.
+///
+/// Best effort, like the stamp: a record that could not be written leaves the pin unverified, which
+/// is how every pin read before this record existed. The `stat` is taken BEFORE the hash, for the
+/// reason `install_pinned_exe` gives for the source key: a pin that changes while it is hashed
+/// leaves a record the next pass cannot match, and that pass hashes again and corrects it.
+#[cfg(unix)]
+fn record_pin_identity(target: &Path, pin_hash: Option<String>) {
+    let record = pin_identity_record(target);
+    let stamp = pin_source_stamp(target);
+    let line = (|| {
+        let stamped = std::fs::read_to_string(&stamp).ok()?;
+        let stamp_identity = source_identity(&stamp)?;
+        let pin_identity = source_identity(target)?;
+        let pin_hash = pin_hash.or_else(|| sha256_of_file(target))?;
+        Some(format!(
+            "{} {} {} {}\n",
+            stamped.trim(),
+            pin_hash,
+            pin_identity.encode(),
+            stamp_identity.encode()
+        ))
+    })();
+    let written = line.is_some_and(|line| std::fs::write(&record, line).is_ok());
+    if !written {
+        let _ = std::fs::remove_file(&record);
     }
 }
 
@@ -4412,6 +4591,8 @@ dev.zellij.session.mysession = {
         let mut signed = std::fs::read(&target).unwrap();
         signed.extend(std::iter::repeat(0xcd).take(900));
         std::fs::write(&target, &signed).unwrap();
+        // and records the signed copy, as the signing transaction does after its rename
+        record_pin_refreshed_from(&source, &target);
 
         assert_eq!(
             install_pinned_exe(&source, &target),
@@ -4422,6 +4603,177 @@ dev.zellij.session.mysession = {
             signed,
             "the signature was copied over by the next `session up`"
         );
+    }
+
+    /// The fault the identity record exists for: `cp` of another build over a pin whose stamp
+    /// names this source. The stamp still agrees, and before the record every reader believed it.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_build_copied_over_a_stamped_pin_reads_as_replaced_and_is_refreshed() {
+        let scratch = ScratchDir::new("pin-replaced");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        assert!(
+            pin_identity_record(&target).exists(),
+            "the writer records the pin"
+        );
+        assert!(!pin_replaced_outside_zellij(&target));
+
+        // what `cp other-build pinned` does: the same inode, rewritten in place
+        let other = elf_with_build_id(&[0x29; 20], 5000);
+        std::fs::write(&target, &other).unwrap();
+
+        assert!(pin_replaced_outside_zellij(&target));
+        assert!(
+            pin_needs_refresh(&source, &target),
+            "a dry run has to report the refresh the fix makes"
+        );
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone()))
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        assert!(
+            !pin_replaced_outside_zellij(&target),
+            "the refresh re-records"
+        );
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+    }
+
+    /// `mv` or `install` over the pin brings a new inode, which `stat` sees even when the size and
+    /// the mtime were made to match.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pin_renamed_over_with_its_size_and_mtime_kept_reads_as_replaced() {
+        let scratch = ScratchDir::new("pin-renamed");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let length = std::fs::metadata(&target).unwrap().len() as usize;
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+        let impostor = scratch.write("impostor", &vec![0x55; length]);
+        std::fs::File::options()
+            .write(true)
+            .open(&impostor)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&impostor, &target).unwrap();
+
+        assert!(pin_replaced_outside_zellij(&target));
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::Refreshed(target.clone()))
+        );
+    }
+
+    /// A `touch` moves the mtime and not the bytes. The hash tells the two apart, and the writer
+    /// records the new `stat` so the next pass does not hash again.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_touched_pin_is_not_called_replaced() {
+        let scratch = ScratchDir::new("pin-touched");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        let recorded = std::fs::read_to_string(pin_identity_record(&target)).unwrap();
+
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+
+        assert!(!pin_replaced_outside_zellij(&target));
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        let after = std::fs::read_to_string(pin_identity_record(&target)).unwrap();
+        assert_ne!(after, recorded, "the new `stat` was not recorded");
+        assert_eq!(check_pin_identity(&target), PinIdentity::Verified);
+    }
+
+    /// A pin stamped by a build from before the identity record has no record to check against.
+    /// It is believed as it always was - unverified, not broken.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_stamp_without_an_identity_record_is_believed_as_before() {
+        let scratch = ScratchDir::new("pin-old-stamp");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        std::fs::remove_file(pin_identity_record(&target)).unwrap();
+        std::fs::write(&target, b"anything at all").unwrap();
+
+        assert_eq!(check_pin_identity(&target), PinIdentity::Unverified);
+        assert!(!pin_replaced_outside_zellij(&target));
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert!(
+            !pin_identity_record(&target).exists(),
+            "a pass that wrote nothing has no file of its own to vouch for"
+        );
+    }
+
+    /// An older build re-stamps without re-recording - after its own refresh, or after signing the
+    /// pin in place. A record from before that write describes a file zellij itself replaced, so
+    /// it must not speak.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_record_from_before_the_stamp_was_rewritten_says_nothing() {
+        let scratch = ScratchDir::new("pin-restamped");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+
+        // what an older build's signing pass does: rewrite the pin, then the stamp, same hash
+        std::fs::write(&target, b"the signed copy").unwrap();
+        let stamp = pin_source_stamp(&target);
+        let stamped = std::fs::read_to_string(&stamp).unwrap();
+        std::fs::write(&stamp, &stamped).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stamp)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(check_pin_identity(&target), PinIdentity::Unverified);
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+    }
+
+    /// The writer leaves a stamp that already says the right thing exactly as it is, because the
+    /// identity record is bound to the stamp file's own `stat`.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn a_pass_that_finds_the_pin_current_keeps_its_record_valid() {
+        let scratch = ScratchDir::new("pin-current");
+        let source = scratch.write("zellij", &elf_with_build_id(&[0xab; 20], 4096));
+        let target = scratch.0.join("pinned");
+        install_pinned_exe(&source, &target).expect("a writable temp dir");
+        // no key, so the pass hashes and re-records the source
+        std::fs::remove_file(pin_source_key(&target)).unwrap();
+
+        assert_eq!(
+            install_pinned_exe(&source, &target),
+            Ok(PinOutcome::UpToDate(target.clone()))
+        );
+        assert_eq!(check_pin_identity(&target), PinIdentity::Verified);
     }
 
     /// What `zellij session doctor --dry-run` reports, asked without writing.
@@ -4542,6 +4894,8 @@ dev.zellij.session.mysession = {
         let mut signed = std::fs::read(&target).unwrap();
         signed.extend(std::iter::repeat(0xcd).take(900));
         std::fs::write(&target, &signed).unwrap();
+        // and records the signed copy, as the signing transaction does after its rename
+        record_pin_refreshed_from(&source, &target);
 
         let before = source_identity(&source).unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -5295,6 +5649,8 @@ dev.zellij.session.mysession = {
         let mut signed = std::fs::read(&target).unwrap();
         signed.extend(std::iter::repeat(0xcd).take(900));
         std::fs::write(&target, &signed).unwrap();
+        // and records the signed copy, as the signing transaction does after its rename
+        record_pin_refreshed_from(&source, &target);
 
         assert_eq!(
             install_pinned_exe(&target, &target),

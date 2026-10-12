@@ -988,6 +988,27 @@ fn print_pin_state<W: Write + ?Sized>(
         writeln!(out, "pin       off (no `pin_exe` in session_service)")?;
         return Ok(true);
     };
+    // the stamp beside the pin vouches for the file zellij wrote; a build copied over it since is
+    // not what that stamp describes, whatever the launcher points at
+    let agrees = print_pin_line(out, name, pinned)?;
+    if zellij_utils::session_lifecycle::pin_replaced_outside_zellij(pinned) {
+        writeln!(
+            out,
+            "pin       {} was replaced outside zellij - `zellij session doctor --fix`, run from \
+             the installed build, refreshes it",
+            pinned.display()
+        )?;
+        return Ok(false);
+    }
+    Ok(agrees)
+}
+
+/// Which pin the launcher runs, for [`print_pin_state`].
+fn print_pin_line<W: Write + ?Sized>(
+    out: &mut W,
+    name: &str,
+    pinned: &std::path::Path,
+) -> io::Result<bool> {
     match pin_state_of(name, pinned) {
         PinState::Recorded(path) => {
             writeln!(out, "pin       {} - the launcher runs it", path.display())?;
