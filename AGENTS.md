@@ -298,6 +298,20 @@ zellij delete-session <throwaway-name> --force --yes
 
 Then kill the sessions and confirm the servers are gone when you finish.
 
+**Clear the agent's own identity before you start a scratch server from inside an agent.** A
+server hands its environment to every pane it creates, and an agent's shell carries
+`AGENT_SESSION_ID`, `AGENT_KIND` and the harness's own variables (`CLAUDE_CODE_*`,
+`CLAUDECODE`, and the like). Started from there, the scratch server reports the calling agent's
+session on every pane, and a test of agent detection passes or fails for the wrong reason:
+
+```sh
+env -u AGENT_SESSION_ID -u AGENT_KIND -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID \
+  zellij --session <throwaway-name>
+```
+
+`session_restart_drop_env` drops named variables when a session is created, but only those the
+config names, and a scratch config may name none.
+
 **The scratch path must be short.** A unix socket path maxes out near 104 bytes, and the session
 socket sits several directories below `ZELLIJ_SOCKET_DIR`. A deep path fails with `IPC socket path
 is too long` and the failure does not name the cause. Use something like `/tmp/zj-test`, not a path
