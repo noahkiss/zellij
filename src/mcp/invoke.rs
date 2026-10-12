@@ -471,7 +471,7 @@ async fn plan_in(
     let session = read
         .string("session")
         .or_else(|| ambient_session.map(String::from));
-    let then_type = typed_command(&read)?.map(|command| TypeAfter {
+    let then_type = typed_command(&read, env)?.map(|command| TypeAfter {
         session: session.clone(),
         command,
     });
@@ -662,21 +662,78 @@ pub fn agent_key(
     }
 }
 
-/// How a create runs its `command`: `shell` or `exec`, refused when it is neither.
+/// How a create runs its `command`: `shell`, `exec` or `agent`, refused when it is none of them.
 fn run_in(args: &Args) -> Result<String, String> {
     let run_in = args.enumerated("run_in", RUN_IN_DEFAULT);
     match run_in.as_str() {
-        "shell" | "exec" => Ok(run_in),
-        other => Err(format!("`run_in` must be shell or exec, not `{}`.", other)),
+        "shell" | "exec" | "agent" => Ok(run_in),
+        other => Err(format!(
+            "`run_in` must be shell, exec or agent, not `{}`.",
+            other
+        )),
     }
 }
 
 /// The command a create types into its pane once the pane is ready: the `command` of a
-/// `run_in: shell` create, and nothing for an `exec` one, which hands it to the server instead.
-fn typed_command(args: &Args) -> Result<Option<String>, String> {
+/// `run_in: shell` create, the harness and its brief for an `agent` one, and nothing for an
+/// `exec` one, which hands it to the server instead.
+fn typed_command(args: &Args, env: &CallEnv) -> Result<Option<String>, String> {
+    if args.string("brief").is_some() && run_in(args)? != "agent" {
+        return Err(
+            "`brief` is the first prompt of an agent: pass it with run_in=agent.".to_owned(),
+        );
+    }
     Ok(match run_in(args)?.as_str() {
         "shell" => args.string("command"),
+        "agent" => Some(agent_command(args, env)?),
         _ => None,
+    })
+}
+
+/// The line an `agent` create types into its shell: the harness command as the caller wrote it,
+/// and the brief file's text as its first prompt, in the form that harness takes one.
+///
+/// The brief is read by the pane's own shell, `"$(cat '<path>')"`, so its text never passes
+/// through this command line, a shell history line keeps the short form, and quotes or newlines
+/// in it arrive as written. Everything after `--` is the prompt, so a brief that begins with a
+/// dash is not read as a flag. opencode takes its first prompt as `--prompt`.
+///
+/// A session restore records an agent pane as the bare resume of its session (nkmk.32), so the
+/// brief, which reaches the harness as an argument, is never typed again by a restore.
+fn agent_command(args: &Args, env: &CallEnv) -> Result<String, String> {
+    let command = args.required("command").map_err(|_| {
+        "run_in=agent needs `command`: the harness to start, like `claude` or `codex --model \
+         o3`."
+            .to_owned()
+    })?;
+    let program = command.split_whitespace().next().unwrap_or_default();
+    let harness = zellij_utils::agent_detect::harness_for_command(program).ok_or_else(|| {
+        format!(
+            "`{}` is not a coding agent this build knows: run_in=agent starts claude, codex, \
+             opencode or pi.",
+            program
+        )
+    })?;
+    let Some(brief) = args.string("brief") else {
+        return Ok(command);
+    };
+    let expanded = expand_path(&brief, env)?;
+    let path = Path::new(&expanded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env.base.join(path)
+    };
+    if !path.is_file() {
+        return Err(format!("`brief` {} is not a file.", path.display()));
+    }
+    let quoted = format!(
+        "\"$(cat '{}')\"",
+        path.to_string_lossy().replace('\'', "'\\''")
+    );
+    Ok(match harness.kind {
+        "opencode" => format!("{} --prompt {}", command, quoted),
+        _ => format!("{} -- {}", command, quoted),
     })
 }
 
@@ -918,7 +975,8 @@ fn argv_in(
             // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
             // ready - see `TypeAfter`. `exec` hands `command` to the server as `$SHELL -c`, as
             // every create did before, and waits for nothing
-            let shell_mode = run_in(&args)? == "shell";
+            // an `agent` create is a shell create whose typed line is the harness and its brief
+            let shell_mode = run_in(&args)? != "exec";
             let wait_ready = shell_mode && args.flag_or("wait_ready", true);
             // the end of every create's command line: the readiness wait, or the command after
             // `--`, which has to come last because everything after it is the command's own argv
@@ -934,6 +992,16 @@ fn argv_in(
             };
             let mut rest = vec!["action".to_owned()];
             match kind.as_str() {
+                "agent_tab" if args.flag("floating") => {
+                    // `--new-tab` refuses `--floating`, so the first create into a tab that is
+                    // not there yet would fail where the second succeeded. Refusing both is the
+                    // only answer that does not depend on which call arrived first
+                    return Err(
+                        "A floating pane cannot arrive with the tab that holds it. Ask for \
+                                `kind: floating`, which floats beside your own pane."
+                            .to_owned(),
+                    );
+                },
                 "agent_tab" => {
                     let Some((tab, placement)) = agent_tab else {
                         return Err(
@@ -942,14 +1010,6 @@ fn argv_in(
                                 .to_owned(),
                         );
                     };
-                    if args.flag("floating") {
-                        // `--new-tab` refuses `--floating`, so the first create into a tab that is
-                        // not there yet would fail where the second succeeded. Refusing both is the
-                        // only answer that does not depend on which call arrived first
-                        return Err("A floating pane cannot arrive with the tab that holds it. \
-                                    Ask for `kind: pane`, or make the agent's tab first."
-                            .to_owned());
-                    }
                     rest.push("new-pane".to_owned());
                     rest.push(match placement {
                         TabPlacement::Existing => flag_value("--in-tab", tab),
@@ -974,7 +1034,7 @@ fn argv_in(
                     }
                     finish(&mut rest);
                 },
-                "pane" => {
+                "pane" | "floating" => {
                     rest.push("new-pane".to_owned());
                     // beside the agent's own pane, not beside whichever pane a person happens to
                     // be focused on. Without a `$ZELLIJ_PANE_ID` to resolve, the CLI says so
@@ -988,7 +1048,9 @@ fn argv_in(
                     if let Some(handle) = chosen_handle(&args)? {
                         rest.push(flag_value("--handle", &handle));
                     }
-                    if args.flag("floating") {
+                    // two spellings of one pane: `kind: floating`, and `kind: pane` with the
+                    // `floating` flag
+                    if kind == "floating" || args.flag("floating") {
                         rest.push("--floating".to_owned());
                     }
                     finish(&mut rest);
@@ -1015,7 +1077,7 @@ fn argv_in(
                 },
                 other => {
                     return Err(format!(
-                        "`kind` must be agent_tab, pane or tab, not `{}`.",
+                        "`kind` must be agent_tab, pane, floating or tab, not `{}`.",
                         other
                     ));
                 },
@@ -1766,7 +1828,7 @@ mod tests {
             "zellij_create",
             json!({"kind": "pane", "command": "make", "run_in": "login"})
         )
-        .contains("shell or exec"));
+        .contains("shell, exec or agent"));
     }
 
     #[tokio::test]
@@ -1815,6 +1877,91 @@ mod tests {
         .await
         .expect("a plan");
         assert!(plan.then_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_agent_create_types_the_harness_with_its_brief_as_the_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let brief = dir.path().join("it's a brief.md");
+        std::fs::write(&brief, "- fix the test\n").unwrap();
+        let env = call_env(Some("/bin/zsh"), Some("/home/tester"), dir.path(), &[]);
+        let typed = |value: Value| {
+            let env = &env;
+            async move {
+                plan_in("zellij_create", &args(value), None, env)
+                    .await
+                    .map(|plan| plan.then_type.map(|then_type| then_type.command))
+            }
+        };
+        let quoted = format!(
+            "\"$(cat '{}')\"",
+            brief.to_string_lossy().replace('\'', "'\\''")
+        );
+        assert_eq!(
+            typed(
+                json!({"kind": "pane", "run_in": "agent", "command": "claude --model haiku",
+                         "brief": "it's a brief.md"})
+            )
+            .await,
+            Ok(Some(format!("claude --model haiku -- {}", quoted)))
+        );
+        // opencode takes its first prompt as a flag
+        assert_eq!(
+            typed(
+                json!({"kind": "pane", "run_in": "agent", "command": "opencode",
+                         "brief": brief.to_string_lossy()})
+            )
+            .await,
+            Ok(Some(format!("opencode --prompt {}", quoted)))
+        );
+        // no brief starts the harness bare
+        assert_eq!(
+            typed(json!({"kind": "pane", "run_in": "agent", "command": "/usr/bin/codex -m o3"}))
+                .await,
+            Ok(Some("/usr/bin/codex -m o3".to_owned()))
+        );
+        for (refused, says) in [
+            (
+                json!({"kind": "pane", "run_in": "agent", "command": "vim"}),
+                "not a coding agent",
+            ),
+            (
+                json!({"kind": "pane", "run_in": "agent"}),
+                "needs `command`",
+            ),
+            (
+                json!({"kind": "pane", "run_in": "agent", "command": "pi", "brief": "nope.md"}),
+                "is not a file",
+            ),
+            (
+                json!({"kind": "pane", "command": "ls", "brief": "it's a brief.md"}),
+                "with run_in=agent",
+            ),
+        ] {
+            let error = typed(refused.clone()).await.unwrap_err();
+            assert!(error.contains(says), "{}: {}", refused, error);
+        }
+        // an agent pane waits for its shell like any shell create
+        assert!(line(
+            "zellij_create",
+            json!({"kind": "pane", "run_in": "agent", "command": "claude"}),
+            None
+        )
+        .contains("--wait-ready"));
+    }
+
+    #[test]
+    fn a_floating_pane_is_a_kind_and_the_old_flag_still_floats() {
+        let floating = line("zellij_create", json!({"kind": "floating"}), None);
+        assert!(floating.contains("--near-current-pane"), "{}", floating);
+        assert!(floating.contains("--floating"), "{}", floating);
+        assert!(line(
+            "zellij_create",
+            json!({"kind": "pane", "floating": true}),
+            None
+        )
+        .contains("--floating"));
+        assert!(!line("zellij_create", json!({"kind": "pane"}), None).contains("--floating"));
     }
 
     #[test]
@@ -2034,7 +2181,7 @@ mod tests {
             Some(("work-zj", TabPlacement::Existing)),
         )
         .expect_err("a floating pane in the agent's tab");
-        assert!(said.contains("`kind: pane`"), "{}", said);
+        assert!(said.contains("`kind: floating`"), "{}", said);
     }
 
     #[test]

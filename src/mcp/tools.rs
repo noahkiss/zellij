@@ -395,9 +395,11 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_create",
-        summary: "Make a pane to work in, optionally running a command in it.",
+        summary: "Make a pane to work in, optionally running a command in it, or start a \
+                  coding agent in one with a brief as its first prompt.",
         best_for: "starting work when you have no pane of your own yet. One pane per job is the \
-                   norm; after that, write to the one you have.",
+                   norm; after that, write to the one you have. With run_in=agent, handing a job \
+                   to another coding agent.",
         not_for:
             "running something in a pane that already exists - write to it instead. Not for a \
                   second pane when your first one is idle, and not for replacing a pane whose \
@@ -417,12 +419,21 @@ pub const TOOLS: &[ToolSpec] = &[
                time is reported as `ready: false` with the pane's handle, and nothing is typed. \
                The handle in the answer is the pane's address and survives a session restore; \
                use it, not the integer id, and pass `handle` yourself when you want to find the \
-               pane again by a name you chose.",
+               pane again by a name you chose. run_in=agent starts a coding agent: command is \
+               the harness and its flags (claude, codex, opencode or pi; pass the model the \
+               harness's own way, `--model` for all four), brief is a file whose text becomes its \
+               first prompt, cwd is where it works and name is what its frame says. It is typed \
+               into your shell once the shell is ready, like any shell command, and the call \
+               returns the pane's handle as soon as it is typed: follow with zellij_wait_for \
+               until=agent_idle for the end of its first turn, and zellij_read_pane last_reply \
+               for what it said. The brief is in the agent's command line, so list-agents shows \
+               it; a session restore brings the agent back as a resume of its session, without \
+               the brief.",
         params: &[
             SESSION,
             ParamSpec {
                 name: "kind",
-                kind: ParamKind::Enum(&["agent_tab", "pane", "tab"]),
+                kind: ParamKind::Enum(&["agent_tab", "pane", "floating", "tab"]),
                 required: false,
                 from: None,
                 describe: "Where the pane goes. agent_tab, the default, is your own tab - the tab \
@@ -430,7 +441,8 @@ pub const TOOLS: &[ToolSpec] = &[
                            not take the person's focus. It is named after the tab this server's \
                            own pane is in, even when `session` names a different session. Use it \
                            unless you have a reason not to. pane splits your own pane where you \
-                           are. tab makes a fresh tab of its own.",
+                           are. floating floats over your own tab, the same as pane with \
+                           `floating: true`. tab makes a fresh tab of its own.",
                 default: Some(invoke::CREATE_KIND_DEFAULT),
             },
             ParamSpec {
@@ -444,7 +456,7 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "run_in",
-                kind: ParamKind::Enum(&["shell", "exec"]),
+                kind: ParamKind::Enum(&["shell", "exec", "agent"]),
                 required: false,
                 from: None,
                 describe: "How `command` runs. shell, the default, types it into your interactive \
@@ -452,7 +464,8 @@ pub const TOOLS: &[ToolSpec] = &[
                            apply, and the pane stays a shell afterwards. exec runs it as \
                            `$SHELL -c`, which reads no interactive rc file, ends the pane's \
                            command when it ends, and keeps its exit status for zellij_wait_for \
-                           until=exit.",
+                           until=exit. agent is shell for a coding agent: `command` must start \
+                           claude, codex, opencode or pi, and `brief` becomes its first prompt.",
                 default: Some(invoke::RUN_IN_DEFAULT),
             },
             ParamSpec {
@@ -501,6 +514,17 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action new-pane", "--floating")),
                 describe: "",
+                default: None,
+            },
+            ParamSpec {
+                name: "brief",
+                kind: ParamKind::Str,
+                required: false,
+                from: None,
+                describe: "With run_in=agent: a file whose text is the agent's first prompt. \
+                           `~` and `$VAR` are expanded, and a relative path is taken from this \
+                           server's directory. The agent's shell reads it, so it can be long and \
+                           hold any characters.",
                 default: None,
             },
         ],
@@ -1234,9 +1258,10 @@ mod tests {
                 "{} is not namespaced by its service",
                 tool.name
             );
-            // nine, for `zellij_create`: `run_in` and `wait_ready` joined its seven at nkmk.32
+            // ten, for `zellij_create`: `run_in` and `wait_ready` joined its seven at nkmk.32,
+            // and `brief` at nkmk.34, beside `floating` rather than in place of it
             assert!(
-                tool.params.len() <= 9,
+                tool.params.len() <= 10,
                 "{} asks for more parameters than an agent can be expected to get right",
                 tool.name
             );

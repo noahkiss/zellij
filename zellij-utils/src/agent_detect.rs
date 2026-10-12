@@ -493,7 +493,9 @@ fn state_cell(status: &crate::data::PaneProgramStatus) -> String {
 /// `-` is how the fork's output says a field has no value, rather than printing an empty column.
 fn dashed(value: Option<String>) -> String {
     match value {
-        Some(value) if !value.is_empty() => value,
+        // a table row is one line: an agent started with a multi-line prompt has newlines in its
+        // command, and they would break the row in two
+        Some(value) if !value.is_empty() => value.replace(['\n', '\r', '\t'], " "),
         _ => "-".to_owned(),
     }
 }
@@ -784,6 +786,19 @@ mod tests {
             }),
             session: session.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn a_multi_line_command_stays_on_its_own_row() {
+        let mut agent = watched(1, None, None);
+        agent.command = Some("claude -- line one\nline two".to_owned());
+        let table = agent_table(&vec![agent]);
+        assert_eq!(table.len(), 2);
+        assert!(
+            table[1].contains("claude -- line one line two"),
+            "{}",
+            table[1]
+        );
     }
 
     #[test]

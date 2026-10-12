@@ -8,7 +8,7 @@
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
 //! * **Nine tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
-//!   fails if it grows past nine or if a tool asks for more than nine parameters.
+//!   fails if it grows past nine or if a tool asks for more than ten parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
 //! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so

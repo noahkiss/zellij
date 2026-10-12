@@ -9383,6 +9383,55 @@ an unknown pane answered as a miss.
 `src/mcp/invoke.rs` (`argv_in`, the refusals in `write_input_call`). Tests: the command line, a
 path beginning with a dash kept behind `--`, and the four refusals.
 
+### `zellij_create run_in=agent`: start an agent from a brief
+
+From nkmk.34, from the agent-orchestration plan. Handing a job to another agent meant making a
+pane, waiting for its shell, and typing a harness command with the brief quoted into it by hand.
+
+```
+zellij_create {"run_in": "agent", "command": "claude --model opus", "brief": "~/briefs/fix-ci.md",
+               "cwd": "~/src/app", "name": "fix-ci"}
+  # action new-pane --in-tab=work-zj --no-focus --cwd=/home/u/src/app --name=fix-ci --wait-ready ...
+  # then, once the shell is ready, typed:  claude --model opus -- "$(cat '/home/u/briefs/fix-ci.md')"
+pane_id: terminal_9
+handle: brisk-heron
+ready_by: prompt
+```
+
+- **`run_in` takes `agent`.** It is the `shell` mode with a different typed line: the pane is made
+  wherever `kind` says (the caller's `-zj` tab by default), its shell is waited for, and then the
+  harness is typed and Enter pressed. The answer is the pane's handle as soon as the line is typed;
+  `zellij_wait_for until=agent_idle` waits for the end of the first turn, and `zellij_read_pane
+  last_reply` reads what the agent said.
+- **`command` is the harness and its flags**, as the caller would type them. Its first word must be
+  claude, codex, opencode or pi (by basename, the same table `list-agents` matches), or the call is
+  refused. The model goes in it the harness's own way; all four take `--model`.
+- **`brief` is a file whose text is the first prompt.** The pane's own shell reads it:
+  `"$(cat '<path>')"`, after `--` so that a brief beginning with a dash is not read as a flag
+  (`--prompt` for opencode, which takes its first prompt as a flag). The text never passes through
+  the MCP call or the typed line, so it can be long and hold quotes and newlines. The path is
+  expanded like `cwd` and must be a file. Without `brief` the harness starts bare. `brief` with any
+  other `run_in` is refused.
+- **A restore does not send the brief again.** The brief reaches the harness as an argument, so it
+  is in the agent's argv, and `list-agents` shows it in `command`. nkmk.32's bare resume records a
+  known harness as argv0 and its session words only, in every `resurrect_commands` mode (see
+  [only its agents](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents)), so the
+  restored pane is `claude --resume <id>`. Verified live on a spawned claude: `session-layout.kdl`
+  held `args "--resume" "<id>"`.
+- **The `list-agents` table folds a newline in a cell to a space**, so a multi-line brief in an
+  agent's command no longer splits its row in two. `--json` keeps the command as it is.
+- **`kind` takes `floating`** as well: a floating pane beside the caller's own, what `kind: pane`
+  with `floating: true` makes. The `floating` flag stays, so no caller breaks, and `brief` takes
+  the tool to ten parameters: the cap moved from nine to ten for it.
+
+The brief is typed as `"$(cat …)"`, which bash, zsh and fish 3.4+ read the same way. A shell
+without `$( )` (nu, older fish) gets the line literally. Files: `src/mcp/invoke.rs` (`run_in`,
+`typed_command`, `agent_command`, the `floating` kind), `src/mcp/tools.rs`,
+`zellij-utils/src/agent_detect.rs` (the table fold). Tests: the typed line
+for claude and opencode, a path with a quote in it, no brief, the refusals (not a harness, no
+command, no file, a brief without `run_in=agent`), the readiness wait, both spellings of a
+floating pane, and a multi-line command on one table row.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
