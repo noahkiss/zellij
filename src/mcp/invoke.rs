@@ -615,9 +615,19 @@ fn argv_in(
         },
         "zellij_wait_for" => {
             let until = args.enumerated("until", "exit");
-            if !["exit", "match", "quiet", "ready"].contains(&until.as_str()) {
+            if ![
+                "exit",
+                "match",
+                "quiet",
+                "ready",
+                "agent_idle",
+                "agent_waiting",
+            ]
+            .contains(&until.as_str())
+            {
                 return Err(format!(
-                    "`until` must be exit, match, quiet or ready, not `{}`.",
+                    "`until` must be exit, match, quiet, ready, agent_idle or agent_waiting, \
+                     not `{}`.",
                     until
                 ));
             }
@@ -626,7 +636,9 @@ fn argv_in(
                 "wait".to_owned(),
                 args.required("pane")?,
                 "--for".to_owned(),
-                until.clone(),
+                // the tool's enum spells its values the way its other enums do; the CLI's are
+                // kebab-case
+                until.replace('_', "-"),
             ];
             if until == "match" {
                 rest.push("--match".to_owned());
@@ -1255,7 +1267,27 @@ mod tests {
         );
         assert!(
             refusal("zellij_wait_for", json!({"pane": "3", "until": "soon"}))
-                .contains("exit, match, quiet or ready")
+                .contains("exit, match, quiet, ready, agent_idle or agent_waiting")
+        );
+    }
+
+    #[test]
+    fn an_agent_wait_is_the_cli_agent_wait() {
+        assert_eq!(
+            line(
+                "zellij_wait_for",
+                json!({"pane": "sunny-otter", "until": "agent_idle"}),
+                None
+            ),
+            "action wait sunny-otter --for agent-idle --timeout 300"
+        );
+        assert_eq!(
+            line(
+                "zellij_wait_for",
+                json!({"pane": "3", "until": "agent_waiting", "timeout_s": 60}),
+                None
+            ),
+            "action wait 3 --for agent-waiting --timeout 60"
         );
     }
 

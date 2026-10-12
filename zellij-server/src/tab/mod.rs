@@ -893,6 +893,11 @@ pub trait Pane {
     fn input_since_prompt(&self) -> bool {
         false
     }
+    /// Whether input was typed into the pane after a program in it last reported over `OSC
+    /// 7501`. Only a terminal pane can say; see `ProgramStatusRecords::input_since_report`.
+    fn input_since_state(&self) -> bool {
+        false
+    }
     fn update_exit_status(&mut self, _exit_status: i32) {}
     fn set_plugin_regex_highlights(
         &mut self,

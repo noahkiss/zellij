@@ -16,7 +16,7 @@ use zellij_utils::{
     cli::{SubscribeCli, SubscribeFormat},
     data::{
         ListAgentsEnvelope, ListAgentsResponse, ListPanesEnvelope, PaneCommandState, PaneDump,
-        PaneId, PaneListEntry, PaneTarget,
+        PaneId, PaneListEntry, PaneProgramStatus, PaneTarget,
     },
     errors::prelude::*,
     input::actions::Action,
@@ -847,6 +847,13 @@ pub enum WaitCondition {
     Match(String),
     /// The pane's shell is ready for input. The duration is the quiet window of the fallback.
     Ready(Duration),
+    /// The coding agent in the pane stopped working (`waiting: false`), or is blocked on a
+    /// person (`waiting: true`). `quiet` is the silence that answers for an agent that reports no
+    /// state.
+    Agent {
+        waiting: bool,
+        quiet: Duration,
+    },
 }
 
 /// Reads `list-panes --json` for the one pane the wait is about.
@@ -925,7 +932,12 @@ fn remaining(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
 /// The report a met wait prints: how long it took, and what it saw.
 fn wait_report(waited: Duration, found: Option<String>) -> Vec<String> {
     let mut lines = vec![format!("waited_ms: {}", waited.as_millis())];
-    lines.extend(found);
+    // a wait may report several keys, one per line
+    lines.extend(
+        found
+            .iter()
+            .flat_map(|found| found.lines().map(str::to_owned)),
+    );
     lines
 }
 
@@ -968,6 +980,10 @@ pub fn start_wait_client(
         WaitCondition::Ready(quiet) => {
             wait_for_ready(make_os_input, session_name, pane, quiet, deadline)
                 .map(|ready_by| Some(format!("ready_by: {}", ready_by.as_str())))
+        },
+        WaitCondition::Agent { waiting, quiet } => {
+            wait_for_agent(make_os_input, session_name, pane, waiting, quiet, deadline)
+                .map(|verdict| Some(agent_report(&verdict).join("\n")))
         },
     };
     match outcome {
@@ -1873,6 +1889,238 @@ fn wait_for_ready(
     answer
 }
 
+/// What a `--for agent-idle` or `--for agent-waiting` look read off the pane's row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentLook {
+    /// The `OSC 7501` state the pane holds, `None` when no program in it has reported one.
+    state: Option<PaneProgramStatus>,
+    /// Input was typed after that state was reported, so it describes the turn before.
+    stale: bool,
+}
+
+/// How a met agent wait was judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentVerdict {
+    /// The agent reported this state after the last input.
+    State(PaneProgramStatus),
+    /// No state to read, and the pane fell quiet: a heuristic, for an agent that reports none.
+    Quiet,
+}
+
+/// The decisions of an agent wait, apart from the session it asks, so they can be proven from a
+/// scripted sequence of renders and looks.
+///
+/// The agent's own word wins. A state counts only when it was reported after the last input:
+/// right after a message is typed, the pane still holds the `done` of the turn before until the
+/// agent reports `working`. With no state at all the pane's silence answers for `agent-idle`,
+/// and nothing answers for `agent-waiting`, which misses once the pane has been quiet that long.
+#[derive(Debug)]
+struct AgentWatch {
+    waiting: bool,
+    quiet: ReadyWatch,
+}
+
+impl AgentWatch {
+    fn new(waiting: bool, quiet: Duration) -> Self {
+        AgentWatch {
+            waiting,
+            quiet: ReadyWatch::new(quiet),
+        }
+    }
+
+    fn rendered(&mut self, viewport: &[String], now: Instant) {
+        self.quiet.rendered(viewport, now);
+    }
+
+    fn quiet_at(&self) -> Option<Instant> {
+        self.quiet.quiet_at()
+    }
+
+    /// `Ok(Some)` met, `Ok(None)` keep waiting, `Err` a miss to report.
+    fn judge(&self, look: &AgentLook, now: Instant) -> Result<Option<AgentVerdict>, String> {
+        let quiet_now = self.quiet.quiet_at().map_or(false, |at| now >= at);
+        match (&look.state, look.stale) {
+            // the pane holds a state from before the last input: the agent has not taken the
+            // input up yet. Neither the state nor the silence answers until it reports again
+            (Some(_), true) => Ok(None),
+            (Some(state), false) => match (state.state.as_str(), self.waiting) {
+                ("working", _) => Ok(None),
+                ("blocked", _) => Ok(Some(AgentVerdict::State(state.clone()))),
+                (_, false) => Ok(Some(AgentVerdict::State(state.clone()))),
+                (finished, true) => Err(format!(
+                    "the agent ended its turn ({}) without asking anything.",
+                    finished
+                )),
+            },
+            (None, _) if !quiet_now => Ok(None),
+            (None, _) if !self.waiting => Ok(Some(AgentVerdict::Quiet)),
+            (None, _) => Err(
+                "it reports no agent state (OSC 7501), so nothing can say it is blocked. claude \
+                 and pi report one; codex reports one through the hooks `zellij setup \
+                 --agent-hooks` prints; opencode does not. Wait with `--for agent-idle`, which \
+                 falls back to silence, and read the pane."
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// The record lines a met agent wait prints after `waited_ms`.
+fn agent_report(verdict: &AgentVerdict) -> Vec<String> {
+    // one line per key, so a message that spans lines is folded onto one
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match verdict {
+        AgentVerdict::Quiet => vec!["idle_by: quiet".to_owned()],
+        AgentVerdict::State(state) => {
+            let mut lines = vec![
+                "idle_by: state".to_owned(),
+                format!("state: {}", state.state),
+            ];
+            if let Some(kind) = &state.kind {
+                lines.push(format!("state_kind: {}", kind));
+            }
+            if let Some(msg) = state
+                .msg
+                .as_deref()
+                .map(one_line)
+                .filter(|msg| !msg.is_empty())
+            {
+                lines.push(format!("state_msg: {}", msg));
+            }
+            lines
+        },
+    }
+}
+
+/// The pane's row in a `list-panes --json` answer, read for an agent wait.
+fn agent_look(panes_json: &str, pane: PaneId) -> Result<(PaneState, AgentLook), String> {
+    let panes: Vec<PaneListEntry> =
+        serde_json::from_str(panes_json).map_err(|e| format!("Could not read the panes: {}", e))?;
+    let found = panes.into_iter().find(|entry| {
+        let info = &entry.pane_info;
+        match pane {
+            PaneId::Terminal(id) => !info.is_plugin && info.id == id,
+            PaneId::Plugin(id) => info.is_plugin && info.id == id,
+        }
+    });
+    let none = AgentLook {
+        state: None,
+        stale: false,
+    };
+    Ok(match found {
+        None => (PaneState::Gone, none),
+        Some(entry) if entry.pane_info.exited => {
+            (PaneState::Exited(entry.pane_info.exit_status), none)
+        },
+        Some(entry) => (
+            PaneState::Running,
+            AgentLook {
+                state: entry.program_status,
+                stale: entry.input_since_state,
+            },
+        ),
+    })
+}
+
+/// `--for agent-idle` and `--for agent-waiting`: a poll of `list-panes` for the agent's own word,
+/// on the 250 ms tick `--for exit` uses, and the render stream for the silence fallback.
+///
+/// A pane that closes, or whose command exits, before the agent stops is a miss.
+fn wait_for_agent(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    waiting: bool,
+    quiet: Duration,
+    deadline: Option<Instant>,
+) -> Result<AgentVerdict, WaitMiss> {
+    let os_input = make_os_input();
+    let updates = subscribe_to_renders(&*os_input, session_name, pane)?;
+    let mut watch = AgentWatch::new(waiting, quiet);
+    let mut next_look = Instant::now();
+    let what = if waiting {
+        "was not blocked on a person"
+    } else {
+        "had not stopped working since the last input"
+    };
+    let answer = loop {
+        if Instant::now() >= next_look {
+            let look = ask(
+                make_os_input(),
+                session_name,
+                Action::ListPanes {
+                    show_tab: false,
+                    show_command: false,
+                    show_state: false,
+                    show_geometry: false,
+                    show_all: true,
+                    output_json: true,
+                    report_withheld: false,
+                },
+                &pane.to_string(),
+            )
+            .and_then(|lines| agent_look(&lines.join("\n"), pane));
+            match look {
+                Err(message) => break Err(WaitMiss::Failed(message)),
+                Ok((PaneState::Gone, _)) => {
+                    break Err(WaitMiss::Missed(format!("{} closed.", pane)))
+                },
+                Ok((PaneState::Exited(status), _)) => {
+                    break Err(WaitMiss::Missed(format!(
+                        "{} exited (exit_status: {}).",
+                        pane,
+                        status.map_or_else(|| "-".to_owned(), |status| status.to_string())
+                    )))
+                },
+                Ok((PaneState::Running, look)) => match watch.judge(&look, Instant::now()) {
+                    Ok(Some(verdict)) => break Ok(verdict),
+                    Ok(None) => {},
+                    Err(why) => break Err(WaitMiss::Missed(format!("{}: {}", pane, why))),
+                },
+            }
+            next_look = Instant::now() + EXIT_POLL_INTERVAL;
+        }
+        let now = Instant::now();
+        if remaining(deadline, now) == Some(Duration::ZERO) {
+            break Err(WaitMiss::Missed(format!(
+                "{} {} when the wait timed out.",
+                pane, what
+            )));
+        }
+        if let Some(quiet_at) = watch.quiet_at().filter(|at| *at > now) {
+            next_look = next_look.min(quiet_at);
+        }
+        let wake = match deadline {
+            Some(deadline) => next_look.min(deadline),
+            None => next_look,
+        };
+        match updates.recv_timeout(wake.saturating_duration_since(now)) {
+            Ok(ServerToClientMsg::PaneRenderUpdate { viewport, .. }) => {
+                watch.rendered(&viewport, Instant::now());
+            },
+            Ok(ServerToClientMsg::SubscribedPaneClosed { .. }) => {
+                break Err(WaitMiss::Missed(format!("{} closed.", pane)))
+            },
+            Ok(ServerToClientMsg::LogError { lines }) => {
+                break Err(WaitMiss::Failed(lines.join("\n")))
+            },
+            Ok(ServerToClientMsg::Exit { .. }) => {
+                break Err(WaitMiss::Missed(
+                    "The session exited during the wait.".to_owned(),
+                ))
+            },
+            Ok(_) | Err(RecvTimeoutError::Timeout) => {},
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(WaitMiss::Failed(
+                    "The session stopped answering while the wait was running.".to_owned(),
+                ))
+            },
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    answer
+}
+
 /// Subscribe to one pane's renders, and hand them over on a channel read by a thread - so that a
 /// deadline is still reachable while nothing is arriving. `recv_from_server` blocks, and a pane
 /// that fell silent is exactly the case where it blocks longest.
@@ -2285,6 +2533,7 @@ mod tests {
                 last_command_exit_code: None,
                 program_status: None,
                 input_since_prompt: false,
+                input_since_state: false,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()
@@ -2571,5 +2820,128 @@ mod tests {
         assert!(!action_answers_with_its_own_report(
             &Action::ToggleFloatingPanes
         ));
+    }
+
+    fn status(state: &str, kind: Option<&str>) -> PaneProgramStatus {
+        PaneProgramStatus {
+            state: state.to_owned(),
+            kind: kind.map(str::to_owned),
+            app: Some("claude-code".to_owned()),
+            title: None,
+            msg: kind.map(|_| "Allow Bash: cargo test?\nreally".to_owned()),
+            progress: None,
+            at: 1,
+        }
+    }
+
+    fn agent(state: Option<PaneProgramStatus>, stale: bool) -> AgentLook {
+        AgentLook { state, stale }
+    }
+
+    /// The trap this wait exists to avoid: a message is typed into an agent that said `done`, and
+    /// the pane still holds that `done` until the agent says `working`. It is the turn before.
+    #[test]
+    fn a_state_reported_before_the_last_input_does_not_answer() {
+        let watch = AgentWatch::new(false, Duration::from_millis(3000));
+        let start = Instant::now();
+        let later = start + Duration::from_secs(60);
+        assert_eq!(
+            watch.judge(&agent(Some(status("done", None)), true), later),
+            Ok(None)
+        );
+        assert_eq!(
+            watch.judge(&agent(Some(status("working", None)), false), later),
+            Ok(None)
+        );
+        assert_eq!(
+            watch.judge(&agent(Some(status("done", None)), false), start),
+            Ok(Some(AgentVerdict::State(status("done", None))))
+        );
+    }
+
+    #[test]
+    fn idle_is_any_stop_and_waiting_is_only_a_block() {
+        let idle = AgentWatch::new(false, Duration::from_millis(3000));
+        let waiting = AgentWatch::new(true, Duration::from_millis(3000));
+        let now = Instant::now();
+        for state in ["idle", "done", "error"] {
+            assert!(matches!(
+                idle.judge(&agent(Some(status(state, None)), false), now),
+                Ok(Some(AgentVerdict::State(_)))
+            ));
+            // an agent that finished without asking will not ask now: a miss, not a hang
+            let miss = waiting
+                .judge(&agent(Some(status(state, None)), false), now)
+                .unwrap_err();
+            assert!(miss.contains("without asking"), "{miss}");
+        }
+        let blocked = status("blocked", Some("permission"));
+        for watch in [&idle, &waiting] {
+            assert_eq!(
+                watch.judge(&agent(Some(blocked.clone()), false), now),
+                Ok(Some(AgentVerdict::State(blocked.clone())))
+            );
+        }
+        assert_eq!(
+            agent_report(&AgentVerdict::State(blocked)),
+            vec![
+                "idle_by: state",
+                "state: blocked",
+                "state_kind: permission",
+                "state_msg: Allow Bash: cargo test? really",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_state_is_judged_by_silence_and_cannot_be_waited_on_for_a_block() {
+        let quiet = Duration::from_millis(3000);
+        let mut idle = AgentWatch::new(false, quiet);
+        let mut waiting = AgentWatch::new(true, quiet);
+        let start = Instant::now();
+        let none = agent(None, false);
+        // nothing drawn yet: not started, so not quiet
+        assert_eq!(idle.judge(&none, start + quiet * 2), Ok(None));
+        idle.rendered(&screen(&["> working..."]), start);
+        waiting.rendered(&screen(&["> working..."]), start);
+        assert_eq!(idle.judge(&none, start + quiet / 2), Ok(None));
+        assert_eq!(waiting.judge(&none, start + quiet / 2), Ok(None));
+        assert_eq!(
+            idle.judge(&none, start + quiet),
+            Ok(Some(AgentVerdict::Quiet))
+        );
+        assert_eq!(agent_report(&AgentVerdict::Quiet), vec!["idle_by: quiet"]);
+        let miss = waiting.judge(&none, start + quiet).unwrap_err();
+        assert!(miss.contains("reports no agent state"), "{miss}");
+    }
+
+    #[test]
+    fn the_agent_wait_reads_the_state_and_whether_it_is_stale_off_the_row() {
+        let mut entries: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (1, false, false, None),
+            (2, false, true, Some(0)),
+        ]))
+        .unwrap();
+        entries[0].program_status = Some(status("done", None));
+        entries[0].input_since_state = true;
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("\"input_since_state\":true"));
+        assert_eq!(
+            agent_look(&json, PaneId::Terminal(1)).unwrap(),
+            (PaneState::Running, agent(Some(status("done", None)), true))
+        );
+        assert_eq!(
+            agent_look(&json, PaneId::Terminal(2)).unwrap().0,
+            PaneState::Exited(Some(0))
+        );
+        assert_eq!(
+            agent_look(&json, PaneId::Terminal(9)).unwrap().0,
+            PaneState::Gone
+        );
+        entries[0].input_since_state = false;
+        // written only when true, so a row nobody typed into reads as it always did
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("input_since_state"));
     }
 }

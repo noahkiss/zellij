@@ -1404,6 +1404,9 @@ impl Pane for TerminalPane {
     fn input_since_prompt(&self) -> bool {
         self.grid.input_since_prompt()
     }
+    fn input_since_state(&self) -> bool {
+        self.grid.program_status.input_since_report()
+    }
     fn update_exit_status(&mut self, exit_status: i32) {
         if let Some(notification_end) = self.notification_end.as_mut() {
             notification_end.set_exit_status(exit_status);

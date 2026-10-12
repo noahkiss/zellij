@@ -2737,6 +2737,11 @@ pub struct PaneListEntry {
     /// shell writes OSC 133 markers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub input_since_prompt: bool,
+    /// Input was typed into the pane after the program in it last reported its `state`, so that
+    /// state is from BEFORE the input: an agent told something new has not said yet that it took
+    /// it up. Written only when `true`, and only beside a `state`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_since_state: bool,
     /// What a program in the pane last said it is doing, over `OSC 7501`: the `state`, `state_*`
     /// keys of [`PaneProgramStatus`], flattened onto the row. Absent when no program has reported.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]

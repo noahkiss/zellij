@@ -236,11 +236,12 @@ const OUTPUTS: &[OutputSpec] = &[
         keys: "tab_id position name active / handle pane_id title command focused note",
     },
     // `waited_ms` on every wait; `exit_status` is `--for exit`'s line, `matched` is
-    // `--for match`'s and `ready_by` is `--for ready`'s. A wait that missed prints nothing here
+    // `--for match`'s and `ready_by` is `--for ready`'s. `idle_by` and the `state` keys are the
+    // agent waits'. A wait that missed prints nothing here
     OutputSpec {
         command: "action wait",
         shape: "record",
-        keys: "waited_ms exit_status matched ready_by",
+        keys: "waited_ms exit_status matched ready_by idle_by state state_kind state_msg",
     },
     OutputSpec {
         command: "action set-pane-note",

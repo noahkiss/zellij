@@ -1148,7 +1148,7 @@ impl ImageMode {
 
 /// The condition a `zellij action wait` blocks on.
 #[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum WaitFor {
     /// The pane's command ends, or the pane goes away.
     Exit,
@@ -1159,6 +1159,13 @@ pub enum WaitFor {
     /// The pane's shell is ready for input: it drew a prompt (OSC 133), or it drew something and
     /// then fell quiet for `--quiet-ms`.
     Ready,
+    /// The coding agent in the pane stopped working: it reported `idle`, `done`, `error` or
+    /// `blocked` over `OSC 7501` after the last input typed into the pane. A pane whose program
+    /// reports no state is judged by `--quiet-ms` of silence instead.
+    AgentIdle,
+    /// The coding agent in the pane is blocked on a person: it reported `blocked` (a permission,
+    /// a question, a sign-in) after the last input typed into the pane.
+    AgentWaiting,
 }
 
 impl Default for WaitFor {
@@ -1214,6 +1221,8 @@ pub enum CliAction {
     ///
     ///   zellij action wait build --for ready
     ///
+    ///   zellij action wait sunny-otter --for agent-idle
+    ///
     /// `--for ready` is met when the pane's shell says it drew a prompt - an OSC 133 prompt
     /// marker, read as `command_state: prompt` in `list-panes` - or, for a shell that writes no
     /// markers, when the pane has drawn something and then produced nothing for `--quiet-ms`
@@ -1222,6 +1231,17 @@ pub enum CliAction {
     /// prompt drawn after the last input typed into the pane counts, so a wait started right after
     /// typing a command answers once that command has finished. Its timeout defaults to 10
     /// seconds.
+    ///
+    /// `--for agent-idle` and `--for agent-waiting` read the state the agent in the pane reports
+    /// over `OSC 7501` - the `state` key of `list-agents --json`. `agent-idle` is met when the
+    /// agent stops working: `idle`, `done`, `error`, or `blocked` on a person. `agent-waiting` is
+    /// met only by `blocked`, and misses when the agent ends its turn without asking anything.
+    /// Only a state reported after the last input typed into the pane counts, so a wait started
+    /// right after sending a message does not answer with the turn before it. Both print
+    /// `state:`, with `state_kind:` and `state_msg:` when the agent gave them. A pane whose
+    /// program reports no state (opencode; codex without the hooks `zellij setup --agent-hooks`
+    /// prints) is judged by silence for `agent-idle` - `--quiet-ms`, 3000 by default here - and
+    /// says `idle_by: quiet`; `agent-waiting` cannot be judged there, and misses.
     ///
     /// Exit 0 means the condition was met, and the report says how long it took. Exit 2 means it
     /// was not - the timeout ran out, or the pane closed while waiting for something else - and
@@ -1247,7 +1267,8 @@ pub enum CliAction {
         pane_id: String,
 
         /// What to wait for: the pane's command to end, the pane to fall quiet, a line to
-        /// match, or the pane's shell to be ready for input
+        /// match, the pane's shell to be ready for input, or the coding agent in the pane to
+        /// stop working or to be blocked on a person
         #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
         wait_for: WaitFor,
 
@@ -1256,12 +1277,15 @@ pub enum CliAction {
         pattern: Option<String>,
 
         /// How long a pane must produce nothing to count as quiet, for `--for quiet` (default
-        /// 500) and for the fallback of `--for ready` (default 300)
+        /// 500), for the fallback of `--for ready` (default 300), and for `--for agent-idle` on
+        /// a pane that reports no state (default 3000)
         #[clap(
             long,
             value_parser,
             default_value = "500",
-            default_value_if("wait_for", "ready", "300")
+            default_value_if("wait_for", "ready", "300"),
+            default_value_if("wait_for", "agent-idle", "3000"),
+            default_value_if("wait_for", "agent-waiting", "3000")
         )]
         quiet_ms: u64,
 
@@ -4440,6 +4464,16 @@ mod tests {
             (WaitFor::Quiet, 500, 300)
         );
         assert_eq!(wait_bounds(&["wait", "build"]), (WaitFor::Exit, 500, 300));
+        // an agent's turn is minutes, and its spinner pauses: the silence that says it stopped
+        // is longer than a shell's
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "agent-idle"]),
+            (WaitFor::AgentIdle, 3000, 300)
+        );
+        assert_eq!(
+            wait_bounds(&["wait", "build", "--for", "agent-waiting"]),
+            (WaitFor::AgentWaiting, 3000, 300)
+        );
     }
 
     #[test]

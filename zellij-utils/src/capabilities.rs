@@ -86,10 +86,11 @@ pub const CAPABILITIES: &[&str] = &[
     "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
     "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
     "list-agents-watch",  // list-agents --watch, one JSON line per agent change
-    "session-drop-env",   // session_restart_drop_env
+    "wait-agent-state", // action wait --for agent-idle|agent-waiting, input_since_state on list-panes --json
+    "session-drop-env", // session_restart_drop_env
     "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
     "session-service-config", // session_service, pin_exe
-    "session-warnings",   // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
+    "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
 ];
 
 /// The version, split into the parts that can actually be compared.

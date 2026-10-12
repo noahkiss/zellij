@@ -561,7 +561,7 @@ That loop is what every agent and every CI wrapper around this fork was writing,
 both directions at once: too slow when the thing finished immediately, and too quick when it did
 not. `wait` blocks until the pane does what you named, and then says how long that took.
 
-Four conditions, and a `--timeout` on all of them:
+Six conditions, and a `--timeout` on all of them:
 
 - **`--for exit`** — the pane's command ends. It prints `exit_status:`, and `-` where the pane
   closed and took its status with it.
@@ -571,6 +571,9 @@ Four conditions, and a `--timeout` on all of them:
   unanchored.
 - **`--for ready`** — the pane's shell is ready for input. It prints `ready_by:`, and says which
   signal fired. See [below](#--for-ready-a-shell-that-is-ready-for-input).
+- **`--for agent-idle`** and **`--for agent-waiting`** — the coding agent in the pane stopped
+  working, or is blocked on a person. From nkmk.34; see
+  [`zellij_wait_for until=agent_idle`](#zellij_wait_for-untilagent_idle-wait-for-an-agent-to-stop-working).
 
 **The exit code is about the wait, not about the command.** Met is 0, whatever `exit_status` says;
 a timeout is 2, the fork's miss, and prints nothing on stdout; a regex that does not compile is 1.
@@ -9199,6 +9202,64 @@ pasted, and `action --json` printed the record.
 and the dispatch in `src/commands.rs`. Tests: 15 in `drop_file.rs` cover the safe extension, the
 name, the whole-or-nothing write, the permissions, the empty and over-ceiling refusals, a path
 source, the prune's guard and age, and the reference forms and shell quoting.
+
+### `zellij_wait_for until=agent_idle`: wait for an agent to stop working
+
+From nkmk.34, from the agent-orchestration plan. A session that drives agents in other panes had to
+poll `list-agents` and read `state` itself, and the first poll after sending a message read the
+`done` of the turn before.
+
+```
+zellij_write_input {"pane": "sunny-otter", "text": "Run the tests and say what failed.", ...}
+zellij_wait_for    {"pane": "sunny-otter", "until": "agent_idle", "timeout_s": 900}
+  # action wait sunny-otter --for agent-idle --timeout 900
+waited_ms: 48210
+idle_by: state
+state: done
+```
+
+`until` takes `agent_idle` and `agent_waiting`, and maps to `action wait --for agent-idle` and
+`--for agent-waiting`. Both read the `OSC 7501` state the agent reports, the `state` key of
+`list-agents --json`.
+
+- **`agent-idle` is met when the agent stops working**: `idle`, `done` or `error`, or `blocked` on
+  a person. A supervisor that waits for the end of a turn must also hear that the agent stopped to
+  ask, or it sleeps until the timeout while the agent waits for an answer. `state` says which.
+- **`agent-waiting` is met only by `blocked`.** An agent that ends its turn without asking is a
+  miss, exit 2, rather than a wait that runs to its timeout: it will not ask now.
+- **The report** is `waited_ms`, `idle_by` (`state` or `quiet`), `state`, and `state_kind` and
+  `state_msg` when the agent gave them. A message on several lines is folded onto one.
+- **Only a state reported after the last input counts.** The grid keeps a per-pane flag beside the
+  `OSC 7501` records: typed input sets it (the same bytes that set `input_since_prompt`), and any
+  report or clear resets it. `list-panes --json` carries `"input_since_state": true`, written only
+  when true and only beside a `state`, so no existing row changes. While it is set the wait reads
+  the state as stale. This is the `--for ready` rule applied to the agent's own word, and it needs
+  no baseline: an agent that finished before the wait began has already reported.
+- **An agent that reports no state** (opencode; codex without the hooks `zellij setup
+  --agent-hooks` prints) is judged by silence for `agent-idle`: `--quiet-ms`, 3000 by default for
+  these two modes, after the pane has drawn something. The report says `idle_by: quiet`.
+  `agent-waiting` has no fallback, and misses with a message that names the harnesses that report.
+  Claude between `133;A` and its next report also reads as no state for a moment; its spinner
+  keeps the pane from being quiet, so the silence fallback does not answer early there.
+- **A pane that closes or whose command exits first is a miss**, exit 2.
+
+Capability: `wait-agent-state`.
+
+Limits:
+
+- An Enter that the agent ignores (an empty prompt) sets the flag and gets no report, so the wait
+  runs to its timeout.
+- A keystroke typed into an agent's prompt without submitting it makes the state stale until the
+  agent reports again.
+
+MCP: the enum values, the summary, the tips and the `quiet_ms` note. The tool keeps its six
+parameters. Files: `zellij-server/src/program_status.rs` (the flag), `panes/grid.rs`,
+`panes/terminal_pane.rs`, `tab/mod.rs`, `screen.rs`; `zellij-utils/src/data.rs`
+(`input_since_state`), `cli.rs` (the two `WaitFor` values and the 3000 ms default),
+`cli_surface.rs` (the wait's keys); `zellij-client/src/cli_client.rs` (`wait_for_agent`,
+`AgentWatch`); `src/commands.rs`; `src/mcp/`. Tests: the flag's life in `program_status`, the
+judge on scripted looks (stale, working, each stop, the silence fallback, the `agent-waiting`
+misses), the row reading, the report lines, the clap defaults and the MCP command lines.
 
 ## Assessed and deliberately not built
 

@@ -187,7 +187,8 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "zellij_wait_for",
         summary: "Block until a pane's command exits, its output matches a pattern, it falls \
-                  silent, or its shell is ready for the next command.",
+                  silent, its shell is ready for the next command, or the coding agent in it \
+                  stops working.",
         best_for: "the step after starting something long: wait for it rather than reading the \
                    pane over and over.",
         not_for: "a pane that is already in the state you want - read it instead. This call \
@@ -206,7 +207,17 @@ pub const TOOLS: &[ToolSpec] = &[
                right after typing does not count. Use it after zellij_write_input sends a line \
                to a shell; read `ready_by` (prompt, or quiet for a shell without OSC 133 marks, \
                where quiet_ms is the window). Every wait is bounded: without timeout_s it gives \
-               up after 300 seconds rather than blocking for the life of the pane.",
+               up after 300 seconds rather than blocking for the life of the pane. \
+               until=agent_idle is for a pane running a coding agent: it returns when the agent \
+               stops working - its turn ended (`state` idle, done or error) or it is blocked on a \
+               person (`state` blocked, with `state_kind` permission, question or auth and the \
+               question in `state_msg`). Read `state` to tell which. until=agent_waiting returns \
+               only for blocked, and misses when the agent ends its turn without asking. Both \
+               count only a state the agent reported after the last input typed into the pane, \
+               so wait straight after zellij_write_input sends a message, without a pause. An \
+               agent that reports no state (opencode, or codex without its hooks) is judged by \
+               3 seconds of silence for agent_idle and says `idle_by: quiet`; agent_waiting \
+               cannot tell there and misses.",
         params: &[
             SESSION,
             ParamSpec {
@@ -219,7 +230,14 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "until",
-                kind: ParamKind::Enum(&["exit", "match", "quiet", "ready"]),
+                kind: ParamKind::Enum(&[
+                    "exit",
+                    "match",
+                    "quiet",
+                    "ready",
+                    "agent_idle",
+                    "agent_waiting",
+                ]),
                 required: false,
                 from: Some(("action wait", "--for")),
                 describe: "",
@@ -240,7 +258,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action wait", "--quiet-ms")),
                 describe: "How long a pane must produce nothing to count as quiet, when \
-                           until=quiet, or ready for a shell without OSC 133 marks.",
+                           until=quiet, or ready for a shell without OSC 133 marks. For \
+                           until=agent_idle on an agent that reports no state, 3000 unless \
+                           given.",
                 default: Some("500"),
             },
             ParamSpec {

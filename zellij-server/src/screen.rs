@@ -5967,6 +5967,11 @@ impl Screen {
                 tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
                     .and_then(|pane| pane.program_status())
             };
+            // only beside a state: a shell pane somebody typed into has no state to call stale
+            let input_since_state = program_status.is_some()
+                && tab
+                    .get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .map_or(false, |pane| pane.input_since_state());
             PaneListEntry {
                 pane_info,
                 tab_position: tab.position,
@@ -5976,6 +5981,7 @@ impl Screen {
                 last_command_exit_code,
                 program_status,
                 input_since_prompt,
+                input_since_state,
             }
         }
 

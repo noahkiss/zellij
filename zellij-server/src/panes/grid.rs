@@ -3759,6 +3759,7 @@ impl Grid {
     /// Record that input was typed into this pane: a key, a paste, `write-chars`.
     pub fn note_typed_input(&mut self) {
         self.input_since_prompt = true;
+        self.program_status.note_input();
     }
 
     /// Whether input was typed into this pane after its shell last wrote an OSC 133 prompt marker.

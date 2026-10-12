@@ -1141,6 +1141,18 @@ fn attach_with_cli_client(
             zellij_utils::cli::WaitFor::Ready => {
                 zellij_client::cli_client::WaitCondition::Ready(Duration::from_millis(*quiet_ms))
             },
+            zellij_utils::cli::WaitFor::AgentIdle => {
+                zellij_client::cli_client::WaitCondition::Agent {
+                    waiting: false,
+                    quiet: Duration::from_millis(*quiet_ms),
+                }
+            },
+            zellij_utils::cli::WaitFor::AgentWaiting => {
+                zellij_client::cli_client::WaitCondition::Agent {
+                    waiting: true,
+                    quiet: Duration::from_millis(*quiet_ms),
+                }
+            },
         };
         let exit_status = zellij_client::cli_client::start_wait_client(
             &|| {

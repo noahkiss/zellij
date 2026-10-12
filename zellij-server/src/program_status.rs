@@ -249,6 +249,8 @@ pub struct ProgramStatusRecords {
     /// `seq` at the last new prompt (`OSC 133;A`). A record at or below it was reported before
     /// that prompt, so by a program that ran earlier. 0 until a prompt is seen.
     prompt_seq: u64,
+    /// Input was typed into the pane after the last report. See [`Self::input_since_report`].
+    input_since_report: bool,
 }
 
 impl ProgramStatusRecords {
@@ -256,8 +258,12 @@ impl ProgramStatusRecords {
     pub fn apply(&mut self, message: Message, now_ms: u64) {
         match message {
             Message::Query => {},
-            Message::Clear { id } => self.clear(&id),
+            Message::Clear { id } => {
+                self.input_since_report = false;
+                self.clear(&id)
+            },
             Message::Report(report) => {
+                self.input_since_report = false;
                 self.seq += 1;
                 self.records.insert(
                     report.id,
@@ -329,6 +335,21 @@ impl ProgramStatusRecords {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Input was typed into the pane: a key, a paste, `write-chars`.
+    pub fn note_input(&mut self) {
+        self.input_since_report = true;
+    }
+
+    /// Whether input was typed into the pane after the program last reported or cleared.
+    ///
+    /// This is what tells a fresh state from a stale one. Right after a message is typed into an
+    /// agent that reported `done`, the pane still holds that `done` until the agent reports
+    /// `working`. A wait for the agent to be idle again would answer at once, for the turn
+    /// before. With this, a state counts only once it was reported after the last input.
+    pub fn input_since_report(&self) -> bool {
+        self.input_since_report
     }
 
     pub fn len(&self) -> usize {
@@ -616,5 +637,21 @@ mod tests {
         assert_eq!(records.len(), MAX_RECORDS);
         assert!(!records.records.contains_key("r0"));
         assert!(records.records.contains_key(&format!("r{MAX_RECORDS}")));
+    }
+
+    #[test]
+    fn input_makes_the_state_stale_until_the_program_reports_again() {
+        let mut records = ProgramStatusRecords::default();
+        assert!(!records.input_since_report());
+        records.apply(Message::Report(report("state=done")), 1);
+        records.note_input();
+        // the `done` is still there, and now it is the turn before
+        assert!(records.input_since_report());
+        assert_eq!(records.summary().unwrap().state, "done");
+        records.apply(Message::Report(report("state=working")), 2);
+        assert!(!records.input_since_report());
+        records.note_input();
+        records.apply(Message::Clear { id: String::new() }, 3);
+        assert!(!records.input_since_report());
     }
 }
