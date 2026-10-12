@@ -1211,6 +1211,7 @@ impl Action {
                 None => Ok(vec![Action::ToggleActiveSyncTab]),
             },
             CliAction::NewPane {
+                ready: _,
                 direction,
                 command,
                 plugin,
@@ -1543,6 +1544,7 @@ impl Action {
                 }
             },
             CliAction::Edit {
+                ready: _,
                 direction,
                 file,
                 line_number,
@@ -1677,6 +1679,7 @@ impl Action {
             CliAction::CloseTabById { id } => Ok(vec![Action::CloseTabById { id }]),
             CliAction::RenameTabById { id, name } => Ok(vec![Action::RenameTabById { id, name }]),
             CliAction::NewTab {
+                ready: _,
                 name,
                 layout,
                 layout_string,
@@ -4397,6 +4400,7 @@ mod tests {
     #[test]
     fn test_new_tab_with_layout_string() {
         let cli_action = CliAction::NewTab {
+            ready: Default::default(),
             name: None,
             layout: None,
             layout_string: Some("layout {\n    pane\n    pane\n}\n".into()),
@@ -4439,6 +4443,7 @@ mod tests {
     #[test]
     fn test_new_tab_with_invalid_layout_string() {
         let cli_action = CliAction::NewTab {
+            ready: Default::default(),
             name: None,
             layout: None,
             layout_string: Some("invalid { kdl".into()),
@@ -4545,6 +4550,7 @@ mod tests {
     #[test]
     fn test_new_pane_tiled_with_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: Some(Direction::Right),
             command: vec![],
             plugin: None,
@@ -4607,6 +4613,7 @@ mod tests {
     #[test]
     fn test_new_pane_tiled_without_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: None,
@@ -4662,6 +4669,7 @@ mod tests {
 
     fn command_less_new_pane_with_cwd(cwd: Option<PathBuf>, stacked: bool) -> Vec<Action> {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: None,
@@ -4746,6 +4754,7 @@ mod tests {
     #[test]
     fn test_new_in_place_pane_with_pane_id_to_replace() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: None,
@@ -4806,6 +4815,7 @@ mod tests {
     #[test]
     fn test_new_in_place_pane_with_malformed_pane_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: None,
@@ -4853,6 +4863,7 @@ mod tests {
     #[test]
     fn test_new_pane_floating_with_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: None,
@@ -4909,6 +4920,7 @@ mod tests {
     #[test]
     fn test_new_pane_stacked_with_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec!["ls".into()],
             plugin: None,
@@ -4962,6 +4974,7 @@ mod tests {
     #[test]
     fn test_new_pane_blocking_with_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec!["ls".into()],
             plugin: None,
@@ -5015,6 +5028,7 @@ mod tests {
     #[test]
     fn test_edit_with_tab_id() {
         let cli_action = CliAction::Edit {
+            ready: Default::default(),
             file: PathBuf::from("/tmp/test.rs"),
             direction: None,
             line_number: None,
@@ -5053,6 +5067,7 @@ mod tests {
     #[test]
     fn test_edit_without_tab_id() {
         let cli_action = CliAction::Edit {
+            ready: Default::default(),
             file: PathBuf::from("/tmp/test.rs"),
             direction: None,
             line_number: None,
@@ -5091,6 +5106,7 @@ mod tests {
     #[test]
     fn test_new_pane_plugin_tiled_with_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: Some("zellij:strider".into()),
@@ -5144,6 +5160,7 @@ mod tests {
     #[test]
     fn test_new_pane_plugin_floating_with_tab_id() {
         let cli_action = CliAction::NewPane {
+            ready: Default::default(),
             direction: None,
             command: vec![],
             plugin: Some("zellij:strider".into()),

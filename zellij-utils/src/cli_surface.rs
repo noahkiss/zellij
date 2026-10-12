@@ -249,18 +249,19 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action new-pane",
         shape: "record",
         // `tab_id` is `--new-tab`'s line: the tab it made, above the pane it put in it. Every other
-        // new-pane prints the pane alone, into a tab that already existed
-        keys: "tab_id pane_id handle",
+        // new-pane prints the pane alone, into a tab that already existed. `ready_by` and
+        // `ready_ms` are `--wait-ready`'s lines, on this verb and the two below
+        keys: "tab_id pane_id handle ready_by ready_ms",
     },
     OutputSpec {
         command: "action edit",
         shape: "record",
-        keys: "pane_id handle",
+        keys: "pane_id handle ready_by ready_ms",
     },
     OutputSpec {
         command: "action new-tab",
         shape: "record",
-        keys: "tab_id pane_id handle",
+        keys: "tab_id pane_id handle ready_by ready_ms",
     },
     OutputSpec {
         command: "action break-pane",

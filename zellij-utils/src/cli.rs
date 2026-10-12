@@ -690,6 +690,9 @@ pub enum Sessions {
             conflicts_with("block_until_exit_failure")
         )]
         handle: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
     /// Load a plugin in a new pane
     ///
@@ -828,6 +831,9 @@ pub enum Sessions {
         /// error, and nothing is created
         #[clap(long, value_parser = chosen_handle)]
         handle: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
     /// Send data to one or more plugins, launch them if they are not running.
     #[clap(override_usage(
@@ -1104,6 +1110,37 @@ pub enum WaitFor {
 impl Default for WaitFor {
     fn default() -> Self {
         WaitFor::Exit
+    }
+}
+
+/// `--wait-ready` and `--ready-timeout`, on every verb that makes a pane for a caller to type into.
+///
+/// Held by the client, like `--handle`: it waits once the report names the pane, so nothing about
+/// it reaches the action or the client/server contract.
+#[derive(Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadyFlags {
+    /// Wait until the new pane's shell is ready for input before answering, as `zellij action
+    /// wait --for ready` does, and add `ready_by:` and `ready_ms:` to the report. A pane that is
+    /// not ready in time is still reported, and the exit is 2
+    #[clap(long)]
+    pub wait_ready: bool,
+
+    /// Seconds `--wait-ready` waits before giving up
+    #[clap(
+        long,
+        value_name = "SECONDS",
+        requires("wait_ready"),
+        default_value = "10"
+    )]
+    pub ready_timeout: u64,
+}
+
+impl Default for ReadyFlags {
+    fn default() -> Self {
+        ReadyFlags {
+            wait_ready: false,
+            ready_timeout: 10,
+        }
     }
 }
 
@@ -1771,6 +1808,9 @@ pub enum CliAction {
             conflicts_with("in_place")
         )]
         in_tab: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
     /// Open a file in a new pane running your $EDITOR
     ///
@@ -1846,6 +1886,9 @@ pub enum CliAction {
         /// error, and nothing is created
         #[clap(long, value_parser = chosen_handle)]
         handle: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
     /// Put every client of this session into an input mode
     SwitchMode {
@@ -2112,6 +2155,9 @@ pub enum CliAction {
         /// Create the tab and leave every client's focus where it is
         #[clap(long)]
         no_focus: bool,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
     /// Move a tab in the specified direction. [right|left]
     ///
@@ -2724,6 +2770,57 @@ impl CliAction {
             CliAction::NewPane { handle, .. } | CliAction::Edit { handle, .. } => handle.take(),
             _ => None,
         }
+    }
+
+    /// The deadline `--wait-ready` set, taken out of the request for the client to hold, as
+    /// `--handle` is. `Ok(None)` is a request that did not ask.
+    ///
+    /// Refused alongside a blocking wait: that one replaces the report with the command's exit
+    /// status, and a pane that is ready is one a caller is about to type into, not one it waits
+    /// out. The refusal is here rather than in clap because the blocking flags differ by verb, and
+    /// `run` arrives with them already folded into `unblock_condition`.
+    pub fn take_wait_ready(&mut self) -> Result<Option<Duration>, String> {
+        let (ready, blocks) = match self {
+            CliAction::NewPane {
+                ready,
+                blocking,
+                block_until_exit_success,
+                block_until_exit_failure,
+                block_until_exit,
+                unblock_condition,
+                ..
+            } => (
+                ready,
+                *blocking
+                    || *block_until_exit_success
+                    || *block_until_exit_failure
+                    || *block_until_exit
+                    || unblock_condition.is_some(),
+            ),
+            CliAction::NewTab {
+                ready,
+                block_until_exit_success,
+                block_until_exit_failure,
+                block_until_exit,
+                ..
+            } => (
+                ready,
+                *block_until_exit_success || *block_until_exit_failure || *block_until_exit,
+            ),
+            CliAction::Edit { ready, .. } => (ready, false),
+            _ => return Ok(None),
+        };
+        let taken = std::mem::take(ready);
+        if !taken.wait_ready {
+            return Ok(None);
+        }
+        if blocks {
+            return Err("`--wait-ready` cannot be used with `--blocking` or \
+                 `--block-until-exit*`: those wait for the command to end and answer with its \
+                 status, and a ready pane is one you type into."
+                .to_owned());
+        }
+        Ok(Some(Duration::from_secs(taken.ready_timeout)))
     }
 
     /// The deadline `pipe --timeout` set, taken out of the request for the client to hold.
@@ -4296,6 +4393,118 @@ mod tests {
             );
             // taken once: the client applies it, and it must not also travel with the action
             assert_eq!(action.take_chosen_handle(), None);
+        }
+    }
+
+    #[test]
+    fn wait_ready_is_taken_out_of_every_creating_verb() {
+        for args in [
+            vec!["new-pane", "--wait-ready"],
+            vec!["new-pane", "--wait-ready", "--", "htop"],
+            vec!["new-pane", "--wait-ready", "--new-tab"],
+            vec!["edit", "--wait-ready", "notes.md"],
+            vec!["new-tab", "--wait-ready"],
+        ] {
+            let mut action = parse_action(&args);
+            assert_eq!(
+                action.take_wait_ready(),
+                Ok(Some(Duration::from_secs(10))),
+                "{:?}",
+                args
+            );
+            // taken once: the client waits, and the flag does not travel with the action
+            assert_eq!(action.take_wait_ready(), Ok(None), "{:?}", args);
+        }
+        let mut action = parse_action(&["new-pane", "--wait-ready", "--ready-timeout", "3"]);
+        assert_eq!(action.take_wait_ready(), Ok(Some(Duration::from_secs(3))));
+        // the negative controls: a verb that did not ask, and one that makes no pane
+        assert_eq!(parse_action(&["new-pane"]).take_wait_ready(), Ok(None));
+        assert_eq!(parse_action(&["list-panes"]).take_wait_ready(), Ok(None));
+        // a timeout is only something `--wait-ready` has
+        assert!(parse_cli(
+            ["zellij", "action", "new-pane", "--ready-timeout", "3"]
+                .iter()
+                .map(|a| a.to_string())
+                .collect()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn wait_ready_is_refused_beside_a_blocking_wait() {
+        for args in [
+            vec!["new-pane", "--wait-ready", "--blocking", "--", "make"],
+            vec![
+                "new-pane",
+                "--wait-ready",
+                "--block-until-exit",
+                "--",
+                "make",
+            ],
+            vec![
+                "new-pane",
+                "--wait-ready",
+                "--block-until-exit-success",
+                "--",
+                "make",
+            ],
+            vec![
+                "new-pane",
+                "--wait-ready",
+                "--block-until-exit-failure",
+                "--",
+                "make",
+            ],
+            vec![
+                "new-tab",
+                "--wait-ready",
+                "--block-until-exit",
+                "--",
+                "make",
+            ],
+        ] {
+            let refusal = parse_action(&args).take_wait_ready();
+            assert!(
+                refusal
+                    .as_ref()
+                    .is_err_and(|message| message.contains("--wait-ready")),
+                "{:?}: {:?}",
+                args,
+                refusal
+            );
+        }
+        // `zellij run` arrives with its blocking flags already folded into `unblock_condition`
+        let mut run = parse_action(&["new-pane", "--wait-ready", "--", "make"]);
+        if let CliAction::NewPane {
+            unblock_condition, ..
+        } = &mut run
+        {
+            *unblock_condition = Some(UnblockCondition::OnAnyExit);
+        }
+        assert!(run.take_wait_ready().is_err());
+    }
+
+    #[test]
+    fn the_top_level_creating_commands_take_wait_ready_too() {
+        for args in [
+            vec!["zellij", "run", "--wait-ready", "--", "htop"],
+            vec![
+                "zellij",
+                "edit",
+                "--wait-ready",
+                "--ready-timeout",
+                "4",
+                "notes.md",
+            ],
+        ] {
+            let cli = parse_cli(args.iter().map(|a| a.to_string()).collect())
+                .unwrap_or_else(|e| panic!("{:?}: {}", args, e));
+            let ready = match cli.command {
+                Some(Command::Sessions(Sessions::Run { ready, .. }))
+                | Some(Command::Sessions(Sessions::Edit { ready, .. })) => ready,
+                other => panic!("{:?}", other),
+            };
+            assert!(ready.wait_ready, "{:?}", args);
         }
     }
 

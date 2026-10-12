@@ -23,6 +23,17 @@ use zellij_utils::{
     ipc::{ClientToServerMsg, ExitReason, ServerToClientMsg},
 };
 
+/// `--wait-ready` on a verb that makes a pane: how long to wait for the pane's shell, and how to
+/// open the connections the wait asks the session on.
+pub struct WaitReady<'a> {
+    pub timeout: Duration,
+    pub make_os_input: &'a dyn Fn() -> Box<dyn ClientOsApi>,
+}
+
+/// The quiet window `--wait-ready` falls back on, for a shell that writes no OSC 133 prompt
+/// marker. The same default `wait --for ready` takes.
+const READY_QUIET: Duration = Duration::from_millis(300);
+
 /// Runs the actions one CLI invocation turned into.
 ///
 /// `anchor_pane` is the pane these actions should be read as coming from - what `--near` names. A
@@ -36,6 +47,11 @@ use zellij_utils::{
 /// `output_json` is `action --json`: the report is printed as one object instead of `key: value`
 /// lines. It reaches only the printing - what the session is asked, and what it answers, are the
 /// same either way.
+///
+/// `wait_ready` is `--wait-ready`: once the report names the pane, wait for its shell as `wait
+/// --for ready` does, and add `ready_by:` and `ready_ms:` to the report. A pane that is not ready
+/// in time is still reported - the caller made it and has to be able to close it - and the exit is
+/// 2.
 pub fn start_cli_client(
     mut os_input: Box<dyn ClientOsApi>,
     session_name: &str,
@@ -44,6 +60,7 @@ pub fn start_cli_client(
     mut chosen_handle: Option<String>,
     pipe_timeout: Option<Duration>,
     output_json: bool,
+    wait_ready: Option<WaitReady>,
 ) -> i32 {
     let zellij_ipc_pipe: PathBuf = {
         let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
@@ -139,7 +156,38 @@ pub fn start_cli_client(
                         }
                     },
                 };
-                print_report(&lines, output_json);
+                let Some(wait) = &wait_ready else {
+                    print_report(&lines, output_json);
+                    continue;
+                };
+                let Some(made) = reported_pane(&lines) else {
+                    print_report(&lines, output_json);
+                    eprintln!("The session reported no pane, so there was none to wait for.");
+                    return 2;
+                };
+                let started = Instant::now();
+                match wait_for_ready(
+                    wait.make_os_input,
+                    session_name,
+                    made,
+                    READY_QUIET,
+                    Some(started + wait.timeout),
+                ) {
+                    Ok(ready_by) => {
+                        print_report(&with_ready(lines, ready_by, started.elapsed()), output_json)
+                    },
+                    Err(miss) => {
+                        // the pane exists whether or not it is ready, so it is reported either way
+                        print_report(&lines, output_json);
+                        let (message, exit_status) = match miss {
+                            WaitMiss::Missed(message) => (message, 2),
+                            WaitMiss::Failed(message) => (message, 1),
+                        };
+                        eprintln!("{}", message);
+                        os_input.send_to_server(ClientToServerMsg::ClientExited);
+                        return exit_status;
+                    },
+                }
             },
         }
     }
@@ -726,6 +774,14 @@ fn with_handle(lines: Vec<String>, handle: &str) -> Vec<String> {
 }
 
 /// The pane a creating command's report says it made.
+/// A creation report with `--wait-ready`'s two lines added: which signal said the pane was ready,
+/// and how long after it was made.
+fn with_ready(mut lines: Vec<String>, ready_by: ReadyBy, waited: Duration) -> Vec<String> {
+    lines.push(format!("ready_by: {}", ready_by.as_str()));
+    lines.push(format!("ready_ms: {}", waited.as_millis()));
+    lines
+}
+
 fn reported_pane(lines: &[String]) -> Option<PaneId> {
     lines
         .iter()
@@ -2179,6 +2235,37 @@ mod tests {
         );
         let promised = zellij_utils::cli_surface::promised_output_keys("action wait").unwrap();
         assert!(promised.split_whitespace().any(|key| key == "ready_by"));
+    }
+
+    #[test]
+    fn a_creation_that_waited_for_ready_says_how_and_how_long() {
+        let report = vec![
+            "pane_id: terminal_4".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(
+            with_ready(report.clone(), ReadyBy::Prompt, Duration::from_millis(187)),
+            vec![
+                "pane_id: terminal_4".to_owned(),
+                "handle: sunny-otter".to_owned(),
+                "ready_by: prompt".to_owned(),
+                "ready_ms: 187".to_owned(),
+            ]
+        );
+        // the pane the wait is about is still the one the report names
+        assert_eq!(reported_pane(&report), Some(PaneId::Terminal(4)));
+        // and every line it adds is one the surface map promises for each creating verb
+        for command in ["action new-pane", "action edit", "action new-tab"] {
+            let promised = zellij_utils::cli_surface::promised_output_keys(command).unwrap();
+            for key in ["ready_by", "ready_ms"] {
+                assert!(
+                    promised.split_whitespace().any(|promised| promised == key),
+                    "{} does not promise {}",
+                    command,
+                    key
+                );
+            }
+        }
     }
 
     #[test]

@@ -3927,6 +3927,7 @@ pub fn send_cli_new_pane_action_with_default_parameters() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: vec![],
         plugin: None,
@@ -4041,6 +4042,7 @@ pub fn send_cli_new_pane_action_with_split_direction() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: Some(Direction::Right),
         command: vec![],
         plugin: None,
@@ -4101,6 +4103,7 @@ pub fn send_cli_new_pane_action_with_command_and_cwd() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: Some(Direction::Right),
         command: vec!["htop".into()],
         plugin: None,
@@ -4172,6 +4175,7 @@ pub fn send_cli_new_pane_action_with_floating_pane_and_coordinates() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: Some(Direction::Right),
         command: vec!["htop".into()],
         plugin: None,
@@ -4232,6 +4236,7 @@ pub fn send_cli_edit_action_with_default_parameters() {
         pty_receiver
     );
     let cli_edit_action = CliAction::Edit {
+        ready: Default::default(),
         file: PathBuf::from("/file/to/edit"),
         direction: None,
         line_number: None,
@@ -4277,6 +4282,7 @@ pub fn send_cli_edit_action_with_line_number() {
         pty_receiver
     );
     let cli_edit_action = CliAction::Edit {
+        ready: Default::default(),
         file: PathBuf::from("/file/to/edit"),
         direction: None,
         line_number: Some(100),
@@ -4322,6 +4328,7 @@ pub fn send_cli_edit_action_with_split_direction() {
         pty_receiver
     );
     let cli_edit_action = CliAction::Edit {
+        ready: Default::default(),
         file: PathBuf::from("/file/to/edit"),
         direction: Some(Direction::Down),
         line_number: None,
@@ -4535,6 +4542,7 @@ pub fn send_cli_new_tab_action_default_params() {
         plugin_receiver
     );
     let new_tab_action = CliAction::NewTab {
+        ready: Default::default(),
         name: None,
         layout: None,
         layout_string: None,
@@ -4581,6 +4589,7 @@ pub fn send_cli_new_tab_action_with_name_and_layout() {
         plugin_receiver
     );
     let new_tab_action = CliAction::NewTab {
+        ready: Default::default(),
         name: Some("my-awesome-tab-name".into()),
         layout: Some(PathBuf::from(format!(
             "{}/src/unit/fixtures/layout-with-three-panes.kdl",
@@ -6056,6 +6065,7 @@ pub fn send_cli_new_pane_in_place_with_close_replaced_pane() {
         pty_receiver
     );
     let cli_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: vec!["bash".into()],
         plugin: None,
@@ -6124,6 +6134,7 @@ pub fn send_cli_edit_in_place_with_close_replaced_pane() {
         pty_receiver
     );
     let cli_action = CliAction::Edit {
+        ready: Default::default(),
         file: PathBuf::from("/some/file.txt"),
         direction: None,
         line_number: None,
@@ -9773,6 +9784,7 @@ pub fn send_cli_new_tab_action_with_layout_string() {
     );
     // Same layout as layout-with-three-panes.kdl but passed as a string
     let new_tab_action = CliAction::NewTab {
+        ready: Default::default(),
         name: None,
         layout: None,
         layout_string: Some("layout {\n    pane\n    pane\n    pane\n}\n".into()),
@@ -9828,6 +9840,7 @@ pub fn send_cli_new_tab_action_with_layout_string_and_name() {
         plugin_receiver
     );
     let new_tab_action = CliAction::NewTab {
+        ready: Default::default(),
         name: Some("my-string-layout-tab".into()),
         layout: None,
         layout_string: Some("layout {\n    pane\n    pane\n    pane\n}\n".into()),
@@ -9886,6 +9899,7 @@ pub fn send_cli_new_pane_action_with_tab_id() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: Some(Direction::Right),
         command: vec![],
         plugin: None,
@@ -9953,6 +9967,7 @@ pub fn send_cli_new_floating_pane_action_with_tab_id() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: vec![],
         plugin: None,
@@ -10019,6 +10034,7 @@ pub fn send_cli_edit_action_with_tab_id() {
         pty_receiver
     );
     let cli_edit_action = CliAction::Edit {
+        ready: Default::default(),
         file: PathBuf::from("/tmp/test.rs"),
         direction: None,
         line_number: None,
@@ -10070,6 +10086,7 @@ pub fn send_cli_new_pane_action_with_tab_id_and_direction() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: Some(Direction::Right),
         command: vec![],
         plugin: None,
@@ -10136,6 +10153,7 @@ pub fn send_cli_new_pane_action_with_tab_id_and_stacked() {
         pty_receiver
     );
     let cli_new_pane_action = CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: vec!["ls".into()],
         plugin: None,

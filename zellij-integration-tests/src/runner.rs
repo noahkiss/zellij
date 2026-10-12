@@ -292,6 +292,7 @@ fn new_pane_cli_action(
     block_until_exit: bool,
 ) -> CliAction {
     CliAction::NewPane {
+        ready: Default::default(),
         direction: None,
         command: command.iter().map(|part| part.to_string()).collect(),
         plugin: None,
@@ -633,6 +634,8 @@ impl TestSession {
                     pipe_timeout,
                     // no `action --json`: the harness reads the report's own lines
                     false,
+                    // no `--wait-ready`: it opens connections of its own, which this fake has not
+                    None,
                 )
             })
             .unwrap()

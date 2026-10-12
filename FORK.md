@@ -641,6 +641,44 @@ in `zellij-utils/src/cli.rs`, and `ready_by` in the surface map. Tests: the deci
 renders and looks (prompt at once; output then quiet; a running command never quiet; a clear that
 wiped the markers), the pane-list read, and the defaults.
 
+#### `--wait-ready` on the verbs that make a pane
+
+```
+$ zellij action new-pane --wait-ready
+pane_id: terminal_4
+handle: sunny-otter
+ready_by: prompt
+ready_ms: 252
+```
+
+`action new-pane`, `run`, `action edit`, `edit` and `action new-tab` take `--wait-ready`. Once the
+report names the pane, the client runs the `--for ready` wait on it before it answers, and adds two
+lines: `ready_by:` (`prompt` or `quiet`, as above) and `ready_ms:`, the time from the pane being
+reported to it being ready. `--ready-timeout <SECONDS>` bounds the wait, 10 by default, and is an
+error without `--wait-ready`.
+
+- **A pane that is not ready in time is still reported.** The caller made it and has to be able to
+  close it, so `pane_id:` and `handle:` print, the reason goes to stderr, and the exit is 2. A pane
+  whose command exits first is the same miss.
+- **`--wait-ready` is refused beside `--blocking` and `--block-until-exit*`**, exit 2. Those wait
+  for the command to end and answer with its status in place of the report; a ready pane is one you
+  type into. The refusal is in `CliAction::take_wait_ready`, not clap, because the blocking flags
+  differ by verb and `run` arrives with them already folded into one condition.
+- **It is the client's to hold**, like `--handle`: taken off the request before the action is
+  built, so nothing about it reaches the action or the client/server contract.
+- `action --json` carries both lines: `"ready_by": "prompt"`, `"ready_ms": 252`.
+
+There is no `run --shell`. Running a command inside the user's interactive shell is what the MCP
+`zellij_create` does by default — make a shell pane with `--wait-ready`, then type the command —
+and that covers the case without a second way to spawn a command pane.
+
+`zellij-utils/src/cli.rs` (`ReadyFlags`, flattened into the five verbs, and
+`CliAction::take_wait_ready`), `src/commands.rs` and `src/main.rs` to plumb it, and
+`zellij-client/src/cli_client.rs` (`WaitReady`, `with_ready`, the wait in `start_cli_client`). The
+surface map promises `ready_by ready_ms` for `new-pane`, `edit` and `new-tab`. Tests: the flag is
+taken from every creating verb and only once; the refusals beside each blocking flag, and beside a
+`run` whose flags were already folded; `run` and `edit` parse it; the report assembly.
+
 ### Pane handles
 
 Every pane carries a two-word handle — `sunny-otter` — assigned when the pane is created and unique

@@ -1163,6 +1163,14 @@ fn attach_with_cli_client(
     // `pipe --timeout` is the client's to hold: the session has nothing to time out, and keeping it
     // here is what keeps the flag off `Action::CliPipe` and off the client/server contract
     let pipe_timeout = cli_action.take_pipe_timeout();
+    // `--wait-ready` is the client's to hold too: it waits once the report names the pane
+    let ready_timeout = match cli_action.take_wait_ready() {
+        Ok(ready_timeout) => ready_timeout,
+        Err(message) => {
+            eprintln!("{}", message);
+            std::process::exit(2);
+        },
+    };
     if let Some(handle) = &chosen_handle {
         if let Ok(taken_by) = resolve_pane_target(handle) {
             eprintln!(
@@ -1262,6 +1270,14 @@ fn attach_with_cli_client(
                 chosen_handle,
                 pipe_timeout,
                 structure_report,
+                ready_timeout.map(|timeout| zellij_client::cli_client::WaitReady {
+                    timeout,
+                    make_os_input: &|| {
+                        Box::new(get_os_input(
+                            zellij_client::os_input_output::get_cli_client_os_input,
+                        ))
+                    },
+                }),
             );
             if should_archive {
                 match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)
