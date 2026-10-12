@@ -8825,6 +8825,36 @@ in-place `cp`; a rename with size and mtime kept; a `touch`; no record; a record
 re-stamp; a current pass keeps the record valid. Three signing tests now record their simulated
 signature through `record_pin_refreshed_from`, as the signing transaction does.
 
+### An image goes to the client zlib-compressed
+
+```
+\e_Ga=t,q=2,f=32,t=d,i=2000000000,s=410,v=520,m=1;...        # before: raw RGBA, 1,140,720 bytes
+\e_Ga=t,q=2,f=32,t=d,i=2000000000,s=410,v=520,o=z,m=1;...    # now: zlib, 277,554 bytes
+```
+
+From nkmk.33. zellij decodes every kitty image a pane sends into RGBA, and sends that RGBA on to
+each kitty-capable client as base64. A program that sent a 180 KB PNG still cost the client 1.1 MB
+for a 410x520 image, every time a client needed it. Over ssh or `tssh` that is the slow part of
+showing an image.
+
+The server now zlib-compresses the RGBA and sets `o=z` on the transmit. The chunking is unchanged:
+4096 base64 bytes a chunk, `m=1` on every chunk but the last. The compressed payload is cached per
+image and per scaled size, like the base64 before it, so an image is compressed once and not on
+every transmit. When zlib does not make the payload smaller, the raw RGBA goes as before, without
+`o=z`. The zlib comes from `flate2`, which `zellij-server` already used.
+
+Measured with a fake kitty host on a pty, showing a 410x520 crop of a real screenshot sent as
+`f=100`: the transmit fell from 1,140,720 bytes to 277,554, and the client decoded the same RGBA
+that went in.
+
+Not covered: the PNG a program sent is not passed through. The store keeps only the decoded RGBA,
+and a scaled copy has no PNG at all. On the image above, the PNG would have been about 13% smaller
+than the zlib payload; not worth keeping a second copy of every image.
+
+`zellij-server` only: `TransmitPayload` in `kitty_graphics/store.rs`, and `emit_kitty_transmit` in
+`output/mod.rs`. Four output tests: the chunking and its `m=` flags, the header without `o=z`, a
+410x520 image that round-trips through base64 and zlib, and the raw fallback.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

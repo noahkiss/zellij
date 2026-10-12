@@ -4,7 +4,7 @@ use crate::panes::Row;
 
 use crate::panes::Selection;
 use crate::{
-    panes::kitty_graphics::store::{InternalImageId, KittyImageStore},
+    panes::kitty_graphics::store::{InternalImageId, KittyImageStore, TransmitPayload},
     panes::sixel::SixelImageStore,
     panes::terminal_character::{AnsiCode, CharacterStyles},
     panes::{LinkHandler, PaneId, TerminalCharacter, DEFAULT_STYLES, EMPTY_TERMINAL_CHARACTER},
@@ -410,18 +410,22 @@ fn pane_sort_key(pane_id: PaneId) -> (u8, u32) {
     }
 }
 
+const KITTY_TRANSMIT_CHUNK_BYTES: usize = 4096;
+
 fn emit_kitty_transmit(
     out: &mut String,
     host_image_id: u32,
     width: usize,
     height: usize,
-    b64: &str,
+    payload: &TransmitPayload,
 ) -> Result<()> {
     let err_context = "failed to serialize kitty transmit";
+    let b64 = payload.base64.as_str();
+    let compression = if payload.zlib { "o=z," } else { "" };
     let mut parts: Vec<&str> = vec![];
     let mut index = 0;
     while index < b64.len() {
-        let end = std::cmp::min(index + 4096, b64.len());
+        let end = std::cmp::min(index + KITTY_TRANSMIT_CHUNK_BYTES, b64.len());
         parts.push(&b64[index..end]);
         index = end;
     }
@@ -433,10 +437,11 @@ fn emit_kitty_transmit(
         if part_index == 0 {
             write!(
                 out,
-                "\u{1b}_Ga=t,q=2,f=32,t=d,i={},s={},v={},m={};{}\u{1b}\\",
+                "\u{1b}_Ga=t,q=2,f=32,t=d,i={},s={},v={},{}m={};{}\u{1b}\\",
                 host_image_id,
                 width,
                 height,
+                compression,
                 if last == 0 { 0 } else { 1 },
                 part
             )
@@ -566,13 +571,15 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                         Some(dims) => dims,
                         None => continue,
                     };
-                    let b64 = match kitty_image_store.base64_for(chunk.internal_image_id, variant) {
-                        Some(b64) => b64,
+                    let payload = match kitty_image_store
+                        .transmit_payload_for(chunk.internal_image_id, variant)
+                    {
+                        Some(payload) => payload,
                         None => continue,
                     };
                     let host_image_id = host_state.next_host_image_id;
                     host_state.next_host_image_id += 1;
-                    emit_kitty_transmit(&mut out, host_image_id, width, height, &b64)?;
+                    emit_kitty_transmit(&mut out, host_image_id, width, height, &payload)?;
                     host_state.transmitted.insert(image_key, host_image_id);
                     host_image_id
                 },

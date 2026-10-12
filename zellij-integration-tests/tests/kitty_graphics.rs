@@ -7,7 +7,7 @@ use zellij_integration_tests::{
 };
 
 const KITTY_PROBE_ACK: &[u8] = b"\x1b_Gi=31;OK\x1b\\";
-const TRANSMIT_HEADER: &[u8] = b"\x1b_Ga=t,q=2,f=32,t=d,i=2000000000,s=2,v=2,m=0;";
+const TRANSMIT_HEADER: &[u8] = b"\x1b_Ga=t,q=2,f=32,t=d,i=2000000000,s=2,v=2,o=z,m=0;";
 const PLACEMENT: &[u8] = b"\x1b_Ga=p,q=2,i=2000000000,p=1,x=0,y=0,w=2,h=2,X=0,Y=0,z=0,C=1\x1b\\";
 const IMAGE_FREE_DELETE: &[u8] = b"\x1b_Ga=d,q=2,d=I,i=2000000000\x1b\\";
 const PLACEMENT_DELETE: &[u8] = b"\x1b_Ga=d,q=2,d=i,i=2000000000,p=1\x1b\\";
