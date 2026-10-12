@@ -4876,6 +4876,37 @@ verbatim rather than a second shape to keep in step. `is_current_client` marks t
 `zellij action` is its own short-lived client focused on no pane, so a CLI query marks no row. The
 flag rides on the existing `ListClientsAction` message (field 1) and adds nothing to the contract.
 
+#### `rootshell_pane`: which rootshell tab a client is attached from
+
+From nkmk.33. rootshell exports a stable UUID for each of its tabs over ssh as `LC_ROOTSHELL_PANE`.
+sshd's default `AcceptEnv LC_*` passes it, so it is in the environment of the `zellij` client that
+tab runs. A notification about something a client should see - an agent waiting on a person - can
+only reach the right iPad tab if the session knows that UUID. It did not.
+
+```
+$ zellij action list-clients --json
+[{"client_id": 1, "pane_id": {"Terminal": 3}, ..., "tty": "/dev/pts/4",
+  "rootshell_pane": "00000000-0000-4000-8000-000000000001"}]
+```
+
+- **The client sends it in the map it already sends.** `host_terminal_env` is the allowlist of
+  host-terminal variables the client puts in its `CliAssets` on every attach (`TERM`,
+  `KITTY_WINDOW_ID` and the rest), carried by the contract's existing `host_terminal_env` map
+  (tag 12). `LC_ROOTSHELL_PANE` joins the allowlist. No new message, no new tag, no contract change.
+  An older server ignores the extra entry.
+- **The row is a CLI-only shape.** `list-clients --json` now prints `ClientListEntry`: the
+  `ClientInfo` keys, flattened, plus `rootshell_pane`. `ClientInfo` itself is unchanged, so plugins
+  see nothing new and no protobuf tag is spent. The key is absent, not null, for a client that had
+  no such variable.
+- **The value is checked before it is repeated.** It is whatever the client's environment held,
+  so it is trimmed, and dropped when it is empty, over 128 characters, or has a control character
+  in it. A UUID passes.
+- **It names the tab a client attached from, not the tab it is in now.** A client re-sends the map
+  on every attach, so a reattach from another tab updates it. The value lives for as long as the
+  client stays attached.
+
+Capability: `client-rootshell-pane`.
+
 ### `go-to-tab-name --no-focus`
 
 ```

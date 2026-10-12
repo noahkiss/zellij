@@ -58,6 +58,7 @@ pub const CAPABILITIES: &[&str] = &[
     "client-tty",         // ClientInfo.tty
     "list-clients-fixed", // the session manager's client list actually lists clients
     "list-clients-json",  // zellij action list-clients --json
+    "client-rootshell-pane", // list-clients --json rootshell_pane, from LC_ROOTSHELL_PANE
     "move-tab-to-index",  // zellij action move-tab --to-index
     "signal-pane",        // zellij action signal-pane --pane-id X --signal int|hup|kill
     "break-pane-cli",     // zellij action break-pane / break-pane-to-tab / -right / -left

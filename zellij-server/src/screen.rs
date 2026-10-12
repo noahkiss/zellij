@@ -4933,6 +4933,7 @@ impl Screen {
             .unwrap_or(true)
     }
 
+    /// The fork's `list-clients --json` reads `rootshell_pane` from here; see `rootshell_pane_of`.
     pub fn set_client_host_terminal_env(
         &mut self,
         client_id: ClientId,
@@ -8521,6 +8522,16 @@ impl Screen {
             self.client_sizes
                 .iter()
                 .map(|(client_id, size)| (*client_id, *size))
+                .collect(),
+        );
+        // and which rootshell tab each one came from, for list-clients --json
+        session_layout_metadata.set_client_rootshell_panes(
+            self.client_host_terminal_env
+                .iter()
+                .filter_map(|(client_id, env)| {
+                    crate::session_layout_metadata::rootshell_pane_of(env)
+                        .map(|pane| (*client_id, pane))
+                })
                 .collect(),
         );
         session_layout_metadata.set_client_ttys(

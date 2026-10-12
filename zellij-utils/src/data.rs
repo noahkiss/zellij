@@ -2896,6 +2896,21 @@ pub struct ClientInfo {
     pub tty: Option<String>,
 }
 
+/// One row of `zellij action list-clients --json`: the [`ClientInfo`] plugins receive, flattened,
+/// and what only the command line is told.
+///
+/// CLI-only, like [`PaneListEntry`]: a field here costs no protobuf tag and changes nothing a
+/// plugin sees, which a field on `ClientInfo` would.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClientListEntry {
+    #[serde(flatten)]
+    pub client: ClientInfo,
+    /// The rootshell tab this client is attached from: the `LC_ROOTSHELL_PANE` the client had in
+    /// its environment. Absent for a client that had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootshell_pane: Option<String>,
+}
+
 /// One pane of an archived snapshot, as the saved layout describes it.
 ///
 /// Both fields are optional because a saved layout may name a pane, give it a command, both or

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const HOST_TERMINAL_ENV_VARS: [&str; 7] = [
+pub const HOST_TERMINAL_ENV_VARS: [&str; 8] = [
     "TERM",
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
@@ -19,7 +19,15 @@ pub const HOST_TERMINAL_ENV_VARS: [&str; 7] = [
     "WEZTERM_PANE",
     "ITERM_SESSION_ID",
     "GHOSTTY_RESOURCES_DIR",
+    // fork addition: the rootshell tab this client is attached from. rootshell exports a stable
+    // per-tab UUID over ssh under an `LC_` name, which sshd's default `AcceptEnv LC_*` passes, so
+    // a notification about this client can be routed back to that exact tab. See
+    // `list-clients --json`'s `rootshell_pane`
+    ROOTSHELL_PANE_VAR,
 ];
+
+/// The variable rootshell names its tab with. It reaches the server in `host_terminal_env`.
+pub const ROOTSHELL_PANE_VAR: &str = "LC_ROOTSHELL_PANE";
 
 pub fn host_terminal_env() -> BTreeMap<String, String> {
     host_terminal_env_from(|name| std::env::var(name).ok())
@@ -172,6 +180,18 @@ mod tests {
             .into_iter()
             .collect::<BTreeMap<String, String>>(),
             "unset and non-whitelisted variables are left out"
+        );
+    }
+
+    #[test]
+    fn the_rootshell_tab_rides_with_the_host_terminal_variables() {
+        let env = host_terminal_env_from(|name| match name {
+            "LC_ROOTSHELL_PANE" => Some("00000000-0000-4000-8000-000000000001".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            env.get(ROOTSHELL_PANE_VAR).map(String::as_str),
+            Some("00000000-0000-4000-8000-000000000001")
         );
     }
 

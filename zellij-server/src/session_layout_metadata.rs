@@ -9,7 +9,7 @@ use zellij_utils::common_path::common_path_all;
 use zellij_utils::pane_size::{PaneGeom, Size};
 use zellij_utils::{
     agent_detect::harness_for_command,
-    data::{ClientInfo, LayoutMetadata, PaneMetadata, TabMetadata},
+    data::{ClientInfo, ClientListEntry, LayoutMetadata, PaneMetadata, TabMetadata},
     input::command::RunCommand,
     input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
     input::plugins::PluginAliases,
@@ -21,6 +21,21 @@ use zellij_utils::{
         GlobalLayoutManifest, PaneLayoutManifest, TabLayoutManifest,
     },
 };
+
+/// The rootshell tab a client's host terminal map names (`LC_ROOTSHELL_PANE`), if it names a
+/// usable one.
+///
+/// The value is whatever the client's environment held, so it is checked before it is repeated
+/// to every reader of `list-clients --json`: trimmed, at most 128 characters, and no control
+/// characters. rootshell's own value is a UUID, which passes.
+pub fn rootshell_pane_of(host_terminal_env: &BTreeMap<String, String>) -> Option<String> {
+    let value = host_terminal_env
+        .get(zellij_utils::input::cli_assets::ROOTSHELL_PANE_VAR)?
+        .trim();
+    let usable =
+        !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(|c| c.is_control());
+    usable.then(|| value.to_owned())
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct SessionLayoutMetadata {
@@ -35,6 +50,9 @@ pub struct SessionLayoutMetadata {
     /// Terminal device per attached client, same reason as `client_sizes`: assembled in the
     /// plugin thread, which has no view of `Screen`'s state.
     client_ttys: BTreeMap<ClientId, String>,
+    /// The rootshell tab per attached client (`LC_ROOTSHELL_PANE`), same reason again. Only the
+    /// JSON client list reads it.
+    client_rootshell_panes: BTreeMap<ClientId, String>,
 }
 
 impl SessionLayoutMetadata {
@@ -87,8 +105,18 @@ impl SessionLayoutMetadata {
     ///
     /// `requesting_client_id` marks `is_current_client`. A `zellij action` client is its own
     /// short-lived client that is focused on no pane, so a CLI query marks no row.
+    ///
+    /// Each row is a [`ClientListEntry`]: the `ClientInfo` keys, flattened, and `rootshell_pane`
+    /// where the client had one.
     pub fn list_clients_metadata_json(&self, requesting_client_id: ClientId) -> String {
-        let clients = self.client_infos(requesting_client_id);
+        let clients: Vec<ClientListEntry> = self
+            .client_infos(requesting_client_id)
+            .into_iter()
+            .map(|client| ClientListEntry {
+                rootshell_pane: self.client_rootshell_panes.get(&client.client_id).cloned(),
+                client,
+            })
+            .collect();
         serde_json::to_string_pretty(&clients).unwrap_or_else(|_| "[]".to_string())
     }
     /// Every client this layout knows about, in the shape `Event::ListClients` uses.
@@ -113,6 +141,12 @@ impl SessionLayoutMetadata {
     }
     pub fn set_client_ttys(&mut self, client_ttys: BTreeMap<ClientId, String>) {
         self.client_ttys = client_ttys;
+    }
+    pub fn set_client_rootshell_panes(
+        &mut self,
+        client_rootshell_panes: BTreeMap<ClientId, String>,
+    ) {
+        self.client_rootshell_panes = client_rootshell_panes;
     }
     /// Every client this layout knows about, and the pane each one is focused on.
     ///
@@ -178,6 +212,7 @@ impl SessionLayoutMetadata {
             tabs,
             client_sizes: _,
             client_ttys: _,
+            client_rootshell_panes: _,
         } = self;
         let mut hasher = DefaultHasher::new();
         global_cwd.hash(&mut hasher);
@@ -1747,6 +1782,44 @@ mod tests {
         let parsed: Vec<ClientInfo> = serde_json::from_str(&rendered).expect("valid JSON array");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].client_id, 2);
+    }
+
+    #[test]
+    fn json_client_list_names_the_rootshell_tab_where_a_client_had_one() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![1, 2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![]);
+        meta.set_client_rootshell_panes([(2, "a-tab-uuid".to_owned())].into_iter().collect());
+        let rendered = meta.list_clients_metadata_json(1);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["client_id"], 1);
+        assert!(
+            parsed[0].get("rootshell_pane").is_none(),
+            "absent, not null"
+        );
+        assert_eq!(parsed[1]["client_id"], 2);
+        assert_eq!(parsed[1]["rootshell_pane"], "a-tab-uuid");
+        // every ClientInfo key is still there, flat
+        let as_info: Vec<ClientInfo> = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(as_info[1].client_id, 2);
+    }
+
+    #[test]
+    fn only_a_usable_rootshell_tab_is_repeated() {
+        let env = |value: &str| -> BTreeMap<String, String> {
+            [("LC_ROOTSHELL_PANE".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            super::rootshell_pane_of(&env(" 00000000-0000-4000-8000-000000000001\n")).as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert_eq!(super::rootshell_pane_of(&env("")), None);
+        assert_eq!(super::rootshell_pane_of(&env("a\u{1b}]52;c;x")), None);
+        assert_eq!(super::rootshell_pane_of(&env(&"x".repeat(129))), None);
+        assert_eq!(super::rootshell_pane_of(&BTreeMap::new()), None);
     }
 
     #[test]
