@@ -923,6 +923,9 @@ pub struct Grid {
     pub hover_position: Option<Position>, // pane-relative cursor cell; None when outside pane
     pub cached_hover_tooltip: Option<String>,
     osc133_markers_seen: bool,
+    /// Whether input was typed into the pane after its shell last wrote an OSC 133 prompt marker.
+    /// See [`Grid::input_since_prompt`].
+    input_since_prompt: bool,
     osc133_command_selection: bool,
     command_output_flash: Option<Selection>,
     word_separators: String,
@@ -1315,6 +1318,7 @@ impl Grid {
             hover_position: None,
             cached_hover_tooltip: None,
             osc133_markers_seen: false,
+            input_since_prompt: false,
             osc133_command_selection: true,
             command_output_flash: None,
             word_separators: DEFAULT_WORD_SEPARATORS.to_owned(),
@@ -3752,6 +3756,21 @@ impl Grid {
         None
     }
 
+    /// Record that input was typed into this pane: a key, a paste, `write-chars`.
+    pub fn note_typed_input(&mut self) {
+        self.input_since_prompt = true;
+    }
+
+    /// Whether input was typed into this pane after its shell last wrote an OSC 133 prompt marker.
+    ///
+    /// This is what tells a fresh prompt from a stale one. Right after a command is typed, the
+    /// shell's last marker is still the prompt it drew before the typing, and `command_state` reads
+    /// `prompt` until the shell's preexec hook writes the output marker. With this, a prompt counts
+    /// only once it was drawn after the last input - which is "the command I typed has finished".
+    pub fn input_since_prompt(&self) -> bool {
+        self.input_since_prompt
+    }
+
     #[cfg(test)]
     pub fn osc133_end_exit_codes(&self) -> Vec<Option<i32>> {
         let first_line = -(self.lines_above.len() as isize);
@@ -4863,6 +4882,10 @@ impl Perform for Grid {
                     self.program_status.drop_unfinished();
                 }
                 if let (Some(marker), Some(row)) = (marker, self.viewport.get_mut(self.cursor.y)) {
+                    // a prompt drawn now is drawn after everything typed so far
+                    if marker == Osc133MarkerKind::Prompt {
+                        self.input_since_prompt = false;
+                    }
                     row.add_osc133_marker(self.cursor.x, marker);
                     self.osc133_markers_seen = true;
                 }

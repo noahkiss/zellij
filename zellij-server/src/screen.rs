@@ -5949,13 +5949,17 @@ impl Screen {
         ) -> PaneListEntry {
             // the markers are on the pane's own grid, so this is a lookup by id rather than
             // something `pane_infos_for_tab` could have carried out
-            let (command_state, last_command_exit_code) = if pane_info.is_plugin {
-                (None, None)
+            let (command_state, last_command_exit_code, input_since_prompt) = if pane_info.is_plugin
+            {
+                (None, None, false)
             } else {
                 tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
-                    .and_then(|pane| pane.osc133_command_state())
-                    .map(|(state, exit_code)| (Some(state), exit_code))
-                    .unwrap_or((None, None))
+                    .and_then(|pane| {
+                        pane.osc133_command_state().map(|(state, exit_code)| {
+                            (Some(state), exit_code, pane.input_since_prompt())
+                        })
+                    })
+                    .unwrap_or((None, None, false))
             };
             let program_status = if pane_info.is_plugin {
                 None
@@ -5971,6 +5975,7 @@ impl Screen {
                 command_state,
                 last_command_exit_code,
                 program_status,
+                input_since_prompt,
             }
         }
 

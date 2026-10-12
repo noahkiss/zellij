@@ -454,7 +454,7 @@ impl Pane for TerminalPane {
                 }
             }
         } else {
-            if self.grid.supports_kitty_keyboard_protocol {
+            let adjusted = if self.grid.supports_kitty_keyboard_protocol {
                 self.adjust_input_to_terminal_with_kitty_keyboard_protocol(
                     key_with_modifier,
                     raw_input_bytes,
@@ -466,7 +466,14 @@ impl Pane for TerminalPane {
                     raw_input_bytes,
                     raw_input_bytes_are_kitty,
                 )
+            };
+            // fork addition: what reaches the shell here was typed, so its last prompt is no longer
+            // a fresh one. See `Grid::input_since_prompt`.
+            if matches!(&adjusted, Some(AdjustedInput::WriteBytesToTerminal(bytes)) if !bytes.is_empty())
+            {
+                self.grid.note_typed_input();
             }
+            adjusted
         }
     }
     fn position_and_size(&self) -> PaneGeom {
@@ -1393,6 +1400,9 @@ impl Pane for TerminalPane {
     }
     fn program_status(&self) -> Option<zellij_utils::data::PaneProgramStatus> {
         self.grid.program_status.summary()
+    }
+    fn input_since_prompt(&self) -> bool {
+        self.grid.input_since_prompt()
     }
     fn update_exit_status(&mut self, exit_status: i32) {
         if let Some(notification_end) = self.notification_end.as_mut() {

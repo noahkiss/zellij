@@ -631,6 +631,7 @@ hands them to whatever the rc chain runs. Two signals answer it, and the exact o
   five minutes.
 - **A pane that closes or whose command exits first is a miss**, exit 2, with the exit status when
   the pane kept one.
+- **Only a prompt drawn after the last input counts** (from nkmk.33). See [below](#--for-ready-after-typing-a-command-the-prompt-must-be-fresh).
 
 The prompt signal needs the shell to write OSC 133. zsh does when a `precmd` hook prints
 `\e]133;A\a`; without one every answer is `quiet`, which is still right for an idle shell and is
@@ -640,6 +641,49 @@ fooled only by an rc file that pauses for longer than the window after printing 
 in `zellij-utils/src/cli.rs`, and `ready_by` in the surface map. Tests: the decisions from scripted
 renders and looks (prompt at once; output then quiet; a running command never quiet; a clear that
 wiped the markers), the pane-list read, and the defaults.
+
+#### `--for ready` after typing a command: the prompt must be fresh
+
+```
+$ zellij action write-chars --pane-id=terminal_7 -- 'cargo test'; zellij action send-keys --pane-id=terminal_7 -- Enter
+$ zellij action wait terminal_7 --for ready --timeout 600
+waited_ms: 48213
+ready_by: prompt
+```
+
+Typing a command and then waiting for the shell to be ready again is "wait for the command I typed
+to finish". Through nkmk.32 that had a race. Right after the Enter, the shell's last OSC 133 marker
+is still the prompt it drew BEFORE the typing, and `command_state` reads `prompt` until the
+shell's preexec hook writes the output marker. A wait that looked in that window answered `ready`
+for a command that had not started.
+
+From nkmk.33 the server records, per terminal pane, whether input was typed after the shell's last
+prompt marker. A key, a paste or `write-chars` sets it; the next prompt marker clears it.
+`list-panes --json` carries it as `"input_since_prompt": true`, written only when true and only
+for a shell that writes markers, so no existing row changes. The ready wait reads such a stale
+prompt as `running`: neither ready, nor quiet.
+
+- **A fast command is not missed.** The wait needs no baseline and no transition it might sleep
+  through. A command that finished before the wait began has already drawn its fresh prompt, and
+  the first look answers.
+- **Typed input without an Enter is not ready.** The shell has taken input and has not drawn a
+  prompt after it, so the wait runs to its timeout. That is the honest answer: the pane is not
+  ready for a new command.
+- **A new pane is unchanged.** Nothing has been typed into it, so its first prompt counts, as
+  before. `--wait-ready` and `zellij_create` behave exactly as they did.
+- **What counts as input**: the bytes a key, a paste, `write-chars` or `send-keys` puts on the
+  pane's pty. The terminal's own replies to the shell's queries, and focus reports, do not count.
+  A mouse report does, when the program at the prompt asked for mouse tracking.
+- **A shell without markers is judged as before**, by quiet. The flag is not consulted, because
+  no prompt marker will ever clear it.
+
+`zellij-server/src/panes/grid.rs` (`input_since_prompt`, set by `note_typed_input`, cleared by the
+OSC 133 prompt marker), `zellij-server/src/panes/terminal_pane.rs` (set where typed bytes reach
+the pty), `zellij-server/src/screen.rs` and `PaneListEntry` in `zellij-utils/src/data.rs`, and
+`pane_look` in `zellij-client/src/cli_client.rs`. Tests: the grid flag across typing, a command's
+output and end, and the next prompt; a typed line through `adjust_input_to_terminal` and a dropped
+paste marker that marks nothing; the pane-list read of a stale prompt, which is neither ready nor
+quiet, and of a fresh one, which is ready at once.
 
 #### `--wait-ready` on the verbs that make a pane
 
@@ -7640,6 +7684,9 @@ knows the answer and is already telling us.
   command is producing output and has reported no end) or `done` (the last one ended).
 - `last_command_exit_code` comes with a `done` and only with a `done`, and only when the shell put
   a code in its end marker.
+- `input_since_prompt` is `true` when input was typed after the shell's last prompt marker, so a
+  `prompt` is the one from before that input (from nkmk.33). It is absent otherwise. See [`--for
+  ready` after typing a command](#--for-ready-after-typing-a-command-the-prompt-must-be-fresh).
 - **Both keys are absent for a shell that emits no markers, and for a plugin pane.** Absent means
   "this pane cannot answer", which is a different thing from `prompt`. A consumer that must work
   against a bare `sh` still has `last_output_at` and the process columns.
@@ -8304,6 +8351,31 @@ which breaks every caller that passes it.
 `src/mcp/tools.rs` (the two parameters, the tips, and a boolean default written as a boolean).
 Tests: the shell-mode command lines for each `kind`; `exec` unchanged with either `wait_ready`; the
 plan's write and Enter; nothing typed after a timeout; the `not_ready` and ready result shapes.
+
+### `zellij_wait_for until=ready`: the command I typed has finished
+
+```
+zellij_write_input {"pane": "sunny-otter", "text": "cargo test"}
+zellij_write_input {"pane": "sunny-otter", "keys": "Enter"}
+zellij_wait_for    {"pane": "sunny-otter", "until": "ready", "timeout_s": 600}
+  # action wait sunny-otter --for ready --timeout 600
+```
+
+`until` takes `ready` beside `exit`, `match` and `quiet`, and maps to `action wait --for ready`.
+It is the wait for "the command I just typed into a shell has finished", which `exit` cannot be
+(the shell does not exit) and `quiet` only guesses at (a silent build is quiet).
+
+Ready means the shell drew a prompt AFTER the last input typed into the pane. The prompt still
+on screen right after the typing does not count, so a wait started a moment after
+`zellij_write_input` does not answer before the command has even begun; see [`--for ready` after
+typing a command](#--for-ready-after-typing-a-command-the-prompt-must-be-fresh). `ready_by` says
+which signal answered: `prompt`, or `quiet` for a shell without OSC 133 markers, where `quiet_ms`
+sets the window. The tool's tips say so.
+
+No parameter was added: `zellij_wait_for` keeps its six. `src/mcp/tools.rs` (the enum value, the
+summary, the tips and the `quiet_ms` note) and `src/mcp/invoke.rs` (the accepted value). Tests:
+the command line for `until=ready`, with and without `quiet_ms` and `timeout_s`, and the refusal
+that names the four values.
 
 ### A refreshed pin is no longer mistaken for the build the server is running
 

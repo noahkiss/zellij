@@ -1390,3 +1390,29 @@ pub fn a_trzsz_trigger_lands_on_the_grid_marked_as_multiplexed() {
         dump
     );
 }
+
+/// Typed input that reaches the shell marks the pane's last prompt as drawn before it, and the next
+/// prompt marker clears that. A bracketed-paste marker the pane drops reaches nothing, and marks
+/// nothing.
+#[test]
+pub fn typed_input_marks_the_last_prompt_as_stale_until_the_next_one() {
+    let mut pane = create_guest_modal_pane();
+    pane.handle_pty_bytes("\x1b]133;A\x07$ \x1b]133;B\x07".as_bytes().to_vec());
+    assert!(!pane.input_since_prompt());
+
+    pane.adjust_input_to_terminal(&None, b"\x1b[200~".to_vec(), false, Some(1));
+    assert!(
+        !pane.input_since_prompt(),
+        "a paste marker the shell does not take is not input"
+    );
+
+    pane.adjust_input_to_terminal(&None, b"ls\r".to_vec(), false, Some(1));
+    assert!(pane.input_since_prompt());
+
+    pane.handle_pty_bytes(
+        "\x1b]133;C\x07\r\nfile\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07"
+            .as_bytes()
+            .to_vec(),
+    );
+    assert!(!pane.input_since_prompt());
+}

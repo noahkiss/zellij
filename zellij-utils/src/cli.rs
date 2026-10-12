@@ -1218,8 +1218,10 @@ pub enum CliAction {
     /// marker, read as `command_state: prompt` in `list-panes` - or, for a shell that writes no
     /// markers, when the pane has drawn something and then produced nothing for `--quiet-ms`
     /// (300 by default here). The report's `ready_by:` line names which: `prompt` or `quiet`. A
-    /// pane whose shell says a command is running is not ready, however long it is silent. Its
-    /// timeout defaults to 10 seconds.
+    /// pane whose shell says a command is running is not ready, however long it is silent. Only a
+    /// prompt drawn after the last input typed into the pane counts, so a wait started right after
+    /// typing a command answers once that command has finished. Its timeout defaults to 10
+    /// seconds.
     ///
     /// Exit 0 means the condition was met, and the report says how long it took. Exit 2 means it
     /// was not - the timeout ran out, or the pane closed while waiting for something else - and

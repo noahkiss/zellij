@@ -859,6 +859,12 @@ fn pane_state(panes_json: &str, pane: PaneId) -> Result<PaneState, String> {
 
 /// [`pane_state`], and what the pane's shell says it is doing: its OSC 133 `command_state`, absent
 /// for a shell that writes no markers - and for one whose markers a clear has just wiped.
+///
+/// A prompt the shell drew BEFORE the last input typed into the pane is read as `running`. Right
+/// after a command is typed, the last marker is still that old prompt until the shell's preexec
+/// hook writes the output marker, so taking it as a prompt would answer "ready" for a command that
+/// has not started. Read as running, it is neither ready nor quiet, and the wait holds until the
+/// shell draws a prompt after the input - which is the typed command finishing.
 fn pane_look(
     panes_json: &str,
     pane: PaneId,
@@ -877,7 +883,15 @@ fn pane_look(
         Some(entry) if entry.pane_info.exited => {
             (PaneState::Exited(entry.pane_info.exit_status), None)
         },
-        Some(entry) => (PaneState::Running, entry.command_state),
+        Some(entry) => {
+            let command_state = match entry.command_state {
+                Some(PaneCommandState::Prompt) if entry.input_since_prompt => {
+                    Some(PaneCommandState::Running)
+                },
+                other => other,
+            };
+            (PaneState::Running, command_state)
+        },
     })
 }
 
@@ -2161,6 +2175,7 @@ mod tests {
                 command_state: None,
                 last_command_exit_code: None,
                 program_status: None,
+                input_since_prompt: false,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()
@@ -2268,6 +2283,41 @@ mod tests {
             pane_look(&panes, PaneId::Terminal(9)).unwrap(),
             (PaneState::Gone, None)
         );
+    }
+
+    /// The race a caller that types and then waits runs into: the command is typed, and until the
+    /// shell's preexec hook writes the output marker the last marker is still the prompt drawn
+    /// BEFORE the typing. That prompt is not ready, and neither is the quiet after it; the prompt
+    /// the shell draws after the command is.
+    #[test]
+    fn a_prompt_drawn_before_the_last_input_is_not_ready() {
+        let mut entries: Vec<PaneListEntry> =
+            serde_json::from_str(&panes_json(&[(1, false, false, None)])).unwrap();
+        entries[0].command_state = Some(PaneCommandState::Prompt);
+        entries[0].input_since_prompt = true;
+        let typed = serde_json::to_string(&entries).unwrap();
+        assert!(typed.contains("\"input_since_prompt\":true"));
+        let (state, command_state) = pane_look(&typed, PaneId::Terminal(1)).unwrap();
+        assert_eq!(
+            (state, command_state),
+            (PaneState::Running, Some(PaneCommandState::Running))
+        );
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        watch.rendered(&screen(&["user@host ~ % ls"]), start);
+        assert_eq!(
+            watch.judge(command_state, start + Duration::from_secs(5)),
+            None
+        );
+
+        // the command ran and the shell drew its next prompt: nothing typed since
+        entries[0].input_since_prompt = false;
+        let fresh = serde_json::to_string(&entries).unwrap();
+        // written only when true, so a row with nothing typed reads as it always did
+        assert!(!fresh.contains("input_since_prompt"));
+        let (_, command_state) = pane_look(&fresh, PaneId::Terminal(1)).unwrap();
+        assert_eq!(watch.judge(command_state, start), Some(ReadyBy::Prompt));
     }
 
     #[test]

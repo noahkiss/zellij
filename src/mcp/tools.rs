@@ -186,8 +186,8 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_wait_for",
-        summary: "Block until a pane's command exits, its output matches a pattern, or it falls \
-                  silent.",
+        summary: "Block until a pane's command exits, its output matches a pattern, it falls \
+                  silent, or its shell is ready for the next command.",
         best_for: "the step after starting something long: wait for it rather than reading the \
                    pane over and over.",
         not_for: "a pane that is already in the state you want - read it instead. This call \
@@ -201,8 +201,12 @@ pub const TOOLS: &[ToolSpec] = &[
                needs a pattern; until=quiet takes the window in quiet_ms. until=match sees lines \
                that arrive AFTER the wait began, so anchor on a short string rather than on a line \
                that may wrap. until=exit on a plain shell pane waits for the shell, which is a \
-               timeout. Every wait is bounded: without timeout_s it gives up after 300 seconds \
-               rather than blocking for the life of the pane.",
+               timeout. until=ready means the command you typed has finished: the shell drew a \
+               prompt AFTER the last input typed into the pane, so the prompt still on screen \
+               right after typing does not count. Use it after zellij_write_input sends a line \
+               to a shell; read `ready_by` (prompt, or quiet for a shell without OSC 133 marks, \
+               where quiet_ms is the window). Every wait is bounded: without timeout_s it gives \
+               up after 300 seconds rather than blocking for the life of the pane.",
         params: &[
             SESSION,
             ParamSpec {
@@ -215,7 +219,7 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "until",
-                kind: ParamKind::Enum(&["exit", "match", "quiet"]),
+                kind: ParamKind::Enum(&["exit", "match", "quiet", "ready"]),
                 required: false,
                 from: Some(("action wait", "--for")),
                 describe: "",
@@ -236,7 +240,7 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action wait", "--quiet-ms")),
                 describe: "How long a pane must produce nothing to count as quiet, when \
-                           until=quiet.",
+                           until=quiet, or ready for a shell without OSC 133 marks.",
                 default: Some("500"),
             },
             ParamSpec {

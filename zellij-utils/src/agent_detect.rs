@@ -695,6 +695,7 @@ mod tests {
             command_state: None,
             last_command_exit_code: None,
             program_status: None,
+            input_since_prompt: false,
         };
         let agents = agents_from_pane_list(vec![entry]);
         assert_eq!(agents.len(), 1);
@@ -727,6 +728,7 @@ mod tests {
             agent: detect_command_line("claude", &env(&[])),
             command_state: None,
             last_command_exit_code: None,
+            input_since_prompt: false,
             program_status: Some(status.clone()),
         };
         let pane_json = serde_json::to_value(&entry).unwrap();

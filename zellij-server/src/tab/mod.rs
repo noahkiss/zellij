@@ -888,6 +888,11 @@ pub trait Pane {
     fn program_status(&self) -> Option<zellij_utils::data::PaneProgramStatus> {
         None
     }
+    /// Whether input was typed into the pane after its shell last drew a prompt. Only a terminal
+    /// pane can say; see `Grid::input_since_prompt`.
+    fn input_since_prompt(&self) -> bool {
+        false
+    }
     fn update_exit_status(&mut self, _exit_status: i32) {}
     fn set_plugin_regex_highlights(
         &mut self,

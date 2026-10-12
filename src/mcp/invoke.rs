@@ -615,9 +615,9 @@ fn argv_in(
         },
         "zellij_wait_for" => {
             let until = args.enumerated("until", "exit");
-            if !["exit", "match", "quiet"].contains(&until.as_str()) {
+            if !["exit", "match", "quiet", "ready"].contains(&until.as_str()) {
                 return Err(format!(
-                    "`until` must be exit, match or quiet, not `{}`.",
+                    "`until` must be exit, match, quiet or ready, not `{}`.",
                     until
                 ));
             }
@@ -1232,6 +1232,30 @@ mod tests {
         assert!(
             refusal("zellij_wait_for", json!({"pane": "3", "until": "match"}))
                 .contains("needs a `pattern`")
+        );
+    }
+
+    #[test]
+    fn a_ready_wait_is_the_cli_ready_wait() {
+        assert_eq!(
+            line(
+                "zellij_wait_for",
+                json!({"pane": "sunny-otter", "until": "ready"}),
+                None
+            ),
+            "action wait sunny-otter --for ready --timeout 300"
+        );
+        assert_eq!(
+            line(
+                "zellij_wait_for",
+                json!({"pane": "3", "until": "ready", "quiet_ms": 800, "timeout_s": 20}),
+                None
+            ),
+            "action wait 3 --for ready --quiet-ms 800 --timeout 20"
+        );
+        assert!(
+            refusal("zellij_wait_for", json!({"pane": "3", "until": "soon"}))
+                .contains("exit, match, quiet or ready")
         );
     }
 

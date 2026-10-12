@@ -2731,6 +2731,12 @@ pub struct PaneListEntry {
     /// one in its end marker. Absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_command_exit_code: Option<i32>,
+    /// Input was typed into the pane after its shell last drew a prompt, so a `command_state` of
+    /// `prompt` is the prompt from BEFORE that input: the typed command has not started, or its
+    /// shell has not drawn the next prompt yet. Written only when `true`, and only for a pane whose
+    /// shell writes OSC 133 markers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_since_prompt: bool,
     /// What a program in the pane last said it is doing, over `OSC 7501`: the `state`, `state_*`
     /// keys of [`PaneProgramStatus`], flattened onto the row. Absent when no program has reported.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]

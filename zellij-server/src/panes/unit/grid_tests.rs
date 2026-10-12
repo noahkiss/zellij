@@ -4166,6 +4166,39 @@ fn osc133_command_state_at_a_prompt() {
     );
 }
 
+/// A prompt counts as fresh only when it was drawn after the last input: typing a command leaves
+/// the old prompt the last marker until preexec writes the output marker, and the next prompt
+/// marker is the shell saying the typed command finished.
+#[test]
+fn osc133_a_prompt_marker_is_fresh_only_after_the_last_input() {
+    let mut grid = create_grid_with_content("\x1b]133;A\x07$ \x1b]133;B\x07");
+    assert!(!grid.input_since_prompt(), "nothing was typed");
+
+    grid.note_typed_input();
+    assert!(grid.input_since_prompt());
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Prompt, None)),
+        "the stale prompt is still the last marker"
+    );
+
+    // the command runs and ends: still not a prompt drawn after the input
+    let mut vte_parser = vte::Parser::new();
+    vte_parser.advance(
+        &mut grid,
+        "ls\x1b]133;C\x07\r\nfile\r\n\x1b]133;D;0\x07".as_bytes(),
+    );
+    assert!(grid.input_since_prompt());
+
+    // the next prompt is
+    vte_parser.advance(&mut grid, "\x1b]133;A\x07$ \x1b]133;B\x07".as_bytes());
+    assert!(!grid.input_since_prompt());
+    assert_eq!(
+        grid.osc133_command_state(),
+        Some((PaneCommandState::Prompt, None))
+    );
+}
+
 #[test]
 fn osc133_command_state_while_a_command_runs() {
     let grid = create_grid_with_content(
