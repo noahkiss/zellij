@@ -183,7 +183,17 @@ pub enum Call {
         /// pane that arrives with its tab is named in a second command instead.
         rename: Option<RenameAfter>,
     },
+    /// Command lines run one after another, with a short pause between, stopping at the first
+    /// that fails: `zellij_write_input` with `submit`, which pastes and then presses Enter.
+    Sequence(Vec<Vec<String>>),
 }
+
+/// The pause between the steps of a [`Call::Sequence`].
+///
+/// A program that reads a paste as it arrives can still be taking it in when an Enter right
+/// behind it lands, and some take that Enter as part of the paste: a newline in the message
+/// instead of the key that sends it. A pause a person would not notice keeps the two apart.
+pub const SEQUENCE_PAUSE_MS: u64 = 150;
 
 /// A tool call, planned: what it runs, and the command a shell-mode create types once its pane is
 /// ready.
@@ -450,6 +460,11 @@ async fn plan_in(
     env: &CallEnv,
 ) -> Result<Plan, String> {
     let read = Args::new(args);
+    if tool == "zellij_write_input" {
+        if let Some(call) = write_input_call(&read, ambient_session).await? {
+            return Ok(call.into());
+        }
+    }
     if tool != "zellij_create" {
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
@@ -478,6 +493,166 @@ async fn plan_in(
     });
     let call = Call::MakingAgentTab { argv, rename };
     Ok(Plan { call, then_type })
+}
+
+/// `zellij_write_input` when it is more than one keystroke or one write: a message to submit, or
+/// an action on the coding agent in the pane. `None` for a plain `keys` or `text` call, which
+/// [`argv_in`] builds.
+async fn write_input_call(
+    args: &Args<'_>,
+    ambient_session: Option<&str>,
+) -> Result<Option<Call>, String> {
+    let submit = args.flag("submit");
+    let action = args.string("agent_action");
+    if !submit && action.is_none() {
+        return Ok(None);
+    }
+    let pane = args.required("pane")?;
+    let session = args
+        .string("session")
+        .or_else(|| ambient_session.map(String::from));
+    let scoped = |rest: Vec<String>| -> Vec<String> {
+        let mut argv = Vec::new();
+        if let Some(session) = &session {
+            argv.push("-s".to_owned());
+            argv.push(session.clone());
+        }
+        argv.extend(rest);
+        argv
+    };
+    let press = |key: &str| {
+        scoped(vec![
+            "action".to_owned(),
+            "send-keys".to_owned(),
+            flag_value("--pane-id", &pane),
+            "--".to_owned(),
+            key.to_owned(),
+        ])
+    };
+    if let Some(action) = action {
+        if submit || args.string("keys").is_some() || args.string("text").is_some() {
+            return Err(
+                "`agent_action` presses its own key: pass it alone, without keys, text or \
+                 submit."
+                    .to_owned(),
+            );
+        }
+        if !["interrupt", "approve", "deny"].contains(&action.as_str()) {
+            return Err(format!(
+                "`agent_action` must be interrupt, approve or deny, not `{}`.",
+                action
+            ));
+        }
+        let agents = run(&scoped(vec![
+            "action".to_owned(),
+            "list-agents".to_owned(),
+            "--json".to_owned(),
+        ]))
+        .await?;
+        if agents.is_error() {
+            return Err(format!(
+                "Could not ask the session which agent is in `{}`: {}",
+                pane,
+                agents.stderr.trim()
+            ));
+        }
+        let row = agent_row(&agents.stdout, &pane).ok_or_else(|| {
+            format!(
+                "`{}` is not running a coding agent this server can see. Pass the handle \
+                 zellij_overview with scope=agents prints.",
+                pane
+            )
+        })?;
+        let field = |name: &str| row.get(name).and_then(Value::as_str);
+        let key = agent_key(
+            field("kind").unwrap_or_default(),
+            field("state"),
+            field("state_kind"),
+            &action,
+        )?;
+        return Ok(Some(Call::One(press(key))));
+    }
+    if args.string("keys").is_some() {
+        return Err("`submit` sends text: pass text, not keys.".to_owned());
+    }
+    let text = args
+        .required("text")
+        .map_err(|_| "`submit` needs the `text` to send.".to_owned())?;
+    Ok(Some(Call::Sequence(vec![
+        scoped(vec![
+            "action".to_owned(),
+            "paste".to_owned(),
+            flag_value("--pane-id", &pane),
+            "--".to_owned(),
+            text,
+        ]),
+        press("Enter"),
+    ])))
+}
+
+/// The `list-agents --json` row of the pane a caller named: by handle, bare id or `terminal_N`.
+pub fn agent_row(json: &str, pane: &str) -> Option<Map<String, Value>> {
+    let rows: Vec<Map<String, Value>> = serde_json::from_str(json.trim()).ok()?;
+    rows.into_iter().find(|row| {
+        let id = row.get("pane_id").and_then(Value::as_u64);
+        row.get("handle").and_then(Value::as_str) == Some(pane)
+            || id.map_or(false, |id| {
+                pane == id.to_string() || pane == format!("terminal_{}", id)
+            })
+    })
+}
+
+/// The key an agent action presses, or why it presses none.
+///
+/// The keys are the ones the harnesses share. A permission prompt opens on its "allow once"
+/// option in claude, codex and opencode, so Enter takes it; Esc refuses it, and interrupts a
+/// working turn. pi asks for no approval at all. The agent's own `state` is the guard: an Enter
+/// sent to an agent that is not asking anything would send whatever it holds in its input box.
+/// An agent that reports no state cannot be checked, and gets the key.
+pub fn agent_key(
+    kind: &str,
+    state: Option<&str>,
+    state_kind: Option<&str>,
+    action: &str,
+) -> Result<&'static str, String> {
+    let nothing = |what: &str| {
+        Err(format!(
+            "Nothing to {}: the agent's state is {}. Nothing was pressed.",
+            what,
+            state.unwrap_or("-")
+        ))
+    };
+    match action {
+        "interrupt" => match state {
+            None | Some("working") => Ok("Esc"),
+            Some("blocked") => Err(
+                "The agent is blocked on a person, not working: approve or deny it instead. \
+                 Nothing was pressed."
+                    .to_owned(),
+            ),
+            Some(_) => nothing("interrupt"),
+        },
+        "approve" if kind == "pi" => {
+            Err("pi asks for no approvals, so there is nothing to approve.".to_owned())
+        },
+        "approve" => match (state, state_kind) {
+            (Some("blocked"), Some("question")) => Err(
+                "The agent is asking a question, not for permission: answer it with keys (the \
+                 option's number) or text. Nothing was pressed."
+                    .to_owned(),
+            ),
+            (None, _) | (Some("blocked"), _) => Ok("Enter"),
+            _ => nothing("approve"),
+        },
+        "deny" => match state {
+            None | Some("blocked") => Ok("Esc"),
+            Some(_) => nothing("deny"),
+        },
+        other => Err(format!(
+            "`agent_action` must be interrupt, approve or deny, not `{}`.",
+            other
+        )),
+    }
 }
 
 /// How a create runs its `command`: `shell` or `exec`, refused when it is neither.
@@ -597,6 +772,22 @@ fn argv_in(
                 "`scope` must be panes, agents or sessions, not `{}`.",
                 other
             )),
+        },
+        "zellij_read_pane" if args.flag("last_reply") => {
+            if args.flag("full") || args.flag("ansi") {
+                return Err(
+                    "`last_reply` reads the agent's transcript, not the screen: pass it \
+                            without full or ansi."
+                        .to_owned(),
+                );
+            }
+            Ok(scoped(vec![
+                "action".to_owned(),
+                "last-reply".to_owned(),
+                "--pane-id".to_owned(),
+                args.required("pane")?,
+                "--json".to_owned(),
+            ]))
         },
         "zellij_read_pane" => {
             let mut rest = vec![
@@ -1289,6 +1480,128 @@ mod tests {
             ),
             "action wait 3 --for agent-waiting --timeout 60"
         );
+    }
+
+    #[test]
+    fn a_last_reply_reads_the_transcript_and_not_the_screen() {
+        assert_eq!(
+            line(
+                "zellij_read_pane",
+                json!({"pane": "sunny-otter", "last_reply": true}),
+                None
+            ),
+            "action last-reply --pane-id sunny-otter --json"
+        );
+        assert!(refusal(
+            "zellij_read_pane",
+            json!({"pane": "3", "last_reply": true, "full": true})
+        )
+        .contains("without full or ansi"));
+    }
+
+    #[test]
+    fn an_agent_action_presses_the_key_the_state_calls_for_or_nothing() {
+        // approve takes the prompt's first option, allow once, in every harness that asks
+        for kind in ["claude", "codex", "opencode"] {
+            assert_eq!(
+                agent_key(kind, Some("blocked"), Some("permission"), "approve"),
+                Ok("Enter")
+            );
+        }
+        assert_eq!(
+            agent_key("claude", Some("blocked"), Some("permission"), "deny"),
+            Ok("Esc")
+        );
+        assert_eq!(
+            agent_key("claude", Some("working"), None, "interrupt"),
+            Ok("Esc")
+        );
+        // an agent that reports no state cannot be checked, and gets the key
+        assert_eq!(agent_key("opencode", None, None, "approve"), Ok("Enter"));
+        // the guard: an Enter to an idle agent would send its draft
+        for (state, action) in [
+            ("done", "approve"),
+            ("idle", "interrupt"),
+            ("working", "deny"),
+        ] {
+            let refused = agent_key("claude", Some(state), None, action).unwrap_err();
+            assert!(refused.contains("Nothing was pressed"), "{}", refused);
+        }
+        assert!(
+            agent_key("claude", Some("blocked"), Some("question"), "approve")
+                .unwrap_err()
+                .contains("asking a question")
+        );
+        assert!(agent_key("claude", Some("blocked"), Some("permission"), "interrupt").is_err());
+        assert!(agent_key("pi", Some("blocked"), None, "approve").is_err());
+    }
+
+    #[test]
+    fn an_agent_is_found_by_any_name_its_pane_answers_to() {
+        let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude"}]"#;
+        for name in ["sunny-otter", "3", "terminal_3"] {
+            assert!(agent_row(rows, name).is_some(), "{}", name);
+        }
+        assert!(agent_row(rows, "4").is_none());
+        assert!(agent_row("not json", "3").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_submitted_message_is_a_paste_then_enter() {
+        let plan = plan_in(
+            "zellij_write_input",
+            &args(json!({"pane": "sunny-otter", "text": "line one\nline two", "submit": true})),
+            Some("work"),
+            &a_shell_env(),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let Call::Sequence(argvs) = plan.call else {
+            panic!("not a sequence");
+        };
+        assert_eq!(
+            argvs,
+            vec![
+                vec![
+                    "-s",
+                    "work",
+                    "action",
+                    "paste",
+                    "--pane-id=sunny-otter",
+                    "--",
+                    "line one\nline two"
+                ],
+                vec![
+                    "-s",
+                    "work",
+                    "action",
+                    "send-keys",
+                    "--pane-id=sunny-otter",
+                    "--",
+                    "Enter"
+                ],
+            ]
+        );
+        for refused in [
+            json!({"pane": "3", "submit": true}),
+            json!({"pane": "3", "keys": "Enter", "submit": true}),
+            json!({"pane": "3", "agent_action": "approve", "text": "x"}),
+            json!({"pane": "3", "agent_action": "maybe"}),
+        ] {
+            assert!(
+                plan_in(
+                    "zellij_write_input",
+                    &args(refused.clone()),
+                    None,
+                    &a_shell_env()
+                )
+                .await
+                .is_err(),
+                "{}",
+                refused
+            );
+        }
     }
 
     #[test]

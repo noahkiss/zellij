@@ -104,6 +104,24 @@ impl ZellijMcp {
                 let outcome = invoke::run(&argv).await?;
                 return Ok((argv, outcome));
             },
+            invoke::Call::Sequence(argvs) => {
+                let mut ran = None;
+                for (step, argv) in argvs.into_iter().enumerate() {
+                    if step > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            invoke::SEQUENCE_PAUSE_MS,
+                        ))
+                        .await;
+                    }
+                    let outcome = invoke::run(&argv).await?;
+                    let failed = outcome.is_error();
+                    ran = Some((argv, outcome));
+                    if failed {
+                        break;
+                    }
+                }
+                return ran.ok_or_else(|| "Nothing to run.".to_owned());
+            },
             invoke::Call::MakingAgentTab { argv, rename } => (argv, rename),
         };
         let mut outcome = invoke::run(&argv).await?;

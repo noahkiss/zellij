@@ -2313,6 +2313,11 @@ impl Action {
             CliAction::ListAgents { .. } => {
                 Err("`list-agents` is run by the client, not sent as an action".into())
             },
+            // `last-reply` reads a file on this machine, found from the `list-panes` answer. The
+            // session has nothing to add, so it is the client's, like `list-agents`
+            CliAction::LastReply { .. } => {
+                Err("`last-reply` is run by the client, not sent as an action".into())
+            },
             // `show` is `new-pane` with a command the CLI builds - the viewer this binary carries -
             // and is rewritten into one before it gets here, so no verb is added to the contract
             // `drop-file` stores the file on this side and is sent as a `Paste`, so the contract

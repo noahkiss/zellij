@@ -1251,6 +1251,21 @@ fn attach_with_cli_client(
         );
         std::process::exit(exit_status);
     }
+    // `last-reply` never becomes an action: it reads the agent's transcript on this machine,
+    // found from the pane list
+    if let zellij_utils::cli::CliAction::LastReply { pane_id, json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_last_reply_client(
+            &|| {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            },
+            session_name,
+            pane_id,
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
     // a `dump-screen` of several panes never becomes several actions either. It is the same per-pane
     // request, asked N times down one connection, and holding that in the client is what keeps a
     // sweep off the client/server contract. One `--pane-id` is not a sweep and does not come here:

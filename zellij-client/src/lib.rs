@@ -7,6 +7,7 @@ mod os_input_output_unix;
 #[path = "os_input_output_windows.rs"]
 mod os_input_output_windows;
 
+pub mod agent_reply;
 pub mod cli_client;
 mod command_is_executing;
 mod input_handler;

@@ -1026,6 +1026,138 @@ pub fn start_list_agents_client(
     print_agents(&agents, withheld, output_json, report_withheld, false)
 }
 
+/// `zellij action last-reply`: the agent's last reply, from its harness's transcript.
+///
+/// The pane is resolved the way every addressed verb resolves one, so a pane a privacy policy
+/// withholds is refused before anything is read. Its row in the agent list names the harness and
+/// the session id, and [`crate::agent_reply`] finds and reads the transcript on this machine.
+///
+/// Exit 0 printed a reply. Exit 2 is a miss with the reason on stderr: not an agent, no session
+/// id yet, a harness whose transcript this build does not read, no transcript file, or nothing
+/// written since the last prompt. Exit 1 is a session that could not be asked.
+pub fn start_last_reply_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    target: &str,
+    output_json: bool,
+) -> i32 {
+    let pane = match resolve_pane_target(make_os_input(), session_name, target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 2;
+        },
+    };
+    let agents = match agents_of_session(make_os_input(), session_name) {
+        Ok((agents, _)) => agents,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let var = |name: &str| std::env::var(name).ok();
+    match last_reply_of(&agents, pane, &var, home.as_deref()) {
+        Ok(found) => {
+            if output_json {
+                println!("{}", serde_json::to_string(&found).unwrap_or_default());
+            } else {
+                println!("{}", found.reply);
+            }
+            0
+        },
+        Err(message) => {
+            eprintln!("{}: {}", target, message);
+            2
+        },
+    }
+}
+
+/// What `last-reply --json` prints.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LastReplyReport {
+    pub pane_id: String,
+    pub handle: String,
+    pub kind: String,
+    pub agent_id: String,
+    /// The transcript the reply was read from.
+    pub transcript: PathBuf,
+    /// The agent's `OSC 7501` state, when it reports one: `done` or `idle` means the turn ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    pub reply: String,
+}
+
+/// The last reply of the agent in `pane`, or why there is none. Pure but for the file reads.
+fn last_reply_of(
+    agents: &ListAgentsResponse,
+    pane: PaneId,
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
+) -> Result<LastReplyReport, String> {
+    let PaneId::Terminal(id) = pane else {
+        return Err("a plugin pane runs no coding agent.".to_owned());
+    };
+    let agent = agents
+        .iter()
+        .find(|agent| agent.pane_id == id)
+        .ok_or_else(|| {
+            "it is not running a coding agent (`list-agents` does not list it).".to_owned()
+        })?;
+    let kind = agent.agent.kind.as_str();
+    if !crate::agent_reply::reads_transcript_of(kind) {
+        return Err(format!(
+            "{} keeps its sessions where this build does not read them. Read the pane's screen \
+             with dump-screen instead.",
+            kind
+        ));
+    }
+    let agent_id = agent.agent.agent_id.clone().ok_or_else(|| {
+        format!(
+            "no {} session id is known for it yet, so its transcript cannot be found. A {} that \
+             has not been sent a message has none.",
+            kind, kind
+        )
+    })?;
+    let root = crate::agent_reply::transcript_root(kind, var, home)
+        .ok_or_else(|| "no home directory to look for the transcript in.".to_owned())?;
+    let transcript =
+        crate::agent_reply::find_transcript(kind, &root, &agent_id).ok_or_else(|| {
+            format!(
+                "no transcript of {} session {} under {}.",
+                kind,
+                agent_id,
+                root.display()
+            )
+        })?;
+    let text = crate::agent_reply::read_tail(&transcript)
+        .map_err(|e| format!("could not read {}: {}", transcript.display(), e))?;
+    let found = crate::agent_reply::last_reply(kind, &text);
+    let state = agent
+        .program_status
+        .as_ref()
+        .map(|status| status.state.clone());
+    if found.reply.is_empty() {
+        return Err(format!(
+            "the agent has written no reply since its last prompt{}.",
+            match (&state, found.mid_tool) {
+                (Some(state), _) => format!(" (state: {})", state),
+                (None, true) => " (it is running a tool)".to_owned(),
+                (None, false) => String::new(),
+            }
+        ));
+    }
+    Ok(LastReplyReport {
+        pane_id: pane.to_string(),
+        handle: agent.handle.clone(),
+        kind: kind.to_owned(),
+        agent_id,
+        transcript,
+        state,
+        reply: found.reply,
+    })
+}
+
 /// `zellij action list-agents --all-sessions`: the same rows, from every live session, each
 /// carrying the session it came from.
 ///
@@ -2943,5 +3075,64 @@ mod tests {
         assert!(!serde_json::to_string(&entries)
             .unwrap()
             .contains("input_since_state"));
+    }
+
+    fn agent_row(
+        pane_id: u32,
+        kind: &str,
+        agent_id: Option<&str>,
+    ) -> zellij_utils::data::AgentListEntry {
+        zellij_utils::data::AgentListEntry {
+            handle: format!("pane-{}", pane_id),
+            pane_id,
+            tab_id: 0,
+            tab_position: 0,
+            tab_name: "t".to_owned(),
+            title: String::new(),
+            agent: agent_detect::PaneAgent {
+                kind: kind.to_owned(),
+                agent_id: agent_id.map(str::to_owned),
+                source: "command".to_owned(),
+                session_source: None,
+            },
+            command: None,
+            cwd: None,
+            pid: None,
+            program_status: None,
+            session: None,
+        }
+    }
+
+    #[test]
+    fn a_last_reply_is_read_from_the_transcript_of_the_panes_own_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let project = home.join(".claude/projects/-src");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("s1.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        let agents = vec![
+            agent_row(1, "claude", Some("s1")),
+            agent_row(2, "opencode", Some("s2")),
+            agent_row(3, "claude", None),
+            agent_row(4, "claude", Some("gone")),
+        ];
+        let found = last_reply_of(&agents, PaneId::Terminal(1), &none, Some(home)).unwrap();
+        assert_eq!(
+            (found.reply.as_str(), found.handle.as_str()),
+            ("hello", "pane-1")
+        );
+        assert_eq!(found.transcript, project.join("s1.jsonl"));
+        let why =
+            |pane| last_reply_of(&agents, PaneId::Terminal(pane), &none, Some(home)).unwrap_err();
+        assert!(why(2).contains("opencode keeps its sessions"), "{}", why(2));
+        assert!(why(3).contains("no claude session id"), "{}", why(3));
+        assert!(why(4).contains("no transcript"), "{}", why(4));
+        assert!(why(9).contains("not running a coding agent"), "{}", why(9));
     }
 }

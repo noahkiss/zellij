@@ -2645,6 +2645,32 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(long, value_parser, default_value = "1000")]
         interval_ms: u64,
     },
+    /// Print the last reply of the coding agent in a pane, from its harness's transcript
+    ///
+    /// The text the agent wrote after the last prompt, tool call or tool result - the answer at
+    /// the end of a turn, without the narration between tool calls and without thinking. It is
+    /// read from the transcript file the harness writes, found by the session id `list-agents`
+    /// shows: claude (`~/.claude/projects`), codex (`~/.codex/sessions`) and pi
+    /// (`~/.pi/agent/sessions`), honouring CLAUDE_CONFIG_DIR, CODEX_HOME and PI_CODING_AGENT_DIR
+    /// in this command's environment. opencode is not read.
+    ///
+    ///   zellij action last-reply --pane-id sunny-otter
+    ///
+    /// Returns: the reply text alone, or with --json a record of pane_id, handle, kind,
+    /// agent_id, transcript, state and reply. Exit 2, with the reason on stderr, when the pane
+    /// runs no agent, its session id is not known yet, its harness is not read, no transcript is
+    /// found, or the agent has written nothing since its last prompt.
+    LastReply {
+        /// The pane: terminal_1, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-agents` prints the handles of the
+        /// panes running an agent
+        #[clap(short, long, value_parser)]
+        pane_id: String,
+
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// Get information about the currently active tab
     ///
     /// Returns: `name:`, `id:` and `position:` lines, or the full TabInfo with --json
@@ -3035,6 +3061,7 @@ impl CliAction {
             | CliAction::ListClients { json, .. }
             | CliAction::ListEvents { json, .. }
             | CliAction::ListAgents { json, .. }
+            | CliAction::LastReply { json, .. }
             | CliAction::CurrentTabInfo { json, .. } => {
                 *json = true;
                 true

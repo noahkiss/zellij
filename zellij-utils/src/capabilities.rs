@@ -87,6 +87,7 @@ pub const CAPABILITIES: &[&str] = &[
     "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
     "list-agents-watch",  // list-agents --watch, one JSON line per agent change
     "wait-agent-state", // action wait --for agent-idle|agent-waiting, input_since_state on list-panes --json
+    "last-reply",       // action last-reply: an agent's last reply, from its transcript
     "session-drop-env", // session_restart_drop_env
     "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
     "session-service-config", // session_service, pin_exe

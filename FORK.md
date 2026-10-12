@@ -9261,6 +9261,86 @@ parameters. Files: `zellij-server/src/program_status.rs` (the flag), `panes/grid
 judge on scripted looks (stale, working, each stop, the silence fallback, the `agent-waiting`
 misses), the row reading, the report lines, the clap defaults and the MCP command lines.
 
+### Checking in on an agent: `last-reply`, `submit` and `agent_action`
+
+From nkmk.34, from the agent-orchestration plan. A session that drives agents in other panes read
+their whole screen to learn what they said, typed a message as keystrokes whose newlines sent it
+early, and had to know which key each harness wants for an approval.
+
+```
+zellij_write_input {"pane": "sunny-otter", "text": "Fix the failing test.\nThen run it.", "submit": true}
+zellij_wait_for    {"pane": "sunny-otter", "until": "agent_idle"}
+zellij_read_pane   {"pane": "sunny-otter", "last_reply": true}
+  # action last-reply --pane-id sunny-otter --json
+{"pane_id": "terminal_3", "handle": "sunny-otter", "kind": "claude", "agent_id": "…",
+ "transcript": "/home/u/.claude/projects/-home-u-src/….jsonl", "state": "done",
+ "reply": "Fixed: the fixture path was relative. The test passes."}
+zellij_write_input {"pane": "sunny-otter", "agent_action": "approve"}
+```
+
+**`zellij action last-reply --pane-id <pane> [--json]`** prints the agent's last reply, read from
+its harness's own transcript rather than from the screen. Each harness draws a turn its own way,
+wraps it to the pane and scrolls the start of a long answer away; the transcript holds the text as
+the model wrote it.
+
+- **Which transcript**: the session id `list-agents` already shows (`agent_id`, from nkmk.31's
+  resolution: claude's per-process record, codex's open rollout file, or the agent's own `OSC 1337`
+  report). The file is found by that id under the harness's directory, newest first:
+
+  | harness | file |
+  |---|---|
+  | claude | `$CLAUDE_CONFIG_DIR` or `~/.claude`, `projects/*/<id>.jsonl` |
+  | codex | `$CODEX_HOME` or `~/.codex`, `sessions/YYYY/MM/DD/rollout-*-<id>.jsonl` |
+  | pi | `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, `sessions/*/*_<id>.jsonl` |
+
+- **The last reply** is the text the agent wrote after the last prompt, tool call or tool result:
+  the answer at the end of a turn, without the "let me look" narration between tool calls. Thinking
+  is never part of it. claude's subagent lines (`isSidechain`) and injected context (`isMeta`)
+  are skipped. Only the last 8 MiB of a transcript is read.
+- **A miss, exit 2, says why**: the pane runs no agent; no session id is known yet (a codex or pi
+  that has not been sent a message); opencode, whose sessions live in a database this build does
+  not read; no transcript under the directory; or nothing written since the last prompt (the
+  report names the agent's `state`). The pane is resolved like every addressed verb, so a pane a
+  privacy policy withholds is refused before anything is read.
+- **It is the client's**, like `list-agents`: one `list-panes`, then a file read on this machine.
+  No action, no contract change. The directories come from the CLI's own environment, not the
+  agent's: an agent started with a different `CLAUDE_CONFIG_DIR` is looked for in the wrong place.
+
+**`zellij_read_pane` gains `last_reply`**, which runs `last-reply --json`. It refuses `full` and
+`ansi` beside it.
+
+**`zellij_write_input` gains `submit` and `agent_action`.**
+
+- `submit` with `text` runs `action paste` (one bracketed paste, so a newline in the message does
+  not send it early) and then `send-keys Enter`, 150 ms apart. A TUI that reads a paste as it
+  arrives can take an Enter right behind it as part of the paste.
+- `agent_action` is `interrupt`, `approve` or `deny`. It reads the pane's `list-agents` row first
+  and presses a key only when the agent's reported state fits:
+
+  | action | presses | only when the state is |
+  |---|---|---|
+  | `interrupt` | `Esc` | `working`, or none reported |
+  | `approve` | `Enter`: the prompt's first option, allow once, in claude, codex and opencode | `blocked` (not `question`), or none reported |
+  | `deny` | `Esc` | `blocked`, or none reported |
+
+  An Enter sent to an agent that is not asking would send whatever it holds in its input box, which
+  is why the state is the guard. A question (`blocked`, `question`) is answered with keys or text.
+  pi asks for no approvals. An agent that reports no state (opencode) cannot be checked and gets
+  the key. The pane is matched by handle, bare id or `terminal_N`; a uuid is refused with a pointer
+  to `zellij_overview`. Verified live on claude only; the codex and opencode keys come from their
+  prompts' default option and their own Esc bindings.
+
+Capability: `last-reply`. Both MCP tools stay within the parameter cap: `zellij_read_pane` has
+five, `zellij_write_input` six. Files: `zellij-client/src/agent_reply.rs` (new: the transcript
+roots, the find, the tail read and the per-harness walk), `cli_client.rs`
+(`start_last_reply_client`, `last_reply_of`), `zellij-utils/src/cli.rs` (`LastReply`),
+`input/actions.rs` (the refusal arm), `cli_surface.rs` (the `read` band, the payload row),
+`capabilities.rs`; `src/commands.rs`; `src/mcp/` (`Call::Sequence`, `write_input_call`,
+`agent_row`, `agent_key`, the two tools). Tests: the walk on claude, codex and pi transcripts
+(narration, tool steps, mid-tool, sidechain, meta), the roots and their variables, the find at each
+harness's depth, the tail read, every miss of `last_reply_of`, the key table and its refusals, the
+row match, and the paste-then-Enter sequence.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

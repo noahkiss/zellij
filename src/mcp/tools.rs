@@ -141,16 +141,24 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_read_pane",
-        summary: "Read what is on a pane's screen right now.",
+        summary: "Read what is on a pane's screen right now, or the last reply of the coding \
+                  agent in it.",
         best_for: "seeing the output of something a pane is running, including a pane in a tab \
-                   nobody is looking at - the grid is kept whether or not the pane renders.",
+                   nobody is looking at - the grid is kept whether or not the pane renders. With \
+                   last_reply, checking what an agent in another pane answered.",
         not_for: "waiting for output that has not arrived yet, and not for a pane you cannot \
                   name: there is no default pane here.",
         follow_up: Some("zellij_wait_for when the output you want is not there yet"),
-        reports: &["action dump-screen"],
+        reports: &["action dump-screen", "action last-reply"],
         tips: "This is the grid, not the frame. A pane held open after its command exited shows \
                `[ EXIT CODE: n ]` in its border, and that line is NOT in this answer. Use \
-               zellij_wait_for with until=exit for a command's status.",
+               zellij_wait_for with until=exit for a command's status. last_reply reads the \
+               agent's own transcript instead of the screen: the text it wrote after its last \
+               prompt or tool call, whole, however long, without the narration between tool \
+               calls. It reads claude, codex and pi, from the transcript on this machine; for \
+               opencode, or an agent that has not been sent a message yet, the call misses and \
+               says why - read the screen then. Wait with until=agent_idle first, so the reply \
+               is the finished one.",
         params: &[
             SESSION,
             ParamSpec {
@@ -177,6 +185,15 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action dump-screen", "--ansi")),
                 describe: "",
+                default: None,
+            },
+            ParamSpec {
+                name: "last_reply",
+                kind: ParamKind::Bool,
+                required: false,
+                from: None,
+                describe: "Return only the last reply of the coding agent in the pane, read from \
+                           its transcript, instead of the screen. Not with full or ansi.",
                 default: None,
             },
         ],
@@ -281,9 +298,10 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_write_input",
-        summary: "Type into a named pane, as if at its keyboard.",
+        summary: "Type into a named pane, as if at its keyboard, or send a coding agent in it a \
+                  message, an interrupt or an answer to its approval prompt.",
         best_for: "driving a program that is already running in a pane - answering a prompt, \
-                   sending a line to a shell.",
+                   sending a line to a shell, talking to an agent in another pane.",
         not_for: "starting something in a NEW pane, and not for a pane you have not named. There \
                   is no focused pane here: an unnamed target would be a pane you have never seen.",
         follow_up: Some("zellij_wait_for or zellij_read_pane to see what the pane did with it"),
@@ -291,9 +309,18 @@ pub const TOOLS: &[ToolSpec] = &[
         // flag: a tool that multiplexes says what each of its commands returns
         reports: &["action send-keys", "action write-chars"],
         tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
-               text is written literally and presses nothing. Pass one or the other. This is the \
-               cheap way to do more work in a pane you already made: reach for it before \
-               zellij_create.",
+               text is written literally and presses nothing. Pass one of keys, text or \
+               agent_action. This is the cheap way to do more work in a pane you already made: \
+               reach for it before zellij_create. To message a coding agent, pass text with \
+               submit=true: the text goes in as one bracketed paste, so its newlines do not send \
+               it early, and then Enter sends it. Follow with zellij_wait_for until=agent_idle. \
+               agent_action works on a pane running claude, codex, opencode or pi, and checks \
+               the state the agent reports before it presses anything: interrupt stops a \
+               working agent; approve accepts the permission prompt a blocked agent shows, on \
+               its first option (allow once); deny refuses it. A call that does not fit the \
+               state - approve when nothing is asked, interrupt when the agent is idle - is \
+               refused and presses nothing. A question the agent asks (blocked, kind question) \
+               is answered with keys or text, not with approve.",
         params: &[
             SESSION,
             ParamSpec {
@@ -323,7 +350,26 @@ pub const TOOLS: &[ToolSpec] = &[
                 from: Some(("action write-chars", "chars")),
                 describe:
                     "The text to write literally. It presses nothing: add a second call with \
-                           keys `Enter` to submit it.",
+                           keys `Enter` to submit it, or pass submit.",
+                default: None,
+            },
+            ParamSpec {
+                name: "submit",
+                kind: ParamKind::Bool,
+                required: false,
+                from: None,
+                describe: "With text: paste it as one bracketed paste, then press Enter. How to \
+                           send a message to a coding agent, or several lines to a shell at once.",
+                default: None,
+            },
+            ParamSpec {
+                name: "agent_action",
+                kind: ParamKind::Enum(&["interrupt", "approve", "deny"]),
+                required: false,
+                from: None,
+                describe: "Act on the coding agent in the pane: interrupt its work, approve its \
+                           permission prompt, or deny it. The key is the one that agent expects, \
+                           and nothing is pressed unless the agent's state fits.",
                 default: None,
             },
         ],

@@ -37,6 +37,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "current-tab-info",
             "dump-layout",
             "dump-screen",
+            "last-reply",
             "list-agents",
             "list-clients",
             "list-events",
@@ -200,6 +201,13 @@ const OUTPUTS: &[OutputSpec] = &[
     },
     OutputSpec {
         command: "action dump-screen",
+        shape: "payload",
+        keys: "",
+    },
+    // the reply alone; `--json` makes it a record of pane_id handle kind agent_id transcript
+    // state reply
+    OutputSpec {
+        command: "action last-reply",
         shape: "payload",
         keys: "",
     },
