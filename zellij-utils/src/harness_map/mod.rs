@@ -174,7 +174,8 @@ mod tests {
             vec!["zellij", "setup", "--harness-map"],
             vec!["zellij", "setup", "--harness-map", "--json"],
         ] {
-            let args = crate::cli::CliArgs::try_parse_from(flags).unwrap();
+            let args = crate::cli::on_big_stack(move || crate::cli::CliArgs::try_parse_from(flags))
+                .unwrap();
             match args.command.unwrap() {
                 crate::cli::Command::Setup(setup) => assert!(setup.harness_map),
                 other => panic!("unexpected command: {other:?}"),
