@@ -162,6 +162,14 @@ fn create_new_tab_with_plugin_receiver(
     size: Size,
     stacked_resize: bool,
 ) -> (Tab, Receiver<(PluginInstruction, ErrorContext)>) {
+    create_new_tab_with_plugin_receiver_and_pty_writer(size, stacked_resize, None)
+}
+
+fn create_new_tab_with_plugin_receiver_and_pty_writer(
+    size: Size,
+    stacked_resize: bool,
+    pty_writer: Option<SenderWithContext<PtyWriteInstruction>>,
+) -> (Tab, Receiver<(PluginInstruction, ErrorContext)>) {
     let index = 0;
     let position = 0;
     let name = String::new();
@@ -169,6 +177,9 @@ fn create_new_tab_with_plugin_receiver(
     let mut senders = ThreadSenders::default().silently_fail_on_send();
     let (to_plugin, plugin_receiver): ChannelWithContext<PluginInstruction> = unbounded();
     senders.replace_to_plugin(SenderWithContext::new(to_plugin));
+    if let Some(pty_writer) = pty_writer {
+        senders.replace_to_pty_writer(pty_writer);
+    }
     let max_panes = None;
     let mode_info = ModeInfo::default();
     let style = Style::default();
@@ -18295,4 +18306,182 @@ fn a_pane_that_still_holds_still_names_its_command() {
         ))),
         "a held pane can be re-run with ENTER, so its command is still what it is running"
     );
+}
+
+#[test]
+fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
+    for explicit_target in [true, false] {
+        for should_focus in [true, false] {
+            let (tx, rx) = unbounded();
+            let mut tab = create_new_tab_with_plugin_receiver_and_pty_writer(
+                Size { cols: 80, rows: 24 },
+                true,
+                Some(SenderWithContext::new(tx)),
+            )
+            .0;
+            drain_pty_writer(&rx);
+            tab.new_stacked_pane(
+                PaneId::Terminal(2),
+                None,
+                None,
+                false,
+                should_focus,
+                explicit_target.then_some(PaneId::Terminal(1)),
+                (!explicit_target).then_some(1),
+                None,
+                None,
+            )
+            .unwrap();
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(2)).unwrap();
+            let expected = (expanded.get_content_rows(), expanded.get_content_columns());
+            assert_eq!(expected, (21, 78));
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(collapsed.rows(), 1);
+            assert_eq!(
+                (
+                    collapsed.get_terminal_rows(),
+                    collapsed.get_terminal_columns()
+                ),
+                expected
+            );
+            let writes = drain_pty_writer(&rx);
+            for pid in [1, 2] {
+                assert!(
+                    writes.iter().any(|instruction| matches!(instruction,
+                        PtyWriteInstruction::ResizePty(id, cols, rows, _, _)
+                            if *id == pid && (*rows as usize, *cols as usize) == expected
+                    )),
+                    "stack creation sizes terminal {pid} before rendering"
+                );
+            }
+            tab.resize_whole_tab(Size {
+                cols: 100,
+                rows: 30,
+            })
+            .unwrap();
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(2)).unwrap();
+            let expected = (expanded.get_content_rows(), expanded.get_content_columns());
+            assert_eq!(expected, (27, 98));
+            let writes = drain_pty_writer(&rx);
+            for pid in [1, 2] {
+                let last_size = writes
+                    .iter()
+                    .filter_map(|instruction| match instruction {
+                        PtyWriteInstruction::ResizePty(id, cols, rows, _, _) if *id == pid => {
+                            Some((*rows as usize, *cols as usize))
+                        },
+                        _ => None,
+                    })
+                    .last();
+                assert_eq!(last_size, Some(expected));
+            }
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(
+                (
+                    collapsed.get_terminal_rows(),
+                    collapsed.get_terminal_columns()
+                ),
+                expected
+            );
+            assert_eq!(collapsed.rows(), 1);
+            tab.handle_pty_bytes(1, format!("\x1b[{};1Hlast row", expected.0).into_bytes())
+                .unwrap();
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert!(collapsed.dump_screen(false, None).contains("last row"));
+            tab.tiled_panes.expand_pane_in_stack(PaneId::Terminal(1));
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(
+                (
+                    expanded.get_terminal_rows(),
+                    expanded.get_terminal_columns()
+                ),
+                expected
+            );
+            tab.tiled_panes.focus_pane(PaneId::Terminal(1), 1);
+            tab.toggle_active_pane_fullscreen(1);
+            let fullscreen = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(
+                (
+                    fullscreen.get_terminal_rows(),
+                    fullscreen.get_terminal_columns()
+                ),
+                (
+                    fullscreen.get_content_rows(),
+                    fullscreen.get_content_columns()
+                )
+            );
+            assert_eq!(
+                (
+                    fullscreen.get_terminal_rows(),
+                    fullscreen.get_terminal_columns()
+                ),
+                (28, 98)
+            );
+            tab.toggle_active_pane_fullscreen(1);
+            let restored = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            assert_eq!(
+                (
+                    restored.get_terminal_rows(),
+                    restored.get_terminal_columns()
+                ),
+                expected
+            );
+            tab.new_pane(
+                PaneId::Terminal(3),
+                None,
+                None,
+                false,
+                true,
+                NewPanePlacement::Tiled {
+                    direction: Some(Direction::Right),
+                    borderless: None,
+                },
+                Some(1),
+                None,
+            )
+            .unwrap();
+            for use_strategies in [false, true] {
+                let before_columns = tab
+                    .tiled_panes
+                    .panes
+                    .get(&PaneId::Terminal(1))
+                    .unwrap()
+                    .get_content_columns();
+                drain_pty_writer(&rx);
+                let strategy = ResizeStrategy::new(Resize::Increase, Some(Direction::Right));
+                if use_strategies {
+                    tab.tiled_panes
+                        .resize_pane_with_strategies(PaneId::Terminal(1), &[strategy], (5.0, 5.0))
+                        .unwrap();
+                } else {
+                    tab.tiled_panes
+                        .resize_pane_with_id(strategy, PaneId::Terminal(1), None)
+                        .unwrap();
+                }
+                let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+                let expected = (expanded.get_content_rows(), expanded.get_content_columns());
+                assert!(expected.1 > before_columns);
+                let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(2)).unwrap();
+                assert_eq!(collapsed.rows(), 1);
+                assert_eq!(
+                    (
+                        collapsed.get_terminal_rows(),
+                        collapsed.get_terminal_columns()
+                    ),
+                    expected
+                );
+                let writes = drain_pty_writer(&rx);
+                let last_size = writes
+                    .iter()
+                    .filter_map(|instruction| match instruction {
+                        PtyWriteInstruction::ResizePty(2, cols, rows, _, _) => {
+                            Some((*rows as usize, *cols as usize))
+                        },
+                        _ => None,
+                    })
+                    .last();
+                assert_eq!(last_size, Some(expected));
+            }
+        }
+    }
 }

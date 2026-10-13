@@ -152,6 +152,7 @@ pub struct TerminalPane {
     vte_parser: vte::Parser,
     selection_scrolled_at: time::Instant,
     content_offset: Offset,
+    stack_terminal_size: Option<(usize, usize)>,
     pane_title: String,
     frame_agent_name: Option<String>,
     pane_name: String,
@@ -226,12 +227,46 @@ impl Pane for TerminalPane {
         self.get_rows()
             .saturating_sub(self.content_offset.top + self.content_offset.bottom)
     }
+    fn get_terminal_rows(&self) -> usize {
+        if self.current_geom().is_collapsed_stack_member() {
+            self.stack_terminal_size
+                .map(|size| size.0)
+                .unwrap_or(self.grid.height)
+        } else {
+            self.get_content_rows()
+        }
+    }
+    fn get_terminal_columns(&self) -> usize {
+        if self.current_geom().is_collapsed_stack_member() {
+            self.stack_terminal_size
+                .map(|size| size.1)
+                .unwrap_or(self.grid.width)
+        } else {
+            self.get_content_columns()
+        }
+    }
+    fn set_stack_terminal_size(&mut self, size: Option<(usize, usize)>) {
+        let previous_size = self.stack_terminal_size;
+        self.stack_terminal_size = size;
+        if size.is_none() && previous_size.is_some() {
+            self.reflow_lines();
+        }
+        if let Some((rows, cols)) = size {
+            if self.grid.height != rows || self.grid.width != cols {
+                self.grid.change_size(rows, cols);
+                self.set_should_render(true);
+            }
+        }
+    }
     fn reset_size_and_position_override(&mut self) {
         self.geom_override = None;
         self.reflow_lines();
     }
     fn set_geom(&mut self, position_and_size: PaneGeom) {
         let is_pinned = self.geom.is_pinned;
+        if !position_and_size.is_stacked() {
+            self.stack_terminal_size = None;
+        }
         self.geom = position_and_size;
         self.geom.is_pinned = is_pinned;
         self.reflow_lines();
@@ -1531,6 +1566,7 @@ impl TerminalPane {
             note: None,
             frame: HashMap::new(),
             content_offset: Offset::default(),
+            stack_terminal_size: None,
             pid,
             grid,
             selectable: true,
@@ -1591,21 +1627,13 @@ impl TerminalPane {
         }
     }
     fn reflow_lines(&mut self) {
-        // Fork addition: a collapsed stack member is one row of title with no content area, and
-        // `TiledPanes::set_pane_frames` deliberately leaves its pty at the size the pane had while
-        // expanded. Its grid has to stay there too, or the two disagree: the program keeps drawing
-        // full-height frames into a one-row grid, every absolute cursor move scrolls instead of
-        // overwriting, and each redraw is shredded into the scrollback - which is the "corrupted
-        // pane, fixed by scrolling up and back down" the collapsed-member patch was meant to end.
-        //
-        // This is the one place the invariant can be stated. `set_geom`, `set_geom_override`,
-        // `set_content_offset` and the push/pull helpers all resize the grid through here, and
-        // each of them is reached with the collapsed geometry at some point.
+        // Visible stack geometry can temporarily describe only its title.
+        // The frame pass synchronizes collapsed grids to the expanded terminal size.
         if self.current_geom().is_collapsed_stack_member() {
             return;
         }
-        let rows = self.get_content_rows();
-        let cols = self.get_content_columns();
+        let rows = self.get_terminal_rows();
+        let cols = self.get_terminal_columns();
         self.grid.force_change_size(rows, cols);
         if self.banner.is_some() {
             self.grid.reset_terminal_state();

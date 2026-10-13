@@ -4630,12 +4630,15 @@ Both stack renderings reprinted, classic and stack list. The fork's 0.44 `top_on
 same accidental reason: it rode the old frames-on override, where 0.45's `top_only` is a `titles`
 variant.
 
-The fix says what the accident said, on purpose. A pane collapsed to its stack header has no content
+The initial fix says what the accident said, on purpose. A pane collapsed to its stack header has no content
 area, so `set_pane_frames` takes its content rows to zero and leaves its pty alone. The pane keeps —
 in its grid and in its terminal — the size it had while expanded, so re-expanding to the same
 geometry writes the same size back and the shell hears nothing. A stack that genuinely changed size
 while the pane was collapsed (a column resize, a moved stack) is picked up on the way out of the
 header, as one legitimate resize.
+
+The later "Collapsed stack members use the expanded terminal size" patch supersedes that deferred resize.
+It updates every member immediately when stack dimensions change and sizes new panes before rendering.
 
 **The grid half of that sentence was not true at first, and the gap corrupted panes.** Taking
 the pty out of the layout pass was not enough, because the grid is resized by a different route:
@@ -4682,6 +4685,25 @@ and no badge.
 applies to a collapsed member, in order — the intermediate one included, since that is the one that
 squashed the grid. It then asserts the grid's rows, columns and contents survive the collapse and the
 re-expansion. Replaying only the clamped offset passes with or without the guard, and tests nothing.
+
+### Collapsed stack members use the expanded terminal size
+
+Classic stack collapse changes visible geometry only. Every terminal in a stack uses the expanded
+member's content rows and columns, including frame offsets. The grid uses the same size as the pty.
+Resizing a stack updates collapsed terminals immediately. Switching the expanded member keeps that
+size, so focus changes do not require a terminal resize.
+
+`list-panes` keeps visible geometry: a collapsed member reports one pane row. Its content rows remain
+zero because only its title renders. `dump-screen --pane-id` returns the full terminal grid.
+No CLI or plugin contract fields change.
+
+`TiledPanes` synchronizes terminal sizes after computing visible frame offsets and after direct solver resizing.
+`TerminalPane` stores the stack terminal size separately. The pty resize macro reads terminal dimensions.
+Both stack insertion paths reapply frames before returning, so new terminals receive their size without
+waiting for a client render. Previously, an unfocused insertion could leave its pty at zero rows and columns.
+
+The stack unit test captures pty sizes before rendering. It checks both insertion paths with and without focus.
+It also checks collapsed geometry, viewport and solver resizing, screen dumping, expansion, and fullscreen restoration.
 
 ### Two bars ship in the binary (`slim-tab-bar`, `slim-keybinds`)
 

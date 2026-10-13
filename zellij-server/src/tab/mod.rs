@@ -92,8 +92,8 @@ macro_rules! resize_pty {
                 $senders
                     .send_to_pty_writer(PtyWriteInstruction::ResizePty(
                         *pid,
-                        $pane.get_content_columns() as u16,
-                        $pane.get_content_rows() as u16,
+                        $pane.get_terminal_columns() as u16,
+                        $pane.get_terminal_rows() as u16,
                         None,
                         None,
                     ))
@@ -117,9 +117,9 @@ macro_rules! resize_pty {
             match *character_cell_size {
                 Some(size_in_pixels) => {
                     let width_in_pixels =
-                        (size_in_pixels.width * $pane.get_content_columns()) as u16;
+                        (size_in_pixels.width * $pane.get_terminal_columns()) as u16;
                     let height_in_pixels =
-                        (size_in_pixels.height * $pane.get_content_rows()) as u16;
+                        (size_in_pixels.height * $pane.get_terminal_rows()) as u16;
                     (Some(width_in_pixels), Some(height_in_pixels))
                 },
                 None => (None, None),
@@ -132,8 +132,8 @@ macro_rules! resize_pty {
                 $senders
                     .send_to_pty_writer(PtyWriteInstruction::ResizePty(
                         *pid,
-                        $pane.get_content_columns() as u16,
-                        $pane.get_content_rows() as u16,
+                        $pane.get_terminal_columns() as u16,
+                        $pane.get_terminal_rows() as u16,
                         width_in_pixels,
                         height_in_pixels,
                     ))
@@ -310,6 +310,14 @@ pub trait Pane {
     fn get_content_y(&self) -> usize;
     fn get_content_columns(&self) -> usize;
     fn get_content_rows(&self) -> usize;
+    fn get_terminal_rows(&self) -> usize {
+        self.get_content_rows()
+    }
+    fn get_terminal_columns(&self) -> usize {
+        self.get_content_columns()
+    }
+    fn set_stack_terminal_size(&mut self, _size: Option<(usize, usize)>) {}
+
     fn reset_size_and_position_override(&mut self);
     fn set_geom(&mut self, position_and_size: PaneGeom);
     fn set_geom_override(&mut self, pane_geom: PaneGeom);
@@ -7878,16 +7886,12 @@ impl Tab {
         self.tiled_panes
             .add_pane_to_stack_of_pane_id(pane_id, pane, root_pane_id);
         self.set_should_clear_display_before_rendering();
-        // Groupify BEFORE the focus/frame re-application so the just-collapsed
-        // in-grid stack member is moved to `suppressed_panes` before
-        // `reapply_pane_frames` sends a `resize_pty!` at the 1-row collapsed
-        // size. Without this, the shell inside that pane sees two rapid
-        // WINCH events (1 row → visible-size rows) and redraws its prompt
-        // twice, blanking out the visible rows of previous output.
+        // Move hidden stack-list members before reapplying visible frames.
         self.sync_stacked_pane_list_mode();
         if should_focus {
             self.tiled_panes.expand_pane_in_stack(pane_id);
         }
+        self.tiled_panes.reapply_pane_frames();
         self.swap_layouts.set_is_tiled_damaged();
         Ok(())
     }
@@ -7904,13 +7908,12 @@ impl Tab {
         self.dissolve_stack_lists_for_classic_mutation();
         self.tiled_panes
             .add_pane_to_stack_of_active_pane(pane_id, pane, client_id);
-        // See comment in `add_stacked_pane_to_pane_id` — groupify before
-        // focusing so the collapsed member is suppressed before
-        // `reapply_pane_frames` fires its intermediate `resize_pty!`.
+        // Move hidden stack-list members before reapplying visible frames.
         self.sync_stacked_pane_list_mode();
         if should_focus {
             self.tiled_panes.focus_pane(pane_id, client_id);
         }
+        self.tiled_panes.reapply_pane_frames();
         self.swap_layouts.set_is_tiled_damaged();
         Ok(())
     }
