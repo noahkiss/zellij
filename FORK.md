@@ -595,7 +595,12 @@ What `--for match` can see is worth knowing before you write a pattern against i
   the pane delivers afterwards does. Use `dump-screen` for what is already there.
 - **A line identical to one already on screen is not new.** Each render carries the whole viewport
   rather than a delta, so "new" is worked out by comparing against the last one, and on a rendered
-  screen a prompt printed twice is the same line twice.
+  screen a prompt printed twice is the same line twice. Run the same `echo` twice and the second
+  wait times out, however right the regex is.
+- **The pattern is a regex, tested one screen line at a time**, so `^` and `$` anchor to that line.
+  A timed-out `--for match` names the pattern and the two rules above in its message (from
+  nkmk.35), because a miss caused by them otherwise reads as a wrong regex. The MCP
+  `zellij_wait_for until=match` description says the same.
 
 `--for exit` is the one condition that is a poll rather than a subscription — every 250ms, and
 nothing about it reaches the protocol. The render stream reports a pane *closing*, and a command

@@ -227,9 +227,11 @@ pub const TOOLS: &[ToolSpec] = &[
             "The exit_code of THIS call says whether the wait succeeded, not whether the command \
                did. A command that failed still returns exit_code 0 here: read `exit_status` in \
                the result. A wait that times out is a miss, not an error, and says so. until=match \
-               needs a pattern; until=quiet takes the window in quiet_ms. until=match sees lines \
-               that arrive AFTER the wait began, so anchor on a short string rather than on a line \
-               that may wrap. until=exit on a plain shell pane waits for the shell, which is a \
+               needs a pattern, a regex tested line by line (^ and $ anchor to the line); until=quiet \
+               takes the window in quiet_ms. until=match sees only lines that arrive AFTER the \
+               wait began: text already on screen never matches, and neither does a line identical \
+               to one already on screen, so make the output you wait for unique. Match a short \
+               string rather than a line that may wrap. until=exit on a plain shell pane waits for the shell, which is a \
                timeout. until=ready means the command you typed has finished: the shell drew a \
                prompt AFTER the last input typed into the pane, so the prompt still on screen \
                right after typing does not count. Use it after zellij_write_input sends a line \
@@ -276,8 +278,9 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action wait", "--match")),
-                describe: "The regex a delivered line must match, when until=match. Rust regex \
-                           syntax, unanchored.",
+                describe: "The regex a new line must match, when until=match. Rust regex syntax, \
+                           unanchored, tested one screen line at a time. Text already on screen \
+                           when the wait begins does not count.",
                 default: None,
             },
             ParamSpec {

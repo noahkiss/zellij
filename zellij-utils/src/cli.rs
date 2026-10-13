@@ -1258,7 +1258,9 @@ pub enum CliAction {
     /// the byte stream. A line the terminal wrapped arrives as two lines, so a pattern spanning
     /// the wrap never matches; anchor on a short distinctive string. Lines already on screen when
     /// the wait began are the baseline and do not match: only a line the pane delivers afterwards
-    /// does. A line identical to one already on screen is not new, and is not matched either.
+    /// does. A line identical to one already on screen is not new, and is not matched either - so
+    /// wait for output that differs from what the pane has already shown. A timed-out match says
+    /// so, and names the pattern.
     Wait {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
@@ -1272,7 +1274,9 @@ pub enum CliAction {
         #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
         wait_for: WaitFor,
 
-        /// The regex a delivered line must match, for `--for match`. Rust regex syntax, unanchored
+        /// The regex a new line must match, for `--for match`. Rust regex syntax, unanchored, tested
+        /// one screen line at a time, so `^` and `$` anchor to that line. Text already on screen
+        /// when the wait begins never matches
         #[clap(long = "match", value_parser, required_if_eq("wait_for", "match"))]
         pattern: Option<String>,
 

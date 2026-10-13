@@ -924,6 +924,24 @@ fn first_match<'a>(pattern: &Regex, lines: &[&'a str]) -> Option<&'a str> {
     lines.iter().copied().find(|line| pattern.is_match(line))
 }
 
+/// The sentence a render wait prints when its deadline passes.
+///
+/// A `--for match` miss names the pattern and the two rules that make a wait miss a line the
+/// caller can see: lines already on screen when the wait began are the baseline, and a line
+/// identical to one already on screen is not new. Both read as "the regex is wrong" otherwise.
+fn timed_out_message(pane: PaneId, watching: &Watching) -> String {
+    match watching {
+        Watching::Match(pattern) => format!(
+            "The wait on {} timed out: no new line matched the regex `{}`. Only a line drawn after \
+             the wait began counts - lines already on screen do not, and neither does a line \
+             identical to one already on screen.",
+            pane,
+            pattern.as_str()
+        ),
+        Watching::Quiet(_) => format!("The wait on {} timed out.", pane),
+    }
+}
+
 /// How long is left before a deadline, or `None` once it has passed.
 fn remaining(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
     deadline.map(|deadline| deadline.saturating_duration_since(now))
@@ -1834,7 +1852,7 @@ fn wait_on_renders(
             Err(RecvTimeoutError::Timeout) => {
                 let timed_out = remaining(deadline, Instant::now()) == Some(Duration::ZERO);
                 if timed_out {
-                    break Err(WaitMiss::Missed(format!("The wait on {} timed out.", pane)));
+                    break Err(WaitMiss::Missed(timed_out_message(pane, &watching)));
                 }
                 break Ok(None);
             },
@@ -2729,6 +2747,53 @@ mod tests {
         // the negative control, and the limitation worth knowing: the terminal wrapped this line,
         // so the two halves arrive as two lines and a pattern spanning the wrap matches neither
         assert_eq!(first_match(&pattern, &["test resu", "lt: ok"]), None);
+    }
+
+    #[test]
+    fn a_match_pattern_is_a_regex_anchored_to_the_line() {
+        // a regex, not a substring: anchors and classes work against each delivered line
+        let pattern = Regex::new("^round-7[0-9]-x$").unwrap();
+        assert_eq!(
+            first_match(&pattern, &["$ echo round", "round-77-x"]),
+            Some("round-77-x")
+        );
+        // the negative control: the anchor holds, so the line that merely contains it misses
+        assert_eq!(first_match(&pattern, &["$ echo round-77-x"]), None);
+    }
+
+    #[test]
+    fn a_line_already_on_screen_never_matches_again() {
+        // the baseline: the same output printed a second time is not a new line, so a wait for
+        // it misses even though the regex matches it
+        let pattern = Regex::new("^round-77-x$").unwrap();
+        let before = vec!["round-77-x".to_owned(), "$".to_owned()];
+        let after = vec![
+            "round-77-x".to_owned(),
+            "$ echo again".to_owned(),
+            "round-77-x".to_owned(),
+        ];
+        assert_eq!(first_match(&pattern, &new_lines(&before, &after)), None);
+        // the negative control: output that differs is new, and matches
+        let other = Regex::new("^round-77-y$").unwrap();
+        let fresh = vec!["round-77-x".to_owned(), "round-77-y".to_owned()];
+        assert_eq!(
+            first_match(&other, &new_lines(&before, &fresh)),
+            Some("round-77-y")
+        );
+    }
+
+    #[test]
+    fn a_match_that_times_out_says_why_it_may_have_missed() {
+        let pane = PaneId::Terminal(3);
+        let message = timed_out_message(pane, &Watching::Match(Regex::new("^done$").unwrap()));
+        assert!(message.contains("`^done$`"), "{}", message);
+        assert!(message.contains("already on screen"), "{}", message);
+        assert!(message.contains("identical"), "{}", message);
+        // the negative control: a quiet wait has no pattern to explain
+        assert_eq!(
+            timed_out_message(pane, &Watching::Quiet(Duration::from_millis(500))),
+            "The wait on terminal_3 timed out."
+        );
     }
 
     #[test]
