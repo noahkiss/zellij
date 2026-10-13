@@ -1,3 +1,6 @@
+[test-groups]
+web-token-db = { max-threads = 1 }
+
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 2 }
 fail-fast = false
@@ -11,3 +14,8 @@ retries = 2
 [[profile.default.overrides]]
 filter = 'binary(nested_fullscreen) + binary(nested_sessions) + binary(nested_hardening) + binary(nested_guest_modal) + binary(nested_status_hints) + binary(startup_host_query)'
 threads-required = 4
+
+# These tests delete the token database. serial_test locks only one process.
+[[profile.default.overrides]]
+filter = 'test(web_client::web_client_tests::) + test(web_authentication_tokens::)'
+test-group = "web-token-db"

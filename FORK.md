@@ -9718,6 +9718,13 @@ The client forwarding guard uses `debug_assert!`.
 Its panic test now compiles only when debug assertions are enabled.
 This keeps the quick-profile release gate valid without changing production behavior.
 
+### Nextest serializes tests that share the web token database
+
+Web client tests and token tests share a database and delete it between tests.
+Their `serial_test` locks apply only within one process.
+A nextest group now runs these tests one at a time across test processes.
+Other tests retain parallel execution. Production authentication behavior stays unchanged.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
