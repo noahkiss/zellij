@@ -44,6 +44,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "list-panes",
             "list-tabs",
             "list-tree",
+            "whoami",
             // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
             // and this one changes nothing. It is also why the audit ring does not record it
             "wait",
