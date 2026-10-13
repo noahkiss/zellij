@@ -302,7 +302,9 @@ fn main() {
     } else if let Some(Command::Sessions(Sessions::Mcp { session })) = opts.command.clone() {
         // the protocol owns stdout from here on, and the server never returns until the client
         // goes away
-        std::process::exit(mcp::start(session));
+        // the config file is read by the server for its `remote_hosts` block, and nothing else
+        let config_path = Config::config_file_path(&opts);
+        std::process::exit(mcp::start(session, config_path));
     } else if let Some(Command::Sessions(Sessions::Session(session_cli))) = opts.command.clone() {
         session_commands::session_lifecycle_command(session_cli, opts);
     } else if let Some(Command::Sessions(Sessions::KillAllSessions {

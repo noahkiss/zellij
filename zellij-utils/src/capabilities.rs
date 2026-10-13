@@ -92,6 +92,7 @@ pub const CAPABILITIES: &[&str] = &[
     "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
     "session-service-config", // session_service, pin_exe
     "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
+    "mcp-remote-hosts", // zellij mcp: remote_hosts in config.kdl, host/session, scope=fleet
 ];
 
 /// The version, split into the parts that can actually be compared.

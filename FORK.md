@@ -5331,6 +5331,9 @@ Capabilities: `list-agents-all-sessions`, `list-agents-watch`.
 { "mcpServers": { "zellij": { "command": "zellij", "args": ["mcp"] } } }
 ```
 
+From nkmk.35 the server also drives sessions on other machines: see [`zellij mcp` reaches sessions
+on other machines over ssh](#zellij-mcp-reaches-sessions-on-other-machines-over-ssh).
+
 `setup --dump-surface` already describes the whole command tree in one call, which is most of what
 an agent needs. What it cannot do is help a harness that **cannot shell out**, and it cannot be
 gated per verb - an MCP client allows or denies each tool by name, which on a machine where "read a
@@ -9495,6 +9498,112 @@ zellij_overview {"scope": "my_agents"}
 `src/mcp/invoke.rs` (`AgentsView`, the `my_agents` plan), `src/mcp/mod.rs`, `src/mcp/tools.rs`.
 Tests: the filter, the ages from an envelope and a bare array, the command line, and a watch that
 ignores a moving `last_output_at`.
+
+### `zellij mcp` reaches sessions on other machines over ssh
+
+From nkmk.35, from the agent-orchestration plan. One MCP server drives the sessions on every
+machine of a small fleet, the same way it drives local ones. Every tool already runs the CLI, so a
+remote call is the same command line, run by the zellij on the other machine through ssh.
+
+```kdl
+// config.kdl - top level
+remote_hosts {
+    host "boxa"
+    host "boxb" bin="/opt/homebrew/bin/zellij"   // optional: the zellij binary on that machine
+}
+```
+
+```
+zellij_overview {"scope": "fleet"}
+boxa: work: brisk-heron claude blocked/permission tab=build out=42s /home/u/app
+boxb: work: calm-otter codex working tab=work-zj out=3s /Users/u/site
+boxc: unreachable: ssh could not reach boxc (exit 255): ...
+
+zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
+```
+
+- **The block is the whitelist.** A host it does not list is refused before ssh runs, and the
+  refusal names the config file and the listed hosts. A `host` takes one name, whatever ssh takes:
+  an alias from `~/.ssh/config`, a hostname, or `user@host`. A name with whitespace, a leading dash
+  or a `/` is skipped with a warning. `bin=` must be an absolute path.
+- **One config for every machine.** The list names the machine that reads it too. That entry is
+  skipped: a call to it stays local, with no ssh. A host is this machine when its first label
+  matches the short hostname, ignoring case and any `user@`, so `boxa` matches `BOXA.local`.
+- **Addressing is the `session` argument, `host/session`.** No tool gained a parameter.
+  `boxa/work` is session `work` on `boxa`. `boxa/` names no session, and the remote CLI resolves
+  one the way a terminal there would, which works when one session runs there. `scope=sessions`
+  and `zellij_snapshot` take `boxa/` to ask that machine. A session name cannot contain `/`
+  (`validate_session_name`), so the split is never ambiguous. A pane handle alone is always
+  local: name its host through `session`.
+- **The transport.** `ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o
+  ForwardX11=no`, never interactive and never forwarding. A connection is shared for 60 seconds
+  through `ControlMaster`, with its socket in `/tmp/zellij-mcp-<uid>` (private, and short: a
+  `$TMPDIR` on macOS is too long for a socket path). The remote line is
+  `sh -c '<script>' sh '<bin>' '<argv>'...`, every word single-quoted, so the remote login shell
+  parses nothing in the argv. The script uses `bin=` when it is given. Otherwise it tries
+  `command -v zellij`, then `/opt/homebrew/bin`, `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`,
+  `~/.local/bin` and `~/.cargo/bin`: a non-interactive ssh shell on macOS may not have Homebrew on
+  `PATH`. `ZELLIJ_MCP_SSH` names a different ssh program, for tests. Exit 255 is ssh's own failure
+  and is reported as "ssh could not reach <host>".
+- **`zellij_overview scope=fleet`** runs `list-agents --all-sessions --json --report-withheld` here
+  and on every remote host at once, each bounded by 10 seconds. Every row gains `host`. The text is
+  one line per agent, `host: session: handle kind state tab=… out=…s cwd`. A host that does not
+  answer is one `unreachable` row, and one that answers with an error is one `error` row, never a
+  failed call. A host on a build from before `--all-sessions` gets `ls --json` and one
+  `list-agents` per session instead, so a fleet halfway through an upgrade still lists. The
+  structured result is `{agents, hosts}`, where `hosts` says per host how many agents it has, or
+  its error. It takes no `session`. State and output ages are computed against this machine's
+  clock.
+- **Files go over stdin.** A file the caller names lives on the caller's machine. `zellij_write_input`
+  `file` sends its bytes over ssh stdin to `action drop-file --name=<its name> -- -`, so the
+  remote store, reference and paste are the ones a local drop makes. A `zellij_create`
+  `run_in=agent` brief and `zellij_show` images are copied first, by a second remote script, into
+  `${TMPDIR:-/tmp}/zellij-mcp-files-<uid>` there (mode 0700). Each copy keeps its name behind a
+  unique prefix. The script removes copies older than seven days before it stores a new one. The
+  agent line and `action show` then name the copy.
+- **What changes for a create on another machine.** `kind: pane` and `floating` are refused: they
+  go beside the caller's own pane, which is not in that session. `agent_tab` and `tab` work. The
+  agent tab is named after the caller's own tab on this machine, so a caller has one tab name on
+  every host, and the remote session is asked whether it has it yet. `cwd` must be absolute; `~`,
+  `$VAR` and a relative path are refused, because they would mean this machine. `run_in=exec` runs
+  through `/bin/sh -c`, not this machine's `$SHELL`.
+- **`scope=my_agents` with `host/session`** lists the agents in that remote session's tab of the
+  caller's tab name. Without a host it is this machine's session, as before. No call lists "my
+  agents" on every host at once; `scope=fleet` lists every agent, with its tab.
+- **A remote result says so:** the structured result carries `host`. `command` is the command
+  line as that machine's zellij ran it.
+- **Capability `mcp-remote-hosts`.**
+
+What is not supported: a host outside the block, password or host-key prompts (`BatchMode` fails
+instead), and a remote `kind: pane`/`floating`. Cancelling a remote `zellij_wait_for` kills the
+local ssh. The remote `wait` runs on until its own `--timeout`, because a `-T` session sends it no
+hangup.
+
+**The block is read by `zellij mcp` alone**, from the config file the CLI would use (`--config`,
+`ZELLIJ_CONFIG_FILE`, `ZELLIJ_CONFIG_DIR`, then the default). It is read again on every call that
+names a host, so an edit needs no restart. It is not in `Options`, because `Options` crosses the
+client/server contract and no other process needs the list. An older binary ignores an unknown
+top-level key, so the block can be in a shared config before every machine runs this build. An
+unknown entry or property warns on stderr at startup and in the fleet answer's `diagnostics`. One
+gap follows from not being in `Options`. A configuration-plugin save that writes `config.kdl`
+from the parsed config (`write_config_to_disk`) drops the block, as it drops comments.
+
+`src/mcp/remote.rs` (new: the block, `route`, quoting, the two remote scripts, ssh's argv, the
+upload), `src/mcp/fleet.rs` (new: the parallel ask, the older-build fallback, the merge),
+`src/mcp/invoke.rs` (`run_on`, `Plan.stdin`, `CallEnv.remote`, the remote arms of create, write,
+show and the agent tab), `src/mcp/mod.rs` (routing, `with_host`, the instructions),
+`src/mcp/tools.rs` (the `fleet` scope and the `session` text), `src/main.rs` (the config path),
+`zellij-utils/src/capabilities.rs`. Tests: the block and its warnings, routing and the
+whitelist refusal, the local-host match, quoting through a real `sh`, the probe with `bin=` and
+on `PATH`, ssh's argv, the upload script, the remote argv of every create, drop and show arm,
+and the fleet merge through a stand-in ssh with one host down, one too old for
+`--all-sessions` and one past the bound.
+
+Proved from a Linux machine against two macOS machines and a scratch session reached over real
+ssh. The fleet answer listed the agents on the Linux machine and on a Mac still on nkmk.31,
+through the fallback, and "no agents" for a Mac with none. Against the scratch session, a create
+into the agent tab, a `submit`, a `wait --for match`, a `dump-screen`, a file drop over stdin, a
+`show` of an uploaded PNG, a close and a `move-tab` all answered as they do locally.
 
 ## Assessed and deliberately not built
 

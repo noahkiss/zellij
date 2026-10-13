@@ -17,10 +17,13 @@
 //! Session lifecycle - `session up`, `down`, `restart`, `enable` - is deliberately absent. Those
 //! start and stop the thing this server is talking to, and they stay where a person runs them.
 
+mod fleet;
 pub mod invoke;
+pub mod remote;
 pub mod tools;
 
 use std::future::Future;
+use std::path::PathBuf;
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
@@ -56,34 +59,83 @@ place and out of the pane they are looking at.
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
 each one is - that is how you find the pane to talk to without being told its name.
 
-zellij_show puts image files in front of the person, in a pop-up pane they close with q.";
+zellij_show puts image files in front of the person, in a pop-up pane they close with q.
+
+Sessions on other machines: write `session` as `host/session` - `boxa/work` - and every tool acts
+on that session over ssh, the same as on a local one. Only hosts listed in remote_hosts in
+config.kdl are reachable. zellij_overview with scope=fleet lists the coding agents in every
+session on every listed host, one row per agent, with its host and session.";
 
 /// The server itself. It holds nothing: every answer comes from a child process.
 #[derive(Clone, Debug, Default)]
 pub struct ZellijMcp {
     /// The session an unqualified call is about, read once at startup.
     ambient_session: Option<String>,
+    /// The config file whose `remote_hosts` block says which other machines a call may reach.
+    /// Read on every call that names a host, so an edit needs no restart.
+    config_path: Option<PathBuf>,
 }
 
 impl ZellijMcp {
-    pub fn new(session: Option<String>) -> Self {
-        ZellijMcp {
+    pub fn new(session: Option<String>, config_path: Option<PathBuf>) -> Self {
+        let server = ZellijMcp {
             ambient_session: session.or_else(invoke::ambient_session),
+            config_path,
+        };
+        for warning in server.remote_hosts().warnings {
+            eprintln!("zellij mcp: {}", warning);
         }
+        server
+    }
+
+    fn remote_hosts(&self) -> remote::RemoteHosts {
+        remote::RemoteHosts::load(self.config_path.as_deref())
     }
 
     /// One tool call: build the command line, run it, and report what the CLI said.
-    async fn call(&self, name: &str, arguments: Map<String, Value>) -> CallToolResult {
-        let plan = match invoke::plan(name, &arguments, self.ambient_session.as_deref()).await {
-            Ok(plan) => plan,
-            // a call that could not be turned into a command line never ran, and the caller is
-            // told what was missing rather than being handed an empty result
+    async fn call(&self, name: &str, mut arguments: Map<String, Value>) -> CallToolResult {
+        let local = zellij_utils::shared::short_hostname();
+        if name == "zellij_overview"
+            && arguments.get("scope").and_then(Value::as_str) == Some("fleet")
+        {
+            if arguments.contains_key("session") {
+                return failed(
+                    "scope=fleet lists every session on every host: pass it without `session`."
+                        .to_owned(),
+                    json!({"reason": "bad_arguments"}),
+                );
+            }
+            return fleet::overview(&self.remote_hosts(), local).await;
+        }
+        // `host/session` picks the machine and leaves the bare session for the command line
+        let hosts = if arguments
+            .get("session")
+            .and_then(Value::as_str)
+            .is_some_and(|session| session.contains(remote::HOST_SEPARATOR))
+        {
+            self.remote_hosts()
+        } else {
+            remote::RemoteHosts::default()
+        };
+        let target = match remote::route(&mut arguments, &hosts, local) {
+            Ok(target) => target,
             Err(message) => return failed(message, json!({"reason": "bad_arguments"})),
         };
+        let plan =
+            match invoke::plan(name, &arguments, self.ambient_session.as_deref(), &target).await {
+                Ok(plan) => plan,
+                // a call that could not be turned into a command line never ran, and the caller is
+                // told what was missing rather than being handed an empty result
+                Err(message) => {
+                    return with_host(failed(message, json!({"reason": "bad_arguments"})), &target)
+                },
+            };
         let then_type = plan.then_type;
-        let (argv, mut outcome) = match self.run_plan(plan.call).await {
+        let (argv, mut outcome) = match self.run_plan(plan.call, &target, plan.stdin).await {
             Ok(ran) => ran,
-            Err(message) => return failed(message, json!({"reason": "not_run"})),
+            Err(message) => {
+                return with_host(failed(message, json!({"reason": "not_run"})), &target)
+            },
         };
         if let (Some(view), false) = (&plan.agents, outcome.is_error()) {
             let now_ms = std::time::SystemTime::now()
@@ -94,10 +146,10 @@ impl ZellijMcp {
             }
         }
         let input_sent = match then_type {
-            Some(then_type) => Some(type_into_created_pane(then_type, &mut outcome).await),
+            Some(then_type) => Some(type_into_created_pane(then_type, &mut outcome, &target).await),
             None => None,
         };
-        self.report(&argv, outcome, input_sent)
+        with_host(self.report(&argv, outcome, input_sent), &target)
     }
 
     /// Run whatever the plan turned out to be, and say which command line answered.
@@ -106,10 +158,15 @@ impl ZellijMcp {
     /// the command line was built, so nothing here reads an exit code to decide what to run next.
     /// The second command line a create can carry is the rename, which `--new-tab` cannot do
     /// itself.
-    async fn run_plan(&self, plan: invoke::Call) -> Result<(Vec<String>, invoke::Outcome), String> {
+    async fn run_plan(
+        &self,
+        plan: invoke::Call,
+        target: &remote::Target,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<(Vec<String>, invoke::Outcome), String> {
         let (argv, rename) = match plan {
             invoke::Call::One(argv) => {
-                let outcome = invoke::run(&argv).await?;
+                let outcome = invoke::run_on(target, &argv, stdin).await?;
                 return Ok((argv, outcome));
             },
             invoke::Call::Sequence(argvs) => {
@@ -121,7 +178,7 @@ impl ZellijMcp {
                         ))
                         .await;
                     }
-                    let outcome = invoke::run(&argv).await?;
+                    let outcome = invoke::run_on(target, &argv, None).await?;
                     let failed = outcome.is_error();
                     ran = Some((argv, outcome));
                     if failed {
@@ -132,13 +189,13 @@ impl ZellijMcp {
             },
             invoke::Call::MakingAgentTab { argv, rename } => (argv, rename),
         };
-        let mut outcome = invoke::run(&argv).await?;
+        let mut outcome = invoke::run_on(target, &argv, None).await?;
         // `--new-tab` refuses `--name`, so the pane that arrived with the tab is named now. A
         // rename that fails is a pane with the wrong title, not a create that did not happen: it
         // is reported beside the create rather than instead of it, and a rename that could not be
         // run at all says so rather than vanishing
         if let (Some(rename), Some(pane)) = (rename, invoke::reported_pane_id(&outcome.stdout)) {
-            match invoke::run(&rename.argv(&pane)).await {
+            match invoke::run_on(target, &rename.argv(&pane), None).await {
                 Ok(renamed) if renamed.is_error() => {
                     also_said(&mut outcome.stderr, &renamed.stderr)
                 },
@@ -274,6 +331,7 @@ impl ZellijMcp {
 async fn type_into_created_pane(
     then_type: invoke::TypeAfter,
     outcome: &mut invoke::Outcome,
+    target: &remote::Target,
 ) -> bool {
     let Some(pane) = invoke::reported_pane_id(&outcome.stdout) else {
         return false;
@@ -282,7 +340,7 @@ async fn type_into_created_pane(
         return false;
     }
     for argv in then_type.argvs(&pane) {
-        let failure = match invoke::run(&argv).await {
+        let failure = match invoke::run_on(target, &argv, None).await {
             Ok(said) if said.is_error() => (said.code, said.stderr),
             Ok(_) => continue,
             Err(message) => (1, message),
@@ -334,6 +392,17 @@ fn failed(message: String, structured: Value) -> CallToolResult {
         CallToolResult::error(vec![ContentBlock::text(message)]),
         structured,
     )
+}
+
+/// A result from another machine says which: `host` beside `command`, which is the command line
+/// as that machine's zellij ran it.
+fn with_host(mut result: CallToolResult, target: &remote::Target) -> CallToolResult {
+    if let (Some(host), Some(Value::Object(structured))) =
+        (target.host(), result.structured_content.as_mut())
+    {
+        structured.insert("host".to_owned(), json!(host));
+    }
+    result
 }
 
 fn with_structure(mut result: CallToolResult, structured: Map<String, Value>) -> CallToolResult {
@@ -414,7 +483,7 @@ impl ServerHandler for ZellijMcp {
 /// Returns the process exit status. Nothing in here may write to stdout: that is the protocol
 /// stream, and a stray line would end the session. Diagnostics go to stderr, which is why the
 /// tools capture their child process's output rather than letting it through.
-pub fn start(session: Option<String>) -> i32 {
+pub fn start(session: Option<String>, config_path: Option<PathBuf>) -> i32 {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -426,7 +495,7 @@ pub fn start(session: Option<String>) -> i32 {
         },
     };
     runtime.block_on(async move {
-        let service = match ZellijMcp::new(session)
+        let service = match ZellijMcp::new(session, config_path)
             .serve(rmcp::transport::io::stdio())
             .await
         {
@@ -513,6 +582,7 @@ mod tests {
                 .as_object()
                 .unwrap(),
             None,
+            &remote::Target::Local,
         )
         .await
         .expect("a plan");
@@ -521,7 +591,9 @@ mod tests {
             "pane_id: terminal_7\nhandle: sunny-otter\n",
             "terminal_7 was not ready when the wait timed out.\n",
         );
-        let sent = type_into_created_pane(plan.then_type.unwrap(), &mut missed).await;
+        let sent =
+            type_into_created_pane(plan.then_type.unwrap(), &mut missed, &remote::Target::Local)
+                .await;
         assert!(!sent);
         assert_eq!(missed.code, 2, "the create's own answer stands");
     }

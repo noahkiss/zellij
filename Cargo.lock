@@ -5184,6 +5184,7 @@ dependencies = [
  "insta",
  "interprocess",
  "isahc",
+ "kdl",
  "libc",
  "log",
  "miette 7.6.0",

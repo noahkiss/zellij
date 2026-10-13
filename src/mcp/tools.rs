@@ -89,7 +89,9 @@ const SESSION: ParamSpec = ParamSpec {
     required: false,
     from: None,
     describe: "The session to act on. Defaults to ZELLIJ_SESSION_NAME in this server's own \
-               environment, which is the session it was started from.",
+               environment, which is the session it was started from. host/session acts on a \
+               session on another machine over ssh - boxa/work - and host/ on whichever session \
+               that machine's CLI picks. The host must be listed in remote_hosts in config.kdl.",
     default: None,
 };
 
@@ -97,7 +99,7 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "zellij_overview",
         summary: "List what a zellij session contains: its panes, the agents running in them, or \
-                  the sessions on this machine.",
+                  the sessions on this machine - or every agent on every listed host.",
         best_for: "the first call of any zellij task - it is how you learn the pane handles \
                    everything else is addressed by, and which panes are running a coding agent.",
         not_for: "reading what is ON a pane's screen, and not for watching a pane over time.",
@@ -117,19 +119,22 @@ pub const TOOLS: &[ToolSpec] = &[
                tab, which is where every agent you started with zellij_create went. A working \
                agent whose output_age_s keeps growing has stalled. scope=sessions answers about \
                the machine rather than about one \
-               session. A `withheld` count above zero means the session keeps some panes to \
+               session. scope=fleet lists every agent in every session on this machine and on \
+               every host in remote_hosts, each row with its host and session; a host that does \
+               not answer within 10 seconds is one `unreachable` row, and the rest still answer. \
+               To act on a fleet row, pass session as host/session. A `withheld` count above zero means the session keeps some panes to \
                itself: they are not in this answer, no tool here will reach them, and there is \
                nothing to ask for.",
         params: &[
             SESSION,
             ParamSpec {
                 name: "scope",
-                kind: ParamKind::Enum(&["panes", "agents", "my_agents", "sessions"]),
+                kind: ParamKind::Enum(&["panes", "agents", "my_agents", "sessions", "fleet"]),
                 required: false,
                 from: None,
                 describe: "What to list: every pane of the session, only the panes running a \
-                           coding agent, only the agents in your own tab, or the sessions on \
-                           this machine.",
+                           coding agent, only the agents in your own tab, the sessions on \
+                           this machine, or every agent on this machine and every remote host.",
                 default: Some("panes"),
             },
             ParamSpec {
@@ -434,7 +439,9 @@ pub const TOOLS: &[ToolSpec] = &[
                until=agent_idle for the end of its first turn, and zellij_read_pane last_reply \
                for what it said. The brief is in the agent's command line, so list-agents shows \
                it; a session restore brings the agent back as a resume of its session, without \
-               the brief.",
+               the brief. On another machine (session host/session) kind is agent_tab or tab, \
+               cwd is an absolute path there, exec runs through /bin/sh, and the brief is \
+               copied there first.",
         params: &[
             SESSION,
             ParamSpec {

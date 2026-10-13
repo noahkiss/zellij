@@ -32,6 +32,8 @@ names = { workspace = true }
 suggest = { workspace = true }
 thiserror = { workspace = true }
 isahc = { workspace = true }
+# `zellij mcp` reads its own `remote_hosts` block out of config.kdl
+kdl = { workspace = true }
 rmcp = { version = "3.1.2", default-features = false, features = ["server", "transport-io"] }
 # `zellij view-images`, the viewer behind `action show`: decoders for the four formats it reads,
 # and the kitty graphics payload encoding. png, flate2 and base64 were already in the tree

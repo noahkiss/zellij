@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use super::remote::{self, Target};
+
 /// How long `zellij_wait_for` waits when the caller did not say.
 ///
 /// The same string the tool's `timeout_s` parameter documents as its default - one constant, so a
@@ -94,6 +96,21 @@ pub async fn run(argv: &[String]) -> Result<Outcome, String> {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// Run the CLI where the call is going: this machine, or another over ssh.
+///
+/// `stdin` is the bytes a remote verb reads in place of a file on its own machine - a drop. A
+/// local call never has any: the local CLI reads the file itself.
+pub async fn run_on(
+    target: &Target,
+    argv: &[String],
+    stdin: Option<Vec<u8>>,
+) -> Result<Outcome, String> {
+    match target {
+        Target::Local => run(argv).await,
+        Target::Remote(host) => remote::run(host, argv, stdin).await,
+    }
 }
 
 /// The arguments of a tool call, read once so that a missing one is reported by name.
@@ -205,6 +222,9 @@ pub struct Plan {
     /// `zellij_overview` with `scope: agents` or `my_agents`: how the agent list is shaped before
     /// it is returned. `None` for every other call.
     pub agents: Option<AgentsView>,
+    /// What a remote `zellij_write_input` `file` sends over stdin: the file's bytes, read on this
+    /// machine. `None` for every other call.
+    pub stdin: Option<Vec<u8>>,
 }
 
 /// How much of an agent's command line `zellij_overview` returns. Enough to tell agents apart.
@@ -269,6 +289,7 @@ impl From<Call> for Plan {
             call,
             then_type: None,
             agents: None,
+            stdin: None,
         }
     }
 }
@@ -401,8 +422,31 @@ fn default_pane_name(command: &str) -> String {
 /// A server started outside a pane has no `$ZELLIJ_PANE_ID` to look up, and a session that is not
 /// there answers nothing; neither is worth failing a create over, and a session that cannot be
 /// listed is one the create will fail against too, with the session's own words.
-async fn agent_tab(env: &CallEnv, ambient_session: Option<&str>) -> (String, TabPlacement) {
-    let Some(panes) = pane_list(ambient_session).await else {
+///
+/// A call to another machine names the tab after the same pane on this one, so a caller has one
+/// tab name everywhere, and asks the remote session whether it has that tab yet.
+async fn agent_tab(
+    env: &CallEnv,
+    ambient_session: Option<&str>,
+    target: &Target,
+    target_session: Option<&str>,
+) -> (String, TabPlacement) {
+    if target.is_remote() {
+        let own_tab = match pane_list(&Target::Local, ambient_session).await {
+            Some(panes) => env
+                .pane
+                .as_deref()
+                .and_then(|pane| tab_of_pane(&panes, pane)),
+            None => None,
+        };
+        let tab = agent_tab_name(own_tab.as_deref());
+        let placement = match pane_list(target, target_session).await {
+            Some(panes) if tab_exists(&panes, &tab) => TabPlacement::Existing,
+            _ => TabPlacement::Made,
+        };
+        return (tab, placement);
+    }
+    let Some(panes) = pane_list(&Target::Local, ambient_session).await else {
         return (agent_tab_name(None), TabPlacement::Made);
     };
     let tab = agent_tab_name(
@@ -420,9 +464,9 @@ async fn agent_tab(env: &CallEnv, ambient_session: Option<&str>) -> (String, Tab
 }
 
 /// Every pane of a session as `list-panes --json` prints them, or `None` if it would not answer.
-async fn pane_list(ambient_session: Option<&str>) -> Option<String> {
+async fn pane_list(target: &Target, session: Option<&str>) -> Option<String> {
     let mut argv = Vec::new();
-    if let Some(session) = ambient_session {
+    if let Some(session) = session {
         argv.push("-s".to_owned());
         argv.push(session.to_owned());
     }
@@ -431,7 +475,7 @@ async fn pane_list(ambient_session: Option<&str>) -> Option<String> {
         "list-panes".to_owned(),
         "--json".to_owned(),
     ]);
-    let outcome = run(&argv).await.ok()?;
+    let outcome = run_on(target, &argv, None).await.ok()?;
     if outcome.is_error() {
         return None;
     }
@@ -509,27 +553,74 @@ pub async fn plan(
     tool: &str,
     args: &Map<String, Value>,
     ambient_session: Option<&str>,
+    target: &Target,
 ) -> Result<Plan, String> {
-    plan_in(tool, args, ambient_session, &CallEnv::from_process()).await
+    let mut env = CallEnv::from_process();
+    env.remote = target.is_remote();
+    plan_in(tool, args, ambient_session, &env, target).await
 }
 
+/// `ambient_session` is this machine's, and is what the agent's tab is named from wherever the call
+/// goes. A call to another machine never falls back to it: a session there is named in the call or
+/// left to the remote CLI.
 async fn plan_in(
     tool: &str,
     args: &Map<String, Value>,
     ambient_session: Option<&str>,
     env: &CallEnv,
+    target: &Target,
 ) -> Result<Plan, String> {
+    let own_session = ambient_session;
+    let ambient_session = if target.is_remote() {
+        None
+    } else {
+        ambient_session
+    };
     let read = Args::new(args);
+    let target_session = read
+        .string("session")
+        .or_else(|| ambient_session.map(String::from));
+    let remote_host = match target {
+        Target::Remote(host) => Some(host),
+        Target::Local => None,
+    };
     if tool == "zellij_write_input" {
-        if let Some(call) = write_input_call(&read, ambient_session).await? {
+        if let Some(call) = write_input_call(&read, ambient_session, target).await? {
             return Ok(call.into());
         }
+        if let (Some(_), Some(file)) = (remote_host, read.string("file")) {
+            // the file is on this machine and the pane is not: its bytes go over ssh's stdin, to
+            // a `drop-file` that reads `-`
+            let argv = argv_in(tool, args, ambient_session, env, None)?;
+            let path = local_file(&file, env, "file")?;
+            let bytes = std::fs::read(&path)
+                .map_err(|e| format!("`file` {} could not be read: {}", path.display(), e))?;
+            let mut plan: Plan = Call::One(argv).into();
+            plan.stdin = Some(bytes);
+            return Ok(plan);
+        }
+    }
+    if let (Some(host), "zellij_show") = (remote_host, tool) {
+        // refused for free before anything is copied
+        argv_in(tool, args, ambient_session, env, None)?;
+        let mut uploaded = Vec::new();
+        for path in read.strings("paths")? {
+            let path = local_file(&path, env, "paths")?;
+            uploaded.push(Value::String(remote::upload(host, &path).await?));
+        }
+        let mut args = args.clone();
+        args.insert("paths".to_owned(), Value::Array(uploaded));
+        return Ok(Call::One(argv_in(tool, &args, ambient_session, env, None)?).into());
     }
     if tool == "zellij_overview" {
         let scope = read.enumerated("scope", "panes");
         if scope == "agents" || scope == "my_agents" {
             let only_tab = if scope == "my_agents" {
-                Some(agent_tab(env, ambient_session).await.0)
+                Some(
+                    agent_tab(env, own_session, target, target_session.as_deref())
+                        .await
+                        .0,
+                )
             } else {
                 None
             };
@@ -538,16 +629,28 @@ async fn plan_in(
                 call,
                 then_type: None,
                 agents: Some(AgentsView { only_tab }),
+                stdin: None,
             });
         }
     }
     if tool != "zellij_create" {
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
-    let session = read
-        .string("session")
-        .or_else(|| ambient_session.map(String::from));
-    let then_type = typed_command(&read, env)?.map(|command| TypeAfter {
+    let session = target_session.clone();
+    // a brief is a file on this machine; a pane on another machine reads the copy made there, and
+    // only once everything a refusal could be about has been checked
+    let brief_at = match remote_host {
+        Some(host) if run_in(&read)? == "agent" && read.string("brief").is_some() => {
+            remote_kind_allowed(&read)?;
+            agent_command(&read, env, None)?;
+            match brief_path(&read, env)? {
+                Some(path) => Some(remote::upload(host, &path).await?),
+                None => None,
+            }
+        },
+        _ => None,
+    };
+    let then_type = typed_command(&read, env, brief_at.as_deref())?.map(|command| TypeAfter {
         session: session.clone(),
         command,
     });
@@ -557,11 +660,12 @@ async fn plan_in(
             call,
             then_type,
             agents: None,
+            stdin: None,
         });
     }
     // before the session is asked anything: a handle the CLI would refuse is refused for free
     chosen_handle(&read)?;
-    let (tab, placement) = agent_tab(env, ambient_session).await;
+    let (tab, placement) = agent_tab(env, own_session, target, target_session.as_deref()).await;
     let argv = argv_in(tool, args, ambient_session, env, Some((&tab, placement)))?;
     if placement == TabPlacement::Existing {
         let call = Call::One(argv);
@@ -569,6 +673,7 @@ async fn plan_in(
             call,
             then_type,
             agents: None,
+            stdin: None,
         });
     }
     let rename = pane_name(&read).map(|name| RenameAfter {
@@ -580,7 +685,37 @@ async fn plan_in(
         call,
         then_type,
         agents: None,
+        stdin: None,
     })
+}
+
+/// A file a caller named, on this machine: `~` and `$VAR` expanded, a relative path taken from
+/// this server's directory, and refused when it is not a file.
+fn local_file(path: &str, env: &CallEnv, param: &str) -> Result<PathBuf, String> {
+    let expanded = expand_path(path, env)?;
+    let path = Path::new(&expanded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env.base.join(path)
+    };
+    if !path.is_file() {
+        return Err(format!("`{}` {} is not a file.", param, path.display()));
+    }
+    Ok(path)
+}
+
+/// `pane` and `floating` go beside the caller's own pane, which is not in a session on another
+/// machine.
+fn remote_kind_allowed(args: &Args) -> Result<(), String> {
+    match args.enumerated("kind", CREATE_KIND_DEFAULT).as_str() {
+        "pane" | "floating" => Err(
+            "`kind: pane` and `floating` go beside your own pane, which is not in a session on \
+             another machine. Use agent_tab, the default, or tab."
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// `zellij_write_input` when it is more than one keystroke or one write: a message to submit, or
@@ -589,6 +724,7 @@ async fn plan_in(
 async fn write_input_call(
     args: &Args<'_>,
     ambient_session: Option<&str>,
+    target: &Target,
 ) -> Result<Option<Call>, String> {
     let submit = args.flag("submit");
     let action = args.string("agent_action");
@@ -638,11 +774,15 @@ async fn write_input_call(
                 action
             ));
         }
-        let agents = run(&scoped(vec![
-            "action".to_owned(),
-            "list-agents".to_owned(),
-            "--json".to_owned(),
-        ]))
+        let agents = run_on(
+            target,
+            &scoped(vec![
+                "action".to_owned(),
+                "list-agents".to_owned(),
+                "--json".to_owned(),
+            ]),
+            None,
+        )
         .await?;
         if agents.is_error() {
             return Err(format!(
@@ -765,7 +905,13 @@ fn run_in(args: &Args) -> Result<String, String> {
 /// The command a create types into its pane once the pane is ready: the `command` of a
 /// `run_in: shell` create, the harness and its brief for an `agent` one, and nothing for an
 /// `exec` one, which hands it to the server instead.
-fn typed_command(args: &Args, env: &CallEnv) -> Result<Option<String>, String> {
+///
+/// `brief_at` is where the brief is on the machine the pane is on, when that is not this one.
+fn typed_command(
+    args: &Args,
+    env: &CallEnv,
+    brief_at: Option<&str>,
+) -> Result<Option<String>, String> {
     if args.string("brief").is_some() && run_in(args)? != "agent" {
         return Err(
             "`brief` is the first prompt of an agent: pass it with run_in=agent.".to_owned(),
@@ -773,7 +919,7 @@ fn typed_command(args: &Args, env: &CallEnv) -> Result<Option<String>, String> {
     }
     Ok(match run_in(args)?.as_str() {
         "shell" => args.string("command"),
-        "agent" => Some(agent_command(args, env)?),
+        "agent" => Some(agent_command(args, env, brief_at)?),
         _ => None,
     })
 }
@@ -788,7 +934,9 @@ fn typed_command(args: &Args, env: &CallEnv) -> Result<Option<String>, String> {
 ///
 /// A session restore records an agent pane as the bare resume of its session (nkmk.32), so the
 /// brief, which reaches the harness as an argument, is never typed again by a restore.
-fn agent_command(args: &Args, env: &CallEnv) -> Result<String, String> {
+///
+/// `brief_at` replaces the brief's own path with a copy's, for a pane on another machine.
+fn agent_command(args: &Args, env: &CallEnv, brief_at: Option<&str>) -> Result<String, String> {
     let command = args.required("command").map_err(|_| {
         "run_in=agent needs `command`: the harness to start, like `claude` or `codex --model \
          o3`."
@@ -802,27 +950,26 @@ fn agent_command(args: &Args, env: &CallEnv) -> Result<String, String> {
             program
         )
     })?;
-    let Some(brief) = args.string("brief") else {
+    let Some(path) = brief_path(args, env)? else {
         return Ok(command);
     };
-    let expanded = expand_path(&brief, env)?;
-    let path = Path::new(&expanded);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env.base.join(path)
+    let path = match brief_at {
+        Some(copy) => copy.to_owned(),
+        None => path.to_string_lossy().into_owned(),
     };
-    if !path.is_file() {
-        return Err(format!("`brief` {} is not a file.", path.display()));
-    }
-    let quoted = format!(
-        "\"$(cat '{}')\"",
-        path.to_string_lossy().replace('\'', "'\\''")
-    );
+    let quoted = format!("\"$(cat '{}')\"", path.replace('\'', "'\\''"));
     Ok(match harness.kind {
         "opencode" => format!("{} --prompt {}", command, quoted),
         _ => format!("{} -- {}", command, quoted),
     })
+}
+
+/// The brief file on this machine, refused when it is not a file. `None` without a brief.
+fn brief_path(args: &Args, env: &CallEnv) -> Result<Option<PathBuf>, String> {
+    match args.string("brief") {
+        Some(brief) => local_file(&brief, env, "brief").map(Some),
+        None => Ok(None),
+    }
 }
 
 /// The handle a create asked for, refused here by the rule the CLI's `--handle` applies.
@@ -921,7 +1068,7 @@ fn argv_in(
                 Ok(scoped(rest))
             },
             other => Err(format!(
-                "`scope` must be panes, agents, my_agents or sessions, not `{}`.",
+                "`scope` must be panes, agents, my_agents, sessions or fleet, not `{}`.",
                 other
             )),
         },
@@ -1022,6 +1169,26 @@ fn argv_in(
                             .to_owned(),
                     );
                 }
+                if env.remote {
+                    // the bytes arrive on stdin - see `plan_in` - and the name keeps the extension
+                    // the store and the pane's program go by
+                    let expanded = expand_path(&file, env)?;
+                    let name = Path::new(&expanded)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let mut rest = vec![
+                        "action".to_owned(),
+                        "drop-file".to_owned(),
+                        "--pane-id".to_owned(),
+                        pane,
+                    ];
+                    if !name.is_empty() {
+                        rest.push(flag_value("--name", &name));
+                    }
+                    rest.extend(["--".to_owned(), "-".to_owned()]);
+                    return Ok(scoped(rest));
+                }
                 return Ok(scoped(vec![
                     "action".to_owned(),
                     "drop-file".to_owned(),
@@ -1075,9 +1242,14 @@ fn argv_in(
                 }
                 if let (false, Some(command)) = (shell_mode, &command) {
                     rest.push("--".to_owned());
-                    rest.extend(shell_command(command.clone(), env.shell.clone()));
+                    // this machine's `$SHELL` names a path on this machine
+                    let shell = if env.remote { None } else { env.shell.clone() };
+                    rest.extend(shell_command(command.clone(), shell));
                 }
             };
+            if env.remote {
+                remote_kind_allowed(&args)?;
+            }
             let mut rest = vec!["action".to_owned()];
             match kind.as_str() {
                 "agent_tab" if args.flag("floating") => {
@@ -1108,7 +1280,7 @@ fn argv_in(
                     // unless it is told this
                     rest.push("--no-focus".to_owned());
                     if let Some(cwd) = args.string("cwd") {
-                        rest.push(flag_value("--cwd", &resolve_cwd(&cwd, env)?));
+                        rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
                     }
                     // a pane that arrives with its tab is named afterwards, by `RenameAfter`:
                     // `--new-tab` and `--name` conflict, because one flag cannot mean both
@@ -1128,7 +1300,7 @@ fn argv_in(
                     // be focused on. Without a `$ZELLIJ_PANE_ID` to resolve, the CLI says so
                     rest.push("--near-current-pane".to_owned());
                     if let Some(cwd) = args.string("cwd") {
-                        rest.push(flag_value("--cwd", &resolve_cwd(&cwd, env)?));
+                        rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
                     }
                     if let Some(name) = pane_name(&args) {
                         rest.push(flag_value("--name", &name));
@@ -1146,7 +1318,7 @@ fn argv_in(
                 "tab" => {
                     rest.push("new-tab".to_owned());
                     if let Some(cwd) = args.string("cwd") {
-                        rest.push(flag_value("--cwd", &resolve_cwd(&cwd, env)?));
+                        rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
                     }
                     if let Some(name) = args.string("name") {
                         rest.push(flag_value("--name", &name));
@@ -1328,7 +1500,12 @@ fn argv_in(
                 "--".to_owned(),
             ];
             for path in args.strings("paths")? {
-                rest.push(expand_path(&path, env)?);
+                // a remote call's paths are the copies already made on that machine
+                rest.push(if env.remote {
+                    path
+                } else {
+                    expand_path(&path, env)?
+                });
             }
             Ok(scoped(rest))
         },
@@ -1367,6 +1544,9 @@ struct CallEnv {
     /// How a `$VAR` in a `cwd` is looked up. `Send + Sync` because a call holds this across the
     /// child process it runs to find the agent's own tab.
     var: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    /// The call goes to a session on another machine, where this one's `$SHELL`, paths and
+    /// files mean nothing.
+    remote: bool,
 }
 
 impl CallEnv {
@@ -1380,6 +1560,7 @@ impl CallEnv {
                 .ok()
                 .filter(|pane| !pane.trim().is_empty()),
             var: Box::new(|name| std::env::var(name).ok()),
+            remote: false,
         }
     }
 }
@@ -1404,6 +1585,22 @@ fn shell_for_command(env_shell: Option<String>) -> String {
 /// rc file or line editor rewrites it on the way.
 fn shell_command(command: String, env_shell: Option<String>) -> Vec<String> {
     vec![shell_for_command(env_shell), "-c".to_owned(), command]
+}
+
+/// A create's `cwd`: resolved here for this machine, and passed through for another, where only
+/// an absolute path means one thing.
+fn create_cwd(cwd: &str, env: &CallEnv) -> Result<String, String> {
+    if !env.remote {
+        return resolve_cwd(cwd, env);
+    }
+    if !cwd.starts_with('/') {
+        return Err(format!(
+            "`cwd` {} is not an absolute path. On another machine `~`, `$VAR` and a relative \
+             path have no meaning this server can resolve: write the whole path.",
+            cwd
+        ));
+    }
+    Ok(cwd.to_owned())
 }
 
 /// A `cwd` as the server will take it: expanded, absolute, and known to be a directory.
@@ -1473,6 +1670,7 @@ mod tests {
             base: base.to_path_buf(),
             pane: None,
             var: Box::new(move |name| vars.get(name).cloned()),
+            remote: false,
         }
     }
 
@@ -1634,10 +1832,15 @@ mod tests {
             json!({"pane": "3", "file": "a.png", "submit": true}),
             json!({"pane": "3", "file": "a.png", "agent_action": "approve"}),
         ] {
-            let said = plan("zellij_write_input", refused.as_object().unwrap(), None)
-                .await
-                .err()
-                .expect("refused");
+            let said = plan(
+                "zellij_write_input",
+                refused.as_object().unwrap(),
+                None,
+                &Target::Local,
+            )
+            .await
+            .err()
+            .expect("refused");
             assert!(said.contains("presses nothing"), "{}", said);
         }
     }
@@ -1773,6 +1976,7 @@ mod tests {
             &args(json!({"pane": "sunny-otter", "text": "line one\nline two", "submit": true})),
             Some("work"),
             &a_shell_env(),
+            &Target::Local,
         )
         .await
         .ok()
@@ -1814,7 +2018,8 @@ mod tests {
                     "zellij_write_input",
                     &args(refused.clone()),
                     None,
-                    &a_shell_env()
+                    &a_shell_env(),
+                    &Target::Local,
                 )
                 .await
                 .is_err(),
@@ -1974,6 +2179,7 @@ mod tests {
             &args(json!({"kind": "pane", "command": "cd /tmp && ls"})),
             Some("work"),
             &a_shell_env(),
+            &Target::Local,
         )
         .await
         .expect("a plan");
@@ -1998,6 +2204,7 @@ mod tests {
                 &args(exec_or_nothing.clone()),
                 None,
                 &a_shell_env(),
+                &Target::Local,
             )
             .await
             .expect("a plan");
@@ -2009,6 +2216,7 @@ mod tests {
             &args(json!({"pane": "3"})),
             None,
             &a_shell_env(),
+            &Target::Local,
         )
         .await
         .expect("a plan");
@@ -2024,7 +2232,7 @@ mod tests {
         let typed = |value: Value| {
             let env = &env;
             async move {
-                plan_in("zellij_create", &args(value), None, env)
+                plan_in("zellij_create", &args(value), None, env, &Target::Local)
                     .await
                     .map(|plan| plan.then_type.map(|then_type| then_type.command))
             }
@@ -2146,6 +2354,7 @@ mod tests {
             &args(json!({"handle": "terminal-1"})),
             Some("no-such-session-mcp-test"),
             &a_shell_env(),
+            &Target::Local,
         )
         .await;
         assert!(matches!(call, Err(reason) if reason.contains("too close to the pane id")));
@@ -2683,6 +2892,138 @@ mod tests {
         assert!(
             refusal("zellij_show", json!({"paths": ["a.png"], "mode": "sixel"}))
                 .contains("`mode` must be auto, kitty or blocks")
+        );
+    }
+
+    /// The process a call to another machine is built in.
+    fn a_remote_env() -> CallEnv {
+        let mut env = a_shell_env();
+        env.remote = true;
+        env
+    }
+
+    #[test]
+    fn a_remote_drop_reads_stdin_and_keeps_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("shot one.png");
+        std::fs::write(&shot, b"png").unwrap();
+        assert_eq!(
+            built(
+                "zellij_write_input",
+                json!({"pane": "sunny-otter", "file": shot.display().to_string()}),
+                Some("work"),
+                &a_remote_env()
+            )
+            .join(" "),
+            "-s work action drop-file --pane-id sunny-otter --name=shot one.png -- -"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_drop_carries_the_bytes_of_the_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("shot.png");
+        std::fs::write(&shot, b"\x89PNG bytes").unwrap();
+        let host = remote::RemoteHost {
+            name: "boxa".into(),
+            bin: None,
+        };
+        let plan = plan_in(
+            "zellij_write_input",
+            &args(
+                json!({"pane": "sunny-otter", "file": shot.display().to_string(),
+                         "session": "work"}),
+            ),
+            None,
+            &a_remote_env(),
+            &Target::Remote(host.clone()),
+        )
+        .await
+        .ok()
+        .expect("a plan");
+        assert_eq!(plan.stdin.as_deref(), Some(&b"\x89PNG bytes"[..]));
+        // and a file that is not there is refused before ssh is run
+        let missing = plan_in(
+            "zellij_write_input",
+            &args(json!({"pane": "sunny-otter", "file": "/nonexistent/shot.png"})),
+            None,
+            &a_remote_env(),
+            &Target::Remote(host),
+        )
+        .await;
+        assert!(matches!(missing, Err(reason) if reason.contains("is not a file")));
+    }
+
+    #[test]
+    fn a_remote_create_takes_only_an_absolute_cwd_and_runs_exec_through_sh() {
+        let line = built(
+            "zellij_create",
+            json!({"kind": "tab", "cwd": "/srv/app", "command": "make", "run_in": "exec"}),
+            Some("work"),
+            &a_remote_env(),
+        )
+        .join(" ");
+        assert_eq!(
+            line, "-s work action new-tab --cwd=/srv/app -- /bin/sh -c make",
+            "this machine's $SHELL is not a path there"
+        );
+        for cwd in ["~/app", "$HOME/app", "app"] {
+            let refused = argv_in(
+                "zellij_create",
+                &args(json!({"kind": "tab", "cwd": cwd})),
+                None,
+                &a_remote_env(),
+                None,
+            )
+            .expect_err("refused");
+            assert!(refused.contains("not an absolute path"), "{}", refused);
+        }
+    }
+
+    #[test]
+    fn a_remote_create_does_not_go_beside_a_pane_it_cannot_see() {
+        for value in [json!({"kind": "pane"}), json!({"kind": "floating"})] {
+            let refused =
+                argv_in("zellij_create", &args(value), None, &a_remote_env(), None).unwrap_err();
+            assert!(
+                refused.contains("agent_tab, the default, or tab"),
+                "{}",
+                refused
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_show_passes_the_copies_paths_as_they_are() {
+        assert_eq!(
+            built(
+                "zellij_show",
+                json!({"paths": ["/tmp/zellij-mcp-files-501/x-shot.png"]}),
+                Some("work"),
+                &a_remote_env()
+            )
+            .join(" "),
+            "-s work action show --mode=auto -- /tmp/zellij-mcp-files-501/x-shot.png"
+        );
+    }
+
+    #[test]
+    fn a_remote_agent_reads_its_brief_from_the_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let brief = dir.path().join("brief.md");
+        std::fs::write(&brief, "do the thing").unwrap();
+        let read = args(json!({"command": "claude", "run_in": "agent",
+                               "brief": brief.display().to_string()}));
+        let typed = typed_command(
+            &Args::new(&read),
+            &a_remote_env(),
+            Some("/tmp/zellij-mcp-files-501/x-brief.md"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            typed,
+            "claude -- \"$(cat '/tmp/zellij-mcp-files-501/x-brief.md')\""
         );
     }
 }
