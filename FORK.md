@@ -9578,8 +9578,8 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   `${TMPDIR:-/tmp}/zellij-mcp-files-<uid>` there (mode 0700). Each copy keeps its name behind a
   unique prefix. The script removes copies older than seven days before it stores a new one. The
   agent line and `action show` then name the copy.
-- **What changes for a create on another machine.** `kind: pane` and `floating` are refused: they
-  go beside the caller's own pane, which is not in that session. `agent_tab` and `tab` work. The
+- **What changes for a create on another machine.** `kind: stacked` is refused:
+  it needs the caller's own pane, which is not in that session. `agent_tab` and `tab` work. The
   agent tab is named after the caller's own tab on this machine, so a caller has one tab name on
   every host, and the remote session is asked whether it has it yet. `cwd` must be absolute; `~`,
   `$VAR` and a relative path are refused, because they would mean this machine. `run_in=exec` runs
@@ -9592,7 +9592,7 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
 - **Capability `mcp-remote-hosts`.**
 
 What is not supported: a host outside the block, password or host-key prompts (`BatchMode` fails
-instead), and a remote `kind: pane`/`floating`. Cancelling a remote `zellij_wait_for` kills the
+instead), and a remote `kind: stacked`. Cancelling a remote `zellij_wait_for` kills the
 local ssh. The remote `wait` runs on until its own `--timeout`, because a `-T` session sends it no
 hangup.
 
@@ -9650,6 +9650,8 @@ MCP `zellij_create` accepts `stacked`, `agent_tab`, and `tab`.
 `stacked` uses `--stacked --near-current-pane` and requires the caller's local pane.
 The tool rejects the removed `pane` and `floating` kinds and the `floating` parameter.
 `zellij_show` keeps its floating image viewer.
+Placement validation runs before session queries, brief reads, or remote uploads.
+This ordering prevents removed MCP kinds from uploading a brief before their rejection.
 
 Tests cover config parsing and rendering, client-only serialization, CLI placement,
 missing-anchor warnings, editor commands, and the MCP kinds and schema.

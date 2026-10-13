@@ -636,6 +636,7 @@ async fn plan_in(
     if tool != "zellij_create" {
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
+    create_kind_allowed(&read)?;
     let session = target_session.clone();
     // a brief is a file on this machine; a pane on another machine reads the copy made there, and
     // only once everything a refusal could be about has been checked
@@ -703,6 +704,20 @@ fn local_file(path: &str, env: &CallEnv, param: &str) -> Result<PathBuf, String>
         return Err(format!("`{}` {} is not a file.", param, path.display()));
     }
     Ok(path)
+}
+
+/// Refuse removed placement options before querying a session or uploading a brief.
+fn create_kind_allowed(args: &Args) -> Result<(), String> {
+    if args.values.contains_key("floating") {
+        return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
+    }
+    match args.enumerated("kind", CREATE_KIND_DEFAULT).as_str() {
+        "agent_tab" | "stacked" | "tab" => Ok(()),
+        other => Err(format!(
+            "`kind` must be agent_tab, stacked or tab, not `{}`.",
+            other
+        )),
+    }
 }
 
 /// A stack needs the caller's pane, which is not on another machine.
@@ -1224,9 +1239,7 @@ fn argv_in(
             }
         },
         "zellij_create" => {
-            if args.values.contains_key("floating") {
-                return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
-            }
+            create_kind_allowed(&args)?;
             let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
             let command = args.string("command");
             // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
@@ -2978,6 +2991,42 @@ mod tests {
                 "{}",
                 refused
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_create_placements_are_refused_before_reading_or_uploading_a_brief() {
+        let host = remote::RemoteHost {
+            name: "boxa".into(),
+            bin: None,
+        };
+        for (placement, expected) in [
+            (json!({"kind": "pane"}), "must be agent_tab, stacked or tab"),
+            (
+                json!({"kind": "floating"}),
+                "must be agent_tab, stacked or tab",
+            ),
+            (
+                json!({"kind": "other"}),
+                "must be agent_tab, stacked or tab",
+            ),
+            (json!({"floating": true}), "`floating` is unsupported"),
+            (json!({"floating": false}), "`floating` is unsupported"),
+        ] {
+            let mut request = args(placement);
+            request.insert("command".into(), json!("claude"));
+            request.insert("run_in".into(), json!("agent"));
+            // A missing brief proves placement fails before file access or SSH.
+            request.insert("brief".into(), json!("/nonexistent/brief.md"));
+            let result = plan_in(
+                "zellij_create",
+                &request,
+                None,
+                &a_remote_env(),
+                &Target::Remote(host.clone()),
+            )
+            .await;
+            assert!(matches!(result, Err(reason) if reason.contains(expected)));
         }
     }
 
