@@ -9712,6 +9712,12 @@ this pane runs claude `project-1`; prefer messaging it by name
 
 The hint never blocks input. Unnamed agents receive no hint.
 
+### The forwarding panic test follows the build's assertion mode
+
+The client forwarding guard uses `debug_assert!`.
+Its panic test now compiles only when debug assertions are enabled.
+This keeps the quick-profile release gate valid without changing production behavior.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
