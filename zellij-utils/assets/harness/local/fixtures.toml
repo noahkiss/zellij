@@ -1,0 +1,121 @@
+# Synthetic regression screens. Trust/rate-limit cases do not verify an installed release.
+# Question footers derive from herdr manifests at the pinned revision in herdr/NOTICE.
+[[screens]]
+harness = "codex"
+screen = "› Explain the change\nSelect a scope\n1. Module\n2. Workspace\nenter to submit answer"
+state = "question"
+rule = "question_submit_footer"
+
+[[screens]]
+harness = "codex"
+screen = "› old question\nenter to submit answer\n• Answer received\n› Next prompt"
+state = "unknown"
+rule = ""
+
+[[screens]]
+harness = "codex"
+screen = "You are approaching rate limits\n› 1. Switch model\n  2. Keep model\n  3. Keep model and never show again\nPress enter to confirm"
+state = "blocked"
+rule = "rate_limit_model_switch"
+
+[[screens]]
+harness = "codex"
+screen = "You are approaching rate limits\n› 1. Switch model\n  2. Keep model\n  3. Keep model and never show again\nPress enter to confirm\n› New request"
+state = "unknown"
+rule = ""
+
+[[screens]]
+harness = "codex"
+screen = "Our prose mentions approaching rate limits."
+state = "unknown"
+rule = ""
+
+[[screens]]
+harness = "codex"
+screen = "Review hooks before trusting their definitions\n› 1. Trust hooks\n  2. Skip hooks\nPress enter to confirm"
+state = "blocked"
+rule = "hook_trust_review"
+
+[[screens]]
+harness = "codex"
+screen = "Folder access\nTrust this folder?\nCodex can read, edit, and run files here\nTrust and continue\nenter continue"
+state = "blocked"
+rule = "trust_directory"
+
+[[screens]]
+harness = "codex"
+screen = "Reconnect failed — check the endpoint, then relaunch (2s)\n›"
+state = "unknown"
+rule = ""
+
+[[screens]]
+harness = "claude"
+screen = "───\nChoose an approach\n❯ 1. Local\n2. Shared\nEnter to select · arrow keys to navigate · esc to cancel"
+state = "question"
+rule = "question_select_footer"
+
+[[screens]]
+harness = "claude"
+screen = "───\nDo you want to proceed?\n❯ 1. Yes\n2. No\nEnter to select · arrow keys to navigate · esc to cancel"
+state = "blocked"
+rule = "live_blocked_form"
+
+[[screens]]
+harness = "claude"
+screen = "───\nIs this a project you created or one you trust?\n❯ Yes, I trust this folder\nNo, exit\nEnter to confirm · Esc to cancel"
+state = "blocked"
+rule = "live_blocked_form"
+
+[[screens]]
+harness = "claude"
+screen = "───\n❯\n───\n? for shortcuts"
+state = "idle"
+rule = "live_prompt_box"
+
+[[screens]]
+harness = "opencode"
+screen = "△ Permission required\nPress esc to interrupt"
+state = "blocked"
+rule = "permission_required"
+
+[[screens]]
+harness = "pi"
+screen = "Project trust\nProject resources require approval\nEnter to confirm"
+state = "blocked"
+rule = "project_trust"
+
+[[screens]]
+harness = "pi"
+screen = "Working..."
+state = "working"
+rule = "working_literal"
+
+[[screens]]
+harness = "pi"
+screen = "The assistant asks: should we change this?"
+state = "unknown"
+rule = ""
+
+[[screens]]
+harness = "pi"
+screen = "Project trust\nEnter to confirm\nResources approved\nWorking..."
+state = "working"
+rule = "working_literal"
+
+[[screens]]
+harness = "claude"
+screen = "The transcript quotes: Yes, I trust this folder."
+state = "unknown"
+rule = ""
+
+[[screens]]
+harness = "codex"
+screen = "You are approaching rate limits\n› 1. Switch model\n  2. Keep model\n  3. Keep model and never show again\nPress enter to confirm\nModel retained\nWorking (2s)\n› next input"
+state = "working"
+rule = "screen_working_fallback"
+
+[[screens]]
+harness = "claude"
+screen = "───\nIs this a project you created or one you trust?\n❯ Yes, I trust this folder\nNo, exit\nEnter to confirm"
+state = "blocked"
+rule = "folder_trust"

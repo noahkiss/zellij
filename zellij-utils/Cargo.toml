@@ -28,6 +28,8 @@ percent-encoding = { version = "2.1.0", default-features = false, features = ["s
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+regex = { workspace = true }
+toml = "=0.9.6"
 shellexpand = { version = "3.0.0", default-features = false, features = ["base-0", "tilde"] }
 strip-ansi-escapes = { workspace = true }
 strum = { workspace = true }

@@ -1,0 +1,14 @@
+# Project-trust observation remains unverified; extension questions need native events.
+# Source: agent-manager config.go @ ac098b3f63ce7e79fb91540349ed226ce5cf5c86.
+id = "pi"
+version = "2026.10.13.1"
+min_engine_version = 1
+
+[[rules]]
+id = "project_trust"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+contains = ["Project trust"]
+regex = ['(?i)(?:enter|return)[^\n]*(?:confirm|continue|trust)[^\n]*\s*\z']

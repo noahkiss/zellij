@@ -1,0 +1,26 @@
+herdr terminal detection manifests and evaluator
+Source: https://github.com/herdrdev/herdr
+Revision: 87e5c13c6028df72405f63388dde585212ad3019
+License: Apache-2.0; see LICENSE.
+
+claude.toml, codex.toml, opencode.toml and pi.toml are verbatim copies of
+src/detect/manifests/ at this revision. Their inline comments remain intact.
+These files contain no additional copyright or license notices.
+
+The evaluator in zellij-utils/src/harness_map/evaluator.rs ports
+src/detect/manifest.rs. Changes: pure public API, no filesystem or remote
+cache, string manifest versions with upstream format validation, explicit
+unsupported-engine errors,
+serializable results and unknown-label handling. Matcher gates, regions,
+priority ties, validation limits and known-agent idle fallback remain intact.
+Herdr does not distinguish questions from permissions; both remain blocked.
+
+The region fixtures in evaluator.rs copy the upstream test
+screen_regions_extract_structure_without_classifying_agent_state from
+src/detect/manifest/tests.rs, with formatting changes. These are synthetic
+test inputs.
+fixtures.toml contains local synthetic harness screens, except the pi
+Working... string also occurs in upstream tests/cross_area.rs.
+The evaluator also accepts a local question state for supplemental manifests.
+Local supplemental TOML and synthetic screens live beside this directory in
+local/. They are fork additions, not modified herdr manifests or captured screens.

@@ -1,0 +1,33 @@
+# Fork additions; exact herdr rules retain their blocked state.
+# Source: herdr claude.toml @ 87e5c13c6028df72405f63388dde585212ad3019.
+# These question-specific footers exclude permission and MCP elicitation wording.
+id = "claude"
+version = "2026.10.13.1"
+min_engine_version = 3
+
+[[rules]]
+id = "question_select_footer"
+state = "question"
+priority = 980
+region = "after_last_horizontal_rule"
+visible_blocker = true
+contains = ["enter to select", "esc to cancel"]
+any = [
+  { contains = ["tab/arrow keys to navigate"] },
+  { contains = ["arrow keys to navigate"] },
+  { contains = ["arrows to navigate"] },
+  { contains = ["↑/↓ to navigate"] },
+  { contains = ["↑↓ to navigate"] },
+]
+not = [{ contains = ["do you want to proceed?"] }, { contains = ["MCP server"] }]
+
+[[rules]]
+id = "folder_trust"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+contains = ["yes, i trust this folder"]
+any = [{ contains = ["is this a project you created or one you trust"] }, { contains = ["trust this folder?"] }]
+line_regex = ['(?i)^\s*❯\s*(?:[1-9]\.\s*)?(?:Yes, I trust this folder|No, exit)']
+regex = ['(?i)(?:enter|return)[^\n]*(?:confirm|continue)[^\n]*\s*\z']
