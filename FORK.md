@@ -9768,6 +9768,34 @@ Their `serial_test` locks apply only within one process.
 A nextest group now runs these tests one at a time across test processes.
 Other tests retain parallel execution. Production authentication behavior stays unchanged.
 
+### `setup --harness-map`: shared harness facts and screen rules
+
+`zellij setup --harness-map [--json]` prints one inventory for Claude, Codex, OpenCode, and Pi.
+Each fact carries a source, revision, and verification marker.
+The JSON includes verbatim detector TOML and separate fork supplements.
+The command needs no session and changes no client/server contract.
+`setup --check --json` advertises the `harness-map` capability.
+
+The zellij fork stores the files under `zellij-utils/assets/harness/`.
+Paseo commit `e135e9c101700b31671fc374325d17b608467a91` supplies native title facts.
+Herdr commit `87e5c13c6028df72405f63388dde585212ad3019` supplies four verbatim manifests and the evaluator semantics.
+The vendored files retain Apache-2.0 LICENSE and source/modification notices.
+The pure Rust evaluator preserves regions, priorities, nested gates, exclusions, and engine requirements.
+The public wrapper returns unknown when no rule matches and preserves transcript-viewer skip semantics.
+It distinguishes explicit question footers where evidence permits.
+Shared permission/question screens remain blocked.
+No server or MCP wiring changes in this patch.
+
+Codex rate-limit, hook-trust, and Pi project-trust screen rules remain unverified against installed releases.
+The inventory also marks uncertain keys, process aliases, and storage assumptions.
+Synthetic fixtures test those rules without claiming a live capture.
+
+To update Herdr, change the pinned commit, re-copy manifests and LICENSE, and review each file's notices.
+Compare engine changes before raising the supported engine version.
+Then update source revisions, re-run fixtures, run the wasm check, and read Rust CI.
+To update Paseo facts, review each provider at the new pinned commit and update the affected facts.
+The [harness README](zellij-utils/assets/harness/README.md) documents the schema and integration API.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

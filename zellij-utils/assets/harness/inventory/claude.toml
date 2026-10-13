@@ -1,0 +1,96 @@
+schema_version = 1
+harness = "claude"
+
+[[facts]]
+key = "process_names"
+value = "claude"
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = false
+notes = "Executable/argv0 name used by the fork hook. Complete process aliases remain unverified."
+
+[[facts]]
+key = "human_title_source"
+value = "Latest custom-title.customTitle; then ai-title.aiTitle; then user-message fallback."
+source = "https://github.com/getpaseo/paseo/blob/e135e9c101700b31671fc374325d17b608467a91/packages/server/src/server/agent/providers/claude/agent.ts"
+revision = "e135e9c101700b31671fc374325d17b608467a91"
+verified = true
+
+[[facts]]
+key = "transcript_path"
+value = "${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<encoded-cwd>/<session-id>.jsonl"
+source = "https://github.com/getpaseo/paseo/blob/e135e9c101700b31671fc374325d17b608467a91/packages/server/src/server/agent/providers/claude/project-dir.ts"
+revision = "e135e9c101700b31671fc374325d17b608467a91"
+verified = true
+
+[[facts]]
+key = "transcript_format"
+value = "Append-only JSONL: messages, tool-use/tool-result blocks, and metadata."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/claude.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "resume_command"
+value = "claude --resume <session-id>"
+source = "https://code.claude.com/docs/en/sessions#resume-a-session"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "approve_keys"
+value = "Displayed numbered Yes choice; no universal digit."
+source = "https://github.com/herdrdev/herdr/blob/87e5c13c6028df72405f63388dde585212ad3019/src/detect/manifests/claude.toml"
+revision = "87e5c13c6028df72405f63388dde585212ad3019"
+verified = false
+notes = "Three-option layouts differ from two-option layouts. Verify the current prompt."
+
+[[facts]]
+key = "deny_keys"
+value = "Escape"
+source = "https://code.claude.com/docs/en/interactive-mode#keyboard-shortcuts"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "interrupt_keys"
+value = "Escape"
+source = "https://code.claude.com/docs/en/interactive-mode#keyboard-shortcuts"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "question_keys"
+value = "Enter confirms/selects; navigation depends on the visible footer."
+source = "https://github.com/herdrdev/herdr/blob/87e5c13c6028df72405f63388dde585212ad3019/src/detect/manifests/claude.toml"
+revision = "87e5c13c6028df72405f63388dde585212ad3019"
+verified = false
+notes = "Screen patterns establish hints, not complete question navigation."
+
+[[facts]]
+key = "folder_trust"
+value = "Interactive untrusted folders require workspace trust; project MCP approval is separate. Headless -p skips these prompts."
+source = "https://code.claude.com/docs/en/security"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "hook_trust"
+value = "Exact hook-trust dialog and answer keys unknown."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = false
+
+[[facts]]
+key = "osc7501"
+value = "Native state reporting after zellij answers the OSC query; SessionStart hook reports session identity."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true
+
+[[facts]]
+key = "hooks"
+value = "SessionStart invokes the shared script for zellij identity reporting. Environment/registry ownership remains external."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true

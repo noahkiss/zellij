@@ -1,0 +1,72 @@
+# Synthetic screens. No captured harness version is asserted.
+[[screens]]
+harness = "codex"
+screen = "> You are in /workspace/project\nDo you trust the contents of this directory?\n1. Yes\n2. No"
+state = "blocked"
+rule = "trust_directory"
+
+[[screens]]
+harness = "codex"
+screen = "› old prompt\nAllow command?\nPress enter to confirm or esc to cancel"
+state = "blocked"
+rule = "live_strong_blocker"
+
+[[screens]]
+harness = "codex"
+screen = "• Working (2s • esc to interrupt)\n› next input"
+state = "working"
+rule = "screen_working_fallback"
+
+[[screens]]
+harness = "codex"
+screen = "• Do you want to continue? yes\n› next input"
+state = "idle"
+rule = ""
+
+[[screens]]
+harness = "claude"
+screen = "Bash command\nDo you want to proceed?\n❯ 1. Yes\n2. Yes, and don't ask again\n3. No"
+state = "blocked"
+rule = "bash_permission_prompt"
+
+[[screens]]
+harness = "claude"
+screen = "───\n❯\n───\n? for shortcuts"
+state = "idle"
+rule = "live_prompt_box"
+
+[[screens]]
+harness = "claude"
+screen = "Showing detailed transcript\nctrl+o to toggle"
+state = "unknown"
+rule = "transcript_viewer"
+
+[[screens]]
+harness = "opencode"
+screen = "△ Permission required\nesc to interrupt"
+state = "blocked"
+rule = "permission_required"
+
+[[screens]]
+harness = "opencode"
+screen = "esc dismiss\nenter submit\n↑↓ select"
+state = "blocked"
+rule = "permission_required"
+
+[[screens]]
+harness = "opencode"
+screen = "esc dismiss\nenter submit"
+state = "idle"
+rule = ""
+
+[[screens]]
+harness = "pi"
+screen = "Working..."
+state = "working"
+rule = "working_literal"
+
+[[screens]]
+harness = "pi"
+screen = "done"
+state = "idle"
+rule = ""

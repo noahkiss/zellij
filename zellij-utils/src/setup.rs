@@ -270,10 +270,14 @@ pub struct Setup {
     #[clap(long, value_parser)]
     pub agent_hooks: bool,
 
+    /// Print coding-agent harness facts and screen detection manifests
+    #[clap(long, value_parser)]
+    pub harness_map: bool,
+
     /// With `--check`, report the version and this build's capabilities as JSON on stdout, and
     /// nothing else. Gate on the capability names: the fork counter resets when the upstream
     /// version moves, so it cannot be compared across an upgrade. With `--dump-surface`, print the
-    /// surface as JSON
+    /// surface as JSON. With `--harness-map`, print harness facts and detection manifests as JSON
     #[clap(long, value_parser)]
     pub json: bool,
 
@@ -426,6 +430,17 @@ impl Setup {
             std::process::exit(0);
         }
 
+        if self.harness_map {
+            let map = crate::harness_map::inventory()?;
+            let output = if self.json {
+                serde_json::to_string_pretty(&map)?
+            } else {
+                map.to_text()
+            };
+            let _ = std::io::stdout().write_all(format!("{output}\n").as_bytes());
+            std::process::exit(0);
+        }
+
         if self.dump_surface {
             // before the config is read, like the other dumps: what the CLI accepts does not
             // depend on a config file, and a broken one must not take the map away
@@ -444,7 +459,7 @@ impl Setup {
         if self.json && !self.check {
             eprintln!(
                 "--json says how to print an answer and needs a question: pass it with --check or \
-                 with --dump-surface"
+                 with --dump-surface or --harness-map"
             );
             std::process::exit(2);
         }
