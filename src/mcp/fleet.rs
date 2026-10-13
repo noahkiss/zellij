@@ -220,17 +220,23 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, warnings: &[String]) -> 
     result
 }
 
-/// One agent on one line: `host: session: handle kind state tab=… out=…s cwd`.
+/// One agent on one line, with its live messaging name before its pane handle.
 fn row_line(host: &str, row: &Map<String, Value>) -> String {
     let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("-");
     let mut state = text("state").to_owned();
     if let Some(kind) = row.get("state_kind").and_then(Value::as_str) {
         state = format!("{}/{}", state, kind);
     }
+    let name = if row.get("self").and_then(Value::as_bool) == Some(true) {
+        format!("{} (you)", text("name"))
+    } else {
+        text("name").to_owned()
+    };
     let mut line = format!(
-        "{}: {}: {} {} {} tab={}",
+        "{}: {}: {} {} {} {} tab={}",
         host,
         text("session"),
+        name,
         text("handle"),
         text("kind"),
         state,
@@ -268,8 +274,15 @@ mod tests {
         })
     }
 
+    #[test]
+    fn fleet_text_marks_the_named_caller() {
+        let row = json!({"session":"work","name":"project-1","self":true,"handle":"brisk-heron","kind":"claude"});
+        assert!(row_line("boxa", row.as_object().unwrap())
+            .contains("project-1 (you) brisk-heron claude"));
+    }
+
     const BOXA: &str = r#"{"agents": [
-        {"handle": "brisk-heron", "kind": "claude", "session": "work", "tab_name": "build",
+        {"handle": "brisk-heron", "name": "project-1", "self": false, "kind": "claude", "session": "work", "tab_name": "build",
          "state": "blocked", "state_kind": "permission", "cwd": "/srv/app",
          "last_output_at": 1000000, "command": "claude"}
     ], "withheld": 1}"#;
@@ -305,7 +318,7 @@ mod tests {
         assert_eq!(
             text,
             vec![
-                "boxa: work: brisk-heron claude blocked/permission tab=build out=42s /srv/app",
+                "boxa: work: project-1 brisk-heron claude blocked/permission tab=build out=42s /srv/app",
                 "boxb: unreachable: ssh could not reach boxb (exit 255): Connection timed out",
                 "boxc: no agents",
                 "boxd: unreachable: no answer within 10 seconds",
@@ -315,6 +328,8 @@ mod tests {
         let agents = structured["result"]["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["host"], json!("boxa"));
+        assert_eq!(agents[0]["name"], "project-1");
+        assert_eq!(agents[0]["self"], false);
         assert_eq!(agents[0]["output_age_s"], json!(42));
         let hosts = &structured["result"]["hosts"];
         assert_eq!(

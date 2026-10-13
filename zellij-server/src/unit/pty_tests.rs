@@ -997,6 +997,7 @@ fn a_serialized_attribute_that_changes_back_writes_both_times() {
 fn a_pane_whose_identity_is_known_is_never_walked_again() {
     let probe = AgentEnvProbe {
         child_pid: 42,
+        kind: "claude".into(),
         found: true,
         ticks_since_probe: 10_000,
         live_session: None,
@@ -1010,6 +1011,7 @@ fn a_new_process_in_the_pane_is_a_new_question() {
     // last walk answered
     let probe = AgentEnvProbe {
         child_pid: 42,
+        kind: "claude".into(),
         found: true,
         ticks_since_probe: 0,
         live_session: None,
@@ -1021,6 +1023,7 @@ fn a_new_process_in_the_pane_is_a_new_question() {
 fn a_pane_with_no_identity_yet_is_retried_but_not_every_tick() {
     let mut probe = AgentEnvProbe {
         child_pid: 42,
+        kind: "claude".into(),
         found: false,
         ticks_since_probe: 0,
         live_session: None,
@@ -1198,6 +1201,7 @@ fn a_known_claude_follows_its_session_without_another_walk() {
     write_claude_record(dir.path(), 77, "first-session");
     let probe = AgentEnvProbe {
         child_pid: 42,
+        kind: "claude".into(),
         found: true,
         ticks_since_probe: 0,
         live_session: Some(LiveSession::ClaudeRecord {
@@ -1206,11 +1210,18 @@ fn a_known_claude_follows_its_session_without_another_walk() {
         }),
     };
     assert!(!probe.needs_another_walk(42));
-    assert_eq!(probe.live_session_id().as_deref(), Some("first-session"));
+    assert_eq!(
+        probe.live_session_id_with(|pid| pid == 77).as_deref(),
+        Some("first-session")
+    );
+    assert_eq!(probe.live_session_id_with(|_| false), None);
     write_claude_record(dir.path(), 77, "second-session");
-    assert_eq!(probe.live_session_id().as_deref(), Some("second-session"));
+    assert_eq!(
+        probe.live_session_id_with(|pid| pid == 77).as_deref(),
+        Some("second-session")
+    );
     std::fs::remove_file(dir.path().join("77.json")).unwrap();
-    assert_eq!(probe.live_session_id(), None);
+    assert_eq!(probe.live_session_id_with(|pid| pid == 77), None);
 }
 
 #[test]
@@ -1219,6 +1230,7 @@ fn a_pane_with_no_live_session_reads_none() {
     write_claude_record(dir.path(), 77, "first-session");
     let probe = AgentEnvProbe {
         child_pid: 42,
+        kind: "claude".into(),
         found: true,
         ticks_since_probe: 0,
         live_session: None,
@@ -1668,6 +1680,7 @@ fn a_held_agent_pane_keeps_the_session_the_tick_found_and_its_source() {
         1,
         AgentEnvProbe {
             child_pid: 100,
+            kind: "claude".into(),
             found: true,
             ticks_since_probe: 0,
             live_session: Some(LiveSession::ClaudeRecord {
@@ -1741,4 +1754,89 @@ fn a_held_pane_is_listed_with_no_pid_and_no_command() {
     pty.update_and_report_cwds();
     let reports = collect_process_info_reports(&screen_rx);
     assert!(!reports.last().expect("a report").contains_key(&1));
+}
+
+#[test]
+fn claude_retries_a_late_record_without_delaying_other_harnesses() {
+    let mut probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: None,
+    };
+    assert!(probe.needs_identity_walk(42, "claude"));
+    probe.kind = "codex".into();
+    assert!(!probe.needs_identity_walk(42, "codex"));
+    probe.kind = "claude".into();
+    probe.live_session = Some(LiveSession::ClaudeRecord {
+        pid: 77,
+        dir: "/tmp/agent-test".into(),
+    });
+    assert!(!probe.needs_identity_walk(42, "claude"));
+    assert!(probe.needs_identity_walk(43, "claude"));
+}
+
+#[test]
+fn agent_identity_uses_the_foreground_job_and_invalidates_changed_harnesses() {
+    assert_eq!(agent_identity_root(10, Some(20)), 20);
+    assert_eq!(agent_identity_root(10, Some(30)), 30);
+    assert_eq!(agent_identity_root(10, Some(10)), 10);
+    assert_eq!(agent_identity_root(10, Some(0)), 10);
+    assert_eq!(agent_identity_root(10, None), 10);
+    let probe = AgentEnvProbe {
+        child_pid: 10,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: Some(LiveSession::ClaudeRecord {
+            pid: 20,
+            dir: "/tmp/agent-test".into(),
+        }),
+    };
+    assert!(probe.needs_identity_walk(10, "codex"));
+    assert!(probe.needs_identity_walk(30, "claude"));
+    assert!(!probe.needs_identity_walk(10, "claude"));
+}
+
+#[test]
+fn a_configured_default_shell_is_listed_as_its_agent_job() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["/bin/bash".into()]);
+    mock.set_foreground_cmd(100, vec!["claude".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    let command = RunCommand {
+        command: "/bin/bash".into(),
+        use_terminal_title: true,
+        ..Default::default()
+    };
+    let (terminal_id, _) = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+        )
+        .unwrap();
+    assert!(!pty.command_terminal_ids.contains(&terminal_id));
+    pty.pane_activity_flags
+        .get(&terminal_id)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    assert_eq!(
+        pty.reported_command_for(terminal_id),
+        Some(&vec!["claude".to_owned()])
+    );
+}
+
+#[test]
+fn shell_commands_with_scripts_remain_command_panes() {
+    let mut command = RunCommand::new("/bin/bash".into());
+    assert!(!command_runs_interactive_shell(&command));
+    command.use_terminal_title = true;
+    assert!(command_runs_interactive_shell(&command));
+    command.args = vec!["-c".into(), "sleep 1".into()];
+    assert!(!command_runs_interactive_shell(&command));
+    command.command = "claude".into();
+    command.args.clear();
+    assert!(!command_runs_interactive_shell(&command));
 }

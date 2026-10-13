@@ -48,17 +48,30 @@ pub const SESSION_SCRIPT_PATH: &str = "~/.config/zellij/agent-session.sh";
 /// test, to the terminal of an unrelated pane further up.
 pub const SESSION_SCRIPT: &str = r#"#!/bin/sh
 # Agent session hook (zellij setup --agent-hooks).
-# Usage: sh agent-session.sh KIND start|end|osc
+# Usage: sh agent-session.sh KIND start|end|osc|context
 #        sh agent-session.sh KIND state STATE [BLOCKED_KIND]
 #   start: register the session in the agent-sessions registry, then report it to zellij
 #   end:   unregister it
 #   osc:   only report it to zellij
+#   context: print live pane context for SessionStart, within 150 milliseconds
 #   state: only tell zellij what the agent is doing (OSC 7501): idle, working, done, blocked
 #          (with permission, question or auth) or error. For an agent that does not report
 #          it itself; claude and pi do.
 # Reads the hook's JSON on stdin for its "session_id".
 kind=$1
 mode=${2:-start}
+if [ "$mode" = context ]; then
+  [ -n "$ZELLIJ" ] && [ -n "$ZELLIJ_PANE_ID" ] || exit 0
+  command -v zellij >/dev/null 2>&1 || exit 0
+  zellij action whoami 2>/dev/null &
+  context_pid=$!
+  (sleep 0.15; kill "$context_pid" 2>/dev/null) </dev/null >/dev/null 2>&1 &
+  watchdog_pid=$!
+  wait "$context_pid" 2>/dev/null
+  kill "$watchdog_pid" 2>/dev/null
+  wait "$watchdog_pid" 2>/dev/null
+  exit 0
+fi
 if [ "$mode" = state ]; then
   cat >/dev/null
   case "$3" in idle|working|done|blocked|error) ;; *) exit 0 ;; esac
@@ -114,14 +127,15 @@ pub const AGENT_HOOKS: &[AgentHook] = &[
         how: "merge into the top-level \"hooks\" object; SessionStart fires on start-up, /clear, \
               /resume and compaction",
         covers:
-            "the zellij report only. The env export ($CLAUDE_ENV_FILE), register and the \
+            "the zellij report and live pane context. The env export ($CLAUDE_ENV_FILE), register and the \
                  SessionEnd unregister live in bm's SessionStart hook for now; do not add them here",
         snippet: r#"{
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude osc" }
+          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude osc" },
+          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude context" }
         ]
       }
     ]
@@ -540,6 +554,73 @@ mod tests {
             .filter(|hook| hook.kind == kind)
             .find(tui)
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_hook_is_silent_outside_zellij_and_bounds_a_slow_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("agent-session.sh");
+        std::fs::write(&script, SESSION_SCRIPT).unwrap();
+        let cli = dir.path().join("zellij");
+        std::fs::write(&cli, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outside = Command::new("sh")
+            .arg(&script)
+            .args(["claude", "context"])
+            .env_remove("ZELLIJ")
+            .env_remove("ZELLIJ_PANE_ID")
+            .output()
+            .unwrap();
+        assert!(outside.status.success());
+        assert!(outside.stdout.is_empty() && outside.stderr.is_empty());
+        let start = Instant::now();
+        let inside = Command::new("sh")
+            .arg(&script)
+            .args(["claude", "context"])
+            .env("ZELLIJ", "1")
+            .env("ZELLIJ_PANE_ID", "7")
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .output()
+            .unwrap();
+        // CI scheduling adds wall time; the watchdog must still interrupt the five-second CLI.
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(inside.status.success());
+        assert!(inside.stdout.is_empty() && inside.stderr.is_empty());
+        std::fs::write(&cli, "#!/bin/sh\nprintf 'live pane context\\n'\n").unwrap();
+        let fast_start = Instant::now();
+        let context = Command::new("sh")
+            .arg(&script)
+            .args(["claude", "context"])
+            .env("ZELLIJ", "1")
+            .env("ZELLIJ_PANE_ID", "7")
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .output()
+            .unwrap();
+        assert!(fast_start.elapsed() < Duration::from_millis(200));
+        assert_eq!(
+            String::from_utf8(context.stdout).unwrap(),
+            "live pane context\n"
+        );
+    }
+
+    #[test]
+    fn claude_session_start_installs_bounded_live_context() {
+        let hook: serde_json::Value = serde_json::from_str(AGENT_HOOKS[0].snippet).unwrap();
+        let hooks = hook["hooks"]["SessionStart"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert!(hooks.iter().any(|hook| hook["command"]
+            .as_str()
+            .unwrap()
+            .ends_with("claude context")));
+        assert!(SESSION_SCRIPT.contains("sleep 0.15"));
+        assert!(
+            SESSION_SCRIPT.contains("[ -n \"$ZELLIJ\" ] && [ -n \"$ZELLIJ_PANE_ID\" ] || exit 0")
+        );
     }
 
     #[test]

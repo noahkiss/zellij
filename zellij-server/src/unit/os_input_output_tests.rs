@@ -269,3 +269,17 @@ fn the_newest_child_of_a_shell_is_the_one_recorded() {
     // an idle shell has no children, and records nothing
     assert_eq!(newest_child(&[]), None);
 }
+
+#[test]
+fn identity_roots_keep_command_panes_and_follow_shell_jobs() {
+    assert_eq!(
+        identity_root_without_children(10, Some(20), false),
+        Some(20)
+    );
+    assert_eq!(identity_root_without_children(10, Some(10), true), Some(10));
+    assert_eq!(identity_root_without_children(10, None, true), Some(10));
+    assert_eq!(identity_root_without_children(10, Some(10), false), None);
+    assert_eq!(identity_root_without_children(10, Some(0), false), None);
+    assert_eq!(identity_root_without_children(10, None, false), None);
+    assert_eq!(newest_child(&[(20, 1), (30, 2)]), Some(30));
+}

@@ -375,6 +375,7 @@ pub enum ScreenInstruction {
     UpdatePaneProcessInfo {
         process_info: HashMap<u32, PaneProcessInfo>,
         detect_agents: bool,
+        pane_frame_agent_name: bool,
     },
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
@@ -6042,12 +6043,19 @@ impl Screen {
             pane_info.terminal_command.as_deref(),
             &agent_env,
         )
-        .map(|(mut agent, command)| match osc_session {
-            Some(session_id) => {
-                agent.agent_id = Some(session_id);
-                agent_detect::with_session_source(agent, Some("osc"), command)
-            },
-            None => agent_detect::with_session_source(agent, live_source, command),
+        .map(|(mut agent, command)| {
+            agent.name = if agent.kind == "claude" {
+                process_info.and_then(|info| info.agent_name.clone())
+            } else {
+                None
+            };
+            match osc_session {
+                Some(session_id) => {
+                    agent.agent_id = Some(session_id);
+                    agent_detect::with_session_source(agent, Some("osc"), command)
+                },
+                None => agent_detect::with_session_source(agent, live_source, command),
+            }
         })
     }
 
@@ -9668,9 +9676,32 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::UpdatePaneProcessInfo {
                 process_info,
                 detect_agents,
+                pane_frame_agent_name,
             } => {
                 screen.pane_process_info = process_info;
                 screen.detect_agents = detect_agents;
+                let names: Vec<_> = screen
+                    .tabs
+                    .values()
+                    .flat_map(|tab| screen.pane_infos_for_tab(tab))
+                    .filter(|info| !info.is_plugin)
+                    .map(|info| {
+                        let name = if pane_frame_agent_name {
+                            screen.agent_in_pane(&info).and_then(|agent| agent.name)
+                        } else {
+                            None
+                        };
+                        (info.id, name)
+                    })
+                    .collect();
+                for tab in screen.tabs.values_mut() {
+                    for (id, name) in &names {
+                        if let Some(pane) = tab.get_pane_with_id_mut(PaneId::Terminal(*id)) {
+                            pane.set_frame_agent_name(name.clone());
+                        }
+                    }
+                }
+                screen.render(None)?;
             },
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
                 screen.record_pane_output(PaneId::Terminal(pid));

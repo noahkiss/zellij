@@ -39,6 +39,28 @@ fn main() {
 
     {
         let config = Config::try_from(&opts).ok();
+        if let Some(Command::Sessions(Sessions::ListAgents {
+            json,
+            report_withheld,
+            all_sessions,
+            watch,
+            interval_ms,
+        })) = opts.command
+        {
+            commands::send_action_to_session(
+                CliAction::ListAgents {
+                    json,
+                    report_withheld,
+                    all_sessions,
+                    watch,
+                    interval_ms,
+                },
+                opts.session,
+                config,
+                json,
+            );
+            std::process::exit(0);
+        }
         if let Some(Command::Action {
             json,
             action: cli_action,

@@ -808,6 +808,8 @@ pub trait Pane {
     }
     /// Puts this pane back under the handle a serialized session recorded for it.
     ///
+    /// Update the live name displayed before the pane frame title.
+    fn set_frame_agent_name(&mut self, _name: Option<String>) {}
     /// Called on the restore path only. If a live pane already answers to `handle` the pane keeps
     /// a freshly generated one instead, because a restore must not end with two panes at one
     /// address.

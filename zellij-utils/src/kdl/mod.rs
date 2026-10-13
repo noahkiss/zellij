@@ -3088,6 +3088,9 @@ impl Options {
             ),
             None => None,
         };
+        let pane_frame_agent_name =
+            kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frame_agent_name")
+                .map(|(v, _)| v);
         let detect_agents =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "detect_agents").map(|(v, _)| v);
         let session_up_resume =
@@ -3301,6 +3304,7 @@ impl Options {
             session_restart_drop_env,
             report_pane_env,
             detect_agents,
+            pane_frame_agent_name,
             session_up_resume,
             session_service,
             pane_privacy,
@@ -6003,6 +6007,11 @@ impl Options {
         }
         if let Some(report_pane_env) = self.report_pane_env_to_kdl() {
             nodes.push(report_pane_env);
+        }
+        if let Some(enabled) = self.pane_frame_agent_name {
+            let mut node = KdlNode::new("pane_frame_agent_name");
+            node.push(KdlValue::Bool(enabled));
+            nodes.push(node);
         }
         if let Some(detect_agents) = self.detect_agents_to_kdl() {
             nodes.push(detect_agents);
@@ -11816,4 +11825,31 @@ fn plugin_permissions_reject_what_expansion_produces_too() {
         }
     "#;
     assert!(Config::from_kdl(expands_to_a_wildcard, None).is_err());
+}
+
+#[test]
+fn pane_frame_agent_name_config_roundtrips_and_defaults_off() {
+    assert_eq!(
+        Options::default().pane_frame_agent_name.unwrap_or(false),
+        false
+    );
+    let config = Config::from_kdl("pane_frame_agent_name true", None).unwrap();
+    assert_eq!(config.options.pane_frame_agent_name, Some(true));
+    let serialized = config
+        .options
+        .to_kdl(false)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let restored = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(restored.options.pane_frame_agent_name, Some(true));
+    let disabled = Options {
+        pane_frame_agent_name: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        config.options.merge(disabled).pane_frame_agent_name,
+        Some(false)
+    );
 }

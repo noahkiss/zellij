@@ -159,6 +159,7 @@ pub enum PtyInstruction {
         resurrect_commands: Option<ResurrectCommands>,
         report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
+        pane_frame_agent_name: Option<bool>,
     },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
@@ -319,12 +320,14 @@ impl HeldPane {
 /// The walk is the expensive half of agent detection, and its answer is stable: a pane is one
 /// program, and that program's environment does not change under it. So a pane is walked when it is
 /// new, when its process is replaced, and - if nothing was found - once every
-/// [`AGENT_ENV_RETRY_TICKS`]. A pane whose identity is known is never walked again.
+/// [`AGENT_ENV_RETRY_TICKS`]. Claude retries each tick until its record appears.
+/// A live record avoids another walk until its process exits.
 #[derive(Debug)]
 struct AgentEnvProbe {
-    /// The pane's child pid at the time of the walk. A different pid is a different program, and
-    /// the only thing that can make a known identity wrong.
+    /// The identity walk’s root PID: the foreground job, or the pane’s own child.
     child_pid: u32,
+    /// The harness matched when this probe ran.
+    kind: String,
     /// Whether the walk found an identity. Once it has, the question is answered for this pid.
     found: bool,
     /// Ticks since the walk, counted only while `found` is false.
@@ -339,6 +342,29 @@ struct AgentEnvProbe {
     live_session: Option<LiveSession>,
 }
 
+/// An interactive shell remains a shell pane even when config supplies it as an explicit command.
+fn command_runs_interactive_shell(command: &RunCommand) -> bool {
+    command.use_terminal_title
+        && command.args.is_empty()
+        && command
+            .command
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or(false, |name| {
+                matches!(
+                    name,
+                    "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "nu" | "nushell"
+                )
+            })
+}
+
+/// Match the identity walk to the foreground job instead of older background jobs.
+fn agent_identity_root(child_pid: u32, foreground_pid: Option<u32>) -> u32 {
+    foreground_pid
+        .filter(|pid| *pid > 0 && *pid != child_pid)
+        .unwrap_or(child_pid)
+}
+
 impl AgentEnvProbe {
     /// Whether this record is worth replacing with another walk.
     ///
@@ -348,10 +374,23 @@ impl AgentEnvProbe {
             || (!self.found && self.ticks_since_probe >= AGENT_ENV_RETRY_TICKS)
     }
 
+    /// Claude can write its record after SessionStart; retry until that record appears.
+    fn needs_identity_walk(&self, child_pid: u32, kind: &str) -> bool {
+        self.kind != kind
+            || (kind == CLAUDE && self.live_session.is_none())
+            || self.needs_another_walk(child_pid)
+    }
+
     /// The session the agent this walk found holds now, re-read from where the walk found it.
     /// `None` when the walk found none, or that agent has since exited or moved on.
     fn live_session_id(&self) -> Option<String> {
-        self.live_session.as_ref()?.reread(open_files_of)
+        self.live_session_id_with(crate::resurrect_hints::live_claude_process)
+    }
+
+    fn live_session_id_with<C: Fn(u32) -> bool>(&self, live_claude: C) -> Option<String> {
+        self.live_session
+            .as_ref()?
+            .reread_live(open_files_of, live_claude)
     }
 }
 
@@ -378,6 +417,8 @@ pub struct PaneProcessInfo {
     /// and these were never asked for by the `report_pane_env` allowlist that governs it; this map
     /// goes no further than the CLI-only pane list.
     pub agent_env: BTreeMap<String, String>,
+    /// Claude’s current messaging name from its live process record.
+    pub agent_name: Option<String>,
     /// Where the harness's own session id in `agent_env` was found, when the pty found it itself:
     /// `record` or `open-file`. `None` when the id, if any, came from the environment.
     pub agent_session_source: Option<String>,
@@ -410,6 +451,8 @@ pub(crate) struct Pty {
     terminal_envs: HashMap<u32, BTreeMap<String, String>>,
     /// Whether to work out which panes run a coding agent at all. `detect_agents`, default true.
     detect_agents: bool,
+    pub pane_frame_agent_name: bool,
+    last_reported_pane_frame_agent_name: Option<bool>,
     /// terminal_id -> the harness session-id variables last found in that pane's processes. Only
     /// panes whose command matched a harness appear here.
     terminal_agent_envs: HashMap<u32, BTreeMap<String, String>>,
@@ -1123,8 +1166,10 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 resurrect_commands,
                 report_pane_env,
                 detect_agents,
+                pane_frame_agent_name,
                 client_id: _,
             } => {
+                pty.pane_frame_agent_name = pane_frame_agent_name.unwrap_or(false);
                 pty.reconfigure(
                     default_editor,
                     post_command_discovery_hook,
@@ -1212,6 +1257,8 @@ impl Pty {
             report_pane_env: report_pane_env.unwrap_or_default(),
             terminal_envs: HashMap::new(),
             detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
+            pane_frame_agent_name: false,
+            last_reported_pane_frame_agent_name: None,
             terminal_agent_envs: HashMap::new(),
             agent_env_probes: HashMap::new(),
             resume_misses: HashMap::new(),
@@ -1349,9 +1396,12 @@ impl Pty {
         // bool is starts_held
         let err_context = || format!("failed to spawn terminal for {:?}", client_or_tab_index);
 
-        // an explicit action is the pane's own command or editor; none means the default shell -
-        // the same rule Screen applies when it records what the pane was invoked with
-        let runs_its_own_command = terminal_action.is_some();
+        // Configured default shells arrive as explicit actions, but their children are still jobs.
+        let runs_its_own_command = match terminal_action.as_ref() {
+            Some(TerminalAction::RunCommand(command)) => !command_runs_interactive_shell(command),
+            Some(TerminalAction::OpenFile(_)) => true,
+            None => false,
+        };
         // returns the terminal id
         let terminal_action = match client_or_tab_index {
             ClientTabIndexOrPaneId::ClientId(client_id)
@@ -2065,7 +2115,9 @@ impl Pty {
                         .with_context(err_context)
                     {
                         Ok((terminal_id, reader, child_pid)) => {
-                            self.command_terminal_ids.insert(terminal_id);
+                            if !command_runs_interactive_shell(&command) {
+                                self.command_terminal_ids.insert(terminal_id);
+                            }
                             if let Some(child_pid) = child_pid {
                                 self.id_to_child_pid.insert(terminal_id, child_pid);
                                 self.capture_initial_cwd(terminal_id, child_pid);
@@ -2720,18 +2772,15 @@ impl Pty {
     ///   for the session-id variable names of the harness that matched. A session with no agent
     ///   pane in it therefore reads nothing, and the process table is not touched at all.
     ///
-    /// **And a matched pane is not walked every tick either.** The walk is the expensive half: a
-    /// full process-table read plus one environment read per descendant. Its answer does not change
-    /// while the pane runs the same program, so it is done when a pane is new, when its process is
-    /// replaced, and - only while nothing has been found - once every [`AGENT_ENV_RETRY_TICKS`].
-    /// A session whose agents have all been identified pays a string compare a second, the same as
-    /// a session with no agents at all. See [`AgentEnvProbe`].
+    /// A known live record avoids another walk until its process exits.
+    /// Claude retries each tick until its record appears; other missing identities retry every
+    /// [`AGENT_ENV_RETRY_TICKS`]. Record-backed names refresh each tick without another process walk.
     ///
     /// Either way the variable lives on a process the shell started, not on the shell, so this
     /// walks down from the pane's own child - the same problem `resurrect_command_hints` solves,
     /// and the same code solving it.
     fn refresh_pane_envs(&mut self) {
-        let agent_panes: Vec<(u32, u32, &'static AgentHarness)> = if self.detect_agents {
+        let mut agent_panes: Vec<(u32, u32, &'static AgentHarness)> = if self.detect_agents {
             self.id_to_child_pid
                 .iter()
                 .filter_map(|(terminal_id, child_pid)| {
@@ -2745,6 +2794,19 @@ impl Pty {
         } else {
             Vec::new()
         };
+        let panes: Vec<(u32, u32, bool)> = agent_panes
+            .iter()
+            .map(|(id, pid, _)| (*id, *pid, self.command_terminal_ids.contains(id)))
+            .collect();
+        let roots = self
+            .bus
+            .os_input
+            .as_ref()
+            .map(|input| input.get_foreground_pids(&panes))
+            .unwrap_or_default();
+        for (terminal_id, child_pid, _) in &mut agent_panes {
+            *child_pid = agent_identity_root(*child_pid, roots.get(terminal_id).copied());
+        }
         // a pane that closed, or stopped running a harness, keeps neither an answer nor a record of
         // having been asked - and detection being turned off empties both, which is the same thing
         let is_agent_pane =
@@ -2764,7 +2826,7 @@ impl Pty {
         let mut to_probe: Vec<(u32, u32, &'static AgentHarness)> = Vec::new();
         for (terminal_id, child_pid, harness) in &agent_panes {
             if let Some(probe) = self.agent_env_probes.get_mut(terminal_id) {
-                if !probe.needs_another_walk(*child_pid) {
+                if !probe.needs_identity_walk(*child_pid, harness.kind) {
                     probe.ticks_since_probe = probe.ticks_since_probe.saturating_add(1);
                     if probe.live_session.is_none() {
                         continue;
@@ -2804,12 +2866,13 @@ impl Pty {
             // an identity variable is frozen in each child at its spawn, so after a `/clear` it
             // names the first session; the agent's own record or open session file names the one
             // it holds now, and wins
-            let live_session = match process_tree.own_session(
+            let live_session = match process_tree.own_session_checked(
                 child_pid,
                 harness.kind,
                 sessions_dir.as_deref(),
                 open_files_of,
                 process_env,
+                crate::resurrect_hints::live_claude_process,
             ) {
                 Ok(own) => {
                     found.insert(claude_identity_key(harness), own.id);
@@ -2832,7 +2895,8 @@ impl Pty {
                 terminal_id,
                 AgentEnvProbe {
                     child_pid,
-                    found: !found.is_empty(),
+                    kind: harness.kind.to_owned(),
+                    found: !found.is_empty() && (harness.kind != CLAUDE || live_session.is_some()),
                     ticks_since_probe: 0,
                     live_session,
                 },
@@ -2861,7 +2925,7 @@ impl Pty {
     ///
     /// The whole map goes every time rather than only the panes that were active, because Screen
     /// stamps every `PaneInfo` it builds and a pane that has been quiet for an hour still has a
-    /// pid. Building it touches no OS: it is a walk of three `HashMap`s the tick above just filled.
+    /// pid. Claude names also read their live process records on this tick.
     ///
     /// A map equal to the last one sent is dropped instead: an idle session would otherwise wake
     /// the screen thread once a second forever to tell it nothing. `detect_agents` is compared
@@ -2897,6 +2961,11 @@ impl Pty {
                             .cloned()
                             .unwrap_or_default(),
                         agent_env,
+                        agent_name: self
+                            .agent_env_probes
+                            .get(&terminal_id)
+                            .and_then(|probe| probe.live_session.as_ref())
+                            .and_then(LiveSession::name),
                         agent_session_source,
                         osc_agent_session,
                     },
@@ -2916,6 +2985,7 @@ impl Pty {
                     command: None,
                     env: BTreeMap::new(),
                     agent_env: held.agent_env.clone(),
+                    agent_name: None,
                     agent_session_source: held.agent_session_source.clone(),
                     osc_agent_session: held.osc_agent_session.clone(),
                 },
@@ -2923,17 +2993,20 @@ impl Pty {
         }
         if process_info == self.last_reported_process_info
             && self.last_reported_detect_agents == Some(self.detect_agents)
+            && self.last_reported_pane_frame_agent_name == Some(self.pane_frame_agent_name)
         {
             return;
         }
         self.last_reported_process_info = process_info.clone();
         self.last_reported_detect_agents = Some(self.detect_agents);
+        self.last_reported_pane_frame_agent_name = Some(self.pane_frame_agent_name);
         let _ = self
             .bus
             .senders
             .send_to_screen(ScreenInstruction::UpdatePaneProcessInfo {
                 process_info,
                 detect_agents: self.detect_agents,
+                pane_frame_agent_name: self.pane_frame_agent_name,
             });
     }
 

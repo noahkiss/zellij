@@ -561,6 +561,7 @@ impl SessionMetaData {
                     resurrect_commands: new_config.options.resurrect_commands,
                     report_pane_env: new_config.options.report_pane_env,
                     detect_agents: new_config.options.detect_agents,
+                    pane_frame_agent_name: new_config.options.pane_frame_agent_name,
                 })
                 .unwrap();
         }
@@ -2798,7 +2799,7 @@ fn init_session(
         .name("pty".to_string())
         .spawn({
             let layout = layout.clone();
-            let pty = Pty::new(
+            let mut pty = Pty::new(
                 pty_thread_bus(
                     pty_receiver,
                     &to_screen_bounded,
@@ -2818,6 +2819,7 @@ fn init_session(
                 config_options.detect_agents,
             );
 
+            pty.pane_frame_agent_name = config_options.pane_frame_agent_name.unwrap_or(false);
             move || pty_thread_main(pty, layout.clone()).fatal()
         })
         .unwrap();

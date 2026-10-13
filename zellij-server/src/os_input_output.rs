@@ -330,6 +330,11 @@ pub trait ServerOsApi: Send + Sync {
     fn get_all_cmds_by_ppid(&self, _post_hook: &Option<String>) -> HashMap<String, Vec<String>> {
         HashMap::new()
     }
+    /// Resolve identity roots for `(terminal_id, child_pid, is_command_pane)` panes.
+    fn get_foreground_pids(&self, _panes: &[(u32, u32, bool)]) -> HashMap<u32, u32> {
+        HashMap::new()
+    }
+
     /// For each `(terminal_id, shell_pid)` pane, return the foreground command running in its
     /// controlling terminal, keyed by `terminal_id`.
     fn get_foreground_cmds(
@@ -614,6 +619,51 @@ impl ServerOsApi for ServerOsInputOutput {
     }
 
     #[cfg(unix)]
+    fn get_foreground_pids(&self, panes: &[(u32, u32, bool)]) -> HashMap<u32, u32> {
+        let mut roots = HashMap::new();
+        let mut shells = Vec::new();
+        for &(terminal_id, child_pid, is_command) in panes {
+            let foreground = self
+                .pty_backend
+                .tcgetpgrp(terminal_id)
+                .filter(|pid| *pid > 0)
+                .map(|pid| pid as u32);
+            match identity_root_without_children(child_pid, foreground, is_command) {
+                Some(pid) => {
+                    roots.insert(terminal_id, pid);
+                },
+                None => shells.push((terminal_id, child_pid)),
+            }
+        }
+        if shells.is_empty() {
+            return roots;
+        }
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let mut children: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
+        for (pid, process) in system.processes() {
+            if let Some(parent) = process.parent() {
+                children
+                    .entry(parent.as_u32())
+                    .or_default()
+                    .push((pid.as_u32(), process.start_time()));
+            }
+        }
+        for (terminal_id, child_pid) in shells {
+            let root = children
+                .get(&child_pid)
+                .and_then(|children| newest_child(children))
+                .unwrap_or(child_pid);
+            roots.insert(terminal_id, root);
+        }
+        roots
+    }
+
+    #[cfg(unix)]
     fn get_foreground_cmds(
         &self,
         panes: &[(u32, u32)],
@@ -867,11 +917,21 @@ fn foreground_cmds_by_child(
     cmds
 }
 
-/// The most recently started of a shell's children, as `(pid, start_time)` pairs.
-///
-/// Start time is seconds on every platform sysinfo reports it for, so two children started in the
-/// same second tie - broken by the higher pid, which is the later of the two often enough to beat
-/// picking arbitrarily.
+/// Command panes keep their own process; shell panes need their newest child when job control cannot answer.
+#[cfg(unix)]
+fn identity_root_without_children(
+    child_pid: u32,
+    foreground: Option<u32>,
+    is_command: bool,
+) -> Option<u32> {
+    match foreground.filter(|pid| *pid > 0) {
+        Some(pid) if pid != child_pid => Some(pid),
+        _ if is_command => Some(child_pid),
+        _ => None,
+    }
+}
+
+/// The newest child, ordered by start time and then PID.
 #[cfg(unix)]
 fn newest_child(children: &[(u32, u64)]) -> Option<u32> {
     children

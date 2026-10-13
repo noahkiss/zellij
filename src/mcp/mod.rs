@@ -27,7 +27,10 @@ use std::path::PathBuf;
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo,
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation, ListPromptsResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, Role, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -60,7 +63,9 @@ Use kind=stacked to stack onto your own pane, or kind=tab for a new tab.
 zellij_create never splits or floats. zellij_show is the floating image viewer exception.
 
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
-each one is - that is how you find the pane to talk to without being told its name.
+each one is, including its live messaging name. Refresh the list before addressing another agent.
+Use your harness's messaging tool for named agents. Type into their panes when they have no messaging.
+The agents prompt and zellij://agents resource return the same live list.
 
 zellij_show puts image files in front of the person, in a pop-up pane they close with q.
 
@@ -152,7 +157,69 @@ impl ZellijMcp {
             Some(then_type) => Some(type_into_created_pane(then_type, &mut outcome, &target).await),
             None => None,
         };
-        with_host(self.report(&argv, outcome, input_sent), &target)
+        let hint = if name == "zellij_write_input" && !outcome.is_error() {
+            self.input_hint(&arguments, &target).await
+        } else {
+            None
+        };
+        let mut result = self.report(&argv, outcome, input_sent);
+        if let Some(hint) = hint {
+            result.content.push(ContentBlock::text(&hint));
+            if let Some(Value::Object(structure)) = result.structured_content.as_mut() {
+                structure.insert("hint".to_owned(), json!(hint));
+            }
+        }
+        with_host(result, &target)
+    }
+
+    async fn input_hint(
+        &self,
+        arguments: &Map<String, Value>,
+        target: &remote::Target,
+    ) -> Option<String> {
+        let pane = arguments.get("pane")?.as_str()?;
+        let session = arguments
+            .get("session")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                if target.is_remote() {
+                    None
+                } else {
+                    self.ambient_session.as_deref()
+                }
+            });
+        let mut argv = Vec::new();
+        if let Some(session) = session {
+            argv.extend(["-s".to_owned(), session.to_owned()]);
+        }
+        argv.extend([
+            "action".to_owned(),
+            "list-panes".to_owned(),
+            "--json".to_owned(),
+        ]);
+        let outcome = invoke::run_on(target, &argv, None).await.ok()?;
+        if outcome.is_error() {
+            return None;
+        }
+        named_agent_hint(&outcome.stdout, pane)
+    }
+
+    async fn live_agents(&self) -> Result<String, ErrorData> {
+        let arguments = Map::from_iter([("scope".to_owned(), json!("agents"))]);
+        let answer = self.call("zellij_overview", arguments).await;
+        if answer.is_error == Some(true) {
+            return Err(ErrorData::internal_error(
+                "Could not read the live agent list",
+                answer.structured_content,
+            ));
+        }
+        let result = answer
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("result"))
+            .ok_or_else(|| ErrorData::internal_error("The agent list returned no JSON", None))?;
+        serde_json::to_string_pretty(result)
+            .map_err(|error| ErrorData::internal_error(error.to_string(), None))
     }
 
     /// Run whatever the plan turned out to be, and say which command line answered.
@@ -444,9 +511,62 @@ fn first_words(stderr: &str, stdout: &str) -> String {
     }
 }
 
+fn agents_prompt_list() -> ListPromptsResult {
+    let mut result = ListPromptsResult::default();
+    result.prompts = vec![Prompt::new(
+        "agents",
+        Some("List live agents with names, tabs and pane handles."),
+        None,
+    )];
+    result
+}
+
+fn agents_resource_list() -> ListResourcesResult {
+    let mut result = ListResourcesResult::default();
+    result.resources = vec![Resource::new("zellij://agents", "agents")
+        .with_description("Live agents with names, tabs and pane handles.")
+        .with_mime_type("application/json")];
+    result
+}
+
+fn named_agent_hint(panes: &str, pane: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(panes).ok()?;
+    let rows = value
+        .as_array()
+        .or_else(|| value.get("panes")?.as_array())?;
+    let row = rows.iter().find(|row| {
+        if row.get("is_plugin").and_then(Value::as_bool) == Some(true) {
+            return false;
+        }
+        let id = row
+            .get("id")
+            .or_else(|| row.get("pane_id"))
+            .and_then(Value::as_u64);
+        row.get("handle").and_then(Value::as_str) == Some(pane)
+            || row.get("uuid").and_then(Value::as_str) == Some(pane)
+            || id.is_some_and(|id| pane == id.to_string() || pane == format!("terminal_{}", id))
+    })?;
+    let agent = row.get("agent").unwrap_or(row);
+    let name = agent.get("name")?.as_str()?;
+    let kind = agent.get("kind")?.as_str()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this pane runs {} `{}`; prefer messaging it by name",
+        kind, name
+    ))
+}
+
 impl ServerHandler for ZellijMcp {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        let mut info = ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .enable_resources()
+                .build(),
+        );
         info.server_info = Implementation::new("zellij", VERSION);
         info.instructions = Some(INSTRUCTIONS.to_owned());
         info
@@ -458,6 +578,56 @@ impl ServerHandler for ZellijMcp {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         async move { Ok(tool_list_result()) }
+    }
+
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListPromptsResult, ErrorData>> + Send + '_ {
+        async move { Ok(agents_prompt_list()) }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResponse, ErrorData>> + Send + '_ {
+        async move {
+            if request.name != "agents" {
+                return Err(ErrorData::invalid_params("Unknown prompt", None));
+            }
+            Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+                Role::User,
+                self.live_agents().await?,
+            )])
+            .into())
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        async move { Ok(agents_resource_list()) }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_ {
+        async move {
+            if request.uri != "zellij://agents" {
+                return Err(ErrorData::invalid_params("Unknown resource", None));
+            }
+            let mut contents = ResourceContents::text(self.live_agents().await?, "zellij://agents");
+            if let ResourceContents::TextResourceContents { mime_type, .. } = &mut contents {
+                *mime_type = Some("application/json".to_owned());
+            }
+            Ok(ReadResourceResult::new(vec![contents]).into())
+        }
     }
 
     fn call_tool(
@@ -524,6 +694,42 @@ pub fn start(session: Option<String>, config_path: Option<PathBuf>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_agents_surfaces_are_advertised_without_tools() {
+        let server = ZellijMcp::default();
+        let capabilities = server.get_info().capabilities;
+        assert!(capabilities.prompts.is_some());
+        assert!(capabilities.resources.is_some());
+        let prompts = agents_prompt_list();
+        assert_eq!(prompts.prompts.len(), 1);
+        assert_eq!(prompts.prompts[0].name, "agents");
+        assert!(prompts.prompts[0].arguments.is_none());
+        let resources = agents_resource_list();
+        assert_eq!(resources.resources[0].uri, "zellij://agents");
+        assert_eq!(
+            resources.resources[0].mime_type.as_deref(),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn input_hint_only_names_the_target_agent() {
+        let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude","name":"proj-45"},
+            {"handle":"quiet-fox","pane_id":4,"kind":"codex","name":null}]"#;
+        let expected = "this pane runs claude `proj-45`; prefer messaging it by name";
+        for target in ["sunny-otter", "3", "terminal_3"] {
+            assert_eq!(named_agent_hint(rows, target).as_deref(), Some(expected));
+        }
+        assert!(named_agent_hint(rows, "quiet-fox").is_none());
+        assert!(named_agent_hint(rows, "missing").is_none());
+        assert!(named_agent_hint("invalid", "3").is_none());
+        let panes = r#"{"panes":[{"handle":"sunny-otter","id":3,"uuid":"test-uuid","agent":{"kind":"claude","name":"proj-45"}},
+            {"id":3,"is_plugin":true,"agent":{"kind":"claude","name":"wrong"}}],"withheld":0}"#;
+        for target in ["test-uuid", "sunny-otter", "3", "terminal_3"] {
+            assert_eq!(named_agent_hint(panes, target).as_deref(), Some(expected));
+        }
+    }
 
     #[test]
     fn the_server_offers_exactly_the_tools_in_the_table() {

@@ -47,6 +47,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
             // and this one changes nothing. It is also why the audit ring does not record it
             "wait",
+            "whoami",
         ],
     },
     ActionGroup {
@@ -215,6 +216,17 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action list-agents",
         shape: "table",
         keys: crate::agent_detect::AGENT_TABLE_KEYS,
+    },
+    OutputSpec {
+        command: "list-agents",
+        shape: "table",
+        keys: crate::agent_detect::AGENT_TABLE_KEYS,
+    },
+    // The short context is prose; --json carries its session, pane and agent fields.
+    OutputSpec {
+        command: "action whoami",
+        shape: "payload",
+        keys: "",
     },
     OutputSpec {
         command: "action list-clients",
@@ -398,11 +410,11 @@ How every one of these answers:
   * A single record is `key: value` lines. A list of like things is a table with an UPPER_SNAKE
     header row. A nesting of them is an indented outline. Keys and columns are append-only:
     a release may add one, never rename or remove one.
-  * `--json` carries the same information, structured. Seven verbs take it after their own name -
-    `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents` and
-    `current-tab-info` - and every verb that reports a record takes it BEFORE the verb, as
+  * `--json` carries the same information, structured. Listing and context verbs also take it after their name:
+    `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents`,
+    `current-tab-info`, `last-reply` and `whoami`. Every verb that reports a record takes it BEFORE the verb, as
     `zellij action --json close-pane --pane-id sunny-otter`, which answers `{\"closed\":
-    \"terminal_3\"}`. For those seven the two positions are the same call. A verb that reports
+    \"terminal_3\"}`. For those listing and context verbs the two positions are the same call. A verb that reports
     nothing answers `{}`; `dump-screen` and `dump-layout` print a payload and refuse the flag.
   * Results go to stdout, diagnostics go to stderr, and a payload command prints its payload
     alone.
@@ -1022,6 +1034,7 @@ mod tests {
             assert!(listing.contains(group.name), "{} is missing", group.name);
         }
         assert!(listing.contains("list-panes"));
+        assert!(listing.contains("whoami"));
         assert!(ACTION_PREAMBLE
             .contains("Exit 0 acted or found, 1 error, 2 the command changed nothing"));
         assert!(ACTION_PREAMBLE.contains("sunny-otter"));

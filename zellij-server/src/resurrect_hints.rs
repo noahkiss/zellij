@@ -170,6 +170,25 @@ pub fn claude_session_record(sessions_dir: &Path, pid: u32) -> Option<String> {
         .map(|id| id.to_owned())
 }
 
+/// Read a name only after the process table verifies the live Claude process.
+fn claude_record_name(dir: &Path, pid: u32, live_claude: bool) -> Option<String> {
+    if !live_claude {
+        return None;
+    }
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join(format!("{}.json", pid))).ok()?).ok()?;
+    if record.get("pid").and_then(|pid| pid.as_u64()) != Some(pid as u64)
+        || !record_is_for_this_process(&record, pid)
+    {
+        return None;
+    }
+    record
+        .get("name")?
+        .as_str()
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+}
+
 /// Whether a claude record was written by the process that has its pid now.
 ///
 /// A claude that crashes leaves its record behind, and the pid is reused. Claude Code writes
@@ -220,6 +239,10 @@ fn start_ticks_from_stat(stat: &str) -> Option<String> {
 /// Where Claude Code keeps its per-process session records: `$CLAUDE_CONFIG_DIR/sessions`, or
 /// `~/.claude/sessions`. Read from the server's own environment, which is the user's.
 pub fn claude_sessions_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ZELLIJ_CLAUDE_SESSIONS_DIR").filter(|dir| !dir.is_empty())
+    {
+        return Some(PathBuf::from(dir));
+    }
     claude_sessions_dir_for(
         std::env::var_os("CLAUDE_CONFIG_DIR"),
         std::env::var_os("HOME"),
@@ -281,12 +304,57 @@ impl LiveSession {
         }
     }
 
+    /// The live Claude messaging name; other harnesses have no names yet.
+    pub fn name(&self) -> Option<String> {
+        let LiveSession::ClaudeRecord { pid, dir } = self else {
+            return None;
+        };
+        claude_record_name(dir, *pid, live_claude_process(*pid))
+    }
+
+    /// Reject a stale Claude record before refreshing its session identity.
+    pub fn reread_live<O, C>(&self, open_files: O, live_claude: C) -> Option<String>
+    where
+        O: Fn(u32) -> Option<Vec<PathBuf>>,
+        C: Fn(u32) -> bool,
+    {
+        if let LiveSession::ClaudeRecord { pid, .. } = self {
+            if !live_claude(*pid) {
+                return None;
+            }
+        }
+        self.reread(open_files)
+    }
+
     pub fn source(&self) -> SessionSource {
         match self {
             LiveSession::ClaudeRecord { .. } => SessionSource::Record,
             LiveSession::CodexRollout { .. } => SessionSource::OpenFile,
         }
     }
+}
+
+/// Verify the PID still runs Claude before trusting its retained record.
+pub fn live_claude_process(pid: u32) -> bool {
+    let process_pid = sysinfo::Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[process_pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+    );
+    let Some(process) = system.process(process_pid) else {
+        return false;
+    };
+    if process.status() == sysinfo::ProcessStatus::Zombie {
+        return false;
+    }
+    process.name().to_string_lossy() == "claude"
+        || process.cmd().iter().take(2).any(|arg| {
+            Path::new(arg)
+                .file_name()
+                .map_or(false, |name| name == "claude")
+        })
 }
 
 /// A pane's own session: its id, and how to find it again.
@@ -380,7 +448,29 @@ impl ProcessTree {
         O: Fn(u32) -> Option<Vec<PathBuf>>,
         E: Fn(u32, &str) -> Option<String>,
     {
-        let pids = self.descendants(root);
+        self.own_session_checked(root, kind, claude_dir, open_files, env_of, |_| true)
+    }
+
+    /// The production walk validates Claude processes; tests can supply a process-table seam.
+    pub fn own_session_checked<O, E, C>(
+        &self,
+        root: u32,
+        kind: &str,
+        claude_dir: Option<&Path>,
+        open_files: O,
+        env_of: E,
+        live_claude: C,
+    ) -> Result<OwnSession, SessionMiss>
+    where
+        O: Fn(u32) -> Option<Vec<PathBuf>>,
+        E: Fn(u32, &str) -> Option<String>,
+        C: Fn(u32) -> bool,
+    {
+        let pids: Vec<u32> = self
+            .descendants(root)
+            .into_iter()
+            .filter(|pid| kind != "claude" || live_claude(*pid))
+            .collect();
         match kind {
             "claude" => {
                 let mut dirs: Vec<PathBuf> =
@@ -1106,5 +1196,74 @@ mod tests {
             path,
             files
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_name_tests {
+    use super::*;
+    #[test]
+    fn retained_records_do_not_hide_a_restarted_claude() {
+        let dir = tempfile::tempdir().unwrap();
+        for (pid, id) in [(10, "shell-stale"), (20, "old"), (30, "new")] {
+            std::fs::write(
+                dir.path().join(format!("{}.json", pid)),
+                format!(r#"{{"pid":{},"name":"{}","sessionId":"{}"}}"#, pid, id, id),
+            )
+            .unwrap();
+        }
+        let retained = LiveSession::ClaudeRecord {
+            pid: 20,
+            dir: dir.path().into(),
+        };
+        assert_eq!(
+            retained.reread_live(|_| None, |pid| pid == 20).as_deref(),
+            Some("old")
+        );
+        assert_eq!(retained.reread_live(|_| None, |pid| pid == 30), None);
+        let tree = ProcessTree {
+            children: [(10, vec![30])].into_iter().collect(),
+        };
+        let own = tree
+            .own_session_checked(
+                10,
+                "claude",
+                Some(dir.path()),
+                |_| None,
+                |_, _| None,
+                |pid| pid == 30,
+            )
+            .unwrap();
+        assert_eq!(own.id, "new");
+        assert_eq!(
+            own.live,
+            LiveSession::ClaudeRecord {
+                pid: 30,
+                dir: dir.path().into()
+            }
+        );
+    }
+
+    #[test]
+    fn names_require_a_live_matching_claude_record_and_follow_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("42.json");
+        std::fs::write(&path, r#"{"pid":42,"name":"project-1"}"#).unwrap();
+        assert_eq!(
+            claude_record_name(dir.path(), 42, true).as_deref(),
+            Some("project-1")
+        );
+        assert_eq!(claude_record_name(dir.path(), 42, false), None);
+        std::fs::write(&path, r#"{"pid":42,"name":"project-2"}"#).unwrap();
+        assert_eq!(
+            claude_record_name(dir.path(), 42, true).as_deref(),
+            Some("project-2")
+        );
+        std::fs::write(&path, r#"{"pid":43,"name":"stale"}"#).unwrap();
+        assert_eq!(claude_record_name(dir.path(), 42, true), None);
+        std::fs::write(&path, r#"{"pid":42,"name":" "}"#).unwrap();
+        assert_eq!(claude_record_name(dir.path(), 42, true), None);
+        std::fs::write(&path, "invalid").unwrap();
+        assert_eq!(claude_record_name(dir.path(), 42, true), None);
     }
 }

@@ -2024,7 +2024,7 @@ mod tests {
             "-s work action list-agents --json --report-withheld"
         );
         let answer = r#"{"agents": [
-            {"handle": "a", "tab_name": "dev-zj", "state": "working", "state_at": 1000000,
+            {"handle": "a", "name": "project-1", "self": true, "tab_name": "dev-zj", "state": "working", "state_at": 1000000,
              "last_output_at": 1055000},
             {"handle": "b", "tab_name": "dev", "state": "done", "state_at": 1000000}
         ], "withheld": 0}"#;
@@ -2037,6 +2037,8 @@ mod tests {
         let rows = mine["agents"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["handle"], "a");
+        assert_eq!(rows[0]["name"], "project-1");
+        assert_eq!(rows[0]["self"], true);
         assert_eq!(rows[0]["state_age_s"], 60);
         assert_eq!(rows[0]["output_age_s"], 5);
         assert_eq!(mine["withheld"], 0);
