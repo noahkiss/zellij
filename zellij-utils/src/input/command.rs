@@ -1,7 +1,7 @@
 //! Trigger a command
 use crate::data::{Direction, OriginatingPlugin};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 #[derive(Debug, Clone)]
 pub enum TerminalAction {
@@ -208,5 +208,124 @@ impl RunCommand {
     pub fn with_cwd(mut self, cwd: PathBuf) -> Self {
         self.cwd = Some(cwd);
         self
+    }
+}
+
+// this is a utility method to separate the arguments from a pathbuf before we turn it into a
+// Command. eg. "/usr/bin/vim -e" ==> "/usr/bin/vim" + "-e" (the latter will be pushed to args)
+fn separate_command_arguments(command: &mut PathBuf, args: &mut Vec<String>) {
+    let mut parts = vec![];
+    let mut current_part = String::new();
+    for part in command.display().to_string().split_ascii_whitespace() {
+        current_part.push_str(part);
+        if current_part.ends_with('\\') {
+            let _ = current_part.pop();
+            current_part.push(' ');
+        } else {
+            let current_part = std::mem::replace(&mut current_part, String::new());
+            parts.push(current_part);
+        }
+    }
+    if !parts.is_empty() {
+        *command = PathBuf::from(parts.remove(0));
+        args.append(&mut parts);
+    }
+}
+
+impl OpenFilePayload {
+    /// Build the editor command and its optional fallback without a line argument.
+    pub fn editor_command(
+        self,
+        default_editor: Option<PathBuf>,
+    ) -> (RunCommand, Option<RunCommand>) {
+        let mut payload = self;
+        let mut failover_cmd_args = None;
+        if payload.path.is_relative() {
+            if let Some(cwd) = payload.cwd.as_ref() {
+                payload.path = cwd.join(payload.path);
+            }
+        }
+        let mut command = default_editor.unwrap_or_else(|| {
+            PathBuf::from(
+                env::var("EDITOR")
+                    .unwrap_or_else(|_| env::var("VISUAL").unwrap_or_else(|_| "vi".into())),
+            )
+        });
+
+        let mut args = vec![];
+
+        if !command.is_dir() {
+            separate_command_arguments(&mut command, &mut args);
+        }
+        let file_to_open = payload
+            .path
+            .into_os_string()
+            .into_string()
+            .expect("Not valid Utf8 Encoding");
+        if let Some(line_number) = payload.line_number {
+            if command.ends_with("vim")
+                || command.ends_with("nvim")
+                || command.ends_with("emacs")
+                || command.ends_with("nano")
+                || command.ends_with("kak")
+            {
+                failover_cmd_args = Some(vec![file_to_open.clone()]);
+                args.push(format!("+{}", line_number));
+                args.push(file_to_open);
+            } else if command.ends_with("hx") || command.ends_with("helix") {
+                // at the time of writing, helix only supports this syntax
+                // and it might be a good idea to leave this here anyway
+                // to keep supporting old versions
+                args.push(format!("{}:{}", file_to_open, line_number));
+            } else {
+                args.push(file_to_open);
+            }
+        } else {
+            args.push(file_to_open);
+        }
+        let cmd = RunCommand {
+            command,
+            args,
+            cwd: payload.cwd,
+            hold_on_close: false,
+            hold_on_start: false,
+            ..Default::default()
+        };
+        let failover_cmd = failover_cmd_args.map(|args| {
+            let mut failover = cmd.clone();
+            failover.args = args;
+            failover
+        });
+        (cmd, failover_cmd)
+    }
+}
+
+#[cfg(test)]
+mod editor_command_tests {
+    use super::*;
+
+    #[test]
+    fn vim_line_and_fallback_match_open_file_commands() {
+        let payload = OpenFilePayload::new("notes.txt".into(), Some(8), Some("/project".into()));
+        let (command, fallback) = payload.editor_command(Some("vim -R".into()));
+        assert_eq!(command.command, PathBuf::from("vim"));
+        assert_eq!(command.args, ["-R", "+8", "/project/notes.txt"]);
+        assert_eq!(fallback.unwrap().args, ["/project/notes.txt"]);
+    }
+
+    #[test]
+    fn helix_uses_file_colon_line() {
+        let payload = OpenFilePayload::new("/project/notes.txt".into(), Some(8), None);
+        let (command, fallback) = payload.editor_command(Some("hx".into()));
+        assert_eq!(command.args, ["/project/notes.txt:8"]);
+        assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn other_editors_ignore_line_and_keep_arguments() {
+        let payload = OpenFilePayload::new("/project/notes.txt".into(), Some(8), None);
+        let (command, fallback) = payload.editor_command(Some("code --wait".into()));
+        assert_eq!(command.args, ["--wait", "/project/notes.txt"]);
+        assert!(fallback.is_none());
     }
 }

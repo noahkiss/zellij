@@ -705,12 +705,11 @@ fn local_file(path: &str, env: &CallEnv, param: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// `pane` and `floating` go beside the caller's own pane, which is not in a session on another
-/// machine.
+/// A stack needs the caller's pane, which is not on another machine.
 fn remote_kind_allowed(args: &Args) -> Result<(), String> {
     match args.enumerated("kind", CREATE_KIND_DEFAULT).as_str() {
-        "pane" | "floating" => Err(
-            "`kind: pane` and `floating` go beside your own pane, which is not in a session on \
+        "stacked" => Err(
+            "`kind: stacked` needs your own pane, which is not in a session on \
              another machine. Use agent_tab, the default, or tab."
                 .to_owned(),
         ),
@@ -1225,6 +1224,9 @@ fn argv_in(
             }
         },
         "zellij_create" => {
+            if args.values.contains_key("floating") {
+                return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
+            }
             let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
             let command = args.string("command");
             // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
@@ -1252,16 +1254,6 @@ fn argv_in(
             }
             let mut rest = vec!["action".to_owned()];
             match kind.as_str() {
-                "agent_tab" if args.flag("floating") => {
-                    // `--new-tab` refuses `--floating`, so the first create into a tab that is
-                    // not there yet would fail where the second succeeded. Refusing both is the
-                    // only answer that does not depend on which call arrived first
-                    return Err(
-                        "A floating pane cannot arrive with the tab that holds it. Ask for \
-                                `kind: floating`, which floats beside your own pane."
-                            .to_owned(),
-                    );
-                },
                 "agent_tab" => {
                     let Some((tab, placement)) = agent_tab else {
                         return Err(
@@ -1294,11 +1286,11 @@ fn argv_in(
                     }
                     finish(&mut rest);
                 },
-                "pane" | "floating" => {
+                "stacked" => {
                     rest.push("new-pane".to_owned());
-                    // beside the agent's own pane, not beside whichever pane a person happens to
-                    // be focused on. Without a `$ZELLIJ_PANE_ID` to resolve, the CLI says so
+                    // Stack onto the caller's pane. The CLI requires ZELLIJ_PANE_ID.
                     rest.push("--near-current-pane".to_owned());
+                    rest.push("--stacked".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
                     }
@@ -1307,11 +1299,6 @@ fn argv_in(
                     }
                     if let Some(handle) = chosen_handle(&args)? {
                         rest.push(flag_value("--handle", &handle));
-                    }
-                    // two spellings of one pane: `kind: floating`, and `kind: pane` with the
-                    // `floating` flag
-                    if kind == "floating" || args.flag("floating") {
-                        rest.push("--floating".to_owned());
                     }
                     finish(&mut rest);
                 },
@@ -1330,14 +1317,11 @@ fn argv_in(
                                 .to_owned(),
                         );
                     }
-                    if args.flag("floating") {
-                        return Err("A tab cannot float; `floating` names a pane.".to_owned());
-                    }
                     finish(&mut rest);
                 },
                 other => {
                     return Err(format!(
-                        "`kind` must be agent_tab, pane, floating or tab, not `{}`.",
+                        "`kind` must be agent_tab, stacked or tab, not `{}`.",
                         other
                     ));
                 },
@@ -2110,10 +2094,10 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "pane", "command": "cargo test"}),
+                json!({"kind": "stacked", "command": "cargo test"}),
                 Some("work")
             ),
-            "-s work action new-pane --near-current-pane --name=cargo test --wait-ready \
+            "-s work action new-pane --near-current-pane --stacked --name=cargo test --wait-ready \
              --ready-timeout=10"
         );
         assert_eq!(
@@ -2135,8 +2119,8 @@ mod tests {
         );
         // a pane with nothing to type still waits, so the answer is a pane ready for input
         assert_eq!(
-            line("zellij_create", json!({"kind": "pane"}), None),
-            "action new-pane --near-current-pane --wait-ready --ready-timeout=10"
+            line("zellij_create", json!({"kind": "stacked"}), None),
+            "action new-pane --near-current-pane --stacked --wait-ready --ready-timeout=10"
         );
         // and the one bound is the one the CLI applies by default
         assert_eq!(READY_TIMEOUT_DEFAULT_S, "10");
@@ -2149,25 +2133,25 @@ mod tests {
             assert_eq!(
                 line(
                     "zellij_create",
-                    json!({"kind": "pane", "command": "make", "run_in": "exec",
+                    json!({"kind": "stacked", "command": "make", "run_in": "exec",
                            "wait_ready": wait_ready}),
                     None
                 ),
-                "action new-pane --near-current-pane --name=make -- /bin/zsh -c make"
+                "action new-pane --near-current-pane --stacked --name=make -- /bin/zsh -c make"
             );
         }
         // the negative control: a shell pane that is told not to wait types at once
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "pane", "command": "make", "wait_ready": false}),
+                json!({"kind": "stacked", "command": "make", "wait_ready": false}),
                 None
             ),
-            "action new-pane --near-current-pane --name=make"
+            "action new-pane --near-current-pane --stacked --name=make"
         );
         assert!(refusal(
             "zellij_create",
-            json!({"kind": "pane", "command": "make", "run_in": "login"})
+            json!({"kind": "stacked", "command": "make", "run_in": "login"})
         )
         .contains("shell, exec or agent"));
     }
@@ -2176,7 +2160,7 @@ mod tests {
     async fn a_shell_create_types_its_command_into_the_pane_it_made_and_an_exec_one_does_not() {
         let plan = plan_in(
             "zellij_create",
-            &args(json!({"kind": "pane", "command": "cd /tmp && ls"})),
+            &args(json!({"kind": "stacked", "command": "cd /tmp && ls"})),
             Some("work"),
             &a_shell_env(),
             &Target::Local,
@@ -2196,8 +2180,8 @@ mod tests {
         // the text goes as one word, whatever is in it: the shell in the pane reads it
         assert_eq!(write.last().map(String::as_str), Some("cd /tmp && ls"));
         for exec_or_nothing in [
-            json!({"kind": "pane", "command": "ls", "run_in": "exec"}),
-            json!({"kind": "pane"}),
+            json!({"kind": "stacked", "command": "ls", "run_in": "exec"}),
+            json!({"kind": "stacked"}),
         ] {
             let plan = plan_in(
                 "zellij_create",
@@ -2243,7 +2227,7 @@ mod tests {
         );
         assert_eq!(
             typed(
-                json!({"kind": "pane", "run_in": "agent", "command": "claude --model haiku",
+                json!({"kind": "stacked", "run_in": "agent", "command": "claude --model haiku",
                          "brief": "it's a brief.md"})
             )
             .await,
@@ -2252,7 +2236,7 @@ mod tests {
         // opencode takes its first prompt as a flag
         assert_eq!(
             typed(
-                json!({"kind": "pane", "run_in": "agent", "command": "opencode",
+                json!({"kind": "stacked", "run_in": "agent", "command": "opencode",
                          "brief": brief.to_string_lossy()})
             )
             .await,
@@ -2260,25 +2244,25 @@ mod tests {
         );
         // no brief starts the harness bare
         assert_eq!(
-            typed(json!({"kind": "pane", "run_in": "agent", "command": "/usr/bin/codex -m o3"}))
+            typed(json!({"kind": "stacked", "run_in": "agent", "command": "/usr/bin/codex -m o3"}))
                 .await,
             Ok(Some("/usr/bin/codex -m o3".to_owned()))
         );
         for (refused, says) in [
             (
-                json!({"kind": "pane", "run_in": "agent", "command": "vim"}),
+                json!({"kind": "stacked", "run_in": "agent", "command": "vim"}),
                 "not a coding agent",
             ),
             (
-                json!({"kind": "pane", "run_in": "agent"}),
+                json!({"kind": "stacked", "run_in": "agent"}),
                 "needs `command`",
             ),
             (
-                json!({"kind": "pane", "run_in": "agent", "command": "pi", "brief": "nope.md"}),
+                json!({"kind": "stacked", "run_in": "agent", "command": "pi", "brief": "nope.md"}),
                 "is not a file",
             ),
             (
-                json!({"kind": "pane", "command": "ls", "brief": "it's a brief.md"}),
+                json!({"kind": "stacked", "command": "ls", "brief": "it's a brief.md"}),
                 "with run_in=agent",
             ),
         ] {
@@ -2288,24 +2272,22 @@ mod tests {
         // an agent pane waits for its shell like any shell create
         assert!(line(
             "zellij_create",
-            json!({"kind": "pane", "run_in": "agent", "command": "claude"}),
+            json!({"kind": "stacked", "run_in": "agent", "command": "claude"}),
             None
         )
         .contains("--wait-ready"));
     }
 
     #[test]
-    fn a_floating_pane_is_a_kind_and_the_old_flag_still_floats() {
-        let floating = line("zellij_create", json!({"kind": "floating"}), None);
-        assert!(floating.contains("--near-current-pane"), "{}", floating);
-        assert!(floating.contains("--floating"), "{}", floating);
-        assert!(line(
-            "zellij_create",
-            json!({"kind": "pane", "floating": true}),
-            None
-        )
-        .contains("--floating"));
-        assert!(!line("zellij_create", json!({"kind": "pane"}), None).contains("--floating"));
+    fn create_only_accepts_stacks_and_tabs() {
+        let stacked = line("zellij_create", json!({"kind": "stacked"}), None);
+        assert!(stacked.contains("--near-current-pane"));
+        assert!(stacked.contains("--stacked"));
+        assert!(!stacked.contains("--floating"));
+        for kind in ["pane", "floating"] {
+            assert!(refusal("zellij_create", json!({"kind": kind}))
+                .contains("must be agent_tab, stacked or tab"));
+        }
     }
 
     #[test]
@@ -2313,10 +2295,10 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "pane", "command": "cargo test", "handle": "test-run", "run_in": "exec"}),
+                json!({"kind": "stacked", "command": "cargo test", "handle": "test-run", "run_in": "exec"}),
                 Some("work")
             ),
-            "-s work action new-pane --near-current-pane --name=cargo test --handle=test-run -- \
+            "-s work action new-pane --near-current-pane --stacked --name=cargo test --handle=test-run -- \
              /bin/zsh -c cargo test"
         );
     }
@@ -2326,20 +2308,21 @@ mod tests {
         // lowercase words joined by dashes, and still not a handle: it reads as plugin_1
         let refused = refusal(
             "zellij_create",
-            json!({"kind": "pane", "handle": "plugin-check"}),
+            json!({"kind": "stacked", "handle": "plugin-check"}),
         );
         assert!(
             refused.contains("too close to the pane id"),
             "got: {}",
             refused
         );
-        assert!(
-            refusal("zellij_create", json!({"kind": "pane", "handle": "Build"}))
-                .contains("lowercase")
-        );
+        assert!(refusal(
+            "zellij_create",
+            json!({"kind": "stacked", "handle": "Build"})
+        )
+        .contains("lowercase"));
         assert!(line(
             "zellij_create",
-            json!({"kind": "pane", "handle": "check-plugin"}),
+            json!({"kind": "stacked", "handle": "check-plugin"}),
             None
         )
         .contains("--handle=check-plugin"));
@@ -2364,7 +2347,7 @@ mod tests {
     fn a_pane_opens_beside_the_agents_own_pane_and_not_beside_the_persons() {
         // bare `new-pane` lands beside whichever pane a person is focused on, so identical calls
         // used to land in different places and shrink whatever the person was reading
-        assert!(line("zellij_create", json!({"kind": "pane"}), None)
+        assert!(line("zellij_create", json!({"kind": "stacked"}), None)
             .starts_with("action new-pane --near-current-pane"));
     }
 
@@ -2454,10 +2437,10 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "pane", "command": "--force --now", "run_in": "exec"}),
+                json!({"kind": "stacked", "command": "--force --now", "run_in": "exec"}),
                 None
             ),
-            "action new-pane --near-current-pane --name=--force --now -- /bin/zsh -c --force --now"
+            "action new-pane --near-current-pane --stacked --name=--force --now -- /bin/zsh -c --force --now"
         );
         // a tab that begins with a dash is a tab name, not a flag, on both forms
         assert!(
@@ -2506,18 +2489,17 @@ mod tests {
         // a name the caller gave beats the command
         assert!(line(
             "zellij_create",
-            json!({"kind": "pane", "command": "cargo test", "name": "tests"}),
+            json!({"kind": "stacked", "command": "cargo test", "name": "tests"}),
             None
         )
         .contains("--name=tests --"));
         // and a pane with no command is not given one
-        assert!(!line("zellij_create", json!({"kind": "pane"}), None).contains("--name"));
+        assert!(!line("zellij_create", json!({"kind": "stacked"}), None).contains("--name"));
     }
 
     #[test]
-    fn a_floating_pane_cannot_arrive_with_the_tab_that_holds_it() {
-        // `--new-tab` refuses `--floating`, so allowing it would work or fail depending on whether
-        // the agent's tab happened to exist yet
+    fn create_refuses_the_removed_floating_parameter() {
+        // Removed parameters fail before the create reaches the CLI.
         let said = argv_in(
             "zellij_create",
             &args(json!({"floating": true})),
@@ -2526,7 +2508,7 @@ mod tests {
             Some(("work-zj", TabPlacement::Existing)),
         )
         .expect_err("a floating pane in the agent's tab");
-        assert!(said.contains("`kind: floating`"), "{}", said);
+        assert!(said.contains("`floating` is unsupported"), "{}", said);
     }
 
     #[test]
@@ -2560,12 +2542,12 @@ mod tests {
         assert_eq!(
             built(
                 "zellij_create",
-                json!({"kind": "pane", "command": "pwd", "run_in": "exec"}),
+                json!({"kind": "stacked", "command": "pwd", "run_in": "exec"}),
                 None,
                 &no_shell
             )
             .join(" "),
-            "action new-pane --near-current-pane --name=pwd -- /bin/sh -c pwd"
+            "action new-pane --near-current-pane --stacked --name=pwd -- /bin/sh -c pwd"
         );
     }
 
@@ -2576,7 +2558,7 @@ mod tests {
         let command = "cd /tmp && echo \"hello world\" $HOME | cat";
         let argv = built(
             "zellij_create",
-            json!({"kind": "pane", "command": command, "name": "shell", "run_in": "exec"}),
+            json!({"kind": "stacked", "command": command, "name": "shell", "run_in": "exec"}),
             None,
             &a_shell_env(),
         );
@@ -2586,6 +2568,7 @@ mod tests {
                 "action",
                 "new-pane",
                 "--near-current-pane",
+                "--stacked",
                 "--name=shell",
                 "--",
                 "/bin/zsh",
@@ -2623,12 +2606,15 @@ mod tests {
             assert_eq!(
                 built(
                     "zellij_create",
-                    json!({"kind": "pane", "cwd": cwd, "wait_ready": false}),
+                    json!({"kind": "stacked", "cwd": cwd, "wait_ready": false}),
                     None,
                     &env
                 )
                 .join(" "),
-                format!("action new-pane --near-current-pane --cwd={}", expected)
+                format!(
+                    "action new-pane --near-current-pane --stacked --cwd={}",
+                    expected
+                )
             );
             assert_eq!(
                 built(
@@ -2652,13 +2638,13 @@ mod tests {
         assert_eq!(
             built(
                 "zellij_create",
-                json!({"kind": "pane", "cwd": "work", "wait_ready": false}),
+                json!({"kind": "stacked", "cwd": "work", "wait_ready": false}),
                 None,
                 &env
             )
             .join(" "),
             format!(
-                "action new-pane --near-current-pane --cwd={}",
+                "action new-pane --near-current-pane --stacked --cwd={}",
                 inside.to_string_lossy()
             )
         );
@@ -2678,7 +2664,7 @@ mod tests {
         for cwd in ["~/nope", "$HOME/nope"] {
             let said = argv_in(
                 "zellij_create",
-                &args(json!({"kind": "pane", "cwd": cwd, "wait_ready": false})),
+                &args(json!({"kind": "stacked", "cwd": cwd, "wait_ready": false})),
                 None,
                 &env,
                 None,
@@ -2711,7 +2697,7 @@ mod tests {
         );
         assert!(
             refusal("zellij_create", json!({"kind": "tab", "floating": true}))
-                .contains("cannot float")
+                .contains("`floating` is unsupported")
         );
     }
 
@@ -2982,7 +2968,7 @@ mod tests {
 
     #[test]
     fn a_remote_create_does_not_go_beside_a_pane_it_cannot_see() {
-        for value in [json!({"kind": "pane"}), json!({"kind": "floating"})] {
+        for value in [json!({"kind": "stacked"})] {
             let refused =
                 argv_in("zellij_create", &args(value), None, &a_remote_env(), None).unwrap_err();
             assert!(

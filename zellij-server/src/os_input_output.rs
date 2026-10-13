@@ -101,27 +101,6 @@ pub(crate) fn command_exists(cmd: &RunCommand) -> bool {
     resolve_command(cmd).is_some()
 }
 
-// this is a utility method to separate the arguments from a pathbuf before we turn it into a
-// Command. eg. "/usr/bin/vim -e" ==> "/usr/bin/vim" + "-e" (the latter will be pushed to args)
-fn separate_command_arguments(command: &mut PathBuf, args: &mut Vec<String>) {
-    let mut parts = vec![];
-    let mut current_part = String::new();
-    for part in command.display().to_string().split_ascii_whitespace() {
-        current_part.push_str(part);
-        if current_part.ends_with('\\') {
-            let _ = current_part.pop();
-            current_part.push(' ');
-        } else {
-            let current_part = std::mem::replace(&mut current_part, String::new());
-            parts.push(current_part);
-        }
-    }
-    if !parts.is_empty() {
-        *command = PathBuf::from(parts.remove(0));
-        args.append(&mut parts);
-    }
-}
-
 /// If a [`TerminalAction::OpenFile(file)`] is given, the text editor specified by environment variable `EDITOR`
 /// (or `VISUAL`, if `EDITOR` is not set) will be started in the new terminal, with the given
 /// file open.
@@ -135,71 +114,11 @@ fn build_command(
     terminal_action: TerminalAction,
     default_editor: Option<PathBuf>,
 ) -> (RunCommand, Option<RunCommand>) {
-    let mut failover_cmd_args = None;
     let cmd = match terminal_action {
-        TerminalAction::OpenFile(mut payload) => {
-            if payload.path.is_relative() {
-                if let Some(cwd) = payload.cwd.as_ref() {
-                    payload.path = cwd.join(payload.path);
-                }
-            }
-            let mut command = default_editor.unwrap_or_else(|| {
-                PathBuf::from(
-                    env::var("EDITOR")
-                        .unwrap_or_else(|_| env::var("VISUAL").unwrap_or_else(|_| "vi".into())),
-                )
-            });
-
-            let mut args = vec![];
-
-            if !command.is_dir() {
-                separate_command_arguments(&mut command, &mut args);
-            }
-            let file_to_open = payload
-                .path
-                .into_os_string()
-                .into_string()
-                .expect("Not valid Utf8 Encoding");
-            if let Some(line_number) = payload.line_number {
-                if command.ends_with("vim")
-                    || command.ends_with("nvim")
-                    || command.ends_with("emacs")
-                    || command.ends_with("nano")
-                    || command.ends_with("kak")
-                {
-                    failover_cmd_args = Some(vec![file_to_open.clone()]);
-                    args.push(format!("+{}", line_number));
-                    args.push(file_to_open);
-                } else if command.ends_with("hx") || command.ends_with("helix") {
-                    // at the time of writing, helix only supports this syntax
-                    // and it might be a good idea to leave this here anyway
-                    // to keep supporting old versions
-                    args.push(format!("{}:{}", file_to_open, line_number));
-                } else {
-                    args.push(file_to_open);
-                }
-            } else {
-                args.push(file_to_open);
-            }
-            RunCommand {
-                command,
-                args,
-                cwd: payload.cwd,
-                hold_on_close: false,
-                hold_on_start: false,
-                ..Default::default()
-            }
-        },
+        TerminalAction::OpenFile(payload) => return payload.editor_command(default_editor),
         TerminalAction::RunCommand(command) => command,
     };
-    let failover_cmd = if let Some(failover_cmd_args) = failover_cmd_args {
-        let mut failover = cmd.clone();
-        failover.args = failover_cmd_args;
-        Some(failover)
-    } else {
-        None
-    };
-    (cmd, failover_cmd)
+    (cmd, None)
 }
 
 // The ClientSender is in charge of sending messages to the client on a special thread

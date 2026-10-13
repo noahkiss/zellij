@@ -6658,6 +6658,23 @@ impl Config {
         let mut config = base_config.unwrap_or_else(|| Config::default());
         let kdl_config: KdlDocument = kdl_config.parse()?;
 
+        if let Some((value, entry)) =
+            kdl_property_first_arg_as_string_or_error!(kdl_config, "new_pane_default")
+        {
+            use crate::input::config::NewPaneDefault;
+            config.new_pane_default = Some(match value {
+                "split" => NewPaneDefault::Split,
+                "stacked" => NewPaneDefault::Stacked,
+                _ => {
+                    return Err(kdl_parsing_error!(
+                        "new_pane_default must be \"split\" or \"stacked\"".to_owned(),
+                        entry
+                    )
+                    .into())
+                },
+            });
+        }
+
         let config_options = Options::from_kdl(&kdl_config)?;
         config.options = config.options.merge(config_options);
 
@@ -6699,6 +6716,15 @@ impl Config {
     pub fn to_string(&self, add_comments: bool) -> String {
         let mut document = KdlDocument::new();
 
+        if let Some(default) = self.new_pane_default {
+            let mut node = KdlNode::new("new_pane_default");
+            node.push(match default {
+                crate::input::config::NewPaneDefault::Split => "split",
+                crate::input::config::NewPaneDefault::Stacked => "stacked",
+            });
+            document.nodes_mut().push(node);
+        }
+
         let clear_defaults = true;
         let keybinds = self.keybinds.to_kdl(clear_defaults);
         document.nodes_mut().push(keybinds);
@@ -6734,6 +6760,48 @@ impl Config {
             .append(&mut self.options.to_kdl(add_comments));
 
         document.to_string()
+    }
+}
+
+#[test]
+fn new_pane_default_is_client_only_and_round_trips() {
+    use crate::input::config::NewPaneDefault;
+    assert_eq!(Config::from_kdl("", None).unwrap().new_pane_default, None);
+    for (value, expected) in [
+        ("split", NewPaneDefault::Split),
+        ("stacked", NewPaneDefault::Stacked),
+    ] {
+        let config = Config::from_kdl(&format!("new_pane_default \"{}\"", value), None).unwrap();
+        assert_eq!(config.new_pane_default, Some(expected));
+        let rendered = config.to_string(false);
+        assert_eq!(
+            Config::from_kdl(&rendered, None).unwrap().new_pane_default,
+            Some(expected)
+        );
+        assert!(serde_json::to_value(&config)
+            .unwrap()
+            .get("new_pane_default")
+            .is_none());
+    }
+    let base = Config::from_kdl("new_pane_default \"stacked\"", None).unwrap();
+    assert_eq!(
+        Config::from_kdl("", Some(base.clone()))
+            .unwrap()
+            .new_pane_default,
+        Some(NewPaneDefault::Stacked)
+    );
+    assert_eq!(
+        Config::from_kdl("new_pane_default \"split\"", Some(base))
+            .unwrap()
+            .new_pane_default,
+        Some(NewPaneDefault::Split)
+    );
+    for invalid in [
+        "new_pane_default \"floating\"",
+        "new_pane_default true",
+        "new_pane_default 3",
+    ] {
+        assert!(Config::from_kdl(invalid, None).is_err(), "{}", invalid);
     }
 }
 

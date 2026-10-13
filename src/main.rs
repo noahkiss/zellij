@@ -1,6 +1,8 @@
 mod commands;
 mod image_viewer;
 mod mcp;
+mod new_pane_default;
+mod pane_default;
 mod session_commands;
 mod session_doctor_command;
 #[cfg(target_os = "linux")]

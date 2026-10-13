@@ -1757,13 +1757,12 @@ pub enum CliAction {
     /// Open a pane, running a command or your shell
     ///
     /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
-    /// handle>`. Without --direction the pane splits whichever side has the most room.
+    /// handle>`. Without placement flags, new_pane_default selects split or stacked.
     ///
     /// Where it lands: beside the focused pane by default, beside the pane --near names, in the tab
     /// --in-tab or --tab-id names, or in a tab of its own with --new-tab, which reports `tab_id:`.
     NewPane {
-        /// Split the pane it opens beside towards right or down. Without it, zellij splits
-        /// whichever side has the most room
+        /// Split towards right or down, overriding new_pane_default
         #[clap(short, long, value_parser, conflicts_with("floating"))]
         direction: Option<Direction>,
 
@@ -1968,8 +1967,7 @@ pub enum CliAction {
         /// The file to open. A relative path is resolved against --cwd, or the current directory
         file: PathBuf,
 
-        /// Split the pane it opens beside towards right or down. Without it, zellij splits
-        /// whichever side has the most room
+        /// Split towards right or down, overriding new_pane_default
         #[clap(short, long, value_parser, conflicts_with("floating"))]
         direction: Option<Direction>,
 

@@ -3,6 +3,7 @@ source: zellij-utils/src/setup.rs
 expression: "format!(\"{:#?}\", config)"
 ---
 Config {
+    new_pane_default: None,
     keybinds: {
         Normal: {
             KeyWithModifier {

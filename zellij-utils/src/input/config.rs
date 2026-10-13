@@ -33,6 +33,9 @@ type ConfigResult = Result<Config, ConfigError>;
 /// Main configuration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Config {
+    /// CLI placement default. This field never crosses the client/server contract.
+    #[serde(skip)]
+    pub new_pane_default: Option<NewPaneDefault>,
     pub keybinds: Keybinds,
     pub options: Options,
     pub themes: Themes,
@@ -42,6 +45,12 @@ pub struct Config {
     pub background_plugins: HashSet<RunPluginOrAlias>,
     pub web_client: WebClientConfig,
     pub plugin_permissions: PluginPermissions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewPaneDefault {
+    Split,
+    Stacked,
 }
 
 #[derive(Error, Debug, Serialize, Deserialize)]
@@ -266,6 +275,7 @@ impl Config {
         }
     }
     pub fn merge(&mut self, other: Config) -> Result<(), ConfigError> {
+        self.new_pane_default = other.new_pane_default.or(self.new_pane_default);
         self.options = self.options.merge(other.options);
         self.keybinds.merge(other.keybinds.clone());
         self.themes = self.themes.merge(other.themes);

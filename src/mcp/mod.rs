@@ -56,6 +56,9 @@ zellij_create puts your pane in your own tab: the tab you are in with `-zj` on t
 first time and reused after. It does not take the person's focus. That keeps your work in one
 place and out of the pane they are looking at.
 
+Use kind=stacked to stack onto your own pane, or kind=tab for a new tab.
+zellij_create never splits or floats. zellij_show is the floating image viewer exception.
+
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
 each one is - that is how you find the pane to talk to without being told its name.
 
@@ -566,7 +569,7 @@ mod tests {
     }
 
     fn create_argv() -> Vec<String> {
-        "action new-pane --near-current-pane --wait-ready --ready-timeout=10"
+        "action new-pane --near-current-pane --stacked --wait-ready --ready-timeout=10"
             .split(' ')
             .map(str::to_owned)
             .collect()
@@ -578,7 +581,7 @@ mod tests {
         // runs here - a write would spawn a child, and this returns before one could
         let plan = invoke::plan(
             "zellij_create",
-            json!({"kind": "pane", "command": "make"})
+            json!({"kind": "stacked", "command": "make"})
                 .as_object()
                 .unwrap(),
             None,

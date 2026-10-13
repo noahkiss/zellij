@@ -1008,6 +1008,17 @@ fn attach_with_cli_client(
     // changes; every other reporting verb prints a record, which the client structures. A payload
     // has no keys to structure, so it is refused here rather than answered with something wrong.
     let mut cli_action = cli_action;
+    let default_anchor = crate::pane_default::caller_anchor(
+        session_name,
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref(),
+        std::env::var("ZELLIJ_PANE_ID").ok().as_deref(),
+    );
+    let stacked_edit = crate::pane_default::apply(
+        &mut cli_action,
+        config.as_ref().and_then(|config| config.new_pane_default),
+        default_anchor,
+        &mut std::io::stderr(),
+    );
     let mut structure_report = false;
     if output_json && !cli_action.set_output_json() {
         let verb = cli_action.verb();
@@ -1394,12 +1405,18 @@ fn attach_with_cli_client(
         },
         other => other,
     };
-    match Action::actions_from_cli(
-        cli_action,
-        Box::new(get_current_dir),
-        config,
-        &resolve_pane_target,
-    ) {
+    let actions = if stacked_edit {
+        crate::new_pane_default::stacked_edit(cli_action, config.as_ref(), get_current_dir())
+            .map(|action| vec![action])
+    } else {
+        Action::actions_from_cli(
+            cli_action,
+            Box::new(get_current_dir),
+            config,
+            &resolve_pane_target,
+        )
+    };
+    match actions {
         Ok(actions) => {
             let exit_status = zellij_client::cli_client::start_cli_client(
                 Box::new(os_input),

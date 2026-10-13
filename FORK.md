@@ -9622,6 +9622,40 @@ through the fallback, and "no agents" for a Mac with none. Against the scratch s
 into the agent tab, a `submit`, a `wait --for match`, a `dump-screen`, a file drop over stdin, a
 `show` of an uploaded PNG, a close and a `move-tab` all answered as they do locally.
 
+### CLI panes can default to stacks; MCP creation uses stacks or tabs
+
+Set this top-level key in `config.kdl`:
+
+```kdl
+new_pane_default "stacked"
+```
+
+`"split"` keeps upstream placement. An absent key also keeps upstream placement.
+Older binaries ignore this top-level key.
+
+The client applies the default to `run`, `action new-pane`, and `edit`.
+An unplaced pane stacks onto the terminal pane named by `ZELLIJ_PANE_ID`.
+Without a numeric anchor in the selected session, the client keeps a split and explains why on stderr.
+Explicit placement flags keep their meaning: direction, floating, stacked, in-place,
+near, near-current-pane, and tab targets. Plugin creation keeps its explicit behavior.
+The setting stays outside `Options` and never changes the protobuf contract.
+
+A stacked edit resolves its editor from the client's config, then `EDITOR`, `VISUAL`, or `vi`.
+It preserves editor arguments, file paths, working directories, and supported line syntax.
+The existing stacked command contract cannot carry the editor's retry without line arguments.
+Ordinary edits retain that retry.
+
+MCP `zellij_create` accepts `stacked`, `agent_tab`, and `tab`.
+`agent_tab` remains the default and reuses the caller's `-zj` tab.
+`stacked` uses `--stacked --near-current-pane` and requires the caller's local pane.
+The tool rejects the removed `pane` and `floating` kinds and the `floating` parameter.
+`zellij_show` keeps its floating image viewer.
+
+Tests cover config parsing and rendering, client-only serialization, CLI placement,
+missing-anchor warnings, editor commands, and the MCP kinds and schema.
+The five active setup snapshots include the unset client default.
+CLI parser tests use the shared large-stack helper required by the unoptimized CI build.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

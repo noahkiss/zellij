@@ -449,16 +449,15 @@ pub const TOOLS: &[ToolSpec] = &[
             SESSION,
             ParamSpec {
                 name: "kind",
-                kind: ParamKind::Enum(&["agent_tab", "pane", "floating", "tab"]),
+                kind: ParamKind::Enum(&["agent_tab", "stacked", "tab"]),
                 required: false,
                 from: None,
                 describe: "Where the pane goes. agent_tab, the default, is your own tab - the tab \
                            you are in with `-zj` on the end, made once, reused after, and it does \
                            not take the person's focus. It is named after the tab this server's \
                            own pane is in, even when `session` names a different session. Use it \
-                           unless you have a reason not to. pane splits your own pane where you \
-                           are. floating floats over your own tab, the same as pane with \
-                           `floating: true`. tab makes a fresh tab of its own.",
+                           unless you have a reason not to. stacked stacks onto your own pane. \
+                           tab makes a fresh tab. This tool never splits or floats.",
                 default: Some(invoke::CREATE_KIND_DEFAULT),
             },
             ParamSpec {
@@ -521,14 +520,6 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action new-pane", "--handle")),
-                describe: "",
-                default: None,
-            },
-            ParamSpec {
-                name: "floating",
-                kind: ParamKind::Bool,
-                required: false,
-                from: Some(("action new-pane", "--floating")),
                 describe: "",
                 default: None,
             },
@@ -1274,14 +1265,28 @@ mod tests {
                 "{} is not namespaced by its service",
                 tool.name
             );
-            // ten, for `zellij_create`: `run_in` and `wait_ready` joined its seven at nkmk.32,
-            // and `brief` at nkmk.34, beside `floating` rather than in place of it
+            // Keep each tool's argument list small enough to use reliably.
             assert!(
                 tool.params.len() <= 10,
                 "{} asks for more parameters than an agent can be expected to get right",
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn create_schema_offers_only_stacks_and_tabs() {
+        let create = TOOLS
+            .iter()
+            .find(|tool| tool.name == "zellij_create")
+            .unwrap();
+        let schema = input_schema(create);
+        assert_eq!(
+            schema["properties"]["kind"]["enum"],
+            json!(["agent_tab", "stacked", "tab"])
+        );
+        assert!(schema["properties"].get("floating").is_none());
+        assert_eq!(invoke::CREATE_KIND_DEFAULT, "agent_tab");
     }
 
     #[test]
