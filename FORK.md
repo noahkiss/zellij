@@ -9508,6 +9508,7 @@ remote call is the same command line, run by the zellij on the other machine thr
 ```kdl
 // config.kdl - top level
 remote_hosts {
+    from "~/.config/fleet/machines.tsv" column="hostname" where="zellij_peer=yes"
     host "boxa"
     host "boxb" bin="/opt/homebrew/bin/zellij"   // optional: the zellij binary on that machine
 }
@@ -9526,6 +9527,17 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   refusal names the config file and the listed hosts. A `host` takes one name, whatever ssh takes:
   an alias from `~/.ssh/config`, a hostname, or `user@host`. A name with whitespace, a leading dash
   or a `/` is skipped with a warning. `bin=` must be an absolute path.
+- **`from` reads the list out of a table** the fleet already keeps, so the config needs no second
+  copy. The file is tab-separated, with a header line and no comments. A leading `~` is the home
+  directory. `column` names the header column that holds the ssh host, `hostname` by default.
+  `where="col=value"` keeps the rows whose `col` is `value`, ignoring case; without it every row
+  counts. A name from a table is lower-cased before ssh sees it: a table may record `BOXA` as the
+  machine reports it, and ssh matches `Host` patterns case-sensitively, so `BOXA` would miss the
+  `Host boxa` entry. An inline `host` with a table row's name replaces that row, which is how one
+  host gets `bin=`; inline hosts no table names are added after the table rows. A file that is
+  missing or unreadable, a column the header lacks, or a `where` that is not `col=value` is a
+  warning and no hosts from that line, never a failed call. The file is read on every call that
+  needs the list, so an edit applies without a restart.
 - **One config for every machine.** The list names the machine that reads it too. That entry is
   skipped: a call to it stays local, with no ssh. A host is this machine when its first label
   matches the short hostname, ignoring case and any `user@`, so `boxa` matches `BOXA.local`.
@@ -9593,7 +9605,7 @@ upload), `src/mcp/fleet.rs` (new: the parallel ask, the older-build fallback, th
 `src/mcp/invoke.rs` (`run_on`, `Plan.stdin`, `CallEnv.remote`, the remote arms of create, write,
 show and the agent tab), `src/mcp/mod.rs` (routing, `with_host`, the instructions),
 `src/mcp/tools.rs` (the `fleet` scope and the `session` text), `src/main.rs` (the config path),
-`zellij-utils/src/capabilities.rs`. Tests: the block and its warnings, routing and the
+`zellij-utils/src/capabilities.rs`. Tests: the block, the `from` table (column, where, a missing file, an unknown column, an inline override, an upper-case local host) and their warnings, routing and the
 whitelist refusal, the local-host match, quoting through a real `sh`, the probe with `bin=` and
 on `PATH`, ssh's argv, the upload script, the remote argv of every create, drop and show arm,
 and the fleet merge through a stand-in ssh with one host down, one too old for

@@ -7,10 +7,14 @@
 //!
 //! ```kdl
 //! remote_hosts {
+//!     from "~/.config/fleet/machines.tsv" column="hostname" where="zellij_peer=yes"
 //!     host "boxa"
 //!     host "boxb" bin="/opt/homebrew/bin/zellij"
 //! }
 //! ```
+//!
+//! `from` reads hosts out of a tab-separated table with a header line, so a fleet that already
+//! keeps one needs no second list. It is read on every call, like the rest of the block.
 //!
 //! The block is the whitelist: a host it does not list is refused before ssh is run. One config is
 //! shared by every machine, so the list names the machine reading it too, and that entry is
@@ -77,8 +81,17 @@ impl RemoteHosts {
         hosts
     }
 
-    /// The block out of a whole config file's text.
+    /// The block out of a whole config file's text, with `~` in a `from` path meaning `$HOME`.
     pub fn parse(text: &str) -> Self {
+        RemoteHosts::parse_in(text, std::env::var("HOME").ok().as_deref())
+    }
+
+    /// The same, told what `~` means.
+    ///
+    /// Inline `host` lines and the rows of every `from` file are merged: file rows first, in
+    /// file order, then the inline hosts no file named. An inline host with a file row's name
+    /// replaces that row, which is how a host listed in a shared table gets its own `bin=`.
+    pub fn parse_in(text: &str, home: Option<&str>) -> Self {
         let document: KdlDocument = match text.parse() {
             Ok(document) => document,
             Err(e) => {
@@ -95,8 +108,19 @@ impl RemoteHosts {
         let Some(children) = block.children() else {
             return hosts;
         };
+        let mut from_files: Vec<RemoteHost> = Vec::new();
         for node in children.nodes() {
             match node.name().value() {
+                "from" => {
+                    for host in hosts.hosts_from_file(node, home) {
+                        if !from_files
+                            .iter()
+                            .any(|seen| seen.name.eq_ignore_ascii_case(&host.name))
+                        {
+                            from_files.push(host);
+                        }
+                    }
+                },
                 "host" => {
                     if let Some(host) = hosts.host_from_kdl(node) {
                         if hosts.find(&host.name).is_some() {
@@ -109,10 +133,142 @@ impl RemoteHosts {
                     }
                 },
                 other => hosts.warnings.push(format!(
-                    "unknown remote_hosts entry {:?}, ignored (expected host)",
+                    "unknown remote_hosts entry {:?}, ignored (expected host or from)",
                     other
                 )),
             }
+        }
+        let inline = std::mem::take(&mut hosts.hosts);
+        for row in from_files {
+            let chosen = inline
+                .iter()
+                .find(|host| host.name.eq_ignore_ascii_case(&row.name))
+                .cloned()
+                .unwrap_or(row);
+            hosts.hosts.push(chosen);
+        }
+        for host in inline {
+            if hosts.find(&host.name).is_none() {
+                hosts.hosts.push(host);
+            }
+        }
+        hosts
+    }
+
+    /// The hosts a `from` line names: one per row of a tab-separated table with a header line,
+    /// read from the `column` named (default `hostname`), kept when `where="col=value"` matches.
+    ///
+    /// Every way this can go wrong - a missing file, a column the header does not have, a bad
+    /// `where` - is a warning and no hosts, never a failed call: a table that moved should cost the
+    /// fleet its remote rows, not the server.
+    fn hosts_from_file(&mut self, node: &KdlNode, home: Option<&str>) -> Vec<RemoteHost> {
+        let mut path = None;
+        let mut column = "hostname".to_owned();
+        let mut filter = None;
+        for entry in node.entries() {
+            match (entry.name().map(|name| name.value()), entry.value()) {
+                (None, KdlValue::String(value)) if path.is_none() => path = Some(value.clone()),
+                (Some("column"), KdlValue::String(value)) => column = value.clone(),
+                (Some("where"), KdlValue::String(value)) => match value.split_once('=') {
+                    Some((key, wanted)) if !key.trim().is_empty() => {
+                        filter = Some((key.trim().to_owned(), wanted.trim().to_owned()))
+                    },
+                    _ => {
+                        self.warnings.push(format!(
+                            "remote_hosts: from where={:?} is not column=value, so the file \
+                             was not read",
+                            value
+                        ));
+                        return Vec::new();
+                    },
+                },
+                (Some(other), _) => self.warnings.push(format!(
+                    "unknown remote_hosts from property {:?}, ignored (expected column or where)",
+                    other
+                )),
+                (None, value) => self.warnings.push(format!(
+                    "remote_hosts: from takes one path, and {} is not it",
+                    value
+                )),
+            }
+        }
+        let Some(path) = path else {
+            self.warnings
+                .push("remote_hosts: a from line with no path, ignored".to_owned());
+            return Vec::new();
+        };
+        let expanded = match (path.strip_prefix('~'), home) {
+            (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+                format!("{}{}", home.trim_end_matches('/'), rest)
+            },
+            _ => path.clone(),
+        };
+        let text = match std::fs::read_to_string(&expanded) {
+            Ok(text) => text,
+            Err(e) => {
+                self.warnings.push(format!(
+                    "remote_hosts: from {} could not be read: {}",
+                    expanded, e
+                ));
+                return Vec::new();
+            },
+        };
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        let header: Vec<&str> = lines
+            .next()
+            .unwrap_or_default()
+            .split('\t')
+            .map(str::trim)
+            .collect();
+        let index_of = |name: &str| header.iter().position(|column| *column == name);
+        let Some(host_at) = index_of(&column) else {
+            self.warnings.push(format!(
+                "remote_hosts: from {} has no column {:?}",
+                expanded, column
+            ));
+            return Vec::new();
+        };
+        let filter_at = match &filter {
+            Some((key, wanted)) => match index_of(key) {
+                Some(at) => Some((at, wanted.clone())),
+                None => {
+                    self.warnings.push(format!(
+                        "remote_hosts: from {} has no column {:?} for where",
+                        expanded, key
+                    ));
+                    return Vec::new();
+                },
+            },
+            None => None,
+        };
+        let mut hosts = Vec::new();
+        for line in lines {
+            let cells: Vec<&str> = line.split('\t').map(str::trim).collect();
+            if let Some((at, wanted)) = &filter_at {
+                if !cells
+                    .get(*at)
+                    .is_some_and(|cell| cell.eq_ignore_ascii_case(wanted))
+                {
+                    continue;
+                }
+            }
+            let Some(name) = cells.get(host_at).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            if let Some(reason) = host_name_error(name) {
+                self.warnings.push(format!(
+                    "remote_hosts: from {}: host {:?} {}, ignored",
+                    expanded, name, reason
+                ));
+                continue;
+            }
+            // lower-cased: a table may record a hostname as the machine reports it (`BOXA`), and
+            // ssh matches `Host` patterns in its config case-sensitively, so `BOXA` would miss
+            // the `Host boxa` entry that carries the user and key
+            hosts.push(RemoteHost {
+                name: name.to_ascii_lowercase(),
+                bin: None,
+            });
         }
         hosts
     }
@@ -823,6 +979,133 @@ mod tests {
         let unshared = ssh_argv("boxa", "x".into(), None);
         assert!(unshared.iter().any(|w| w == "ControlMaster=no"));
         assert!(!unshared.iter().any(|w| w.starts_with("ControlPath")));
+    }
+
+    /// A home directory holding a machine table, the way the shared one is laid out.
+    fn table_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config")).unwrap();
+        std::fs::write(
+            home.path().join(".config/machines.tsv"),
+            "hostname\tfriendly\tzellij_peer\n\
+             boxa\tlinux box\tyes\n\
+             BOXB\tmac\tYES\n\
+             boxc\twork mac\tno\n\
+             \n",
+        )
+        .unwrap();
+        home
+    }
+
+    fn from_config(from: &str, home: &Path) -> RemoteHosts {
+        RemoteHosts::parse_in(
+            &format!("remote_hosts {{\n{}\n}}\n", from),
+            Some(&home.display().to_string()),
+        )
+    }
+
+    fn names(hosts: &RemoteHosts) -> Vec<&str> {
+        hosts.hosts.iter().map(|host| host.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_from_line_reads_the_hosts_out_of_a_table() {
+        let home = table_home();
+        let all = from_config(r#"from "~/.config/machines.tsv""#, home.path());
+        assert_eq!(all.warnings, Vec::<String>::new());
+        assert_eq!(names(&all), vec!["boxa", "boxb", "boxc"]);
+        let peers = from_config(
+            r#"from "~/.config/machines.tsv" column="hostname" where="zellij_peer=yes""#,
+            home.path(),
+        );
+        assert_eq!(
+            names(&peers),
+            vec!["boxa", "boxb"],
+            "the value matches in any case"
+        );
+        let by_name = from_config(
+            r#"from "~/.config/machines.tsv" column="friendly" where="zellij_peer=no""#,
+            home.path(),
+        );
+        assert_eq!(by_name.warnings.len(), 1, "{:?}", by_name.warnings);
+        assert!(by_name.hosts.is_empty(), "`work mac` is not a host name");
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_read_warns_and_adds_nothing() {
+        let home = table_home();
+        let missing = from_config("from \"~/.config/gone.tsv\"\nhost \"boxz\"", home.path());
+        assert_eq!(names(&missing), vec!["boxz"], "the inline host still loads");
+        assert!(
+            missing.warnings[0].contains("could not be read"),
+            "{:?}",
+            missing.warnings
+        );
+        for (from, said) in [
+            (
+                r#"from "~/.config/machines.tsv" column="ssh""#,
+                "no column \"ssh\"",
+            ),
+            (
+                r#"from "~/.config/machines.tsv" where="peer=yes""#,
+                "no column \"peer\" for where",
+            ),
+            (
+                r#"from "~/.config/machines.tsv" where="yes""#,
+                "is not column=value",
+            ),
+        ] {
+            let hosts = from_config(from, home.path());
+            assert!(hosts.hosts.is_empty(), "{}", from);
+            assert!(
+                hosts.warnings.iter().any(|w| w.contains(said)),
+                "{} gave {:?}",
+                from,
+                hosts.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn an_inline_host_overrides_its_table_row_and_the_rest_are_added() {
+        let home = table_home();
+        let hosts = from_config(
+            "host \"boxd\"\n\
+             from \"~/.config/machines.tsv\" where=\"zellij_peer=yes\"\n\
+             host \"boxb\" bin=\"/opt/homebrew/bin/zellij\"",
+            home.path(),
+        );
+        assert_eq!(hosts.warnings, Vec::<String>::new());
+        assert_eq!(names(&hosts), vec!["boxa", "boxb", "boxd"]);
+        assert_eq!(
+            hosts.hosts[1].bin.as_deref(),
+            Some("/opt/homebrew/bin/zellij")
+        );
+    }
+
+    #[test]
+    fn an_uppercase_table_row_for_this_machine_is_skipped_as_local() {
+        let home = table_home();
+        let hosts = from_config(
+            r#"from "~/.config/machines.tsv" where="zellij_peer=yes""#,
+            home.path(),
+        );
+        let remote: Vec<&str> = hosts
+            .remote("boxb.local")
+            .iter()
+            .map(|host| host.name.as_str())
+            .collect();
+        assert_eq!(remote, vec!["boxa"]);
+        assert_eq!(
+            hosts.local_name("BOXB"),
+            "boxb",
+            "a table name is lower-cased for ssh"
+        );
+        let mut arguments = json!({"session": "boxb/work"}).as_object().unwrap().clone();
+        assert_eq!(
+            route(&mut arguments, &hosts, "BOXB.local").unwrap(),
+            Target::Local
+        );
     }
 
     #[test]
