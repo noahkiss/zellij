@@ -86,6 +86,7 @@ pub const CAPABILITIES: &[&str] = &[
     "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
     "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
     "list-agents-watch",  // list-agents --watch, one JSON line per agent change
+    "wait-agent-change",  // blocking agent transitions and changes-only watch
     "wait-agent-state", // action wait --for agent-idle|agent-waiting, input_since_state on list-panes --json
     "last-reply",       // action last-reply: an agent's last reply, from its transcript
     "session-drop-env", // session_restart_drop_env

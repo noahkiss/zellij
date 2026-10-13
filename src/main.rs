@@ -44,6 +44,7 @@ fn main() {
             report_withheld,
             all_sessions,
             watch,
+            changes_only,
             interval_ms,
         })) = opts.command
         {
@@ -53,6 +54,7 @@ fn main() {
                     report_withheld,
                     all_sessions,
                     watch,
+                    changes_only,
                     interval_ms,
                 },
                 opts.session,

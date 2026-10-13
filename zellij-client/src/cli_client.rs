@@ -1215,6 +1215,198 @@ pub fn start_list_agents_all_sessions_client(
     print_agents(&agents, withheld, output_json, report_withheld, true)
 }
 
+fn active_agents(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
+    agent_detect::agents_from_pane_list(
+        panes
+            .into_iter()
+            .filter(|pane| !pane.pane_info.exited && !pane.pane_info.is_held)
+            .collect(),
+    )
+}
+
+fn agent_change_snapshot(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    filter: Option<&[u32]>,
+) -> Result<ListAgentsResponse, String> {
+    let envelope = panes_of_session(make_os_input(), session_name)?;
+    let mut agents = active_agents(envelope.panes);
+    agent_detect::mark_self(
+        &mut agents,
+        std::env::var("ZELLIJ_PANE_ID")
+            .ok()
+            .and_then(|id| id.parse().ok()),
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session_name),
+    );
+    if let Some(panes) = filter {
+        agents.retain(|agent| {
+            if panes.is_empty() {
+                !agent.is_self
+            } else {
+                panes.contains(&agent.pane_id)
+            }
+        });
+    }
+    for agent in &mut agents {
+        if agent.program_status.is_none() {
+            if let Ok(lines) = ask(
+                make_os_input(),
+                session_name,
+                Action::DumpScreen {
+                    file_path: None,
+                    include_scrollback: false,
+                    pane_id: Some(PaneId::Terminal(agent.pane_id)),
+                    ansi: false,
+                },
+                "the agent screen",
+            ) {
+                if agent_detect::screen_agent_blocked(&lines.join("\n")) {
+                    agent.program_status = Some(zellij_utils::data::PaneProgramStatus {
+                        state: "blocked".into(),
+                        kind: Some("question".into()),
+                        app: None,
+                        title: None,
+                        msg: None,
+                        progress: None,
+                        at: 0,
+                    });
+                }
+            }
+        }
+    }
+    Ok(agents)
+}
+
+fn enrich_agent_change(change: &mut agent_detect::AgentChange, agents: &ListAgentsResponse) {
+    let var = |key: &str| std::env::var(key).ok();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    enrich_agent_change_from(change, agents, &var, home.as_deref());
+}
+
+fn enrich_agent_change_from(
+    change: &mut agent_detect::AgentChange,
+    agents: &ListAgentsResponse,
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
+) {
+    if (change.old_state != change.new_state
+        && matches!(
+            change.new_state.as_deref(),
+            Some("idle" | "done" | "error" | "blocked")
+        ))
+        || change.event == "gone"
+    {
+        let scoped = agents
+            .iter()
+            .filter(|agent| agent.session == change.session)
+            .cloned()
+            .collect();
+        change.last_reply = last_reply_of(&scoped, PaneId::Terminal(change.pane_id), var, home)
+            .ok()
+            .and_then(|reply| {
+                reply
+                    .reply
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+            });
+    }
+}
+
+fn agent_snapshot_answer<T>(
+    receiver: std::sync::mpsc::Receiver<T>,
+    deadline: Option<Instant>,
+) -> Result<T, String> {
+    match deadline {
+        Some(end) => receiver
+            .recv_timeout(end.saturating_duration_since(Instant::now()))
+            .map_err(|_| "Agent-change wait timed out".to_owned()),
+        None => receiver
+            .recv()
+            .map_err(|_| "Agent-change snapshot ended".to_owned()),
+    }
+}
+
+/// Block until a watched agent changes. The caller is excluded only for an unscoped wait.
+pub fn start_agent_change_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    panes: &[u32],
+    timeout: Option<Duration>,
+    output_json: bool,
+) -> i32 {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let snapshot = || {
+        let input = make_os_input();
+        let session = session_name.to_owned();
+        let panes = panes.to_vec();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(agent_change_snapshot(
+                &|| input.box_clone(),
+                &session,
+                Some(&panes),
+            ));
+        });
+        agent_snapshot_answer(receiver, deadline)?
+    };
+    let mut previous = match snapshot() {
+        Ok(agents) => agents,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 2;
+        },
+    };
+    loop {
+        if deadline.map(|end| Instant::now() >= end).unwrap_or(false) {
+            eprintln!("Agent-change wait timed out");
+            return 2;
+        }
+        std::thread::sleep(
+            Duration::from_millis(100).min(
+                deadline
+                    .map(|end| end.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::from_millis(100)),
+            ),
+        );
+        let current = match snapshot() {
+            Ok(agents) => agents,
+            Err(message) => {
+                eprintln!("{}", message);
+                return 2;
+            },
+        };
+        if deadline.map(|end| Instant::now() >= end).unwrap_or(false) {
+            eprintln!("Agent-change wait timed out");
+            return 2;
+        }
+        if let Some(mut change) = agent_detect::agent_changes(&previous, &current)
+            .into_iter()
+            .next()
+        {
+            let source = if change.event == "gone" {
+                &previous
+            } else {
+                &current
+            };
+            enrich_agent_change(&mut change, source);
+            if output_json {
+                println!("{}", serde_json::to_string(&change).unwrap());
+            } else {
+                println!(
+                    "handle: {}\npane_id: {}\ntab_id: {}\ntab_name: {}\nkind: {}\nname: {}\nold_state: {}\nnew_state: {}\nevent: {}\nsession: {}\nlast_reply: {}",
+                    change.handle, change.pane_id, change.tab_id, change.tab_name, change.kind,
+                    change.name.as_deref().unwrap_or("-"), change.old_state.as_deref().unwrap_or("-"),
+                    change.new_state.as_deref().unwrap_or("-"), change.event,
+                    change.session.as_deref().unwrap_or("-"), change.last_reply.as_deref().unwrap_or("-")
+                );
+            }
+            return 0;
+        }
+        previous = current;
+    }
+}
+
 /// `zellij action list-agents --watch`: one JSON line whenever an agent appears, changes, or
 /// goes, until the reader stops reading.
 ///
@@ -1228,20 +1420,63 @@ pub fn start_list_agents_watch_client(
     session_name: &str,
     all_sessions: Option<&dyn Fn() -> Vec<String>>,
     interval: Duration,
+    changes_only: bool,
 ) -> i32 {
+    let mut previous: Option<ListAgentsResponse> = None;
     let mut seen = BTreeMap::new();
     let stdout = io::stdout();
     loop {
         let agents = match all_sessions {
+            Some(live_sessions) if changes_only => {
+                let mut agents = Vec::new();
+                for session in live_sessions() {
+                    match agent_change_snapshot(make_os_input, &session, None) {
+                        Ok(mut found) => {
+                            for agent in &mut found {
+                                agent.session = Some(session.clone());
+                            }
+                            agents.extend(found);
+                        },
+                        Err(message) => eprintln!("{}", message),
+                    }
+                }
+                agents
+            },
             Some(live_sessions) => agents_of_sessions(make_os_input, &live_sessions()).0,
-            None => match agents_of_session(make_os_input(), session_name) {
+            None if !changes_only => match agents_of_session(make_os_input(), session_name) {
                 Ok((agents, _)) => agents,
                 Err(message) => {
                     eprintln!("{}", message);
                     return 2;
                 },
             },
+            None => match agent_change_snapshot(make_os_input, session_name, None) {
+                Ok(agents) => agents,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    return 2;
+                },
+            },
         };
+        if changes_only {
+            if let Some(old) = &previous {
+                for mut change in agent_detect::agent_changes(old, &agents) {
+                    let source = if change.event == "gone" { old } else { &agents };
+                    enrich_agent_change(&mut change, source);
+                    if writeln!(stdout.lock(), "{}", serde_json::to_string(&change).unwrap())
+                        .is_err()
+                    {
+                        return 0;
+                    }
+                }
+                if stdout.lock().flush().is_err() {
+                    return 0;
+                }
+            }
+            previous = Some(agents);
+            std::thread::sleep(interval);
+            continue;
+        }
         let (events, next) = agent_detect::agent_watch_events(&seen, agents);
         seen = next;
         let mut out = stdout.lock();
@@ -3342,6 +3577,61 @@ mod tests {
             session: None,
             last_output_at: None,
         }
+    }
+
+    #[test]
+    fn agent_change_held_exit_needs_no_final_osc_state() {
+        let mut entries: Vec<PaneListEntry> =
+            serde_json::from_str(&panes_json(&[(1, false, false, None)])).unwrap();
+        entries[0].agent =
+            Some(agent_detect::detect_command_line("claude", &BTreeMap::new()).unwrap());
+        let previous = active_agents(entries.clone());
+        assert_eq!(previous.len(), 1);
+        entries[0].pane_info.is_held = true;
+        let current = active_agents(entries);
+        assert!(current.is_empty());
+        assert_eq!(
+            agent_detect::agent_changes(&previous, &current)[0].event,
+            "gone"
+        );
+    }
+
+    #[test]
+    fn agent_change_timeout_bounds_a_snapshot_that_never_answers() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        assert!(agent_snapshot_answer(receiver, Some(Instant::now()))
+            .unwrap_err()
+            .contains("timed out"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(7).unwrap();
+        assert_eq!(agent_snapshot_answer(receiver, None), Ok(7));
+    }
+
+    #[test]
+    fn agent_change_reply_uses_the_changed_session_and_only_a_finished_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-src");
+        std::fs::create_dir_all(&project).unwrap();
+        for (id, reply) in [("s1", "wrong"), ("s2", "hello\nsecond line")] {
+            let text = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}});
+            std::fs::write(project.join(format!("{id}.jsonl")), text.to_string()).unwrap();
+        }
+        let mut first = agent_row(1, "claude", Some("s1"));
+        first.session = Some("first".into());
+        let mut old = agent_row(1, "claude", Some("s2"));
+        old.session = Some("second".into());
+        old.program_status = Some(status("working", None));
+        let mut new = old.clone();
+        new.program_status = Some(status("done", None));
+        let agents = vec![first, new.clone()];
+        let mut change = agent_detect::agent_changes(&[old], &[new.clone()]).remove(0);
+        enrich_agent_change_from(&mut change, &agents, &|_| None, Some(dir.path()));
+        assert_eq!(change.last_reply.as_deref(), Some("hello"));
+        let mut renamed = new.clone();
+        renamed.agent.name = Some("child".into());
+        let mut change = agent_detect::agent_changes(&[new], &[renamed]).remove(0);
+        enrich_agent_change_from(&mut change, &agents, &|_| None, Some(dir.path()));
+        assert_eq!(change.last_reply, None);
     }
 
     #[test]

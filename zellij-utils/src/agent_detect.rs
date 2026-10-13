@@ -399,6 +399,104 @@ fn table_of(agents: &ListAgentsResponse, with_session: bool) -> Vec<String> {
         .collect()
 }
 
+/// A semantic agent transition. Missing state means no OSC state has been reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChange {
+    pub pane_id: u32,
+    pub handle: String,
+    pub tab_id: usize,
+    pub tab_name: String,
+    pub kind: String,
+    pub name: Option<String>,
+    pub session: Option<String>,
+    pub old_state: Option<String>,
+    pub new_state: Option<String>,
+    pub event: String,
+    pub last_reply: Option<String>,
+}
+
+fn agent_state(agent: &AgentListEntry) -> Option<String> {
+    agent.program_status.as_ref().map(|s| s.state.clone())
+}
+
+/// Compare identity, name and state, ignoring timestamps and animated titles.
+pub fn agent_changes(previous: &[AgentListEntry], current: &[AgentListEntry]) -> Vec<AgentChange> {
+    let mut changes = Vec::new();
+    for agent in current.iter().chain(previous.iter().filter(|old| {
+        !current
+            .iter()
+            .any(|new| new.pane_id == old.pane_id && new.session == old.session)
+    })) {
+        let old = previous
+            .iter()
+            .find(|old| old.pane_id == agent.pane_id && old.session == agent.session);
+        let new = current
+            .iter()
+            .find(|new| new.pane_id == agent.pane_id && new.session == agent.session);
+        if let (Some(old), Some(new)) = (old, new) {
+            if old.agent.kind == new.agent.kind
+                && old.agent.agent_id == new.agent.agent_id
+                && old.agent.name == new.agent.name
+                && agent_state(old) == agent_state(new)
+            {
+                continue;
+            }
+        }
+        changes.push(AgentChange {
+            pane_id: agent.pane_id,
+            handle: agent.handle.clone(),
+            tab_id: agent.tab_id,
+            tab_name: agent.tab_name.clone(),
+            kind: agent.agent.kind.clone(),
+            name: agent.agent.name.clone(),
+            session: agent.session.clone(),
+            old_state: old.and_then(agent_state),
+            new_state: new.and_then(agent_state),
+            event: if new.is_none() {
+                "gone"
+            } else if old.is_none() {
+                "appeared"
+            } else {
+                "changed"
+            }
+            .into(),
+            last_reply: None,
+        });
+    }
+    changes
+}
+
+/// Small fallback for harness gates and question menus without OSC 7501.
+/// TODO: replace with the harness-map screen evaluator.
+pub fn screen_agent_blocked(screen: &str) -> bool {
+    let text = screen
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let words: Vec<_> = text.split_whitespace().collect();
+    let selected_number = words.windows(2).any(|pair| {
+        ["❯", ">", "›"].contains(&pair[0])
+            && pair[1]
+                .trim_end_matches(['.', ')'])
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+            && pair[1]
+                .chars()
+                .next()
+                .map(|ch| ch.is_ascii_digit())
+                .unwrap_or(false)
+    });
+    text.contains("do you trust")
+        || text.contains("trust this folder")
+        || text.contains("trust the authors")
+        || text.contains("trust these hooks")
+        || text.contains("trust the hooks")
+        || (text.contains("approaching rate limits") && text.contains("switch to"))
+        || (text.contains('?')
+            && (selected_number || (text.contains("1)") && text.contains("enter to select"))))
+}
+
 /// One line of `list-agents --watch`.
 ///
 /// `agent` carries the whole row, so a reader keeps one map keyed by session and pane and
@@ -428,7 +526,17 @@ fn watched_part(agent: &AgentListEntry) -> String {
         &agent.handle,
         &agent.agent.kind,
         &agent.agent.agent_id,
-        &agent.program_status,
+        &agent.agent.name,
+        agent.program_status.as_ref().map(|status| {
+            (
+                &status.state,
+                &status.kind,
+                &status.app,
+                &status.title,
+                &status.msg,
+                status.progress,
+            )
+        }),
     ))
     .unwrap_or_default()
 }
@@ -805,6 +913,63 @@ mod tests {
     }
 
     #[test]
+    fn agent_change_detects_each_transition_and_identity_change() {
+        let old = watched(1, None, Some("working"));
+        for state in ["blocked", "idle", "done", "error"] {
+            let new = watched(1, None, Some(state));
+            let changes = agent_changes(&[old.clone()], &[new]);
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].old_state.as_deref(), Some("working"));
+            assert_eq!(changes[0].new_state.as_deref(), Some(state));
+        }
+        for from in ["working", "blocked", "idle", "done", "error"] {
+            for to in ["working", "blocked", "idle", "done", "error"] {
+                let changes = agent_changes(
+                    &[watched(1, None, Some(from))],
+                    &[watched(1, None, Some(to))],
+                );
+                assert_eq!(changes.len(), usize::from(from != to), "{from} -> {to}");
+            }
+        }
+        let mut new = old.clone();
+        new.agent.name = Some("child".into());
+        assert_eq!(agent_changes(&[old.clone()], &[new]).len(), 1);
+        let mut new = old.clone();
+        new.agent.agent_id = Some("new-turn".into());
+        assert_eq!(agent_changes(&[old.clone()], &[new]).len(), 1);
+        let mut new = old.clone();
+        new.agent.kind = "codex".into();
+        assert_eq!(agent_changes(&[old.clone()], &[new]).len(), 1);
+        assert_eq!(agent_changes(&[], &[old.clone()])[0].event, "appeared");
+        assert_eq!(agent_changes(&[old.clone()], &[])[0].event, "gone");
+        let mut new = old.clone();
+        new.program_status.as_mut().unwrap().at += 1;
+        new.last_output_at = Some(999);
+        new.title = "spinner".into();
+        assert!(agent_changes(&[old], &[new]).is_empty());
+    }
+
+    #[test]
+    fn agent_change_screen_fallback_recognizes_gates_and_ignores_reply_lists() {
+        for screen in [
+            include_str!("fixtures/agent-change/folder-trust.txt"),
+            include_str!("fixtures/agent-change/hooks-trust.txt"),
+            include_str!("fixtures/agent-change/codex-rate-limit.txt"),
+            include_str!("fixtures/agent-change/question.txt"),
+            include_str!("fixtures/agent-change/question-second.txt"),
+        ] {
+            assert!(screen_agent_blocked(screen), "{}", screen);
+        }
+        assert!(!screen_agent_blocked(include_str!(
+            "fixtures/agent-change/reply.txt"
+        )));
+        assert!(!screen_agent_blocked("Working on the patch..."));
+        assert!(screen_agent_blocked(
+            "Choose a build?\n› 1. Quick\n  2. Release"
+        ));
+    }
+
+    #[test]
     fn a_multi_line_command_stays_on_its_own_row() {
         let mut agent = watched(1, None, None);
         agent.command = Some("claude -- line one\nline two".to_owned());
@@ -818,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_row_carries_when_its_pane_last_drew_and_a_watch_ignores_it() {
+    fn agent_change_legacy_watch_ignores_timestamps_and_reports_names() {
         let mut quiet = watched(1, None, Some("working"));
         let (_, seen) = agent_watch_events(&BTreeMap::new(), vec![quiet.clone()]);
         assert!(serde_json::to_string(&quiet)
@@ -826,8 +991,12 @@ mod tests {
             .contains("\"last_output_at\":1"));
         // a spinner frame moves last_output_at; it is not a change worth a line
         quiet.last_output_at = Some(99);
-        let (events, _) = agent_watch_events(&seen, vec![quiet]);
+        quiet.program_status.as_mut().unwrap().at = 99;
+        let (events, _) = agent_watch_events(&seen, vec![quiet.clone()]);
         assert!(events.is_empty(), "{:?}", events);
+        quiet.agent.name = Some("child".into());
+        let (events, _) = agent_watch_events(&seen, vec![quiet]);
+        assert_eq!(events.len(), 1);
     }
 
     #[test]

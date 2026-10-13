@@ -1,0 +1,5 @@
+Approaching rate
+limits
+Switch to gpt-5-mini?
+❯ 1. Switch
+  2. Stay

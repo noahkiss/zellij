@@ -1,0 +1,4 @@
+Which build should I use?
+❯ 1. Quick
+  2. Release
+Enter to select

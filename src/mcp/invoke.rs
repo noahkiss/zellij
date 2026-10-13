@@ -1126,11 +1126,12 @@ fn argv_in(
                 "ready",
                 "agent_idle",
                 "agent_waiting",
+                "agent_change",
             ]
             .contains(&until.as_str())
             {
                 return Err(format!(
-                    "`until` must be exit, match, quiet, ready, agent_idle or agent_waiting, \
+                    "`until` must be exit, match, quiet, ready, agent_idle, agent_waiting or agent_change, \
                      not `{}`.",
                     until
                 ));
@@ -1138,12 +1139,19 @@ fn argv_in(
             let mut rest = vec![
                 "action".to_owned(),
                 "wait".to_owned(),
-                args.required("pane")?,
+                if until == "agent_change" {
+                    args.string("pane").unwrap_or_default()
+                } else {
+                    args.required("pane")?
+                },
                 "--for".to_owned(),
                 // the tool's enum spells its values the way its other enums do; the CLI's are
                 // kebab-case
                 until.replace('_', "-"),
             ];
+            if rest[2].is_empty() {
+                rest.remove(2);
+            }
             if until == "match" {
                 rest.push("--match".to_owned());
                 rest.push(args.required("pattern").map_err(|_| {
@@ -1878,7 +1886,7 @@ mod tests {
         );
         assert!(
             refusal("zellij_wait_for", json!({"pane": "3", "until": "soon"}))
-                .contains("exit, match, quiet, ready, agent_idle or agent_waiting")
+                .contains("exit, match, quiet, ready, agent_idle, agent_waiting or agent_change")
         );
     }
 
@@ -1900,6 +1908,23 @@ mod tests {
             ),
             "action wait 3 --for agent-waiting --timeout 60"
         );
+    }
+
+    #[test]
+    fn agent_change_wait_reuses_the_optional_pane_parameter() {
+        assert_eq!(
+            line("zellij_wait_for", json!({"until": "agent_change"}), None),
+            "action wait --for agent-change --timeout 300"
+        );
+        assert_eq!(
+            line(
+                "zellij_wait_for",
+                json!({"until": "agent_change", "pane": "sunny-otter"}),
+                None
+            ),
+            "action wait sunny-otter --for agent-change --timeout 300"
+        );
+        assert!(refusal("zellij_wait_for", json!({"until": "exit"})).contains("pane"));
     }
 
     #[test]

@@ -386,6 +386,11 @@ pub enum Sessions {
         /// Print agent changes as JSON lines
         #[clap(long)]
         watch: bool,
+        /// With --watch, omit the initial agents and print changes as NDJSON.
+        /// Fields: event, session, pane_id, handle, tab_id, tab_name, kind, name,
+        /// old_state, new_state, and last_reply.
+        #[clap(long, requires = "watch")]
+        changes_only: bool,
         /// Poll interval with --watch, in milliseconds
         #[clap(long, default_value = "1000")]
         interval_ms: u64,
@@ -1184,6 +1189,8 @@ pub enum WaitFor {
     /// The coding agent in the pane is blocked on a person: it reported `blocked` (a permission,
     /// a question, a sign-in) after the last input typed into the pane.
     AgentWaiting,
+    /// Start the child, then wait for agent-change in the background; never poll the screen.
+    AgentChange,
 }
 
 impl Default for WaitFor {
@@ -1226,6 +1233,10 @@ impl Default for ReadyFlags {
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize, strum_macros::Display)]
 pub enum CliAction {
     /// Block until a pane does something, then say what it did
+    ///
+    /// Start the child, then wait for agent-change in the background; never poll the screen.
+    /// Use --for agent-change with repeated --pane targets, or omit them to watch other agents.
+    /// The record carries the pane handle, tab, kind, name, old/new states and last reply line.
     ///
     /// This is the one command that replaces a poll loop. Instead of `send-keys`, `sleep 2`,
     /// `dump-screen`, look, `sleep 2` again, a script says what it is waiting for and gets woken
@@ -1282,13 +1293,18 @@ pub enum CliAction {
     Wait {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns
+        /// in its PANE_ID and HANDLE columns. Optional only for agent-change.
         #[clap(value_parser)]
+        #[clap(default_value = "")]
         pane_id: String,
+
+        /// Watch these panes for agent-change. Omit to watch every agent except the caller.
+        #[clap(long = "pane", requires = "wait_for")]
+        panes: Vec<String>,
 
         /// What to wait for: the pane's command to end, the pane to fall quiet, a line to
         /// match, the pane's shell to be ready for input, or the coding agent in the pane to
-        /// stop working or to be blocked on a person
+        /// stop working, be blocked on a person, or change state, identity or name
         #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
         wait_for: WaitFor,
 
@@ -2666,6 +2682,11 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// lines are every agent there is now. The session is asked again every --interval-ms
         #[clap(long, value_parser)]
         watch: bool,
+        /// With --watch, omit the initial agents and print changes as NDJSON.
+        /// Fields: event, session, pane_id, handle, tab_id, tab_name, kind, name,
+        /// old_state, new_state, and last_reply.
+        #[clap(long, requires = "watch")]
+        changes_only: bool,
 
         /// With --watch: how often to ask, in milliseconds (at least 100)
         #[clap(long, value_parser, default_value = "1000")]
@@ -3621,7 +3642,8 @@ mod tests {
                 all_sessions: true,
                 report_withheld: true,
                 watch: true,
-                interval_ms: 250
+                interval_ms: 250,
+                changes_only: false
             }))
         ));
     }
@@ -4507,6 +4529,16 @@ mod tests {
         // the negative control: no other verb has a pipe deadline to give up
         let mut other = parse_action(&["new-pane"]);
         assert_eq!(other.take_pipe_timeout(), None);
+    }
+
+    #[test]
+    fn agent_change_wait_accepts_no_target_and_repeated_targets() {
+        assert!(
+            matches!(parse_action(&["wait", "--for", "agent-change"]), CliAction::Wait { wait_for: WaitFor::AgentChange, panes, pane_id, .. } if panes.is_empty() && pane_id.is_empty())
+        );
+        assert!(
+            matches!(parse_action(&["wait", "--for", "agent-change", "--pane", "sunny-otter", "--pane", "quiet-fox"]), CliAction::Wait { panes, .. } if panes == ["sunny-otter", "quiet-fox"])
+        );
     }
 
     fn wait_bounds(args: &[&str]) -> (WaitFor, u64, u64) {

@@ -800,6 +800,7 @@ pub(crate) fn send_action_to_session(
         json,
         report_withheld,
         all_sessions: true,
+        changes_only,
         watch,
         interval_ms,
     } = &cli_action
@@ -824,6 +825,7 @@ pub(crate) fn send_action_to_session(
                 "",
                 Some(&live_sessions),
                 watch_interval(*interval_ms),
+                *changes_only,
             )
         } else {
             zellij_client::cli_client::start_list_agents_all_sessions_client(
@@ -1116,12 +1118,53 @@ fn attach_with_cli_client(
     // server would have to keep a caller alive across an unbounded stretch of time to do it here
     if let zellij_utils::cli::CliAction::Wait {
         pane_id,
+        panes,
         wait_for,
         pattern,
         quiet_ms,
         timeout,
     } = &cli_action
     {
+        if *wait_for == zellij_utils::cli::WaitFor::AgentChange {
+            let mut targets = panes.clone();
+            if !pane_id.is_empty() {
+                targets.push(pane_id.clone());
+            }
+            let make_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            };
+            let mut ids = Vec::new();
+            for target in targets {
+                match zellij_client::cli_client::resolve_pane_target(
+                    make_input(),
+                    session_name,
+                    &target,
+                ) {
+                    Ok(PaneId::Terminal(id)) => ids.push(id),
+                    Ok(_) => {
+                        eprintln!("Agent-change requires terminal panes");
+                        std::process::exit(2);
+                    },
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(2);
+                    },
+                }
+            }
+            std::process::exit(zellij_client::cli_client::start_agent_change_client(
+                &make_input,
+                session_name,
+                &ids,
+                (*timeout > 0).then(|| Duration::from_secs(*timeout)),
+                structure_report,
+            ));
+        }
+        if pane_id.is_empty() || !panes.is_empty() {
+            eprintln!("This wait requires one positional pane; --pane requires --for agent-change");
+            std::process::exit(2);
+        }
         // an id form needs no lookup to be understood, and is asked about anyway: the session is
         // the only thing that can say whether a pane privacy policy withholds it, and a wait that
         // skipped the question would poll a list the pane is not in and call that an exit
@@ -1139,6 +1182,7 @@ fn attach_with_cli_client(
             },
         };
         let condition = match wait_for {
+            zellij_utils::cli::WaitFor::AgentChange => unreachable!(),
             zellij_utils::cli::WaitFor::Exit => zellij_client::cli_client::WaitCondition::Exit,
             zellij_utils::cli::WaitFor::Quiet => {
                 zellij_client::cli_client::WaitCondition::Quiet(Duration::from_millis(*quiet_ms))
@@ -1240,6 +1284,7 @@ fn attach_with_cli_client(
     // client/server contract
     if let zellij_utils::cli::CliAction::ListAgents {
         watch: true,
+        changes_only,
         interval_ms,
         ..
     } = &cli_action
@@ -1253,6 +1298,7 @@ fn attach_with_cli_client(
             session_name,
             None,
             watch_interval(*interval_ms),
+            *changes_only,
         );
         std::process::exit(exit_status);
     }

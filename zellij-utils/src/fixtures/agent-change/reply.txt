@@ -1,0 +1,3 @@
+What changed?
+1) The wait records agent changes.
+2) The client prints one reply line.

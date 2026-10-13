@@ -51,6 +51,27 @@ Sessions themselves are portable across the swap: sockets are scoped by client/s
 (`$XDG_RUNTIME_DIR/zellij/contract_version_1/`), not by version string, so the fork CLI attaches to
 and manages sessions started by a stock build of the same contract, and the reverse.
 
+## Agent changes wake a supervising agent
+
+Start the child, then wait for agent-change in the background; never poll the screen.
+
+```sh
+zellij action --json wait --for agent-change --pane sunny-otter --pane quiet-fox --timeout 300
+zellij list-agents --watch --changes-only
+```
+
+Omit `--pane` to watch every agent in the session except the caller.
+The wait records state, name, identity, appearance, and exit changes.
+Exit 0 reports a change; exit 2 reports a timeout or session failure.
+The JSON record includes pane handle, tab, kind, name, old/new states, and one last reply line.
+The reply comes from the harness transcript when a turn ends, when available.
+`--changes-only` streams those records as NDJSON and omits the initial agent list.
+The client samples internally; the supervising agent runs one blocking command.
+Without OSC 7501, a small screen detector recognizes trust gates, rate-limit gates, and question menus.
+The harness-map evaluator will replace this fallback.
+MCP exposes the same wait through `zellij_wait_for until=agent_change`; `pane` remains optional for this mode.
+The capability is `wait-agent-change`.
+
 ## Versioning
 
 `<upstream version>-nkmk.<fork counter>`, e.g. `0.45.0-nkmk.1`. `zellij --version` reports the fork

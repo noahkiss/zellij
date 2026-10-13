@@ -239,7 +239,9 @@ pub const TOOLS: &[ToolSpec] = &[
                to a shell; read `ready_by` (prompt, or quiet for a shell without OSC 133 marks, \
                where quiet_ms is the window). Every wait is bounded: without timeout_s it gives \
                up after 300 seconds rather than blocking for the life of the pane. \
-               until=agent_idle is for a pane running a coding agent: it returns when the agent \
+               Start the child, then wait for agent-change in the background; never poll the screen. \
+               until=agent_change wakes on agent state, identity or name changes. Omit pane to watch \
+               every agent except the caller. until=agent_idle is for a pane running a coding agent: it returns when the agent \
                stops working - its turn ended (`state` idle, done or error) or it is blocked on a \
                person (`state` blocked, with `state_kind` permission, question or auth and the \
                question in `state_msg`). Read `state` to tell which. until=agent_waiting returns \
@@ -254,9 +256,9 @@ pub const TOOLS: &[ToolSpec] = &[
             ParamSpec {
                 name: "pane",
                 kind: ParamKind::Str,
-                required: true,
+                required: false,
                 from: Some(("action wait", "pane_id")),
-                describe: "",
+                describe: "Pane target. Optional only for until=agent_change; omitting it watches other agents in the session.",
                 default: None,
             },
             ParamSpec {
@@ -268,6 +270,7 @@ pub const TOOLS: &[ToolSpec] = &[
                     "ready",
                     "agent_idle",
                     "agent_waiting",
+                    "agent_change",
                 ]),
                 required: false,
                 from: Some(("action wait", "--for")),
@@ -440,9 +443,10 @@ pub const TOOLS: &[ToolSpec] = &[
                harness's own way, `--model` for all four), brief is a file whose text becomes its \
                first prompt, cwd is where it works and name is what its frame says. It is typed \
                into your shell once the shell is ready, like any shell command, and the call \
-               returns the pane's handle as soon as it is typed: follow with zellij_wait_for \
-               until=agent_idle for the end of its first turn, and zellij_read_pane last_reply \
-               for what it said. The brief is in the agent's command line, so list-agents shows \
+               returns the pane's handle as soon as it is typed. Start the child, then wait for \
+               agent-change in the background; never poll the screen. Use zellij_wait_for \
+               until=agent_change and inspect new_state. Finished turns include a last reply line; \
+               zellij_read_pane last_reply reads the full reply. The brief is in the agent's command line, so list-agents shows \
                it; a session restore brings the agent back as a resume of its session, without \
                the brief. On another machine (session host/session) kind is agent_tab or tab, \
                cwd is an absolute path there, exec runs through /bin/sh, and the brief is \

@@ -39,6 +39,9 @@ use zellij_utils::consts::VERSION;
 
 /// What a client is told this server is, before it asks for anything.
 const INSTRUCTIONS: &str = "\
+Start the child, then wait for agent-change in the background; never poll the screen.
+Use zellij_wait_for until=agent_change.
+
 Drive a running zellij session: read what is on a pane, wait for something to happen in one, type
 into one, and make or rearrange panes and tabs.
 
