@@ -1214,6 +1214,16 @@ fn attach_with_cli_client(
         );
         std::process::exit(exit_status);
     }
+    if let zellij_utils::cli::CliAction::Whoami { json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_whoami_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
     // `list-agents` never becomes an action either. It is `list-panes` with a filter and a
     // different table, and doing that in the client is what keeps a whole verb off the
     // client/server contract

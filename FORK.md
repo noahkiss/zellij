@@ -9617,6 +9617,57 @@ through the fallback, and "no agents" for a Mac with none. Against the scratch s
 into the agent tab, a `submit`, a `wait --for match`, a `dump-screen`, a file drop over stdin, a
 `show` of an uploaded PNG, a close and a `move-tab` all answered as they do locally.
 
+### Live agent names, pane frames and caller context
+
+`zellij list-agents` aliases `zellij action list-agents`, including watch and all-session options.
+`list-agents` shows each agent's messaging name. Its JSON carries `name` and `self`.
+The caller's row shows `(you)` in the table, using `ZELLIJ_PANE_ID` and the caller's session.
+`list-panes --json` carries the name under `agent` and marks the caller with `self`.
+MCP overview scopes `agents`, `my_agents` and `fleet` preserve these fields.
+
+Claude names come from its live process's session record.
+The server verifies the record's pid and the Claude process before trusting its name.
+The server refreshes names once per second, including restarts and name removal.
+Identity follows the foreground process, including shells with job control disabled.
+Configured default shells remain shell panes, so their agent children participate in detection.
+Other harnesses return `name: null`; session ids never substitute for names.
+`ZELLIJ_CLAUDE_SESSIONS_DIR` overrides the record directory for isolated tests.
+The default follows `CLAUDE_CONFIG_DIR`, then `~/.claude/sessions`.
+
+Enable names before pane titles with this top-level config key:
+
+```kdl
+pane_frame_agent_name true
+```
+
+The key defaults to false and reloads live.
+A named frame reads `project-1 · title`; changing the name refreshes the frame.
+
+`zellij action whoami` prints the caller's session, host, tab, pane handle, and agent name.
+It also lists other agents with names, tabs, handles, and states.
+`--json` returns the same context as JSON.
+The command requires `ZELLIJ_PANE_ID` and respects pane privacy.
+
+`zellij setup --agent-hooks` includes a Claude SessionStart context hook.
+Install the emitted script and merge the emitted hooks into Claude's settings.
+The context hook stays silent outside zellij and bounds its lookup to 150 ms.
+Its context ends with:
+
+> Agent list changes; run `zellij list-agents` before addressing another agent.
+> To talk to an agent that has a name, message it by that name with your harness's messaging tool;
+> type into its pane only when it has no messaging.
+
+MCP offers an `agents` prompt and a `zellij://agents` JSON resource.
+Each request reads the current session's live list, including names, tabs, handles, and caller markers.
+Neither adds a tool or changes the tool parameter limit.
+After successful `zellij_write_input`, a named target adds this hint:
+
+```text
+this pane runs claude `project-1`; prefer messaging it by name
+```
+
+The hint never blocks input. Unnamed agents receive no hint.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

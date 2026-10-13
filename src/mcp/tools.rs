@@ -112,7 +112,8 @@ pub const TOOLS: &[ToolSpec] = &[
         reports: &["action list-panes", "action list-agents", "list-sessions"],
         tips: "Call this before zellij_create: a pane you already own is cheaper than a new one, \
                and its handle is in this answer. scope=agents narrows the same walk to the panes \
-               running claude, opencode, codex or pi, each with the harness's own session id where \
+               running claude, opencode, codex or pi, each with a live name (Claude only for now), \
+               a self marker and the harness's own session id where \
                it exports one, the state it reports (state, state_kind, state_msg) and how many \
                seconds ago it last reported (state_age_s) and last drew anything (output_age_s): \
                the supervision view. scope=my_agents is the same, for only the agents in your own \
@@ -322,7 +323,8 @@ pub const TOOLS: &[ToolSpec] = &[
         tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
                text is written literally and presses nothing. Pass one of keys, text, \
                file or agent_action. This is the cheap way to do more work in a pane you already made: \
-               reach for it before zellij_create. To message a coding agent, pass text with \
+               reach for it before zellij_create. Prefer your harness's messaging tool for a named agent. \
+               Successful input to a named agent adds a messaging hint. To send pane input, pass text with \
                submit=true: the text goes in as one bracketed paste, so its newlines do not send \
                it early, and then Enter sends it. Follow with zellij_wait_for until=agent_idle. \
                agent_action works on a pane running claude, codex, opencode or pi, and checks \

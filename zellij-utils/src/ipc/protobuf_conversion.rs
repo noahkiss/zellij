@@ -1042,6 +1042,7 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             session_restart_drop_env: None,
             report_pane_env: None,
             detect_agents: None,
+            pane_frame_agent_name: None,
             session_up_resume: None,
             session_service: None,
             pane_privacy: None,

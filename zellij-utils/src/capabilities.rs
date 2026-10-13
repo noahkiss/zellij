@@ -92,6 +92,11 @@ pub const CAPABILITIES: &[&str] = &[
     "snapshot-dir-config", // snapshot_dir, session_snapshot_limit
     "session-service-config", // session_service, pin_exe
     "session-warnings", // Full Disk Access / superseded-build, on ModeInfo for a bar to badge
+    "agent-names",      // live Claude messaging names and caller markers in CLI agent lists
+    "pane-frame-agent-name", // pane_frame_agent_name, default false
+    "agent-whoami",     // action whoami and Claude SessionStart pane context
+    "mcp-agent-surfaces", // agents prompt and zellij://agents resource
+    "mcp-agent-input-hint", // named agent guidance after zellij_write_input
     "mcp-remote-hosts", // zellij mcp: remote_hosts in config.kdl, host/session, scope=fleet
 ];
 

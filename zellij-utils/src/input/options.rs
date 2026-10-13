@@ -511,6 +511,11 @@ pub struct Options {
     #[serde(default)]
     pub detect_agents: Option<bool>,
 
+    /// Show the live agent name before the pane frame title. Defaults to false.
+    #[clap(skip)]
+    #[serde(default)]
+    pub pane_frame_agent_name: Option<bool>,
+
     /// Whether a plain `zellij session up` comes back with the shape the session had. Default:
     /// true. `up` already resurrects from the in-place cache that a crash leaves behind; this is
     /// what makes it reach the archived snapshot as well, which is the only copy left after a
@@ -871,6 +876,7 @@ impl Options {
             .clone()
             .or_else(|| self.report_pane_env.clone());
         let detect_agents = other.detect_agents.or(self.detect_agents);
+        let pane_frame_agent_name = other.pane_frame_agent_name.or(self.pane_frame_agent_name);
         let session_up_resume = other.session_up_resume.or(self.session_up_resume);
         let default_floating_size = other
             .default_floating_size
@@ -981,6 +987,7 @@ impl Options {
             resurrect_commands,
             report_pane_env,
             detect_agents,
+            pane_frame_agent_name,
             session_up_resume,
             default_floating_size,
             styled_underlines,
@@ -1108,6 +1115,7 @@ impl Options {
             .clone()
             .or_else(|| self.report_pane_env.clone());
         let detect_agents = other.detect_agents.or(self.detect_agents);
+        let pane_frame_agent_name = other.pane_frame_agent_name.or(self.pane_frame_agent_name);
         let session_up_resume = other.session_up_resume.or(self.session_up_resume);
         let default_floating_size = other
             .default_floating_size
@@ -1218,6 +1226,7 @@ impl Options {
             resurrect_commands,
             report_pane_env,
             detect_agents,
+            pane_frame_agent_name,
             session_up_resume,
             default_floating_size,
             styled_underlines,

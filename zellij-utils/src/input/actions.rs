@@ -2310,6 +2310,9 @@ impl Action {
             // `list-agents` is a projection of `list-panes` rather than a question of its own. The
             // client asks `list-panes --json` and filters what comes back, which is what keeps a
             // whole verb off the client/server contract. Intercepted before this, like `wait`
+            CliAction::Whoami { .. } => {
+                Err("`whoami` is run by the client, not sent as an action".into())
+            },
             CliAction::ListAgents { .. } => {
                 Err("`list-agents` is run by the client, not sent as an action".into())
             },

@@ -134,6 +134,7 @@ Config {
         resurrect_commands: None,
         report_pane_env: None,
         detect_agents: None,
+        pane_frame_agent_name: None,
         session_up_resume: None,
         default_floating_size: None,
         styled_underlines: None,

@@ -120,6 +120,9 @@ pub fn agent_identity_env_names() -> Vec<&'static str> {
 pub struct PaneAgent {
     /// The harness: `claude`, `opencode`, `codex` or `pi`.
     pub kind: String,
+    /// The live messaging name; unknown names stay null.
+    #[serde(default)]
+    pub name: Option<String>,
     /// The harness's own session id, if it exports one this build knows to look for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -191,6 +194,7 @@ pub fn detect(command: &[String], env: &BTreeMap<String, String>) -> Option<Pane
     };
     Some(PaneAgent {
         kind: harness.kind.to_owned(),
+        name: None,
         agent_id,
         source: source.to_owned(),
         session_source: None,
@@ -298,6 +302,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
             )
             .map(|(_, command)| command.to_owned());
             Some(AgentListEntry {
+                is_self: false,
                 handle: entry.pane_info.handle.clone(),
                 pane_id: entry.pane_info.id,
                 tab_id: entry.pane_info.tab_id,
@@ -322,7 +327,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
 /// already count to. It is the `OSC 7501` state, with a blocked program's reason after a colon:
 /// `blocked:permission`.
 pub const AGENT_TABLE_KEYS: &str =
-    "TAB_ID TAB_NAME PANE_ID HANDLE KIND AGENT_ID SOURCE TITLE COMMAND CWD STATE";
+    "TAB_ID TAB_NAME PANE_ID HANDLE KIND AGENT_ID SOURCE TITLE COMMAND CWD STATE NAME";
 
 /// The agent list as the fork's table: an UPPER_SNAKE header row and one line per agent.
 ///
@@ -356,6 +361,11 @@ fn table_of(agents: &ListAgentsResponse, with_session: bool) -> Vec<String> {
             dashed(agent.command.clone()),
             dashed(agent.cwd.as_ref().map(|cwd| cwd.display().to_string())),
             dashed(agent.program_status.as_ref().map(state_cell)),
+            if agent.is_self {
+                format!("{} (you)", dashed(agent.agent.name.clone()))
+            } else {
+                dashed(agent.agent.name.clone())
+            },
         ];
         if with_session {
             row.push(dashed(agent.session.clone()));
@@ -754,8 +764,11 @@ mod tests {
             "the harness keeps its own key"
         );
         let table = agent_table(&agents);
-        assert!(table[0].ends_with("CWD  STATE"));
-        assert!(table[1].ends_with("blocked:permission"));
+        assert!(table[0]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .ends_with(&["STATE", "NAME"]));
+        assert!(table[1].contains("blocked:permission"));
 
         let quiet = PaneListEntry {
             program_status: None,
@@ -770,6 +783,7 @@ mod tests {
 
     fn watched(pane_id: u32, session: Option<&str>, state: Option<&str>) -> AgentListEntry {
         AgentListEntry {
+            is_self: false,
             handle: format!("pane-{pane_id}"),
             pane_id,
             tab_id: 0,
@@ -892,8 +906,8 @@ mod tests {
     #[test]
     fn the_all_sessions_table_puts_session_last() {
         let table = agent_table_with_sessions(&vec![watched(1, Some("work"), Some("idle"))]);
-        assert!(table[0].ends_with("STATE  SESSION"));
-        assert!(table[1].ends_with("idle   work"));
+        assert!(table[0].ends_with("NAME  SESSION"));
+        assert!(table[1].ends_with("work"));
         assert!(agent_table_with_sessions(&vec![])[0].ends_with("SESSION"));
     }
 
@@ -1082,5 +1096,52 @@ mod tests {
         own.insert(AGENT_KIND.to_owned(), "opencode".to_owned());
         let found = detect(&argv(&["opencode"]), &own).unwrap();
         assert_eq!(found.agent_id.as_deref(), Some("ses_own"));
+    }
+}
+
+/// Mark the caller only within its own session.
+pub fn mark_self(agents: &mut ListAgentsResponse, pane_id: Option<u32>, same_session: bool) {
+    for agent in agents {
+        agent.is_self = same_session && pane_id == Some(agent.pane_id);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    #[test]
+    fn names_are_null_until_a_live_record_supplies_them() {
+        for kind in ["claude", "codex", "opencode", "pi"] {
+            let agent = detect_command_line(kind, &BTreeMap::new()).unwrap();
+            assert!(serde_json::to_value(agent).unwrap()["name"].is_null());
+        }
+    }
+    #[test]
+    fn caller_marker_requires_the_same_pane_and_session() {
+        let mut agent = crate::data::AgentListEntry {
+            is_self: false,
+            handle: "test-pane".into(),
+            pane_id: 7,
+            tab_id: 0,
+            tab_position: 0,
+            tab_name: "tab".into(),
+            title: "title".into(),
+            agent: detect_command_line("claude", &BTreeMap::new()).unwrap(),
+            command: None,
+            cwd: None,
+            pid: None,
+            last_output_at: None,
+            program_status: None,
+            session: None,
+        };
+        agent.agent.name = Some("project-7".into());
+        let mut agents = vec![agent];
+        mark_self(&mut agents, Some(7), true);
+        assert_eq!(serde_json::to_value(&agents[0]).unwrap()["self"], true);
+        assert!(agent_table(&agents)[1].contains("project-7 (you)"));
+        mark_self(&mut agents, Some(7), false);
+        assert!(!agents[0].is_self);
+        mark_self(&mut agents, Some(8), true);
+        assert!(!agents[0].is_self);
     }
 }

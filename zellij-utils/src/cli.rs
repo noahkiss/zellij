@@ -372,6 +372,24 @@ pub enum Sessions {
         #[clap(short, long)]
         json: bool,
     },
+    /// List live coding agents with names and pane handles
+    ListAgents {
+        /// Output as JSON
+        #[clap(short, long)]
+        json: bool,
+        /// Include the count of privacy-withheld panes
+        #[clap(long)]
+        report_withheld: bool,
+        /// List agents in every live session
+        #[clap(long)]
+        all_sessions: bool,
+        /// Print agent changes as JSON lines
+        #[clap(long)]
+        watch: bool,
+        /// Poll interval with --watch, in milliseconds
+        #[clap(long, default_value = "1000")]
+        interval_ms: u64,
+    },
     /// List existing plugin aliases
     #[clap(visible_alias = "la")]
     ListAliases,
@@ -2611,6 +2629,12 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
     },
+    /// Show this pane and the agents in its session
+    Whoami {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// List the panes running a coding agent, and which agent each one is
     ///
     /// A filtered `list-panes`: the panes whose command is a harness this build recognises -
@@ -3061,6 +3085,7 @@ impl CliAction {
             | CliAction::ListClients { json, .. }
             | CliAction::ListEvents { json, .. }
             | CliAction::ListAgents { json, .. }
+            | CliAction::Whoami { json, .. }
             | CliAction::LastReply { json, .. }
             | CliAction::CurrentTabInfo { json, .. } => {
                 *json = true;
@@ -3567,6 +3592,36 @@ mod tests {
     /// Parse a command line on a thread with a real stack. See [`on_big_stack`].
     fn parse_cli(args: Vec<String>) -> Result<CliArgs, clap::Error> {
         on_big_stack(move || CliArgs::try_parse_from(args))
+    }
+
+    #[test]
+    fn top_level_list_agents_accepts_the_action_options() {
+        let cli = parse_cli(
+            [
+                "zellij",
+                "list-agents",
+                "--json",
+                "--all-sessions",
+                "--report-withheld",
+                "--watch",
+                "--interval-ms",
+                "250",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions(Sessions::ListAgents {
+                json: true,
+                all_sessions: true,
+                report_withheld: true,
+                watch: true,
+                interval_ms: 250
+            }))
+        ));
     }
 
     fn parse_action(args: &[&str]) -> CliAction {

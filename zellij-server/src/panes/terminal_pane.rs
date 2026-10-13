@@ -153,6 +153,7 @@ pub struct TerminalPane {
     selection_scrolled_at: time::Instant,
     content_offset: Offset,
     pane_title: String,
+    frame_agent_name: Option<String>,
     pane_name: String,
     prev_pane_name: String,
     frame: HashMap<ClientId, PaneFrame>,
@@ -540,6 +541,13 @@ impl Pane for TerminalPane {
             Ok(None)
         }
     }
+    fn set_frame_agent_name(&mut self, name: Option<String>) {
+        if self.frame_agent_name != name {
+            self.frame_agent_name = name;
+            self.frame.clear();
+        }
+    }
+
     fn render_frame(
         &mut self,
         client_id: ClientId,
@@ -593,6 +601,12 @@ impl Pane for TerminalPane {
             text_color_override.into()
         } else {
             self.title_with_bell_indicator(normal_title)
+        };
+
+        let pane_title = if frame_params.blank_title {
+            pane_title
+        } else {
+            prefix_agent_name(pane_title, self.frame_agent_name.as_deref())
         };
 
         let frame_geom = frame_params
@@ -1527,6 +1541,7 @@ impl TerminalPane {
             style,
             selection_scrolled_at: time::Instant::now(),
             pane_title: initial_pane_title,
+            frame_agent_name: None,
             pane_name: pane_name.clone(),
             prev_pane_name: pane_name,
             borderless: false,
@@ -1757,3 +1772,24 @@ mod grid_tests;
 #[cfg(test)]
 #[path = "./unit/search_in_pane_tests.rs"]
 mod search_tests;
+
+fn prefix_agent_name(title: String, name: Option<&str>) -> String {
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => format!("{name} · {title}"),
+        None => title,
+    }
+}
+
+#[test]
+fn frame_agent_name_prefix_tracks_changes() {
+    assert_eq!(prefix_agent_name("title".into(), None), "title");
+    assert_eq!(prefix_agent_name("title".into(), Some("")), "title");
+    assert_eq!(
+        prefix_agent_name("title".into(), Some("agent-1")),
+        "agent-1 · title"
+    );
+    assert_eq!(
+        prefix_agent_name("title".into(), Some("agent-2")),
+        "agent-2 · title"
+    );
+}

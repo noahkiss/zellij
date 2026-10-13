@@ -349,6 +349,10 @@ load_plugins {
 //
 // pane_frames true
 
+// Show the live agent name before the pane title.
+// Defaults to false; Claude Code names are available.
+// pane_frame_agent_name false
+
 // Set the pane frame style when pane_frames is enabled
 // Options:
 //   - titles (default - draw a title above each pane)

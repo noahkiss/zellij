@@ -115,10 +115,29 @@ pub fn start_cli_client(
                 );
             },
             action => {
+                let mark_panes = matches!(
+                    &action,
+                    Action::ListPanes {
+                        output_json: true,
+                        ..
+                    }
+                );
                 let promised_a_pane = action_reports_a_new_pane(&action);
                 let lines = match individual_messages_client(&mut os_input, action, pane_id) {
                     ActionOutcome::Done(exit_status) => return exit_status,
                     ActionOutcome::Reported(lines) => lines,
+                };
+                let lines = if mark_panes {
+                    pane_list_with_self(
+                        lines,
+                        os_input
+                            .env_variable("ZELLIJ_PANE_ID")
+                            .and_then(|id| id.parse().ok()),
+                        os_input.env_variable("ZELLIJ_SESSION_NAME").as_deref()
+                            == Some(session_name),
+                    )
+                } else {
+                    lines
                 };
                 // a verb that makes a pane answers with the pane it made, and the session writes
                 // that line only once a tab has taken the pane. No line means no pane, and the
@@ -1338,11 +1357,139 @@ pub fn start_drop_file_client(
     0
 }
 
+/// Show the caller's pane and its session's live agents.
+pub fn start_whoami_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    output_json: bool,
+) -> i32 {
+    if std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .as_deref()
+        .is_some_and(|own_session| own_session != session_name)
+    {
+        eprintln!("whoami must target the caller's own session");
+        return 2;
+    }
+    let caller = match std::env::var("ZELLIJ_PANE_ID").ok().and_then(|id| {
+        id.strip_prefix("terminal_")
+            .unwrap_or(&id)
+            .parse::<u32>()
+            .ok()
+    }) {
+        Some(id) => id,
+        None => {
+            eprintln!("whoami needs ZELLIJ_PANE_ID from a terminal pane");
+            return 2;
+        },
+    };
+    let envelope = match panes_of_session(os_input, session_name) {
+        Ok(envelope) => envelope,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    let pane = match envelope
+        .panes
+        .iter()
+        .find(|p| !p.pane_info.is_plugin && p.pane_info.id == caller)
+    {
+        Some(pane) => pane,
+        None => {
+            eprintln!("whoami could not find the caller's pane in this session");
+            return 2;
+        },
+    };
+    let report = whoami_report(
+        session_name,
+        zellij_utils::shared::short_hostname(),
+        pane,
+        &envelope.panes,
+        envelope.withheld,
+    );
+    if output_json {
+        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+    } else {
+        println!("{}", whoami_text(&report));
+    }
+    0
+}
+
+fn whoami_report(
+    session: &str,
+    host: &str,
+    pane: &PaneListEntry,
+    panes: &[PaneListEntry],
+    withheld: usize,
+) -> serde_json::Value {
+    let others = agent_detect::agents_from_pane_list(panes.to_vec())
+        .into_iter()
+        .filter(|agent| agent.pane_id != pane.pane_info.id)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "session": session, "host": host,
+        "pane_id": format!("terminal_{}", pane.pane_info.id),
+        "handle": pane.pane_info.handle,
+        "tab_id": pane.pane_info.tab_id, "tab_name": pane.tab_name,
+        "tab_position": pane.tab_position,
+        "name": pane.agent.as_ref().and_then(|agent| agent.name.as_deref()),
+        "agents": others, "withheld": withheld,
+    })
+}
+
+fn whoami_text(report: &serde_json::Value) -> String {
+    let string = |key: &str| report[key].as_str().unwrap_or("unnamed");
+    let mut lines = vec![format!(
+        "You are {} in session {} on {}, tab {} (position {}), pane {} ({}).",
+        string("name"),
+        string("session"),
+        string("host"),
+        string("tab_name"),
+        report["tab_position"],
+        string("handle"),
+        string("pane_id")
+    )];
+    if let Some(agents) = report["agents"].as_array() {
+        for agent in agents {
+            lines.push(format!(
+                "Agent {}: {}, tab {}, pane {}, state {}.",
+                agent["name"].as_str().unwrap_or("unnamed"),
+                agent["kind"].as_str().unwrap_or("unknown"),
+                agent["tab_name"].as_str().unwrap_or(""),
+                agent["handle"].as_str().unwrap_or(""),
+                agent["state"].as_str().unwrap_or("unknown")
+            ));
+        }
+    }
+    if report["withheld"].as_u64().unwrap_or(0) > 0 {
+        lines.push(format!("Privacy withheld {} panes.", report["withheld"]));
+    }
+    lines.push("Agent list changes; run `zellij list-agents` before addressing another agent. To talk to an agent that has a name, message it by that name with your harness's messaging tool; type into its pane only when it has no messaging.".into());
+    lines.join("\n")
+}
+
 /// The agents of one session, and how many of its panes a privacy policy withheld.
 fn agents_of_session(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
 ) -> Result<(ListAgentsResponse, usize), String> {
+    let envelope = panes_of_session(os_input, session_name)?;
+    let mut agents = agent_detect::agents_from_pane_list(envelope.panes);
+    agent_detect::mark_self(
+        &mut agents,
+        std::env::var("ZELLIJ_PANE_ID")
+            .ok()
+            .and_then(|id| id.parse().ok()),
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session_name),
+    );
+    Ok((agents, envelope.withheld))
+}
+
+fn panes_of_session(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<ListPanesEnvelope, String> {
     let lines = ask(
         os_input,
         session_name,
@@ -1367,10 +1514,7 @@ fn agents_of_session(
             session_name, e
         )
     })?;
-    Ok((
-        agent_detect::agents_from_pane_list(envelope.panes),
-        envelope.withheld,
-    ))
+    Ok(envelope)
 }
 
 /// The agents of several sessions, each row naming its session; the withheld panes summed; and
@@ -2415,6 +2559,35 @@ mod tests {
     use super::*;
     use zellij_utils::data::{NewPanePlacement, UnblockCondition};
 
+    #[test]
+    fn whoami_names_the_caller_and_excludes_it_from_other_agents() {
+        let mut panes: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (7, false, false, None),
+            (8, false, false, None),
+        ]))
+        .unwrap();
+        for (index, pane) in panes.iter_mut().enumerate() {
+            pane.agent = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude", "name": format!("project-{}", index), "source": "command"
+                }))
+                .unwrap(),
+            );
+            pane.pane_info.handle = format!("pane-{}", index);
+            pane.tab_name = "coding".into();
+        }
+        let report = whoami_report("scratch", "test-host", &panes[0], &panes, 2);
+        assert_eq!(report["name"], "project-0");
+        assert_eq!(report["pane_id"], "terminal_7");
+        assert_eq!(report["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(report["agents"][0]["name"], "project-1");
+        let text = whoami_text(&report);
+        assert!(text.contains("Privacy withheld 2 panes."));
+        assert!(text.ends_with("type into its pane only when it has no messaging."));
+        panes[0].agent.as_mut().unwrap().name = None;
+        assert!(whoami_report("scratch", "test-host", &panes[0], &panes, 0)["name"].is_null());
+    }
+
     fn blocking_pane(unblock_condition: Option<UnblockCondition>) -> Action {
         Action::NewBlockingPane {
             placement: NewPanePlacement::default(),
@@ -3083,6 +3256,7 @@ mod tests {
         agent_id: Option<&str>,
     ) -> zellij_utils::data::AgentListEntry {
         zellij_utils::data::AgentListEntry {
+            is_self: false,
             handle: format!("pane-{}", pane_id),
             pane_id,
             tab_id: 0,
@@ -3091,6 +3265,7 @@ mod tests {
             title: String::new(),
             agent: agent_detect::PaneAgent {
                 kind: kind.to_owned(),
+                name: None,
                 agent_id: agent_id.map(str::to_owned),
                 source: "command".to_owned(),
                 session_source: None,
@@ -3135,5 +3310,67 @@ mod tests {
         assert!(why(3).contains("no claude session id"), "{}", why(3));
         assert!(why(4).contains("no transcript"), "{}", why(4));
         assert!(why(9).contains("not running a coding agent"), "{}", why(9));
+    }
+}
+
+/// Attach the caller marker to JSON pane rows without changing the wire contract.
+fn pane_list_with_self(
+    lines: Vec<String>,
+    pane_id: Option<u32>,
+    same_session: bool,
+) -> Vec<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&lines.join("\n")) else {
+        return lines;
+    };
+    let rows = if value.is_array() {
+        value.as_array_mut()
+    } else {
+        value
+            .get_mut("panes")
+            .and_then(|panes| panes.as_array_mut())
+    };
+    let Some(rows) = rows else {
+        return lines;
+    };
+    for row in rows {
+        let is_self = same_session
+            && pane_id.is_some()
+            && row.get("is_plugin").and_then(serde_json::Value::as_bool) != Some(true)
+            && pane_id.map(u64::from) == row.get("id").and_then(|id| id.as_u64());
+        if let Some(row) = row.as_object_mut() {
+            row.insert("self".into(), serde_json::Value::Bool(is_self));
+        }
+    }
+    serde_json::to_string_pretty(&value)
+        .map(|value| vec![value])
+        .unwrap_or(lines)
+}
+
+#[cfg(test)]
+mod pane_self_tests {
+    use super::*;
+    #[test]
+    fn json_panes_mark_only_the_callers_session_and_pane() {
+        for envelope in [false, true] {
+            let json = if envelope {
+                r#"{"panes":[{"id":7},{"id":8},{"id":7,"is_plugin":true}],"withheld":1}"#
+            } else {
+                r#"[{"id":7},{"id":8},{"id":7,"is_plugin":true}]"#
+            };
+            let value: serde_json::Value = serde_json::from_str(
+                &pane_list_with_self(vec![json.into()], Some(7), true).join("\n"),
+            )
+            .unwrap();
+            let rows = if envelope { &value["panes"] } else { &value };
+            assert_eq!(rows[0]["self"], true);
+            assert_eq!(rows[1]["self"], false);
+            assert_eq!(rows[2]["self"], false);
+            let value: serde_json::Value = serde_json::from_str(
+                &pane_list_with_self(vec![json.into()], Some(7), false).join("\n"),
+            )
+            .unwrap();
+            let rows = if envelope { &value["panes"] } else { &value };
+            assert_eq!(rows[0]["self"], false);
+        }
     }
 }

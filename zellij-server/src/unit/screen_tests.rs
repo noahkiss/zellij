@@ -16358,6 +16358,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
             command: Some(vec!["claude".to_owned(), "--resume".to_owned()]),
             env: Default::default(),
             agent_env: Default::default(),
+            agent_name: None,
             agent_session_source: None,
             osc_agent_session: None,
         },
@@ -16367,6 +16368,7 @@ pub fn pane_info_carries_the_pid_cwd_and_command_the_pty_reported() {
         .send(ScreenInstruction::UpdatePaneProcessInfo {
             process_info,
             detect_agents: true,
+            pane_frame_agent_name: false,
         });
     // any state change makes screen rebuild the manifest and report it
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
@@ -16487,6 +16489,7 @@ fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
             command: Some(vec!["claude".to_owned()]),
             env: Default::default(),
             agent_env: Default::default(),
+            agent_name: None,
             agent_session_source: None,
             osc_agent_session: None,
         },
@@ -16508,6 +16511,7 @@ fn pane_list_for_an_agent_pane(
         .send(ScreenInstruction::UpdatePaneProcessInfo {
             process_info,
             detect_agents,
+            pane_frame_agent_name: false,
         });
     let (response_channel, panes) = crossbeam::channel::unbounded();
     let _ = mock_screen.to_screen.send(ScreenInstruction::ListPanes {
@@ -16559,6 +16563,7 @@ pub fn an_agent_row_says_where_its_session_id_came_from() {
             )]
             .into_iter()
             .collect(),
+            agent_name: None,
             agent_session_source: Some("open-file".to_owned()),
             osc_agent_session: None,
         },
@@ -16879,6 +16884,7 @@ pub fn pane_info_carries_the_allowlisted_environment() {
                 .into_iter()
                 .collect(),
             agent_env: Default::default(),
+            agent_name: None,
             agent_session_source: None,
             osc_agent_session: None,
         },
@@ -16888,6 +16894,7 @@ pub fn pane_info_carries_the_allowlisted_environment() {
         .send(ScreenInstruction::UpdatePaneProcessInfo {
             process_info,
             detect_agents: true,
+            pane_frame_agent_name: false,
         });
     let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
         PaneId::Terminal(0),
@@ -18898,6 +18905,7 @@ pub fn an_agents_own_osc_report_wins_in_the_agent_row() {
             )]
             .into_iter()
             .collect(),
+            agent_name: None,
             agent_session_source: Some("record".to_owned()),
             osc_agent_session: Some("from-osc".to_owned()),
         },

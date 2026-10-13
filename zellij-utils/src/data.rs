@@ -2837,6 +2837,9 @@ pub struct PaneDump {
 /// pane and nothing else.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AgentListEntry {
+    /// Whether this row names the caller’s pane.
+    #[serde(default, rename = "self")]
+    pub is_self: bool,
     /// The pane's two-word handle: its address, and what a reader should use to talk to it.
     pub handle: String,
     /// The pane's integer id, for a caller that already speaks in them.
