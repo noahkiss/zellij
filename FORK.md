@@ -9712,6 +9712,11 @@ MCP overview scopes `agents`, `my_agents` and `fleet` preserve these fields.
 Claude names come from its live process's session record.
 The server verifies the record's pid and the Claude process before trusting its name.
 The server refreshes names once per second, including restarts and name removal.
+The detection tick discovers agent commands even when their panes produce no output.
+A silent agent can therefore acquire its record identity and messaging name while waiting at a prompt.
+The server caches record contents and checks their modification time on each tick.
+It re-reads the record when its modification time or foreground process changes.
+Name and session-id changes use the same cached record.
 Identity follows the foreground process, including shells with job control disabled.
 Configured default shells remain shell panes, so their agent children participate in detection.
 Other harnesses return `name: null`; session ids never substitute for names.

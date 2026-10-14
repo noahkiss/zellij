@@ -320,8 +320,8 @@ impl HeldPane {
 /// The walk is the expensive half of agent detection, and its answer is stable: a pane is one
 /// program, and that program's environment does not change under it. So a pane is walked when it is
 /// new, when its process is replaced, and - if nothing was found - once every
-/// [`AGENT_ENV_RETRY_TICKS`]. Claude retries each tick until its record appears.
-/// A live record avoids another walk until its process exits.
+/// [`AGENT_ENV_RETRY_TICKS`]. A verified Claude record handle checks metadata each tick,
+/// including while its record is missing. It avoids another walk until its process changes.
 #[derive(Debug)]
 struct AgentEnvProbe {
     /// The identity walk’s root PID: the foreground job, or the pane’s own child.
@@ -336,10 +336,63 @@ struct AgentEnvProbe {
     /// file a codex holds open.
     ///
     /// An agent moves to another session on `/clear` or `/new` without becoming another process,
-    /// so the walk's answer goes stale while the pid stays the same. This is re-read every tick
-    /// instead - one small file or one process's fd list, not a walk - and one that is gone sends
-    /// the pane back to the walk.
+    /// so the walk's answer can change while the pid stays the same.
+    /// Claude record metadata gates cached reads; Codex refreshes its open-file list.
+    /// A process that exits sends the pane back to the walk.
     live_session: Option<LiveSession>,
+}
+
+/// A Claude record changes only when its file changes or its foreground process changes.
+#[derive(Default)]
+struct AgentRecordCache {
+    key: Option<(
+        u32,
+        LiveSession,
+        Option<std::time::SystemTime>,
+        Option<String>,
+    )>,
+    session_id: Option<String>,
+    name: Option<String>,
+    env_fallback: BTreeMap<String, String>,
+}
+
+impl AgentRecordCache {
+    fn refresh(&mut self, child_pid: u32, live: &LiveSession) -> Option<String> {
+        let LiveSession::ClaudeRecord { pid, dir } = live else {
+            *self = Self::default();
+            return live.reread_live(open_files_of, crate::resurrect_hints::live_claude_process);
+        };
+        if !crate::resurrect_hints::live_claude_process(*pid) {
+            *self = Self::default();
+            return None;
+        }
+        let modified = std::fs::metadata(dir.join(format!("{}.json", pid)))
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        // PID reuse must invalidate a record validated for the earlier process.
+        let started = crate::resurrect_hints::process_start_ticks(*pid);
+        if self
+            .key
+            .as_ref()
+            .map_or(false, |(root, previous, _, start)| {
+                *root == child_pid && previous == live && start != &started
+            })
+        {
+            // Rebuild the environment fallback for the process that reused this PID.
+            *self = Self::default();
+            return None;
+        }
+        let key = (child_pid, live.clone(), modified, started);
+        if self.key.as_ref() != Some(&key) {
+            (self.session_id, self.name) = if modified.is_some() {
+                crate::resurrect_hints::claude_record_identity(dir, *pid)
+            } else {
+                (None, None)
+            };
+            self.key = Some(key);
+        }
+        self.session_id.clone()
+    }
 }
 
 /// An interactive shell remains a shell pane even when config supplies it as an explicit command.
@@ -374,19 +427,22 @@ impl AgentEnvProbe {
             || (!self.found && self.ticks_since_probe >= AGENT_ENV_RETRY_TICKS)
     }
 
-    /// Claude can write its record after SessionStart; retry until that record appears.
+    /// Rewalk changed processes and missing identities without a verified record handle.
     fn needs_identity_walk(&self, child_pid: u32, kind: &str) -> bool {
         self.kind != kind
-            || (kind == CLAUDE && self.live_session.is_none())
-            || self.needs_another_walk(child_pid)
+            || self.child_pid != child_pid
+            || (self.live_session.is_none()
+                && (kind == CLAUDE || self.needs_another_walk(child_pid)))
     }
 
     /// The session the agent this walk found holds now, re-read from where the walk found it.
     /// `None` when the walk found none, or that agent has since exited or moved on.
+    #[cfg(test)]
     fn live_session_id(&self) -> Option<String> {
         self.live_session_id_with(crate::resurrect_hints::live_claude_process)
     }
 
+    #[cfg(test)]
     fn live_session_id_with<C: Fn(u32) -> bool>(&self, live_claude: C) -> Option<String> {
         self.live_session
             .as_ref()?
@@ -396,8 +452,9 @@ impl AgentEnvProbe {
 
 /// What the pty thread knows about the process it started in a terminal pane.
 ///
-/// Everything here comes out of the caches `update_and_report_cwds` refreshes once a second for
-/// panes that produced output - reporting it to Screen costs a message, not a probe. This is the
+/// The detection tick refreshes command and agent caches even without pane output.
+/// CWD and ordinary environment caches retain their existing policies.
+/// Reporting the caches to Screen costs a message, not another probe. This is the
 /// snapshot half of the pair whose push half is `Event::CwdChanged` / `Event::CommandChanged`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PaneProcessInfo {
@@ -459,6 +516,7 @@ pub(crate) struct Pty {
     /// terminal_id -> when that pane was last walked for an identity, and what came of it. This is
     /// what keeps the walk off the tick for a pane whose answer is already known.
     agent_env_probes: HashMap<u32, AgentEnvProbe>,
+    agent_record_cache: HashMap<u32, AgentRecordCache>,
     /// terminal_id -> the session the pane's agent reported itself with `OSC 1337`.
     osc_agent_sessions: HashMap<u32, OscAgentSession>,
     /// terminal_id -> what a held pane kept of its agent when its pid was forgotten. See
@@ -1261,6 +1319,7 @@ impl Pty {
             last_reported_pane_frame_agent_name: None,
             terminal_agent_envs: HashMap::new(),
             agent_env_probes: HashMap::new(),
+            agent_record_cache: HashMap::new(),
             resume_misses: HashMap::new(),
             osc_agent_sessions: HashMap::new(),
             held_panes: HashMap::new(),
@@ -2773,8 +2832,8 @@ impl Pty {
     ///   pane in it therefore reads nothing, and the process table is not touched at all.
     ///
     /// A known live record avoids another walk until its process exits.
-    /// Claude retries each tick until its record appears; other missing identities retry every
-    /// [`AGENT_ENV_RETRY_TICKS`]. Record-backed names refresh each tick without another process walk.
+    /// Claude checks cached record metadata each tick; other missing identities retry every
+    /// [`AGENT_ENV_RETRY_TICKS`]. Record changes refresh names without another process walk.
     ///
     /// Either way the variable lives on a process the shell started, not on the shell, so this
     /// walks down from the pane's own child - the same problem `resurrect_command_hints` solves,
@@ -2816,6 +2875,9 @@ impl Pty {
         self.agent_env_probes
             .retain(|terminal_id, _| is_agent_pane(terminal_id));
 
+        self.agent_record_cache
+            .retain(|terminal_id, _| is_agent_pane(terminal_id));
+
         let sessions_dir = agent_panes
             .iter()
             .any(|(_, _, harness)| harness.kind == CLAUDE)
@@ -2831,10 +2893,30 @@ impl Pty {
                     if probe.live_session.is_none() {
                         continue;
                     }
-                    if let Some(session_id) = probe.live_session_id() {
+                    let session_id = self
+                        .agent_record_cache
+                        .entry(*terminal_id)
+                        .or_default()
+                        .refresh(*child_pid, probe.live_session.as_ref().unwrap());
+                    if let Some(session_id) = session_id {
                         let envs = self.terminal_agent_envs.entry(*terminal_id).or_default();
                         envs.insert(claude_identity_key(harness), session_id);
                         envs.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
+                        continue;
+                    }
+                    if harness.kind == CLAUDE
+                        && self
+                            .agent_record_cache
+                            .get(terminal_id)
+                            .map_or(false, |cache| cache.key.is_some())
+                    {
+                        // Keep the verified process handle while a missing record waits for a rewrite.
+                        let fallback = self.agent_record_cache[terminal_id].env_fallback.clone();
+                        if fallback.is_empty() {
+                            self.terminal_agent_envs.remove(terminal_id);
+                        } else {
+                            self.terminal_agent_envs.insert(*terminal_id, fallback);
+                        }
                         continue;
                     }
                     // that agent has exited or moved on: what the pane runs now is a new question
@@ -2863,6 +2945,7 @@ impl Pty {
         for (terminal_id, child_pid, harness) in to_probe {
             let identity_vars = agent_detect::identity_env_names_for(harness);
             let mut found = process_tree.find_all_envs(child_pid, &identity_vars);
+            let env_fallback = found.clone();
             // an identity variable is frozen in each child at its spawn, so after a `/clear` it
             // names the first session; the agent's own record or open session file names the one
             // it holds now, and wins
@@ -2888,9 +2971,52 @@ impl Pty {
                         child_pid,
                         miss
                     );
-                    None
+                    if harness.kind == CLAUDE
+                        && crate::resurrect_hints::live_claude_process(child_pid)
+                    {
+                        // Track a verified foreground Claude before its SessionStart record appears.
+                        let process_dir = crate::resurrect_hints::claude_sessions_dir_for(
+                            process_env(child_pid, "CLAUDE_CONFIG_DIR").map(Into::into),
+                            process_env(child_pid, "HOME").map(Into::into),
+                        );
+                        let dir = sessions_dir
+                            .as_ref()
+                            .filter(|_| {
+                                std::env::var_os("ZELLIJ_CLAUDE_SESSIONS_DIR")
+                                    .map_or(false, |override_dir| !override_dir.is_empty())
+                            })
+                            .cloned()
+                            .or(process_dir)
+                            .or_else(|| sessions_dir.clone());
+                        dir.map(|dir| LiveSession::ClaudeRecord {
+                            pid: child_pid,
+                            dir,
+                        })
+                    } else {
+                        None
+                    }
                 },
             };
+            if let Some(live) = live_session.as_ref() {
+                let cached_id = self
+                    .agent_record_cache
+                    .entry(terminal_id)
+                    .or_default()
+                    .refresh(child_pid, live);
+                if matches!(live, LiveSession::ClaudeRecord { .. }) {
+                    self.agent_record_cache
+                        .get_mut(&terminal_id)
+                        .unwrap()
+                        .env_fallback = env_fallback.clone();
+                    found = env_fallback;
+                    if let Some(id) = cached_id {
+                        found.insert(claude_identity_key(harness), id);
+                        found.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
+                    }
+                }
+            } else {
+                self.agent_record_cache.remove(&terminal_id);
+            }
             self.agent_env_probes.insert(
                 terminal_id,
                 AgentEnvProbe {
@@ -2947,6 +3073,14 @@ impl Pty {
                     .agent_env_probes
                     .get(&terminal_id)
                     .and_then(|probe| probe.live_session.as_ref())
+                    .filter(|live| {
+                        !matches!(live, LiveSession::ClaudeRecord { .. })
+                            || self
+                                .agent_record_cache
+                                .get(&terminal_id)
+                                .and_then(|cache| cache.session_id.as_ref())
+                                .is_some()
+                    })
                     .map(|live| live.source().as_str().to_owned());
                 let osc_agent_session = self.osc_agent_session(terminal_id).map(str::to_owned);
                 (
@@ -2962,10 +3096,9 @@ impl Pty {
                             .unwrap_or_default(),
                         agent_env,
                         agent_name: self
-                            .agent_env_probes
+                            .agent_record_cache
                             .get(&terminal_id)
-                            .and_then(|probe| probe.live_session.as_ref())
-                            .and_then(LiveSession::name),
+                            .and_then(|cache| cache.name.clone()),
                         agent_session_source,
                         osc_agent_session,
                     },
@@ -3025,7 +3158,7 @@ impl Pty {
             })
             .collect();
 
-        if active_terminal_ids.is_empty() {
+        if active_terminal_ids.is_empty() && !self.detect_agents {
             return;
         }
 
@@ -3073,7 +3206,13 @@ impl Pty {
             }
         }
 
-        let panes: Vec<(u32, u32)> = active_terminal_ids
+        // Detection discovers silent foreground jobs on every tick. CWD stays activity-driven.
+        let command_terminal_ids: Vec<u32> = if self.detect_agents {
+            self.id_to_child_pid.keys().copied().collect()
+        } else {
+            active_terminal_ids.clone()
+        };
+        let panes: Vec<(u32, u32)> = command_terminal_ids
             .iter()
             .filter_map(|id| self.id_to_child_pid.get(id).map(|pid| (*id, *pid)))
             .collect();
@@ -3094,11 +3233,25 @@ impl Pty {
             })
             .unwrap_or_default();
 
-        for terminal_id in &active_terminal_ids {
+        for terminal_id in &command_terminal_ids {
             let foreground_cmd: Vec<String> = foreground_cmds
                 .get(terminal_id)
                 .cloned()
                 .unwrap_or_default();
+            if !active_terminal_ids.contains(terminal_id) {
+                let is_agent = |command: Option<&Vec<String>>| {
+                    command
+                        .and_then(|argv| argv.first())
+                        .and_then(|argv0| agent_detect::harness_for_command(argv0))
+                        .is_some()
+                };
+                // Preserve output-driven updates for quiet non-agent commands.
+                if !is_agent(Some(&foreground_cmd))
+                    && !is_agent(self.reported_command_for(*terminal_id))
+                {
+                    continue;
+                }
+            }
 
             if self.terminal_foreground_cmds.get(terminal_id) != Some(&foreground_cmd) {
                 let pane_id = PaneId::Terminal(*terminal_id);

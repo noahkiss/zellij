@@ -1840,3 +1840,194 @@ fn shell_commands_with_scripts_remain_command_panes() {
     command.args.clear();
     assert!(!command_runs_interactive_shell(&command));
 }
+
+/// The detection tick discovers and refreshes a foreground agent without PTY output.
+#[test]
+#[cfg(unix)]
+fn a_silent_fake_claude_refreshes_its_record_on_the_detection_tick() {
+    struct SilentAgent(std::process::Child);
+    impl Drop for SilentAgent {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let config = tempfile::tempdir().unwrap();
+    let records = config.path().join("sessions");
+    std::fs::create_dir(&records).unwrap();
+    let agent = SilentAgent(
+        std::process::Command::new("bash")
+            .args(["-c", "exec -a claude sleep 60"])
+            .env("CLAUDE_CONFIG_DIR", config.path())
+            .env(agent_detect::AGENT_SESSION_ID, "env-session")
+            .env(AGENT_KIND, "claude")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = agent.0.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::resurrect_hints::live_claude_process(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake Claude must start"
+        );
+        std::thread::yield_now();
+    }
+    let write_record = |id: &str, name: &str| {
+        std::fs::write(
+            records.join(format!("{}.json", pid)),
+            serde_json::to_vec(&serde_json::json!({"pid": pid, "sessionId": id, "name": name}))
+                .unwrap(),
+        )
+        .unwrap();
+    };
+    let mock = MockOsApi::new();
+    mock.set_foreground_cmd(pid, vec!["claude".into()]);
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    // No activity flag or command cache: the agent has never written pane output.
+    pty.id_to_child_pid.insert(1, pid);
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports
+        .last()
+        .expect("silent pending agent must be reported")[&1];
+    assert_eq!(info.agent_name, None);
+    assert_eq!(info.agent_session_source, None);
+    assert_eq!(
+        info.agent_env
+            .get(agent_detect::AGENT_SESSION_ID)
+            .map(String::as_str),
+        Some("env-session")
+    );
+    assert!(matches!(
+        pty.agent_env_probes[&1].live_session,
+        Some(LiveSession::ClaudeRecord { .. })
+    ));
+    for _ in 0..=AGENT_ENV_RETRY_TICKS {
+        pty.update_and_report_cwds();
+    }
+    assert!(pty.agent_env_probes[&1].ticks_since_probe > AGENT_ENV_RETRY_TICKS);
+    assert!(collect_process_info_reports(&screen_rx).is_empty());
+    write_record("late-session", "late-name");
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        reports.last().unwrap()[&1].agent_name.as_deref(),
+        Some("late-name")
+    );
+
+    // A malformed startup record keeps a pending handle and avoids repeated identity walks.
+    let record = records.join(format!("{}.json", pid));
+    std::fs::write(&record, b"invalid json").unwrap();
+    let malformed_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    pty.id_to_child_pid.insert(1, pid);
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        reports.last().unwrap()[&1]
+            .agent_env
+            .get(agent_detect::AGENT_SESSION_ID)
+            .map(String::as_str),
+        Some("env-session")
+    );
+    write_record("first-session", "first-name");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(malformed_mtime))
+        .unwrap();
+    for _ in 0..=AGENT_ENV_RETRY_TICKS {
+        pty.update_and_report_cwds();
+    }
+    assert!(collect_process_info_reports(&screen_rx).is_empty());
+    assert!(pty.agent_record_cache[&1].session_id.is_none());
+    assert_eq!(
+        pty.terminal_agent_envs[&1]
+            .get(agent_detect::AGENT_SESSION_ID)
+            .map(String::as_str),
+        Some("env-session")
+    );
+    assert!(pty.agent_env_probes[&1].ticks_since_probe > AGENT_ENV_RETRY_TICKS);
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(malformed_mtime + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("silent agent must be reported")[&1];
+    let harness = agent_detect::harness_for_command("claude").unwrap();
+    let key = claude_identity_key(harness);
+    assert_eq!(
+        info.agent_env.get(&key).map(String::as_str),
+        Some("first-session")
+    );
+    assert_eq!(info.agent_name.as_deref(), Some("first-name"));
+    assert_eq!(info.agent_session_source.as_deref(), Some("record"));
+
+    // A same-mtime rewrite stays cached, proving the tick does not reread unchanged files.
+    let record = records.join(format!("{}.json", pid));
+    let modified = std::fs::metadata(&record).unwrap().modified().unwrap();
+    write_record("second-session", "second-name");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    pty.update_and_report_cwds();
+    assert!(collect_process_info_reports(&screen_rx).is_empty());
+    assert_eq!(
+        pty.agent_record_cache[&1].name.as_deref(),
+        Some("first-name")
+    );
+    let live = pty.agent_env_probes[&1].live_session.clone().unwrap();
+    assert_eq!(
+        pty.agent_record_cache
+            .get_mut(&1)
+            .unwrap()
+            .refresh(pid + 1, &live)
+            .as_deref(),
+        Some("second-session")
+    );
+    assert_eq!(
+        pty.agent_record_cache[&1].name.as_deref(),
+        Some("second-name")
+    );
+
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("record changes must be reported")[&1];
+    assert_eq!(
+        info.agent_env.get(&key).map(String::as_str),
+        Some("second-session")
+    );
+    assert_eq!(info.agent_name.as_deref(), Some("second-name"));
+    let mut switched = AgentRecordCache::default();
+    switched.refresh(pid, &live);
+    assert_eq!(switched.name.as_deref(), Some("second-name"));
+    switched.refresh(pid, &LiveSession::CodexRollout { pid });
+    assert_eq!(switched.name, None);
+    std::fs::remove_file(record).unwrap();
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("record removal must be reported")[&1];
+    assert_eq!(info.agent_name, None);
+    assert_eq!(
+        info.agent_env.get(&key).map(String::as_str),
+        Some("env-session")
+    );
+    assert_eq!(info.agent_session_source, None);
+
+    mock.clear_foreground_cmd(pid);
+    pty.update_and_report_cwds();
+    assert!(!pty.agent_record_cache.contains_key(&1));
+}

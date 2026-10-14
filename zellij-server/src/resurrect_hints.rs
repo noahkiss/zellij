@@ -170,7 +170,34 @@ pub fn claude_session_record(sessions_dir: &Path, pid: u32) -> Option<String> {
         .map(|id| id.to_owned())
 }
 
+/// Read Claude's session and name together after the caller verifies its live process.
+pub fn claude_record_identity(dir: &Path, pid: u32) -> (Option<String>, Option<String>) {
+    let record = std::fs::read(dir.join(format!("{}.json", pid)))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(record) = record else {
+        return (None, None);
+    };
+    if record.get("pid").and_then(|value| value.as_u64()) != Some(pid as u64)
+        || !record_is_for_this_process(&record, pid)
+    {
+        return (None, None);
+    }
+    let session_id = record
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    let name = record
+        .get("name")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned);
+    (session_id, name)
+}
+
 /// Read a name only after the process table verifies the live Claude process.
+#[cfg(test)]
 fn claude_record_name(dir: &Path, pid: u32, live_claude: bool) -> Option<String> {
     if !live_claude {
         return None;
@@ -215,13 +242,13 @@ fn record_is_for_this_process(record: &serde_json::Value, pid: u32) -> bool {
 
 /// Field 22 of `/proc/<pid>/stat`, the process start time, as the string Claude Code records.
 #[cfg(target_os = "linux")]
-fn process_start_ticks(pid: u32) -> Option<String> {
+pub(crate) fn process_start_ticks(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     start_ticks_from_stat(&stat)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_start_ticks(_pid: u32) -> Option<String> {
+pub(crate) fn process_start_ticks(_pid: u32) -> Option<String> {
     None
 }
 
@@ -302,14 +329,6 @@ impl LiveSession {
                 .iter()
                 .find_map(|path| codex_session_from_path(path)),
         }
-    }
-
-    /// The live Claude messaging name; other harnesses have no names yet.
-    pub fn name(&self) -> Option<String> {
-        let LiveSession::ClaudeRecord { pid, dir } = self else {
-            return None;
-        };
-        claude_record_name(dir, *pid, live_claude_process(*pid))
     }
 
     /// Reject a stale Claude record before refreshing its session identity.
