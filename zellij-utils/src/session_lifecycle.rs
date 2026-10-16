@@ -3106,23 +3106,26 @@ fn same_executable_path(one: &Path, other: &Path) -> bool {
         }
 }
 
+/// The system TCC directory: on every Mac, and gated by Full Disk Access on every macOS version.
+///
+/// Not the per-user `~/Library/Application Support/com.apple.TCC/TCC.db` the probes opened before.
+/// macOS 27 has no such file, so every probe of it answered "unknown", granted or not.
+#[cfg(target_os = "macos")]
+const SYSTEM_TCC_DIR: &str = "/Library/Application Support/com.apple.TCC";
+
 /// Whether Full Disk Access is granted to THIS binary, asked fresh.
 ///
 /// Cheap enough to ask on a timer, which it has to be: an FDA toggle takes effect on a live
 /// process, so a session that was refused at startup can be granted while it runs and a cached
 /// answer would keep telling the user to fix something they have already fixed.
 ///
-/// `None` means the question was not answered - the file is missing, or the failure was not a
-/// permission one. It is not the same as "denied" and must never be reported as one.
+/// `None` means the question was not answered - the directory is missing, or the failure was not
+/// a permission one. It is not the same as "denied" and must never be reported as one.
 #[cfg(target_os = "macos")]
 pub fn full_disk_access_granted() -> Option<bool> {
-    let dirs = directories::BaseDirs::new()?;
-    // the same file the startup probe uses last: reachable only with Full Disk Access, and reading
-    // nothing out of it - the open IS the question
-    let gated = dirs
-        .home_dir()
-        .join("Library/Application Support/com.apple.TCC/TCC.db");
-    let error = std::fs::File::open(&gated).err().map(|e| e.kind());
+    // the same directory the startup probe uses last: reachable only with Full Disk Access, and
+    // reading no entry out of it - the open IS the question
+    let error = std::fs::read_dir(SYSTEM_TCC_DIR).err().map(|e| e.kind());
     match classify_tcc_probe(error) {
         TccProbe::Reachable => Some(true),
         TccProbe::Refused => Some(false),
@@ -3243,12 +3246,12 @@ pub fn probe_protected_locations_now() {
         home.join("Downloads"),
         home.join("Desktop"),
         home.join("Documents"),
-        home.join("Library/Application Support/com.apple.TCC/TCC.db"),
+        std::path::PathBuf::from(SYSTEM_TCC_DIR),
     ];
 
     for path in locations {
         // read_dir opens the directory, which is where TCC intercepts; File::open does the same for
-        // the db. Neither reads an entry - the open IS the probe.
+        // a path that is not one. Neither reads an entry - the open IS the probe.
         let error = if path.is_dir() {
             std::fs::read_dir(&path).err()
         } else {

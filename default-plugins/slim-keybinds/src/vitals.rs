@@ -106,13 +106,14 @@ fn duration(secs: u64) -> String {
 /// both Linux and macOS.
 ///
 /// **The Full-Disk-Access question is a real `open`, and it is asked here rather than spawned on
-/// its own.** `head -c 1` opens the file; `[ -r ]` would call `access(2)`, which reads the
-/// permission bits while TCC refuses at `open(2)` instead — so a test on the bits answers
-/// "readable" on a machine holding no grant at all. `[ -e ]` first, because TCC gates the open and
-/// not the stat: a file that is not there is not a refusal and is reported apart. The same idiom
-/// `zellij session doctor` runs in a pane (`session_doctor_macos.rs`), and one byte is all that is
-/// read out of the file. Only the Darwin branch asks it — nowhere else has the permission to be
-/// missing.
+/// its own.** `ls` opens the system TCC directory, `/Library/Application Support/com.apple.TCC`,
+/// which every Mac has and Full Disk Access has always gated. `[ -r ]` would call `access(2)`,
+/// which reads the permission bits while TCC refuses at `open(2)` instead — so a test on the bits
+/// answers "readable" on a machine holding no grant at all. `[ -d ]` first, because TCC gates the
+/// open and not the stat: a directory that is not there is not a refusal and is reported apart.
+/// The same idiom `zellij session doctor` runs in a pane (`session_doctor_macos.rs`), and nothing
+/// listed is kept. The per-user `TCC.db` the probe opened before is gone on macOS 27. Only the
+/// Darwin branch asks it — nowhere else has the permission to be missing.
 pub fn probe_command() -> String {
     "case \"$(uname)\" in \
        Darwin) \
@@ -120,9 +121,9 @@ pub fn probe_command() -> String {
          echo \"MEMTOTAL $(sysctl -n hw.memsize)\"; \
          vm_stat; \
          echo \"BAT $(pmset -g batt | grep -Eo '[0-9]+%' | head -1)\"; \
-         _db=\"$(eval echo ~\"$(id -un)\")/Library/Application Support/com.apple.TCC/TCC.db\"; \
-         if [ ! -e \"$_db\" ]; then echo \"FDA unknown\"; \
-         elif head -c 1 \"$_db\" >/dev/null 2>&1; then echo \"FDA yes\"; \
+         _tcc=\"/Library/Application Support/com.apple.TCC\"; \
+         if [ ! -d \"$_tcc\" ]; then echo \"FDA unknown\"; \
+         elif ls \"$_tcc\" >/dev/null 2>&1; then echo \"FDA yes\"; \
          else echo \"FDA no\"; fi; \
          _b=$(sysctl -n kern.boottime | tr ',' '\\n' | \
               sed -n 's/.*sec = \\([0-9]*\\).*/\\1/p' | head -1); \

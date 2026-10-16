@@ -3100,10 +3100,11 @@ judges a terminal-launched process against the terminal's grants, while a pane i
 domain and is attributed to the server's executable. They are skipped when the session is down,
 where the answers would be this terminal's.
 
-Full Disk Access is asked by OPENING the user's `TCC.db` for one byte. `[ -r ]` calls `access(2)`,
-which reads the permission bits, while TCC refuses at `open(2)` — so a test on the bits answers
-"readable" on a machine holding no grant at all. A database that is not there is reported as
-unknown rather than as a refusal, and neither the pane nor the client that opens it can outlast the
+Full Disk Access is asked by OPENING the system TCC directory,
+`/Library/Application Support/com.apple.TCC` (`ls` it). `[ -r ]` calls `access(2)`, which reads
+the permission bits, while TCC refuses at `open(2)` — so a test on the bits answers "readable" on a
+machine holding no grant at all. A directory that is not there is reported as unknown rather than
+as a refusal, and neither the pane nor the client that opens it can outlast the
 probe's five-second deadline: a client talking to a wedged server never returns on its own.
 
 `--dry-run` withholds every fix, and the pane probe is the one thing it still does: it is a
@@ -4538,14 +4539,13 @@ runs every ten seconds, as one more tagged line in the probe's Darwin branch. Th
 exactly what it cost before, and `RunCommands` is the permission it already held. Vitals are off by
 default (`show_vitals`), so a bar that never asked for the cluster is unaffected.
 
-**The question is a real `open`.** `head -c 1` against
-`~/Library/Application Support/com.apple.TCC/TCC.db` — the same file, and the same shell idiom,
-`zellij session doctor` runs in a pane. TCC refuses at `open(2)` while `access(2)` reads only the
-permission bits, so `[ -r ]` answers "readable" on a machine holding no grant at all. One byte is
-read out of the file and nothing is kept.
+**The question is a real `open`.** `ls` against `/Library/Application Support/com.apple.TCC` —
+the same directory, and the same shell idiom, `zellij session doctor` runs in a pane. TCC refuses
+at `open(2)` while `access(2)` reads only the permission bits, so `[ -r ]` answers "readable" on a
+machine holding no grant at all. Nothing listed is kept.
 
 **Three answers, not two.** `fda ok` when the open succeeded, `fda no` when it was refused, and
-**nothing at all** when the question went unanswered: the gated file is not there, or the host is
+**nothing at all** when the question went unanswered: the gated directory is not there, or the host is
 not macOS and has no such permission to be missing. That is the server's `full_disk_access_granted`
 rule — an `Option<bool>`, where `None` is never a denial — carried into the bar. A Linux session's
 cluster is therefore byte-identical to what it drew before.
@@ -8195,7 +8195,7 @@ Needs you
 
 Nothing was wedged. The macOS probe opens a floating pane that writes two lines to a file, and the
 two are not worth the same. `manager=` is written the moment the pane's shell starts. `fda=` is
-written after an `open(2)` on `TCC.db`, and **TCC is fast to allow and slow to refuse**: on a Mac
+written after an `open(2)` on the TCC directory, and **TCC is fast to allow and slow to refuse**: on a Mac
 that holds the grant the open returns at once, and on a Mac that does not it sits. Measured on a
 rollout: `manager=` immediately, `fda=no` at about 5.5 to 5.8 seconds.
 
@@ -8214,8 +8214,8 @@ bounded run. A finished `fda=` line ends the wait whenever it arrives, even past
 a late answer is still an answer.
 
 **A fourth answer, for a check that never finished.** `Option<bool>` became a four-state
-`FullDiskAccess`: `Granted`, `Denied`, `Undetermined` (`fda=unknown` — there is no `TCC.db` to
-open, so there is nothing to be refused by) and the new `Unanswered`.
+`FullDiskAccess`: `Granted`, `Denied`, `Undetermined` (`fda=unknown` — there is no TCC directory
+to open, so there is nothing to be refused by) and the new `Unanswered`.
 
 ```
 $ zellij session doctor mysession        # after, when the second line never lands
@@ -8254,6 +8254,35 @@ this fork's Linux box cannot cross-compile the tree to `aarch64-apple-darwin` (a
 dependency, `libnghttp2-sys`, wants a macOS C toolchain), so the macOS module was type-checked by
 ungating it and its two macOS-only imports for one `cargo check` and then putting the gates back.
 The timings themselves came from a Mac, and are what the deadline is set against.
+
+### Full Disk Access is asked of the system TCC directory
+
+Every Full Disk Access probe used to open the per-user database,
+`~/Library/Application Support/com.apple.TCC/TCC.db`. macOS 27 has no such file: the whole
+`com.apple.TCC` directory under the user's Application Support is gone. So on a macOS 27 Mac every
+probe found nothing to open, and `zellij session doctor` reported "the probe could not tell whether
+Full Disk Access is granted" on a server that held the grant. The keybind bar's `fda` reading went
+blank the same way, and the tab bar's `TCC` badge could never fire.
+
+The probes now open the system TCC directory, `/Library/Application Support/com.apple.TCC`. Every
+Mac has it, and its database has always needed Full Disk Access, so one target serves every macOS
+version and there is no fallback to the old path. Measured on a macOS 27 Mac: from a pane of a
+server holding the grant, `ls` lists the directory; from a process without it, `ls` fails with
+"Operation not permitted". The per-user path answered "No such file or directory" either way.
+
+All four probes moved together, because they must agree:
+
+| Probe | Where | How it opens |
+|---|---|---|
+| doctor's pane probe | `src/session_doctor_macos.rs` | `[ -d ]`, then `ls` |
+| keybind bar vitals | `default-plugins/slim-keybinds/src/vitals.rs` | `[ -d ]`, then `ls` |
+| server's live check (`full_disk_access_granted`) | `zellij-utils/src/session_lifecycle.rs` | `read_dir` |
+| startup probe (`probe_protected_locations_now`) | `zellij-utils/src/session_lifecycle.rs` | `read_dir` |
+
+The open is still the question. Listing a directory calls `opendir`, a real `open(2)` that TCC can
+refuse, not an `access(2)` on the permission bits. The three answers keep their meaning: a
+directory that is not there is `unknown`, never a refusal. The doctor script no longer needs
+`$HOME`, so its `eval echo ~user` fallback is gone.
 
 ### `zellij_create` hands its command to a shell, and refuses a `cwd` it cannot find
 

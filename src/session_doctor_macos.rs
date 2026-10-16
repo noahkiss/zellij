@@ -293,20 +293,20 @@ fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
     let answer_path = answer_file.display().to_string();
     // The OPEN is the probe, and it has to be a real one: `[ -r ]` calls `access(2)`, which reads
     // the permission bits, while TCC refuses at `open(2)` instead - so a test on the bits answers
-    // "readable" on a machine holding no grant at all. Nothing is read out of the file beyond the
-    // one byte it takes to prove the open was allowed.
+    // "readable" on a machine holding no grant at all. `ls` opens the directory to list it, and
+    // nothing it lists is kept.
     //
-    // A TCC.db that is not there is not a refusal, and the two are reported apart rather than
-    // guessed at. `[ -e ]` is safe to ask: TCC gates the open, not the stat.
+    // The target is the SYSTEM TCC directory. Every Mac has it, and it has always needed Full Disk
+    // Access. The per-user `~/Library/Application Support/com.apple.TCC/TCC.db` it replaces is gone
+    // on macOS 27, so every Mac there answered unknown, granted or not.
     //
-    // `$HOME` is not trusted to be set - the server's environment comes from launchd rather than
-    // from a login shell - so it falls back to the `eval echo ~user` idiom the vitals probe uses.
+    // A directory that is not there is not a refusal, and the two are reported apart rather than
+    // guessed at. `[ -d ]` is safe to ask: TCC gates the open, not the stat.
     let script = format!(
         "{{ printf 'manager=%s\\n' \"$(launchctl managername 2>/dev/null)\"; \
-         home=${{HOME:-$(eval echo ~\"$(id -un)\")}}; \
-         db=\"$home/Library/Application Support/com.apple.TCC/TCC.db\"; \
-         if [ ! -e \"$db\" ]; then echo fda=unknown; \
-         elif head -c 1 \"$db\" >/dev/null 2>&1; then echo fda=yes; \
+         tcc=\"/Library/Application Support/com.apple.TCC\"; \
+         if [ ! -d \"$tcc\" ]; then echo fda=unknown; \
+         elif ls \"$tcc\" >/dev/null 2>&1; then echo fda=yes; \
          else echo fda=no; fi; }} > {} 2>/dev/null",
         shell_quote(&answer_path)
     );

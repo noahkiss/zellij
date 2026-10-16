@@ -42,7 +42,7 @@ pub(crate) struct PaneAnswer {
 /// What the probe was able to say about Full Disk Access.
 ///
 /// Four answers, because the last two used to be one. `Undetermined` is the pane telling us it
-/// could not look - there is no `TCC.db` to open, so there is nothing to be refused by.
+/// could not look - there is no TCC directory to open, so there is nothing to be refused by.
 /// `Unanswered` is the pane never telling us anything, which on macOS is what a refusal in
 /// progress looks like.
 #[derive(Debug, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub(crate) enum FullDiskAccess {
     Granted,
     /// `fda=no` - the open was refused.
     Denied,
-    /// `fda=unknown` - there was no `TCC.db` to open.
+    /// `fda=unknown` - there was no TCC directory to open.
     Undetermined,
     /// No finished `fda=` line arrived before [`FDA_TIMEOUT`].
     Unanswered,
