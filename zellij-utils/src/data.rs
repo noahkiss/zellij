@@ -2742,6 +2742,15 @@ pub struct PaneListEntry {
     /// it up. Written only when `true`, and only beside a `state`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub input_since_state: bool,
+    /// The command line the server typed at this restored shell's prompt under
+    /// `resurrect_commands "prefill"`, which nobody has touched since: pressing Enter runs it.
+    ///
+    /// Present only once the line is written, not while it waits for the shell's line editor.
+    /// Gone at the first input that reaches the pane by any route, and when the shell reports a
+    /// command start. `restored_from` marks every restored pane; this marks only the ones a
+    /// prefill is still waiting in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefilled_command: Option<String>,
     /// What a program in the pane last said it is doing, over `OSC 7501`: the `state`, `state_*`
     /// keys of [`PaneProgramStatus`], flattened onto the row. Absent when no program has reported.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]

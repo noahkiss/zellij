@@ -4293,6 +4293,16 @@ recorded as a shell at the next serialization, the same cost the ESC on a held p
 layout override (`override-layout`) reaches the screen batched with other work, so it types
 nothing.
 
+**`list-panes --json` names the line while it waits.** `restored_from` marks every restored pane,
+so a consumer could not tell a prefilled shell from any other. `prefilled_command` can: it holds
+the line the screen pasted, from the moment the paste is written - not while it waits for the line
+editor - until anything touches it. Every route that writes user bytes to a terminal pane ends in
+one place, the pane's input adjustment: a key, a paste, `action write` and `write-chars`, MCP
+`write_input`, a plugin's write. The first non-empty input there clears it, and so does the
+shell's `OSC 133;C`, the line having run. A prompt redraw (`133;A`) does not, because a redraw is
+not the line being used. The field is on the CLI-only `PaneListEntry`, so `list-tree --json`
+carries it too, with no protobuf tag. A consumer reads it as "Enter resumes this pane".
+
 **A top-level key, not one inside `resurrect_command_hints`.** Every child of that block is parsed
 as a hint, and a hint with no children fails the whole config on every build. A top-level key is
 ignored by a build that does not know it; nkmk.25 reports a config carrying one as well defined.

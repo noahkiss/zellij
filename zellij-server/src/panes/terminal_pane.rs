@@ -504,7 +504,9 @@ impl Pane for TerminalPane {
                 )
             };
             // fork addition: what reaches the shell here was typed, so its last prompt is no longer
-            // a fresh one. See `Grid::input_since_prompt`.
+            // a fresh one, and a prefilled line is no longer untouched. Every route that writes
+            // user bytes - a key, a paste, `write`/`write-chars`, a plugin - arrives through here.
+            // See `Grid::input_since_prompt` and `Grid::prefilled_command`.
             if matches!(&adjusted, Some(AdjustedInput::WriteBytesToTerminal(bytes)) if !bytes.is_empty())
             {
                 self.grid.note_typed_input();
@@ -1452,6 +1454,12 @@ impl Pane for TerminalPane {
     }
     fn input_since_prompt(&self) -> bool {
         self.grid.input_since_prompt()
+    }
+    fn prefilled_command(&self) -> Option<String> {
+        self.grid.prefilled_command().map(str::to_owned)
+    }
+    fn set_prefilled_command(&mut self, command: Option<String>) {
+        self.grid.set_prefilled_command(command);
     }
     fn input_since_state(&self) -> bool {
         self.grid.program_status.input_since_report()

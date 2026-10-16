@@ -903,6 +903,13 @@ pub trait Pane {
     fn input_since_prompt(&self) -> bool {
         false
     }
+    /// fork addition: the command line a `resurrect_commands "prefill"` restore typed at this
+    /// pane's prompt, until anything touches it. Only a terminal pane holds one; see
+    /// `Grid::prefilled_command`.
+    fn prefilled_command(&self) -> Option<String> {
+        None
+    }
+    fn set_prefilled_command(&mut self, _command: Option<String>) {}
     /// Whether input was typed into the pane after a program in it last reported over `OSC
     /// 7501`. Only a terminal pane can say; see `ProgramStatusRecords::input_since_report`.
     fn input_since_state(&self) -> bool {

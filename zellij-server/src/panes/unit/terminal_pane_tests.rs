@@ -1416,3 +1416,25 @@ pub fn typed_input_marks_the_last_prompt_as_stale_until_the_next_one() {
     );
     assert!(!pane.input_since_prompt());
 }
+
+/// A prefilled line is held until the pane's input touches it. A bracketed-paste marker the pane
+/// drops reaches nothing and leaves it; a key clears it, and so does the shell starting a command.
+#[test]
+pub fn a_prefilled_command_is_kept_until_input_or_a_command_start() {
+    let mut pane = create_guest_modal_pane();
+    assert_eq!(pane.prefilled_command(), None);
+
+    pane.set_prefilled_command(Some("claude --resume abc".to_owned()));
+    pane.adjust_input_to_terminal(&None, b"\x1b[200~".to_vec(), false, Some(1));
+    assert_eq!(
+        pane.prefilled_command().as_deref(),
+        Some("claude --resume abc"),
+        "a paste marker the shell does not take is not input"
+    );
+    pane.adjust_input_to_terminal(&None, b"\r".to_vec(), false, Some(1));
+    assert_eq!(pane.prefilled_command(), None, "a key clears it");
+
+    pane.set_prefilled_command(Some("claude --resume abc".to_owned()));
+    pane.handle_pty_bytes("\x1b]133;C\x07".as_bytes().to_vec());
+    assert_eq!(pane.prefilled_command(), None, "a command start clears it");
+}

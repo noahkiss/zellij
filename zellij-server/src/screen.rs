@@ -5973,6 +5973,12 @@ impl Screen {
                 && tab
                     .get_pane_with_id(PaneId::Terminal(pane_info.id))
                     .map_or(false, |pane| pane.input_since_state());
+            let prefilled_command = if pane_info.is_plugin {
+                None
+            } else {
+                tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .and_then(|pane| pane.prefilled_command())
+            };
             PaneListEntry {
                 pane_info,
                 tab_position: tab.position,
@@ -5983,6 +5989,7 @@ impl Screen {
                 program_status,
                 input_since_prompt,
                 input_since_state,
+                prefilled_command,
             }
         }
 
@@ -9734,6 +9741,15 @@ pub(crate) fn screen_thread_main(
                                 None,
                             ))
                             .context("failed to type a prefill")?;
+                        // written straight to the pty, not through the pane's input, so this
+                        // does not count as the input that clears it again
+                        if let Some(pane) = screen
+                            .tabs
+                            .values_mut()
+                            .find_map(|tab| tab.get_pane_with_id_mut(PaneId::Terminal(pid)))
+                        {
+                            pane.set_prefilled_command(Some(prefill));
+                        }
                     }
                 }
                 if let Some(vte_bytes) = vte_bytes {

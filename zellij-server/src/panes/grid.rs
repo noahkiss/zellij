@@ -926,6 +926,8 @@ pub struct Grid {
     /// Whether input was typed into the pane after its shell last wrote an OSC 133 prompt marker.
     /// See [`Grid::input_since_prompt`].
     input_since_prompt: bool,
+    /// See [`Grid::prefilled_command`].
+    prefilled_command: Option<String>,
     osc133_command_selection: bool,
     command_output_flash: Option<Selection>,
     word_separators: String,
@@ -1319,6 +1321,7 @@ impl Grid {
             cached_hover_tooltip: None,
             osc133_markers_seen: false,
             input_since_prompt: false,
+            prefilled_command: None,
             osc133_command_selection: true,
             command_output_flash: None,
             word_separators: DEFAULT_WORD_SEPARATORS.to_owned(),
@@ -3760,6 +3763,21 @@ impl Grid {
     pub fn note_typed_input(&mut self) {
         self.input_since_prompt = true;
         self.program_status.note_input();
+        self.prefilled_command = None;
+    }
+
+    /// fork addition: the command line `resurrect_commands "prefill"` typed at this restored
+    /// shell's prompt, for as long as nobody has touched it since.
+    ///
+    /// Set once the paste is written, not while it waits for the line editor. Any input that
+    /// reaches the pane clears it - see [`Grid::note_typed_input`] - and so does a command start
+    /// (`OSC 133;C`), which is the line having run.
+    pub fn prefilled_command(&self) -> Option<&str> {
+        self.prefilled_command.as_deref()
+    }
+
+    pub fn set_prefilled_command(&mut self, command: Option<String>) {
+        self.prefilled_command = command;
     }
 
     /// Whether input was typed into this pane after its shell last wrote an OSC 133 prompt marker.
@@ -4884,7 +4902,11 @@ impl Perform for Grid {
                 // 7501, and a command start (`133;C`) drops the results from before that prompt
                 match params.get(1).copied() {
                     Some(b"A") => self.program_status.prompt(),
-                    Some(b"C") => self.program_status.command_started(),
+                    Some(b"C") => {
+                        self.program_status.command_started();
+                        // the line at the prompt ran, whatever put it there
+                        self.prefilled_command = None;
+                    },
                     _ => {},
                 }
                 if let (Some(marker), Some(row)) = (marker, self.viewport.get_mut(self.cursor.y)) {

@@ -3092,6 +3092,7 @@ mod tests {
                 program_status: None,
                 input_since_prompt: false,
                 input_since_state: false,
+                prefilled_command: None,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()

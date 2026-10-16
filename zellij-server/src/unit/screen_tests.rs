@@ -18918,3 +18918,129 @@ pub fn an_agents_own_osc_report_wins_in_the_agent_row() {
     assert_eq!(agent.agent_id.as_deref(), Some("from-osc"));
     assert_eq!(agent.session_source.as_deref(), Some("osc"));
 }
+
+/// Two restored panes, a prefill pending on pane 0, and `steps` sent after it. Returns each
+/// terminal pane's id, `prefilled_command` and `restored_from`, read from `ListPanes`.
+fn prefilled_commands_after(steps: Vec<ScreenInstruction>) -> Vec<(u32, Option<String>, String)> {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let pty_writer_receiver = mock_screen.pty_writer_receiver.take().unwrap();
+    let mut layout = two_pane_layout();
+    for (index, child) in layout.children.iter_mut().enumerate() {
+        child.restored_from = Some(format!("restored-{index}"));
+    }
+    let screen_thread = mock_screen.run(Some(layout), vec![]);
+    let received_pty_instructions = Arc::new(Mutex::new(vec![]));
+    let pty_writer_thread = log_actions_in_thread!(
+        received_pty_instructions,
+        PtyWriteInstruction::Exit,
+        pty_writer_receiver
+    );
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PrefillPane(
+        0,
+        "claude --resume abc".to_owned(),
+    ));
+    for step in steps {
+        let _ = mock_screen.to_screen.send(step);
+    }
+    let (response_channel, panes) = crossbeam::channel::unbounded();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ListPanes {
+        show_all: true,
+        response_channel,
+    });
+    let pane_list = panes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("screen should answer ListPanes");
+    mock_screen.teardown(vec![pty_writer_thread, screen_thread]);
+    let mut rows: Vec<_> = pane_list
+        .iter()
+        .filter(|entry| !entry.pane_info.is_plugin)
+        .map(|entry| {
+            (
+                entry.pane_info.id,
+                entry.prefilled_command.clone(),
+                entry.pane_info.restored_from.clone(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn line_editor_ready(pid: u32) -> ScreenInstruction {
+    ScreenInstruction::PtyBytes(pid, b"\x1b[?2004h$ ".to_vec())
+}
+
+fn prefill_on_pane_0(rows: &[(u32, Option<String>, String)]) -> Option<String> {
+    rows.iter()
+        .find(|(id, ..)| *id == 0)
+        .and_then(|row| row.1.clone())
+}
+
+/// `list-panes` names the line a prefill typed only once it is written, and only on its own
+/// pane: `restored_from` marks both restored panes, `prefilled_command` only the prefilled one.
+#[test]
+pub fn a_written_prefill_is_listed_on_its_pane_and_a_pending_one_is_not() {
+    let pending = prefilled_commands_after(vec![ScreenInstruction::PtyBytes(
+        0,
+        b"shell init output\r\n".to_vec(),
+    )]);
+    assert_eq!(
+        prefill_on_pane_0(&pending),
+        None,
+        "nothing is at the prompt while the shell is still starting"
+    );
+
+    let written = prefilled_commands_after(vec![line_editor_ready(0)]);
+    assert_eq!(
+        written,
+        vec![
+            (
+                0,
+                Some("claude --resume abc".to_owned()),
+                "restored-0".to_owned()
+            ),
+            (1, None, "restored-1".to_owned()),
+        ]
+    );
+}
+
+/// The listed line is gone at the first input that reaches the pane, whichever route it took,
+/// and when the shell reports that a command started.
+#[test]
+pub fn any_input_to_the_pane_clears_its_prefilled_command() {
+    let routes: Vec<(&str, ScreenInstruction)> = vec![
+        (
+            "a key from a client",
+            ScreenInstruction::WriteCharacter(None, b"x".to_vec(), false, 1, None),
+        ),
+        (
+            "write / write-chars to the pane",
+            ScreenInstruction::WriteToPaneId(b"x".to_vec(), PaneId::Terminal(0), None),
+        ),
+        (
+            "a paste to the pane",
+            ScreenInstruction::Paste(b"x".to_vec(), Some(PaneId::Terminal(0)), 1, None),
+        ),
+        (
+            "a command start from the shell",
+            ScreenInstruction::PtyBytes(0, b"\x1b]133;C\x07".to_vec()),
+        ),
+    ];
+    for (route, step) in routes {
+        let rows = prefilled_commands_after(vec![line_editor_ready(0), step]);
+        assert_eq!(prefill_on_pane_0(&rows), None, "{route} clears it");
+    }
+
+    let untouched = prefilled_commands_after(vec![
+        line_editor_ready(0),
+        ScreenInstruction::WriteToPaneId(Vec::new(), PaneId::Terminal(0), None),
+        ScreenInstruction::WriteToPaneId(b"x".to_vec(), PaneId::Terminal(1), None),
+        ScreenInstruction::PtyBytes(0, b"\x1b]133;A\x07$ ".to_vec()),
+    ]);
+    assert_eq!(
+        prefill_on_pane_0(&untouched),
+        Some("claude --resume abc".to_owned()),
+        "no bytes, bytes to another pane and a prompt redraw leave the line where it was"
+    );
+}
