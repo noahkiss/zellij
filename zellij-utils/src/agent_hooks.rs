@@ -18,8 +18,12 @@
 //!
 //! Steps 1 and 2 cover sessions outside zellij too, which is why only step 3 is guarded.
 //!
-//! Print only. Nothing here writes a file: the operator installs the snippets, usually through
-//! dotfiles. Pure strings, so it builds for wasm with the rest of the ungated half.
+//! The harness snippets are print only: the operator installs them, usually through dotfiles,
+//! and nothing here edits a harness's settings. The shared script is different. Every hook calls
+//! it by path, and a copy left behind by an older build silently lacks the modes the current
+//! hooks call, so the binary owns it: `setup --agent-hooks --write` writes it, and `session
+//! doctor` rewrites it when it is missing or stale. The strings build for wasm with the rest of
+//! the ungated half; the file half is gated.
 
 /// One agent's install instructions.
 pub struct AgentHook {
@@ -39,6 +43,21 @@ pub struct AgentHook {
 
 /// The shared hook script `claude` and `codex` call as `sh <script> <kind> <start|end|osc>`.
 pub const SESSION_SCRIPT_PATH: &str = "~/.config/zellij/agent-session.sh";
+
+/// [`SESSION_SCRIPT_PATH`] below `HOME`, with no `~`. The hooks name the script by `~`, so it
+/// follows `HOME` and nothing else: not `ZELLIJ_CONFIG_DIR`, not `XDG_CONFIG_HOME`.
+const SESSION_SCRIPT_UNDER_HOME: &str = ".config/zellij/agent-session.sh";
+
+/// The sha256 of every `SESSION_SCRIPT` an earlier build shipped, oldest first. A copy that
+/// matches one of these is an older build's script; a copy that matches none, and is not this
+/// build's either, holds local edits. When `SESSION_SCRIPT` changes, append the old hash here:
+/// `the_session_script_hash_is_pinned` fails until you do.
+#[cfg(not(target_family = "wasm"))]
+const EARLIER_SESSION_SCRIPTS: &[&str] = &[
+    "f72dce7d091b9ffe196985571f754ca1e17b3d592e3affe31ae28692722ae1fb", // OSC 1337 report only
+    "55cc7140a29fb6ba3ed22d70dfe892602ef7026a2f82fb6863650b5cc7ceab2f", // before the state mode
+    "6eacd8a12d1a95445db6cc818efc603c5337978d4e8026e46c90caae2a8031d7", // before the context mode
+];
 
 /// Both harnesses hand their hook a JSON object on stdin with a `session_id` field. A hook's
 /// stdout is the agent's, not the terminal, and a claude hook has no controlling terminal at all -
@@ -126,16 +145,25 @@ pub const AGENT_HOOKS: &[AgentHook] = &[
         file: "~/.claude/settings.json (or $CLAUDE_CONFIG_DIR/settings.json)",
         how: "merge into the top-level \"hooks\" object; SessionStart fires on start-up, /clear, \
               /resume and compaction",
-        covers:
-            "the zellij report and live pane context. The env export ($CLAUDE_ENV_FILE), register and the \
-                 SessionEnd unregister live in bm's SessionStart hook for now; do not add them here",
+        covers: "register on SessionStart, unregister on SessionEnd, the zellij report, and live \
+                 pane context. Registration is this hook's job. `agent-sessions register` merges \
+                 into an existing entry, so bm's SessionStart hook may register the same id again \
+                 to add bm_project, in either order. The env export ($CLAUDE_ENV_FILE) lives in \
+                 bm's SessionStart hook; do not add it here",
         snippet: r#"{
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude osc" },
+          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude start" },
           { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude context" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "sh ~/.config/zellij/agent-session.sh claude end" }
         ]
       }
     ]
@@ -507,6 +535,125 @@ export default function agentSession(pi: ExtensionAPI) {
     },
 ];
 
+/// Where the shared script lives under `home`.
+pub fn session_script_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(SESSION_SCRIPT_UNDER_HOME)
+}
+
+/// What the shared script on disk is, compared with this build's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptState {
+    /// No file there.
+    Missing,
+    /// Byte for byte this build's [`SESSION_SCRIPT`].
+    Current,
+    /// An earlier build's script, unedited.
+    Earlier,
+    /// Matches no build's script: somebody edited it.
+    Edited,
+    /// There, and not readable as a file.
+    Unreadable(String),
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+/// Compare the script at `path` with this build's.
+#[cfg(not(target_family = "wasm"))]
+pub fn session_script_state(path: &std::path::Path) -> ScriptState {
+    script_state_against(path, EARLIER_SESSION_SCRIPTS)
+}
+
+/// [`session_script_state`] against a given list of earlier hashes, so a test can name one.
+#[cfg(not(target_family = "wasm"))]
+fn script_state_against(path: &std::path::Path, earlier: &[&str]) -> ScriptState {
+    match std::fs::read(path) {
+        Ok(bytes) if bytes == SESSION_SCRIPT.as_bytes() => ScriptState::Current,
+        Ok(bytes) if earlier.contains(&sha256_hex(&bytes).as_str()) => ScriptState::Earlier,
+        Ok(_) => ScriptState::Edited,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ScriptState::Missing,
+        Err(error) => ScriptState::Unreadable(error.to_string()),
+    }
+}
+
+/// Write this build's script to `path`, and say what was there before.
+///
+/// A current file is left untouched, so a second run writes nothing. Otherwise the bytes go to a
+/// temporary file in the same directory, which is renamed over the old one: a hook that starts
+/// mid-write reads the old script or the new one, never half of either. A symlink is written
+/// through, so a dotfiles link keeps pointing where it did. The directory is created if needed.
+#[cfg(not(target_family = "wasm"))]
+pub fn write_session_script(path: &std::path::Path) -> std::io::Result<ScriptState> {
+    use std::io::Write;
+    let before = session_script_state(path);
+    if before == ScriptState::Current {
+        return Ok(before);
+    }
+    let target = if path.is_symlink() {
+        std::fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let directory = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the script path has no directory"))?;
+    std::fs::create_dir_all(directory)?;
+    let file_name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = directory.join(format!(".{}.{}.tmp", file_name, std::process::id()));
+    let written = std::fs::File::create(&temporary).and_then(|mut file| {
+        file.write_all(SESSION_SCRIPT.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(error) = written.and_then(|_| std::fs::rename(&temporary, &target)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(before)
+}
+
+/// `setup --agent-hooks --write`: write the script under `HOME`, and say in one line what was done.
+#[cfg(not(target_family = "wasm"))]
+pub fn write_home_session_script() -> Result<String, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| {
+            String::from("HOME is not set, so there is no ~ to write the script under")
+        })?;
+    let path = session_script_path(std::path::Path::new(&home));
+    let before = write_session_script(&path)
+        .map_err(|error| format!("could not write {}: {}", path.display(), error))?;
+    Ok(match before {
+        ScriptState::Current => format!("{} is already this build's script", path.display()),
+        ScriptState::Missing => format!("wrote {}", path.display()),
+        ScriptState::Earlier => {
+            format!("rewrote {}: it was an older build's script", path.display())
+        },
+        ScriptState::Edited => format!(
+            "rewrote {}: it held local edits, which are gone",
+            path.display()
+        ),
+        ScriptState::Unreadable(why) => {
+            format!("rewrote {}: it could not be read ({})", path.display(), why)
+        },
+    })
+}
+
+#[cfg(target_family = "wasm")]
+pub fn write_home_session_script() -> Result<String, String> {
+    Err(String::from(
+        "a plugin cannot write the agent-session script",
+    ))
+}
+
 /// What `zellij setup --agent-hooks` prints.
 pub fn agent_hooks_text() -> String {
     let mut text = String::new();
@@ -521,10 +668,11 @@ pub fn agent_hooks_text() -> String {
          # claude and pi report their own state (OSC 7501) once zellij answers their query; the\n\
          # codex hook and the opencode TUI plugin report it for theirs, and list-agents --json\n\
          # carries it as `state`.\n\
-         # Nothing here is written for you.\n",
+         # `--write` writes the shared hook script, and `zellij session doctor` keeps it current.\n\
+         # Nothing else here is written for you: no harness settings file is touched.\n",
     );
     text.push_str(&format!(
-        "\n## shared hook script (claude, codex)\n# file: {}\n# create it; it needs no execute bit\n\n{}",
+        "\n## shared hook script (claude, codex)\n# file: {}\n# `zellij setup --agent-hooks --write` writes it; it needs no execute bit\n\n{}",
         SESSION_SCRIPT_PATH, SESSION_SCRIPT
     ));
     for hook in AGENT_HOOKS {
@@ -667,15 +815,177 @@ mod tests {
         }
     }
 
-    /// claude's export, register and unregister belong to bm's hook today; this one only reports.
+    /// claude registers through this hook now; only the env export stays in bm's.
     #[test]
-    fn the_claude_hook_only_reports_and_says_where_the_rest_lives() {
+    fn the_claude_hook_starts_and_ends_and_says_where_the_rest_lives() {
         let claude = hook("claude");
-        assert!(claude.snippet.contains("agent-session.sh claude osc"));
-        assert!(!claude.snippet.contains("agent-sessions"));
-        assert!(claude.covers.contains("bm's SessionStart hook"));
         let value: serde_json::Value = serde_json::from_str(claude.snippet).unwrap();
-        assert!(value["hooks"]["SessionStart"][0]["hooks"][0]["command"].is_string());
+        let commands = |event: &str| -> Vec<String> {
+            value["hooks"][event][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hook| hook["command"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            commands("SessionStart"),
+            [
+                "sh ~/.config/zellij/agent-session.sh claude start",
+                "sh ~/.config/zellij/agent-session.sh claude context",
+            ]
+        );
+        assert_eq!(
+            commands("SessionEnd"),
+            ["sh ~/.config/zellij/agent-session.sh claude end"]
+        );
+        assert!(!claude.snippet.contains("claude osc"));
+        assert!(!claude.snippet.contains("agent-sessions"));
+        for needed in [
+            "Registration is this hook's job",
+            "merges",
+            "bm_project",
+            "$CLAUDE_ENV_FILE",
+        ] {
+            assert!(claude.covers.contains(needed), "covers lacks {}", needed);
+        }
+    }
+
+    /// The modes claude's hooks run, outside zellij: `start` registers and `end` unregisters by
+    /// the id in the hook's JSON, and neither prints anything.
+    #[cfg(unix)]
+    #[test]
+    fn start_and_end_register_and_unregister_the_id_from_the_hook_json() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("agent-session.sh");
+        std::fs::write(&script, SESSION_SCRIPT).unwrap();
+        let log = dir.path().join("calls");
+        let registry = dir.path().join("agent-sessions");
+        std::fs::write(
+            &registry,
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for mode in ["start", "end"] {
+            let mut child = Command::new("sh")
+                .arg(&script)
+                .args(["claude", mode])
+                .env_remove("ZELLIJ")
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id": "abc-123", "hook_event_name": "SessionEnd"}"#)
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{}", mode);
+            assert!(
+                output.stdout.is_empty() && output.stderr.is_empty(),
+                "{}",
+                mode
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "register --id abc-123 --kind claude\nunregister --id abc-123\n"
+        );
+    }
+
+    /// The hash list is how doctor tells an older build's script from an edited one, and it works
+    /// only if every shipped script is in it. Changing `SESSION_SCRIPT` fails this until the old
+    /// hash is appended to `EARLIER_SESSION_SCRIPTS` and the new one is pinned here.
+    #[test]
+    fn the_session_script_hash_is_pinned() {
+        let current = sha256_hex(SESSION_SCRIPT.as_bytes());
+        assert_eq!(
+            current, "969d8d1e183c3510a3b767b83e21088ddedeae922e53f61a44de0727fe148fb7",
+            "SESSION_SCRIPT changed: append the old hash to EARLIER_SESSION_SCRIPTS, then pin the \
+             new one here"
+        );
+        assert!(!EARLIER_SESSION_SCRIPTS.contains(&current.as_str()));
+    }
+
+    #[test]
+    fn write_writes_the_exact_bytes_and_a_second_write_changes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let path = session_script_path(home.path());
+        assert_eq!(path, home.path().join(".config/zellij/agent-session.sh"));
+        assert_eq!(session_script_state(&path), ScriptState::Missing);
+        // the directory does not exist yet
+        assert_eq!(write_session_script(&path).unwrap(), ScriptState::Missing);
+        assert_eq!(std::fs::read(&path).unwrap(), SESSION_SCRIPT.as_bytes());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(write_session_script(&path).unwrap(), ScriptState::Current);
+        assert_eq!(std::fs::read(&path).unwrap(), SESSION_SCRIPT.as_bytes());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        // no temporary file is left beside it
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(entries, ["agent-session.sh"]);
+    }
+
+    #[test]
+    fn an_older_script_and_an_edited_one_are_told_apart_and_both_rewritten() {
+        let home = tempfile::tempdir().unwrap();
+        let path = session_script_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let older = "#!/bin/sh\n# an older build's script\n";
+        let older_hash = sha256_hex(older.as_bytes());
+        std::fs::write(&path, older).unwrap();
+        assert_eq!(
+            script_state_against(&path, &[older_hash.as_str()]),
+            ScriptState::Earlier
+        );
+        assert_eq!(script_state_against(&path, &[]), ScriptState::Edited);
+        assert_eq!(write_session_script(&path).unwrap(), ScriptState::Edited);
+        assert_eq!(std::fs::read(&path).unwrap(), SESSION_SCRIPT.as_bytes());
+        std::fs::write(&path, format!("{}# a local tweak\n", SESSION_SCRIPT)).unwrap();
+        assert_eq!(session_script_state(&path), ScriptState::Edited);
+        assert_eq!(write_session_script(&path).unwrap(), ScriptState::Edited);
+        assert_eq!(session_script_state(&path), ScriptState::Current);
+    }
+
+    /// `--write` modifies `--agent-hooks` and means nothing on its own.
+    #[test]
+    fn write_is_a_flag_of_agent_hooks() {
+        use crate::cli::{CliArgs, Command};
+        use clap::Parser;
+        let parsed = CliArgs::try_parse_from(["zellij", "setup", "--agent-hooks", "--write"]);
+        match parsed.unwrap().command {
+            Some(Command::Setup(setup)) => assert!(setup.agent_hooks && setup.write),
+            other => panic!("expected setup, got {:?}", other),
+        }
+        assert!(CliArgs::try_parse_from(["zellij", "setup", "--write"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_goes_through_a_symlink() {
+        let home = tempfile::tempdir().unwrap();
+        let real = home.path().join("dotfiles-agent-session.sh");
+        std::fs::write(&real, "#!/bin/sh\nold\n").unwrap();
+        let path = session_script_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        assert_eq!(write_session_script(&path).unwrap(), ScriptState::Edited);
+        assert!(path.is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), SESSION_SCRIPT.as_bytes());
     }
 
     #[test]

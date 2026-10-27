@@ -79,6 +79,7 @@ fn examine(
     check_config(&mut report, opts);
     check_socket_dir(&mut report, name);
     check_artifacts(&mut report);
+    check_agent_script(&mut report, mode);
     check_unit(&mut report, name, exe, extras.as_ref(), pinned.clone());
     let facts = SessionFacts::collect(name);
     check_session(&mut report, name, &facts);
@@ -331,6 +332,76 @@ fn wrapper_faults(directory: &Path, running: Option<&Path>) -> Vec<(PathBuf, &'s
         .collect();
     faults.sort();
     faults
+}
+
+/// The shared script the coding-agent hooks run, `~/.config/zellij/agent-session.sh`.
+///
+/// Unlike the leftovers above, this file is the binary's own: its bytes are this build's
+/// `SESSION_SCRIPT`, and the hooks `setup --agent-hooks` prints call modes only this build's copy
+/// has. A stale copy fails quietly - it exits zero on a mode it does not know - so the check is the
+/// only thing that notices, and rewriting it is the fix even when it holds local edits. The finding
+/// says so when it does. A byte compare and one hash, so it costs nothing on any platform.
+fn check_agent_script(report: &mut Report, mode: DoctorMode) {
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    report.push(agent_script_finding(
+        &zellij_utils::agent_hooks::session_script_path(&home),
+        mode,
+    ));
+}
+
+/// The finding for the script at `path`, writing it first if `mode` allows.
+fn agent_script_finding(path: &Path, mode: DoctorMode) -> Finding {
+    use zellij_utils::agent_hooks::{session_script_state, write_session_script, ScriptState};
+
+    let shown = path.display();
+    // what is wrong, as the dry run says it and as the fix says it
+    let (would, did, note) = match session_script_state(path) {
+        ScriptState::Current => {
+            return Finding::ok(
+                "hooks",
+                format!("{} is this build's agent-session script", shown),
+            )
+        },
+        ScriptState::Missing => (
+            format!("write {}: the agent hooks run it and it is missing", shown),
+            format!("wrote {}: the agent hooks run it and it was missing", shown),
+            None,
+        ),
+        ScriptState::Earlier => (
+            format!(
+                "rewrite {}: it is an older build's agent-session script",
+                shown
+            ),
+            format!(
+                "rewrote {}: it was an older build's agent-session script",
+                shown
+            ),
+            Some("the hooks call modes the older script does not have"),
+        ),
+        ScriptState::Edited => (
+            format!("rewrite {}: it holds local edits", shown),
+            format!("rewrote {}: it held local edits, which are gone", shown),
+            Some("zellij owns this file and rewrites it to this build's script"),
+        ),
+        ScriptState::Unreadable(why) => (
+            format!("rewrite {}: it cannot be read ({})", shown, why),
+            format!("rewrote {}: it could not be read ({})", shown, why),
+            None,
+        ),
+    };
+    if !mode.fix {
+        return Finding::changed("hooks", mode.describe(&would)).maybe_note(note.map(String::from));
+    }
+    match write_session_script(path) {
+        Ok(_) => Finding::changed("hooks", did).maybe_note(note.map(String::from)),
+        Err(error) => Finding::needs_you("hooks", format!("could not write {}: {}", shown, error))
+            .note("`zellij setup --agent-hooks --write` writes it"),
+    }
 }
 
 /// What is installed to keep the session up, whether the init system holds it, and whether the
@@ -1229,5 +1300,56 @@ mod tests {
     fn a_directory_that_is_not_there_holds_no_leftovers() {
         let scratch = tempfile::tempdir().unwrap();
         assert!(wrapper_faults(&scratch.path().join("no-such-bin"), None).is_empty());
+    }
+
+    #[test]
+    fn doctor_writes_a_missing_agent_script_and_a_dry_run_only_says_so() {
+        use zellij_utils::agent_hooks::{session_script_path, SESSION_SCRIPT};
+        use zellij_utils::session_doctor::Status;
+        let home = tempfile::tempdir().unwrap();
+        let path = session_script_path(home.path());
+
+        let dry = agent_script_finding(&path, DoctorMode::from_flags(true, false, false));
+        assert_eq!(dry.status, Status::Changed, "{:?}", dry);
+        assert!(dry.message.starts_with("would write "), "{:?}", dry);
+        assert!(dry.message.contains("is missing"), "{:?}", dry);
+        assert!(!path.exists());
+
+        let fixed = agent_script_finding(&path, DoctorMode::default());
+        assert_eq!(fixed.status, Status::Changed, "{:?}", fixed);
+        assert!(fixed.message.starts_with("wrote "), "{:?}", fixed);
+        assert_eq!(std::fs::read(&path).unwrap(), SESSION_SCRIPT.as_bytes());
+
+        let again = agent_script_finding(&path, DoctorMode::default());
+        assert_eq!(again.status, Status::AlreadyCorrect, "{:?}", again);
+        assert!(again
+            .message
+            .contains("is this build's agent-session script"));
+    }
+
+    #[test]
+    fn doctor_rewrites_a_stale_agent_script_and_says_when_it_held_local_edits() {
+        use zellij_utils::agent_hooks::{session_script_path, SESSION_SCRIPT};
+        use zellij_utils::session_doctor::Status;
+        let home = tempfile::tempdir().unwrap();
+        let path = session_script_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n# start|end|osc only, and a tweak\n").unwrap();
+
+        let dry = agent_script_finding(&path, DoctorMode::from_flags(false, true, false));
+        assert_eq!(dry.status, Status::Changed, "{:?}", dry);
+        assert!(dry.message.starts_with("would rewrite "), "{:?}", dry);
+        assert!(dry.message.contains("holds local edits"), "{:?}", dry);
+        assert_ne!(std::fs::read(&path).unwrap(), SESSION_SCRIPT.as_bytes());
+
+        let fixed = agent_script_finding(&path, DoctorMode::default());
+        assert_eq!(fixed.status, Status::Changed, "{:?}", fixed);
+        assert!(fixed.message.starts_with("rewrote "), "{:?}", fixed);
+        assert!(fixed.message.contains("held local edits"), "{:?}", fixed);
+        assert!(fixed
+            .notes
+            .iter()
+            .any(|note| note.contains("zellij owns this file")));
+        assert_eq!(std::fs::read(&path).unwrap(), SESSION_SCRIPT.as_bytes());
     }
 }

@@ -266,9 +266,15 @@ pub struct Setup {
     pub dump_surface: bool,
 
     /// Print, for each coding agent, the hook that tells zellij which session its pane holds,
-    /// and the file it goes in. Prints only; writes nothing
+    /// and the file it goes in. Prints only; writes nothing unless `--write` is given
     #[clap(long, value_parser)]
     pub agent_hooks: bool,
+
+    /// With `--agent-hooks`, also write the shared hook script to
+    /// ~/.config/zellij/agent-session.sh, replacing an older or edited copy. No harness settings
+    /// file is touched: those snippets are still only printed
+    #[clap(long, value_parser, requires = "agent_hooks")]
+    pub write: bool,
 
     /// Print coding-agent harness facts and screen detection manifests
     #[clap(long, value_parser)]
@@ -426,6 +432,17 @@ impl Setup {
         }
 
         if self.agent_hooks {
+            if self.write {
+                match crate::agent_hooks::write_home_session_script() {
+                    Ok(said) => {
+                        let _ = std::io::stdout().write_all(format!("# {}\n\n", said).as_bytes());
+                    },
+                    Err(error) => {
+                        eprintln!("{}", error);
+                        std::process::exit(1);
+                    },
+                }
+            }
             let _ = std::io::stdout().write_all(crate::agent_hooks::agent_hooks_text().as_bytes());
             std::process::exit(0);
         }
