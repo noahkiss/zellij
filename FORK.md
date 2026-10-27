@@ -4234,8 +4234,9 @@ and then is back at its shell. Not "when the pane is not running an agent right 
 fires at start-up, usually before the once-a-second tick has seen the agent, and that rule would
 drop every fresh report. A new report from the next agent replaces the old one.
 
-`zellij setup --agent-hooks` prints the hook for each agent and the file it goes in. It prints
-only; nothing is written. A build that reads the report lists `agent-session-osc` in
+`zellij setup --agent-hooks` prints the hook for each agent and the file it goes in. It edits no
+harness settings file. From nkmk.36, `--write` also writes the shared script; see
+[The binary keeps agent-session.sh current](#the-binary-keeps-agent-sessionsh-current). A build that reads the report lists `agent-session-osc` in
 `zellij setup --check --json`, so dotfiles can install the hooks only where they do something.
 
 **The hooks follow the shared agent-session contract.** On every session start - a claude
@@ -4251,7 +4252,7 @@ only the last is limited to zellij:
 
 | agent | file | export | register / unregister | report |
 |---|---|---|---|---|
-| `claude` | `settings.json` `SessionStart`, calling `~/.config/zellij/agent-session.sh claude osc` | not here | not here | yes |
+| `claude` | `settings.json` `SessionStart` and `SessionEnd`, calling `~/.config/zellij/agent-session.sh claude start` and `claude end` | not here: bm's hook | `SessionStart` / `SessionEnd` (from nkmk.36) | yes |
 | `codex` | `config.toml` `[[hooks.SessionStart]]` and `[[hooks.SessionEnd]]`, the same script | none: codex 0.160 has no way | `SessionStart` / `SessionEnd` | yes |
 | `opencode` (v1 and v2) | `~/.config/opencode/plugins/agent-session-env.ts` (server) and `~/.config/opencode/plugins/agent-session/tui.ts`, a TUI plugin directory; v1 also names it in `tui.json` | the server plugin | session opened in the TUI / TUI exit | yes |
 | `pi` | `~/.pi/agent/extensions/agent-session.ts` | its own `process.env`, which every command it runs inherits | `session_start` / `session_shutdown` | yes |
@@ -4261,9 +4262,11 @@ see [What an agent says it is doing](#what-an-agent-says-it-is-doing-osc-7501-an
 From nkmk.34 the opencode TUI plugin does the same for opencode, from opencode's own events; see
 [opencode reports its state from its TUI plugin](#opencode-reports-its-state-from-its-tui-plugin).
 
-claude's export, register and unregister are owned for now by bm's SessionStart hook; the zellij
-snippet prints a note and does not duplicate them. A move into the zellij hook is agreed with
-that hook's owner first, so there is always exactly one.
+claude's export is owned by bm's SessionStart hook, and the zellij snippet does not duplicate it.
+Up to nkmk.35 that hook also owned register and unregister, and the zellij snippet ran
+`claude osc`, because a second `agent-sessions register` replaced the whole entry. From nkmk.36
+`register` merges into an existing entry, so the zellij snippet registers with `claude start` and
+unregisters with `claude end`, and bm's hook may register the same id again to add `bm_project`.
 
 On the reading side, `AGENT_SESSION_ID` is the first identity variable for every harness, before
 its native names. When `AGENT_KIND` names another harness than the one detected - a codex pane
@@ -9924,6 +9927,33 @@ Compare engine changes before raising the supported engine version.
 Then update source revisions, re-run fixtures, run the wasm check, and read Rust CI.
 To update Paseo facts, review each provider at the new pinned commit and update the affected facts.
 The [harness README](zellij-utils/assets/harness/README.md) documents the schema and integration API.
+
+### The binary keeps agent-session.sh current
+
+Every claude and codex hook calls `~/.config/zellij/agent-session.sh` by path. Nothing wrote that
+file: the operator copied it out of `setup --agent-hooks`. So a machine kept an older build's copy
+for weeks, and the `context` and `state` modes never ran. An unknown mode exits zero, so nothing
+said so. The binary now owns the file.
+
+- `zellij setup --agent-hooks --write` writes this build's `SESSION_SCRIPT` to that path. It
+  creates the directory, writes a temporary file beside the script and renames it over, so a hook
+  never reads half a script. A symlink is written through, so a dotfiles link stays a link. A
+  current copy is left alone. The first line of output says what it did; the snippets follow as
+  before. `--write` without `--agent-hooks` is a usage error. No harness settings file is touched.
+- `zellij session doctor` checks the script under `hooks`. A missing or stale copy is one finding,
+  and the default fix rewrites it. A dry run or `--no-fix` says `would write` or `would rewrite`.
+  The finding tells an older build's script from an edited one, for example
+  `rewrote ~/.config/zellij/agent-session.sh: it held local edits, which are gone`. Rewriting is
+  the fix either way, because the binary owns the file.
+- To tell the two apart, `EARLIER_SESSION_SCRIPTS` in `zellij-utils/src/agent_hooks.rs` holds the
+  sha256 of every script an earlier build shipped. A test pins the current hash, so a change to
+  the script fails until the old hash is appended.
+- The path follows `HOME` only, because the hooks name it with `~`. `ZELLIJ_CONFIG_DIR` and
+  `XDG_CONFIG_HOME` do not move it.
+- The claude snippet now runs `claude start` and `claude context` on `SessionStart`, and
+  `claude end` on `SessionEnd`. See the agent-session contract above for why.
+
+`setup --check --json` lists `agent-hooks-write`. No client/server contract changes.
 
 ## Assessed and deliberately not built
 

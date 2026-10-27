@@ -83,6 +83,7 @@ pub const CAPABILITIES: &[&str] = &[
     "resurrect-command-hints",  // resurrect_command_hints
     "resurrect-commands",       // resurrect_commands "all" | "agents" | "prefill"
     "agent-session-osc",        // OSC 1337 SetUserVar=agent_session, setup --agent-hooks
+    "agent-hooks-write",        // setup --agent-hooks --write; doctor keeps the script current
     "harness-map",              // setup --harness-map [--json]: facts and pure screen detector data
     "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
     "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
