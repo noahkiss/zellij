@@ -966,12 +966,15 @@ mod tests {
     fn write_is_a_flag_of_agent_hooks() {
         use crate::cli::{CliArgs, Command};
         use clap::Parser;
-        let parsed = CliArgs::try_parse_from(["zellij", "setup", "--agent-hooks", "--write"]);
-        match parsed.unwrap().command {
-            Some(Command::Setup(setup)) => assert!(setup.agent_hooks && setup.write),
-            other => panic!("expected setup, got {:?}", other),
-        }
-        assert!(CliArgs::try_parse_from(["zellij", "setup", "--write"]).is_err());
+        // Parsing builds the whole clap tree, which overflows a debug test thread's stack.
+        crate::cli::on_big_stack(|| {
+            let parsed = CliArgs::try_parse_from(["zellij", "setup", "--agent-hooks", "--write"]);
+            match parsed.unwrap().command {
+                Some(Command::Setup(setup)) => assert!(setup.agent_hooks && setup.write),
+                other => panic!("expected setup, got {:?}", other),
+            }
+            assert!(CliArgs::try_parse_from(["zellij", "setup", "--write"]).is_err());
+        });
     }
 
     #[cfg(unix)]
