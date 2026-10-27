@@ -2164,6 +2164,45 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::ReopenPane {
+            handle,
+            list: true,
+            output_json,
+        } => {
+            // a list names no pane, so a handle beside it would be ignored; clap refuses the pair
+            let _ = handle;
+            match request_closed_panes_from_screen(&senders).with_context(err_context)? {
+                Some(closed) => {
+                    let output_lines = if output_json {
+                        vec![serde_json::to_string_pretty(&closed)
+                            .unwrap_or_else(|_| "[]".to_string())]
+                    } else {
+                        crate::closed_panes::format_closed_panes_table(&closed)
+                    };
+                    send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
+                },
+                None => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout listing the session's closed panes",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        Action::ReopenPane {
+            handle,
+            list: false,
+            ..
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::ReopenPane {
+                    handle,
+                    default_shell: default_shell.clone(),
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
         Action::ListEvents { output_json } => {
             match request_events_from_screen(&senders).with_context(err_context)? {
                 Some(events) => {
@@ -3950,6 +3989,31 @@ fn request_pane_handle(
 }
 
 /// Asks Screen for its action ring. `None` when Screen did not answer in time.
+/// fork addition: the closed panes a reopen can bring back, newest first. `None` when Screen did
+/// not answer in time.
+fn request_closed_panes_from_screen(
+    senders: &ThreadSenders,
+) -> Result<Option<Vec<crate::closed_panes::ClosedPane>>> {
+    use crossbeam::channel::{unbounded, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (response_sender, response_receiver) = unbounded();
+    senders.send_to_screen(ScreenInstruction::ListClosedPanes {
+        response_channel: response_sender,
+    })?;
+    match response_receiver.recv_timeout(Duration::from_secs(1)) {
+        Ok(closed) => Ok(Some(closed)),
+        Err(RecvTimeoutError::Timeout) => {
+            log::error!("ListClosedPanes timed out waiting for Screen response");
+            Ok(None)
+        },
+        Err(RecvTimeoutError::Disconnected) => {
+            log::error!("ListClosedPanes channel disconnected");
+            Ok(None)
+        },
+    }
+}
+
 fn request_events_from_screen(senders: &ThreadSenders) -> Result<Option<Vec<ActionEvent>>> {
     use crossbeam::channel::{unbounded, RecvTimeoutError};
     use std::time::Duration;

@@ -614,3 +614,43 @@ fn unknown_key_instruction_is_skipped_with_a_warning() {
     let pane = config.keybinds.0.get(&InputMode::Pane).unwrap();
     assert!(pane.contains_key(&KeyWithModifier::new(BareKey::Char('z'))));
 }
+
+#[test]
+fn reopen_pane_is_bindable_with_or_without_a_handle() {
+    let config_contents = r#"
+        keybinds {
+            pane {
+                bind "z" { ReopenPane; SwitchToMode "Normal"; }
+                bind "Z" { ReopenPane "sunny-otter"; }
+            }
+        }
+    "#;
+    let config = Config::from_kdl(config_contents, None).unwrap();
+    let pane_mode = |c| {
+        config
+            .keybinds
+            .get_actions_for_key_in_mode(&InputMode::Pane, &KeyWithModifier::new(BareKey::Char(c)))
+            .cloned()
+    };
+    assert_eq!(
+        pane_mode('z'),
+        Some(vec![
+            Action::ReopenPane {
+                handle: None,
+                list: false,
+                output_json: false,
+            },
+            Action::SwitchToMode {
+                input_mode: InputMode::Normal
+            }
+        ]),
+    );
+    assert_eq!(
+        pane_mode('Z'),
+        Some(vec![Action::ReopenPane {
+            handle: Some("sunny-otter".to_owned()),
+            list: false,
+            output_json: false,
+        }]),
+    );
+}

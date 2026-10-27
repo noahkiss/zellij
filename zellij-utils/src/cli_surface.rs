@@ -89,6 +89,8 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "launch-plugin",
             "new-pane",
             "new-tab",
+            // it makes a pane, and reports the one it made; `--list` alone changes nothing
+            "reopen-pane",
             // the viewer it opens is a pane like any other, and it reports the one it made
             "show",
             "start-or-reload-plugin",

@@ -658,6 +658,16 @@ pub enum Action {
     ListEvents {
         output_json: bool,
     },
+    /// fork addition: brings back a terminal pane that was closed lately, or lists the ones the
+    /// session remembers.
+    ///
+    /// The server keeps the last few closed terminal panes in memory. `handle: None` with
+    /// `list: false` reopens the newest; a handle reopens that one. `list` changes nothing.
+    ReopenPane {
+        handle: Option<String>,
+        list: bool,
+        output_json: bool,
+    },
     ListTabs {
         show_state: bool,
         show_dimensions: bool,
@@ -2182,6 +2192,16 @@ impl Action {
             }]),
             CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
             CliAction::ListEvents { json } => Ok(vec![Action::ListEvents { output_json: json }]),
+            CliAction::ReopenPane {
+                last: _,
+                handle,
+                list,
+                json,
+            } => Ok(vec![Action::ReopenPane {
+                handle,
+                list,
+                output_json: json,
+            }]),
             CliAction::ListTabs {
                 state,
                 dimensions,

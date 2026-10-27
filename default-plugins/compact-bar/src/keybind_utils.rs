@@ -424,6 +424,7 @@ impl KeybindProcessor {
                         )
                     },
                     |action: &Action| matches!(action, Action::CloseFocus),
+                    |action: &Action| matches!(action, Action::ReopenPane { list: false, .. }),
                     |action: &Action| {
                         matches!(
                             action,

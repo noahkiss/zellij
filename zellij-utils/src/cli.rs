@@ -1364,6 +1364,36 @@ pub enum CliAction {
         #[clap(long)]
         json: bool,
     },
+    /// Bring back a pane that was closed lately
+    ///
+    /// The session remembers its last 10 closed terminal panes, in memory only - a restart
+    /// forgets them. A pane comes back stacked in the tab it left, or in a new tab when that tab
+    /// is gone, in the same directory and under its old handle when that handle is free.
+    ///
+    /// What comes back is a shell. A pane that ran a coding agent gets the agent's bare resume
+    /// typed at the prompt - `claude --resume <id>` for the session it held when it closed - and
+    /// a pane that ran a command gets that command typed. Nothing runs until Enter. A plain shell
+    /// gets nothing typed.
+    ///
+    /// A pane leaves the list once it is reopened. A shell or a plugin pane whose own process
+    /// exited is not remembered; an agent or a command pane that exited is.
+    ///
+    /// No flag means `--last`. `--handle` and `--last` need no focused pane, so they work in a
+    /// session nobody is attached to.
+    ReopenPane {
+        /// Reopen the pane that closed most recently (the default)
+        #[clap(long, conflicts_with_all = &["handle", "list"])]
+        last: bool,
+        /// Reopen the closed pane that had this handle
+        #[clap(long, value_parser, conflicts_with = "list")]
+        handle: Option<String>,
+        /// List the closed panes the session remembers, newest first, and reopen nothing
+        #[clap(long)]
+        list: bool,
+        /// With --list, output as JSON
+        #[clap(long, requires = "list")]
+        json: bool,
+    },
     /// Leave a short note on a pane, or clear the one it has
     ///
     /// The note is drawn on the pane's frame, in the colour its meaning has in the theme. It is
@@ -3111,6 +3141,12 @@ impl CliAction {
             | CliAction::Whoami { json, .. }
             | CliAction::LastReply { json, .. }
             | CliAction::CurrentTabInfo { json, .. } => {
+                *json = true;
+                true
+            },
+            CliAction::ReopenPane {
+                json, list: true, ..
+            } => {
                 *json = true;
                 true
             },

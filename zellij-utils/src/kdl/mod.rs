@@ -1329,6 +1329,17 @@ impl Action {
             Action::ToggleMouseMode => Some(KdlNode::new("ToggleMouseMode")),
             Action::PreviousSwapLayout => Some(KdlNode::new("PreviousSwapLayout")),
             Action::NextSwapLayout => Some(KdlNode::new("NextSwapLayout")),
+            Action::ReopenPane {
+                handle,
+                list: false,
+                ..
+            } => {
+                let mut node = KdlNode::new("ReopenPane");
+                if let Some(handle) = handle {
+                    node.push(handle.clone());
+                }
+                Some(node)
+            },
             Action::BreakPane => Some(KdlNode::new("BreakPane")),
             Action::BreakPaneRight => Some(KdlNode::new("BreakPaneRight")),
             Action::BreakPaneLeft => Some(KdlNode::new("BreakPaneLeft")),
@@ -2280,6 +2291,19 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
             },
             "PreviousSwapLayout" => Ok(Action::PreviousSwapLayout),
             "NextSwapLayout" => Ok(Action::NextSwapLayout),
+            // fork addition: no argument reopens the newest closed pane, a string the one that had
+            // that handle
+            "ReopenPane" => {
+                let handle = action_arguments
+                    .first()
+                    .and_then(|v| v.value().as_string())
+                    .map(|handle| handle.to_owned());
+                Ok(Action::ReopenPane {
+                    handle,
+                    list: false,
+                    output_json: false,
+                })
+            },
             "BreakPane" => Ok(Action::BreakPane),
             "BreakPaneRight" => Ok(Action::BreakPaneRight),
             "BreakPaneLeft" => Ok(Action::BreakPaneLeft),

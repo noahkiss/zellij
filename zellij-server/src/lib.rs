@@ -17,6 +17,7 @@ pub mod tab;
 
 pub mod background_jobs;
 mod bell_dwell;
+mod closed_panes;
 mod global_async_runtime;
 mod logging_pipe;
 mod mobile_web;

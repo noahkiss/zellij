@@ -426,7 +426,7 @@ pub const TOOLS: &[ToolSpec] = &[
         follow_up: Some("zellij_write_input or zellij_wait_for, using the handle this returns"),
         // `kind: tab` runs `new-tab`, which prints the same three keys today and need not keep
         // doing so. A tool that multiplexes says what each of its commands returns
-        reports: &["action new-pane", "action new-tab"],
+        reports: &["action new-pane", "action new-tab", "action reopen-pane"],
         tips:
             "By default the pane runs your interactive shell, with your full rc files, and the \
                call waits until that shell is ready before it types `command` and presses Enter - \
@@ -538,6 +538,18 @@ pub const TOOLS: &[ToolSpec] = &[
                            `~` and `$VAR` are expanded, and a relative path is taken from this \
                            server's directory. The agent's shell reads it, so it can be long and \
                            hold any characters.",
+                default: None,
+            },
+            ParamSpec {
+                name: "reopen",
+                kind: ParamKind::Str,
+                required: false,
+                from: None,
+                describe: "Bring back a closed pane instead of making a new one: `last` for the \
+                           newest, or the handle it had. It returns stacked in its old tab (a new \
+                           tab if that one closed), in its directory, under its old handle when \
+                           free. An agent's resume, or a command pane's command, is typed at the \
+                           prompt and not run. Takes no other parameter but session.",
                 default: None,
             },
         ],
@@ -1375,6 +1387,8 @@ mod tests {
         // looked valid in the one place an agent reads it. Every `--handle` says the same thing.
         let handles: Vec<(&str, &str)> = cli_surface::surface_commands()
             .iter()
+            // `reopen-pane --handle` names a closed pane to find, not a handle to give one
+            .filter(|command| !command.path.ends_with("reopen-pane"))
             .filter_map(|command| {
                 command
                     .arg("--handle")

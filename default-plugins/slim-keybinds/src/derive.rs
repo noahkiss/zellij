@@ -306,6 +306,7 @@ fn predicates_for_mode(mode: InputMode) -> &'static [fn(&Action) -> bool] {
                 )
             },
             |a| matches!(a, Action::CloseFocus),
+            |a| matches!(a, Action::ReopenPane { list: false, .. }),
             |a| {
                 matches!(
                     a,

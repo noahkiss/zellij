@@ -1027,6 +1027,19 @@ impl TryFrom<ProtobufAction> for Action {
                 Some(_) => Err("BreakPaneLeft should not have a payload"),
                 None => Ok(Action::BreakPaneLeft),
             },
+            Some(ProtobufActionName::ReopenPane) => match protobuf_action.optional_payload {
+                Some(OptionalPayload::ReopenPanePayload(handle)) => Ok(Action::ReopenPane {
+                    handle: Some(handle),
+                    list: false,
+                    output_json: false,
+                }),
+                None => Ok(Action::ReopenPane {
+                    handle: None,
+                    list: false,
+                    output_json: false,
+                }),
+                _ => Err("Wrong payload for Action::ReopenPane"),
+            },
             Some(ProtobufActionName::RenameSession) => match protobuf_action.optional_payload {
                 Some(OptionalPayload::RenameSessionPayload(name)) => {
                     Ok(Action::RenameSession { name })
@@ -1955,6 +1968,16 @@ impl TryFrom<Action> for ProtobufAction {
                 name: ProtobufActionName::BreakPaneLeft as i32,
                 optional_payload: None,
             }),
+            // a key reopens; listing is a CLI read with nothing to bind
+            Action::ReopenPane {
+                handle,
+                list: false,
+                ..
+            } => Ok(ProtobufAction {
+                name: ProtobufActionName::ReopenPane as i32,
+                optional_payload: handle.map(OptionalPayload::ReopenPanePayload),
+            }),
+            Action::ReopenPane { list: true, .. } => Err("Unsupported action"),
             Action::RenameSession { name: session_name } => Ok(ProtobufAction {
                 name: ProtobufActionName::RenameSession as i32,
                 optional_payload: Some(OptionalPayload::RenameSessionPayload(session_name)),
@@ -3418,5 +3441,27 @@ mod tests {
             let decoded: Action = protobuf.try_into().expect("decode");
             assert_eq!(original, decoded);
         }
+    }
+
+    /// A bound reopen reaches the plugins that draw key hints; a listing is no key's business.
+    #[test]
+    fn reopen_pane_reaches_plugins_and_a_listing_does_not() {
+        for handle in [None, Some("sunny-otter".to_owned())] {
+            let original = Action::ReopenPane {
+                handle,
+                list: false,
+                output_json: false,
+            };
+            let protobuf: ProtobufAction = original.clone().try_into().expect("encode");
+            let decoded: Action = protobuf.try_into().expect("decode");
+            assert_eq!(original, decoded);
+        }
+        let listing: Result<ProtobufAction, _> = Action::ReopenPane {
+            handle: None,
+            list: true,
+            output_json: true,
+        }
+        .try_into();
+        assert!(listing.is_err());
     }
 }

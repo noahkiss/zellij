@@ -40,6 +40,8 @@ use crate::route::NotificationEnd;
 
 use log::{debug, warn};
 use zellij_utils::agent_detect::{self, PaneAgent};
+
+use crate::closed_panes::{ClosedPane, ClosedPaneKind, ClosedPanes, ClosingPane};
 use zellij_utils::data::{
     ActionEvent, CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates,
     GetFocusedPaneInfoResponse, HostTerminalThemeMode, KeyWithModifier, LayoutInfo,
@@ -845,6 +847,24 @@ pub enum ScreenInstruction {
     ListEvents {
         response_channel: crossbeam::channel::Sender<Vec<ActionEvent>>,
     },
+    /// fork addition: brings back the newest closed terminal pane, or the newest one that had
+    /// `handle`. See `crate::closed_panes`.
+    ReopenPane {
+        handle: Option<String>,
+        default_shell: Option<TerminalAction>,
+        client_id: ClientId,
+        completion_tx: Option<NotificationEnd>,
+    },
+    /// fork addition: the closed panes a reopen can bring back, newest first.
+    ListClosedPanes {
+        response_channel: crossbeam::channel::Sender<Vec<ClosedPane>>,
+    },
+    /// fork addition: the pty is about to hand over a reopened pane, which takes back this
+    /// handle the moment a tab takes it - before the creation is reported.
+    ExpectReopenedPane {
+        terminal_id: u32,
+        handle: String,
+    },
     /// Leaves a short note on a pane's frame, or clears it with `None`.
     SetPaneNote {
         pane_id: PaneId,
@@ -1301,6 +1321,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::SetPaneNote { .. } => ScreenContext::SetPaneNote,
             ScreenInstruction::RecordAction { .. } => ScreenContext::RecordAction,
             ScreenInstruction::ListEvents { .. } => ScreenContext::ListEvents,
+            ScreenInstruction::ReopenPane { .. } => ScreenContext::ReopenPane,
+            ScreenInstruction::ListClosedPanes { .. } => ScreenContext::ListClosedPanes,
+            ScreenInstruction::ExpectReopenedPane { .. } => ScreenContext::ReopenPane,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
             ScreenInstruction::Reconfigure { .. } => ScreenContext::Reconfigure,
@@ -1793,6 +1816,14 @@ pub(crate) struct Screen {
     /// terminal_id -> the command line to type at that pane's first prompt; see
     /// `ScreenInstruction::PrefillPane`.
     pending_prefills: HashMap<u32, String>,
+    /// fork addition: the last few closed terminal panes; see `crate::closed_panes`.
+    closed_panes: ClosedPanes,
+    /// fork addition: a reopened pane's old handle, waiting for the pane to exist. See
+    /// `ScreenInstruction::ExpectReopenedPane`.
+    pending_reopen_handles: HashMap<u32, String>,
+    /// fork addition: tab id -> the handle and the prefill of the pane a reopen is building
+    /// that tab for, applied when its layout arrives.
+    reopen_in_new_tab: HashMap<usize, (String, Option<String>)>,
     /// Whether this session answers "which panes run a coding agent" at all. `detect_agents`,
     /// default true, owned by the pty thread and told to Screen with the process info it gates.
     detect_agents: bool,
@@ -2094,6 +2125,9 @@ impl Screen {
             pane_output_activity: HashMap::new(),
             pane_process_info: HashMap::new(),
             pending_prefills: HashMap::new(),
+            closed_panes: ClosedPanes::default(),
+            pending_reopen_handles: HashMap::new(),
+            reopen_in_new_tab: HashMap::new(),
             detect_agents: DETECT_AGENTS_DEFAULT,
             mobile_web_prefs: HashMap::new(),
             client_host_focused: HashMap::new(),
@@ -2529,6 +2563,12 @@ impl Screen {
     fn close_tab_by_id(&mut self, tab_id: usize) -> Result<()> {
         let err_context = || format!("failed to close tab at index {tab_id:?}");
 
+        // fork addition: a pane closed with its tab can be reopened like any other
+        let closing = self
+            .tabs
+            .get(&tab_id)
+            .map(|tab| self.closing_pane_snapshots(&tab.get_all_pane_ids(), false))
+            .unwrap_or_default();
         let mut tab_to_close = self.tabs.remove(&tab_id).with_context(err_context)?;
         let mut pane_ids = tab_to_close.get_all_pane_ids();
 
@@ -2538,6 +2578,12 @@ impl Screen {
         let suppressed_panes = tab_to_close.extract_suppressed_panes();
         for suppressed_pane_id in suppressed_panes.keys() {
             pane_ids.retain(|p| p != suppressed_pane_id);
+        }
+        // a suppressed pane moves to another tab rather than closing
+        for (pane_id, closed) in closing {
+            if pane_ids.contains(&pane_id) {
+                self.closed_panes.remember(closed);
+            }
         }
 
         let _ = self.bus.senders.send_to_plugin(PluginInstruction::Update(
@@ -6064,6 +6110,109 @@ impl Screen {
                 None => agent_detect::with_session_source(agent, live_source, command),
             }
         })
+    }
+
+    /// fork addition: what a reopen needs of each of `pane_ids` that is a live terminal pane,
+    /// read before the panes close. See `remember_closed_panes` for the other half.
+    ///
+    /// `process_exited` is the close a pane's own process caused. A shell that exited was ended on
+    /// purpose, so only an agent or a command pane is kept from that route.
+    fn closing_pane_snapshots(
+        &self,
+        pane_ids: &[PaneId],
+        process_exited: bool,
+    ) -> Vec<(PaneId, ClosedPane)> {
+        let mut snapshots = vec![];
+        for tab in self.tabs.values() {
+            let here: Vec<u32> = tab
+                .get_all_pane_ids()
+                .into_iter()
+                .filter(|id| pane_ids.contains(id))
+                .filter_map(|id| match id {
+                    PaneId::Terminal(id) => Some(id),
+                    PaneId::Plugin(_) => None,
+                })
+                .collect();
+            if here.is_empty() {
+                continue;
+            }
+            for info in self.pane_infos_for_tab(tab) {
+                if info.is_plugin || !here.contains(&info.id) {
+                    continue;
+                }
+                let pane_id = PaneId::Terminal(info.id);
+                let started_with = tab.get_pane_with_id(pane_id).and_then(|pane| {
+                    match pane.invoked_with() {
+                        // a shell opened with a directory of its own still carries it here
+                        Some(Run::Command(run))
+                            if !(run.args.is_empty() && run.use_terminal_title) =>
+                        {
+                            Some(run.clone())
+                        },
+                        _ => None,
+                    }
+                });
+                let process_info = self.pane_process_info.get(&info.id);
+                let agent = self.agent_in_pane(&info);
+                let closing = ClosingPane {
+                    agent: agent
+                        .as_ref()
+                        .map(|agent| (agent.kind.as_str(), agent.agent_id.as_deref())),
+                    live_argv: process_info.and_then(|info| info.command.as_deref()),
+                    started_with: started_with
+                        .as_ref()
+                        .map(|run| (run.command.display().to_string(), run.args.clone())),
+                };
+                let kind = closing.kind();
+                if process_exited && kind == ClosedPaneKind::Shell {
+                    continue;
+                }
+                let cwd = process_info
+                    .and_then(|info| info.cwd.clone())
+                    .or_else(|| started_with.as_ref().and_then(|run| run.cwd.clone()));
+                snapshots.push((
+                    pane_id,
+                    ClosedPane {
+                        handle: info.handle.clone(),
+                        tab_id: tab.id,
+                        tab_name: tab.name.clone(),
+                        title: info.title.clone(),
+                        cwd,
+                        kind,
+                        prefill: closing.prefill(),
+                        agent: agent.as_ref().map(|agent| agent.kind.clone()),
+                        agent_session_id: agent.and_then(|agent| agent.agent_id),
+                    },
+                ));
+            }
+        }
+        snapshots
+    }
+
+    /// fork addition: keeps each snapshot whose pane is really gone. A close can refuse, and a
+    /// suppressed pane outlives its tab, so the snapshot is only half the answer.
+    fn remember_closed_panes(&mut self, snapshots: Vec<(PaneId, ClosedPane)>) {
+        for (pane_id, closed) in snapshots {
+            if !self.pane_exists(&pane_id) {
+                self.closed_panes.remember(closed);
+            }
+        }
+    }
+
+    /// fork addition: the pane a reopened pane stacks under in `tab` - the focused tiled pane of
+    /// a client looking at the tab, else the tab's first selectable tiled pane. An explicit
+    /// anchor is what lets a reopen work with nobody attached.
+    fn reopen_anchor(tab: &Tab, client_id: Option<ClientId>) -> Option<PaneId> {
+        let tiled = tab.get_tiled_pane_ids();
+        client_id
+            .and_then(|client_id| tab.get_active_pane_id(client_id))
+            .filter(|pane_id| tiled.contains(pane_id))
+            .or_else(|| {
+                tiled.into_iter().find(|pane_id| {
+                    tab.get_pane_with_id(*pane_id)
+                        .map_or(false, |pane| pane.selectable())
+                })
+            })
     }
 
     /// Gives a live pane the handle its creator chose for it.
@@ -9990,6 +10139,14 @@ pub(crate) fn screen_thread_main(
                 // by dropping the pty rather than by failing, so asking the tabs afterwards is
                 // what tells the two apart. Reporting the id from the request instead is how
                 // `new-pane` came to print a pane that was never made
+                // fork addition: a reopened pane answers to its old name before it is reported
+                if let PaneId::Terminal(terminal_id) = pid {
+                    if let Some(handle) = screen.pending_reopen_handles.remove(&terminal_id) {
+                        if let Err(e) = screen.set_pane_handle(pid, &handle) {
+                            log::info!("reopen-pane: kept a new handle: {}", e);
+                        }
+                    }
+                }
                 if let Some(completion) = completion_tx.as_mut() {
                     if screen.pane_exists(&pid) {
                         completion.set_affected_pane_id(pid);
@@ -10689,6 +10846,102 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::ListEvents { response_channel } => {
                 let _ = response_channel.send(screen.collect_action_events());
             },
+            ScreenInstruction::ListClosedPanes { response_channel } => {
+                let _ = response_channel.send(screen.closed_panes.list());
+            },
+            ScreenInstruction::ExpectReopenedPane {
+                terminal_id,
+                handle,
+            } => {
+                screen.pending_reopen_handles.insert(terminal_id, handle);
+            },
+            ScreenInstruction::ReopenPane {
+                handle,
+                default_shell,
+                client_id,
+                mut completion_tx,
+            } => {
+                let Some(closed) = screen.closed_panes.take(handle.as_deref()) else {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(match &handle {
+                            Some(handle) => format!(
+                                "No closed pane had the handle '{}'. `zellij action reopen-pane --list` shows the ones this session remembers.",
+                                handle
+                            ),
+                            None => "No closed pane to reopen.".to_owned(),
+                        });
+                    }
+                    continue;
+                };
+                // a keypress focuses what it brings back; a call from outside moves nobody
+                let attached_client = Some(client_id)
+                    .filter(|client_id| screen.active_tab_ids.contains_key(client_id));
+                if let Some(tab) = screen.tabs.get(&closed.tab_id) {
+                    let looking_at_tab = attached_client
+                        .filter(|client_id| screen.active_tab_ids.get(client_id) == Some(&tab.id));
+                    let placement = match Screen::reopen_anchor(tab, looking_at_tab) {
+                        Some(anchor) => NewPanePlacement::Stacked {
+                            pane_id_to_stack_under: Some(anchor.into()),
+                            borderless: None,
+                        },
+                        None => NewPanePlacement::Tiled {
+                            direction: None,
+                            borderless: None,
+                        },
+                    };
+                    let route = if looking_at_tab.is_some() {
+                        ClientTabIndexOrPaneId::TabIndex(tab.id)
+                    } else {
+                        ClientTabIndexOrPaneId::TabIndexNoFocus(tab.id)
+                    };
+                    screen
+                        .bus
+                        .senders
+                        .send_to_pty(PtyInstruction::SpawnReopenedTerminal {
+                            default_shell,
+                            cwd: closed.cwd,
+                            placement,
+                            client_or_tab_index: route,
+                            completion_tx,
+                            prefill: closed.prefill,
+                            handle: closed.handle,
+                        })
+                        .context("failed to reopen a pane")?;
+                } else {
+                    // the tab went with the pane, so it comes back as a tab of its own, under its
+                    // old name and built from the session's new-tab template like any other
+                    let tab_index = screen.get_new_tab_id();
+                    pending_tab_ids.insert(tab_index);
+                    let swap_layouts = (
+                        screen.default_layout.swap_tiled_layouts.clone(),
+                        screen.default_layout.swap_floating_layouts.clone(),
+                    );
+                    screen.new_tab(
+                        tab_index,
+                        swap_layouts,
+                        Some(closed.tab_name.clone()),
+                        attached_client,
+                    )?;
+                    screen
+                        .reopen_in_new_tab
+                        .insert(tab_index, (closed.handle, closed.prefill));
+                    screen
+                        .bus
+                        .senders
+                        .send_to_plugin(PluginInstruction::NewTab(
+                            closed.cwd,
+                            default_shell,
+                            None,
+                            vec![],
+                            tab_index,
+                            None,
+                            false,
+                            attached_client.is_some(),
+                            (client_id, false),
+                            completion_tx,
+                        ))?;
+                }
+            },
             ScreenInstruction::SetPaneNote {
                 pane_id,
                 note,
@@ -11123,6 +11376,9 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::CloseFocusedPane(client_id, mut completion_tx) => {
                 let old_pane_id = screen.get_active_pane_id(&client_id);
+                let closing = old_pane_id
+                    .map(|pane_id| screen.closing_pane_snapshots(&[pane_id], false))
+                    .unwrap_or_default();
                 if let Some(old_pane_id) = old_pane_id {
                     // the report is written before the close because the close consumes the
                     // channel. A close that refuses sets an error message, and an error outranks a
@@ -11142,6 +11398,7 @@ pub(crate) fn screen_thread_main(
                     // every pane it started with
                     c.set_error_message(NO_FOCUSED_PANE_TO_CLOSE.to_owned());
                 }
+                screen.remember_closed_panes(closing);
                 let new_pane_id = screen.get_active_pane_id(&client_id);
                 if let (Some(old), Some(new)) = (old_pane_id, new_pane_id) {
                     screen.report_key_passthrough_state(client_id, old, new);
@@ -11212,6 +11469,9 @@ pub(crate) fn screen_thread_main(
                 // waiting for it
                 exit_status,
             ) => {
+                // fork addition: no client and nobody waiting is the pane's own process exiting
+                let process_exited = client_id.is_none() && _completion_tx.is_none();
+                let closing = screen.closing_pane_snapshots(&[id], process_exited);
                 match client_id {
                     Some(client_id) => {
                         active_tab!(screen, client_id, |tab: &mut Tab| tab.close_pane(
@@ -11256,6 +11516,7 @@ pub(crate) fn screen_thread_main(
                     },
                 }
 
+                screen.remember_closed_panes(closing);
                 screen.clear_nested_guest(id);
 
                 // Clean up PTY-side resources (async reader task, child PID mapping,
@@ -11473,6 +11734,16 @@ pub(crate) fn screen_thread_main(
                     "ScreenInstruction::ApplyLayout: applying layout for tab {}",
                     tab_id
                 );
+                // fork addition: the tab a reopen built, whose first terminal is the reopened pane
+                let reopened = screen
+                    .reopen_in_new_tab
+                    .remove(&tab_id)
+                    .and_then(|reopened| {
+                        new_pane_pids
+                            .iter()
+                            .next()
+                            .map(|(terminal_id, ..)| (*terminal_id, reopened))
+                    });
                 // tab_id is a stable identifier from NewTab instruction
                 if let Some(first_terminal_pane) = new_pane_pids.iter().next() {
                     completion_tx
@@ -11500,6 +11771,14 @@ pub(crate) fn screen_thread_main(
                     (client_id, is_web_client),
                     blocking_terminal,
                 )?;
+                if let Some((terminal_id, (handle, prefill))) = reopened {
+                    if let Err(e) = screen.set_pane_handle(PaneId::Terminal(terminal_id), &handle) {
+                        log::info!("reopen-pane: kept a new handle: {}", e);
+                    }
+                    if let Some(prefill) = prefill {
+                        screen.pending_prefills.insert(terminal_id, prefill);
+                    }
+                }
                 pending_tab_ids.remove(&tab_id);
                 if pending_tab_ids.is_empty() {
                     // every tab is built, so the names none of them claimed go back into
@@ -14706,6 +14985,7 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::CloseFocusWithPaneId(pane_id, mut completion_tx) => {
                 let printed_id = screen.pane_summary(pane_id);
+                let closing = screen.closing_pane_snapshots(&[pane_id], false);
                 let all_tabs = screen.get_tabs_mut();
                 let mut found = false;
                 for tab in all_tabs.values_mut() {
@@ -14734,6 +15014,7 @@ pub(crate) fn screen_thread_main(
                         c.set_error_message(format!("No pane answers to '{}'", printed_id));
                     }
                 }
+                screen.remember_closed_panes(closing);
                 screen.render(None)?;
                 screen.log_and_report_session_state()?;
             },

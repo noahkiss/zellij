@@ -1404,6 +1404,21 @@ Config {
             ],
             KeyWithModifier {
                 bare_key: Char(
+                    'u',
+                ),
+                key_modifiers: {},
+            }: [
+                ReopenPane {
+                    handle: None,
+                    list: false,
+                    output_json: false,
+                },
+                SwitchToMode {
+                    input_mode: Normal,
+                },
+            ],
+            KeyWithModifier {
+                bare_key: Char(
                     'w',
                 ),
                 key_modifiers: {},

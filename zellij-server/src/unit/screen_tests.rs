@@ -19044,3 +19044,443 @@ pub fn any_input_to_the_pane_clears_its_prefilled_command() {
         "no bytes, bytes to another pane and a prompt redraw leave the line where it was"
     );
 }
+
+// fork addition: `reopen-pane`
+
+fn reopen_list_panes(mock_screen: &MockScreen) -> ListPanesResponse {
+    let (response_channel, panes) = crossbeam::channel::unbounded();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ListPanes {
+        show_all: true,
+        response_channel,
+    });
+    panes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("screen should answer ListPanes")
+}
+
+fn reopen_closed_panes(mock_screen: &MockScreen) -> Vec<crate::closed_panes::ClosedPane> {
+    let (response_channel, closed) = crossbeam::channel::unbounded();
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::ListClosedPanes { response_channel });
+    closed
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("screen should answer ListClosedPanes")
+}
+
+fn reopen_handle_of(mock_screen: &MockScreen, terminal_id: u32) -> String {
+    reopen_list_panes(mock_screen)
+        .into_iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == terminal_id)
+        .map(|entry| entry.pane_info.handle)
+        .expect("the pane is listed")
+}
+
+fn reopen_agent_process_info(session_id: &str, cwd: &str) -> crate::pty::PaneProcessInfo {
+    crate::pty::PaneProcessInfo {
+        pid: Some(4242),
+        cwd: Some(PathBuf::from(cwd)),
+        command: Some(vec![
+            "claude".to_owned(),
+            "--model".to_owned(),
+            "opus".to_owned(),
+            "write the tests".to_owned(),
+        ]),
+        env: Default::default(),
+        agent_env: Default::default(),
+        agent_name: None,
+        agent_session_source: None,
+        osc_agent_session: Some(session_id.to_owned()),
+    }
+}
+
+fn reopen_send_process_info(
+    mock_screen: &MockScreen,
+    panes: Vec<(u32, crate::pty::PaneProcessInfo)>,
+) {
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info: panes.into_iter().collect(),
+            detect_agents: true,
+            pane_frame_agent_name: false,
+        });
+}
+
+/// A closed agent pane is remembered with the session it held, and a reopen asks the pty for a
+/// shell stacked in the same tab, in the same directory, carrying the agent's bare resume and the
+/// old handle. The screen half then gives the new pane that handle and types the resume once the
+/// line editor is up - so `list-panes` shows it as the pane's `prefilled_command`.
+#[test]
+pub fn a_closed_agent_pane_comes_back_stacked_with_its_resume_at_the_prompt() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let pty_receiver = mock_screen.pty_receiver.take().unwrap();
+    let pty_writer_receiver = mock_screen.pty_writer_receiver.take().unwrap();
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let received_pty_instructions = Arc::new(Mutex::new(vec![]));
+    let pty_thread = log_actions_in_thread!(
+        received_pty_instructions,
+        PtyInstruction::Exit,
+        pty_receiver
+    );
+    let received_pty_writes = Arc::new(Mutex::new(vec![]));
+    let pty_writer_thread = log_actions_in_thread!(
+        received_pty_writes,
+        PtyWriteInstruction::Exit,
+        pty_writer_receiver
+    );
+    reopen_send_process_info(
+        &mock_screen,
+        vec![(1, reopen_agent_process_info("abc-123", "/work/agent"))],
+    );
+    let old_handle = reopen_handle_of(&mock_screen, 1);
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(1),
+        Some(mock_screen.main_client_id),
+        None,
+        None,
+    ));
+    let closed = reopen_closed_panes(&mock_screen);
+    assert_eq!(
+        closed.len(),
+        1,
+        "the closed pane is remembered: {:?}",
+        closed
+    );
+    assert_eq!(closed[0].handle, old_handle);
+    assert_eq!(closed[0].kind, crate::closed_panes::ClosedPaneKind::Agent);
+    assert_eq!(closed[0].agent_session_id.as_deref(), Some("abc-123"));
+    assert_eq!(
+        closed[0].prefill.as_deref(),
+        Some("claude --resume abc-123")
+    );
+    assert_eq!(closed[0].cwd, Some(PathBuf::from("/work/agent")));
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ReopenPane {
+        handle: None,
+        default_shell: None,
+        client_id: mock_screen.main_client_id,
+        completion_tx: None,
+    });
+    assert!(
+        reopen_closed_panes(&mock_screen).is_empty(),
+        "a reopened pane leaves the ring"
+    );
+
+    // what the pty does with `SpawnReopenedTerminal`, in the order it sends it
+    let new_pid = 7;
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PrefillPane(
+        new_pid,
+        "claude --resume abc-123".to_owned(),
+    ));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::ExpectReopenedPane {
+            terminal_id: new_pid,
+            handle: old_handle.clone(),
+        });
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewPane(
+        PaneId::Terminal(new_pid),
+        None,
+        None,
+        None,
+        NewPanePlacement::Stacked {
+            pane_id_to_stack_under: Some(PaneId::Terminal(0).into()),
+            borderless: None,
+        },
+        false,
+        ClientTabIndexOrPaneId::TabIndex(0),
+        None,
+        false,
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::PtyBytes(
+        new_pid,
+        b"\x1b[?2004h$ ".to_vec(),
+    ));
+    let panes = reopen_list_panes(&mock_screen);
+    mock_screen.teardown(vec![pty_thread, pty_writer_thread, screen_thread]);
+
+    let spawned: Vec<_> = received_pty_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i {
+            PtyInstruction::SpawnReopenedTerminal {
+                cwd,
+                placement,
+                client_or_tab_index,
+                prefill,
+                handle,
+                ..
+            } => Some((
+                cwd.clone(),
+                placement.clone(),
+                *client_or_tab_index,
+                prefill.clone(),
+                handle.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spawned.len(), 1, "one reopen asks for one pane");
+    let (cwd, placement, route, prefill, handle) = spawned[0].clone();
+    assert_eq!(cwd, Some(PathBuf::from("/work/agent")));
+    assert_eq!(prefill.as_deref(), Some("claude --resume abc-123"));
+    assert_eq!(handle, old_handle);
+    assert!(
+        matches!(
+            placement,
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under: Some(_),
+                ..
+            }
+        ),
+        "stacked under an explicit anchor, so no focus is needed: {:?}",
+        placement
+    );
+    assert!(matches!(
+        route,
+        ClientTabIndexOrPaneId::TabIndex(0) | ClientTabIndexOrPaneId::TabIndexNoFocus(0)
+    ));
+
+    let reopened = panes
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == new_pid)
+        .expect("the reopened pane exists");
+    assert_eq!(
+        reopened.pane_info.handle, old_handle,
+        "it took its old handle back"
+    );
+    assert_eq!(
+        reopened.prefilled_command.as_deref(),
+        Some("claude --resume abc-123")
+    );
+    assert!(reopened.pane_info.stack_id.is_some(), "it is in a stack");
+    let writes: Vec<Vec<u8>> = received_pty_writes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i {
+            PtyWriteInstruction::Write(bytes, pid, _) if *pid == new_pid => Some(bytes.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        vec![b"\x1b[200~claude --resume abc-123\x1b[201~".to_vec()],
+        "pasted, not run"
+    );
+}
+
+/// Which closes are remembered: any close a person or a caller asked for, and a process exit
+/// only for a command pane or an agent - a shell that exited was ended on purpose.
+#[test]
+pub fn the_ring_fills_from_closes_and_skips_an_exited_shell() {
+    let size = Size {
+        cols: 120,
+        rows: 40,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let mut layout = TiledPaneLayout::default();
+    layout.children_split_direction = SplitDirection::Vertical;
+    let mut command_pane = TiledPaneLayout::default();
+    command_pane.run = Some(Run::Command(RunCommand {
+        command: PathBuf::from("cargo"),
+        args: vec!["test".to_owned(), "a b".to_owned()],
+        hold_on_close: false,
+        ..Default::default()
+    }));
+    layout.children = vec![
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+        command_pane,
+        TiledPaneLayout::default(),
+    ];
+    mock_screen.drop_all_pty_messages();
+    let screen_thread = mock_screen.run(Some(layout), vec![]);
+    // a shell whose own process exited is not remembered
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(0),
+        None,
+        None,
+        Some(0),
+    ));
+    // a command pane whose process exited is
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ClosePane(
+        PaneId::Terminal(2),
+        None,
+        None,
+        Some(0),
+    ));
+    // and so is a shell closed by `close-pane --pane-id`
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::CloseFocusWithPaneId(
+            PaneId::Terminal(3),
+            None,
+        ));
+    // and one a person closed with the close key
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::CloseFocusedPane(
+            mock_screen.main_client_id,
+            None,
+        ));
+    let closed = reopen_closed_panes(&mock_screen);
+    mock_screen.teardown(vec![screen_thread]);
+    let kinds: Vec<_> = closed.iter().map(|c| (c.kind, c.prefill.clone())).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            (crate::closed_panes::ClosedPaneKind::Shell, None),
+            (crate::closed_panes::ClosedPaneKind::Shell, None),
+            (
+                crate::closed_panes::ClosedPaneKind::Command,
+                Some("cargo test 'a b'".to_owned())
+            ),
+        ],
+        "newest first: {:?}",
+        closed
+    );
+}
+
+/// A pane whose tab is gone comes back in a new tab under the old tab's name, and the pane the
+/// new tab's layout makes takes the old handle and the prefill.
+#[test]
+pub fn a_pane_whose_tab_closed_comes_back_in_a_new_tab() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    mock_screen.drop_all_pty_messages();
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    // a second tab, with panes 2 and 3
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewTab(
+        None,
+        None,
+        Some(two_pane_layout()),
+        vec![],
+        Some("agents".to_owned()),
+        (Some(vec![]), Some(vec![])),
+        None,
+        false,
+        true,
+        (mock_screen.main_client_id, false),
+        None,
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ApplyLayout(
+        two_pane_layout(),
+        vec![],
+        vec![(2, None), (3, None)],
+        vec![],
+        HashMap::new(),
+        1,
+        true,
+        (mock_screen.main_client_id, false),
+        None,
+        None,
+    ));
+    reopen_send_process_info(
+        &mock_screen,
+        vec![(2, reopen_agent_process_info("s-9", "/work/two"))],
+    );
+    let old_handle = reopen_handle_of(&mock_screen, 2);
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::CloseTabWithId(1, None));
+    let closed = reopen_closed_panes(&mock_screen);
+    assert_eq!(closed.len(), 2, "both panes of the tab are remembered");
+    assert!(closed.iter().all(|c| c.tab_name == "agents"));
+
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ReopenPane {
+        handle: Some(old_handle.clone()),
+        default_shell: None,
+        client_id: mock_screen.main_client_id,
+        completion_tx: None,
+    });
+    let after = reopen_closed_panes(&mock_screen);
+    assert_eq!(after.len(), 1, "only the named pane left the ring");
+    assert_ne!(after[0].handle, old_handle);
+
+    // the layout for the new tab, as the plugin thread and the pty send it back
+    let new_tab_id = 1;
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ApplyLayout(
+        TiledPaneLayout::default(),
+        vec![],
+        vec![(9, None)],
+        vec![],
+        HashMap::new(),
+        new_tab_id,
+        true,
+        (mock_screen.main_client_id, false),
+        None,
+        None,
+    ));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::PtyBytes(9, b"\x1b[?2004h$ ".to_vec()));
+    let panes = reopen_list_panes(&mock_screen);
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let new_tabs: Vec<_> = received_plugin_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|i| match i {
+            PluginInstruction::NewTab(cwd, _, layout, _, tab_index, ..) => {
+                Some((cwd.clone(), layout.is_none(), *tab_index))
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        new_tabs.last(),
+        Some(&(Some(PathBuf::from("/work/two")), true, new_tab_id)),
+        "a new tab from the session's template, in the pane's directory"
+    );
+    let reopened = panes
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 9)
+        .expect("the reopened pane exists");
+    assert_eq!(reopened.tab_name, "agents");
+    assert_eq!(reopened.pane_info.handle, old_handle);
+    assert_eq!(
+        reopened.prefilled_command.as_deref(),
+        Some("claude --resume s-9")
+    );
+}
+
+/// A handle nothing remembers reopens nothing.
+#[test]
+pub fn reopening_a_handle_the_ring_lacks_changes_nothing() {
+    let size = Size { cols: 80, rows: 20 };
+    let mut mock_screen = MockScreen::new(size);
+    let pty_receiver = mock_screen.pty_receiver.take().unwrap();
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let received_pty_instructions = Arc::new(Mutex::new(vec![]));
+    let pty_thread = log_actions_in_thread!(
+        received_pty_instructions,
+        PtyInstruction::Exit,
+        pty_receiver
+    );
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ReopenPane {
+        handle: Some("no-such-pane".to_owned()),
+        default_shell: None,
+        client_id: mock_screen.main_client_id,
+        completion_tx: None,
+    });
+    let panes = reopen_list_panes(&mock_screen);
+    mock_screen.teardown(vec![pty_thread, screen_thread]);
+    assert_eq!(panes.iter().filter(|e| !e.pane_info.is_plugin).count(), 2);
+    assert!(!received_pty_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|i| matches!(i, PtyInstruction::SpawnReopenedTerminal { .. })));
+}

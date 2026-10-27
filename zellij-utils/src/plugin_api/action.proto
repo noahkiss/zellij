@@ -247,6 +247,9 @@ message Action {
     HideFloatingPanesPayload hide_floating_panes_payload = 59;
     AreFloatingPanesVisiblePayload are_floating_panes_visible_payload = 60;
     SetPaneFrameStylePayload set_pane_frame_style_payload = 61;
+    // fork additions start at 200, leaving room below for upstream
+    // the handle of the closed pane to reopen; absent for the newest
+    string reopen_pane_payload = 200;
   }
 }
 
@@ -509,6 +512,8 @@ enum ActionName {
     ScrollToNextPrompt = 111;
     SelectCommandAtScrollPosition = 112;
     CopyLastCommandOutput = 113;
+    // fork additions start at 200, leaving room below for upstream
+    ReopenPane = 200;
 }
 
 message Position {

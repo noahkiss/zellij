@@ -1191,6 +1191,22 @@ fn test_client_messages() {
         client_id: Some(100),
         is_cli_client: true,
     });
+    for (handle, list, output_json) in [
+        (None, false, false),
+        (Some("sunny-otter".to_owned()), false, false),
+        (None, true, true),
+    ] {
+        test_client_roundtrip!(ClientToServerMsg::Action {
+            action: Action::ReopenPane {
+                handle,
+                list,
+                output_json,
+            },
+            terminal_id: None,
+            client_id: Some(100),
+            is_cli_client: true,
+        });
+    }
     test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::EditFile {
             payload: OpenFilePayload {

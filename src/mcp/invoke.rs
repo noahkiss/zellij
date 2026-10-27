@@ -633,7 +633,8 @@ async fn plan_in(
             });
         }
     }
-    if tool != "zellij_create" {
+    // a reopen brings a closed pane back where it was, so there is no tab to resolve
+    if tool != "zellij_create" || read.string("reopen").is_some() {
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
     create_kind_allowed(&read)?;
@@ -1245,6 +1246,28 @@ fn argv_in(
                 ])),
                 (None, None) => Err("Nothing to send: pass `keys`, `text` or `file`.".to_owned()),
             }
+        },
+        "zellij_create" if args.string("reopen").is_some() => {
+            let reopen = args.string("reopen").unwrap_or_default();
+            // the pane comes back as it was: its tab, its directory, its handle, its line
+            if let Some(param) = [
+                "kind", "command", "run_in", "cwd", "name", "handle", "brief",
+            ]
+            .into_iter()
+            .find(|param| args.values.contains_key(*param))
+            {
+                return Err(format!(
+                    "`reopen` brings a closed pane back as it was, and takes no `{}`.",
+                    param
+                ));
+            }
+            let mut rest = vec!["action".to_owned(), "reopen-pane".to_owned()];
+            match reopen.as_str() {
+                "" => return Err("`reopen` is `last` or the handle of a closed pane.".to_owned()),
+                "last" => rest.push("--last".to_owned()),
+                handle => rest.push(flag_value("--handle", handle)),
+            }
+            Ok(scoped(rest))
         },
         "zellij_create" => {
             create_kind_allowed(&args)?;
@@ -2164,6 +2187,27 @@ mod tests {
         );
         // and the one bound is the one the CLI applies by default
         assert_eq!(READY_TIMEOUT_DEFAULT_S, "10");
+    }
+
+    #[test]
+    fn reopen_runs_reopen_pane_and_takes_nothing_else() {
+        assert_eq!(
+            line("zellij_create", json!({"reopen": "last"}), Some("work")),
+            "-s work action reopen-pane --last"
+        );
+        assert_eq!(
+            line("zellij_create", json!({"reopen": "sunny-otter"}), None),
+            "action reopen-pane --handle=sunny-otter"
+        );
+        let refused = argv_in(
+            "zellij_create",
+            &args(json!({"reopen": "last", "command": "ls"})),
+            None,
+            &a_shell_env(),
+            None,
+        )
+        .unwrap_err();
+        assert!(refused.contains("`command`"), "{}", refused);
     }
 
     #[test]

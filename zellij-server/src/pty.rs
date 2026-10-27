@@ -68,6 +68,18 @@ pub enum PtyInstruction {
         bool,                    // set_blocking
     ), // bool (if Some) is
     // should_float, String is an optional pane name
+    /// fork addition: `reopen-pane`'s shell, in the closed pane's directory, with the line to
+    /// type at its prompt and the handle it takes back. Both are handed to the screen before the
+    /// pane is, so neither can arrive after the pane is reported or its shell is reading.
+    SpawnReopenedTerminal {
+        default_shell: Option<TerminalAction>,
+        cwd: Option<PathBuf>,
+        placement: NewPanePlacement,
+        client_or_tab_index: ClientTabIndexOrPaneId,
+        completion_tx: Option<NotificationEnd>,
+        prefill: Option<String>,
+        handle: String,
+    },
     OpenInPlaceEditor(
         PathBuf,
         Option<usize>,
@@ -192,6 +204,7 @@ impl From<&PtyInstruction> for PtyContext {
     fn from(pty_instruction: &PtyInstruction) -> Self {
         match *pty_instruction {
             PtyInstruction::SpawnTerminal(..) => PtyContext::SpawnTerminal,
+            PtyInstruction::SpawnReopenedTerminal { .. } => PtyContext::SpawnReopenedTerminal,
             PtyInstruction::OpenInPlaceEditor(..) => PtyContext::OpenInPlaceEditor,
             PtyInstruction::UpdateActivePane(..) => PtyContext::UpdateActivePane,
             PtyInstruction::GoToTab(..) => PtyContext::GoToTab,
@@ -702,6 +715,56 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                             }
                         },
                         _ => Err::<(), _>(err).non_fatal(),
+                    },
+                }
+            },
+            PtyInstruction::SpawnReopenedTerminal {
+                default_shell,
+                cwd,
+                placement,
+                client_or_tab_index,
+                mut completion_tx,
+                prefill,
+                handle,
+            } => {
+                let shell = pty.get_default_terminal(cwd, default_shell);
+                match pty.spawn_terminal(Some(shell), client_or_tab_index) {
+                    Ok((pid, _starts_held)) => {
+                        if let Some(prefill) = prefill {
+                            let _ = pty
+                                .bus
+                                .senders
+                                .send_to_screen(ScreenInstruction::PrefillPane(pid, prefill));
+                        }
+                        let _ =
+                            pty.bus
+                                .senders
+                                .send_to_screen(ScreenInstruction::ExpectReopenedPane {
+                                    terminal_id: pid,
+                                    handle,
+                                });
+                        // a plain shell, so no command and no title of its own: the pane is told
+                        // what an ordinary shell pane is told
+                        pty.bus
+                            .senders
+                            .send_to_screen(ScreenInstruction::NewPane(
+                                PaneId::Terminal(pid),
+                                None,
+                                None,
+                                None,
+                                placement,
+                                false,
+                                client_or_tab_index,
+                                completion_tx,
+                                false,
+                            ))
+                            .context("failed to hand a reopened pane to the screen")?;
+                    },
+                    Err(err) => {
+                        log::error!("Failed to reopen a pane: {:?}", err);
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!("Failed to reopen the pane: {}", err));
+                        }
                     },
                 }
             },

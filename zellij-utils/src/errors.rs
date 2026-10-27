@@ -403,6 +403,8 @@ pub enum ScreenContext {
     SetPaneNote,
     RecordAction,
     ListEvents,
+    ReopenPane,
+    ListClosedPanes,
     ListTabs,
     GetCurrentTabInfo,
     Reconfigure,
@@ -507,6 +509,7 @@ pub enum ScreenContext {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PtyContext {
     SpawnTerminal,
+    SpawnReopenedTerminal,
     OpenInPlaceEditor,
     SpawnTerminalVertically,
     SpawnTerminalHorizontally,

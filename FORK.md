@@ -1062,6 +1062,57 @@ report. The `set-pane-note` or the `close-pane` that comes after says `build`.
 This is a ring, not a log: it is bounded, it is in memory, nothing about it is written to disk, and
 it is gone when the server stops. It is for the question you are asking now.
 
+### `reopen-pane`: bring back a pane closed by mistake
+
+```
+$ zellij action reopen-pane --list
+HANDLE       TAB     KIND     CWD               PREFILL
+sunny-otter  agents  agent    /home/user/work   claude --resume 8f2c...
+calm-fox     Tab #1  command  /home/user/work   cargo test
+$ zellij action reopen-pane            # the newest; same as --last
+$ zellij action reopen-pane --handle calm-fox
+```
+
+The server keeps the last 10 closed terminal panes of the session, in memory only. A restart
+forgets them, and no scrollback is kept. A reopen brings one back:
+
+- **Where it was.** Stacked in its old tab, under the focused tiled pane of a client looking at
+  that tab, else under the tab's first tiled pane. If the tab closed too, a new tab under the old
+  tab's name, built from the session's new-tab template. The stack anchor is explicit, so
+  `--handle` and `--last` work with nobody attached.
+- **In its directory, under its old handle** when no live pane holds that handle now. A taken
+  handle leaves the pane with a fresh one.
+- **As a shell, with one line typed and not run.** An agent pane gets its bare resume: the session
+  the agent held when the pane closed (`claude --resume <id>`, `codex resume <id>`,
+  `opencode --session <id>`, `pi --session <id>`), read from the same per-pane agent record
+  `list-agents` reports. With no session known it gets the argv's id or the picker, by the rule a
+  restored session uses. A command pane gets its own command line. A plain shell gets nothing. The
+  line goes through the `resurrect_commands "prefill"` path, so it is pasted once the line editor
+  turns bracketed paste on, and `list-panes` reports it as `prefilled_command`.
+- **Once.** The entry leaves the list when it is reopened.
+
+What is remembered: every terminal pane closed by `close-pane`, the close key, a plugin, or with its
+tab. A pane whose own process exited is remembered only when it was an agent or a command pane - a
+shell that exited was ended on purpose. Plugin panes are never remembered.
+
+`--list` changes nothing and prints newest first; `--list --json` gives the same rows with `handle`,
+`tab_id`, `tab_name`, `title`, `cwd`, `kind` (`agent`, `command` or `shell`), `agent`,
+`agent_session_id` and `prefill`.
+
+The default config binds pane mode `u` to it: `bind "u" { ReopenPane; SwitchToMode "Normal"; }`.
+`ReopenPane "<handle>"` reopens a named pane from a key. The slim-keybinds and compact-bar hints
+show it. The MCP server's `zellij_create` takes `reopen: "last"` or `reopen: "<handle>"`.
+
+Contracts: `ReopenPaneAction` is a new message at tag 174 in the fork block of
+`common_types.proto`. A stock server of the same contract ignores it. The plugin API carries a
+bound reopen too, so a hint plugin can see the key: `ActionName.ReopenPane = 200` and
+`reopen_pane_payload = 200` in `plugin_api/action.proto`, the start of a fork block there. A plugin
+built before this drops the action from the bind, as it drops any action it cannot decode, and
+keeps the rest. So an old status-bar read pane mode's `u` as a bare `SwitchToMode "Normal"`, took
+it for pane mode's exit key, and lost the `Ctrl +` prefix on every hint. Every default plugin is
+rebuilt in this commit for that reason; a third-party plugin built before it shows the same
+symptom until it is rebuilt.
+
 ### `go-to-pane`
 
 ```

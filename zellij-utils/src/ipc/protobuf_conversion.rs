@@ -1288,6 +1288,7 @@ impl From<crate::input::actions::Action>
             RenameTabAction,
             RenameTabByIdAction,
             RenameTerminalPaneAction,
+            ReopenPaneAction,
             ResizeAction,
             ResizeByPaneIdAction,
             ResolvePaneTargetAction,
@@ -2100,6 +2101,15 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::ListEvents { output_json } => {
                 ActionType::ListEvents(ListEventsAction { output_json })
             },
+            crate::input::actions::Action::ReopenPane {
+                handle,
+                list,
+                output_json,
+            } => ActionType::ReopenPane(ReopenPaneAction {
+                handle,
+                list,
+                output_json,
+            }),
             crate::input::actions::Action::ListPanes {
                 show_tab,
                 show_command,
@@ -3100,6 +3110,11 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 output_json: a.output_json,
             }),
             ActionType::ListEvents(a) => Ok(crate::input::actions::Action::ListEvents {
+                output_json: a.output_json,
+            }),
+            ActionType::ReopenPane(a) => Ok(crate::input::actions::Action::ReopenPane {
+                handle: a.handle,
+                list: a.list,
                 output_json: a.output_json,
             }),
             ActionType::ListPanes(list_panes_action) => {

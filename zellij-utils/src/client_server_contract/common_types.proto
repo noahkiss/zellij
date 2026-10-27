@@ -307,6 +307,7 @@ message Action {
     ListEventsAction list_events = 171;
     MoveTabToIndexAction move_tab_to_index = 172;
     NewShellPaneAction new_shell_pane = 173;
+    ReopenPaneAction reopen_pane = 174;
   }
 }
 
@@ -425,6 +426,12 @@ message ListTreeAction {
 // fork addition: the session's action ring
 message ListEventsAction {
   bool output_json = 1;
+}
+// fork addition: bring back a pane that was closed lately, or list the ones the session remembers
+message ReopenPaneAction {
+  optional string handle = 1;
+  bool list = 2;
+  bool output_json = 3;
 }
 message ListPanesAction {
   bool show_tab = 1;
