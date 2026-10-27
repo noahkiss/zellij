@@ -1,6 +1,6 @@
 use super::super::actions::*;
 use super::super::keybinds::*;
-use crate::data::{BareKey, Direction, KeyWithModifier};
+use crate::data::{BareKey, Direction, InputMode, KeyWithModifier};
 use crate::input::config::Config;
 use insta::assert_snapshot;
 use strum::IntoEnumIterator;
@@ -569,20 +569,32 @@ fn keybindings_unbinds_happen_after_binds() {
 }
 
 #[test]
-fn error_received_on_unknown_input_mode() {
+fn unknown_input_mode_block_is_skipped_with_a_warning() {
+    // a mode from a newer build: its binds have nowhere to go, the rest of the config loads
     let config_contents = r#"
         keybinds {
             i_do_not_exist {
                 bind "z" { SwitchToMode "Resize"; }
             }
+            pane {
+                bind "y" { SwitchToMode "Resize"; }
+            }
         }
     "#;
-    let config_error = Config::from_kdl(config_contents, None).unwrap_err();
-    assert_snapshot!(format!("{:?}", config_error));
+    let config = Config::from_kdl(config_contents, None).unwrap();
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 3: ")
+            && config.warnings[0].contains("\"i_do_not_exist\""),
+        "{}",
+        config.warnings[0]
+    );
+    let pane = config.keybinds.0.get(&InputMode::Pane).unwrap();
+    assert!(pane.contains_key(&KeyWithModifier::new(BareKey::Char('y'))));
 }
 
 #[test]
-fn error_received_on_unknown_key_instruction() {
+fn unknown_key_instruction_is_skipped_with_a_warning() {
     let config_contents = r#"
         keybinds {
             pane {
@@ -591,6 +603,14 @@ fn error_received_on_unknown_key_instruction() {
             }
         }
     "#;
-    let config_error = Config::from_kdl(config_contents, None).unwrap_err();
-    assert_snapshot!(format!("{:?}", config_error));
+    let config = Config::from_kdl(config_contents, None).unwrap();
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 4: ")
+            && config.warnings[0].contains("\"i_am_not_bind_or_unbind\""),
+        "{}",
+        config.warnings[0]
+    );
+    let pane = config.keybinds.0.get(&InputMode::Pane).unwrap();
+    assert!(pane.contains_key(&KeyWithModifier::new(BareKey::Char('z'))));
 }

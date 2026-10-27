@@ -2771,12 +2771,22 @@ resurrect_command_hints {
 }
 ```
 
-**Only the unknown-NAME case is softened**, exactly as above. `on_unknown_cwd "withold"` is still
-the whole config failing, and so is a `match_fields` naming a field that is not one, a hint whose
-`resume_args` is not a string, and a hint that names no `match`, `env` or `resume_args` at all. A
-privacy setting silently dropped is worse than one that refuses, and the operator who wrote it
-meant it. An unknown name means the opposite — nobody who typed it expected THIS build to act on
-it.
+**An unknown VALUE in `pane_privacy` fails closed for that rule, not for the whole config.** The
+setting takes its strictest known value, with a warning naming the file and line, and the rest of
+the config loads. A privacy setting silently loosened is worse than one that refuses, so the
+fallback is never the default:
+
+| Setting | An unknown value becomes |
+|---|---|
+| `on_unknown_cwd "withold"` | `withhold` |
+| `tab_rule "some"` | `any` |
+| `match_fields "cwd" "hostname"` | every field this build knows: `cwd`, `command`, `title`, `tab_name` |
+
+A config with only known values reads exactly as before, and an `allow` or `all` the operator chose
+is not tightened. A malformed value (missing, or not a string) still fails the config. In
+`resurrect_command_hints`, a hint whose `resume_args` is not a string, or a hint that names no
+`match`, `env` or `resume_args` at all, still fails too. An unknown name means nobody who typed it
+expected THIS build to act on it, so it is ignored.
 
 `rewrite` stays a **known** name in a hint, not an unknown one. It is retired, and it has its own
 warning saying what replaced it and whether the hint was skipped; reporting it as merely unknown
@@ -2805,7 +2815,72 @@ so an unknown entry with a number or a bool in it would have failed the config o
 for it on its way to being ignored.
 
 With this, every block the fork added parses its own children the way an unknown top-level key has
-always behaved. Upstream's own strict blocks are still untouched.
+always behaved. Upstream's own strict blocks are still untouched — until the entry below.
+
+### A setting this build does not know warns and is skipped, on every config surface
+
+The two entries above made the fork's own blocks tolerant. The rest of `config.kdl` was still
+strict, and one shared config reaches machines on different builds. On nkmk.35 a single bind
+naming an action a newer build added failed the whole file:
+
+```
+× Failed to parse Zellij configuration
+╰── Unsupported action: ReopenPane
+```
+
+From this release one rule covers every surface. **An unknown name, or an unknown enum value, is
+warned about and skipped.** The parser skips the smallest unit it cannot keep in part:
+
+| Surface | What is skipped |
+|---|---|
+| An unknown top-level setting | nothing; it was always ignored, and now it is named |
+| An unknown action in a `bind` | the whole bind: the actions left would do something else |
+| `SwitchToMode` or `SetPaneFrameStyle` with an unknown value | the whole bind |
+| An unknown key spelling in `bind` or `unbind` | that key; the other keys of the bind are bound |
+| An unknown mode block in `keybinds` | that block |
+| An unknown mode in `shared_except` or `shared_among` | that mode name; the block applies to the rest |
+| An unknown instruction in a mode block (not `bind` or `unbind`) | that node |
+| An unknown value for an enum option (`default_mode`, `pane_frame_style`, `on_force_close`, `copy_clipboard`, `web_sharing`, `explicit_theme_hue`, `nested_session_handling`, `input_while_scrolled`, `command_pane_on_clean_exit`, `host_notification_protocol`, `new_pane_default`) | the option, which keeps its default |
+| An unknown child of `default_floating_size`, `ui`, `ui { pane_frames }` or `web_client` | that child |
+| An unknown `cursor_style` or `cursor_inactive_style` in `web_client` | the option, which keeps its default |
+| An unknown component of a theme, or an unknown color slot in a component | that entry |
+| An unknown permission in `plugin_permissions` | that permission; the others are granted |
+
+**A malformed known thing still fails the config.** That covers a wrong type for a known key, bad
+syntax, and a known action with the wrong arguments (`MoveFocus "Sideways"`) — even when an unknown
+action sits before it in the same bind. A typo in something real must still show.
+
+Each warning names the file, the line and the thing skipped, in file order. `zellij setup --check`
+prints them under a config it still calls well defined, and the parse logs them at `warn`:
+
+```
+[CONFIG FILE]: Well defined.
+[CONFIG WARNING]: /home/<user>/.config/zellij/config.kdl:42: Unsupported action: ReopenPane in bind "Alt z", the bind is skipped
+```
+
+Layout files take the same path for the settings they carry, because a layout's top level is
+parsed as config too. The layout grammar itself (`layout`, `pane`, `tab` and their properties) is
+not covered and stays as strict as upstream.
+
+Not plain warn-and-skip, on purpose:
+
+- **An unknown VALUE in `pane_privacy` fails closed for that rule.** The setting takes its strictest
+  known value (`withhold`, `any`, or every match field), not its default. See the entry above.
+- **`session_service` values.** No key there takes a value from a closed set: a string `pin_exe` is a
+  path, and every other check is a type or a range (`watchdog_interval_secs 0`). Those are malformed
+  known settings and still fail. Its unknown names warn, as before.
+- **`Direction` and `Resize` arguments of an action.** These are closed geometric sets, so a bad
+  one is a wrong argument, not a newer name.
+- **`plugin_permissions` wildcards and remote locations.** That is a security rule, not an unknown
+  name.
+- **An unknown property on a known action.** It is ignored silently, as before. Each action reads
+  its own properties by name, and no list of what each one accepts exists to warn against.
+
+A skipped thing is not written back out by `setup --dump-config`.
+
+This is tolerance from this release onward only. A machine on an older build still rejects what
+its own build did not know, so the oldest binary in the fleet still gates a config change. See
+AGENTS.md, "Rolling a new config key out before every machine has the binary".
 
 ### A pinned copy of the binary (`pin_exe`)
 

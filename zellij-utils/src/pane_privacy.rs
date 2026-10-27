@@ -25,7 +25,8 @@
 //! The settings are a top-level `pane_privacy` block in `config.kdl`, so a binary that predates the
 //! feature ignores the whole block rather than failing to parse the config. A CHILD this build does
 //! not know is ignored the same way, and kept in [`PanePrivacyOptions::unknown_entries`] so
-//! `zellij setup --check` can name it.
+//! `zellij setup --check` can name it. A known setting with a value this build does not know fails
+//! closed for that setting: it takes the strictest value, never the default.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

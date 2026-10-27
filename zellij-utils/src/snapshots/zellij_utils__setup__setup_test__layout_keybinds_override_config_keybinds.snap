@@ -337,4 +337,5 @@ Config {
     plugin_permissions: PluginPermissions {
         granted: {},
     },
+    warnings: [],
 }

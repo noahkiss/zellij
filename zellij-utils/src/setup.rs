@@ -663,13 +663,19 @@ impl Setup {
                     // Every block that parses its own children keeps its own list, and they are
                     // printed as one run: a person reading this wants the keys this build ignored,
                     // not which block each came from - the warning itself names that.
+                    // `config.warnings` holds everything else the parse did not know, each naming
+                    // its file and line.
                     let unknown_entries = config
-                        .options
-                        .session_service
-                        .as_ref()
-                        .map(|session_service| session_service.unknown_entries.as_slice())
-                        .unwrap_or_default()
+                        .warnings
                         .iter()
+                        .chain(
+                            config
+                                .options
+                                .session_service
+                                .as_ref()
+                                .map(|session_service| session_service.unknown_entries.as_slice())
+                                .unwrap_or_default(),
+                        )
                         .chain(
                             config
                                 .options

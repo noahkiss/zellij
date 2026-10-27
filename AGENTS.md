@@ -440,8 +440,20 @@ warn and ignore an unknown name at every depth; see FORK.md's "An unknown key in
 `resurrect_command_hints` warn on a key they do not know". But the old rule is not dead: a
 machine still on ≤ nkmk.17 still rejects an unknown nested key in any of them.
 
-So before seeding a nested key ahead of the binary, check both sides: the block must be a
-warn-and-ignore one in the build that ships the key, and the OLDEST binary in the fleet must
+**From the release that carries FORK.md's "A setting this build does not know warns and is
+skipped, on every config surface", the whole config is tolerant.** An unknown name or enum value
+anywhere — a bind's action, a key spelling, a mode, an option value, a child of `ui`, `web_client`
+or a theme, a permission — warns with its file and line and is skipped; `setup --check` still
+reports the config as well defined. A malformed KNOWN thing (wrong type, bad syntax, a known action
+with bad arguments) still fails. An unknown `pane_privacy` value fails closed for that one rule: it
+takes the strictest known value, not the default. That entry lists the exceptions.
+
+Tolerance only helps a machine that runs it. **A machine still on an older build keeps that
+build's strict behaviour**: it rejects a new action, mode or option value exactly as before. So the
+oldest build in the fleet still gates a config change.
+
+So before seeding a new key, action or value ahead of the binary, check both sides: the surface
+must be a warn-and-ignore one in the build that ships it, and the OLDEST binary in the fleet must
 tolerate it too. Do not generalise a top-level probe to a nested key: test the key you actually
 intend to add, in the position you intend to add it, against the oldest release still running,
 and re-run `zellij setup --check` **before committing**. Getting this wrong breaks every machine

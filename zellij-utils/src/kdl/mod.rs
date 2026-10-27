@@ -1,4 +1,5 @@
 mod kdl_layout_parser;
+pub mod unknown;
 use crate::data::{
     BareKey, Direction, FloatingPaneCoordinates, InputMode, KeyWithModifier, LayoutInfo,
     LayoutMetadata, MultiplayerColors, Palette, PaletteColor, PaneId, PaneInfo, PaneManifest,
@@ -30,6 +31,7 @@ use kdl_layout_parser::KdlLayoutParser;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use strum::IntoEnumIterator;
+use unknown::note_unknown;
 use uuid::Uuid;
 
 use miette::NamedSource;
@@ -362,6 +364,43 @@ macro_rules! keys_from_kdl {
     };
 }
 
+/// The modes a `shared_except` or `shared_among` block names. A mode this build does not have is
+/// noted and left out.
+fn known_modes_from_kdl(kdl_node: &KdlNode) -> Result<Vec<InputMode>, ConfigError> {
+    let mut modes = vec![];
+    for mode_name in kdl_string_arguments!(kdl_node) {
+        match InputMode::from_str(mode_name) {
+            Ok(mode) => modes.push(mode),
+            Err(_) => note_unknown(
+                kdl_node.span().offset(),
+                format!(
+                    "unknown mode {:?} in {}, ignored",
+                    mode_name,
+                    kdl_name!(kdl_node)
+                ),
+            ),
+        }
+    }
+    Ok(modes)
+}
+
+/// The keys a `bind` or `unbind` names. A key this build cannot spell - a modifier or a key name
+/// from a newer build, or a typo - is noted and left out; the others are kept, because each key of
+/// a bind is bound on its own.
+fn known_keys_from_kdl(kdl_node: &KdlNode) -> Result<Vec<KeyWithModifier>, ConfigError> {
+    let mut keys = vec![];
+    for key in kdl_string_arguments!(kdl_node) {
+        match KeyWithModifier::from_str(key) {
+            Ok(parsed) => keys.push(parsed),
+            Err(_) => note_unknown(
+                kdl_node.span().offset(),
+                format!("unknown key {:?} in {}, ignored", key, kdl_name!(kdl_node)),
+            ),
+        }
+    }
+    Ok(keys)
+}
+
 #[macro_export]
 macro_rules! actions_from_kdl {
     ( $kdl_node:expr, $config_options:expr ) => {
@@ -473,7 +512,7 @@ impl Action {
             "WriteChars" => Ok(Action::WriteChars { chars: string }),
             "SetPaneFrameStyle" => {
                 let style = PaneFrameStyle::from_str(string.as_str()).map_err(|e| {
-                    ConfigError::new_kdl_error(
+                    ConfigError::new_unknown_name(
                         format!("{}", e),
                         action_node.span().offset(),
                         action_node.span().len(),
@@ -484,7 +523,7 @@ impl Action {
             "SwitchToMode" => match InputMode::from_str(string.as_str()) {
                 Ok(input_mode) => Ok(Action::SwitchToMode { input_mode }),
                 Err(_e) => {
-                    return Err(ConfigError::new_kdl_error(
+                    return Err(ConfigError::new_unknown_name(
                         format!("Unknown InputMode '{}'", string),
                         action_node.span().offset(),
                         action_node.span().len(),
@@ -2350,7 +2389,8 @@ impl TryFrom<(&KdlNode, &Options)> for Action {
             "TogglePanePinned" => Ok(Action::TogglePanePinned),
             "TogglePaneInGroup" => Ok(Action::TogglePaneInGroup),
             "ToggleGroupMarking" => Ok(Action::ToggleGroupMarking),
-            _ => Err(ConfigError::new_kdl_error(
+            // an action from a newer build: the keybinding parser skips the bind it is in
+            _ => Err(ConfigError::new_unknown_name(
                 format!("Unsupported action: {}", action_name).into(),
                 kdl_action.span().offset(),
                 kdl_action.span().len(),
@@ -2921,18 +2961,173 @@ fn plist_value_to_kdl(name: &str, value: &PlistValue) -> KdlNode {
     node
 }
 
+/// The string value of a `pane_privacy` setting. A missing value, or one that is not a string, is
+/// malformed rather than unknown, and stays an error.
+fn pane_privacy_string_value(entry: &KdlNode) -> Result<&str, ConfigError> {
+    kdl_first_entry_as_string!(entry).ok_or_else(|| {
+        ConfigError::new_kdl_error(
+            format!("pane_privacy {} takes a string value", kdl_name!(entry)),
+            entry.span().offset(),
+            entry.span().len(),
+        )
+    })
+}
+
+/// Every top-level node a config may hold: the blocks [`Config::from_kdl`] reads, every option
+/// [`Options::from_kdl`] reads, `layout` (a layout file goes through the same parse for the
+/// options it carries) and `remote_hosts` (read by the MCP server from the same file). Anything
+/// else is a key from a newer build, or a typo, and is warned about.
+///
+/// A key read anywhere from the top level of `config.kdl` belongs here: the test
+/// `every_option_from_kdl_reads_is_a_known_top_level_node` holds [`Options::from_kdl`] to it.
+const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
+    // blocks
+    "keybinds",
+    "themes",
+    "plugins",
+    "load_plugins",
+    "plugin_permissions",
+    "ui",
+    "env",
+    "web_client",
+    "new_pane_default",
+    "layout",
+    "remote_hosts",
+    // options
+    "advanced_mouse_actions",
+    "attach_to_session",
+    "auto_layout",
+    "bell_clear_delay_ms",
+    "builtin_plugin_dir",
+    "client_async_worker_tasks",
+    "command_pane_on_clean_exit",
+    "copy_clipboard",
+    "copy_command",
+    "copy_on_select",
+    "dangerously_enable_paste_buffer_read",
+    "default_cwd",
+    "default_floating_size",
+    "default_layout",
+    "default_mode",
+    "default_shell",
+    "detect_agents",
+    "disable_session_metadata",
+    "enforce_https_for_localhost",
+    "expect_full_disk_access",
+    "explicit_theme_hue",
+    "focus_follows_mouse",
+    "host_notification_protocol",
+    "input_while_scrolled",
+    "layout_dir",
+    "mirror_session",
+    "mouse_click_through",
+    "mouse_hover_effects",
+    "mouse_hover_tips",
+    "mouse_mode",
+    "mouse_scroll_resize",
+    "nested_session_handling",
+    "on_force_close",
+    "osc133_command_selection",
+    "osc8_hyperlinks",
+    "pane_frame_agent_name",
+    "pane_frame_style",
+    "pane_frames",
+    "pane_privacy",
+    "plugin_watch",
+    "post_command_discovery_hook",
+    "report_pane_env",
+    "resurrect_command_hints",
+    "resurrect_commands",
+    "scroll_buffer_size",
+    "scroll_mode_sync",
+    "scrollback_editor",
+    "scrollback_lines_to_serialize",
+    "serialization_interval",
+    "serialize_pane_viewport",
+    "session_aliases",
+    "session_name",
+    "session_restart_drop_env",
+    "session_serialization",
+    "session_service",
+    "session_snapshot_limit",
+    "session_up_resume",
+    "show_release_notes",
+    "show_startup_tips",
+    "simplified_ui",
+    "snapshot_dir",
+    "stacked_pane_list",
+    "stacked_resize",
+    "stale_build_notice",
+    "styled_underlines",
+    "support_kitty_graphics_protocol",
+    "support_kitty_keyboard_protocol",
+    "terminal_title_template",
+    "theme",
+    "theme_dark",
+    "theme_dir",
+    "theme_light",
+    "visual_bell",
+    "web_server",
+    "web_server_cert",
+    "web_server_ip",
+    "web_server_key",
+    "web_server_port",
+    "web_sharing",
+    "word_separators",
+];
+
+/// Note every top-level node this build does not read. Nothing is dropped: an unknown top-level
+/// node has always been ignored. What is new is that it is said.
+fn note_unknown_top_level_nodes(document: &KdlDocument) {
+    for node in document.nodes() {
+        let name = kdl_name!(node);
+        if !KNOWN_TOP_LEVEL_NODES.contains(&name) {
+            note_unknown(
+                node.span().offset(),
+                format!("unknown setting {:?}, ignored", name),
+            );
+        }
+    }
+}
+
+/// Note that a known option holds a value this build does not know. The option is left unset, so
+/// it keeps its default.
+fn note_unknown_value(option: &str, value: &str, entry: &KdlEntry, expected: &str) {
+    note_unknown(
+        entry.span().offset(),
+        format!(
+            "unknown value {:?} for {}, ignored and the default kept (expected {})",
+            value, option, expected
+        ),
+    );
+}
+
+/// The value of a string option parsed by `parse`, or - for a value it does not know - `None`,
+/// with a note. A value of the wrong TYPE is still an error, raised before this is reached.
+fn known_value_or_note<T, E>(
+    option: &str,
+    found: Option<(&str, &KdlEntry)>,
+    parse: impl FnOnce(&str) -> Result<T, E>,
+    expected: &str,
+) -> Option<T> {
+    let (value, entry) = found?;
+    match parse(value) {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            note_unknown_value(option, value, entry, expected);
+            None
+        },
+    }
+}
+
 impl Options {
     pub fn from_kdl(kdl_options: &KdlDocument) -> Result<Self, ConfigError> {
-        let on_force_close =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "on_force_close") {
-                Some((string, entry)) => Some(OnForceClose::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for on_force_close: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let on_force_close = known_value_or_note(
+            "on_force_close",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "on_force_close"),
+            OnForceClose::from_str,
+            "quit or detach",
+        );
         let simplified_ui =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "simplified_ui").map(|(v, _)| v);
         let default_shell =
@@ -2942,16 +3137,12 @@ impl Options {
             .map(|(string, _entry)| expand_path(string));
         let pane_frames =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frames").map(|(v, _)| v);
-        let pane_frame_style =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "pane_frame_style") {
-                Some((string, entry)) => Some(PaneFrameStyle::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for pane_frame_style: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let pane_frame_style = known_value_or_note(
+            "pane_frame_style",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "pane_frame_style"),
+            PaneFrameStyle::from_str,
+            "full, titles, none or top_only",
+        );
         let auto_layout =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "auto_layout").map(|(v, _)| v);
         let theme = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme")
@@ -2960,23 +3151,18 @@ impl Options {
             .map(|(theme, _entry)| theme.to_string());
         let theme_light = kdl_property_first_arg_as_string_or_error!(kdl_options, "theme_light")
             .map(|(theme, _entry)| theme.to_string());
-        let explicit_theme_hue =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "explicit_theme_hue") {
-                Some((string, entry)) => Some(ThemeHue::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for explicit_theme_hue: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
-        let default_mode =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "default_mode") {
-                Some((string, entry)) => Some(InputMode::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(format!("Invalid input mode: '{}'", string), entry)
-                })?),
-                None => None,
-            };
+        let explicit_theme_hue = known_value_or_note(
+            "explicit_theme_hue",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "explicit_theme_hue"),
+            ThemeHue::from_str,
+            "light or dark",
+        );
+        let default_mode = known_value_or_note(
+            "default_mode",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "default_mode"),
+            InputMode::from_str,
+            "an input mode",
+        );
         let default_layout =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "default_layout")
                 .map(|(string, _entry)| expand_path(string));
@@ -3002,16 +3188,12 @@ impl Options {
                 .map(|(scroll_buffer_size, _entry)| scroll_buffer_size as usize);
         let copy_command = kdl_property_first_arg_as_string_or_error!(kdl_options, "copy_command")
             .map(|(copy_command, _entry)| copy_command.to_string());
-        let copy_clipboard =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "copy_clipboard") {
-                Some((string, entry)) => Some(Clipboard::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for copy_clipboard: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let copy_clipboard = known_value_or_note(
+            "copy_clipboard",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "copy_clipboard"),
+            Clipboard::from_str,
+            "system or primary",
+        );
         let copy_on_select =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "copy_on_select").map(|(v, _)| v);
         let osc8_hyperlinks =
@@ -3117,16 +3299,12 @@ impl Options {
         .map(|(v, _)| v);
         let web_server =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "web_server").map(|(v, _)| v);
-        let web_sharing =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "web_sharing") {
-                Some((string, entry)) => Some(WebSharing::from_str(string).map_err(|_| {
-                    kdl_parsing_error!(
-                        format!("Invalid value for web_sharing: '{}'", string),
-                        entry
-                    )
-                })?),
-                None => None,
-            };
+        let web_sharing = known_value_or_note(
+            "web_sharing",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "web_sharing"),
+            WebSharing::from_str,
+            "on, off or disabled",
+        );
         let stacked_resize =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "stacked_resize").map(|(v, _)| v);
         let stacked_pane_list =
@@ -3207,56 +3385,30 @@ impl Options {
         let word_separators =
             kdl_property_first_arg_as_string_or_error!(kdl_options, "word_separators")
                 .map(|(separators, _entry)| separators.to_string());
-        let nested_session_handling = match kdl_property_first_arg_as_string_or_error!(
-            kdl_options,
-            "nested_session_handling"
-        ) {
-            Some((value, entry)) => {
-                use crate::input::options::NestedSessionHandling;
-                match value.parse::<NestedSessionHandling>() {
-                    Ok(v) => Some(v),
-                    Err(e) => return Err(kdl_parsing_error!(e, entry)),
-                }
-            },
-            None => None,
-        };
-        let input_while_scrolled =
-            match kdl_property_first_arg_as_string_or_error!(kdl_options, "input_while_scrolled") {
-                Some((value, entry)) => {
-                    use crate::input::options::InputWhileScrolled;
-                    match value.parse::<InputWhileScrolled>() {
-                        Ok(v) => Some(v),
-                        Err(e) => return Err(kdl_parsing_error!(e, entry)),
-                    }
-                },
-                None => None,
-            };
-        let command_pane_on_clean_exit = match kdl_property_first_arg_as_string_or_error!(
-            kdl_options,
-            "command_pane_on_clean_exit"
-        ) {
-            Some((value, entry)) => {
-                use crate::input::options::CommandPaneOnCleanExit;
-                match value.parse::<CommandPaneOnCleanExit>() {
-                    Ok(v) => Some(v),
-                    Err(e) => return Err(kdl_parsing_error!(e, entry)),
-                }
-            },
-            None => None,
-        };
-        let host_notification_protocol = match kdl_property_first_arg_as_string_or_error!(
-            kdl_options,
-            "host_notification_protocol"
-        ) {
-            Some((value, entry)) => {
-                use crate::input::options::HostNotificationProtocol;
-                match value.parse::<HostNotificationProtocol>() {
-                    Ok(v) => Some(v),
-                    Err(e) => return Err(kdl_parsing_error!(e, entry)),
-                }
-            },
-            None => None,
-        };
+        let nested_session_handling = known_value_or_note(
+            "nested_session_handling",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "nested_session_handling"),
+            |value| value.parse::<crate::input::options::NestedSessionHandling>(),
+            "ask, fullscreen, descend or never",
+        );
+        let input_while_scrolled = known_value_or_note(
+            "input_while_scrolled",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "input_while_scrolled"),
+            |value| value.parse::<crate::input::options::InputWhileScrolled>(),
+            "scroll-mode, jump or stay",
+        );
+        let command_pane_on_clean_exit = known_value_or_note(
+            "command_pane_on_clean_exit",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "command_pane_on_clean_exit"),
+            |value| value.parse::<crate::input::options::CommandPaneOnCleanExit>(),
+            "hold or shell",
+        );
+        let host_notification_protocol = known_value_or_note(
+            "host_notification_protocol",
+            kdl_property_first_arg_as_string_or_error!(kdl_options, "host_notification_protocol"),
+            |value| value.parse::<crate::input::options::HostNotificationProtocol>(),
+            "auto, osc9, osc99, bell or off",
+        );
         let dangerously_enable_paste_buffer_read = kdl_property_first_arg_as_bool_or_error!(
             kdl_options,
             "dangerously_enable_paste_buffer_read"
@@ -3765,9 +3917,12 @@ impl Options {
             .and_then(|entry| entry.value().as_string());
         let mode = value.and_then(ResurrectCommands::from_config);
         if mode.is_none() {
-            log::warn!(
-                "resurrect_commands {:?} is not a mode this build knows, ignored (expected \"all\", \"agents\" or \"prefill\")",
-                node.entries().iter().next().map(|entry| entry.value().to_string())
+            note_unknown(
+                node.span().offset(),
+                format!(
+                    "resurrect_commands {:?} is not a mode this build knows, ignored (expected \"all\", \"agents\" or \"prefill\")",
+                    node.entries().iter().next().map(|entry| entry.value().to_string())
+                ),
             );
         }
         mode
@@ -3838,6 +3993,17 @@ impl Options {
             "empty default_floating_size block"
         ) {
             let entry_name = kdl_name!(entry);
+            if entry_name != "width" && entry_name != "height" {
+                note_unknown(
+                    entry.span().offset(),
+                    format!(
+                        "unknown default_floating_size entry {:?}, ignored (expected width or \
+                         height)",
+                        entry_name
+                    ),
+                );
+                continue;
+            }
             let raw_value = entry
                 .entries()
                 .iter()
@@ -3874,17 +4040,8 @@ impl Options {
                 })?;
             match entry_name {
                 "width" => default_floating_size.width = Some(size),
-                "height" => default_floating_size.height = Some(size),
-                _ => {
-                    return Err(ConfigError::new_kdl_error(
-                        format!(
-                            "Unknown default_floating_size entry: {:?} (expected width or height)",
-                            entry_name
-                        ),
-                        entry.span().offset(),
-                        entry.span().len(),
-                    ))
-                },
+                // any other name was passed over above
+                _ => default_floating_size.height = Some(size),
             }
         }
         Ok(default_floating_size)
@@ -3933,9 +4090,11 @@ impl Options {
     /// it is kept in [`PanePrivacyOptions::unknown_entries`], logged, and otherwise passed over, so
     /// a new key can go into a shared config before every machine has the binary that reads it.
     ///
-    /// Only the unknown-NAME case is soft. A name this build KNOWS, given a value it cannot mean,
-    /// is still the whole config failing to parse - a privacy setting that was silently dropped is
-    /// worse than one that refuses, and the operator who wrote `on_unknown_cwd "withold"` meant it.
+    /// A name this build KNOWS, given a value it cannot mean, fails closed for that one setting:
+    /// the setting takes its strictest known value, with a warning, and the rest of the config
+    /// loads. A privacy setting silently loosened is worse than one that refuses, so the fallback
+    /// is never the default: `on_unknown_cwd` becomes `withhold`, `tab_rule` becomes `any`, and a
+    /// `match_fields` naming an unknown field matches on every field this build knows.
     ///
     /// Nothing here compiles a pattern or reads a file. This function is built for wasm along with
     /// the rest of the config parser, and the matcher is not.
@@ -3963,51 +4122,67 @@ impl Options {
                 },
                 "match_fields" => {
                     let mut fields = Vec::new();
-                    for field in kdl_string_arguments!(entry) {
-                        let field = MatchField::from_name(field).ok_or_else(|| {
-                            ConfigError::new_kdl_error(
-                                format!(
-                                    "Unknown pane_privacy match field: {:?} (expected cwd, \
-                                     command, title or tab_name)",
-                                    field
-                                ),
-                                entry.span().offset(),
-                                entry.span().len(),
-                            )
-                        })?;
-                        if !fields.contains(&field) {
-                            fields.push(field);
+                    let mut unknown_field = None;
+                    for field_name in kdl_string_arguments!(entry) {
+                        match MatchField::from_name(field_name) {
+                            Some(field) => {
+                                if !fields.contains(&field) {
+                                    fields.push(field);
+                                }
+                            },
+                            None => {
+                                unknown_field.get_or_insert(field_name);
+                            },
                         }
+                    }
+                    if let Some(field_name) = unknown_field {
+                        // fail closed: a field this build cannot read might have been the one
+                        // that withholds a pane, so every field it can read is matched instead
+                        note_unknown(
+                            entry.span().offset(),
+                            format!(
+                                "unknown pane_privacy match field {:?}, so match_fields matches \
+                                 every field this build knows (cwd, command, title and tab_name)",
+                                field_name
+                            ),
+                        );
+                        fields = vec![
+                            MatchField::Cwd,
+                            MatchField::Command,
+                            MatchField::Title,
+                            MatchField::TabName,
+                        ];
                     }
                     pane_privacy.match_fields = Some(fields);
                 },
                 "on_unknown_cwd" => {
-                    let value = kdl_first_entry_as_string!(entry).unwrap_or("");
+                    let value = pane_privacy_string_value(entry)?;
                     pane_privacy.on_unknown_cwd =
-                        Some(OnUnknownCwd::from_name(value).ok_or_else(|| {
-                            ConfigError::new_kdl_error(
+                        Some(OnUnknownCwd::from_name(value).unwrap_or_else(|| {
+                            note_unknown(
+                                entry.span().offset(),
                                 format!(
-                                    "Unknown pane_privacy on_unknown_cwd: {:?} (expected withhold \
-                                     or allow)",
+                                    "unknown pane_privacy on_unknown_cwd {:?}, so it is withhold, \
+                                     the strictest (expected withhold or allow)",
                                     value
                                 ),
-                                entry.span().offset(),
-                                entry.span().len(),
-                            )
-                        })?);
+                            );
+                            OnUnknownCwd::Withhold
+                        }));
                 },
                 "tab_rule" => {
-                    let value = kdl_first_entry_as_string!(entry).unwrap_or("");
-                    pane_privacy.tab_rule = Some(TabRule::from_name(value).ok_or_else(|| {
-                        ConfigError::new_kdl_error(
+                    let value = pane_privacy_string_value(entry)?;
+                    pane_privacy.tab_rule = Some(TabRule::from_name(value).unwrap_or_else(|| {
+                        note_unknown(
+                            entry.span().offset(),
                             format!(
-                                "Unknown pane_privacy tab_rule: {:?} (expected any or all)",
+                                "unknown pane_privacy tab_rule {:?}, so it is any, the strictest \
+                                 (expected any or all)",
                                 value
                             ),
-                            entry.span().offset(),
-                            entry.span().len(),
-                        )
-                    })?);
+                        );
+                        TabRule::Any
+                    }));
                 },
                 other => {
                     pane_privacy.note_unknown_entry(format!(
@@ -6342,11 +6517,13 @@ impl Keybinds {
         }
         for key_block in all_nodes {
             if kdl_name!(key_block) != "bind" && kdl_name!(key_block) != "unbind" {
-                return Err(ConfigError::new_kdl_error(
-                    format!("Unknown keybind instruction: '{}'", kdl_name!(key_block)),
+                note_unknown(
                     key_block.span().offset(),
-                    key_block.span().len(),
-                ));
+                    format!(
+                        "unknown keybind instruction {:?}, ignored (expected bind or unbind)",
+                        kdl_name!(key_block)
+                    ),
+                );
             }
         }
         Ok(())
@@ -6364,16 +6541,9 @@ impl Keybinds {
         };
         for block in kdl_children_nodes_or_error!(kdl_keybinds, "keybindings with no children") {
             if kdl_name!(block) == "shared_except" || kdl_name!(block) == "shared" {
-                let mut modes_to_exclude = vec![];
-                for mode_name in kdl_string_arguments!(block) {
-                    modes_to_exclude.push(InputMode::from_str(mode_name).map_err(|_| {
-                        ConfigError::new_kdl_error(
-                            format!("Invalid mode: '{}'", mode_name),
-                            block.name().span().offset(),
-                            block.name().span().len(),
-                        )
-                    })?);
-                }
+                // a mode this build does not have is not bound here anyway, so excluding it
+                // changes nothing, and the rest of the block still applies
+                let modes_to_exclude = known_modes_from_kdl(block)?;
                 for mode in InputMode::iter() {
                     if modes_to_exclude.contains(&mode) {
                         continue;
@@ -6383,10 +6553,8 @@ impl Keybinds {
                 }
             }
             if kdl_name!(block) == "shared_among" {
-                let mut modes_to_include = vec![];
-                for mode_name in kdl_string_arguments!(block) {
-                    modes_to_include.push(InputMode::from_str(mode_name)?);
-                }
+                // a mode this build does not have cannot be bound, and the others still are
+                let modes_to_include = known_modes_from_kdl(block)?;
                 for mode in InputMode::iter() {
                     if !modes_to_include.contains(&mode) {
                         continue;
@@ -6404,8 +6572,11 @@ impl Keybinds {
             {
                 continue;
             }
-            let mut input_mode_keybinds =
-                Keybinds::input_mode_keybindings(mode, &mut keybinds_from_config)?;
+            let Some(mut input_mode_keybinds) =
+                Keybinds::input_mode_keybindings(mode, &mut keybinds_from_config)?
+            else {
+                continue;
+            };
             Keybinds::bind_keys_in_block(mode, &mut input_mode_keybinds, config_options)?;
         }
         if let Some(global_unbind) = kdl_keybinds.children().and_then(|c| c.get("unbind")) {
@@ -6418,8 +6589,39 @@ impl Keybinds {
         input_mode_keybinds: &mut HashMap<KeyWithModifier, Vec<Action>>,
         config_options: &Options,
     ) -> Result<(), ConfigError> {
-        let keys: Vec<KeyWithModifier> = keys_from_kdl!(key_block);
-        let actions: Vec<Action> = actions_from_kdl!(key_block, config_options);
+        let keys: Vec<KeyWithModifier> = known_keys_from_kdl(key_block)?;
+        // Every action is parsed before any is bound, so that a malformed known action is still
+        // an error even when an unknown one sits before it. An unknown action drops the whole
+        // bind: the actions that are left would do something else.
+        let mut actions: Vec<Action> = vec![];
+        let mut unknown_action = None;
+        for kdl_action in kdl_children_nodes_or_error!(key_block, "no actions found for key_block")
+        {
+            match Action::try_from((kdl_action, config_options)) {
+                Ok(action) => actions.push(action),
+                Err(ConfigError::UnknownName(kdl_error)) => {
+                    if unknown_action.is_none() {
+                        unknown_action = Some((kdl_action.span().offset(), kdl_error));
+                    }
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        if let Some((offset, kdl_error)) = unknown_action {
+            let keys: Vec<&str> = kdl_string_arguments!(key_block);
+            note_unknown(
+                offset,
+                format!(
+                    "{} in bind {}, the bind is skipped",
+                    kdl_error.error_message,
+                    keys.iter()
+                        .map(|key| format!("{:?}", key))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            );
+            return Ok(());
+        }
         for key in keys {
             input_mode_keybinds.insert(key, actions.clone());
         }
@@ -6429,7 +6631,7 @@ impl Keybinds {
         key_block: &KdlNode,
         input_mode_keybinds: &mut HashMap<KeyWithModifier, Vec<Action>>,
     ) -> Result<(), ConfigError> {
-        let keys: Vec<KeyWithModifier> = keys_from_kdl!(key_block);
+        let keys: Vec<KeyWithModifier> = known_keys_from_kdl(key_block)?;
         for key in keys {
             input_mode_keybinds.remove(&key);
         }
@@ -6439,7 +6641,7 @@ impl Keybinds {
         global_unbind: &KdlNode,
         keybinds_from_config: &mut Keybinds,
     ) -> Result<(), ConfigError> {
-        let keys: Vec<KeyWithModifier> = keys_from_kdl!(global_unbind);
+        let keys: Vec<KeyWithModifier> = known_keys_from_kdl(global_unbind)?;
         for mode in keybinds_from_config.0.values_mut() {
             for key in &keys {
                 mode.remove(&key);
@@ -6450,21 +6652,25 @@ impl Keybinds {
     fn input_mode_keybindings<'a>(
         mode: &KdlNode,
         keybinds_from_config: &'a mut Keybinds,
-    ) -> Result<&'a mut HashMap<KeyWithModifier, Vec<Action>>, ConfigError> {
+    ) -> Result<Option<&'a mut HashMap<KeyWithModifier, Vec<Action>>>, ConfigError> {
         let mode_name = kdl_name!(mode);
-        let input_mode = InputMode::from_str(mode_name).map_err(|_| {
-            ConfigError::new_kdl_error(
-                format!("Invalid mode: '{}'", mode_name),
-                mode.name().span().offset(),
-                mode.name().span().len(),
-            )
-        })?;
+        let Ok(input_mode) = InputMode::from_str(mode_name) else {
+            // a mode from a newer build: its binds have nowhere to go here
+            note_unknown(
+                mode.span().offset(),
+                format!(
+                    "unknown mode {:?} in keybinds, its binds are skipped",
+                    mode_name
+                ),
+            );
+            return Ok(None);
+        };
         let input_mode_keybinds = keybinds_from_config.get_input_mode_mut(&input_mode);
         let clear_defaults_for_mode = kdl_arg_is_truthy!(mode, "clear-defaults");
         if clear_defaults_for_mode {
             input_mode_keybinds.clear();
         }
-        Ok(input_mode_keybinds)
+        Ok(Some(input_mode_keybinds))
     }
     pub fn from_string(
         stringified_keybindings: String,
@@ -6664,24 +6870,42 @@ impl BareKey {
 
 impl Config {
     pub fn from_kdl(kdl_config: &str, base_config: Option<Config>) -> Result<Config, ConfigError> {
+        Config::from_kdl_named(kdl_config, base_config, None)
+    }
+    /// [`Config::from_kdl`], naming the document in each warning about something this build did
+    /// not know and skipped (see [`unknown`]). Each one is logged and kept in
+    /// [`Config::warnings`].
+    pub fn from_kdl_named(
+        kdl_config: &str,
+        base_config: Option<Config>,
+        source_name: Option<&str>,
+    ) -> Result<Config, ConfigError> {
+        let (parsed, notes) = unknown::collect(|| Config::parse_kdl(kdl_config, base_config));
+        let mut config = parsed.map_err(|e| match e {
+            // a caller that did not catch an unknown name: it fails like any other config error
+            ConfigError::UnknownName(kdl_error) => ConfigError::KdlError(kdl_error),
+            e => e,
+        })?;
+        for warning in unknown::render(kdl_config, source_name, notes) {
+            log::warn!("{}", warning);
+            config.warnings.push(warning);
+        }
+        Ok(config)
+    }
+    fn parse_kdl(kdl_config: &str, base_config: Option<Config>) -> Result<Config, ConfigError> {
         let mut config = base_config.unwrap_or_else(|| Config::default());
         let kdl_config: KdlDocument = kdl_config.parse()?;
+        note_unknown_top_level_nodes(&kdl_config);
 
         if let Some((value, entry)) =
             kdl_property_first_arg_as_string_or_error!(kdl_config, "new_pane_default")
         {
             use crate::input::config::NewPaneDefault;
-            config.new_pane_default = Some(match value {
-                "split" => NewPaneDefault::Split,
-                "stacked" => NewPaneDefault::Stacked,
-                _ => {
-                    return Err(kdl_parsing_error!(
-                        "new_pane_default must be \"split\" or \"stacked\"".to_owned(),
-                        entry
-                    )
-                    .into())
-                },
-            });
+            match value {
+                "split" => config.new_pane_default = Some(NewPaneDefault::Split),
+                "stacked" => config.new_pane_default = Some(NewPaneDefault::Stacked),
+                _ => note_unknown_value("new_pane_default", value, entry, "split or stacked"),
+            }
         }
 
         let config_options = Options::from_kdl(&kdl_config)?;
@@ -6805,11 +7029,16 @@ fn new_pane_default_is_client_only_and_round_trips() {
             .new_pane_default,
         Some(NewPaneDefault::Split)
     );
-    for invalid in [
-        "new_pane_default \"floating\"",
-        "new_pane_default true",
-        "new_pane_default 3",
-    ] {
+    // a value a newer build may add is warned about and leaves the default; a wrong type fails
+    let newer = Config::from_kdl("new_pane_default \"floating\"", None).unwrap();
+    assert_eq!(newer.new_pane_default, None);
+    assert_eq!(newer.warnings.len(), 1, "{:?}", newer.warnings);
+    assert!(
+        newer.warnings[0].contains("\"floating\""),
+        "{}",
+        newer.warnings[0]
+    );
+    for invalid in ["new_pane_default true", "new_pane_default 3"] {
         assert!(Config::from_kdl(invalid, None).is_err(), "{}", invalid);
     }
 }
@@ -6937,14 +7166,17 @@ pub fn plugin_permissions_from_kdl(
         let mut permissions = vec![];
         for permission_node in plugin_node.children().map(|c| c.nodes()).unwrap_or(&[]) {
             let permission_name = permission_node.name().value();
-            let permission = PermissionType::from_str(permission_name).map_err(|_| {
-                ConfigError::new_kdl_error(
-                    format!("Unknown permission: {}", permission_name),
+            match PermissionType::from_str(permission_name) {
+                Ok(permission) => permissions.push(permission),
+                // a permission from a newer build: granting the rest is what the line asks for
+                Err(_) => note_unknown(
                     permission_node.span().offset(),
-                    permission_node.span().len(),
-                )
-            })?;
-            permissions.push(permission);
+                    format!(
+                        "unknown permission {:?} for {:?} in plugin_permissions, not granted",
+                        permission_name, raw_location
+                    ),
+                ),
+            }
         }
         granted.entry(location).or_default().extend(permissions);
     }
@@ -7069,6 +7301,14 @@ fn load_plugins_from_kdl(
 impl UiConfig {
     pub fn from_kdl(kdl_ui_config: &KdlNode) -> Result<UiConfig, ConfigError> {
         let mut ui_config = UiConfig::default();
+        note_unknown_children(kdl_ui_config, "ui", &["pane_frames"]);
+        if let Some(pane_frames) = kdl_get_child!(kdl_ui_config, "pane_frames") {
+            note_unknown_children(
+                pane_frames,
+                "ui pane_frames",
+                &["rounded_corners", "hide_session_name"],
+            );
+        }
         if let Some(pane_frames) = kdl_get_child!(kdl_ui_config, "pane_frames") {
             let rounded_corners =
                 kdl_children_property_first_arg_as_bool!(pane_frames, "rounded_corners")
@@ -7112,6 +7352,40 @@ impl UiConfig {
     }
 }
 
+/// The components a theme with named styles may hold. One a newer build adds is warned about and
+/// left at its default.
+const THEME_COMPONENTS: &[&str] = &[
+    "text_unselected",
+    "text_selected",
+    "ribbon_unselected",
+    "ribbon_selected",
+    "table_title",
+    "table_cell_unselected",
+    "table_cell_selected",
+    "list_unselected",
+    "list_selected",
+    "frame_unselected",
+    "frame_selected",
+    "frame_highlight",
+    "exit_code_success",
+    "exit_code_error",
+    "multiplayer_user_colors",
+];
+
+/// Note every child of `node` whose name is not in `known`. `context` names the block in the
+/// warning.
+pub(crate) fn note_unknown_children(node: &KdlNode, context: &str, known: &[&str]) {
+    for child in node.children().map(|c| c.nodes()).unwrap_or(&[]) {
+        let name = kdl_name!(child);
+        if !known.contains(&name) {
+            note_unknown(
+                child.span().offset(),
+                format!("unknown {} entry {:?}, ignored", context, name),
+            );
+        }
+    }
+}
+
 impl Themes {
     fn style_declaration_from_node(
         style_node: &KdlNode,
@@ -7124,6 +7398,18 @@ impl Themes {
                 let colors = kdl_children_or_error!(
                     descriptor,
                     format!("Missing colors for {}", style_descriptor)
+                );
+                note_unknown_children(
+                    descriptor,
+                    &format!("theme {:?} {}", kdl_name!(style_node), style_descriptor),
+                    &[
+                        "base",
+                        "background",
+                        "emphasis_0",
+                        "emphasis_1",
+                        "emphasis_2",
+                        "emphasis_3",
+                    ],
                 );
                 Ok(Some(StyleDeclaration {
                     base: PaletteColor::try_from(("base", colors))?,
@@ -7185,12 +7471,26 @@ impl Themes {
                 "fg", "bg", "red", "green", "blue", "yellow", "magenta", "orange", "cyan", "black",
                 "white",
             ]);
-            let theme = if theme_colors
-                .nodes()
-                .iter()
-                .all(|n| palette_color_names.contains(n.name().value()))
-            {
+            let names = || theme_colors.nodes().iter().map(|n| n.name().value());
+            // A palette theme with a color a newer build added is still a palette theme: it names
+            // no component of the newer definition, so reading it as one would lose every color.
+            let is_palette_theme = names().all(|name| palette_color_names.contains(name))
+                || (names().any(|name| palette_color_names.contains(name))
+                    && !names().any(|name| THEME_COMPONENTS.contains(&name)));
+            let theme = if is_palette_theme {
                 // Older palette based theme definition
+                for color in theme_colors.nodes() {
+                    if !palette_color_names.contains(color.name().value()) {
+                        note_unknown(
+                            color.span().offset(),
+                            format!(
+                                "unknown theme {:?} color {:?}, ignored",
+                                theme_name,
+                                color.name().value()
+                            ),
+                        );
+                    }
+                }
                 let palette = Palette {
                     fg: PaletteColor::try_from(("fg", theme_colors))?,
                     bg: PaletteColor::try_from(("bg", theme_colors))?,
@@ -7211,6 +7511,11 @@ impl Themes {
                 }
             } else {
                 // Newer theme definition with named styles
+                note_unknown_children(
+                    theme_config,
+                    &format!("theme {:?}", theme_name),
+                    THEME_COMPONENTS,
+                );
                 let s = Styling {
                     text_unselected: Themes::style_declaration_from_node(
                         theme_config,
@@ -9722,15 +10027,18 @@ fn explicit_theme_hue_from_kdl() {
 }
 
 #[test]
-fn explicit_theme_hue_rejects_unknown_values() {
-    let fake_config = r##"
-        explicit_theme_hue "sepia"
-    "##;
-    let document: KdlDocument = fake_config.parse().unwrap();
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn explicit_theme_hue_warns_on_unknown_values() {
+    let config = Config::from_kdl("explicit_theme_hue \"sepia\"", None).unwrap();
+    assert_eq!(config.options.explicit_theme_hue, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
     assert!(
-        Options::from_kdl(&document).is_err(),
-        "only 'dark' and 'light' are accepted"
+        config.warnings[0].starts_with("line 1: ") && config.warnings[0].contains("\"sepia\""),
+        "{}",
+        config.warnings[0]
     );
+    assert!(Config::from_kdl("explicit_theme_hue 3", None).is_err());
 }
 
 #[test]
@@ -9924,12 +10232,18 @@ fn input_while_scrolled_kdl_round_trip_for_every_variant() {
 }
 
 #[test]
-fn input_while_scrolled_rejects_an_unknown_value() {
-    let fake_config = r##"
-        input_while_scrolled "sideways"
-    "##;
-    let document: KdlDocument = fake_config.parse().unwrap();
-    assert!(Options::from_kdl(&document).is_err());
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn input_while_scrolled_warns_on_an_unknown_value() {
+    let config = Config::from_kdl("input_while_scrolled \"sideways\"", None).unwrap();
+    assert_eq!(config.options.input_while_scrolled, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 1: ") && config.warnings[0].contains("\"sideways\""),
+        "{}",
+        config.warnings[0]
+    );
+    assert!(Config::from_kdl("input_while_scrolled 3", None).is_err());
 }
 
 #[test]
@@ -9963,12 +10277,18 @@ fn command_pane_on_clean_exit_kdl_round_trip_for_every_variant() {
 }
 
 #[test]
-fn command_pane_on_clean_exit_rejects_an_unknown_value() {
-    let fake_config = r##"
-        command_pane_on_clean_exit "close"
-    "##;
-    let document: KdlDocument = fake_config.parse().unwrap();
-    assert!(Options::from_kdl(&document).is_err());
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn command_pane_on_clean_exit_warns_on_an_unknown_value() {
+    let config = Config::from_kdl("command_pane_on_clean_exit \"close\"", None).unwrap();
+    assert_eq!(config.options.command_pane_on_clean_exit, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 1: ") && config.warnings[0].contains("\"close\""),
+        "{}",
+        config.warnings[0]
+    );
+    assert!(Config::from_kdl("command_pane_on_clean_exit 3", None).is_err());
 }
 
 #[test]
@@ -10005,12 +10325,19 @@ fn host_notification_protocol_kdl_round_trip_for_every_variant() {
 }
 
 #[test]
-fn an_unknown_host_notification_protocol_is_a_config_error() {
-    let fake_config = r##"
-        host_notification_protocol "carrier-pigeon"
-    "##;
-    let document: KdlDocument = fake_config.parse().unwrap();
-    assert!(Options::from_kdl(&document).is_err());
+/// A value a newer build may add leaves the option at its default, with a warning naming it. A
+/// value of the wrong type is still an error.
+fn an_unknown_host_notification_protocol_warns_and_keeps_the_default() {
+    let config = Config::from_kdl("host_notification_protocol \"carrier-pigeon\"", None).unwrap();
+    assert_eq!(config.options.host_notification_protocol, None);
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(
+        config.warnings[0].starts_with("line 1: ")
+            && config.warnings[0].contains("\"carrier-pigeon\""),
+        "{}",
+        config.warnings[0]
+    );
+    assert!(Config::from_kdl("host_notification_protocol 3", None).is_err());
 }
 
 #[test]
@@ -10447,14 +10774,77 @@ fn no_pane_privacy_block_is_no_policy() {
     assert_eq!(config.options.pane_privacy, None);
 }
 
-/// A name this build KNOWS, given a value it cannot mean, is still the whole config failing: the
-/// operator meant that setting, and a privacy setting silently dropped is worse than one refused.
+/// A known name with an unknown VALUE fails closed for that one setting: it takes the strictest
+/// value this build knows, with a warning naming the line, and the rest of the config loads. A
+/// privacy setting silently loosened is worse than one refused, so the fallback is never the
+/// default.
+#[test]
+fn pane_privacy_fails_closed_for_a_value_it_does_not_know() {
+    let config = Config::from_kdl(
+        "pane_privacy {\n    pattern \"secret\"\n    match_fields \"cwd\" \"hostname\"\n    on_unknown_cwd \"maybe\"\n    tab_rule \"some\"\n}\nsimplified_ui true",
+        None,
+    )
+    .unwrap();
+    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
+    assert_eq!(pane_privacy.patterns, vec!["secret".to_owned()]);
+    assert_eq!(
+        pane_privacy.match_fields,
+        Some(vec![
+            MatchField::Cwd,
+            MatchField::Command,
+            MatchField::Title,
+            MatchField::TabName
+        ])
+    );
+    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Withhold));
+    assert_eq!(pane_privacy.tab_rule, Some(TabRule::Any));
+    assert_eq!(config.options.simplified_ui, Some(true));
+    assert_eq!(config.warnings.len(), 3, "{:?}", config.warnings);
+    assert!(config.warnings[0].starts_with("line 3: ") && config.warnings[0].contains("hostname"));
+    assert!(config.warnings[1].starts_with("line 4: ") && config.warnings[1].contains("withhold"));
+    assert!(config.warnings[2].starts_with("line 5: ") && config.warnings[2].contains("any"));
+}
+
+/// A strict rule the operator wrote stays exactly as written beside one this build cannot read:
+/// only the unknown one is forced to its strictest value.
+#[test]
+fn a_known_strict_pane_privacy_rule_beside_an_unknown_value_is_kept() {
+    let config = Config::from_kdl(
+        "pane_privacy {\n    match_fields \"title\"\n    on_unknown_cwd \"withhold\"\n    tab_rule \"everything\"\n}",
+        None,
+    )
+    .unwrap();
+    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
+    assert_eq!(pane_privacy.match_fields, Some(vec![MatchField::Title]));
+    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Withhold));
+    assert_eq!(pane_privacy.tab_rule, Some(TabRule::Any));
+    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+    assert!(config.warnings[0].contains("\"everything\""));
+}
+
+/// Normal use does not change: a block of known values reads exactly as before, with no warning,
+/// and an `allow` or `all` the operator chose is not tightened.
+#[test]
+fn pane_privacy_with_only_known_values_is_unchanged() {
+    let config = Config::from_kdl(
+        "pane_privacy {\n    match_fields \"cwd\"\n    on_unknown_cwd \"allow\"\n    tab_rule \"all\"\n}",
+        None,
+    )
+    .unwrap();
+    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
+    assert_eq!(pane_privacy.match_fields, Some(vec![MatchField::Cwd]));
+    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Allow));
+    assert_eq!(pane_privacy.tab_rule, Some(TabRule::All));
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+}
+
+/// A malformed value - missing, or not a string - is a mistake, not a newer build, and still fails.
 #[test]
 fn pane_privacy_rejects_values_it_cannot_read() {
     for bad in [
-        "pane_privacy {\n match_fields \"cwd\" \"hostname\"\n}",
-        "pane_privacy {\n on_unknown_cwd \"maybe\"\n}",
-        "pane_privacy {\n tab_rule \"some\"\n}",
+        "pane_privacy {\n on_unknown_cwd\n}",
+        "pane_privacy {\n tab_rule 3\n}",
+        "pane_privacy {\n match_fields 3\n}",
         "pane_privacy {\n patterns_file\n}",
         // no block at all: the entry is a bare node with no children, which is not a policy
         "pane_privacy",
@@ -11235,6 +11625,30 @@ fn session_service_names_restart_via_launchd_among_what_it_accepts() {
         "{:?}",
         error
     );
+}
+
+/// No `session_service` key takes a value from a closed set, so it has no "unknown value" to fall
+/// back from: a string `pin_exe` is a path, and every other value check is a type or a range. Those
+/// are malformed known settings and still fail; the block's unknown NAMES warn, as above.
+#[test]
+fn session_service_values_are_types_and_ranges_not_named_choices() {
+    let config = Config::from_kdl(
+        "session_service {\n    pin_exe \"some-later-keyword\"\n}",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        config.options.session_service.unwrap().pin_exe,
+        Some(PinnedExe::At(PathBuf::from("some-later-keyword")))
+    );
+    for malformed in [
+        "session_service {\n    managed_session \"yes\"\n}",
+        "session_service {\n    restart_via_launchd 1\n}",
+        "session_service {\n    watchdog_interval_secs 0\n}",
+        "session_service {\n    pin_exe 3\n}",
+    ] {
+        assert!(Config::from_kdl(malformed, None).is_err(), "{}", malformed);
+    }
 }
 
 #[test]

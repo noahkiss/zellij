@@ -153,7 +153,17 @@ impl CursorInactiveStyle {
             Some("underline") => Ok(CursorInactiveStyle::Underline),
             Some("outline") => Ok(CursorInactiveStyle::Outline),
             Some("no_style") => Ok(CursorInactiveStyle::NoStyle),
-            _ => Err(ConfigError::new_kdl_error(
+            // a style from a newer build: the caller keeps the default
+            Some(other) => Err(ConfigError::new_unknown_name(
+                format!(
+                    "unknown cursor_inactive_style {:?} in web_client, ignored (expected block, \
+                     bar, underline, outline or no_style)",
+                    other
+                ),
+                kdl.span().offset(),
+                kdl.span().len(),
+            )),
+            None => Err(ConfigError::new_kdl_error(
                 format!("Must be 'block', 'bar', 'underline', 'outline' or 'no_style'"),
                 kdl.span().offset(),
                 kdl.span().len(),
@@ -206,7 +216,17 @@ impl CursorStyle {
             Some("block") => Ok(CursorStyle::Block),
             Some("bar") => Ok(CursorStyle::Bar),
             Some("underline") => Ok(CursorStyle::Underline),
-            _ => Err(ConfigError::new_kdl_error(
+            // a style from a newer build: the caller keeps the default
+            Some(other) => Err(ConfigError::new_unknown_name(
+                format!(
+                    "unknown cursor_style {:?} in web_client, ignored (expected block, bar or \
+                     underline)",
+                    other
+                ),
+                kdl.span().offset(),
+                kdl.span().len(),
+            )),
+            None => Err(ConfigError::new_kdl_error(
                 format!("Must be 'block', 'bar' or 'underline'"),
                 kdl.span().offset(),
                 kdl.span().len(),
@@ -257,9 +277,38 @@ impl Default for WebClientConfig {
     }
 }
 
+/// A parsed value, or `None` with a note when the value is one this build does not know.
+fn known_or_note<T>(parsed: Result<T, ConfigError>) -> Result<Option<T>, ConfigError> {
+    match parsed {
+        Ok(value) => Ok(Some(value)),
+        Err(ConfigError::UnknownName(kdl_error)) => {
+            crate::kdl::unknown::note_unknown(
+                kdl_error.offset.unwrap_or_default(),
+                kdl_error.error_message,
+            );
+            Ok(None)
+        },
+        Err(e) => Err(e),
+    }
+}
+
 impl WebClientConfig {
     pub fn from_kdl(kdl: &KdlNode) -> Result<Self, ConfigError> {
         let mut web_client_config = WebClientConfig::default();
+        crate::kdl::note_unknown_children(
+            kdl,
+            "web_client",
+            &[
+                "font",
+                "theme",
+                "cursor_blink",
+                "cursor_inactive_style",
+                "cursor_style",
+                "mac_option_is_meta",
+                "base_url",
+                "font_size",
+            ],
+        );
 
         if let Some(font) = kdl_get_child_entry_string_value!(kdl, "font") {
             web_client_config.font = font.to_owned();
@@ -275,11 +324,12 @@ impl WebClientConfig {
 
         if let Some(cursor_inactive_style_node) = kdl_get_child!(kdl, "cursor_inactive_style") {
             web_client_config.cursor_inactive_style =
-                Some(CursorInactiveStyle::from_kdl(cursor_inactive_style_node)?);
+                known_or_note(CursorInactiveStyle::from_kdl(cursor_inactive_style_node))?;
         }
 
         if let Some(cursor_style_node) = kdl_get_child!(kdl, "cursor_style") {
-            web_client_config.cursor_style = Some(CursorStyle::from_kdl(cursor_style_node)?);
+            web_client_config.cursor_style =
+                known_or_note(CursorStyle::from_kdl(cursor_style_node))?;
         }
 
         if let Some(mac_option_is_meta) = kdl_get_child_entry_bool_value!(kdl, "mac_option_is_meta")
