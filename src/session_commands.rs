@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up, term_for_new_session,
-    warn_if_server_build_differs, BuildVerdict, DownOutcome, SessionFacts,
+    build_mismatch_warning_of, build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up,
+    own_executable, server_executable, term_for_new_session, BuildVerdict, DownOutcome,
+    ExecutableIdentity, SessionFacts,
 };
 use zellij_utils::session_service::{
     self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
@@ -1601,6 +1602,86 @@ fn resume_archive_target(name: &str, opts: &CliArgs) -> Option<(String, String)>
     }
 }
 
+/// Where the watchdog records the build pair it last warned about for `session`.
+///
+/// State, not cache: the stamp has to mean the same thing to every tick, and the cache directory
+/// moves with an environment a launcher does not share (see `consts.rs`).
+fn build_warning_stamp(session: &str) -> PathBuf {
+    zellij_utils::consts::ZELLIJ_STATE_DIR
+        .join("build-warned")
+        .join(session)
+}
+
+/// The running server's build and this binary's, in the fields `compare_builds` reads.
+///
+/// An upgrade changes this binary's identity and a restart changes the server's, so either one
+/// makes a new pair, and the watchdog warns about it again.
+fn build_pair(ours: Option<&ExecutableIdentity>, theirs: Option<&ExecutableIdentity>) -> String {
+    fn one(identity: Option<&ExecutableIdentity>) -> String {
+        let Some(identity) = identity else {
+            return "none".to_owned();
+        };
+        let build_id = identity.build_id.as_ref().map_or_else(
+            || "-".to_owned(),
+            |id| id.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+        );
+        let file_id = identity
+            .file_id
+            .map_or_else(|| "-".to_owned(), |(dev, ino)| format!("{}:{}", dev, ino));
+        let size = identity
+            .size
+            .map_or_else(|| "-".to_owned(), |size| size.to_string());
+        format!(
+            "{} file={} build={} size={} replaced={}",
+            identity.path.display(),
+            file_id,
+            build_id,
+            size,
+            identity.replaced
+        )
+    }
+    format!("running {}\nthis {}\n", one(theirs), one(ours))
+}
+
+/// The build-mismatch warning to print, if any, given the stamp the last tick left.
+///
+/// From a shell, every time: a person typed `up`, and the answer must say what "already running"
+/// hides. From the init system's own job, once per [`build_pair`]: the watchdog asks every
+/// `watchdog_interval_secs`, and while a restart was owed the same four lines went to stderr on
+/// every tick - 25,615 copies on one Mac. `session status` and `session doctor` still report it on
+/// demand. A stamp that cannot be written costs the old behaviour, never the warning.
+fn warning_to_print(
+    warning: Option<String>,
+    pair: &str,
+    as_the_unit: bool,
+    stamp: &Path,
+) -> Option<String> {
+    let warning = warning?;
+    if !as_the_unit {
+        return Some(warning);
+    }
+    if std::fs::read_to_string(stamp).map_or(false, |last| last == pair) {
+        return None;
+    }
+    if let Some(dir) = stamp.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(stamp, pair);
+    Some(warning)
+}
+
+/// Say that the healthy session `name` is served by a superseded build, if it is.
+fn warn_about_a_superseded_build(name: &str, as_the_unit: bool) {
+    let ours = own_executable();
+    let theirs = server_executable(name);
+    let warning = build_mismatch_warning_of(name, ours.as_ref(), theirs.as_ref());
+    let pair = build_pair(ours.as_ref(), theirs.as_ref());
+    let stamp = build_warning_stamp(name);
+    if let Some(warning) = warning_to_print(warning, &pair, as_the_unit, &stamp) {
+        eprintln!("{}", warning);
+    }
+}
+
 /// Create the session if it is not there, then prove that it is.
 fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     // First, and on every `up` including the one that finds the session already healthy: an upgrade
@@ -1634,12 +1715,13 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
         // that setting for the SYSTEM manager's units only - so the line has to not be written. The
         // build warning below and every failure still go to stderr, and a pass that CREATES the
         // session still prints `up`.
-        if !zellij_utils::session_lifecycle::running_as_the_unit(name) {
+        let as_the_unit = zellij_utils::session_lifecycle::running_as_the_unit(name);
+        if !as_the_unit {
             println!("ok    session '{}' already running", name);
         }
         // "already running" is exactly the answer that hides a superseded build: an `up` after an
         // upgrade reports success and leaves the old server serving the session.
-        warn_if_server_build_differs(name);
+        warn_about_a_superseded_build(name, as_the_unit);
         return Ok(());
     }
     if (healthy || facts.listed) && named_snapshot {
@@ -2175,6 +2257,90 @@ fn down_then_up(name: &str, shape: UpShape, wait_timeout: u64, opts: &CliArgs) -
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    fn identity(path: &str, build: u8) -> ExecutableIdentity {
+        ExecutableIdentity {
+            path: PathBuf::from(path),
+            file_id: Some((1, u64::from(build))),
+            build_id: Some(vec![build]),
+            size: Some(100),
+            replaced: false,
+        }
+    }
+
+    /// One healthy-session `up`, as it decides the warning, over identities and a stamp the test
+    /// owns.
+    fn tick(
+        ours: &ExecutableIdentity,
+        theirs: &ExecutableIdentity,
+        as_the_unit: bool,
+        stamp: &Path,
+    ) -> Option<String> {
+        let warning = build_mismatch_warning_of("s", Some(ours), Some(theirs));
+        let pair = build_pair(Some(ours), Some(theirs));
+        warning_to_print(warning, &pair, as_the_unit, stamp)
+    }
+
+    fn stamp_in(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("build-warned").join("s")
+    }
+
+    #[test]
+    fn the_units_first_tick_on_a_superseded_build_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let warning = tick(&identity("/new", 2), &identity("/old", 1), true, &stamp);
+        assert!(warning.unwrap().contains("running a different build"));
+        assert!(stamp.exists());
+    }
+
+    #[test]
+    fn the_units_next_tick_on_the_same_pair_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let (ours, theirs) = (identity("/new", 2), identity("/old", 1));
+        assert!(tick(&ours, &theirs, true, &stamp).is_some());
+        assert_eq!(tick(&ours, &theirs, true, &stamp), None);
+        assert_eq!(tick(&ours, &theirs, true, &stamp), None);
+    }
+
+    #[test]
+    fn the_unit_warns_again_when_the_pair_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let theirs = identity("/old", 1);
+        assert!(tick(&identity("/new", 2), &theirs, true, &stamp).is_some());
+        // a second upgrade lands before the restart: this binary is a new build again
+        assert!(tick(&identity("/new", 3), &theirs, true, &stamp).is_some());
+        assert_eq!(tick(&identity("/new", 3), &theirs, true, &stamp), None);
+        // a restart onto a build that is still not this one
+        assert!(tick(&identity("/new", 3), &identity("/mid", 4), true, &stamp).is_some());
+    }
+
+    #[test]
+    fn up_from_a_shell_warns_every_time_and_leaves_the_stamp_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let (ours, theirs) = (identity("/new", 2), identity("/old", 1));
+        for _ in 0..3 {
+            assert!(tick(&ours, &theirs, false, &stamp).is_some());
+        }
+        assert!(!stamp.exists());
+        // and a shell call after the unit has warned still warns
+        assert!(tick(&ours, &theirs, true, &stamp).is_some());
+        assert!(tick(&ours, &theirs, false, &stamp).is_some());
+        assert_eq!(tick(&ours, &theirs, true, &stamp), None);
+    }
+
+    #[test]
+    fn the_same_build_says_nothing_and_writes_no_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = stamp_in(&dir);
+        let build = identity("/same", 1);
+        assert_eq!(tick(&build, &build, true, &stamp), None);
+        assert_eq!(tick(&build, &build, false, &stamp), None);
+        assert!(!stamp.exists());
+    }
 
     #[test]
     fn a_restart_comes_back_from_the_newest_snapshot() {

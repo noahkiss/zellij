@@ -2847,9 +2847,20 @@ fn pin_write_error(path: &Path, error: &std::io::Error) -> String {
 /// package changes nothing until the session is restarted. Nothing else says so, and a machine can
 /// therefore sit on a superseded build for days while everyone believes the upgrade took effect.
 pub fn build_mismatch_warning(name: &str) -> Option<String> {
-    let ours = own_executable();
-    let theirs = server_executable(name);
-    if compare_builds(ours.as_ref(), theirs.as_ref()) != BuildMatch::Different {
+    build_mismatch_warning_of(
+        name,
+        own_executable().as_ref(),
+        server_executable(name).as_ref(),
+    )
+}
+
+/// [`build_mismatch_warning`] over identities already read, for a caller that keeps them.
+pub fn build_mismatch_warning_of(
+    name: &str,
+    ours: Option<&ExecutableIdentity>,
+    theirs: Option<&ExecutableIdentity>,
+) -> Option<String> {
+    if compare_builds(ours, theirs) != BuildMatch::Different {
         return None;
     }
     let (ours, theirs) = (ours?, theirs?);

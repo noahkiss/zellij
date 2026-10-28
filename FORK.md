@@ -1766,6 +1766,16 @@ output of a `--user` unit passes through at any level. What still prints is ever
 something: the build-mismatch warning and every failure go to stderr, and a tick that creates the
 session prints `up`. `up` from a shell still says `ok`.
 
+The job says the build-mismatch warning **once per build pair**, not once per tick. While a restart
+is owed, every tick wrote the same four lines to stderr: 25,615 copies, 10 MB of one Mac's
+`.err.log`. The job now records the pair it warned about — the running server's executable
+identity and its own, the same identities `compare_builds` decides on — in
+`<state-dir>/build-warned/<session>`, and stays silent until either side changes. An upgrade or a
+restart onto another stale build is a new pair and warns again. The stamp lives in the state
+directory, not the cache, because a launcher's `XDG_CACHE_HOME` can differ from a shell's. A stamp
+that cannot be written costs the old behaviour, never the warning. `up` from a shell warns every
+time and never reads or writes the stamp, and `session status` and `session doctor` are unchanged.
+
 None of these read `ZELLIJ_SOCKET_DIR`. The binary resolves its own socket directory, so there is no
 environment variable for a launcher to get wrong, and none for a long-lived shell to hold a stale
 copy of.
