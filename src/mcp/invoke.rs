@@ -305,22 +305,36 @@ pub struct TypeAfter {
 }
 
 impl TypeAfter {
+    fn scoped(&self, rest: &[&str]) -> Vec<String> {
+        let mut argv = Vec::new();
+        if let Some(session) = &self.session {
+            argv.push("-s".to_owned());
+            argv.push(session.clone());
+        }
+        argv.extend(rest.iter().map(|word| (*word).to_owned()));
+        argv
+    }
+
     /// The command lines that type the command into `pane` and press Enter, in order.
     pub fn argvs(&self, pane: &str) -> [Vec<String>; 2] {
-        let scoped = |rest: [&str; 5]| {
-            let mut argv = Vec::new();
-            if let Some(session) = &self.session {
-                argv.push("-s".to_owned());
-                argv.push(session.clone());
-            }
-            argv.extend(rest.iter().map(|word| (*word).to_owned()));
-            argv
-        };
         let pane = flag_value("--pane-id", pane);
         [
-            scoped(["action", "write-chars", &pane, "--", &self.command]),
-            scoped(["action", "send-keys", &pane, "--", "Enter"]),
+            self.scoped(&["action", "write-chars", &pane, "--", &self.command]),
+            self.scoped(&["action", "send-keys", &pane, "--", "Enter"]),
         ]
+    }
+
+    /// The command lines that read the pane back: the session's pane list, and `pane`'s screen.
+    pub fn read_back_argvs(&self, pane: &str) -> [Vec<String>; 2] {
+        [
+            self.scoped(&["action", "list-panes", "--json"]),
+            self.scoped(&["action", "dump-screen", &flag_value("--pane-id", pane)]),
+        ]
+    }
+
+    /// The command as it is typed.
+    pub fn command(&self) -> &str {
+        &self.command
     }
 }
 

@@ -5594,7 +5594,9 @@ without telling the server, which simply sees the future dropped. Every child is
 `kill_on_drop`, so a dropped call takes its child with it - at cancellation and at shutdown alike,
 because the runtime drops its pending tasks when stdin reaches EOF. `zellij_wait_for` is bounded
 too: without `timeout_s` it gives up after 300 seconds rather than blocking for the life of the
-pane, which is the default its own schema has always advertised.
+pane, which is the default its own schema has always advertised. That bound is the server's, not
+the client's: a client whose request deadline is shorter (often 60 seconds) gives up first, so
+`timeout_s` tells the caller to stay under that deadline and wait again.
 
 **Every tool declares the shape of what it returns**, and it is the same shape for all eight: the
 CLI's exit code, what it printed - parsed when that was JSON - what it wrote to stderr, and on a
@@ -10029,6 +10031,40 @@ said so. The binary now owns the file.
   `claude end` on `SessionEnd`. See the agent-session contract above for why.
 
 `setup --check --json` lists `agent-hooks-write`. No client/server contract changes.
+
+### `zellij_create` reads its pane back before it says `input_sent`
+
+`input_sent: true` used to mean only that `write-chars` and `send-keys` exited 0. That is the
+server taking the keystrokes, not the pane showing them. A report from a Mac had a tab open in the
+session's default directory with nothing typed, while the tool answered `ready: true`,
+`input_sent: true`. The report could not be reproduced on Linux with nkmk.30, .35 or .37 as the
+server. The answer now comes from the pane:
+
+- **Before typing**, one `list-panes --json` reads the fresh shell's `pane_cwd`, before the
+  typed command can `cd`. The result carries `pane_cwd`. A create that passed `cwd` also carries
+  `cwd_honoured`. When it is `false`, the result has a note naming both directories. On this
+  machine the two are compared through the filesystem, so a symlinked `/tmp` is not a mismatch.
+  On a remote host they are compared as text.
+- **After typing**, the pane is read for up to 2 seconds. The command counts as seen when the
+  shell's OSC 133 state is `running` or `done`, or when the first 24 characters of the command's
+  first line are on the pane's screen.
+- `input_sent` turns `false` only when the pane was read and showed neither. The result then has a
+  note: the command was handed to the pane, so read the pane before you type it again. A pane that
+  could not be read at all keeps the write's own answer.
+
+`src/mcp/mod.rs` (`type_and_read_back`, `typed_command_seen`, `terminal_pane_row`) and
+`src/mcp/invoke.rs` (`TypeAfter::read_back_argvs`). Tests: what counts as seen, the requested
+`cwd` and the directory comparison, the pane row by reported id, and nothing read back from a pane
+that was not ready.
+
+The same change gives `zellij_wait_for`'s `timeout_s` a description of its own, replacing the CLI
+help it borrowed. Every wait answers a fraction of a second after `timeout_s`, and many MCP clients
+cut a request at 60 seconds. So `timeout_s: 60` lost to that deadline every time: the caller got
+`MCP error -32001: Request timed out` instead of the bounded miss. Concurrent waits do not
+serialize: rmcp runs each request in its own task, and each wait is its own child process. The
+description now tells the caller to stay at least 5 seconds under the client's deadline and wait
+again. The 300-second default is unchanged: lowering it would cut short a long wait in a client
+whose deadline is long, such as Claude Code.
 
 ## Assessed and deliberately not built
 

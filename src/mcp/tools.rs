@@ -238,7 +238,9 @@ pub const TOOLS: &[ToolSpec] = &[
                right after typing does not count. Use it after zellij_write_input sends a line \
                to a shell; read `ready_by` (prompt, or quiet for a shell without OSC 133 marks, \
                where quiet_ms is the window). Every wait is bounded: without timeout_s it gives \
-               up after 300 seconds rather than blocking for the life of the pane. \
+               up after 300 seconds rather than blocking for the life of the pane. If your MCP \
+               client cuts a request off sooner (many do at 60 seconds), pass a timeout_s under \
+               that deadline and wait again. \
                Start the child, then wait for agent-change in the background; never poll the screen. \
                until=agent_change wakes on agent state, identity or name changes. Omit pane to watch \
                every agent except the caller. until=agent_idle is for a pane running a coding agent: it returns when the agent \
@@ -303,7 +305,11 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Int,
                 required: false,
                 from: Some(("action wait", "--timeout")),
-                describe: "",
+                describe: "Seconds to wait before the wait gives up and answers with a miss. The \
+                           answer comes a fraction of a second after this, so keep it at least 5 \
+                           seconds under your MCP client's own request deadline, which is often \
+                           60 seconds: a client that gives up first returns a request error \
+                           instead of this tool's answer. To wait longer, wait again.",
                 default: Some("300"),
             },
         ],

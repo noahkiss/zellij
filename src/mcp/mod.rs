@@ -156,9 +156,13 @@ impl ZellijMcp {
                 outcome.stdout = shaped;
             }
         }
-        let input_sent = match then_type {
-            Some(then_type) => Some(type_into_created_pane(then_type, &mut outcome, &target).await),
-            None => None,
+        let (input_sent, checked) = match then_type {
+            Some(then_type) => {
+                let (sent, checked) =
+                    type_and_read_back(&then_type, &argv, &mut outcome, &target).await;
+                (Some(sent), checked)
+            },
+            None => (None, Map::new()),
         };
         let hint = if name == "zellij_write_input" && !outcome.is_error() {
             self.input_hint(&arguments, &target).await
@@ -166,6 +170,12 @@ impl ZellijMcp {
             None
         };
         let mut result = self.report(&argv, outcome, input_sent);
+        if let Some(note) = checked.get("note").and_then(Value::as_str) {
+            result.content.push(ContentBlock::text(note));
+        }
+        if let Some(Value::Object(structure)) = result.structured_content.as_mut() {
+            structure.extend(checked);
+        }
         if let Some(hint) = hint {
             result.content.push(ContentBlock::text(&hint));
             if let Some(Value::Object(structure)) = result.structured_content.as_mut() {
@@ -402,7 +412,7 @@ impl ZellijMcp {
 /// exits 2 and still names its pane, and nothing is typed into it. A write that fails leaves a pane
 /// with nothing running in it, so its failure becomes the call's.
 async fn type_into_created_pane(
-    then_type: invoke::TypeAfter,
+    then_type: &invoke::TypeAfter,
     outcome: &mut invoke::Outcome,
     target: &remote::Target,
 ) -> bool {
@@ -423,6 +433,159 @@ async fn type_into_created_pane(
         return false;
     }
     true
+}
+
+/// Type a shell-mode create's command into its pane, and check the pane rather than the exit codes.
+///
+/// Returns `input_sent` and what the read-back adds to the answer. Before typing, the fresh shell's
+/// directory is read, while the typed command cannot yet have moved it: a create whose `cwd` the
+/// shell is not in says so in `pane_cwd`, `cwd_honoured` and a note. After typing, `input_sent` is
+/// `true` only if the pane shows the command, or could not be read at all; a pane that was read
+/// and shows nothing turns it `false`, with a note not to type the command twice blind.
+async fn type_and_read_back(
+    then_type: &invoke::TypeAfter,
+    argv: &[String],
+    outcome: &mut invoke::Outcome,
+    target: &remote::Target,
+) -> (bool, Map<String, Value>) {
+    let mut checked = Map::new();
+    let mut notes = Vec::new();
+    let pane = invoke::reported_pane_id(&outcome.stdout).filter(|_| !outcome.is_error());
+    if let Some(pane) = &pane {
+        let row = created_pane_row(then_type, pane, target).await;
+        if let Some(cwd) = row
+            .as_ref()
+            .and_then(|row| row.get("pane_cwd"))
+            .and_then(Value::as_str)
+        {
+            checked.insert("pane_cwd".to_owned(), json!(cwd));
+            if let Some(asked) = requested_cwd(argv) {
+                let honoured = same_dir(cwd, asked, target);
+                checked.insert("cwd_honoured".to_owned(), json!(honoured));
+                if !honoured {
+                    notes.push(format!(
+                        "The pane's shell started in {}, not in the requested cwd {}.",
+                        cwd, asked
+                    ));
+                }
+            }
+        }
+    }
+    let mut sent = type_into_created_pane(then_type, outcome, target).await;
+    if let (true, Some(pane)) = (sent, &pane) {
+        if typed_command_seen(then_type, pane, target).await == Some(false) {
+            sent = false;
+            notes.push(format!(
+                "The command was handed to the pane, but the pane did not show it within {} \
+                 seconds. Read the pane before typing it again.",
+                READ_BACK_MS / 1000
+            ));
+        }
+    }
+    if !notes.is_empty() {
+        checked.insert("note".to_owned(), json!(notes.join(" ")));
+    }
+    (sent, checked)
+}
+
+/// How long a create reads its pane back for a sign of the command it typed, at most.
+const READ_BACK_MS: u64 = 2000;
+
+/// The pause between two reads of a created pane.
+const READ_BACK_STEP_MS: u64 = 100;
+
+/// The created pane's row in the session's pane list, or `None` when it could not be read.
+async fn created_pane_row(
+    then_type: &invoke::TypeAfter,
+    pane: &str,
+    target: &remote::Target,
+) -> Option<Value> {
+    let [list, _] = then_type.read_back_argvs(pane);
+    let said = invoke::run_on(target, &list, None).await.ok()?;
+    if said.is_error() {
+        return None;
+    }
+    terminal_pane_row(&said.stdout, pane)
+}
+
+/// Whether the pane shows the command a create typed into it, read back from the pane itself.
+///
+/// The write's exit code says only that the server took the keystrokes. The pane is the evidence
+/// that they arrived: its shell says a command started (`command_state` running or done), or the
+/// typed line is on its screen. `None` when the pane could not be read at all, which leaves the
+/// write's own answer standing rather than contradicting it with nothing.
+async fn typed_command_seen(
+    then_type: &invoke::TypeAfter,
+    pane: &str,
+    target: &remote::Target,
+) -> Option<bool> {
+    let [_, dump] = then_type.read_back_argvs(pane);
+    let mut read_any = false;
+    let mut waited = 0;
+    loop {
+        if let Some(row) = created_pane_row(then_type, pane, target).await {
+            read_any = true;
+            if command_started(&row) {
+                return Some(true);
+            }
+        }
+        if let Ok(screen) = invoke::run_on(target, &dump, None).await {
+            if !screen.is_error() {
+                read_any = true;
+                if typed_on_screen(&screen.stdout, then_type.command()) {
+                    return Some(true);
+                }
+            }
+        }
+        if waited >= READ_BACK_MS {
+            return read_any.then_some(false);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(READ_BACK_STEP_MS)).await;
+        waited += READ_BACK_STEP_MS;
+    }
+}
+
+/// A shell with OSC 133 marks says a typed command started: `running`, or `done` once it ended.
+fn command_started(row: &Value) -> bool {
+    matches!(
+        row.get("command_state").and_then(Value::as_str),
+        Some("running" | "done")
+    )
+}
+
+/// Whether the start of a typed command's first line is on a pane's screen. Only the start: a long
+/// line wraps, and the wrap point is the pane's width.
+fn typed_on_screen(screen: &str, command: &str) -> bool {
+    let needle: String = command
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(24)
+        .collect();
+    !needle.is_empty() && screen.contains(&needle)
+}
+
+/// The directory a create asked for, as it went onto the command line.
+fn requested_cwd(argv: &[String]) -> Option<&str> {
+    argv.iter().find_map(|word| word.strip_prefix("--cwd="))
+}
+
+/// Whether two directories are the same one. On this machine through the filesystem, so a symlink
+/// such as macOS's `/tmp` is not a difference; on another, as text.
+fn same_dir(a: &str, b: &str, target: &remote::Target) -> bool {
+    let trimmed = |dir: &str| dir.trim_end_matches('/').to_owned();
+    if trimmed(a) == trimmed(b) {
+        return true;
+    }
+    if target.is_remote() {
+        return false;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The value of one `key: value` line of a CLI report.
@@ -532,24 +695,32 @@ fn agents_resource_list() -> ListResourcesResult {
     result
 }
 
-fn named_agent_hint(panes: &str, pane: &str) -> Option<String> {
+/// The terminal pane `pane` names - a handle, a uuid, `7` or `terminal_7` - in a `list-panes
+/// --json` answer.
+fn terminal_pane_row(panes: &str, pane: &str) -> Option<Value> {
     let value: Value = serde_json::from_str(panes).ok()?;
     let rows = value
         .as_array()
         .or_else(|| value.get("panes")?.as_array())?;
-    let row = rows.iter().find(|row| {
-        if row.get("is_plugin").and_then(Value::as_bool) == Some(true) {
-            return false;
-        }
-        let id = row
-            .get("id")
-            .or_else(|| row.get("pane_id"))
-            .and_then(Value::as_u64);
-        row.get("handle").and_then(Value::as_str) == Some(pane)
-            || row.get("uuid").and_then(Value::as_str) == Some(pane)
-            || id.is_some_and(|id| pane == id.to_string() || pane == format!("terminal_{}", id))
-    })?;
-    let agent = row.get("agent").unwrap_or(row);
+    rows.iter()
+        .find(|row| {
+            if row.get("is_plugin").and_then(Value::as_bool) == Some(true) {
+                return false;
+            }
+            let id = row
+                .get("id")
+                .or_else(|| row.get("pane_id"))
+                .and_then(Value::as_u64);
+            row.get("handle").and_then(Value::as_str) == Some(pane)
+                || row.get("uuid").and_then(Value::as_str) == Some(pane)
+                || id.is_some_and(|id| pane == id.to_string() || pane == format!("terminal_{}", id))
+        })
+        .cloned()
+}
+
+fn named_agent_hint(panes: &str, pane: &str) -> Option<String> {
+    let row = terminal_pane_row(panes, pane)?;
+    let agent = row.get("agent").unwrap_or(&row);
     let name = agent.get("name")?.as_str()?;
     let kind = agent.get("kind")?.as_str()?;
     if name.is_empty() {
@@ -803,11 +974,79 @@ mod tests {
             "pane_id: terminal_7\nhandle: sunny-otter\n",
             "terminal_7 was not ready when the wait timed out.\n",
         );
-        let sent =
-            type_into_created_pane(plan.then_type.unwrap(), &mut missed, &remote::Target::Local)
-                .await;
+        let then_type = plan.then_type.unwrap();
+        let sent = type_into_created_pane(&then_type, &mut missed, &remote::Target::Local).await;
         assert!(!sent);
         assert_eq!(missed.code, 2, "the create's own answer stands");
+        // and nothing is read back from it either: the pane said nothing worth checking
+        let (sent, checked) = type_and_read_back(
+            &then_type,
+            &create_argv(),
+            &mut missed,
+            &remote::Target::Local,
+        )
+        .await;
+        assert!(!sent);
+        assert!(checked.is_empty(), "{:?}", checked);
+    }
+
+    #[test]
+    fn a_typed_command_counts_as_seen_by_its_shell_or_its_screen() {
+        assert!(command_started(&json!({"command_state": "running"})));
+        assert!(command_started(&json!({"command_state": "done"})));
+        assert!(!command_started(&json!({"command_state": "prompt"})));
+        // a shell without OSC 133 marks says nothing, which is not a no
+        assert!(!command_started(&json!({})));
+        let screen = "noah ~/develop/products 12:20\n> claude --resume abc\n";
+        assert!(typed_on_screen(screen, "claude --resume abc"));
+        // only the start of a long line: the rest may have wrapped onto the next row
+        assert!(typed_on_screen(
+            "> claude --model opus --permi\nssion-mode plan\n",
+            "claude --model opus --permission-mode plan"
+        ));
+        assert!(!typed_on_screen("noah ~/develop 12:20\n", "claude"));
+        assert!(!typed_on_screen("anything", "   "));
+    }
+
+    #[test]
+    fn the_requested_cwd_is_read_off_the_create_and_compared_as_a_directory() {
+        let argv: Vec<String> = "action new-tab --cwd=/srv/app --name=app --wait-ready"
+            .split(' ')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(requested_cwd(&argv), Some("/srv/app"));
+        assert_eq!(requested_cwd(&create_argv()), None);
+        let remote = remote::Target::Remote(remote::RemoteHost {
+            name: "boxa".into(),
+            bin: None,
+        });
+        assert!(same_dir("/srv/app/", "/srv/app", &remote));
+        assert!(!same_dir("/srv", "/srv/app", &remote));
+        // on this machine a symlink to the same directory is the same directory
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_dir(
+            link.to_str().unwrap(),
+            real.to_str().unwrap(),
+            &remote::Target::Local
+        ));
+        assert!(!same_dir(
+            dir.path().to_str().unwrap(),
+            real.to_str().unwrap(),
+            &remote::Target::Local
+        ));
+    }
+
+    #[test]
+    fn the_created_pane_is_found_by_the_id_the_create_reported() {
+        let panes = r#"[{"id": 2, "is_plugin": true, "handle": "a"},
+                        {"id": 2, "is_plugin": false, "handle": "b", "pane_cwd": "/x"}]"#;
+        let row = terminal_pane_row(panes, "terminal_2").expect("the terminal pane");
+        assert_eq!(row["pane_cwd"], json!("/x"));
+        assert!(terminal_pane_row(panes, "terminal_3").is_none());
     }
 
     #[test]
