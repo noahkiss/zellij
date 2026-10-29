@@ -11745,7 +11745,15 @@ pub(crate) fn screen_thread_main(
                             .map(|(terminal_id, ..)| (*terminal_id, reopened))
                     });
                 // tab_id is a stable identifier from NewTab instruction
-                if let Some(first_terminal_pane) = new_pane_pids.iter().next() {
+                // fork addition: a tab opened on a plugin was told which pane that is by the
+                // plugin thread, which put it there - the plugins below include the template's
+                // bars, in no particular order
+                let pane_already_named = completion_tx
+                    .as_ref()
+                    .map_or(false, |c| c.has_affected_pane_id());
+                if pane_already_named {
+                    // the plugin thread's pick stands
+                } else if let Some(first_terminal_pane) = new_pane_pids.iter().next() {
                     completion_tx
                         .as_mut()
                         .map(|c| c.set_affected_pane_id(PaneId::Terminal(first_terminal_pane.0)));
@@ -12891,6 +12899,18 @@ pub(crate) fn screen_thread_main(
                 // the id is reported at the end of this arm, once a tab has taken the pane - see
                 // the confirmation below
 
+                // fork addition: a tab the client branch below would not open the pane in. That
+                // branch always wins, because a plugin is loaded on a client's behalf, so a pane
+                // asked for in another tab (`--tab-id`, `--in-tab`) landed in the focused one -
+                // or, with no client attached, nowhere.
+                let client_tab = client_id
+                    .and_then(|client_id| screen.active_tab_ids.get(&client_id))
+                    .or_else(|| screen.active_tab_ids.values().next())
+                    .copied();
+                let other_tab = tab_index
+                    .filter(|index| Some(*index) != client_tab)
+                    .filter(|index| screen.tabs.contains_key(index));
+
                 if should_be_in_place {
                     if let Some(pane_id_to_replace) = pane_id_to_replace {
                         let client_tab_index_or_pane_id =
@@ -12917,6 +12937,17 @@ pub(crate) fn screen_thread_main(
                     } else {
                         log::error!("Must have pane id to replace or connected client_id if replacing a pane");
                     }
+                } else if let Some(tab) = other_tab.and_then(|index| screen.tabs.get_mut(&index)) {
+                    tab.new_pane(
+                        PaneId::Plugin(plugin_id),
+                        Some(pane_title),
+                        Some(run_plugin),
+                        start_suppressed,
+                        should_focus_plugin.unwrap_or(true),
+                        new_pane_placement,
+                        None,
+                        None,
+                    )?;
                 } else if let Some(client_id) = client_id {
                     active_tab_and_connected_client_id!(screen, client_id, |active_tab: &mut Tab, _client_id: ClientId| {
                         active_tab.new_pane(

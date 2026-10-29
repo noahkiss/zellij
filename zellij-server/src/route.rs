@@ -196,6 +196,11 @@ impl NotificationEnd {
         self.affected_pane_id = Some(pane_id);
     }
 
+    /// fork addition: whether a pane was already named as the one this action made.
+    pub fn has_affected_pane_id(&self) -> bool {
+        self.affected_pane_id.is_some()
+    }
+
     pub fn set_affected_tab_id(&mut self, tab_id: usize) {
         self.affected_tab_id = Some(tab_id);
     }

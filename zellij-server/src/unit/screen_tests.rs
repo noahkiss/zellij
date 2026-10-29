@@ -19484,3 +19484,129 @@ pub fn reopening_a_handle_the_ring_lacks_changes_nothing() {
         .iter()
         .any(|i| matches!(i, PtyInstruction::SpawnReopenedTerminal { .. })));
 }
+
+/// fork: a plugin pane asked for in a tab the client is not in opens in that tab. The client's
+/// own tab used to win, so `new-pane --plugin --tab-id` landed in the focused tab.
+#[test]
+pub fn a_plugin_pane_asked_for_in_another_tab_opens_in_that_tab() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let client_id = mock_screen.main_client_id;
+    // a second tab, which takes the client's focus
+    mock_screen.new_tab(two_pane_layout());
+    subscribe_background_plugin(&mock_screen, 99, client_id);
+
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::AddPlugin(
+        Some(false), // should_float
+        false,       // should be opened in place
+        false,       // close_replaced_pane
+        RunPluginOrAlias::from_url("file:/path/to/fake/plugin", &None, None, None).unwrap(),
+        None,        // pane title
+        Some(0),     // tab index: the first tab, not the client's
+        42,          // plugin id
+        None,        // pane id to replace
+        None,        // cwd
+        false,       // start suppressed
+        None,        // floating pane coordinates
+        Some(false), // should focus plugin
+        Some(client_id),
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let result = completion_rx.try_recv().expect("a completion result");
+    assert_eq!(result.affected_pane_id, Some(PaneId::Plugin(42)));
+    let instructions = received_plugin_instructions.lock().unwrap();
+    let mut last_manifest = None;
+    for instruction in instructions.iter() {
+        if let PluginInstruction::Update(updates) = instruction {
+            for (pid, _cid, event) in updates {
+                if let (Some(99), Event::PaneUpdate(manifest)) = (pid, event) {
+                    last_manifest = Some(manifest.panes.clone());
+                }
+            }
+        }
+    }
+    let panes = last_manifest.expect("a pane manifest");
+    let has_plugin = |tab: usize| {
+        panes.get(&tab).map_or(false, |panes| {
+            panes.iter().any(|p| p.is_plugin && p.id == 42)
+        })
+    };
+    assert!(
+        has_plugin(0),
+        "the plugin is not in the tab it asked for: {:?}",
+        panes
+    );
+    assert!(
+        !has_plugin(1),
+        "the plugin opened in the client's tab: {:?}",
+        panes
+    );
+}
+
+/// fork: a tab opened on a plugin reports the pane the plugin thread named, not whichever of the
+/// tab's plugins - its template's bars among them - the screen would otherwise pick.
+#[test]
+pub fn a_new_tab_keeps_the_pane_the_plugin_thread_named() {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+    let client_id = mock_screen.main_client_id;
+
+    let run_plugin =
+        RunPluginOrAlias::from_url("file:/path/to/fake/plugin", &None, None, None).unwrap();
+    let mut tab_layout = TiledPaneLayout::default();
+    tab_layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    for child in tab_layout.children.iter_mut() {
+        child.run = Some(Run::Plugin(run_plugin.clone()));
+    }
+    let mut plugin_ids = HashMap::new();
+    plugin_ids.insert(run_plugin, vec![7, 8]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let mut completion = crate::route::NotificationEnd::new(completion_tx);
+    completion.set_affected_pane_id(PaneId::Plugin(8));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::NewTab(
+        None,
+        None,
+        Some(tab_layout.clone()),
+        vec![],
+        None,
+        (Some(vec![]), Some(vec![])),
+        None,
+        false,
+        true,
+        (client_id, false),
+        None,
+    ));
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ApplyLayout(
+        tab_layout,
+        vec![],
+        vec![],
+        vec![],
+        plugin_ids,
+        1,
+        true,
+        (client_id, false),
+        Some(completion),
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![screen_thread]);
+
+    let result = completion_rx.try_recv().expect("a completion result");
+    assert_eq!(result.affected_pane_id, Some(PaneId::Plugin(8)));
+    assert_eq!(result.affected_tab_id, Some(1));
+}

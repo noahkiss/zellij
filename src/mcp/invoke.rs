@@ -652,6 +652,7 @@ async fn plan_in(
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
     create_kind_allowed(&read)?;
+    plugin_pane(&read)?;
     let session = target_session.clone();
     // a brief is a file on this machine; a pane on another machine reads the copy made there, and
     // only once everything a refusal could be about has been checked
@@ -919,16 +920,66 @@ pub fn agent_key(
     }
 }
 
-/// How a create runs its `command`: `shell`, `exec` or `agent`, refused when it is none of them.
+/// How a create runs its `command`: `shell`, `exec`, `agent` or `plugin`, refused when it is none
+/// of them.
 fn run_in(args: &Args) -> Result<String, String> {
     let run_in = args.enumerated("run_in", RUN_IN_DEFAULT);
     match run_in.as_str() {
-        "shell" | "exec" | "agent" => Ok(run_in),
+        "shell" | "exec" | "agent" | "plugin" => Ok(run_in),
         other => Err(format!(
-            "`run_in` must be shell, exec or agent, not `{}`.",
+            "`run_in` must be shell, exec, agent or plugin, not `{}`.",
             other
         )),
     }
+}
+
+/// The plugin a `run_in: plugin` create loads instead of a terminal - its `command` - with its
+/// configuration in the form `--configuration` takes. `None` for a terminal create. Refused with
+/// what only a terminal pane has, and with `kind: stacked`: the CLI drops `--stacked` for a
+/// plugin and opens it tiled in the focused tab, which is the person's.
+fn plugin_pane(args: &Args) -> Result<Option<(String, Option<String>)>, String> {
+    if run_in(args)? != "plugin" {
+        if args.values.contains_key("plugin_config") {
+            return Err(
+                "`plugin_config` configures a plugin: pass it with run_in=plugin.".to_owned(),
+            );
+        }
+        return Ok(None);
+    }
+    let plugin = args.required("command").map_err(|_| {
+        "run_in=plugin needs `command`: the plugin, like `file:/path/to.wasm`.".to_owned()
+    })?;
+    if let Some(param) = ["brief", "wait_ready"]
+        .into_iter()
+        .find(|param| args.values.contains_key(*param))
+    {
+        return Err(format!(
+            "A plugin pane has no shell, and takes no `{}`.",
+            param
+        ));
+    }
+    if args.enumerated("kind", CREATE_KIND_DEFAULT) == "stacked" {
+        return Err(
+            "A plugin pane cannot be stacked: use agent_tab, the default, or tab.".to_owned(),
+        );
+    }
+    let config = match args.values.contains_key("plugin_config") {
+        false => None,
+        true => {
+            let entries = args.strings("plugin_config")?;
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| !entry.contains('=') || entry.contains(','))
+            {
+                return Err(format!(
+                    "`plugin_config` takes one `key=value` per entry, with no comma: not `{}`.",
+                    entry
+                ));
+            }
+            Some(entries.join(","))
+        },
+    };
+    Ok(Some((plugin, config)))
 }
 
 /// The command a create types into its pane once the pane is ready: the `command` of a
@@ -1017,6 +1068,10 @@ fn chosen_handle(args: &Args) -> Result<Option<String>, String> {
 
 /// The name a created pane is given: the caller's own, or the command it runs.
 fn pane_name(args: &Args) -> Option<String> {
+    // a plugin pane is titled by its plugin already
+    if args.enumerated("run_in", RUN_IN_DEFAULT) == "plugin" {
+        return args.string("name");
+    }
     args.string("name")
         .or_else(|| args.string("command").as_deref().map(default_pane_name))
 }
@@ -1265,7 +1320,14 @@ fn argv_in(
             let reopen = args.string("reopen").unwrap_or_default();
             // the pane comes back as it was: its tab, its directory, its handle, its line
             if let Some(param) = [
-                "kind", "command", "run_in", "cwd", "name", "handle", "brief",
+                "kind",
+                "command",
+                "run_in",
+                "cwd",
+                "name",
+                "handle",
+                "brief",
+                "plugin_config",
             ]
             .into_iter()
             .find(|param| args.values.contains_key(*param))
@@ -1287,11 +1349,21 @@ fn argv_in(
             create_kind_allowed(&args)?;
             let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
             let command = args.string("command");
+            // a plugin pane has no shell to wait for, and no command to hand over
+            let plugin = plugin_pane(&args)?;
+            let with_plugin = |rest: &mut Vec<String>| {
+                if let Some((plugin, config)) = &plugin {
+                    rest.push(flag_value("--plugin", plugin));
+                    if let Some(config) = config {
+                        rest.push(flag_value("--configuration", config));
+                    }
+                }
+            };
             // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
             // ready - see `TypeAfter`. `exec` hands `command` to the server as `$SHELL -c`, as
             // every create did before, and waits for nothing
             // an `agent` create is a shell create whose typed line is the harness and its brief
-            let shell_mode = run_in(&args)? != "exec";
+            let shell_mode = !matches!(run_in(&args)?.as_str(), "exec" | "plugin");
             let wait_ready = shell_mode && args.flag_or("wait_ready", true);
             // the end of every create's command line: the readiness wait, or the command after
             // `--`, which has to come last because everything after it is the command's own argv
@@ -1300,7 +1372,7 @@ fn argv_in(
                     rest.push("--wait-ready".to_owned());
                     rest.push(flag_value("--ready-timeout", READY_TIMEOUT_DEFAULT_S));
                 }
-                if let (false, Some(command)) = (shell_mode, &command) {
+                if let (false, None, Some(command)) = (shell_mode, &plugin, &command) {
                     rest.push("--".to_owned());
                     // this machine's `$SHELL` names a path on this machine
                     let shell = if env.remote { None } else { env.shell.clone() };
@@ -1342,6 +1414,7 @@ fn argv_in(
                     if let Some(handle) = chosen_handle(&args)? {
                         rest.push(flag_value("--handle", &handle));
                     }
+                    with_plugin(&mut rest);
                     finish(&mut rest);
                 },
                 "stacked" => {
@@ -1359,6 +1432,22 @@ fn argv_in(
                         rest.push(flag_value("--handle", &handle));
                     }
                     finish(&mut rest);
+                },
+                "tab" if plugin.is_some() => {
+                    // `new-tab` takes no plugin configuration; `new-pane --new-tab` does, and
+                    // names the tab as `new-tab --name` would
+                    rest.push("new-pane".to_owned());
+                    rest.push(match args.string("name") {
+                        Some(name) => flag_value("--new-tab", &name),
+                        None => "--new-tab".to_owned(),
+                    });
+                    if let Some(cwd) = args.string("cwd") {
+                        rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
+                    }
+                    if let Some(handle) = chosen_handle(&args)? {
+                        rest.push(flag_value("--handle", &handle));
+                    }
+                    with_plugin(&mut rest);
                 },
                 "tab" => {
                     rest.push("new-tab".to_owned());
@@ -2251,7 +2340,7 @@ mod tests {
             "zellij_create",
             json!({"kind": "stacked", "command": "make", "run_in": "login"})
         )
-        .contains("shell, exec or agent"));
+        .contains("shell, exec, agent or plugin"));
     }
 
     #[tokio::test]
@@ -2386,6 +2475,64 @@ mod tests {
             assert!(refusal("zellij_create", json!({"kind": kind}))
                 .contains("must be agent_tab, stacked or tab"));
         }
+    }
+
+    #[test]
+    fn a_plugin_create_loads_the_plugin_in_the_agents_tab_and_waits_for_no_shell() {
+        let plugin = json!({"run_in": "plugin", "command": "file:/tmp/bar.wasm",
+                            "plugin_config": ["data_file=/tmp/d", "mode=a=b"], "handle": "bar-test"});
+        assert_eq!(
+            in_agent_tab(
+                plugin.clone(),
+                Some("work"),
+                "work-zj",
+                TabPlacement::Existing
+            ),
+            "-s work action new-pane --in-tab=work-zj --no-focus --handle=bar-test \
+             --plugin=file:/tmp/bar.wasm --configuration=data_file=/tmp/d,mode=a=b"
+        );
+        assert_eq!(
+            in_agent_tab(plugin, Some("work"), "work-zj", TabPlacement::Made),
+            "-s work action new-pane --new-tab=work-zj --no-focus --handle=bar-test \
+             --plugin=file:/tmp/bar.wasm --configuration=data_file=/tmp/d,mode=a=b"
+        );
+        assert_eq!(
+            line(
+                "zellij_create",
+                json!({"kind": "tab", "run_in": "plugin", "command": "zellij:strider", "name": "files"}),
+                None
+            ),
+            "action new-pane --new-tab=files --plugin=zellij:strider"
+        );
+    }
+
+    #[test]
+    fn a_plugin_create_refuses_what_only_a_terminal_has() {
+        for (extra, said) in [
+            (json!({"wait_ready": false}), "no `wait_ready`"),
+            (json!({"kind": "stacked"}), "cannot be stacked"),
+            (json!({"plugin_config": ["a=1,b=2"]}), "no comma"),
+            (json!({"plugin_config": ["flag"]}), "one `key=value`"),
+        ] {
+            let mut value = extra.clone();
+            value["run_in"] = json!("plugin");
+            value["command"] = json!("zellij:strider");
+            let refused = refusal("zellij_create", value);
+            assert!(refused.contains(said), "{}: {}", extra, refused);
+        }
+        assert!(refusal("zellij_create", json!({"run_in": "plugin"})).contains("needs `command`"));
+        assert!(refusal(
+            "zellij_create",
+            json!({"run_in": "plugin", "command": "zellij:strider", "brief": "b.md"})
+        )
+        .contains("`brief`"));
+        assert!(refusal("zellij_create", json!({"plugin_config": ["a=1"]}))
+            .contains("with run_in=plugin"));
+        assert!(refusal(
+            "zellij_create",
+            json!({"reopen": "last", "plugin_config": ["a=1"]})
+        )
+        .contains("no `plugin_config`"));
     }
 
     #[test]

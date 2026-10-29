@@ -456,7 +456,8 @@ pub const TOOLS: &[ToolSpec] = &[
                it; a session restore brings the agent back as a resume of its session, without \
                the brief. On another machine (session host/session) kind is agent_tab or tab, \
                cwd is an absolute path there, exec runs through /bin/sh, and the brief is \
-               copied there first.",
+               copied there first. run_in=plugin loads a plugin instead, configured by \
+               plugin_config; read what it draws with zellij_read_pane.",
         params: &[
             SESSION,
             ParamSpec {
@@ -483,7 +484,7 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "run_in",
-                kind: ParamKind::Enum(&["shell", "exec", "agent"]),
+                kind: ParamKind::Enum(&["shell", "exec", "agent", "plugin"]),
                 required: false,
                 from: None,
                 describe: "How `command` runs. shell, the default, types it into your interactive \
@@ -492,7 +493,10 @@ pub const TOOLS: &[ToolSpec] = &[
                            `$SHELL -c`, which reads no interactive rc file, ends the pane's \
                            command when it ends, and keeps its exit status for zellij_wait_for \
                            until=exit. agent is shell for a coding agent: `command` must start \
-                           claude, codex, opencode or pi, and `brief` becomes its first prompt.",
+                           claude, codex, opencode or pi, and `brief` becomes its first prompt. \
+                           plugin opens `command` as a plugin pane instead of a terminal: \
+                           `file:/path/to.wasm`, `zellij:<name>` or an alias. It takes kind \
+                           agent_tab or tab, not stacked.",
                 default: Some(invoke::RUN_IN_DEFAULT),
             },
             ParamSpec {
@@ -544,6 +548,15 @@ pub const TOOLS: &[ToolSpec] = &[
                            `~` and `$VAR` are expanded, and a relative path is taken from this \
                            server's directory. The agent's shell reads it, so it can be long and \
                            hold any characters.",
+                default: None,
+            },
+            ParamSpec {
+                name: "plugin_config",
+                kind: ParamKind::StrList,
+                required: false,
+                from: Some(("action new-pane", "--configuration")),
+                describe: "With run_in=plugin: the plugin's configuration, one `key=value` per \
+                           entry. A value cannot hold a comma.",
                 default: None,
             },
             ParamSpec {
@@ -1289,9 +1302,10 @@ mod tests {
                 "{} is not namespaced by its service",
                 tool.name
             );
-            // Keep each tool's argument list small enough to use reliably.
+            // Keep each tool's argument list small enough to use reliably. Eleven since
+            // `zellij_create` took `plugin_config`; a plugin pane reuses `command` and `run_in`
             assert!(
-                tool.params.len() <= 10,
+                tool.params.len() <= 11,
                 "{} asks for more parameters than an agent can be expected to get right",
                 tool.name
             );

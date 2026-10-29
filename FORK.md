@@ -10066,6 +10066,53 @@ description now tells the caller to stay at least 5 seconds under the client's d
 again. The 300-second default is unchanged: lowering it would cut short a long wait in a client
 whose deadline is long, such as Claude Code.
 
+### `zellij_create run_in=plugin`: a plugin pane in the agent's own tab
+
+An agent testing a plugin had no way to load it next to its own work. `zellij_create` ran shells,
+commands and agents only. The CLI route, `new-pane --plugin`, opened the plugin in the focused tab,
+which is the person's. So agents started a throwaway background session for every look.
+
+```
+zellij_create {"run_in": "plugin", "command": "file:/tmp/bar.wasm",
+               "plugin_config": ["data_file=/tmp/d.json"], "handle": "bar-test"}
+  # action new-pane --in-tab=work-zj --no-focus --handle=bar-test --plugin=file:/tmp/bar.wasm
+  #   --configuration=data_file=/tmp/d.json
+pane_id: plugin_12
+handle: bar-test
+```
+
+- **`run_in` takes `plugin`.** `command` is then the plugin: a `file:` path, a `zellij:` plugin
+  or an alias. **`plugin_config` is its configuration**, one `key=value` per entry, joined into
+  `--configuration`. An entry with a comma, or with no `=`, is refused, because
+  `--configuration` cannot carry it. `plugin_config` with any other `run_in` is refused.
+- **`kind` is `agent_tab` (the default) or `tab`.** `stacked` is refused: the CLI drops
+  `--stacked` for a plugin pane, and the pane would open tiled in the focused tab. `tab` runs
+  `new-pane --new-tab`, because `new-tab --initial-plugin` takes no configuration; `name` names
+  that tab.
+- **`brief` and `wait_ready` are refused** with a plugin, which has no shell. Without `name` the
+  pane keeps the title zellij gives a plugin.
+- The answer carries the pane's handle, so `zellij_read_pane` reads what the plugin draws.
+- The tool's parameter cap moves from ten to eleven for `plugin_config`.
+
+Two server fixes make the placement true. Both changed what the CLI does, not only the MCP:
+
+- **A plugin pane asked for in another tab opens there.** `new-pane --plugin --tab-id` and
+  `--in-tab` were ignored. `AddPlugin` took the client's active tab whenever a client was named,
+  and a plugin load always names one. So the pane opened in the focused tab, or, with no client
+  attached, nowhere: `No pane was created`. `AddPlugin` now uses the requested tab when it is a
+  different tab from the client's. Where the two agree, nothing changes.
+- **`new-pane --plugin --new-tab` reports the plugin.** The report took the first plugin of a
+  `HashMap`, so it could name the tab template's tab bar or status bar, and `--handle` went onto
+  that bar. The plugin thread now names the pane it put into the template's empty slot, and
+  `ApplyLayout` keeps that name instead of picking one.
+
+Files: `src/mcp/invoke.rs` (`run_in`, `plugin_pane`, the create arms), `src/mcp/tools.rs`,
+`zellij-server/src/screen.rs` (`AddPlugin`, `ApplyLayout`), `zellij-server/src/plugins/mod.rs`
+(`NewTab`), `zellij-server/src/route.rs` (`NotificationEnd::has_affected_pane_id`). Tests: the
+argv for an existing and a new agent tab and for `kind: tab`, each refusal, a plugin pane opening
+in a tab the client is not in, and a new tab that keeps the pane the plugin thread named. No
+client/server contract changes.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

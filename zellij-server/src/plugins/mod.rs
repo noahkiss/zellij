@@ -538,7 +538,7 @@ pub(crate) fn plugin_thread_main(
                 block_on_first_terminal,
                 should_change_focus_to_new_tab,
                 (client_id, is_web_client),
-                completion_tx,
+                mut completion_tx,
             ) => {
                 // prefer connected clients so as to avoid opening plugins in the background for
                 // CLI clients unless no-one else is connected
@@ -553,11 +553,21 @@ pub(crate) fn plugin_thread_main(
                 let mut plugin_ids: HashMap<RunPluginOrAlias, Vec<PluginId>> = HashMap::new();
                 tab_layout = tab_layout.or_else(|| Some(layout.new_tab().0));
 
+                // fork addition: where the first plugin of `initial_panes` sits in the run
+                // instructions below, so the report names it - and not whichever plugin of the
+                // tab's template the screen happens to pick
+                let mut initial_plugin_slot = None;
                 // Match initial_panes plugins to empty slots in the layout
                 if let Some(ref initial_panes_vec) = initial_panes {
                     if let Some(ref mut tiled_layout) = tab_layout {
                         for initial_pane in initial_panes_vec.iter() {
                             if let CommandOrPlugin::Plugin(run_plugin_or_alias) = initial_pane {
+                                if initial_plugin_slot.is_none() {
+                                    initial_plugin_slot = tiled_layout
+                                        .extract_run_instructions()
+                                        .iter()
+                                        .position(|run| matches!(run, None | Some(Run::Cwd(_))));
+                                }
                                 if !tiled_layout.replace_next_empty_slot_with_run(Run::Plugin(
                                     run_plugin_or_alias.clone(),
                                 )) {
@@ -602,7 +612,7 @@ pub(crate) fn plugin_thread_main(
                 let mut all_run_instructions = extracted_run_instructions;
                 all_run_instructions.append(&mut extracted_floating_plugins);
 
-                for run_instruction in all_run_instructions {
+                for (slot, run_instruction) in all_run_instructions.into_iter().enumerate() {
                     if let Some(Run::Plugin(run_plugin_or_alias)) = run_instruction {
                         let run_plugin = run_plugin_or_alias.get_run_plugin();
                         let cwd = run_plugin_or_alias
@@ -618,6 +628,11 @@ pub(crate) fn plugin_thread_main(
                             Some(client_id),
                         ) {
                             Ok((plugin_id, _client_id)) => {
+                                if Some(slot) == initial_plugin_slot {
+                                    if let Some(completion) = completion_tx.as_mut() {
+                                        completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
+                                    }
+                                }
                                 plugin_ids
                                     .entry(run_plugin_or_alias.clone())
                                     .or_default()
