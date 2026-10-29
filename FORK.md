@@ -1113,6 +1113,56 @@ it for pane mode's exit key, and lost the `Ctrl +` prefix on every hint. Every d
 rebuilt in this commit for that reason; a third-party plugin built before it shows the same
 symptom until it is rebuilt.
 
+### `reload-template`: give every tab the current tab template
+
+```
+$ zellij action reload-template                        # the configured default layout, read again
+$ zellij action reload-template --layout ~/bar.kdl     # the tab_template of another layout
+```
+
+Add a bar plugin to the `tab_template` of `default.kdl`, run this, and every live tab gets the bar
+without the session restarting. For each tab:
+
+- **The template's plugin panes are added**, unless a pane of that tab already runs the same
+  plugin with the same configuration. So a second run starts nothing.
+- **Every existing pane is kept**, terminal or plugin, with its process. The template's terminal
+  slots never start a shell: the tab's own panes fill them, and panes the template has no slot
+  for are placed beside them.
+- **No tab is closed, renamed or added.** It needs no focused tab, so it works with nobody
+  attached.
+
+Without `--layout`, the server reads the configured `default_layout` again from disk. It looks in
+the configured `layout_dir`, then in `layouts/` of the `ZELLIJ_CONFIG_DIR` it was started with,
+then in the default config directory: the order a session start uses. If that read fails, the
+command prints why, exits non-zero and changes nothing. Floating panes in the template follow the
+same rules.
+
+It is `override-layout --retain-existing-terminal-panes --retain-existing-plugin-panes` with two
+differences, and it reuses that machinery from the plugin thread on:
+
+- `override-layout` matches the layout's explicit `tab`s to live tabs by index, so a layout with
+  only a `tab_template` covers one tab. It closes every tab it has no layout for, and renames the
+  ones it has. The server here builds one layout per live tab from the template, keyed by tab id,
+  with no name.
+- `override-layout` starts a shell for any terminal slot no running pane matches exactly. A
+  template's slot is an empty run, and a plain shell made by `new-tab` matches it. A pane that
+  runs a command or an agent, a restored pane, or one started with a directory (`Run::Cwd`) does
+  not, so the override adds a stray shell beside it. That is the stray pane seen in a session's
+  first tab. Here an empty slot no pane matches is given to a terminal pane that matched no slot,
+  and every terminal slot is then ignored. Ignoring alone is not enough: the unplaced pane would
+  be fitted in by splitting another pane, and a tab holding only the new bar has none to split,
+  so the pane would be lost.
+
+Limits: the swap layouts of each tab are replaced by the template's, as `override-layout` does.
+A tab whose floating panes are visible has them hidden when the template has none. New tabs still
+come from the layout the session started with; only the live tabs change.
+
+Contracts: `ReloadTemplateAction` is a new message at tag 175 in the fork block of
+`common_types.proto`, carrying an optional `TabLayoutInfo`. It is a new action, not a flag on
+`OverrideLayoutAction`: a stock server ignores a field it does not know, and would run a plain
+override that closes every tab but one. A stock server ignores the new message and changes
+nothing. The plugin API does not carry it.
+
 ### `go-to-pane`
 
 ```

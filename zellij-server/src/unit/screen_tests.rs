@@ -19610,3 +19610,298 @@ pub fn a_new_tab_keeps_the_pane_the_plugin_thread_named() {
     assert_eq!(result.affected_pane_id, Some(PaneId::Plugin(8)));
     assert_eq!(result.affected_tab_id, Some(1));
 }
+
+// fork addition: `reload-template`
+
+fn reload_template_bar() -> RunPluginOrAlias {
+    RunPluginOrAlias::from_url("zellij:compact-bar", &None, None, None).unwrap()
+}
+
+/// A template like a layout's `tab_template`: a one-row bar above the tab's own panes.
+fn reload_template_with_bar() -> zellij_utils::input::layout::TabLayoutInfo {
+    let mut bar = TiledPaneLayout::default();
+    bar.run = Some(Run::Plugin(reload_template_bar()));
+    bar.split_size = Some(zellij_utils::input::layout::SplitSize::Fixed(1));
+    let mut tiled_layout = TiledPaneLayout::default();
+    tiled_layout.children = vec![bar, TiledPaneLayout::default()];
+    zellij_utils::input::layout::TabLayoutInfo {
+        tab_index: 0,
+        tab_name: None,
+        tiled_layout,
+        floating_layouts: vec![],
+        swap_tiled_layouts: Some(vec![]),
+        swap_floating_layouts: Some(vec![]),
+    }
+}
+
+/// A tab with one terminal pane `pid` invoked with `run`, made with no client attached.
+fn reload_template_tab(screen: &mut Screen, tab_index: usize, pid: u32, run: Option<Run>) {
+    screen
+        .new_tab(tab_index, (vec![], vec![]), None, None)
+        .expect("TEST");
+    let mut layout = TiledPaneLayout::default();
+    layout.run = run;
+    screen
+        .apply_layout(
+            layout,
+            vec![],
+            vec![(pid, None)],
+            vec![],
+            HashMap::new(),
+            tab_index,
+            true,
+            (1, false),
+            None,
+        )
+        .expect("TEST");
+}
+
+/// What the `ReloadTemplate` arm and `OverrideLayoutComplete` do between them, with the plugin
+/// thread's ids filled in by hand: each plugin slot left in a tab's layout gets the next id.
+/// Returns how many plugins it started.
+fn reload_template_apply(screen: &mut Screen, next_plugin_id: &mut u32) -> usize {
+    let template = reload_template_with_bar();
+    let mut plugins_started = 0;
+    let tab_ids: Vec<usize> = screen.tabs.keys().copied().collect();
+    for tab_id in tab_ids {
+        let tab = screen.tabs.get(&tab_id).unwrap();
+        let tab_layout = super::template_layout_for_tab(&template, tab_id, tab);
+        assert_eq!(tab_layout.tab_index, tab_id);
+        assert_eq!(tab_layout.tab_name, None, "a reload names no tab");
+        let mut plugin_ids: HashMap<RunPluginOrAlias, Vec<u32>> = HashMap::new();
+        for run in tab_layout.tiled_layout.extract_run_instructions() {
+            match run {
+                Some(Run::Plugin(plugin)) => {
+                    plugin_ids.entry(plugin).or_default().push(*next_plugin_id);
+                    *next_plugin_id += 1;
+                    plugins_started += 1;
+                },
+                other => panic!("a reload starts no terminal, but asked for {:?}", other),
+            }
+        }
+        let client_id = 10; // a cli client: nobody is attached
+        screen
+            .tabs
+            .get_mut(&tab_id)
+            .unwrap()
+            .override_layout(
+                tab_layout.tiled_layout,
+                tab_layout.floating_layouts,
+                tab_layout.swap_tiled_layouts,
+                tab_layout.swap_floating_layouts,
+                vec![],
+                vec![],
+                plugin_ids,
+                true,
+                true,
+                client_id,
+                None,
+            )
+            .expect("TEST");
+    }
+    plugins_started
+}
+
+/// A screen whose tabs can start plugin panes: a plugin pane needs a sender to the plugin thread.
+fn reload_template_screen(size: Size) -> (Screen, Receiver<(PluginInstruction, ErrorContext)>) {
+    let mut screen = create_new_screen(size, true, true);
+    let (to_plugin, plugin_receiver): ChannelWithContext<PluginInstruction> = channels::unbounded();
+    screen.bus.senders.to_plugin = Some(SenderWithContext::new(to_plugin));
+    (screen, plugin_receiver)
+}
+
+fn reload_template_tab_state(screen: &Screen) -> Vec<(usize, String, Vec<PaneId>)> {
+    let mut state: Vec<(usize, String, Vec<PaneId>)> = screen
+        .tabs
+        .iter()
+        .map(|(tab_id, tab)| {
+            let mut pane_ids = tab.get_all_pane_ids();
+            pane_ids.sort();
+            (*tab_id, tab.name.clone(), pane_ids)
+        })
+        .collect();
+    state.sort_by_key(|(tab_id, ..)| *tab_id);
+    state
+}
+
+#[test]
+pub fn reload_template_adds_the_bar_to_every_tab_and_keeps_tabs_and_panes() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut screen, _plugin_receiver) = reload_template_screen(size);
+    // a pane started with a directory matches no empty slot - the case where
+    // `override-layout` starts a stray shell
+    reload_template_tab(&mut screen, 0, 1, Some(Run::Cwd(PathBuf::from("/tmp"))));
+    reload_template_tab(&mut screen, 1, 2, None);
+    reload_template_tab(&mut screen, 2, 3, None);
+    screen.tabs.get_mut(&1).unwrap().name = "editor".to_owned();
+    assert_eq!(
+        reload_template_tab_state(&screen)[0].2,
+        vec![PaneId::Terminal(1)],
+        "the first tab starts with its terminal"
+    );
+
+    let mut next_plugin_id = 100;
+    let started = reload_template_apply(&mut screen, &mut next_plugin_id);
+    assert_eq!(started, 3, "one bar per tab");
+
+    assert_eq!(
+        reload_template_tab_state(&screen),
+        vec![
+            (
+                0,
+                "Tab #1".to_owned(),
+                vec![PaneId::Terminal(1), PaneId::Plugin(100)]
+            ),
+            (
+                1,
+                "editor".to_owned(),
+                vec![PaneId::Terminal(2), PaneId::Plugin(101)]
+            ),
+            (
+                2,
+                "Tab #3".to_owned(),
+                vec![PaneId::Terminal(3), PaneId::Plugin(102)]
+            ),
+        ],
+        "every tab kept its terminal and its name, and got exactly one bar"
+    );
+}
+
+#[test]
+pub fn reload_template_twice_changes_nothing_the_second_time() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut screen, _plugin_receiver) = reload_template_screen(size);
+    reload_template_tab(&mut screen, 0, 1, Some(Run::Cwd(PathBuf::from("/tmp"))));
+    reload_template_tab(&mut screen, 1, 2, None);
+    let mut next_plugin_id = 100;
+    reload_template_apply(&mut screen, &mut next_plugin_id);
+    let after_first = reload_template_tab_state(&screen);
+
+    let started = reload_template_apply(&mut screen, &mut next_plugin_id);
+
+    assert_eq!(started, 0, "every tab already runs the bar");
+    assert_eq!(reload_template_tab_state(&screen), after_first);
+}
+
+#[test]
+pub fn reload_template_keeps_a_plugin_pane_the_template_does_not_name() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut screen, _plugin_receiver) = reload_template_screen(size);
+    reload_template_tab(&mut screen, 0, 1, None);
+    let other = RunPluginOrAlias::from_url("file:/path/to/fake/plugin", &None, None, None).unwrap();
+    let mut layout = TiledPaneLayout::default();
+    layout.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    layout.children[1].run = Some(Run::Plugin(other.clone()));
+    let mut plugin_ids = HashMap::new();
+    plugin_ids.insert(other, vec![7]);
+    screen
+        .tabs
+        .get_mut(&0)
+        .unwrap()
+        .override_layout(
+            layout,
+            vec![],
+            Some(vec![]),
+            Some(vec![]),
+            vec![],
+            vec![],
+            plugin_ids,
+            true,
+            true,
+            10,
+            None,
+        )
+        .expect("TEST");
+    assert_eq!(
+        reload_template_tab_state(&screen),
+        vec![(
+            0,
+            "Tab #1".to_owned(),
+            vec![PaneId::Terminal(1), PaneId::Plugin(7)]
+        )]
+    );
+
+    let mut next_plugin_id = 100;
+    reload_template_apply(&mut screen, &mut next_plugin_id);
+
+    assert_eq!(
+        reload_template_tab_state(&screen),
+        vec![(
+            0,
+            "Tab #1".to_owned(),
+            vec![PaneId::Terminal(1), PaneId::Plugin(7), PaneId::Plugin(100)]
+        )]
+    );
+}
+
+#[test]
+pub fn reload_template_sends_one_layout_per_live_tab_and_closes_none() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(None, vec![]);
+    mock_screen.new_tab(TiledPaneLayout::default());
+    mock_screen.new_tab(TiledPaneLayout::default());
+    let received_plugin_instructions = Arc::new(Mutex::new(vec![]));
+    let plugin_receiver = mock_screen.plugin_receiver.take().unwrap();
+    let plugin_thread = log_actions_in_thread!(
+        received_plugin_instructions,
+        PluginInstruction::Exit,
+        plugin_receiver
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // nobody attached: the reload must not need a focused tab
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::RemoveClient(mock_screen.main_client_id));
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::ReloadTemplate(
+            Some(reload_template_with_bar()),
+            None,
+            10, // a cli client
+            None,
+        ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    mock_screen.teardown(vec![plugin_thread, screen_thread]);
+
+    let received_plugin_instructions = received_plugin_instructions.lock().unwrap();
+    let (tab_layouts, retain_terminals, retain_plugins) = received_plugin_instructions
+        .iter()
+        .find_map(|instruction| match instruction {
+            PluginInstruction::OverrideLayout(_, _, tab_layouts, terminals, plugins, ..) => {
+                Some((tab_layouts.clone(), *terminals, *plugins))
+            },
+            _ => None,
+        })
+        .expect("the reload goes to the plugin thread as an override");
+    assert!(retain_terminals && retain_plugins);
+    let mut tab_ids: Vec<usize> = tab_layouts.iter().map(|t| t.tab_index).collect();
+    tab_ids.sort();
+    assert_eq!(tab_ids, vec![0, 1, 2], "one layout per live tab");
+    for tab_layout in &tab_layouts {
+        assert_eq!(tab_layout.tab_name, None);
+        assert_eq!(
+            tab_layout.tiled_layout.extract_run_instructions(),
+            vec![Some(Run::Plugin(reload_template_bar()))],
+            "only the bar is started"
+        );
+    }
+    assert!(
+        !received_plugin_instructions
+            .iter()
+            .any(|i| matches!(i, PluginInstruction::Unload(..))),
+        "no pane is unloaded"
+    );
+}

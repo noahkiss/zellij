@@ -1282,6 +1282,7 @@ impl From<crate::input::actions::Action>
             PreviousSwapLayoutByTabIdAction,
             QueryTabNamesAction,
             QuitAction,
+            ReloadTemplateAction,
             RenamePaneByPaneIdAction,
             RenamePluginPaneAction,
             RenameSessionAction,
@@ -1890,6 +1891,11 @@ impl From<crate::input::actions::Action>
                 retain_existing_plugin_panes,
                 apply_only_to_active_tab,
             }),
+            crate::input::actions::Action::ReloadTemplate { template } => {
+                ActionType::ReloadTemplate(ReloadTemplateAction {
+                    template: template.map(|t| t.into()),
+                })
+            },
             crate::input::actions::Action::QueryTabNames => {
                 ActionType::QueryTabNames(QueryTabNamesAction {})
             },
@@ -2900,6 +2906,9 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     apply_only_to_active_tab: override_layout_action.apply_only_to_active_tab,
                 })
             },
+            ActionType::ReloadTemplate(a) => Ok(crate::input::actions::Action::ReloadTemplate {
+                template: a.template.map(|t| t.try_into()).transpose()?,
+            }),
             ActionType::QueryTabNames(_) => Ok(crate::input::actions::Action::QueryTabNames),
             ActionType::NewTiledPluginPane(new_tiled_plugin_action) => {
                 Ok(crate::input::actions::Action::NewTiledPluginPane {

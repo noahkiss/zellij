@@ -9,7 +9,7 @@ use crate::input::cli_assets::CliAssets;
 use crate::input::command::{OpenFilePayload, RunCommand, RunCommandAction};
 use crate::input::layout::{
     FloatingPaneLayout, LayoutConstraint, PercentOrFixed, PluginAlias, PluginUserConfiguration,
-    Run, RunPlugin, RunPluginLocation, RunPluginOrAlias, SplitDirection, SplitSize,
+    Run, RunPlugin, RunPluginLocation, RunPluginOrAlias, SplitDirection, SplitSize, TabLayoutInfo,
     TiledPaneLayout,
 };
 use crate::input::mouse::{MouseEvent, MouseEventType};
@@ -2339,6 +2339,28 @@ fn test_client_messages() {
             retain_existing_terminal_panes: false,
             retain_existing_plugin_panes: false,
             apply_only_to_active_tab: false,
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::ReloadTemplate { template: None },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    let (tiled_layout, floating_layouts) = crate::input::layout::Layout::default().new_tab();
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::ReloadTemplate {
+            template: Some(TabLayoutInfo {
+                tab_index: 0,
+                tab_name: None,
+                tiled_layout,
+                floating_layouts,
+                swap_tiled_layouts: None,
+                swap_floating_layouts: None,
+            }),
         },
         terminal_id: Some(1),
         client_id: Some(100),

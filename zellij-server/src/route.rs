@@ -1577,6 +1577,16 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::ReloadTemplate { template } => {
+            senders
+                .send_to_screen(ScreenInstruction::ReloadTemplate(
+                    template,
+                    default_shell.clone(),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::QueryTabNames => {
             senders
                 .send_to_screen(ScreenInstruction::QueryTabNames(

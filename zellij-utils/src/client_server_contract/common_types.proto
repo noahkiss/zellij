@@ -308,6 +308,7 @@ message Action {
     MoveTabToIndexAction move_tab_to_index = 172;
     NewShellPaneAction new_shell_pane = 173;
     ReopenPaneAction reopen_pane = 174;
+    ReloadTemplateAction reload_template = 175;
   }
 }
 
@@ -391,6 +392,10 @@ message OverrideLayoutAction {
   bool retain_existing_terminal_panes = 2;
   bool retain_existing_plugin_panes = 3;
   bool apply_only_to_active_tab = 4;
+}
+// fork addition: apply a tab template to every live tab; no template means the session's default
+message ReloadTemplateAction {
+  optional TabLayoutInfo template = 1;
 }
 message QueryTabNamesAction {}
 message BreakPaneAction {}

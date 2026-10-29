@@ -115,6 +115,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "paste",
             "pipe",
             "previous-swap-layout",
+            "reload-template",
             "rename-pane",
             "rename-tab",
             "rename-tab-by-id",

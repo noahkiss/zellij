@@ -2446,6 +2446,21 @@ pub enum CliAction {
         #[clap(long)]
         apply_only_to_active_tab: bool,
     },
+    /// Apply the tab template to every tab of the session
+    ///
+    /// Each tab gets the template's plugin panes, such as its bars, unless it already has them.
+    /// Every existing pane and every tab is kept, and no tab is renamed. Running it twice changes
+    /// nothing the second time. Without --layout, the session's configured default layout is
+    /// read again from disk.
+    ReloadTemplate {
+        /// A layout file to take the tab template from, instead of the default layout
+        #[clap(long, value_parser)]
+        layout: Option<PathBuf>,
+
+        /// Where to look for the layout by name, overriding the configured layout directory
+        #[clap(long, value_parser, requires = "layout")]
+        layout_dir: Option<PathBuf>,
+    },
     /// Reload a running plugin's wasm, or start it if it is not running
     ///
     /// The reload is how a plugin under development picks up a rebuild without its pane moving.

@@ -500,6 +500,13 @@ pub enum Action {
         retain_existing_plugin_panes: bool,
         apply_only_to_active_tab: bool,
     },
+    /// fork addition: apply a tab template to every live tab, keeping every pane and every tab.
+    ///
+    /// `template: None` means the session's configured default layout, read again from disk.
+    /// Only `tiled_layout`, `floating_layouts` and the swap layouts of the template are used.
+    ReloadTemplate {
+        template: Option<TabLayoutInfo>,
+    },
     /// Query all tab names
     QueryTabNames,
     /// Open a new tiled (embedded, non-floating) plugin pane
@@ -850,6 +857,7 @@ impl Action {
             (Action::LaunchOrFocusPlugin { .. }, Action::LaunchOrFocusPlugin { .. }) => true,
             (Action::LaunchPlugin { .. }, Action::LaunchPlugin { .. }) => true,
             (Action::OverrideLayout { .. }, Action::OverrideLayout { .. }) => true,
+            (Action::ReloadTemplate { .. }, Action::ReloadTemplate { .. }) => true,
             _ => self == other_action,
         }
     }
@@ -2064,6 +2072,45 @@ impl Action {
                     retain_existing_terminal_panes,
                     retain_existing_plugin_panes,
                     apply_only_to_active_tab,
+                }])
+            },
+            CliAction::ReloadTemplate { layout, layout_dir } => {
+                // without a file, the server reads its own configured default layout again
+                let Some(layout_path) = layout else {
+                    return Ok(vec![Action::ReloadTemplate { template: None }]);
+                };
+                let layout_dir = layout_dir
+                    .or_else(|| config.and_then(|c| c.options.layout_dir))
+                    .or_else(|| get_layout_dir(find_default_config_dir()));
+                let layout_source_name = layout_path.to_string_lossy().to_string();
+                let (path_to_raw_layout, raw_layout, swap_layouts) =
+                    Layout::stringified_from_path_or_default(Some(&layout_path), layout_dir)
+                        .map_err(|e| format!("Failed to load layout: {}", e))?;
+                let layout = Layout::from_str(
+                    &raw_layout,
+                    path_to_raw_layout,
+                    swap_layouts.as_ref().map(|(f, p)| (f.as_str(), p.as_str())),
+                    None,
+                )
+                .map_err(|e| match e {
+                    ConfigError::KdlError(kdl_error) => {
+                        let report: Report = kdl_error
+                            .add_src(layout_source_name.clone(), raw_layout.clone())
+                            .into();
+                        format!("{:?}", report)
+                    },
+                    e => format!("Failed to parse layout: {}", e),
+                })?;
+                let (tiled_layout, floating_layouts) = layout.new_tab();
+                Ok(vec![Action::ReloadTemplate {
+                    template: Some(TabLayoutInfo {
+                        tab_index: 0,
+                        tab_name: None,
+                        tiled_layout,
+                        floating_layouts,
+                        swap_tiled_layouts: Some(layout.swap_tiled_layouts),
+                        swap_floating_layouts: Some(layout.swap_floating_layouts),
+                    }),
                 }])
             },
             CliAction::StartOrReloadPlugin { url, configuration } => {

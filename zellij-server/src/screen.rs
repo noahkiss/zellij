@@ -704,6 +704,13 @@ pub enum ScreenInstruction {
         ClientId,
         Option<NotificationEnd>,
     ),
+    /// fork addition: apply a tab template to every live tab; `None` is the default layout's
+    ReloadTemplate(
+        Option<TabLayoutInfo>,
+        Option<TerminalAction>, // default_shell
+        ClientId,
+        Option<NotificationEnd>,
+    ),
     QueryTabNames(ClientId, Option<NotificationEnd>),
     NewTiledPluginPane(
         RunPluginOrAlias,
@@ -1273,6 +1280,7 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::NextSwapLayout(..) => ScreenContext::NextSwapLayout,
             ScreenInstruction::OverrideLayout(..) => ScreenContext::OverrideLayout,
             ScreenInstruction::OverrideLayoutComplete(..) => ScreenContext::OverrideLayoutComplete,
+            ScreenInstruction::ReloadTemplate(..) => ScreenContext::ReloadTemplate,
             ScreenInstruction::QueryTabNames(..) => ScreenContext::QueryTabNames,
             ScreenInstruction::NewTiledPluginPane(..) => ScreenContext::NewTiledPluginPane,
             ScreenInstruction::NewFloatingPluginPane(..) => ScreenContext::NewFloatingPluginPane,
@@ -7639,6 +7647,44 @@ impl Screen {
             log::error!("Failed to find pane with id: {:?} to resize", pane_id);
         }
     }
+    /// fork addition: the default layout's tab template, for `reload-template` with no layout.
+    ///
+    /// The configured default layout is read again from disk, from the layout directory a session
+    /// start uses, because the point of the action is to pick up a template edited since the
+    /// session started. A read that fails is an error for the caller, not a quiet fall back to the
+    /// layout the session started with: that would report success and change nothing.
+    fn default_tab_template(&self) -> std::result::Result<TabLayoutInfo, String> {
+        #[cfg(not(test))]
+        let layout = Layout::from_path_or_default_without_config(
+            self.default_layout_name
+                .as_ref()
+                .map(PathBuf::from)
+                .as_ref(),
+            // the order a session start resolves it in (`setup.rs`): the configured directory,
+            // then the config directory the server was started with, then the default
+            self.layout_dir
+                .clone()
+                .or_else(|| {
+                    zellij_utils::home::get_layout_dir(
+                        std::env::var_os(zellij_utils::consts::ZELLIJ_CONFIG_DIR_ENV)
+                            .map(PathBuf::from),
+                    )
+                })
+                .or_else(zellij_utils::home::default_layout_dir),
+        )
+        .map_err(|e| format!("reload-template: cannot read the default layout: {}", e))?;
+        #[cfg(test)]
+        let layout = (*self.default_layout).clone();
+        let (tiled_layout, floating_layouts) = layout.new_tab();
+        Ok(TabLayoutInfo {
+            tab_index: 0,
+            tab_name: None,
+            tiled_layout,
+            floating_layouts,
+            swap_tiled_layouts: Some(layout.swap_tiled_layouts),
+            swap_floating_layouts: Some(layout.swap_floating_layouts),
+        })
+    }
     pub fn break_pane(
         &mut self,
         default_shell: Option<TerminalAction>,
@@ -9611,6 +9657,94 @@ fn find_already_running_panes(
     }
 
     (tiled_to_ignore, floating_indices)
+}
+
+/// fork addition: the tab template, fitted to one live tab for `reload-template`.
+///
+/// A template's terminal slots are filled by the panes the tab already has, never by a new
+/// shell. `override-layout` starts a shell for every slot no running pane matches exactly, so a
+/// tab whose pane was not invoked with the slot's empty run gets a stray one: a command or agent
+/// pane, a restored pane, or one started with a directory.
+///
+/// So an empty slot no pane matches takes the run of a terminal pane that matched no slot, and
+/// the layout applier puts that pane in it. Then every terminal slot is ignored. Without the
+/// first step the pane would be left without a slot, to be placed by splitting another pane; a
+/// tab that holds only the template's bar has none to split, and the pane would be lost.
+///
+/// A plugin slot is started only when no pane of the tab already runs that plugin, so a second
+/// run starts nothing.
+fn template_layout_for_tab(template: &TabLayoutInfo, tab_id: usize, tab: &Tab) -> TabLayoutInfo {
+    let mut tab_layout = template.clone();
+    tab_layout.tab_index = tab_id;
+    tab_layout.tab_name = None;
+    let is_plugin = |run: &Option<Run>| matches!(run, Some(Run::Plugin(_)));
+
+    let mut unmatched_panes: Vec<Option<Run>> = tab
+        .get_tiled_panes()
+        .map(|(_, pane)| pane)
+        .chain(tab.suppressed_stack_list_members().map(|(_, pane)| pane))
+        .filter(|pane| matches!(pane.pid(), PaneId::Terminal(_)))
+        .map(|pane| pane.invoked_with().clone())
+        .collect();
+    let mut leaves = vec![];
+    terminal_leaf_paths(&tab_layout.tiled_layout, &mut vec![], &mut leaves);
+    let mut unmatched_leaves = vec![];
+    for path in leaves {
+        let run = &leaf_at_path(&mut tab_layout.tiled_layout, &path).run;
+        match unmatched_panes.iter().position(|pane_run| pane_run == run) {
+            Some(index) => {
+                unmatched_panes.remove(index);
+            },
+            None => unmatched_leaves.push(path),
+        }
+    }
+    for path in unmatched_leaves {
+        let leaf = leaf_at_path(&mut tab_layout.tiled_layout, &path);
+        if matches!(leaf.run, None | Some(Run::Cwd(_))) && !unmatched_panes.is_empty() {
+            leaf.run = unmatched_panes.remove(0);
+        }
+    }
+
+    let terminal_slots: Vec<Option<Run>> = tab_layout
+        .tiled_layout
+        .extract_run_instructions()
+        .into_iter()
+        .filter(|run| !is_plugin(run))
+        .collect();
+    let (already_running, floating_already_running) =
+        find_already_running_panes(&tab_layout.tiled_layout, &tab_layout.floating_layouts, tab);
+    for run in already_running.into_iter().filter(|run| is_plugin(run)) {
+        tab_layout.tiled_layout.ignore_run_instruction(run);
+    }
+    for run in terminal_slots {
+        tab_layout.tiled_layout.ignore_run_instruction(run);
+    }
+    for (index, floating) in tab_layout.floating_layouts.iter_mut().enumerate() {
+        if !is_plugin(&floating.run) || floating_already_running.contains(&index) {
+            floating.already_running = true;
+        }
+    }
+    tab_layout
+}
+
+/// fork addition: the path, as child indices, to every leaf of `layout` that is not a plugin.
+fn terminal_leaf_paths(layout: &TiledPaneLayout, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    if layout.children.is_empty() {
+        if !matches!(layout.run, Some(Run::Plugin(_))) {
+            out.push(path.clone());
+        }
+        return;
+    }
+    for (index, child) in layout.children.iter().enumerate() {
+        path.push(index);
+        terminal_leaf_paths(child, path, out);
+        path.pop();
+    }
+}
+
+fn leaf_at_path<'a>(layout: &'a mut TiledPaneLayout, path: &[usize]) -> &'a mut TiledPaneLayout {
+    path.iter()
+        .fold(layout, |layout, index| &mut layout.children[*index])
 }
 
 // The box is here in order to make the
@@ -12669,6 +12803,52 @@ pub(crate) fn screen_thread_main(
                 screen.log_and_report_session_state()?;
                 let _ = screen.render(None);
                 drop(completion_tx); // action ends here, notify the action initiator
+            },
+            ScreenInstruction::ReloadTemplate(
+                template,
+                default_shell,
+                client_id,
+                completion_tx,
+            ) => {
+                // one layout per live tab, keyed by its id, so the override closes no tab, and
+                // no layout carries a name, so it renames none
+                let template = match template {
+                    Some(template) => template,
+                    None => match screen.default_tab_template() {
+                        Ok(template) => template,
+                        Err(message) => {
+                            log::error!("{}", message);
+                            screen
+                                .bus
+                                .senders
+                                .send_to_server(ServerInstruction::LogError(
+                                    vec![message],
+                                    client_id,
+                                    completion_tx,
+                                ))?;
+                            continue;
+                        },
+                    },
+                };
+                let tab_layouts: Vec<TabLayoutInfo> = screen
+                    .tabs
+                    .iter()
+                    .map(|(tab_id, tab)| template_layout_for_tab(&template, *tab_id, tab))
+                    .collect();
+                let retain_existing_terminal_panes = true;
+                let retain_existing_plugin_panes = true;
+                screen
+                    .bus
+                    .senders
+                    .send_to_plugin(PluginInstruction::OverrideLayout(
+                        None,
+                        default_shell,
+                        tab_layouts,
+                        retain_existing_terminal_panes,
+                        retain_existing_plugin_panes,
+                        client_id,
+                        completion_tx,
+                    ))?;
             },
             ScreenInstruction::QueryTabNames(client_id, completion_tx) => {
                 // in the order the tab bar draws them: the map is keyed by stable id, which stops
