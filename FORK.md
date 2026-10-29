@@ -5180,22 +5180,36 @@ build", which is the question a script asks.
 * `server_exe_replaced` — present only when it is true: the file the server started from is no
   longer at its path. Every platform can say so since nkmk.23, which compares the file's mtime with
   the socket's, and a missing file counts since nkmk.25.
+* `server_version` — the version the server is running: what its `zellij --version` prints after
+  "zellij ", such as `0.45.1-nkmk.36`. Absent when it is not known.
 
-All four are absent for a dead session, and for a live one whose server the platform will not answer
-about or which has two servers for its name. Omitted rather than null, like the metadata fields
-beside them, so a consumer that sees `server_exe` can trust it.
+All five are absent for a dead session, and for a live one with two servers for its name. The first
+four are also absent for a live one whose executable the platform will not answer about. Each is
+omitted rather than null, like the metadata fields beside them, so a consumer that sees `server_exe`
+can trust it.
 
 **Nothing here crosses a contract**, which is the whole design. The answer is read from the OS on
 the side that runs `ls`, by the same `server_executable` the stale-build warning uses — no
 `SessionInfo` field, no protobuf tag, no client/server message. The decision not to put a version on
 the plugin API stands; this never asks the session anything.
 
-**There is no version string, and that is deliberate.** A version can only be had by running the
-binary, and `ls` is a listing. Spawning every server's executable to ask it turns a read of the
-socket directory into an execution of whatever those paths point at, and it hangs for as long as one
-of them sits on a mount that has gone away. The build id is cheaper — a few kilobytes off the front
-of the file, never the 40 MB — and it is the better answer to the question being asked, since two
-builds of one version have different build ids and one version string could not tell them apart.
+**The version is never asked of the binary.** Spawning every server's executable to ask its version
+turns a read of the socket directory into an execution of whatever those paths point at. It also
+hangs while one of them sits on a mount that has gone away. `server_version` comes from one of two
+places instead:
+
+1. `server_build` is `same`. Then the version is the listing binary's own.
+2. Otherwise, a stamp the server writes as it starts: `server-version` in its session_info folder,
+   holding its pid and then its version. `ls` trusts the stamp only when that pid is the pid
+   serving the session now, so a stamp an earlier server left under the same name never counts.
+
+With neither, the field is absent. A wrong version is worse than none. The stamp is a file, not a
+message, so it crosses no contract either. A server that exits cleanly removes its own stamp.
+Snapshots neither hash nor copy it, since it names a process, not a session's shape. A server
+older than this release writes no stamp, so its version is known only when it is the same build.
+
+The build id stays the answer to "which build": two builds of one version have different build ids,
+and a version string cannot tell them apart.
 
 ### `list-clients --json`
 

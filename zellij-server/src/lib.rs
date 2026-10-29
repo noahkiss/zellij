@@ -1351,6 +1351,13 @@ pub fn start_server_impl(
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    // `ls --json` reads this to name the version of a server that is not its own build. After the
+    // daemonize, so the pid in it is the server's. Not for the in-process test server, whose pid
+    // is the test harness's.
+    if install_panic_hook {
+        zellij_utils::sessions::write_server_version_stamp(&session_name);
+    }
+
     let (to_server, server_receiver): ChannelWithContext<ServerInstruction> = channels::bounded(50);
     let to_server = SenderWithContext::new(to_server);
     let session_data: Arc<RwLock<Option<SessionMetaData>>> = Arc::new(RwLock::new(None));

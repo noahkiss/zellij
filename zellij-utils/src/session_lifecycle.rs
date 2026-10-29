@@ -1639,6 +1639,14 @@ fn executable_of_pid(_pid: u32) -> Option<PathBuf> {
 /// Exactly one such server, or nothing: two servers for one name is its own fault, reported by the
 /// post-conditions, and guessing which of them a client will reach would be inventing an answer.
 pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
+    executable_of_server(&the_server_for_session(name)?)
+}
+
+/// The one server serving `name` from the socket directory this binary resolved.
+///
+/// Nothing when there is none, and nothing when there are two: the same rule as
+/// [`server_executable`], which is this plus the executable.
+pub fn the_server_for_session(name: &str) -> Option<ServerProcess> {
     let expected_socket = ZELLIJ_SOCK_DIR.join(name);
     let mut ours = servers_for_session(name)
         .into_iter()
@@ -1647,6 +1655,11 @@ pub fn server_executable(name: &str) -> Option<ExecutableIdentity> {
     if ours.next().is_some() {
         return None;
     }
+    Some(server)
+}
+
+/// The build behind one server process, read out of the OS by its pid.
+pub fn executable_of_server(server: &ServerProcess) -> Option<ExecutableIdentity> {
     let identity = identify_executable(executable_of_pid(server.pid)?);
     Some(as_the_server_runs_it(identity, &server.socket))
 }

@@ -1,7 +1,7 @@
 use crate::{
     consts::{
-        is_ipc_socket, session_info_folder_for_session, session_layout_cache_file_name,
-        ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
+        is_ipc_socket, server_version_stamp_file_name, session_info_folder_for_session,
+        session_layout_cache_file_name, VERSION, ZELLIJ_SESSION_INFO_CACHE_DIR, ZELLIJ_SOCK_DIR,
     },
     data::SessionInfo,
     envs,
@@ -923,6 +923,11 @@ pub struct SessionListEntry {
     /// the answer is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_exe_replaced: Option<bool>,
+    /// The version the session's server is running: what its `zellij --version` prints after
+    /// "zellij ". Absent for a dead session, and whenever it is not known - see
+    /// `server_identity_fields` for the two ways it is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
 }
 
 /// What `ls --json` reports about the binary behind one live session.
@@ -932,21 +937,38 @@ pub struct SessionListEntry {
 /// protobuf tag, no client/server message. FORK.md declined putting a version on the plugin API
 /// for a warning, and this stays inside that decision by never asking the session anything.
 ///
-/// **There is no version string, deliberately.** A version would have to come from running the
-/// binary, and `ls` is a listing: spawning every server's executable to ask it its version turns a
-/// read of the socket directory into an execution of whatever those paths point at, and it hangs
-/// as long as one of them is on a mount that has gone away. The build id is both cheaper - a few
-/// kilobytes off the front of the file, never the 40 MB - and a better answer to the question that
-/// is actually being asked, because two builds of one version have different build ids and one
-/// version string could not tell them apart.
+/// **The version is never asked of the binary.** Running every server's executable to ask its
+/// version turns a read of the socket directory into an execution of whatever those paths point
+/// at. It also hangs while one of them is on a mount that has gone away. So `server_version` comes
+/// from one of two places, and from nowhere else:
+///
+/// 1. The build is `same` as this one. Then the version is this binary's own.
+/// 2. Otherwise, the stamp the server wrote into its session_info folder as it started. The stamp
+///    names the pid that wrote it, and it counts only when that pid is the pid serving the
+///    session now. A stamp left by an earlier server under the same name never counts.
+///
+/// Neither: the field is absent. A wrong version is worse than none. The build id stays the
+/// answer to "which build": two builds of one version have different build ids.
 fn server_identity_fields(name: &str, is_dead: bool) -> ServerIdentityFields {
     if is_dead {
         return ServerIdentityFields::default();
     }
-    let Some(theirs) = crate::session_lifecycle::server_executable(name) else {
+    let Some(server) = crate::session_lifecycle::the_server_for_session(name) else {
         return ServerIdentityFields::default();
     };
+    let stamp = std::fs::read_to_string(server_version_stamp_file_name(name)).ok();
+    let Some(theirs) = crate::session_lifecycle::executable_of_server(&server) else {
+        return ServerIdentityFields {
+            server_version: server_version(
+                crate::session_lifecycle::BuildMatch::Unknown,
+                stamp.as_deref(),
+                server.pid,
+            ),
+            ..Default::default()
+        };
+    };
     let ours = crate::session_lifecycle::own_executable();
+    let verdict = crate::session_lifecycle::compare_builds(ours.as_ref(), Some(&theirs));
     ServerIdentityFields {
         server_exe: Some(theirs.path.display().to_string()),
         server_build_id: theirs.build_id.as_ref().map(|id| {
@@ -955,7 +977,7 @@ fn server_identity_fields(name: &str, is_dead: bool) -> ServerIdentityFields {
                 .collect::<String>()
         }),
         server_build: Some(
-            match crate::session_lifecycle::compare_builds(ours.as_ref(), Some(&theirs)) {
+            match verdict {
                 crate::session_lifecycle::BuildMatch::Same => "same",
                 crate::session_lifecycle::BuildMatch::Different => "different",
                 crate::session_lifecycle::BuildMatch::Unknown => "unknown",
@@ -963,6 +985,82 @@ fn server_identity_fields(name: &str, is_dead: bool) -> ServerIdentityFields {
             .to_owned(),
         ),
         server_exe_replaced: theirs.replaced.then_some(true),
+        server_version: server_version(verdict, stamp.as_deref(), server.pid),
+    }
+}
+
+/// The version of the server with `pid`, from what `server_identity_fields` knows about it.
+fn server_version(
+    verdict: crate::session_lifecycle::BuildMatch,
+    stamp: Option<&str>,
+    pid: u32,
+) -> Option<String> {
+    if verdict == crate::session_lifecycle::BuildMatch::Same {
+        return Some(VERSION.to_owned());
+    }
+    version_from_stamp(stamp?, pid)
+}
+
+/// What a server writes into its version stamp: its pid, then its version, a line each.
+pub fn server_version_stamp_contents(pid: u32, version: &str) -> String {
+    format!("{}\n{}\n", pid, version)
+}
+
+/// The version a stamp records, if the stamp was written by `pid`.
+///
+/// Anything else is `None`: another pid, a malformed stamp, or a truncated one. Both lines must
+/// end in a newline, so a stamp read halfway through its write never counts.
+fn version_from_stamp(stamp: &str, pid: u32) -> Option<String> {
+    let mut lines = stamp.split_inclusive('\n');
+    let stamp_pid = lines.next()?.strip_suffix('\n')?;
+    let version = lines.next()?.strip_suffix('\n')?;
+    if lines.next().is_some() || stamp_pid.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    if version.is_empty() || version.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(version.to_owned())
+}
+
+/// Record this server's pid and version in its session's session_info folder.
+///
+/// The server calls this once, as it starts. A failure is logged and nothing more: without the
+/// stamp `ls --json` omits `server_version` for a server of another build, which is safe.
+pub fn write_server_version_stamp(session_name: &str) {
+    let folder = session_info_folder_for_session(session_name);
+    let stamp = server_version_stamp_file_name(session_name);
+    let pid = process::id();
+    // written beside the stamp and renamed over it, so a reader never sees half a stamp
+    let partial = folder.join(format!(
+        "{}.{}.partial",
+        crate::consts::SERVER_VERSION_STAMP_FILE_NAME,
+        pid
+    ));
+    let written = fs::create_dir_all(&folder)
+        .and_then(|_| fs::write(&partial, server_version_stamp_contents(pid, VERSION)))
+        .and_then(|_| fs::rename(&partial, &stamp));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&partial);
+        log::error!(
+            "Failed to write the server version stamp {:?}: {:?}",
+            stamp,
+            e
+        );
+    }
+}
+
+/// Remove this server's version stamp from its session's session_info folder, as it exits.
+///
+/// Only a stamp this process wrote: a new server under the same name may already have replaced it.
+pub fn remove_own_server_version_stamp(session_name: &str) {
+    let stamp = server_version_stamp_file_name(session_name);
+    let ours = fs::read_to_string(&stamp)
+        .ok()
+        .and_then(|contents| version_from_stamp(&contents, process::id()))
+        .is_some();
+    if ours {
+        let _ = fs::remove_file(&stamp);
     }
 }
 
@@ -972,6 +1070,7 @@ struct ServerIdentityFields {
     server_build_id: Option<String>,
     server_build: Option<String>,
     server_exe_replaced: Option<bool>,
+    server_version: Option<String>,
 }
 
 /// Build the `ls --json` listing from the session names and the metadata each live session wrote.
@@ -1009,6 +1108,7 @@ pub fn session_list_entries(
                 server_build_id: server.server_build_id,
                 server_build: server.server_build,
                 server_exe_replaced: server.server_exe_replaced,
+                server_version: server.server_version,
                 name,
             }
         })
@@ -1665,6 +1765,7 @@ mod tests {
         assert_eq!(entries[0].server_build_id, None);
         assert_eq!(entries[0].server_build, None);
         assert_eq!(entries[0].server_exe_replaced, None);
+        assert_eq!(entries[0].server_version, None);
         // the metadata fields are still there, so this is the server lookup coming back empty and
         // not the whole entry being empty
         assert_eq!(entries[0].connected_clients, Some(1));
@@ -1690,6 +1791,7 @@ mod tests {
             server_build_id: Some("aabbcc".to_owned()),
             server_build: Some("unknown".to_owned()),
             server_exe_replaced: None,
+            server_version: None,
         };
         let rendered = serde_json::to_string(&entry).expect("TEST");
         assert!(
@@ -1709,6 +1811,83 @@ mod tests {
         );
         // not replaced means the field is not there at all, rather than `false`
         assert!(!rendered.contains("server_exe_replaced"), "{}", rendered);
+    }
+
+    #[test]
+    fn the_server_version_is_in_the_json_only_when_known() {
+        let mut entry = SessionListEntry {
+            name: "s".to_owned(),
+            created_seconds_ago: 1,
+            is_current: false,
+            is_dead: false,
+            connected_clients: None,
+            web_client_count: None,
+            web_clients_allowed: None,
+            tab_count: None,
+            pane_count: None,
+            server_exe: None,
+            server_build_id: None,
+            server_build: None,
+            server_exe_replaced: None,
+            server_version: Some("0.45.1-nkmk.36".to_owned()),
+        };
+        let rendered = serde_json::to_string(&entry).expect("TEST");
+        assert!(
+            rendered.contains(r#""server_version":"0.45.1-nkmk.36""#),
+            "{}",
+            rendered
+        );
+        entry.server_version = None;
+        let rendered = serde_json::to_string(&entry).expect("TEST");
+        assert!(!rendered.contains("server_version"), "{}", rendered);
+    }
+
+    #[test]
+    fn a_same_build_server_runs_our_version_whatever_the_stamp_says() {
+        use crate::session_lifecycle::BuildMatch;
+        assert_eq!(
+            server_version(BuildMatch::Same, None, 42),
+            Some(VERSION.to_owned())
+        );
+        assert_eq!(
+            server_version(BuildMatch::Same, Some("7\n0.1.0\n"), 42),
+            Some(VERSION.to_owned())
+        );
+    }
+
+    #[test]
+    fn another_build_takes_its_version_from_a_stamp_its_own_pid_wrote() {
+        use crate::session_lifecycle::BuildMatch;
+        let stamp = server_version_stamp_contents(42, "0.45.1-nkmk.35");
+        for verdict in [BuildMatch::Different, BuildMatch::Unknown] {
+            assert_eq!(
+                server_version(verdict, Some(&stamp), 42),
+                Some("0.45.1-nkmk.35".to_owned())
+            );
+            // an earlier server under the same name wrote this one
+            assert_eq!(server_version(verdict, Some(&stamp), 43), None);
+            assert_eq!(server_version(verdict, None, 42), None);
+        }
+    }
+
+    #[test]
+    fn a_malformed_or_truncated_stamp_names_no_version() {
+        for stamp in [
+            "",
+            "42",
+            "42\n",
+            "42\n0.45.1",
+            "42\n\n",
+            "42\n0.45 .1\n",
+            "x\n0.45.1\n",
+            "42\n0.45.1\nextra\n",
+        ] {
+            assert_eq!(version_from_stamp(stamp, 42), None, "{:?}", stamp);
+        }
+        assert_eq!(
+            version_from_stamp("42\n0.45.1\n", 42),
+            Some("0.45.1".to_owned())
+        );
     }
 
     #[test]

@@ -309,7 +309,8 @@ fn session_archive_dir(settings: &SnapshotSettings, session_name: &str) -> PathB
 
 /// A stable hash of the *shape* a session_info folder describes: the layout and the pane contents
 /// it references, but not `session-metadata.kdl`, which carries connected client counts and
-/// timestamps that change on every write and would make every save look like a new shape.
+/// timestamps that change on every write and would make every save look like a new shape, and not
+/// the server's version stamp, which changes with every server.
 ///
 /// Used to give a snapshot its short id, to keep the same shape from being archived twice in a row,
 /// and to make `snapshot import` idempotent.
@@ -324,7 +325,10 @@ fn hash_directory_contents(dir: &Path) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     for file in files {
         if let Some(file_name) = file.file_name() {
-            if file_name == SNAPSHOT_SIDECAR_FILE_NAME || file_name == SNAPSHOT_METADATA_FILE_NAME {
+            if file_name == SNAPSHOT_SIDECAR_FILE_NAME
+                || file_name == SNAPSHOT_METADATA_FILE_NAME
+                || file_name == crate::consts::SERVER_VERSION_STAMP_FILE_NAME
+            {
                 continue;
             }
             hasher.update(file_name.to_string_lossy().as_bytes());
@@ -345,6 +349,10 @@ fn copy_directory(from: &Path, to: &Path) -> std::io::Result<()> {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue; // session_info folders are flat
+        }
+        if entry.file_name() == crate::consts::SERVER_VERSION_STAMP_FILE_NAME {
+            // it names the process that wrote it, and a restored session runs a new one
+            continue;
         }
         std::fs::copy(entry.path(), to.join(entry.file_name()))?;
     }
@@ -950,6 +958,34 @@ mod tests {
         assert!(snapshot.path.join(SNAPSHOT_SIDECAR_FILE_NAME).exists());
         assert_eq!(snapshot.meta.reason, SnapshotReason::Manual);
         assert!(snapshot.id.starts_with(&snapshot.meta.saved_at.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_server_version_stamp_is_neither_hashed_nor_archived() {
+        let (settings, root) = temp_settings("version-stamp");
+        let source = root.join("session_info").join("a-session");
+        write_session_info_folder(&source, "layout {\n    tab\n}\n");
+        let unstamped = hash_directory_contents(&source).unwrap();
+        let stamp = source.join(crate::consts::SERVER_VERSION_STAMP_FILE_NAME);
+        std::fs::write(&stamp, "42\n0.45.1\n").unwrap();
+        // a new server is a new pid, and the same shape must still hash the same
+        assert_eq!(hash_directory_contents(&source).unwrap(), unstamped);
+
+        let snapshot = archive_session_info_folder(
+            &source,
+            "a-session",
+            SnapshotReason::Manual,
+            &settings,
+            None,
+        )
+        .unwrap()
+        .into_snapshot()
+        .expect("a snapshot should have been written");
+        assert!(!snapshot
+            .path
+            .join(crate::consts::SERVER_VERSION_STAMP_FILE_NAME)
+            .exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

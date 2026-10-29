@@ -850,9 +850,10 @@ pub(crate) fn background_jobs_main(
                     nested_guest_ping.store(false, Ordering::SeqCst);
                 }
 
-                let cache_file_name =
-                    session_info_cache_file_name(&current_session_name.lock().unwrap().to_owned());
+                let session_name = current_session_name.lock().unwrap().to_owned();
+                let cache_file_name = session_info_cache_file_name(&session_name);
                 let _ = std::fs::remove_file(cache_file_name);
+                zellij_utils::sessions::remove_own_server_version_stamp(&session_name);
                 drain_web_requests(&web_requests_in_flight, WEB_REQUEST_DRAIN_TIMEOUT);
                 return Ok(());
             },

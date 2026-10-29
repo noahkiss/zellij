@@ -79,6 +79,15 @@ pub fn session_layout_cache_file_name(session_name: &str) -> PathBuf {
     session_info_folder_for_session(session_name).join(SERIALIZED_SESSION_LAYOUT_FILE_NAME)
 }
 
+/// The file a server writes into its own session_info folder as it starts: its pid, then its
+/// version. `ls --json` reads it to name the version of a server that is not its own build. It
+/// describes a process, not a session's shape, so snapshots neither hash it nor copy it.
+pub const SERVER_VERSION_STAMP_FILE_NAME: &str = "server-version";
+
+pub fn server_version_stamp_file_name(session_name: &str) -> PathBuf {
+    session_info_folder_for_session(session_name).join(SERVER_VERSION_STAMP_FILE_NAME)
+}
+
 pub fn session_info_folder_for_session(session_name: &str) -> PathBuf {
     ZELLIJ_SESSION_INFO_CACHE_DIR.join(session_name)
 }
