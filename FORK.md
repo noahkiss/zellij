@@ -2537,6 +2537,59 @@ nothing. Do not "tidy" that empty string away.
 Nothing about this reaches `SessionInfo` or the status bar. That would put a version on the plugin
 API contract, which is far more than a warning is worth.
 
+#### Strict mode: a refusal instead of the warning
+
+A warning on stderr is right for a person and wrong for a program. A controller that drives zellij
+over the CLI reads stdout and the exit code, so a session on another build looks healthy to it, and
+it acts on a server that may not have the fix it depends on.
+
+**Strict mode is opt-in.** Set `ZELLIJ_STRICT_VERSION=1`, or pass the global flag
+`--strict-version`. Then every command that would print the warning refuses instead:
+
+```
+error: session 'work' is running a different build of zellij than this binary, and ZELLIJ_STRICT_VERSION is set, so this command did not run.
+  running: /opt/zellij/1.2.3/bin/zellij
+  this:    /opt/zellij/1.2.4/bin/zellij
+  Run `zellij session restart work` to bring it onto this build, or unset ZELLIJ_STRICT_VERSION (and drop --strict-version) to go ahead with a warning.
+```
+
+- **Exit code 3.** The CLI uses 0, 1 and 2 for its own answers (see the conventions at the top), so
+  3 means this and nothing else. Only a pane command's own status passed through by
+  `--block-until-exit` can also be 3; the stderr sentence tells them apart.
+- **The default stays a warning.** An upgrade leaves every running server on the old build until
+  it restarts. A refusal by default would lock the operator out of their own sessions in that
+  window.
+- **Only a proven mismatch refuses.** The evidence rule above is unchanged: "cannot tell" is
+  silence, in strict mode too.
+- **Gated:** every `zellij action` verb, `run`, `edit`, `plugin`, `pipe`, `list-agents` (with
+  `--all-sessions`, each live session is checked and the first proven mismatch refuses), an attach
+  to an existing session, `subscribe`, and `watch`. `subscribe` and `watch` did not check before;
+  they now warn by default as well.
+- **Exempt:** `ls` / `list-sessions`, `kill-session`, `delete-session`, `kill-all-sessions`,
+  `delete-all-sessions`, and every `zellij session ...` subcommand (`up`, `down`, `restart`,
+  `status`, `doctor`, `enable`, `disable`). They are how a caller gets out of skew, so strict mode
+  never refuses them. `session up` still warns about a superseded build. Commands that never
+  checked the build (`snapshot`, `list-aliases`, `web`, `setup`) are unchanged.
+- **A new session does not inherit it.** The server is started with `ZELLIJ_STRICT_VERSION`
+  removed from its environment, like the agent identity variables. Strict mode describes the
+  caller that asked, and a pane that inherited it would refuse the operator's own commands through
+  the next upgrade.
+- **The flag sets the variable for the process,** so a `zellij --strict-version mcp` hands strict
+  mode to every zellij it runs.
+
+**Over ssh.** The remote CLI runs the same check against its own server, so nothing new is needed
+there. But ssh does not carry the local environment: only what `SendEnv` names crosses, and the
+fork's ssh invocation names nothing. So `zellij mcp`'s remote path sets it on the far side itself:
+when strict mode is on locally, the remote `sh -c` script starts with
+`ZELLIJ_STRICT_VERSION=1; export ZELLIJ_STRICT_VERSION`. It sets the variable, not the flag,
+because an older remote binary ignores an unknown variable and rejects an unknown flag. A
+controller that runs its own `ssh host zellij ...` must pass it the same way.
+
+**The soft check** is `ls --json`: its live rows carry `server_build` (`same`, `different`,
+`unknown`) and `server_version` — see [Which binary each session is actually
+on](#which-binary-each-session-is-actually-on). `list-agents` and `list-panes --json` carry
+neither. Strict mode adds nothing to any of them.
+
 ### `zellij session enable|disable|status`
 
 ```

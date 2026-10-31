@@ -526,6 +526,9 @@ fn server_command(exe: PathBuf, socket_path: &Path, debug: bool) -> Command {
     for name in zellij_utils::agent_detect::agent_identity_env_names() {
         cmd.env_remove(name);
     }
+    // strict version mode describes the caller that asked, not the session: a pane that inherited
+    // it would refuse the operator's own commands through the next upgrade
+    cmd.env_remove(zellij_utils::session_lifecycle::STRICT_VERSION_ENV);
     cmd
 }
 

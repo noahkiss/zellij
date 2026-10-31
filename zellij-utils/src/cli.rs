@@ -113,6 +113,12 @@ pub struct CliArgs {
     /// Specify emitting additional debug information
     #[clap(short, long, value_parser)]
     pub debug: bool,
+
+    /// Refuse, with exit code 3, to reach a session served by a different build of zellij instead
+    /// of warning. Same as ZELLIJ_STRICT_VERSION=1. `ls`, `kill-session`, `delete-session` and
+    /// `session ...` are never refused
+    #[clap(long, value_parser)]
+    pub strict_version: bool,
 }
 
 impl CliArgs {

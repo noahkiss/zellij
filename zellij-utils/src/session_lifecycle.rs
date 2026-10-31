@@ -3172,17 +3172,116 @@ pub fn full_disk_access_missing() -> bool {
     full_disk_access_granted() == Some(false)
 }
 
-/// Say it, at most once for the life of this process.
+/// The environment variable that turns a proven build mismatch from a warning into a refusal.
+///
+/// For a program that drives zellij over the CLI and must not act on a session served by another
+/// build. The default stays a warning: an upgrade leaves every running server on the old build
+/// until it restarts, and a refusal by default would lock the operator out in that window.
+pub const STRICT_VERSION_ENV: &str = "ZELLIJ_STRICT_VERSION";
+
+/// The exit code of a strict-mode refusal. Not 1 (error) and not 2 (changed nothing): a caller
+/// told "this session is another build" must be able to tell it apart from both.
+pub const STRICT_VERSION_EXIT_CODE: i32 = 3;
+
+/// Whether a value of [`STRICT_VERSION_ENV`] turns strict mode on. Unset, empty, `0`, `false`,
+/// `no` and `off` leave it off; anything else turns it on.
+pub fn strict_version_value_is_on(value: Option<&str>) -> bool {
+    match value.map(str::trim) {
+        None | Some("") => false,
+        Some(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+    }
+}
+
+/// Whether this process runs in strict version mode. `--strict-version` sets the variable for the
+/// process, so both spellings land here and reach any zellij this process runs.
+pub fn strict_version() -> bool {
+    strict_version_value_is_on(std::env::var(STRICT_VERSION_ENV).ok().as_deref())
+}
+
+/// Which kind of command is asking. An exempt command is one a caller runs to get OUT of skew -
+/// `session restart`, `session up`, `kill-session` - so strict mode never refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkewCaller {
+    Gated,
+    Exempt,
+}
+
+/// What a client does about the build serving the session it is about to reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkewDecision {
+    /// Same build, or nothing could be proven either way.
+    Proceed,
+    /// A proven mismatch, said on stderr; the command goes ahead.
+    Warn(String),
+    /// A proven mismatch in strict mode; the command does not run.
+    Refuse(String),
+}
+
+/// [`SkewDecision`] over identities already read. Only a PROVEN mismatch warns or refuses: "cannot
+/// tell" proceeds in strict mode too.
+pub fn skew_decision(
+    name: &str,
+    ours: Option<&ExecutableIdentity>,
+    theirs: Option<&ExecutableIdentity>,
+    strict: bool,
+    caller: SkewCaller,
+) -> SkewDecision {
+    let Some(warning) = build_mismatch_warning_of(name, ours, theirs) else {
+        return SkewDecision::Proceed;
+    };
+    if !strict || caller == SkewCaller::Exempt {
+        return SkewDecision::Warn(warning);
+    }
+    let (ours, theirs) = match (ours, theirs) {
+        (Some(ours), Some(theirs)) => (ours, theirs),
+        _ => return SkewDecision::Warn(warning),
+    };
+    SkewDecision::Refuse(format!(
+        "error: session '{}' is running a different build of zellij than this binary, and {} is \
+         set, so this command did not run.\n  running: {}\n  this:    {}\n  \
+         Run `zellij session restart {}` to bring it onto this build, or unset {} (and drop \
+         --strict-version) to go ahead with a warning.",
+        name,
+        STRICT_VERSION_ENV,
+        theirs.path.display(),
+        ours.path.display(),
+        name,
+        STRICT_VERSION_ENV
+    ))
+}
+
+/// Check the build serving `name` before a command reaches it: warn at most once for the life of
+/// this process, or, in strict mode, refuse and exit with [`STRICT_VERSION_EXIT_CODE`].
 ///
 /// A client talks to its server many times over; the mismatch is one fact about the session and is
 /// worth one line, not one line per action, per reconnect or per render.
-pub fn warn_if_server_build_differs(name: &str) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        if let Some(warning) = build_mismatch_warning(name) {
-            eprintln!("{}", warning);
-        }
-    });
+pub fn check_server_build(name: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let strict = strict_version();
+    if !strict && WARNED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    match skew_decision(
+        name,
+        own_executable().as_ref(),
+        server_executable(name).as_ref(),
+        strict,
+        SkewCaller::Gated,
+    ) {
+        SkewDecision::Proceed => {},
+        SkewDecision::Warn(warning) => {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("{}", warning);
+            }
+        },
+        SkewDecision::Refuse(message) => {
+            eprintln!("{}", message);
+            std::process::exit(STRICT_VERSION_EXIT_CODE);
+        },
+    }
 }
 
 /// What one probe of a TCC-protected location found.
@@ -3979,6 +4078,73 @@ dev.zellij.session.mysession = {
             size: Some(41_000_000),
             ..executable(path, Some(file_id))
         }
+    }
+
+    /// Strict mode on and off, against a proven mismatch, the same build, and a comparison that
+    /// cannot be made, for a gated command and an exempt one.
+    #[test]
+    fn strict_version_refuses_only_a_proven_mismatch_and_only_for_a_gated_command() {
+        let ours = stamped("/new/zellij", (66, 2), b"new");
+        let other = stamped("/old/zellij", (66, 1), b"old");
+        let copy = stamped("/pin/zellij", (66, 3), b"new");
+        // no size and no stamp: two files, nothing to tell them apart by
+        let unknown = executable("/mystery/zellij", Some((66, 4)));
+        let decide = |theirs: Option<&ExecutableIdentity>, strict, caller| {
+            skew_decision("s", Some(&ours), theirs, strict, caller)
+        };
+        for caller in [SkewCaller::Gated, SkewCaller::Exempt] {
+            for strict in [false, true] {
+                assert_eq!(
+                    decide(Some(&copy), strict, caller),
+                    SkewDecision::Proceed,
+                    "same build, strict={strict}, {caller:?}"
+                );
+                assert_eq!(
+                    decide(Some(&unknown), strict, caller),
+                    SkewDecision::Proceed,
+                    "cannot tell, strict={strict}, {caller:?}"
+                );
+                assert_eq!(
+                    decide(None, strict, caller),
+                    SkewDecision::Proceed,
+                    "no server executable, strict={strict}, {caller:?}"
+                );
+            }
+        }
+        let warned = |decision: SkewDecision| match decision {
+            SkewDecision::Warn(text) => text,
+            other => panic!("expected a warning, got {:?}", other),
+        };
+        assert!(warned(decide(Some(&other), false, SkewCaller::Gated)).starts_with("warning: "));
+        assert!(warned(decide(Some(&other), false, SkewCaller::Exempt)).starts_with("warning: "));
+        assert!(warned(decide(Some(&other), true, SkewCaller::Exempt)).starts_with("warning: "));
+        match decide(Some(&other), true, SkewCaller::Gated) {
+            SkewDecision::Refuse(text) => {
+                assert!(text.starts_with("error: session 's'"), "{}", text);
+                assert!(text.contains("running: /old/zellij"), "{}", text);
+                assert!(text.contains("this:    /new/zellij"), "{}", text);
+                assert!(text.contains(STRICT_VERSION_ENV), "{}", text);
+                assert!(text.contains("zellij session restart s"), "{}", text);
+            },
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn strict_version_reads_its_variable_as_a_switch() {
+        for on in ["1", "true", "yes", "on", "TRUE", " 1 "] {
+            assert!(strict_version_value_is_on(Some(on)), "{:?}", on);
+        }
+        for off in ["", "0", "false", "no", "off", "OFF", " "] {
+            assert!(!strict_version_value_is_on(Some(off)), "{:?}", off);
+        }
+        assert!(!strict_version_value_is_on(None));
+    }
+
+    #[test]
+    fn the_strict_exit_code_is_none_the_cli_already_uses() {
+        // 0 acted, 1 error, 2 changed nothing
+        assert!(![0, 1, 2].contains(&STRICT_VERSION_EXIT_CODE));
     }
 
     #[test]

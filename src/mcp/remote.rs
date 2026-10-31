@@ -507,9 +507,32 @@ pub fn remote_command(script: &str, args: &[String]) -> String {
 
 /// The remote line that runs `zellij <argv>` on `host`.
 pub fn zellij_command(host: &RemoteHost, argv: &[String]) -> String {
+    zellij_command_with(
+        host,
+        argv,
+        zellij_utils::session_lifecycle::strict_version(),
+    )
+}
+
+/// [`zellij_command`], with strict version mode given rather than read.
+///
+/// ssh does not carry the local environment (only what `SendEnv` names), so strict mode is set on
+/// the remote side by the script itself. A variable, not `--strict-version`: an older remote
+/// binary ignores an unknown variable but rejects an unknown flag.
+pub fn zellij_command_with(host: &RemoteHost, argv: &[String], strict: bool) -> String {
     let mut args = vec![host.bin.clone().unwrap_or_default()];
     args.extend(argv.iter().cloned());
-    remote_command(ZELLIJ_ON_REMOTE, &args)
+    if strict {
+        let script = format!(
+            "{}=1; export {}; {}",
+            zellij_utils::session_lifecycle::STRICT_VERSION_ENV,
+            zellij_utils::session_lifecycle::STRICT_VERSION_ENV,
+            ZELLIJ_ON_REMOTE
+        );
+        remote_command(&script, &args)
+    } else {
+        remote_command(ZELLIJ_ON_REMOTE, &args)
+    }
 }
 
 /// ssh's own argv, after the program: options, the host, and the one remote line.
@@ -912,7 +935,7 @@ mod tests {
             .iter()
             .map(|w| (*w).to_owned())
             .collect();
-        let line = zellij_command(&host, &argv);
+        let line = zellij_command_with(&host, &argv, false);
         assert!(line.starts_with("sh -c '"), "{}", line);
         assert!(
             line.ends_with(" sh '' '-s' 'my work' 'action' 'write-chars' '--' 'it'\\''s $x'"),
@@ -931,7 +954,7 @@ mod tests {
         };
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(zellij_command(&with_bin, &argv))
+            .arg(zellij_command_with(&with_bin, &argv, false))
             .output()
             .unwrap();
         assert_eq!(
@@ -941,7 +964,7 @@ mod tests {
         // and the probe finds it on PATH when no bin is configured
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(zellij_command(&host, &argv))
+            .arg(zellij_command_with(&host, &argv, false))
             .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
             .output()
             .unwrap();
@@ -949,6 +972,37 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "-s|my work|action|write-chars|--|it's $x|"
         );
+    }
+
+    /// ssh does not carry the local environment, so strict mode crosses it inside the remote
+    /// script, as a variable the remote zellij reads - and only when it is on here.
+    #[test]
+    fn strict_version_mode_reaches_the_remote_zellij_as_its_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("zellij");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%s|%s' \"${ZELLIJ_STRICT_VERSION-unset}\" \"$*\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host = RemoteHost {
+            name: "boxa".into(),
+            bin: Some(fake.display().to_string()),
+        };
+        let argv = vec!["action".to_owned(), "list-panes".to_owned()];
+        let run = |strict: bool| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(zellij_command_with(&host, &argv, strict))
+                .env_remove("ZELLIJ_STRICT_VERSION")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(run(true), "1|action list-panes");
+        assert_eq!(run(false), "unset|action list-panes");
     }
 
     #[test]

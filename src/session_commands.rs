@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
-    build_mismatch_warning_of, build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up,
-    own_executable, server_executable, term_for_new_session, BuildVerdict, DownOutcome,
-    ExecutableIdentity, SessionFacts,
+    build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up, own_executable,
+    server_executable, skew_decision, strict_version, term_for_new_session, BuildVerdict,
+    DownOutcome, ExecutableIdentity, SessionFacts, SkewCaller, SkewDecision,
 };
 use zellij_utils::session_service::{
     self, configured_pinned_exe, path_dirs, resolve_service_exe, DisableOutcome, EnableOutcome,
@@ -1674,7 +1674,17 @@ fn warning_to_print(
 fn warn_about_a_superseded_build(name: &str, as_the_unit: bool) {
     let ours = own_executable();
     let theirs = server_executable(name);
-    let warning = build_mismatch_warning_of(name, ours.as_ref(), theirs.as_ref());
+    // `up` is how a caller gets OUT of skew, so strict mode never refuses it: exempt, it warns
+    let warning = match skew_decision(
+        name,
+        ours.as_ref(),
+        theirs.as_ref(),
+        strict_version(),
+        SkewCaller::Exempt,
+    ) {
+        SkewDecision::Warn(warning) | SkewDecision::Refuse(warning) => Some(warning),
+        SkewDecision::Proceed => None,
+    };
     let pair = build_pair(ours.as_ref(), theirs.as_ref());
     let stamp = build_warning_stamp(name);
     if let Some(warning) = warning_to_print(warning, &pair, as_the_unit, &stamp) {
@@ -2276,7 +2286,11 @@ mod tests {
         as_the_unit: bool,
         stamp: &Path,
     ) -> Option<String> {
-        let warning = build_mismatch_warning_of("s", Some(ours), Some(theirs));
+        let warning = zellij_utils::session_lifecycle::build_mismatch_warning_of(
+            "s",
+            Some(ours),
+            Some(theirs),
+        );
         let pair = build_pair(Some(ours), Some(theirs));
         warning_to_print(warning, &pair, as_the_unit, stamp)
     }

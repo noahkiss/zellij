@@ -30,6 +30,11 @@ fn main() {
     configure_logger();
     create_config_and_cache_folders();
     let opts = parse_cli_args();
+    // the flag is the variable for this process, so one check reads both, and every zellij this
+    // process runs - `zellij mcp`'s children, local or over ssh - inherits it
+    if opts.strict_version {
+        std::env::set_var(zellij_utils::session_lifecycle::STRICT_VERSION_ENV, "1");
+    }
 
     // the viewer is a program in a pane, not a client of any session: it reads no config and asks
     // no session anything

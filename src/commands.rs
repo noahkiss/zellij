@@ -819,6 +819,11 @@ pub(crate) fn send_action_to_session(
                 zellij_client::os_input_output::get_cli_client_os_input,
             ))
         };
+        // every session it asks is a server it reaches. Strict mode refuses on the first one
+        // proven to be another build; without it, at most one warning for the whole call.
+        for name in live_sessions() {
+            zellij_utils::session_lifecycle::check_server_build(&name);
+        }
         let exit_status = if *watch {
             zellij_client::cli_client::start_list_agents_watch_client(
                 &make_os_input,
@@ -955,6 +960,8 @@ pub(crate) fn subscribe_to_session(
             },
         }
     }
+    // a subscription reads a session for as long as it runs, so a stale server is said here too
+    zellij_utils::session_lifecycle::check_server_build(&session_name);
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     zellij_client::cli_client::start_subscribe_client(
         Box::new(os_input),
@@ -1038,8 +1045,9 @@ fn attach_with_cli_client(
     }
     let cli_action = cli_action;
     // an action is the usual way a script meets a session, so it is where a stale server is usually
-    // met too - the warning costs one process scan and changes nothing about the action
-    zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
+    // met too - the warning costs one process scan and changes nothing about the action. In
+    // strict mode a proven mismatch refuses here instead, before anything is sent.
+    zellij_utils::session_lifecycle::check_server_build(session_name);
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // `save-session --archive` is a client-side addition to the existing action: the action itself
@@ -1971,7 +1979,7 @@ pub(crate) fn start_client(opts: CliArgs) {
                 // an attach joins a server that may predate this binary. Said once per client, and
                 // only for a session that already exists - a new one is this build by definition.
                 if let ClientInfo::Attach(session_name, _) = &client {
-                    zellij_utils::session_lifecycle::warn_if_server_build_differs(session_name);
+                    zellij_utils::session_lifecycle::check_server_build(session_name);
                 }
 
                 if let Some(layout_info) = layout_info {
@@ -2193,6 +2201,9 @@ pub(crate) fn watch_session(session_name: Option<String>, opts: CliArgs) {
             },
         },
     };
+
+    // a watcher is an attach that cannot type, so it meets a stale server the way an attach does
+    zellij_utils::session_lifecycle::check_server_build(client_info.get_session_name());
 
     let mut opts = opts.clone();
     opts.session = Some(client_info.get_session_name().to_string());
