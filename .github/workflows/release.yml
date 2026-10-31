@@ -86,7 +86,7 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             environment: ''
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             environment: release
     # Not secrets: the identity the macOS steps sign with and then assert.
