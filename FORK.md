@@ -5669,6 +5669,7 @@ $ zellij action watch --json
 {"event":"synced","seq":4,...}
 {"event":"pane_output","pane_id":"terminal_3","handle":"sunny-otter","last_output_at":1761900001234,"seq":5,...}
 {"event":"pane_exited","pane_id":"terminal_5","handle":"calm-fox","exit_status":1,"seq":6,...}
+{"event":"pane_changed","pane_id":"terminal_3","handle":"sunny-otter","tab_id":0,"title":"~/src","program_title":"~/src","pane_cwd":"/home/me/src","pane_command":"zsh","terminal_command":null,"command_state":"prompt","seq":7,...}
 ```
 
 A controller that drives zellij over the CLI, locally or over ssh, had to poll: `list-tree` for the
@@ -5687,8 +5688,8 @@ long-lived command the server writes to as things change, one JSON object per li
   or any `state` key. A title change is not a change. A handle renamed under a live agent is a
   `gone` for the old handle and an `agent` for the new one.
 - **Pane lines are ids only**: `pane_opened` (`pane_id`, `handle`, `tab_id`), `pane_exited`
-  (`exit_status`, null when killed by a signal or unreadable), `pane_closed`. The reader re-reads
-  `list-tree` for the rest. **`handle` is on every pane line**, closed and exited included. A pane
+  (`exit_status`, null when killed by a signal or unreadable), `pane_closed`. What a pane says
+  about itself is on `pane_changed`, below. **`handle` is on every pane line**, closed and exited included. A pane
   is identified across looks by its uuid, so a reused id is a close and an open, never a
   continuation. A pane whose handle is renamed keeps its identity and carries the new handle on
   its later lines; there is no rename line.
@@ -5698,10 +5699,31 @@ long-lived command the server writes to as things change, one JSON object per li
   one line per pane per second, and the newest output is never lost. A burst inside the second is
   reported once the second has passed, by the stream's own tick. Output from before the stream
   started is not reported.
+- **`pane_changed`** carries what a pane says about itself: `pane_id`, `handle`, `tab_id`, and
+  the fields of its `list-panes --json` row under the same names - `title`, `program_title`,
+  `pane_cwd`, `pane_command`, `terminal_command`, `command_state`, `last_command_exit_code`, and
+  the `OSC 7501` keys `state`, `state_kind`, `state_app`, `state_title`, `state_msg`,
+  `state_progress`, `state_at`. A key is absent, or null, exactly when the `list-panes` row has
+  it absent or null. The line carries every field, not only the one that moved. It is written
+  when any of those fields, or `tab_id`, changes. A new `state_at` alone is not a change, as on an
+  `agent` line, and neither is a renamed handle. `input_since_prompt`, `input_since_state` and
+  `prefilled_command` are not carried: typing flips them. **A pane moved to another tab** is a
+  `pane_changed` with the new `tab_id`. **At most one line per pane per second**, like
+  `pane_output`: an agent animating its title is one line a second, the newest values win, and the
+  trailing change is never lost, because the stream's tick writes it once the second has passed.
+  A change undone inside the second is no line at all.
+- **The snapshot carries no `pane_changed`**, and `pane_opened` stays ids only. A reader gets the
+  fields by reading `list-tree` (or `list-panes --json`) once, after `synced`; from then on the
+  stream keeps them current. A pane opened after `synced` is followed by its own `pane_changed`
+  in the same look, so the one read is enough. A change that lands between `synced` and that read
+  may be told twice; the later line wins.
 - **Order inside one change**: a tab opens before its panes, a pane opens before its agent, an
-  agent's `gone` comes before its pane closes, a pane closes before its tab.
+  agent's `gone` comes before its pane closes, a pane closes before its tab. `pane_changed` and
+  then `pane_output` lines come last.
 - **A pane privacy policy** applies: a withheld pane is never on the stream, exactly as it is
-  never in `list-panes`.
+  never in `list-panes`, and a `pane_changed` line is built from the same filtered row, so it
+  shows nothing that row does not.
+- **`list-agents --watch`** writes no `pane_changed` line, and its `seq` does not count one.
 - **Exit 0** when the reader closes the pipe, noticed even on a quiet session (the client asks its
   stdout every half second). **Exit 2** when the session goes away. **Exit 2 at once**, within five
   seconds and with the reason on stderr, against a server that predates the command.

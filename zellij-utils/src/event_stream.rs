@@ -16,6 +16,10 @@
 //! A stream starts with `hello`, then one `agent` line per agent, one `pane_opened` line per pane
 //! and one `tab_opened` line per tab, then `synced`. After that every line is a change.
 //!
+//! The snapshot carries ids only. What a pane says about itself - its titles, cwd, command and
+//! state - is a `pane_changed` line, written for every pane opened after `synced` and whenever
+//! one of those fields changes, at most once a second per pane.
+//!
 //! Nothing here asks the operating system anything: the server hands in the model and the clock.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,10 +27,62 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::agent_detect::{agents_from_pane_list, watched_part};
-use crate::data::{AgentListEntry, PaneListEntry};
+use crate::data::{AgentListEntry, PaneCommandState, PaneListEntry, PaneProgramStatus};
 
 /// The shortest gap between two `pane_output` lines for one pane, in milliseconds.
 pub const PANE_OUTPUT_INTERVAL_MS: u64 = 1000;
+
+/// The shortest gap between two `pane_changed` lines for one pane, in milliseconds. Agents
+/// animate their titles, so a title can change many times a second.
+pub const PANE_CHANGED_INTERVAL_MS: u64 = 1000;
+
+/// What a `pane_changed` line says about a pane: the fields of its `list-panes --json` row, under
+/// the same names and with the same rule for when a key is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PaneDetails {
+    pub title: String,
+    pub program_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_command: Option<String>,
+    pub terminal_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_state: Option<PaneCommandState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_command_exit_code: Option<i32>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<PaneProgramStatus>,
+}
+
+impl PaneDetails {
+    fn from_entry(entry: &PaneListEntry) -> Self {
+        let info = &entry.pane_info;
+        PaneDetails {
+            title: info.title.clone(),
+            program_title: info.program_title.clone(),
+            pane_cwd: info.pane_cwd.clone(),
+            pane_command: info.pane_command.clone(),
+            terminal_command: info.terminal_command.clone(),
+            command_state: entry.command_state,
+            last_command_exit_code: entry.last_command_exit_code,
+            program_status: entry.program_status.clone(),
+        }
+    }
+
+    /// Whether a reader that holds `self` already knows `other`. `state_at` alone is not news: a
+    /// program that reports the same state again has changed nothing, as on an `agent` line.
+    fn same_as(&self, other: &PaneDetails) -> bool {
+        let without_at = |details: &PaneDetails| {
+            let mut details = details.clone();
+            if let Some(status) = details.program_status.as_mut() {
+                status.at = 0;
+            }
+            details
+        };
+        without_at(self) == without_at(other)
+    }
+}
 
 /// One tab, as the stream knows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +105,7 @@ pub struct StreamPane {
     pub exited: bool,
     pub exit_status: Option<i32>,
     pub last_output_at: Option<u64>,
+    pub details: PaneDetails,
 }
 
 /// The session at one look: what a stream compares against the last one.
@@ -84,6 +141,7 @@ impl StreamModel {
                     exited: info.exited,
                     exit_status: info.exit_status,
                     last_output_at: info.last_output_at,
+                    details: PaneDetails::from_entry(entry),
                 }
             })
             .collect();
@@ -131,6 +189,13 @@ pub enum StreamEvent {
         handle: String,
         last_output_at: u64,
     },
+    PaneChanged {
+        pane_id: String,
+        handle: String,
+        tab_id: usize,
+        #[serde(flatten)]
+        details: PaneDetails,
+    },
     TabOpened {
         tab_id: usize,
     },
@@ -167,6 +232,11 @@ struct SeenPane {
     output_reported: Option<u64>,
     /// When the stream last wrote a `pane_output` line for this pane.
     output_line_at: Option<u64>,
+    /// The tab and details the reader last heard for this pane: from a `pane_changed` line, or,
+    /// for a pane in the snapshot, from the `list-tree` read that follows it.
+    changed_reported: (usize, PaneDetails),
+    /// When the stream last wrote a `pane_changed` line for this pane.
+    changed_line_at: Option<u64>,
 }
 
 /// One subscriber's stream: its count, and what it last told its reader.
@@ -215,7 +285,7 @@ impl EventStream {
             events.push(StreamEvent::TabOpened { tab_id: tab.tab_id });
         }
         events.push(StreamEvent::Synced);
-        stream.remember(model);
+        stream.remember(model, None);
         let lines = stream.stamp(events, now_ms);
         (stream, lines)
     }
@@ -298,7 +368,35 @@ impl EventStream {
                 events.push(StreamEvent::TabClosed { tab_id: *tab_id });
             }
         }
-        // output last: it is the one kind of line that can wait for a later look
+        // details and output last: they are the kinds of line that can wait for a later look
+        for pane in &model.panes {
+            let Some(seen) = self.panes.get_mut(&pane.key) else {
+                // a pane opened after the snapshot: its details follow its `pane_opened`, so a
+                // reader that read `list-tree` once, after `synced`, never has to read it again
+                events.push(StreamEvent::PaneChanged {
+                    pane_id: pane.pane_id.clone(),
+                    handle: pane.handle.clone(),
+                    tab_id: pane.tab_id,
+                    details: pane.details.clone(),
+                });
+                continue;
+            };
+            let (reported_tab, reported) = &seen.changed_reported;
+            let changed = *reported_tab != pane.tab_id || !reported.same_as(&pane.details);
+            let due = seen.changed_line_at.map_or(true, |at| {
+                now_ms.saturating_sub(at) >= PANE_CHANGED_INTERVAL_MS
+            });
+            if changed && due {
+                seen.changed_reported = (pane.tab_id, pane.details.clone());
+                seen.changed_line_at = Some(now_ms);
+                events.push(StreamEvent::PaneChanged {
+                    pane_id: pane.pane_id.clone(),
+                    handle: pane.handle.clone(),
+                    tab_id: pane.tab_id,
+                    details: pane.details.clone(),
+                });
+            }
+        }
         for pane in &model.panes {
             let Some(output_at) = pane.last_output_at else {
                 continue;
@@ -321,12 +419,14 @@ impl EventStream {
                 });
             }
         }
-        self.remember(model);
+        self.remember(model, Some(now_ms));
         self.stamp(events, now_ms)
     }
 
-    /// Take `model` as what the reader now knows, keeping each pane's output bookkeeping.
-    fn remember(&mut self, model: &StreamModel) {
+    /// Take `model` as what the reader now knows, keeping each pane's output and details
+    /// bookkeeping. `opened_at` is when a pane new to this look had its `pane_changed` written:
+    /// none for the snapshot, which writes none.
+    fn remember(&mut self, model: &StreamModel, opened_at: Option<u64>) {
         self.tabs = model
             .tabs
             .iter()
@@ -334,20 +434,23 @@ impl EventStream {
             .collect();
         let mut panes = BTreeMap::new();
         for pane in &model.panes {
-            let (output_reported, output_line_at) = match self.panes.remove(&pane.key) {
-                Some(seen) => (seen.output_reported, seen.output_line_at),
-                // a pane is opened with whatever output it already has: only output after that
-                // is a `pane_output` line
-                None => (pane.last_output_at, None),
-            };
-            panes.insert(
-                pane.key.clone(),
-                SeenPane {
+            let seen = match self.panes.remove(&pane.key) {
+                Some(seen) => SeenPane {
                     pane: pane.clone(),
-                    output_reported,
-                    output_line_at,
+                    ..seen
                 },
-            );
+                // a pane is opened with whatever output it already has: only output after that
+                // is a `pane_output` line. Its details are the ones its `pane_changed` just
+                // said, or, in the snapshot, the ones `list-tree` says
+                None => SeenPane {
+                    pane: pane.clone(),
+                    output_reported: pane.last_output_at,
+                    output_line_at: None,
+                    changed_reported: (pane.tab_id, pane.details.clone()),
+                    changed_line_at: opened_at,
+                },
+            };
+            panes.insert(pane.key.clone(), seen);
         }
         self.panes = panes;
         self.agents = model
@@ -670,7 +773,7 @@ mod tests {
         );
         assert_eq!(
             events(&stream.advance(&opened, 1)),
-            vec!["tab_opened", "pane_opened", "agent"]
+            vec!["tab_opened", "pane_opened", "agent", "pane_changed"]
         );
         let closed = StreamModel::new(vec![tab(0, "t")], vec![]);
         assert_eq!(
@@ -683,7 +786,9 @@ mod tests {
     fn an_agent_line_is_a_change_of_identity_or_state_and_never_of_title() {
         let mut entry = pane(1, "a-b", 0, Some("claude"));
         let model = StreamModel::new(vec![tab(0, "t")], vec![entry.clone()]);
-        let (mut stream, _) = EventStream::start("ep", hello(), &model, false, 0);
+        // agents only: the `pane_changed` lines a title or state change is also worth are not
+        // what this test is about
+        let (mut stream, _) = EventStream::start("ep", hello(), &model, true, 0);
         entry.pane_info.title = "spinner frame".into();
         let look = |entry: &PaneListEntry| StreamModel::new(vec![tab(0, "t")], vec![entry.clone()]);
         assert!(
@@ -744,6 +849,159 @@ mod tests {
         assert_eq!(parse(&lines)[0]["last_output_at"], 2400);
         // nothing new: nothing said
         assert!(stream.advance(&look(&entry), 9000).is_empty());
+    }
+
+    #[test]
+    fn pane_changed_is_a_change_of_title_cwd_command_state_or_tab() {
+        let mut entry = pane(1, "a-b", 0, None);
+        entry.pane_info.pane_cwd = Some("/home".into());
+        let look = |entry: &PaneListEntry| {
+            StreamModel::new(vec![tab(0, "t"), tab(1, "u")], vec![entry.clone()])
+        };
+        let (mut stream, lines) = EventStream::start("ep", hello(), &look(&entry), false, 0);
+        // the snapshot is ids only
+        assert!(!events(&lines).contains(&"pane_changed".to_owned()));
+        // nothing changed: nothing said, however often the stream looks
+        assert!(stream.advance(&look(&entry), 1).is_empty());
+        assert!(stream.advance(&look(&entry), 5000).is_empty());
+        // a field this line does not carry is not a change
+        entry.pane_info.pane_x = 7;
+        entry.input_since_prompt = true;
+        assert!(stream.advance(&look(&entry), 5001).is_empty());
+        let mut now = 10_000;
+        let mut expect_change = |entry: &PaneListEntry, stream: &mut EventStream| {
+            let lines = stream.advance(&look(entry), now);
+            now += PANE_CHANGED_INTERVAL_MS;
+            assert_eq!(events(&lines), vec!["pane_changed"]);
+            parse(&lines).remove(0)
+        };
+        entry.pane_info.title = "renamed".into();
+        let line = expect_change(&entry, &mut stream);
+        assert_eq!(line["pane_id"], "terminal_1");
+        assert_eq!(line["handle"], "a-b");
+        assert_eq!(line["tab_id"], 0);
+        assert_eq!(line["title"], "renamed");
+        assert_eq!(line["pane_cwd"], "/home");
+        // the same rule for an absent key as `list-panes --json`
+        assert_eq!(line["program_title"], Value::Null);
+        assert_eq!(line["terminal_command"], Value::Null);
+        assert!(line.get("pane_command").is_none());
+        assert!(line.get("state").is_none());
+        entry.pane_info.program_title = Some("vim".into());
+        assert_eq!(expect_change(&entry, &mut stream)["program_title"], "vim");
+        entry.pane_info.pane_cwd = Some("/tmp".into());
+        assert_eq!(expect_change(&entry, &mut stream)["pane_cwd"], "/tmp");
+        entry.pane_info.pane_command = Some("htop".into());
+        assert_eq!(expect_change(&entry, &mut stream)["pane_command"], "htop");
+        entry.pane_info.terminal_command = Some("make test".into());
+        assert_eq!(
+            expect_change(&entry, &mut stream)["terminal_command"],
+            "make test"
+        );
+        entry.command_state = Some(PaneCommandState::Done);
+        entry.last_command_exit_code = Some(2);
+        let line = expect_change(&entry, &mut stream);
+        assert_eq!(line["command_state"], "done");
+        assert_eq!(line["last_command_exit_code"], 2);
+        entry.program_status = Some(PaneProgramStatus {
+            state: "working".into(),
+            title: Some("fix the bug".into()),
+            at: 1,
+            ..Default::default()
+        });
+        let line = expect_change(&entry, &mut stream);
+        assert_eq!(line["state"], "working");
+        assert_eq!(line["state_title"], "fix the bug");
+        assert_eq!(line["state_at"], 1);
+        // the same state reported again is not a change
+        entry.program_status.as_mut().unwrap().at = 99;
+        assert!(stream.advance(&look(&entry), 1_000_000).is_empty());
+        // a pane moved to another tab is a change, with the new tab
+        entry.pane_info.tab_id = 1;
+        assert_eq!(expect_change(&entry, &mut stream)["tab_id"], 1);
+        // a renamed handle is carried, but is not a change on its own
+        entry.pane_info.handle = "c-d".into();
+        assert!(stream.advance(&look(&entry), 1_000_000).is_empty());
+        entry.pane_info.title = "again".into();
+        assert_eq!(expect_change(&entry, &mut stream)["handle"], "c-d");
+    }
+
+    #[test]
+    fn pane_changed_is_at_most_one_line_per_pane_per_second_and_the_last_one_is_not_lost() {
+        let mut entry = pane(1, "a-b", 0, None);
+        let other_entry = pane(2, "c-d", 0, None);
+        let look = |entry: &PaneListEntry, other: &PaneListEntry| {
+            StreamModel::new(vec![tab(0, "t")], vec![entry.clone(), other.clone()])
+        };
+        let (mut stream, lines) =
+            EventStream::start("ep", hello(), &look(&entry, &other_entry), false, 1000);
+        let mut seqs: Vec<u64> = parse(&lines)
+            .iter()
+            .map(|v| v["seq"].as_u64().unwrap())
+            .collect();
+        let mut said = Vec::new();
+        let mut advance = |stream: &mut EventStream, model: &StreamModel, at: u64| {
+            let lines = stream.advance(model, at);
+            seqs.extend(parse(&lines).iter().map(|v| v["seq"].as_u64().unwrap()));
+            said.extend(parse(&lines));
+            lines
+        };
+        // the first change after a quiet second is said at once
+        entry.pane_info.title = "frame 1".into();
+        let lines = advance(&mut stream, &look(&entry, &other_entry), 1100);
+        assert_eq!(parse(&lines)[0]["title"], "frame 1");
+        // an animated title inside the second: held back
+        for (at, frame) in [(1200, "frame 2"), (1500, "frame 3"), (2000, "frame 4")] {
+            entry.pane_info.title = frame.into();
+            assert!(advance(&mut stream, &look(&entry, &other_entry), at).is_empty());
+        }
+        // another pane is not held back by this one's limit
+        let mut other = other_entry.clone();
+        other.pane_info.title = "other".into();
+        let lines = advance(&mut stream, &look(&entry, &other), 2050);
+        assert_eq!(events(&lines), vec!["pane_changed"]);
+        assert_eq!(parse(&lines)[0]["pane_id"], "terminal_2");
+        // the title stopped; the stream's tick after the second says the newest frame
+        let lines = advance(&mut stream, &look(&entry, &other), 2100);
+        assert_eq!(events(&lines), vec!["pane_changed"]);
+        assert_eq!(parse(&lines)[0]["title"], "frame 4");
+        assert_eq!(parse(&lines)[0]["ts"], 2100);
+        // nothing new: nothing said
+        assert!(advance(&mut stream, &look(&entry, &other), 9000).is_empty());
+        // a change that is undone inside the second is no change at all
+        entry.pane_info.title = "frame 5".into();
+        advance(&mut stream, &look(&entry, &other), 9100);
+        entry.pane_info.title = "frame 6".into();
+        advance(&mut stream, &look(&entry, &other), 9200);
+        entry.pane_info.title = "frame 5".into();
+        assert!(advance(&mut stream, &look(&entry, &other), 10_200).is_empty());
+        assert_eq!(said.len(), 4);
+        let expected: Vec<u64> = (0..seqs.len() as u64).collect();
+        assert_eq!(seqs, expected);
+    }
+
+    #[test]
+    fn a_pane_opened_after_the_snapshot_is_followed_by_its_details() {
+        let model = StreamModel::new(vec![tab(0, "t")], vec![]);
+        let (mut stream, _) = EventStream::start("ep", hello(), &model, false, 0);
+        let mut entry = pane(4, "a-b", 0, None);
+        entry.pane_info.pane_cwd = Some("/srv".into());
+        let look = |entry: &PaneListEntry| StreamModel::new(vec![tab(0, "t")], vec![entry.clone()]);
+        let lines = stream.advance(&look(&entry), 10);
+        assert_eq!(events(&lines), vec!["pane_opened", "pane_changed"]);
+        let parsed = parse(&lines);
+        // `pane_opened` stays ids only
+        assert!(parsed[0].get("title").is_none());
+        assert_eq!(parsed[1]["pane_cwd"], "/srv");
+        assert_eq!(parsed[1]["title"], "title");
+        // the line it opened with counts towards the limit
+        entry.pane_info.title = "prompt".into();
+        assert!(stream.advance(&look(&entry), 500).is_empty());
+        let lines = stream.advance(&look(&entry), 1010);
+        assert_eq!(parse(&lines)[0]["title"], "prompt");
+        // `list-agents --watch` never sees one
+        let (mut agents, _) = EventStream::start("ep", hello(), &model, true, 0);
+        assert!(agents.advance(&look(&entry), 10).is_empty());
     }
 
     #[test]
