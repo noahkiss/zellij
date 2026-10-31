@@ -9,8 +9,8 @@ version.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-zellij-client = { path = "../zellij-client", version = "0.45.1-nkmk.39" }
-zellij-server = { path = "../zellij-server", version = "0.45.1-nkmk.39" }
+zellij-client = { path = "../zellij-client", version = "0.45.1-nkmk.40" }
+zellij-server = { path = "../zellij-server", version = "0.45.1-nkmk.40" }
 zellij-utils = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
