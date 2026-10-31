@@ -101,6 +101,7 @@ pub const CAPABILITIES: &[&str] = &[
     "mcp-agent-surfaces", // agents prompt and zellij://agents resource
     "mcp-agent-input-hint", // named agent guidance after zellij_write_input
     "mcp-remote-hosts", // zellij mcp: remote_hosts in config.kdl, host/session, scope=fleet
+    "action-watch", // action watch --json: the server-pushed event stream; list-agents --watch rides it
 ];
 
 /// The version, split into the parts that can actually be compared.

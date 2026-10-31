@@ -39,7 +39,10 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::route::NotificationEnd;
 
 use log::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use zellij_utils::agent_detect::{self, PaneAgent};
+use zellij_utils::event_stream::{EventStream, StreamEvent, StreamModel, StreamTab};
 
 use crate::closed_panes::{ClosedPane, ClosedPaneKind, ClosedPanes, ClosingPane};
 use zellij_utils::data::{
@@ -1034,6 +1037,13 @@ pub enum ScreenInstruction {
     NotifyPaneClosedToSubscribers {
         pane_id: zellij_utils::data::PaneId,
     },
+    /// fork addition: `zellij action watch` - start a session event stream for this client.
+    SubscribeToSessionEvents {
+        client_id: ClientId,
+        agents_only: bool,
+    },
+    /// fork addition: the event stream's own tick, while it has a subscriber.
+    SessionEventTick,
     DesktopNotificationResponse(Vec<u8>, ClientId),
     UpdateBackgroundPluginSubscriptions(PluginId, ClientId, HashSet<EventType>),
     RemoveBackgroundPluginSubscriptions(PluginId),
@@ -1425,6 +1435,10 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::NotifyPaneClosedToSubscribers { .. } => {
                 ScreenContext::NotifyPaneClosedToSubscribers
             },
+            ScreenInstruction::SubscribeToSessionEvents { .. } => {
+                ScreenContext::SubscribeToSessionEvents
+            },
+            ScreenInstruction::SessionEventTick => ScreenContext::SessionEventTick,
             ScreenInstruction::UpdateBackgroundPluginSubscriptions(..) => {
                 ScreenContext::UpdateBackgroundPluginSubscriptions
             },
@@ -1788,6 +1802,14 @@ pub(crate) struct Screen {
     cached_layouts: Vec<LayoutInfo>,
     cached_layout_errors: Vec<LayoutWithError>,
     pane_render_subscribers: HashMap<ClientId, PaneRenderSubscription>,
+    /// fork addition: `zellij action watch`, one stream per subscribed client.
+    session_event_streams: HashMap<ClientId, EventStream>,
+    /// New for every server, on every line of every stream.
+    session_event_epoch: String,
+    /// When the streams last looked at the session, for the render path's rate limit.
+    session_event_last_look: Option<Instant>,
+    /// Cleared to stop the tick thread once the last stream is gone.
+    session_event_ticker: Option<Arc<AtomicBool>>,
     background_plugin_subscriptions: HashMap<(PluginId, ClientId), HashSet<EventType>>,
     next_forward_token: u32,
     pending_forwarded_queries: HashMap<u32, PendingForwardEntry>,
@@ -2101,6 +2123,10 @@ impl Screen {
             cached_layouts: vec![],
             cached_layout_errors: vec![],
             pane_render_subscribers: HashMap::new(),
+            session_event_streams: HashMap::new(),
+            session_event_epoch: zellij_utils::event_stream::new_epoch(),
+            session_event_last_look: None,
+            session_event_ticker: None,
             background_plugin_subscriptions: HashMap::new(),
             next_forward_token: 1, // 0 is reserved as the startup sentinel
             pending_forwarded_queries: HashMap::new(),
@@ -5729,6 +5755,7 @@ impl Screen {
         }
         self.client_sizes.remove(&client_id);
         self.pane_render_subscribers.remove(&client_id);
+        self.drop_session_event_stream(client_id);
         self.client_host_focused.remove(&client_id);
         self.client_notification_protocols.remove(&client_id);
         self.client_progress.remove(&client_id);
@@ -5988,6 +6015,8 @@ impl Screen {
                 .send_to_plugin(PluginInstruction::Update(plugin_updates))
                 .context("failed to update pane state")?;
         }
+        // whatever changed the manifest is news for a watch too, and is told at once
+        self.look_for_session_events(true);
 
         Ok(pane_manifest)
     }
@@ -9565,6 +9594,131 @@ impl Screen {
             self.pane_render_subscribers.remove(&id);
         }
     }
+    /// What a session event stream compares: the tabs, and the pane list `list-panes` answers
+    /// with, after the pane privacy policy. A withheld pane is never on the stream.
+    fn session_event_model(&self) -> StreamModel {
+        let mut tabs: Vec<&Tab> = self.tabs.values().collect();
+        tabs.sort_by_key(|tab| tab.position);
+        let tabs = tabs
+            .into_iter()
+            .map(|tab| StreamTab {
+                tab_id: tab.id,
+                name: tab.name.clone(),
+            })
+            .collect();
+        let panes = self.collect_pane_list(false).unwrap_or_default();
+        let (panes, _withheld) = crate::pane_privacy_policy().filter(panes);
+        StreamModel::new(tabs, panes)
+    }
+    /// `zellij action watch`: the first lines of a new stream, and the stream kept for later.
+    fn subscribe_to_session_events(&mut self, client_id: ClientId, agents_only: bool) {
+        let server_build_id = zellij_utils::session_lifecycle::own_executable()
+            .and_then(|identity| identity.build_id)
+            .map(|id| id.iter().map(|byte| format!("{:02x}", byte)).collect());
+        let hello = StreamEvent::Hello {
+            server_version: zellij_utils::consts::VERSION.to_owned(),
+            server_build_id,
+            session: self.session_name.clone(),
+        };
+        let model = self.session_event_model();
+        let (stream, lines) = EventStream::start(
+            &self.session_event_epoch,
+            hello,
+            &model,
+            agents_only,
+            zellij_utils::event_stream::now_ms(),
+        );
+        if !self.send_session_event_lines(client_id, lines) {
+            return;
+        }
+        self.session_event_streams.insert(client_id, stream);
+        self.session_event_last_look = Some(Instant::now());
+        self.start_session_event_ticker();
+    }
+    /// Look at the session for every stream, and send each the lines its difference is worth.
+    ///
+    /// `now` is false on the render path, which can run many times a second under output: there a
+    /// look is skipped if the last one was under 100ms ago, and the tick picks it up instead.
+    fn look_for_session_events(&mut self, now: bool) {
+        if self.session_event_streams.is_empty() {
+            return;
+        }
+        if !now
+            && self
+                .session_event_last_look
+                .map_or(false, |at| at.elapsed() < Duration::from_millis(100))
+        {
+            return;
+        }
+        self.session_event_last_look = Some(Instant::now());
+        let model = self.session_event_model();
+        let now_ms = zellij_utils::event_stream::now_ms();
+        let mut outgoing = Vec::new();
+        for (client_id, stream) in self.session_event_streams.iter_mut() {
+            let lines = stream.advance(&model, now_ms);
+            if !lines.is_empty() {
+                outgoing.push((*client_id, lines));
+            }
+        }
+        for (client_id, lines) in outgoing {
+            if !self.send_session_event_lines(client_id, lines) {
+                self.drop_session_event_stream(client_id);
+            }
+        }
+    }
+    /// Send lines to a stream's client, in order. False when the client is gone.
+    ///
+    /// A client that is behind has its lines buffered, never dropped: a stream that skipped a line
+    /// would break the promise that `seq` has no gaps.
+    fn send_session_event_lines(&self, client_id: ClientId, lines: Vec<String>) -> bool {
+        let Some(os_input) = &self.bus.os_input else {
+            return true;
+        };
+        for line in lines {
+            if os_input
+                .send_to_client(client_id, ServerToClientMsg::SessionEvent { line })
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+    fn drop_session_event_stream(&mut self, client_id: ClientId) {
+        self.session_event_streams.remove(&client_id);
+        if self.session_event_streams.is_empty() {
+            if let Some(running) = self.session_event_ticker.take() {
+                running.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+    /// The tick that makes a look happen when nothing else does: the trailing `pane_output` line
+    /// of a pane that went quiet, and a change the render path's rate limit put off. It runs only
+    /// while a stream does.
+    fn start_session_event_ticker(&mut self) {
+        if self.session_event_ticker.is_some() {
+            return;
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        self.session_event_ticker = Some(running.clone());
+        let senders = self.bus.senders.clone();
+        let _ = std::thread::Builder::new()
+            .name("session_event_tick".to_owned())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if senders
+                        .send_to_screen(ScreenInstruction::SessionEventTick)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+    }
     fn notify_pane_closed_to_subscribers(&mut self, pane_id: zellij_utils::data::PaneId) {
         let mut dead_subscribers = Vec::new();
 
@@ -9970,6 +10124,8 @@ pub(crate) fn screen_thread_main(
             } => {
                 screen.pane_process_info = process_info;
                 screen.detect_agents = detect_agents;
+                // an agent's identity comes from here, so a watch looks at once
+                screen.look_for_session_events(true);
                 let names: Vec<_> = screen
                     .tabs
                     .values()
@@ -10078,6 +10234,7 @@ pub(crate) fn screen_thread_main(
                 // that a 100ms timeout has been reached (more info in the RenderBlocker comment)
                 if screen.render_blocker.can_render() {
                     screen.render_to_clients()?;
+                    screen.look_for_session_events(false);
                 } else {
                     screen.render(None)?;
                 }
@@ -14828,6 +14985,15 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::NotifyPaneClosedToSubscribers { pane_id } => {
                 screen.notify_pane_closed_to_subscribers(pane_id);
+            },
+            ScreenInstruction::SubscribeToSessionEvents {
+                client_id,
+                agents_only,
+            } => {
+                screen.subscribe_to_session_events(client_id, agents_only);
+            },
+            ScreenInstruction::SessionEventTick => {
+                screen.look_for_session_events(true);
             },
             ScreenInstruction::UpdateBackgroundPluginSubscriptions(
                 plugin_id,

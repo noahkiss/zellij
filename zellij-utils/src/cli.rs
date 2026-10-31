@@ -1370,6 +1370,23 @@ pub enum CliAction {
         #[clap(long)]
         json: bool,
     },
+    /// Keep running, and print one JSON line for every change the session makes
+    ///
+    /// The server pushes the lines as the changes happen. Every line carries `event`, `seq`
+    /// (counted from 0 with no gaps), `epoch` (new for every server start) and `ts` (ms since the
+    /// Unix epoch). The first line is `hello` (server_version, server_build, session), then one
+    /// `agent` line per agent, one `pane_opened` per pane and one `tab_opened` per tab, then
+    /// `synced`. After that: agent, gone, pane_opened, pane_exited, pane_closed, pane_output,
+    /// tab_opened, tab_closed and tab_renamed. Every pane line carries `pane_id` and `handle`.
+    ///
+    /// Returns: JSON lines until the reader closes the pipe (exit 0) or the session goes away
+    /// (exit 2). Exit 2 at once, with the reason on stderr, when the session's server predates
+    /// this command.
+    Watch {
+        /// Output as JSON. The only format: accepted so that `--json` is never an error
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// Bring back a pane that was closed lately
     ///
     /// The session remembers its last 10 closed terminal panes, in memory only - a restart
@@ -2730,7 +2747,9 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
 
         /// Keep running, and print one JSON line whenever an agent appears, changes state or
         /// identity, or goes: {"event": "agent", ...row} or {"event": "gone", ...}. The first
-        /// lines are every agent there is now. The session is asked again every --interval-ms
+        /// lines are every agent there is now. One session is pushed by its server, each line
+        /// with seq, epoch and ts; --all-sessions, --changes-only and an older server are asked
+        /// again every --interval-ms
         #[clap(long, value_parser)]
         watch: bool,
         /// With --watch, omit the initial agents and print changes as NDJSON.
@@ -3158,6 +3177,7 @@ impl CliAction {
             | CliAction::ListTree { json, .. }
             | CliAction::ListClients { json, .. }
             | CliAction::ListEvents { json, .. }
+            | CliAction::Watch { json }
             | CliAction::ListAgents { json, .. }
             | CliAction::Whoami { json, .. }
             | CliAction::LastReply { json, .. }

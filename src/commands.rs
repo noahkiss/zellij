@@ -1277,6 +1277,16 @@ fn attach_with_cli_client(
         );
         std::process::exit(exit_status);
     }
+    // `watch` never becomes an action: it is a stream the server pushes down its own connection
+    if let zellij_utils::cli::CliAction::Watch { .. } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_watch_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+        );
+        std::process::exit(exit_status);
+    }
     if let zellij_utils::cli::CliAction::Whoami { json } = &cli_action {
         let exit_status = zellij_client::cli_client::start_whoami_client(
             Box::new(get_os_input(

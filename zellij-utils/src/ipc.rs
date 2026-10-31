@@ -252,6 +252,11 @@ pub enum ClientToServerMsg {
     HostTerminalFocusChanged {
         focused: bool,
     },
+    /// fork addition: `zellij action watch`. The server answers with `SessionEvent` lines on this
+    /// connection until it goes away. `agents_only` is `list-agents --watch`.
+    SubscribeToSessionEvents {
+        agents_only: bool,
+    },
 }
 
 // Types of messages sent from the server to the client
@@ -309,6 +314,10 @@ pub enum ServerToClientMsg {
     },
     MobileState {
         payload: MobileStatePayload,
+    },
+    /// fork addition: one line of `zellij action watch`, a JSON object the server wrote.
+    SessionEvent {
+        line: String,
     },
 }
 

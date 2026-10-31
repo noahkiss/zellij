@@ -24,6 +24,8 @@ message ServerToClientMsg {
     SetSoftKeyboardMsg set_soft_keyboard = 17;
     EmitNestedSessionFrameMsg emit_nested_session_frame = 18;
     MobileStateMsg mobile_state = 19;
+    // fork addition: one line of `zellij action watch`
+    SessionEventMsg session_event = 20;
   }
 }
 
@@ -146,6 +148,11 @@ message MobileRenderPrefsMsg {
   bool single_pane = 1;
   bool fit = 2;
   bool active_pane_is_fullscreen = 3;
+}
+
+// fork addition: one JSON object, written by the server, carrying seq, epoch and ts.
+message SessionEventMsg {
+  string line = 1;
 }
 
 message MobileStateMsg {

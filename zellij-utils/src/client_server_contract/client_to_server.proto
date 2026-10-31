@@ -32,6 +32,8 @@ message ClientToServerMsg {
     RequestSessionListMsg request_session_list = 25;
     SetMobileRenderPreferencesMsg set_mobile_render_preferences = 26;
     HostTerminalFocusChangedMsg host_terminal_focus_changed = 27;
+    // fork addition: `zellij action watch`, the session's changes pushed as JSON lines
+    SubscribeToSessionEventsMsg subscribe_to_session_events = 28;
   }
 }
 
@@ -158,6 +160,13 @@ message SixelSupportMsg {
 
 message RequestSessionListMsg {
   // Empty message
+}
+
+// fork addition: start a session event stream on this connection. The server answers with
+// SessionEventMsg lines; a server that predates it ignores the message, so the client times out.
+message SubscribeToSessionEventsMsg {
+  // only the hello, agent, gone and synced lines: `list-agents --watch`
+  bool agents_only = 1;
 }
 
 message SetMobileRenderPreferencesMsg {

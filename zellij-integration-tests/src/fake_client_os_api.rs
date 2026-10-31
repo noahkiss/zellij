@@ -36,6 +36,7 @@ fn server_message_name(msg: &ServerToClientMsg) -> String {
         ServerToClientMsg::ForwardQueryToHost { .. } => "ForwardQueryToHost",
         ServerToClientMsg::MobileState { .. } => "MobileState",
         ServerToClientMsg::EmitNestedSessionFrame { .. } => "EmitNestedSessionFrame",
+        ServerToClientMsg::SessionEvent { .. } => "SessionEvent",
     }
     .to_string()
 }

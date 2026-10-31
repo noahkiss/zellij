@@ -47,6 +47,8 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
             // and this one changes nothing. It is also why the audit ring does not record it
             "wait",
+            // a stream of what changed, which changes nothing itself
+            "watch",
             "whoami",
         ],
     },
@@ -376,6 +378,11 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "subscribe",
         shape: "payload",
         keys: "",
+    },    // a stream of JSON lines, one object per change, until the reader or the session goes
+    OutputSpec {
+        command: "action watch",
+        shape: "payload",
+        keys: "",
     },
 ];
 
@@ -415,7 +422,7 @@ How every one of these answers:
     a release may add one, never rename or remove one.
   * `--json` carries the same information, structured. Listing and context verbs also take it after their name:
     `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents`,
-    `current-tab-info`, `last-reply` and `whoami`. Every verb that reports a record takes it BEFORE the verb, as
+    `current-tab-info`, `last-reply`, `watch` and `whoami`. Every verb that reports a record takes it BEFORE the verb, as
     `zellij action --json close-pane --pane-id sunny-otter`, which answers `{\"closed\":
     \"terminal_3\"}`. For those listing and context verbs the two positions are the same call. A verb that reports
     nothing answers `{}`; `dump-screen` and `dump-layout` print a payload and refuse the flag.

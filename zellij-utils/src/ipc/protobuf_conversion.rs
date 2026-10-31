@@ -16,12 +16,12 @@ use crate::{
         MobilePaneMsg, MobileRenderPrefsMsg, MobileSessionMsg, MobileSizeMsg, MobileStateMsg,
         MobileTabMsg, NestedSessionFrameFromHostMsg, PaneMetadata as ProtoPaneMetadata,
         PaneRenderUpdateMsg, QueryTerminalSizeMsg, RenamedSessionMsg, RenderMsg,
-        RequestSessionListMsg, ServerToClientMsg as ProtoServerToClientMsg,
+        RequestSessionListMsg, ServerToClientMsg as ProtoServerToClientMsg, SessionEventMsg,
         SetMobileRenderPreferencesMsg, SetSoftKeyboardMsg, SixelSupportMsg,
         SoftKeyboardVisibilityChangedMsg, StartWebServerMsg, SubscribeToPaneRendersMsg,
-        SubscribedPaneClosedMsg, SwitchSessionMsg, TabMetadata as ProtoTabMetadata,
-        TerminalPixelDimensionsMsg, TerminalResizeMsg, UnblockCliPipeInputMsg,
-        UnblockInputThreadMsg, WebServerStartedMsg,
+        SubscribeToSessionEventsMsg, SubscribedPaneClosedMsg, SwitchSessionMsg,
+        TabMetadata as ProtoTabMetadata, TerminalPixelDimensionsMsg, TerminalResizeMsg,
+        UnblockCliPipeInputMsg, UnblockInputThreadMsg, WebServerStartedMsg,
     },
     data::{HostTerminalThemeMode, InputMode, PaneId},
     errors::prelude::*,
@@ -185,6 +185,11 @@ impl From<ClientToServerMsg> for ProtoClientToServerMsg {
             ClientToServerMsg::HostTerminalFocusChanged { focused } => {
                 client_to_server_msg::Message::HostTerminalFocusChanged(
                     HostTerminalFocusChangedMsg { focused },
+                )
+            },
+            ClientToServerMsg::SubscribeToSessionEvents { agents_only } => {
+                client_to_server_msg::Message::SubscribeToSessionEvents(
+                    SubscribeToSessionEventsMsg { agents_only },
                 )
             },
         };
@@ -364,6 +369,11 @@ impl TryFrom<ProtoClientToServerMsg> for ClientToServerMsg {
                     focused: msg.focused,
                 })
             },
+            Some(client_to_server_msg::Message::SubscribeToSessionEvents(msg)) => {
+                Ok(ClientToServerMsg::SubscribeToSessionEvents {
+                    agents_only: msg.agents_only,
+                })
+            },
             None => Err(anyhow!("Empty ClientToServerMsg message")),
         }
     }
@@ -462,6 +472,9 @@ impl From<ServerToClientMsg> for ProtoServerToClientMsg {
             },
             ServerToClientMsg::MobileState { payload } => {
                 server_to_client_msg::Message::MobileState(mobile_state_payload_to_proto(payload))
+            },
+            ServerToClientMsg::SessionEvent { line } => {
+                server_to_client_msg::Message::SessionEvent(SessionEventMsg { line })
             },
         };
 
@@ -708,6 +721,9 @@ impl TryFrom<ProtoServerToClientMsg> for ServerToClientMsg {
                 Ok(ServerToClientMsg::MobileState {
                     payload: mobile_state_payload_from_proto(msg),
                 })
+            },
+            Some(server_to_client_msg::Message::SessionEvent(msg)) => {
+                Ok(ServerToClientMsg::SessionEvent { line: msg.line })
             },
             None => Err(anyhow!("Empty ServerToClientMsg message")),
         }

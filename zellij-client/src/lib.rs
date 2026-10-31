@@ -250,6 +250,7 @@ impl From<ServerToClientMsg> for ClientInstruction {
             ServerToClientMsg::SubscribedPaneClosed { .. } => ClientInstruction::UnblockInputThread,
             ServerToClientMsg::SetSoftKeyboard { .. } => ClientInstruction::UnblockInputThread,
             ServerToClientMsg::MobileState { .. } => ClientInstruction::UnblockInputThread,
+            ServerToClientMsg::SessionEvent { .. } => ClientInstruction::UnblockInputThread,
         }
     }
 }

@@ -2383,6 +2383,11 @@ impl Action {
             CliAction::ListAgents { .. } => {
                 Err("`list-agents` is run by the client, not sent as an action".into())
             },
+            // `watch` is a stream on its own connection, opened by the client with
+            // `SubscribeToSessionEvents` rather than an action
+            CliAction::Watch { .. } => {
+                Err("`watch` is run by the client, not sent as an action".into())
+            },
             // `last-reply` reads a file on this machine, found from the `list-panes` answer. The
             // session has nothing to add, so it is the client's, like `list-agents`
             CliAction::LastReply { .. } => {

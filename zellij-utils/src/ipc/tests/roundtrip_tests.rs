@@ -3655,6 +3655,8 @@ fn test_client_messages() {
     });
     test_client_roundtrip!(ClientToServerMsg::HostTerminalFocusChanged { focused: true });
     test_client_roundtrip!(ClientToServerMsg::HostTerminalFocusChanged { focused: false });
+    test_client_roundtrip!(ClientToServerMsg::SubscribeToSessionEvents { agents_only: true });
+    test_client_roundtrip!(ClientToServerMsg::SubscribeToSessionEvents { agents_only: false });
     test_client_roundtrip!(ClientToServerMsg::WebServerStarted {
         base_url: "http://localhost:8080".to_string(),
     });
@@ -4167,6 +4169,9 @@ fn test_server_messages() {
     });
     test_server_roundtrip!(ServerToClientMsg::SetSoftKeyboard { on: true });
     test_server_roundtrip!(ServerToClientMsg::SetSoftKeyboard { on: false });
+    test_server_roundtrip!(ServerToClientMsg::SessionEvent {
+        line: r#"{"event":"synced","seq":3,"epoch":"ab","ts":1}"#.to_string(),
+    });
     test_server_roundtrip!(ServerToClientMsg::MobileState {
         payload: MobileStatePayload {
             session_name: String::new(),

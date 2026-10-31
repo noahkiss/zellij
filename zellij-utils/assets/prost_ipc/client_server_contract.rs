@@ -3336,7 +3336,7 @@ impl PaneSignal {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientToServerMsg {
-    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27")]
+    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28")]
     pub message: ::core::option::Option<client_to_server_msg::Message>,
 }
 /// Nested message and enum types in `ClientToServerMsg`.
@@ -3398,6 +3398,9 @@ pub mod client_to_server_msg {
         SetMobileRenderPreferences(super::SetMobileRenderPreferencesMsg),
         #[prost(message, tag="27")]
         HostTerminalFocusChanged(super::HostTerminalFocusChangedMsg),
+        /// fork addition: `zellij action watch`, the session's changes pushed as JSON lines
+        #[prost(message, tag="28")]
+        SubscribeToSessionEvents(super::SubscribeToSessionEventsMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3582,6 +3585,15 @@ pub struct SixelSupportMsg {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RequestSessionListMsg {
 }
+/// fork addition: start a session event stream on this connection. The server answers with
+/// SessionEventMsg lines; a server that predates it ignores the message, so the client times out.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SubscribeToSessionEventsMsg {
+    /// only the hello, agent, gone and synced lines: `list-agents --watch`
+    #[prost(bool, tag="1")]
+    pub agents_only: bool,
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetMobileRenderPreferencesMsg {
@@ -3619,7 +3631,7 @@ impl HostTerminalThemeIndication {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerToClientMsg {
-    #[prost(oneof="server_to_client_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19")]
+    #[prost(oneof="server_to_client_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20")]
     pub message: ::core::option::Option<server_to_client_msg::Message>,
 }
 /// Nested message and enum types in `ServerToClientMsg`.
@@ -3665,6 +3677,9 @@ pub mod server_to_client_msg {
         EmitNestedSessionFrame(super::EmitNestedSessionFrameMsg),
         #[prost(message, tag="19")]
         MobileState(super::MobileStateMsg),
+        /// fork addition: one line of `zellij action watch`
+        #[prost(message, tag="20")]
+        SessionEvent(super::SessionEventMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3855,6 +3870,13 @@ pub struct MobileRenderPrefsMsg {
     pub fit: bool,
     #[prost(bool, tag="3")]
     pub active_pane_is_fullscreen: bool,
+}
+/// fork addition: one JSON object, written by the server, carrying seq, epoch and ts.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SessionEventMsg {
+    #[prost(string, tag="1")]
+    pub line: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

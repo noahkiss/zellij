@@ -3751,6 +3751,17 @@ pub(crate) fn route_thread_main(
                                 retry_queue
                             );
                         },
+                        ClientToServerMsg::SubscribeToSessionEvents { agents_only } => {
+                            let _ = send_to_screen_or_retry_queue!(
+                                senders,
+                                ScreenInstruction::SubscribeToSessionEvents {
+                                    client_id,
+                                    agents_only,
+                                },
+                                instruction,
+                                retry_queue
+                            );
+                        },
                         ClientToServerMsg::SoftKeyboardVisibilityChanged { visible } => {
                             if let Some(senders) = senders.as_ref() {
                                 let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(

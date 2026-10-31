@@ -521,7 +521,7 @@ pub type AgentWatchKey = (Option<String>, u32);
 /// The identity and the state, not the whole row. The title is left out on purpose: several
 /// harnesses animate it, and a watch that printed every spinner frame would bury the change a
 /// reader is waiting for.
-fn watched_part(agent: &AgentListEntry) -> String {
+pub(crate) fn watched_part(agent: &AgentListEntry) -> String {
     serde_json::to_string(&(
         &agent.handle,
         &agent.agent.kind,

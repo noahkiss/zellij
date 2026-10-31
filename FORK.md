@@ -1060,7 +1060,9 @@ was *born* with, because the chosen name is given to it a moment later, by the c
 report. The `set-pane-note` or the `close-pane` that comes after says `build`.
 
 This is a ring, not a log: it is bounded, it is in memory, nothing about it is written to disk, and
-it is gone when the server stops. It is for the question you are asking now.
+it is gone when the server stops. It is for the question you are asking now. A consumer that follows
+the session as it changes reads [`zellij action watch`](#zellij-action-watch-the-session-pushes-its-changes)
+instead: its `seq` and `epoch` say whether a line was missed or the server restarted.
 
 ### `reopen-pane`: bring back a pane closed by mistake
 
@@ -5638,16 +5640,98 @@ It combines with `--all-sessions`, which re-reads the live sessions on every loo
 starts or ends shows up as its agents coming or going. A one-session watch ends with exit 2 when its
 session stops answering. Any watch ends with exit 0 when its reader closes the pipe.
 
-**The push is in the client.** A watch asks the same `list-panes --json` every `--interval-ms`
-(default 1000, at least 100) and prints the difference. That is one pane-list build per session per
-second on the server. It adds no `Action`, no server-side subscription and nothing to the
-client/server contract, which a server-pushed agent event would have needed. The cost is latency:
-a state change reaches the reader within one interval, not at once.
+**Where the push is.** A one-session watch without `--changes-only` rides the server's event
+stream (see [`zellij action watch`](#zellij-action-watch-the-session-pushes-its-changes)): the
+server sends each `agent` and `gone` line as the change happens, and every line gains `seq`,
+`epoch` and `ts`. `seq` counts the stream's own `hello` and `synced` lines, which `list-agents`
+does not print, so the printed numbers skip `0` and the one after the snapshot. A reader that needs gap-free numbering reads `action watch`. Against a server that predates the
+stream, the watch says so on stderr and falls back to the poll below.
+
+`--all-sessions` and `--changes-only` stay a poll in the client: the watch asks the same
+`list-panes --json` every `--interval-ms` (default 1000, at least 100) and prints the difference.
+An all-sessions watch has to notice sessions starting and ending, which only a scan of the socket
+directory tells it, and `--changes-only` enriches each change from the screen and the transcript,
+which the server does not do.
 
 `AgentListEntry` gains `session`, absent outside these two modes. Still CLI-only: no protobuf tag,
 no plugin API.
 
 Capabilities: `list-agents-all-sessions`, `list-agents-watch`.
+
+### `zellij action watch`: the session pushes its changes
+
+```
+$ zellij action watch --json
+{"event":"hello","server_version":"0.45.1-nkmk.39","server_build_id":"9f3c...","session":"work","seq":0,"epoch":"5be1c0a2d4f7e913","ts":1761900000000,"server_build":"same"}
+{"event":"agent","self":false,"handle":"sunny-otter","pane_id":3,...,"seq":1,...}
+{"event":"pane_opened","pane_id":"terminal_3","handle":"sunny-otter","tab_id":0,"seq":2,...}
+{"event":"tab_opened","tab_id":0,"seq":3,...}
+{"event":"synced","seq":4,...}
+{"event":"pane_output","pane_id":"terminal_3","handle":"sunny-otter","last_output_at":1761900001234,"seq":5,...}
+{"event":"pane_exited","pane_id":"terminal_5","handle":"calm-fox","exit_status":1,"seq":6,...}
+```
+
+A controller that drives zellij over the CLI, locally or over ssh, had to poll: `list-tree` for the
+shape of the session, `list-agents` for its agents, `list-panes` for output. This is one
+long-lived command the server writes to as things change, one JSON object per line.
+
+- **Every line** carries `seq`, `epoch` and `ts`. `seq` counts this stream's lines from 0, with no
+  gaps. `epoch` is a random id that is new each time a server starts, so a reader that reconnects
+  knows whether `seq` restarted because the server did. `ts` is milliseconds since the Unix epoch.
+- **First comes the snapshot.** `hello` (`server_version`, `server_build_id`, `session`, and
+  `server_build`: `same`, `different` or `unknown` against the binary reading it), then one `agent`
+  line per agent, one `pane_opened` line per pane, one `tab_opened` line per tab, then `synced`. A
+  reader needs no separate first call.
+- **`agent`** carries the whole `list-agents --json` row; **`gone`** (`pane_id`, `handle`) drops
+  it. The change filter is `list-agents --watch`'s: identity (`handle`, `kind`, `agent_id`, `name`)
+  or any `state` key. A title change is not a change. A handle renamed under a live agent is a
+  `gone` for the old handle and an `agent` for the new one.
+- **Pane lines are ids only**: `pane_opened` (`pane_id`, `handle`, `tab_id`), `pane_exited`
+  (`exit_status`, null when killed by a signal or unreadable), `pane_closed`. The reader re-reads
+  `list-tree` for the rest. **`handle` is on every pane line**, closed and exited included. A pane
+  is identified across looks by its uuid, so a reused id is a close and an open, never a
+  continuation. A pane whose handle is renamed keeps its identity and carries the new handle on
+  its later lines; there is no rename line.
+- **Tab lines**: `tab_opened`, `tab_closed`, `tab_renamed` (`name`). `tab_id` is the stable id,
+  not the position.
+- **`pane_output`** (`pane_id`, `handle`, `last_output_at`) says a pane produced output: at most
+  one line per pane per second, and the newest output is never lost. A burst inside the second is
+  reported once the second has passed, by the stream's own tick. Output from before the stream
+  started is not reported.
+- **Order inside one change**: a tab opens before its panes, a pane opens before its agent, an
+  agent's `gone` comes before its pane closes, a pane closes before its tab.
+- **A pane privacy policy** applies: a withheld pane is never on the stream, exactly as it is
+  never in `list-panes`.
+- **Exit 0** when the reader closes the pipe, noticed even on a quiet session (the client asks its
+  stdout every half second). **Exit 2** when the session goes away. **Exit 2 at once**, within five
+  seconds and with the reason on stderr, against a server that predates the command.
+
+**How the server knows.** Nothing new is tracked. The server builds the same pane list
+`list-panes` answers with, after the privacy policy, and the agents `list-agents` projects from
+it, and each stream remembers what it last told its reader and sends the difference. It looks when
+the pane manifest is reported to plugins (every open, close, exit, move and rename), when the pty
+reports new process information (an agent's identity), after a render (OSC 7501 state and
+output), at most once per 100ms there, and on a 250ms tick that runs only while a stream exists.
+A session nobody watches pays one empty-map check per render. `pane_output` costs nothing on the
+render path: the per-pane output stamp already existed for `last_output_at`.
+
+**The contract.** Two messages, appended, nothing renumbered:
+
+| Direction | Message | Tag | Fields |
+|---|---|---|---|
+| client to server | `SubscribeToSessionEventsMsg subscribe_to_session_events` | 28 | `bool agents_only = 1` |
+| server to client | `SessionEventMsg session_event` | 20 | `string line = 1` |
+
+The server writes each line's JSON itself, so the contract carries one string per line and a new
+event or field changes no message. `agents_only` is `list-agents --watch`. A stock server, or a fork
+server from before this, reads tag 28 as an unknown message, logs it and ignores it, so the client
+times out waiting for `hello` rather than hanging. The verb is not an `Action`: it opens its own
+connection, as `subscribe` does.
+
+`list-events` stays a 256-entry ring in memory. It answers "who did that" after the fact; the watch
+stream, with its `seq` and `epoch`, is the path a consumer follows the session by.
+
+Capability: `action-watch`.
 
 ### `zellij mcp`: the CLI served over the Model Context Protocol
 
