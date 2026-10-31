@@ -1229,7 +1229,27 @@ fn agent_change_snapshot(
     session_name: &str,
     filter: Option<&[u32]>,
 ) -> Result<ListAgentsResponse, String> {
+    agent_snapshot(make_os_input, session_name, filter).map(|(agents, _)| agents)
+}
+
+/// The agents of one session as a teardown sees them, and how many panes the privacy policy
+/// withheld from the answer. `zellij session restart` and `session down` ask this before they
+/// kill anything: the rows of `list-agents`, the caller's own pane marked, and the screen
+/// detector's `blocked` where an agent reported no state.
+pub fn agents_before_teardown(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<(ListAgentsResponse, usize), String> {
+    agent_snapshot(make_os_input, session_name, None)
+}
+
+fn agent_snapshot(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    filter: Option<&[u32]>,
+) -> Result<(ListAgentsResponse, usize), String> {
     let envelope = panes_of_session(make_os_input(), session_name)?;
+    let withheld = envelope.withheld;
     let mut agents = active_agents(envelope.panes);
     agent_detect::mark_self(
         &mut agents,
@@ -1269,12 +1289,13 @@ fn agent_change_snapshot(
                         msg: None,
                         progress: None,
                         at: 0,
+                        working: 0,
                     });
                 }
             }
         }
     }
-    Ok(agents)
+    Ok((agents, withheld))
 }
 
 fn enrich_agent_change(change: &mut agent_detect::AgentChange, agents: &ListAgentsResponse) {
@@ -3595,6 +3616,7 @@ mod tests {
             msg: kind.map(|_| "Allow Bash: cargo test?\nreally".to_owned()),
             progress: None,
             at: 1,
+            working: 0,
         }
     }
 

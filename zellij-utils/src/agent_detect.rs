@@ -838,6 +838,7 @@ mod tests {
             msg: Some("Allow Bash?".to_owned()),
             progress: None,
             at: 1_760_000_000_000,
+            working: 0,
         };
         let entry = PaneListEntry {
             pane_info: PaneInfo {

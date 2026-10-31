@@ -976,6 +976,11 @@ pub enum SessionLifecycleCli {
         /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
         #[clap(long, value_parser, default_value("10"))]
         wait_timeout: u64,
+
+        /// Remove the session even when an agent in it is working. Without it, a working agent
+        /// makes the command refuse with exit code 4
+        #[clap(long)]
+        force: bool,
     },
 
     /// Take the session down and bring it back, from inside it or from anywhere else
@@ -997,6 +1002,11 @@ pub enum SessionLifecycleCli {
         /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
         #[clap(long, value_parser, default_value("10"))]
         wait_timeout: u64,
+
+        /// Restart even when an agent in the session is working. Without it, a working agent
+        /// makes the command refuse with exit code 4
+        #[clap(long)]
+        force: bool,
     },
 
     /// Install the init-system unit that keeps the session up, and load it. systemd on Linux,

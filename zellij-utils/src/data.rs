@@ -2802,6 +2802,19 @@ pub struct PaneProgramStatus {
     /// `last_output_at`.
     #[serde(rename = "state_at", default)]
     pub at: u64,
+    /// How many of the pane's records say `working`, the one above included. Claude Code reports
+    /// each background subagent as a record of its own, so a count above zero under a `done` or
+    /// `idle` state is work still running after the turn ended. Absent when zero.
+    #[serde(
+        rename = "state_working",
+        default,
+        skip_serializing_if = "is_zero_count"
+    )]
+    pub working: u32,
+}
+
+fn is_zero_count(count: &u32) -> bool {
+    *count == 0
 }
 
 pub type ListPanesResponse = Vec<PaneListEntry>;

@@ -1784,8 +1784,8 @@ The same preflight is made by `--in-tab` and by `--near`, and `zellij run`, `zel
 
 ```
 zellij session up      [NAME] [--fresh | --restore [ID]]
-zellij session down    [NAME] [--wait-timeout SECS]
-zellij session restart [NAME] [--fresh | --restore ID]
+zellij session down    [NAME] [--wait-timeout SECS] [--force]
+zellij session restart [NAME] [--fresh | --restore ID] [--force]
 ```
 
 `up` is idempotent, creates the session detached, and then **asserts its own post-condition**:
@@ -5575,6 +5575,7 @@ one pane the same way. It rides on `list-panes --json` and `list-agents --json`,
 | `state_msg` | one line, decoded: the question, the error |
 | `state_progress` | 0-100 for `working` or `blocked`. Absent means indeterminate |
 | `state_at` | when the record was reported, in milliseconds since the epoch - the unit of `last_output_at` |
+| `state_working` | how many of the pane's records say `working`, background subagents included. Absent when zero. See [the teardown guard](#session-down-and-session-restart-refuse-while-an-agent-is-working) |
 
 Every key is absent, not null, when nothing was reported. The keys carry a `state` prefix because
 the row already has a `title`. `zellij_overview` with `scope=agents` reads `list-agents --json`, so
@@ -6673,6 +6674,84 @@ step against the same lock every other lifecycle verb uses. A `restart` calls `d
 holding it, which is why the lock's re-entrancy within a thread is load-bearing rather than a
 convenience — a second `flock` there would wait ninety seconds for a hold this thread owns and then
 proceed unlocked, which is the two-servers race the lock exists to close. That is now asserted.
+
+### `session down` and `session restart` refuse while an agent is working
+
+A teardown kills every pane, and an agent in one of them loses its turn. A release rollout
+restarted live sessions on two Macs and cut a Claude session off mid-turn. So before either verb
+kills anything, it asks the running session for its agents, the rows `list-agents --json`
+returns, and refuses when one of them is working:
+
+```
+$ zellij session restart work
+session restart: refusing - 1 agent(s) in 'work' are working:
+  tab "develop"  sunny-otter  claude  done, but 2 background task(s) still working
+Nothing was torn down. Wait for them to finish, or pass --force to restart anyway.
+Exit status 4: a caller that started this in a pane that closes on exit must check it.
+```
+
+**What counts as working:**
+
+| The agent's row | Busy? |
+|---|---|
+| `state` is `working` | yes |
+| `state` is `blocked`, of any kind (`permission`, `question`, `auth`) | yes. The agent is mid-turn, waiting for the operator, and a teardown cuts that turn off |
+| `state` is one this build does not know | yes. An unknown state fails closed |
+| `state_working` above 0, under any state | yes. See below |
+| `state` is `idle`, `done` or `error` | no. The turn is over |
+| no `state` reported | no, unless the screen detector finds a gate or a question, which reads as `blocked` |
+| the caller's own pane | never. An agent that restarts its own session has chosen to |
+
+- **`--force`** goes ahead as before. `--yes` is not an override, and neither verb takes one.
+- **Exit code 4.** 1 is an error, 2 is a refusal that changed nothing, and 3 is the strict-version
+  refusal. A caller must be able to tell "wait for the agents" from all three.
+- **Only the explicit verbs are guarded.** `session up`, the watchdog tick and the launchd and
+  systemd units never tear a session down, so they are unchanged.
+- **A session that does not answer goes ahead**, with a warning, after a second try half a second
+  later. A wedged server is what a restart is for. A session that is not running is not asked.
+- **Panes withheld by `pane_privacy` are not checked**, and a teardown that goes ahead says how
+  many there were.
+- With `detect_agents false` there are no agent rows, so nothing refuses.
+
+**Background subagents: `state_working`.** A Claude turn that ends while its background subagents
+still run reports `done` (or `idle`). Claude Code already reports each running background task
+(a subagent, a remote agent, a teammate, a workflow) over `OSC 7501` as a record of its own,
+`state=working:id=<task id>`, and clears it when the task ends. The pane kept those records, but
+its summary shows only the most urgent one, and `done` outranks `working`. So the summary now also
+carries `state_working`: how many of the pane's records say `working`, the reported one included.
+It is on `list-panes --json` and `list-agents --json`, and absent when zero. The table is
+unchanged, and `list-agents --watch` does not compare it.
+
+No hook was needed and none was added. The count is server-side and rides the existing JSON:
+no new `OSC` key, no protobuf tag, no client/server contract. Against an older server the field
+is absent and reads as 0. Two limits:
+
+- Claude reports agents, not shells. A background Bash task has no record and is not counted.
+- A new prompt (`OSC 133;A`) drops `working` records, and Claude resends only the records that
+  changed. So a subagent still running when the next turn starts drops out of the count. The
+  case this guard is for, a turn that ended with subagents running and nobody typing, is counted.
+
+**A refusal in a pane that closes on exit.** A restart is usually launched inside the session:
+`zellij --session S run --floating --close-on-exit -- zellij session restart`. `run` returns at
+once, so its caller never sees the exit status, and the pane would close with the refusal in it.
+Two things keep it visible:
+
+- Run inside the session it names, with a terminal on stdin, the refusal waits for Enter. The
+  floating pane stays on screen. A script, an agent's tool call and an SSH shell have no terminal
+  there and never wait.
+- `restart` writes the refusal to its log, `<state dir>/restart.log`, where a successful restart
+  writes its output. A remote caller reads it after the `run`.
+
+Nothing in this repo calls either verb; `session doctor` only prints the command. The operator's
+macOS setup script calls both. Its `session restart` after a re-grant now fails while an agent
+works, and the script already reports a failed restart. Its `session down` before a launch-agent
+kickstart ignores the exit status, so a refusal leaves the old session running and the kickstart
+finds it up. That script must check for exit 4, or pass `--force` when it means to.
+
+The flag is new on two existing commands, and `state_working` is a new key. Neither is an
+`Action`, a protobuf tag or a client/server message.
+
+Capabilities: `session-agent-guard`, `program-status-working-count`.
 
 ### A pin the launcher does not run is inert everywhere, not only in the message
 

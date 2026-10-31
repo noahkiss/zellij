@@ -17,6 +17,7 @@ use std::process;
 use std::time::{Duration, Instant};
 
 use zellij_utils::cli::{CliArgs, Command, SessionLifecycleCli, Sessions};
+use zellij_utils::data::AgentListEntry;
 use zellij_utils::envs;
 use zellij_utils::session_lifecycle::{
     build_verdict, colorterm_for_new_session, env_vars_to_drop, lock_up, own_executable,
@@ -62,9 +63,11 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
         SessionLifecycleCli::Down {
             session_name,
             wait_timeout,
+            force,
         } => {
             let name = resolve_session_name(session_name, &opts, false);
             refuse_from_inside(&name);
+            refuse_if_agents_are_working("down", &name, force, None);
             process::exit(match down(&name, wait_timeout, &opts) {
                 Ok(()) => 0,
                 Err(()) => 1,
@@ -75,8 +78,15 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             fresh,
             restore,
             wait_timeout,
+            force,
         } => {
             let name = resolve_session_name(session_name, &opts, true);
+            refuse_if_agents_are_working(
+                "restart",
+                &name,
+                force,
+                Some(&zellij_utils::consts::ZELLIJ_STATE_DIR.join("restart.log")),
+            );
             restart(
                 &name,
                 restart_restore_target(fresh, restore),
@@ -1408,6 +1418,189 @@ fn refuse_from_inside(name: &str) {
         );
         process::exit(2);
     }
+}
+
+/// The exit code of a teardown refused because an agent in the session is working. Not 1
+/// (error), not 2 (refused, changed nothing) and not 3 (strict-version refusal): a caller must be
+/// able to tell "wait for the agents" from all three.
+pub(crate) const AGENTS_BUSY_EXIT_CODE: i32 = 4;
+
+/// Why one agent makes a teardown refuse, or `None` when it does not.
+///
+/// Busy is `working`, `blocked` of any kind, a state this build does not know (an unknown state
+/// fails closed), or any `working` record under another state: Claude Code reports each
+/// background subagent as a record of its own, and a turn that ended with subagents still running
+/// reports `done` or `idle` above them. A `blocked` agent is mid-turn, waiting for the operator,
+/// and a teardown cuts that turn off. `idle`, `done` and `error` are not busy: the turn is over.
+/// An agent that reported nothing is not busy either, because nothing says it is.
+/// The caller's own pane never counts: an agent that restarts its own session has decided to.
+pub(crate) fn busy_reason(agent: &AgentListEntry) -> Option<String> {
+    if agent.is_self {
+        return None;
+    }
+    let status = agent.program_status.as_ref()?;
+    let state = status.state.as_str();
+    match state {
+        "working" => {
+            let others = status.working.saturating_sub(1);
+            Some(if others == 0 {
+                "working".to_owned()
+            } else {
+                format!("working, and {} background task(s) working", others)
+            })
+        },
+        "blocked" => {
+            let blocked = match &status.kind {
+                Some(kind) => format!("blocked:{}", kind),
+                None => "blocked".to_owned(),
+            };
+            Some(if status.working == 0 {
+                blocked
+            } else {
+                format!(
+                    "{}, and {} background task(s) working",
+                    blocked, status.working
+                )
+            })
+        },
+        "idle" | "done" | "error" => (status.working > 0).then(|| {
+            format!(
+                "{}, but {} background task(s) still working",
+                state, status.working
+            )
+        }),
+        unknown => Some(format!("{} (a state this build does not know)", unknown)),
+    }
+}
+
+/// What a teardown does about the agents in the session it is about to kill.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TeardownGuard<'a> {
+    Proceed,
+    /// Each busy agent, with why it counts as busy.
+    Refuse(Vec<(&'a AgentListEntry, String)>),
+}
+
+pub(crate) fn teardown_guard(agents: &[AgentListEntry], force: bool) -> TeardownGuard<'_> {
+    if force {
+        return TeardownGuard::Proceed;
+    }
+    let busy: Vec<_> = agents
+        .iter()
+        .filter_map(|agent| busy_reason(agent).map(|reason| (agent, reason)))
+        .collect();
+    if busy.is_empty() {
+        TeardownGuard::Proceed
+    } else {
+        TeardownGuard::Refuse(busy)
+    }
+}
+
+/// The refusal, as printed and as written to the restart log.
+fn busy_refusal_text(verb: &str, name: &str, busy: &[(&AgentListEntry, String)]) -> String {
+    let mut text = format!(
+        "session {}: refusing - {} agent(s) in '{}' are working:\n",
+        verb,
+        busy.len(),
+        name
+    );
+    for (agent, reason) in busy {
+        text.push_str(&format!(
+            "  tab {:?}  {}  {}  {}\n",
+            agent.tab_name, agent.handle, agent.agent.kind, reason
+        ));
+    }
+    text.push_str(&format!(
+        "Nothing was torn down. Wait for them to finish, or pass --force to {} anyway.\n\
+         Exit status {}: a caller that started this in a pane that closes on exit must check it.\n",
+        verb, AGENTS_BUSY_EXIT_CODE
+    ));
+    text
+}
+
+/// Refuse the teardown, exiting [`AGENTS_BUSY_EXIT_CODE`], when an agent in `name` is working.
+///
+/// Asked only of a session that is running. A session that is running and does not answer goes
+/// ahead with a warning: a wedged server is what a restart is for, and refusing would leave no way
+/// to fix it short of `--force`. `log_file` is where a restart writes its output; the refusal
+/// goes there too, so a remote caller that started the restart in a pane can read why.
+fn refuse_if_agents_are_working(verb: &str, name: &str, force: bool, log_file: Option<&Path>) {
+    if force {
+        return;
+    }
+    let running = zellij_utils::sessions::get_sessions()
+        .map(|sessions| sessions.iter().any(|(session, _)| session == name))
+        .unwrap_or(false);
+    if !running {
+        return;
+    }
+    let make_os_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+        match zellij_client::os_input_output::get_cli_client_os_input() {
+            Ok(os_input) => Box::new(os_input),
+            Err(e) => {
+                eprintln!("session {}: could not open a client: {}", verb, e);
+                process::exit(1);
+            },
+        }
+    };
+    // Asked twice before going ahead: one failed answer was seen in a live proof and did not
+    // repeat, and a guard that gives up on the first miss is a guard a busy server can skip.
+    let ask = || zellij_client::cli_client::agents_before_teardown(&make_os_input, name);
+    let (agents, withheld) = match ask().or_else(|_| {
+        std::thread::sleep(Duration::from_millis(500));
+        ask()
+    }) {
+        Ok(answer) => answer,
+        Err(e) => {
+            eprintln!(
+                "warning: could not ask '{}' which agents are working ({}); going ahead.",
+                name, e
+            );
+            return;
+        },
+    };
+    let busy = match teardown_guard(&agents, force) {
+        TeardownGuard::Proceed => {
+            if withheld > 0 {
+                eprintln!(
+                    "warning: {} pane(s) of '{}' are withheld by pane_privacy and were not \
+                     checked for working agents.",
+                    withheld, name
+                );
+            }
+            return;
+        },
+        TeardownGuard::Refuse(busy) => busy,
+    };
+    let text = busy_refusal_text(verb, name, &busy);
+    eprint!("{}", text);
+    if let Some(log_file) = log_file {
+        if let Some(dir) = log_file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if log_file.exists() {
+            let _ = std::fs::rename(log_file, log_file.with_extension("log.1"));
+        }
+        let _ = std::fs::write(log_file, &text);
+    }
+    hold_a_pane_that_would_close(name);
+    process::exit(AGENTS_BUSY_EXIT_CODE);
+}
+
+/// Keep the refusal on screen when it was typed in, or launched into, the session it refused.
+///
+/// A restart is usually started inside the session as `zellij run --floating --close-on-exit --
+/// zellij session restart`, and that pane closes the moment this exits, taking the refusal with
+/// it. With a terminal on stdin inside the named session, this waits for Enter first. A script, an
+/// agent's tool call and an SSH caller have no terminal there, and never wait.
+fn hold_a_pane_that_would_close(name: &str) {
+    use std::io::IsTerminal;
+    if envs::get_session_name().ok().as_deref() != Some(name) || !io::stdin().is_terminal() {
+        return;
+    }
+    eprintln!("Press Enter to close.");
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
 }
 
 /// What shape a `session up` is asked to build.
@@ -2756,5 +2949,177 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "config    no session_service extras\n"
         );
+    }
+
+    /// One `list-agents --json` row, with `state` and `state_working` as given.
+    fn agent(handle: &str, state: Option<&str>, working: u32) -> AgentListEntry {
+        let mut row = serde_json::json!({
+            "handle": handle,
+            "pane_id": 1,
+            "tab_id": 0,
+            "tab_position": 0,
+            "tab_name": "develop",
+            "title": "claude",
+            "kind": "claude",
+            "source": "command",
+        });
+        if let Some(state) = state {
+            row["state"] = state.into();
+            row["state_at"] = 1.into();
+            if working > 0 {
+                row["state_working"] = working.into();
+            }
+        }
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn a_working_agent_refuses_the_teardown_and_force_overrides_it() {
+        let agents = vec![
+            agent("idle-otter", Some("idle"), 0),
+            agent("busy-fox", Some("working"), 1),
+        ];
+        match teardown_guard(&agents, false) {
+            TeardownGuard::Refuse(busy) => {
+                assert_eq!(busy.len(), 1);
+                assert_eq!(busy[0].0.handle, "busy-fox");
+                assert_eq!(busy[0].1, "working");
+            },
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+        assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+    }
+
+    #[test]
+    fn idle_finished_and_silent_agents_let_the_teardown_through() {
+        for state in [Some("idle"), Some("done"), Some("error"), None] {
+            let agents = vec![agent("quiet-heron", state, 0)];
+            assert_eq!(
+                teardown_guard(&agents, false),
+                TeardownGuard::Proceed,
+                "state {:?}",
+                state
+            );
+            assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+        }
+        assert_eq!(teardown_guard(&[], false), TeardownGuard::Proceed);
+    }
+
+    /// A turn that ended with subagents still running reports `done` above their `working`
+    /// records; the count is what makes the guard see them.
+    #[test]
+    fn background_work_under_a_finished_turn_is_busy() {
+        for state in ["idle", "done", "error"] {
+            let agents = vec![agent("brisk-heron", Some(state), 2)];
+            match teardown_guard(&agents, false) {
+                TeardownGuard::Refuse(busy) => assert_eq!(
+                    busy[0].1,
+                    format!("{}, but 2 background task(s) still working", state)
+                ),
+                other => panic!("{}: expected a refusal, got {:?}", state, other),
+            }
+            assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+        }
+        let agents = vec![agent("brisk-heron", Some("working"), 3)];
+        assert_eq!(
+            busy_reason(&agents[0]).as_deref(),
+            Some("working, and 2 background task(s) working")
+        );
+    }
+
+    /// A blocked agent is mid-turn, waiting for the operator: a permission prompt, a question,
+    /// a sign-in. A teardown would cut that turn off.
+    #[test]
+    fn a_blocked_agent_of_any_kind_refuses_the_teardown_and_force_overrides_it() {
+        for kind in [Some("permission"), Some("question"), Some("auth"), None] {
+            let mut blocked = agent("stuck-wren", Some("blocked"), 0);
+            blocked.program_status.as_mut().unwrap().kind = kind.map(str::to_owned);
+            let expected = match kind {
+                Some(kind) => format!("blocked:{}", kind),
+                None => "blocked".to_owned(),
+            };
+            let agents = vec![blocked];
+            match teardown_guard(&agents, false) {
+                TeardownGuard::Refuse(busy) => assert_eq!(busy[0].1, expected),
+                other => panic!("{:?}: expected a refusal, got {:?}", kind, other),
+            }
+            assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+        }
+        let mut blocked = agent("stuck-wren", Some("blocked"), 2);
+        blocked.program_status.as_mut().unwrap().kind = Some("permission".to_owned());
+        assert_eq!(
+            busy_reason(&blocked).as_deref(),
+            Some("blocked:permission, and 2 background task(s) working")
+        );
+    }
+
+    #[test]
+    fn a_state_this_build_does_not_know_fails_closed() {
+        let agents = vec![agent("odd-lynx", Some("compiling"), 0)];
+        assert!(matches!(
+            teardown_guard(&agents, false),
+            TeardownGuard::Refuse(_)
+        ));
+        assert_eq!(teardown_guard(&agents, true), TeardownGuard::Proceed);
+    }
+
+    /// An agent that runs the restart from its own pane has decided to cut itself off.
+    #[test]
+    fn the_callers_own_pane_never_counts() {
+        let mut me = agent("my-pane", Some("working"), 4);
+        me.is_self = true;
+        assert_eq!(teardown_guard(&[me], false), TeardownGuard::Proceed);
+    }
+
+    #[test]
+    fn the_refusal_names_each_busy_agent_force_and_the_exit_code() {
+        let agents = vec![agent("busy-fox", Some("working"), 1)];
+        let TeardownGuard::Refuse(busy) = teardown_guard(&agents, false) else {
+            panic!("expected a refusal");
+        };
+        let text = busy_refusal_text("restart", "work", &busy);
+        assert!(
+            text.contains("tab \"develop\"  busy-fox  claude  working"),
+            "{}",
+            text
+        );
+        assert!(text.contains("--force"), "{}", text);
+        assert!(text.contains("Exit status 4"), "{}", text);
+        assert!(![
+            0,
+            1,
+            2,
+            zellij_utils::session_lifecycle::STRICT_VERSION_EXIT_CODE
+        ]
+        .contains(&AGENTS_BUSY_EXIT_CODE));
+    }
+
+    #[test]
+    fn force_parses_on_down_and_restart_and_yes_does_not_exist() {
+        use clap::Parser;
+        use zellij_utils::cli::on_big_stack;
+
+        let parse =
+            |args: &'static [&'static str]| on_big_stack(move || CliArgs::try_parse_from(args));
+        match parse(&["zellij", "session", "restart", "work", "--force"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Restart {
+                force,
+                ..
+            }))) => assert!(force),
+            other => panic!("expected `session restart`, got {:?}", other),
+        }
+        match parse(&["zellij", "session", "down", "work", "--force"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Sessions(Sessions::Session(SessionLifecycleCli::Down {
+                force, ..
+            }))) => assert!(force),
+            other => panic!("expected `session down`, got {:?}", other),
+        }
+        assert!(parse(&["zellij", "session", "restart", "work", "--yes"]).is_err());
     }
 }

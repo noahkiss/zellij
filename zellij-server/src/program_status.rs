@@ -370,6 +370,11 @@ impl ProgramStatusRecords {
             msg: record.msg.clone(),
             progress: record.progress,
             at: record.at,
+            working: self
+                .records
+                .values()
+                .filter(|record| record.state == State::Working)
+                .count() as u32,
         })
     }
 
@@ -537,6 +542,25 @@ mod tests {
             summary.app, None,
             "the replaced root record kept nothing it omitted"
         );
+    }
+
+    /// What Claude Code sends when a turn ends with two background subagents running: a `done`
+    /// root above two `working` records of their own. `done` speaks for the pane; the count keeps
+    /// the subagents visible.
+    #[test]
+    fn the_summary_counts_working_records_under_a_more_urgent_one() {
+        let mut records = ProgramStatusRecords::default();
+        records.apply(osc("state=working:app=claude-code").unwrap(), 1);
+        assert_eq!(records.summary().unwrap().working, 1);
+        records.apply(osc("state=working:app=claude-code:id=a1").unwrap(), 2);
+        records.apply(osc("state=working:app=claude-code:id=a2").unwrap(), 3);
+        records.apply(osc("state=done:app=claude-code").unwrap(), 4);
+        let summary = records.summary().unwrap();
+        assert_eq!(summary.state, "done");
+        assert_eq!(summary.working, 2);
+        records.apply(osc("state=clear:id=a1").unwrap(), 5);
+        records.apply(osc("state=clear:id=a2").unwrap(), 6);
+        assert_eq!(records.summary().unwrap().working, 0);
     }
 
     #[test]
