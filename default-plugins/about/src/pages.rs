@@ -1709,7 +1709,7 @@ mod tests {
     use super::*;
 
     const SERVER_EXE: &str = "/opt/homebrew/Cellar/zellij/0.45.0/bin/zellij";
-    const STABLE_EXE: &str = "/Users/someone/Library/Application Support/zellij/bin/zellij";
+    const STABLE_EXE: &str = "/Users/user/Library/Application Support/zellij/bin/zellij";
 
     fn server_binary(stable: Option<&str>) -> ServerBinary {
         ServerBinary {

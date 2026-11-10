@@ -21,8 +21,8 @@ Three things, on the existing token-authed axum web server:
   (b) a websocket streaming per-pane content diffs
   (c) action execution over POST
 
-The motivation was a web controller that drives zellij by shelling the CLI on a 1s poll plus a
-doorbell plugin, with a planned improvement where a plugin subscribes to per-pane render reports and
+The motivating consumer is an external web controller (not part of this repo) that drives zellij
+by shelling the CLI on a 1s poll plus a doorbell plugin, with a planned improvement where a plugin subscribes to per-pane render reports and
 relays them to the backend over `WebAccess`.
 
 That plugin-side route no longer exists: upstream removed the ANSI render-report event in 0.45. The
@@ -123,8 +123,8 @@ prefer a thin external adapter over a fork patch in `web_client`.
 
 ## Revisited: a centralised consumer, and file reads
 
-The trigger above came close to firing. The case: a consumer that stops deploying a component to
-every machine and instead runs in one place, reaching each host remotely. Every host then has no
+The trigger above came close to firing. The case: a consumer that manages zellij on several hosts
+from one place, instead of running a component on each host. Every host then has no
 process belonging to that consumer — which is nearly the "cannot spawn a process on the host"
 condition, except that SSH still can.
 

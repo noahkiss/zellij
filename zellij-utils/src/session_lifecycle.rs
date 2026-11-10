@@ -3981,11 +3981,11 @@ mod tests {
         let printed = "\
 dev.zellij.session.mysession = {
 	active count = 1
-	path = /Users/someone/Library/LaunchAgents/dev.zellij.session.mysession.plist
+	path = /Users/user/Library/LaunchAgents/dev.zellij.session.mysession.plist
 	state = running
-	program = /Users/someone/Library/Application Support/zellij/bin/zellij
+	program = /Users/user/Library/Application Support/zellij/bin/zellij
 	arguments = {
-		/Users/someone/Library/Application Support/zellij/bin/zellij
+		/Users/user/Library/Application Support/zellij/bin/zellij
 		session
 		up
 		mysession

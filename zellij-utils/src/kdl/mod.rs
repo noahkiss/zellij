@@ -12170,7 +12170,7 @@ fn path_options_are_expanded() {
         theme_dir "${HOME}/.config/zellij/themes"
         scrollback_editor "~/bin/my-editor"
         snapshot_dir "~/.local/state/zellij/snapshots"
-        builtin_plugin_dir "~/develop/zellij/target/wasm32-wasip1/release"
+        builtin_plugin_dir "~/src/zellij/target/wasm32-wasip1/release"
         web_server_cert "~/.config/zellij/cert.pem"
         web_server_key "/etc/zellij/key.pem"
     "#;
@@ -12212,7 +12212,7 @@ fn path_options_are_expanded() {
     assert_eq!(
         options.builtin_plugin_dir,
         Some(PathBuf::from(format!(
-            "{}/develop/zellij/target/wasm32-wasip1/release",
+            "{}/src/zellij/target/wasm32-wasip1/release",
             home
         )))
     );

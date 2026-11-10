@@ -21,8 +21,8 @@ name: Release
 # like a final tag, with three differences: the workspace version is patched to
 # the tag before building, so the binary reports the candidate it is; the GitHub
 # release is marked `--prerelease`; and the tap bump rewrites the SEPARATE
-# `zellij-nkmk-rc` formula instead of `zellij-nkmk`. So proving a patch on a real
-# Mac never touches the formula every machine installs from.
+# `zellij-nkmk-rc` formula instead of `zellij-nkmk`. So a candidate installs beside
+# the release and never replaces the `zellij-nkmk` formula.
 
 on:
   push:

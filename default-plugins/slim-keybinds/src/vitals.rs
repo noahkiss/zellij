@@ -2,8 +2,8 @@
 //!
 //!     cpu 12% │ ram 7.0/23G │ disk 412/931G │ bat 87% │ fda ok
 //!
-//! The probe/parse design is lifted from `~/develop/zellij-claude-bar` (`request_vitals_refresh`,
-//! `parse_vitals`), which learned these the hard way:
+//! The probe/parse design comes from an earlier standalone status-bar plugin
+//! (`request_vitals_refresh`, `parse_vitals`), which learned these the hard way:
 //!
 //! - **`run_command` spawns with an EMPTY environment.** Without an explicit `PATH` the shell
 //!   finds none of these tools and the probe silently returns nothing — no error, just no vitals.

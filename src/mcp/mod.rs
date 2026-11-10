@@ -997,14 +997,14 @@ mod tests {
         assert!(!command_started(&json!({"command_state": "prompt"})));
         // a shell without OSC 133 marks says nothing, which is not a no
         assert!(!command_started(&json!({})));
-        let screen = "noah ~/develop/products 12:20\n> claude --resume abc\n";
+        let screen = "user ~/src/app 12:20\n> claude --resume abc\n";
         assert!(typed_on_screen(screen, "claude --resume abc"));
         // only the start of a long line: the rest may have wrapped onto the next row
         assert!(typed_on_screen(
             "> claude --model opus --permi\nssion-mode plan\n",
             "claude --model opus --permission-mode plan"
         ));
-        assert!(!typed_on_screen("noah ~/develop 12:20\n", "claude"));
+        assert!(!typed_on_screen("user ~/src 12:20\n", "claude"));
         assert!(!typed_on_screen("anything", "   "));
     }
 

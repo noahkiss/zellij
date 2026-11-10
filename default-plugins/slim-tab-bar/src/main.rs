@@ -41,8 +41,8 @@ const DEFAULT_SESSION_GAP: usize = 2;
 /// Never truncate a tab name below this — past it the label stops being identifiable.
 const MIN_LABEL: usize = 3;
 
-/// 12-hour, no leading zero, e.g. `3:47 PM`. Matches what `zellij-claude-bar` shows one row
-/// below; `%H:%M` gives 24-hour instead. Any chrono strftime string works.
+/// 12-hour, no leading zero, e.g. `3:47 PM`. Matches what a status bar one row below
+/// shows; `%H:%M` gives 24-hour instead. Any chrono strftime string works.
 const DEFAULT_CLOCK_FORMAT: &str = "%-I:%M %p";
 
 /// `7/30` — month without a leading zero, day with one. Kept SEPARATE from `clock_format`
@@ -59,7 +59,7 @@ const RESET: &str = "\u{1b}[m";
 
 /// A drawn segment plus its VISIBLE width. The escapes make `part.len()` meaningless, so the
 /// width is tracked alongside — the whole reason for the raw-ANSI rewrite. Same shape as
-/// zellij's own `LinePart` and `zellij-claude-bar`'s `(String, usize)` pairs.
+/// zellij's own `LinePart` and a plain `(String, usize)` pair.
 struct Segment {
     part: String,
     len: usize,

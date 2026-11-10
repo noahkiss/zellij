@@ -704,7 +704,7 @@ load_plugins {
 // plugin without disturbing the rest
 // Default: unset, every built-in comes from the binary
 //
-// builtin_plugin_dir "~/develop/zellij/target/wasm32-wasip1/release"
+// builtin_plugin_dir "~/src/zellij/target/wasm32-wasip1/release"
 
 // How many snapshots `zellij session down` and the snapshot commands keep per session
 // The oldest are removed once the count is above this

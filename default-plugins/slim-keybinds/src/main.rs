@@ -41,8 +41,8 @@ const EDGE_PAD: usize = 1;
 
 const RESET: &str = "\u{1b}[m";
 
-/// Separator inside the vitals cluster, drawn dim. Same glyph as `zellij-claude-bar`'s cluster,
-/// so the two bars read as one system.
+/// Separator inside the vitals cluster, drawn dim. Same glyph as the companion status bar's
+/// cluster, so the two bars read as one system.
 const VITALS_SEP: &str = " \u{2502} ";
 
 /// How often the vitals probe runs, once it has settled. Fast enough that a spinning CPU shows
@@ -219,8 +219,8 @@ impl SlimKeybinds {
 
     /// The right-corner vitals cluster: `cpu 12% │ ram 7.0/23G │ disk 412/931G │ bat 87%`.
     ///
-    /// Dim spelled-out labels, plain values — the same label language as `zellij-claude-bar`'s
-    /// cluster, so the two bars read as one system. `None` when vitals are off or no probe has
+    /// Dim spelled-out labels, plain values — the same label language as the companion status
+    /// bar's cluster, so the two bars read as one system. `None` when vitals are off or no probe has
     /// landed yet, which is also what keeps the bar from flashing a half-built cluster on
     /// startup.
     ///

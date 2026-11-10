@@ -4101,7 +4101,7 @@ mod tests {
         }
     }
 
-    /// The m1p PATH, cut down: what an interactive shell recorded, and the thinner PATH a
+    /// A Mac's PATH, cut down: what an interactive shell recorded, and the thinner PATH a
     /// non-interactive SSH shell has.
     const INTERACTIVE_PATH: &str =
         "/pin:/opt/homebrew/bin:/usr/local/bin:/home/u/.rbenv/shims:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -4149,7 +4149,7 @@ mod tests {
         );
     }
 
-    /// The decision that went wrong on m1p: a shell that ADDS a directory used to re-record, and
+    /// The decision that went wrong on a Mac: a shell that ADDS a directory used to re-record, and
     /// drop everything else it lacked with it.
     #[test]
     fn a_shell_that_adds_a_directory_is_merged_with_the_recorded_path() {
@@ -4222,11 +4222,11 @@ mod tests {
         );
     }
 
-    /// The m1p vector from the nkmk.31 rollout, verbatim but for the home directory: the PATH the
+    /// A Mac's vector from the nkmk.31 rollout, verbatim but for the home directory: the PATH the
     /// running server carried (recorded from a Ghostty terminal), and the one an `enable` over SSH
     /// wrote after mise's shims joined `.profile`. 20 entries became 14.
     #[test]
-    fn the_m1p_enable_over_ssh_keeps_what_it_dropped() {
+    fn a_mac_enable_over_ssh_keeps_what_it_dropped() {
         const RECORDED: &str = "/Users/u/Library/Application Support/zellij/bin\
             :/Users/u/.local/state/fnm_multishells/50496_1791169579118/bin\
             :/Users/u/.rbenv/shims:/usr/local/bin:/System/Cryptexes/App/usr/bin\
@@ -4243,9 +4243,9 @@ mod tests {
             :/usr/bin:/bin:/usr/sbin:/sbin";
         assert_eq!(RECORDED.split(':').count(), 20);
         assert_eq!(SSH.split(':').count(), 14);
-        // every dropped directory existed on m1p, the stale fnm one included
-        let on_m1p = |_: &Path| true;
-        let merged = path_to_keep(RECORDED, SSH, on_m1p).expect("the merge keeps directories");
+        // every dropped directory existed on that Mac, the stale fnm one included
+        let on_that_mac = |_: &Path| true;
+        let merged = path_to_keep(RECORDED, SSH, on_that_mac).expect("the merge keeps directories");
         // six of the seven: the fnm one lived for one shell
         assert_eq!(
             merged.kept,
@@ -4262,7 +4262,7 @@ mod tests {
         assert_eq!(merged.path.split(':').count(), 20);
         // and the next `enable` from the same shell keeps the merged PATH as it is
         assert_eq!(
-            path_to_keep(&merged.path, SSH, on_m1p).map(|again| again.path),
+            path_to_keep(&merged.path, SSH, on_that_mac).map(|again| again.path),
             Some(merged.path.clone())
         );
     }
@@ -4745,12 +4745,12 @@ mod tests {
 
     #[test]
     fn a_state_home_needing_xml_escaping_round_trips_through_the_plist() {
-        let recorded = PathBuf::from("/home/a&b/.state");
+        let recorded = PathBuf::from("/home/u&b/.state");
         let plist = service_unit(ServiceKind::Launchd, &exe(), "work", None, Some(&recorded));
-        assert!(plist.contains("<string>/home/a&amp;b/.state</string>"));
+        assert!(plist.contains("<string>/home/u&amp;b/.state</string>"));
         assert_eq!(
             state_home_in_unit(ServiceKind::Launchd, &plist).as_deref(),
-            Some("/home/a&b/.state")
+            Some("/home/u&b/.state")
         );
     }
 

@@ -80,8 +80,9 @@ jobs:
             which job died if the log is long.
 
             Step 2 — understand this repository before you touch it. It is a
-            personal fork of zellij carrying a patch series. Read AGENTS.md and
-            FORK.md. Two traps live there and cause most red runs:
+            personal fork of zellij carrying a patch series. Read AGENTS.md, the
+            docs/ files it links, and FORK.md. Two traps live there and cause
+            most red runs:
 
             - `zellij-utils` must also compile for wasm. The plugin crates are
               checked in prebuilt, so a local build stays green while

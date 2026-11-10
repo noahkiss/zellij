@@ -30,43 +30,40 @@ So:
 | Path | What it is |
 |---|---|
 | `FORK.md` | The patch ledger and the release runbook. Every behavioural patch has an entry. |
+| `docs/build-and-test.md` | The build and test gate in detail, and the traps behind each rule. |
+| `docs/testing-live-sessions.md` | How to test without touching a real session; detached-session pitfalls. |
+| `docs/fork-history.md` | The upstream base, history rewrites, backup branches for `git bisect`. |
+| `docs/launcher-environment.md` | What a launchd or systemd unit must carry that a login shell supplies. |
+| `docs/config-compatibility.md` | What an older build does with a config key it does not know. |
 | `docs/web-api-assessment.md` | A design that was assessed and deliberately not built. |
 | `.github/workflows/release.yml` | Replaces upstream's release job. Builds the two shipped targets. |
 
-Private design notes and the candidate-patch wishlist are kept in a gitignored directory outside the
-tracked tree. They are **not** part of this repo and must never be copied into it.
-
-That directory is ignored by a machine-level rule, not by this repo's `.gitignore`. Do not rely on
-the ignore: run `git status` before you commit and confirm no private note is staged.
+Read the matching file before you change that area.
 
 ## Conventions
 
 - **Conventional commits**, scoped to the area: `feat(sessions):`, `fix(panes):`, `docs:`,
   `chore:`, `style:`, `test:`. Read `git log --oneline -20` and match it.
-- **Never add an AI or agent attribution footer** to a commit — no `Co-Authored-By` for a model, no
-  "generated with" line. Ever.
+- **Never add an AI or agent attribution footer** to a commit: no `Co-Authored-By` for a model, no
+  "generated with" line.
 - **Update `FORK.md` in the same commit as the change it describes.** A patch that changes
   behaviour and does not touch the ledger is incomplete.
 - **Run `cargo fmt` before you commit.** CI runs `cargo xtask format --check` and fails on drift.
-- Do not bump the version as part of a feature commit. The version bump is its own `chore:` commit,
-  made when a release is cut.
+- The version bump is its own `chore:` commit, made when a release is cut, never part of a feature.
 - **A release is not done until the notes match the tag.** Cutting a version means writing
-  `changelogs/v<version>.md` in the same breath, and updating any out-of-repo notes that record the
-  current version — the operator's tooling docs go stale silently and nothing in CI catches it.
+  `changelogs/v<version>.md` in the same change.
+- Run `git status` before you commit and stage only files that belong to the change.
 
-## Branch, RC, squash-merge, rebase
+## Branch, RC, squash-merge
 
-One patch, one branch, one commit on main. The branch is where the work is messy; main keeps the
-patch ledger readable, because the rebase onto a newer upstream tag replays it commit by commit.
+One patch, one branch, one commit on main. A rebase onto a newer upstream tag replays main commit
+by commit, so main keeps one commit per ledger entry.
 
 1. **Branch per patch.** Never commit a patch to main directly.
-2. **Prove it with a release candidate, on the branch.** Tag `v<version>-rc.1`, `-rc.2`, … and push
-   the tag by name: `git push origin v<version>-rc.N`. This repo sets `push.followTags false`, so a
-   branch push never carries a tag with it — push every tag explicitly. `release.yml` builds and
-   publishes an RC exactly like a final tag, with two differences: the GitHub release is marked
-   `--prerelease`, and the tap bump rewrites the separate
-   `zellij-nkmk-rc` formula. A Mac proof agent then installs the candidate without disturbing the
-   formula every machine runs:
+2. **Prove it with a release candidate, on the branch.** Tag `v<version>-rc.N` and push the tag by
+   name (`git push origin v<version>-rc.N`); `push.followTags` is off. `release.yml` publishes an
+   RC as a `--prerelease` and bumps the separate `zellij-nkmk-rc` formula, so a candidate installs
+   beside the release:
 
    ```
    brew update && brew unlink zellij-nkmk
@@ -75,65 +72,16 @@ patch ledger readable, because the rebase onto a newer upstream tag replays it c
    brew uninstall zellij-nkmk-rc && brew link zellij-nkmk
    ```
 
-   **An RC binary reports the RC.** The branch bumps `Cargo.toml` to the version it is heading
-   for, and `release.yml` patches that version to the whole tag before it builds, so
-   `zellij --version` prints `0.45.0-nkmk.12-rc.1` under a `v0.45.0-nkmk.12-rc.1` tag. Nothing
-   strips the suffix, and a Mac can no longer be running a candidate that calls itself the
-   release. The bake is the only build that patches its own checkout — a final tag builds what
-   main says. It refuses a tag that is not a candidate for the version the branch is bumped to.
+   An RC binary reports the RC (`zellij --version` prints `0.45.0-nkmk.12-rc.1`). RC tags are
+   proof, never install targets.
+3. **Open a pull request when the RC tag goes up.** The `End to End tests` workflow runs only on
+   a pull request and on a push to `main`. Do not tag the release until it is green. The PR is
+   never merged: land as below and close it.
+4. **Land by squash-merge**, with `FORK.md` updated in that commit.
+5. **Tag the final release from main** (`v<version>`, no suffix) and push it by name.
 
-   **Open a pull request from the branch when the RC tag goes up, and do not tag the release
-   until its `End to End tests` run is green.** That workflow runs on a push to `main` and on a
-   pull request, and on nothing else: not on a branch push, not on an RC tag. Without the PR the
-   Docker e2e suite first runs *after* the final tag, on the `main` push, which is how v22 and
-   v23 were each tagged with one test surface unproven. The PR is never merged — land as below
-   and close it.
-3. **Land by squash-merge**, so one ledger entry is one commit. `FORK.md` is updated in that commit,
-   not in a follow-up.
-4. **Tag the final release from main** — `v<version>`, no suffix — and push it by name:
-   `git push origin v<version>`. It bumps `zellij-nkmk` as before.
-   RC tags are proof, never install targets; nothing outside the rc formula points at one.
-5. **Rebase onto a newer upstream tag** with `git rebase --onto <new-base> <old-base> main`, then
-   record the new base in `FORK.md`.
-
-**Upstream strategy — the operating rule.** The fork is a patch series on top of an upstream
-**tag**, and it stays one. Move the base by rebasing, one patch commit at a time, and name the new
-base in `FORK.md`. Between tags, take a single upstream commit only when we want that fix now:
-cherry-pick it with the subject `chore(upstream): <original subject> (<sha>)`, and expect it to drop
-out as empty at the next rebase. Never merge upstream into main, and never let the base become
-"some upstream main commit plus picks" without naming that commit in `FORK.md`. Rebasing onto
-upstream `main` between tags is allowed when it is small — it is still a named base.
-
-**Reordered history does not bisect.** A logically grouped series (one commit per ledger entry,
-reordered) cannot keep every intermediate compiling — a file lands with its group, and a definition
-can sit in a group placed after one of its callers. That is accepted: the tip and the last commit
-of each release build, the middle may not. The chronological, bisectable series is kept on two
-backup branches: `backup/main-pre-squash-2026-08-16` for everything up to that squash, and
-`backup/main-pre-condense-2026-10-06` (old tip `8eb95917c`) for everything landed after it, up to
-v0.45.1-nkmk.30. When a bug needs `git bisect`, bisect there.
-
-The 2026-10-06 condense kept the base (`v0.45.1`, `efd8fd5a8`) and the tip tree, and folded docs
-follow-ups, test and snapshot touch-ups and later amendments into the commit of the ledger entry
-they amend: 185 commits became 160. Each folded commit is named on an `Also:` line in its target's
-body. Release bumps, changelogs and the `chore(upstream)` pick were not touched, and a fold that
-would have needed a conflict resolution was left as its own commit. Every release tag up to
-v0.45.1-nkmk.30 points into the pre-condense branch, not into `main`; the trees are identical.
-
-**After any history rewrite, check the series before you trust it.** Every latent bug a rewrite
-has shipped so far was visible in the series itself on the day of the rewrite. Nobody looked. Two
-kinds of rewrite, two checks:
-
-- **Same base — squash, condense, reorder.** The tip tree must not change. Run
-  `git diff <old-tip> <new-tip>` and expect no output. Any hunk it prints is one the rewrite dropped
-  or mangled. Find it now, not two releases later.
-- **New base — rebase.** Run `git range-diff <old-base>..<old-tip> <new-base>..<new-tip>`. It shows
-  each patch's drift on its own, so a conflict resolved wrong stands out from the base moving under
-  it. Read every patch it marks `!`. Then run the whole gate from "Build and test": the nextest
-  suites, `cargo xtask integration-test`, the wasm check, and e2e — which runs on a pull request
-  and on a push to `main`, never on a bare `rc/**` push.
-
-Keep the pre-rewrite tip on a `backup/main-pre-<rewrite>-<date>` branch until both the checks and
-the next release pass; it is the `<old-tip>` those commands need, and the only place to bisect.
+The upstream base, rebases, and the checks after any history rewrite are in
+`docs/fork-history.md`. Never merge upstream into main.
 
 ## Build and test
 
@@ -141,208 +89,36 @@ the next release pass; it is the `<old-tip>` those commands need, and the only p
 cargo check                                  # while editing
 cargo fmt && cargo xtask format --check      # before every commit
 cargo test -p zellij-utils --profile quick   # the loop: the area you changed
+cargo check -p session-manager --target wasm32-wasip1   # after any zellij-utils change
 ```
 
-Local runs the quick loop. The branch push runs the full gate: `rust.yml` triggers on every
-`feat/**`, `fix/**`, `rc/**` (and the other prefixes it lists) push and runs `cargo xtask build`
-(the plugins from source, so wasm is covered), `cargo xtask test` on every crate, `cargo xtask
-integration-test`, the `--no-web` pass and the assets check, on Linux and macOS. The pull request
-adds the Docker e2e suite. Do not repeat that locally; read it with `gh run list` and
-`gh run view --log-failed`. Local release builds are not a gate either: `release.yml` builds the
-artifact that ships.
-
-`rust-toolchain.toml` pins the toolchain; rustup installs it on the first cargo call.
-
-**Never build without optimizations.** A debug build expects the WASM plugins to be built from
-source; an optimized build uses the prebuilt assets in `zellij-utils/assets/plugins/`. So plain
-`cargo test` fails on the assets, and "just drop `--release` to save time" is not the shortcut it
-looks like.
-
-**Use `--profile quick` to iterate, not `--release`.** `quick` inherits `release`, so debug
-assertions stay off and the prebuilt assets are still used, but it drops full LTO and raises
-`codegen-units` — the two settings that make a release rebuild slow and that only earn their keep
-in the artifact that ships. `--release` re-optimizes the whole program at every link and confines
-each crate's codegen to one core; in an edit-test loop that is most of the wall-clock, and it buys
-nothing a test run can observe.
-
-Two things to know before reaching for it. `quick` gets its own `target/` subtree, so the first
-build after switching is cold and slower than the release build it replaces — it pays back from
-the second. And it is not what ships: never measure runtime performance against `quick`.
-
-Whole-binary builds are the expensive ones, because they pull in `zellij-server` and its embedded
-`wasmtime`. Prefer `cargo check` and a `-p <crate>` test while iterating, and leave the whole
-binary to CI.
-
-**Three test surfaces, and a release must see all of them green.** The nextest suites (`-p zellij-utils
--p zellij-server -p zellij-client`, plus `-p zellij` after a plugins-only build) are the fast loop.
-`cargo xtask integration-test` is the whole-app suite the `Rust` workflow runs — snapshot changes
-that touch pane titles or handles land here, and nothing in the fast loop covers it. The Docker
-e2e suite (`src/tests/e2e`, the `End to End tests` workflow) runs on pushes to `main` and on pull
-requests — **an `rc/**` push never exercises it**, which is why the RC opens a pull request. The
-release gate is a green `Rust` run on the RC branch and green `Rust` and `End to End tests` runs
-on its pull request, on the exact commit to be tagged, checked with `gh run list`. Run the
-integration suite locally only when you expect a snapshot to change, because accepting a snapshot
-needs a local run. The v16 release shipped with four stale integration snapshots and two stale
-e2e snapshots because local gates covered only the first surface. v19 reached `main` with six
-stale plugin-system snapshots for the same reason, fixed in `5fef6e6b1` before the tag.
-
-**That e2e job is also the only runner of zellij-server's `--ignored` plugin-system suite.**
-`cargo xtask ci e2e --test` runs the Docker e2e tests, then runs `cargo test -- --ignored` inside
-`zellij-server` (`xtask/src/ci.rs:195-221`). Nothing else passes `--ignored` — not `cargo xtask
-test`, not the nextest suites — so the fast loop never compiles those tests, let alone runs them.
-Their snapshots capture `RunCommand`'s derived `Debug`, so a new field on it lands here and in no
-other surface. Run them locally only when `RunCommand`'s `Debug` changes; without Docker:
-
-```
-cargo xtask ci e2e --build                                  # builds the fixture plugin
-cargo test -p zellij-server -- --ignored --test-threads 1
-```
-
-`--build` compiles the plugins for `wasm32-wasip1` and copies them to
-`<target dir>/e2e-data/plugins/`, where the tests look for
-`fixture-plugin-for-tests.wasm`. `<target dir>` honours `CARGO_TARGET_DIR`, so the build and the
-tests agree only when both see the same value.
-
-CI also runs `cargo xtask build` and `cargo xtask test` on Linux and macOS, plus a `--no-web` test
-pass. A change behind a feature flag still has to compile without it. **There is no Windows job**,
-and Windows is not a shipped target — the release builds `x86_64-unknown-linux-gnu` and
-`aarch64-apple-darwin` and nothing else. Do not spend effort on a Windows-only failure.
-
-**A change to `zellij-utils` must also build for wasm, and nothing here checks that for you.**
-
-```
-cargo check -p session-manager --target wasm32-wasip1   # or any default plugin
-```
-
-(`cargo xtask build --plugins-only` catches the same class and is what CI actually runs — use it
-when you want a real wasm build, the check when you want speed.)
-
-**To refresh the checked-in assets, that command needs `--release`:**
-
-```
-cargo xtask build --plugins-only --release
-```
-
-Only the release path copies the built `.wasm` files into `zellij-utils/assets/plugins/`
-(`xtask/src/build.rs`, `build_plugins_release_into_assets`). Without `--release` the plugins are
-built to `target/wasm32-wasip1/debug` and the checked-in assets are left exactly as they were — so
-a plugin change "builds" and still is not in the binary.
-
-The default plugins are wasm crates that depend on `zellij-utils`, and their `.wasm` artifacts are
-**checked in prebuilt** under `zellij-utils/assets/plugins/`. Every *local* build — `cargo check`,
-`--profile quick`, `--release` — uses those prebuilt files and never compiles the plugin crates. So
-`zellij-utils` can stop building for wasm entirely while everything you run locally stays green.
-
-That is not hypothetical: it happened at nkmk.7 and survived two releases. `5198a3ebd` made
-`session_service` read `DEFAULT_TERM` from `session_lifecycle`, which is
-`#[cfg(not(target_family = "wasm"))]`. `session_service` is **not** gated, because `kdl/mod.rs`
-parses its config block and is built for wasm — so the reference crossed the gate, and no plugin
-could be rebuilt from then until `fa6bb9bc6`.
-
-**CI caught it immediately. Nobody looked.** The `Rust` workflow builds plugins from source via
-`cargo xtask build`, so every run from nkmk.7 on failed with this exact error on ubuntu, on macOS
-and in the `--no-web` pass — most of the workflow red for two releases while the `Release` workflow,
-which ships prebuilt assets, stayed green and made it look fine. So:
-
-```
-gh run list -R <fork> --limit 10 --json workflowName,conclusion,headBranch
-gh run view <id> -R <fork> --log-failed | grep -iE "error\[|error:"
-```
-
-**Check the runs after pushing, and before cutting a release.** A green `Release` says the artifact
-built, not that the tree is healthy — those two workflows fail independently and only one of them
-compiles the plugins.
-
-The trap is the asymmetric gating in `zellij-utils/src/lib.rs`. Before referencing another module
-from an ungated one, check which side of `#[cfg(not(target_family = "wasm"))]` it sits on. If a
-shared value is wanted on both sides, it belongs in an ungated module such as `shared` — see
-`DEFAULT_TERM`, which lives there for exactly this reason. Gating the *consumer* instead is usually
-wrong; it was tried first for `session_service` and broke `kdl`.
-
-Run the wasm check before any release that touches `zellij-utils`, and always before shipping a
-change to a default plugin — otherwise the plugin change silently is not in the artifact.
+- **Never build without optimizations.** A debug build expects the WASM plugins built from
+  source. Use `--profile quick` to iterate; `--release` only for what ships.
+- **A change to `zellij-utils` must also build for wasm.** The plugins are checked in prebuilt,
+  so local builds stay green while CI's `cargo xtask build` fails.
+- **A release needs three green surfaces:** the nextest suites, `cargo xtask integration-test`
+  (the `Rust` workflow), and the Docker e2e suite (`End to End tests`, on the pull request).
+  Check the runs with `gh run list` after you push.
+- **To refresh the checked-in plugin assets** run `cargo xtask build --plugins-only --release`.
+- Windows is not a shipped target. Do not spend effort on a Windows-only failure.
 
 ## Testing against a running zellij
 
-**Never run a session-mutating command against a developer's real session.** `kill-session`,
-`delete-session`, `new-pane`, `move-tab`, `save-session` and anything under `zellij action` act on
-whatever session the environment resolves to. Assume a long-lived session is running and that losing
-it is unacceptable.
-
-Isolate every test run. Point the whole environment at a scratch directory and use a throwaway
-session name:
+**Never run a session-mutating command against a real session.** Point the environment at a short
+scratch directory and use a throwaway session name:
 
 ```sh
-export ZELLIJ_SOCKET_DIR=/tmp/zj-test/sock    # sockets, and therefore which server you reach
-export ZELLIJ_CONFIG_DIR=/tmp/zj-test/config  # config.kdl, and the key permission grants use
-export XDG_CACHE_HOME=/tmp/zj-test/cache      # session_info, plugin artifacts, permissions.kdl
-export XDG_STATE_HOME=/tmp/zj-test/state      # the snapshot archive
+export ZELLIJ_SOCKET_DIR=/tmp/zj-test/sock
+export ZELLIJ_CONFIG_DIR=/tmp/zj-test/config
+export XDG_CACHE_HOME=/tmp/zj-test/cache
+export XDG_STATE_HOME=/tmp/zj-test/state
 ```
 
-`ZELLIJ_SOCKET_DIR` and `ZELLIJ_CONFIG_DIR` are read directly, and the fork reads `XDG_STATE_HOME`
-by hand, so those three work on every platform. **`XDG_CACHE_HOME` does not.** The cache comes from
-the `directories` crate, which honours the XDG variables on Linux and ignores them on macOS — so on
-macOS the cache stays in the user's real one and only the session name keeps a test apart from live
-state.
-
-**So never run `delete-all-sessions` on macOS, scratch environment or not.** It does not read the
-session list you set up. `delete_all_sessions` (`src/commands.rs:410`) takes its targets from
-`scan_session_list_default_dirs` and `get_resurrectable_sessions`, both of which walk
-`ZELLIJ_CACHE_DIR` — a `directories` crate path that ignores `XDG_CACHE_HOME` on macOS. The scratch
-export moves nothing, so the command enumerates and deletes the real user's serialized sessions, and
-`--force` kills the live ones with them. Delete scratch sessions by name instead:
-
-```sh
-zellij delete-session <throwaway-name> --force --yes
-```
-
-Then kill the sessions and confirm the servers are gone when you finish.
-
-**Clear the agent's own identity before you start a scratch server from inside an agent.** A
-server hands its environment to every pane it creates, and an agent's shell carries
-`AGENT_SESSION_ID`, `AGENT_KIND` and the harness's own variables (`CLAUDE_CODE_*`,
-`CLAUDECODE`, and the like). Started from there, the scratch server reports the calling agent's
-session on every pane, and a test of agent detection passes or fails for the wrong reason:
-
-```sh
-env -u AGENT_SESSION_ID -u AGENT_KIND -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID \
-  zellij --session <throwaway-name>
-```
-
-`session_restart_drop_env` drops named variables when a session is created, but only those the
-config names, and a scratch config may name none.
-
-**The scratch path must be short.** A unix socket path maxes out near 104 bytes, and the session
-socket sits several directories below `ZELLIJ_SOCKET_DIR`. A deep path fails with `IPC socket path
-is too long` and the failure does not name the cause. Use something like `/tmp/zj-test`, not a path
-under a home directory or a per-session temporary directory.
-
-### Pitfalls in a detached session
-
-A **fully detached** session — one no client has ever attached to — behaves differently, and this is
-where automated tests usually go wrong:
-
-- **Geometry is real, but sized for the terminal that is not there.** The layout pass does run, for
-  the session's own tabs and for every tab a command makes afterwards. `pane_x`, `pane_y`,
-  `pane_rows`, `pane_columns` and the stack fields are self-consistent, and tiled panes do not
-  overlap. The viewport is the session's own size: a **50×50 default** for a session started
-  detached, or **the size of the last client to leave** for one that has been attached to. So the
-  numbers are right relative to each other, and right relative to the screen a client will bring
-  only if that client brings the same terminal back. Verified on 0.45.0-nkmk.6: two tiled panes at
-  `x=0` and `x=25`, 25 columns each, in a 48-row viewport; a stacked pair carried `stack_id=0` with
-  `index_in_stack` 0 and 1.
-- **A stack has no anchor.** `new-pane --stacked` has no focused pane to stack under, so it needs an
-  explicit target: `ZELLIJ_PANE_ID=<id> zellij -s <name> action new-pane --stacked
-  --near-current-pane`. Without one it fails loudly with a non-zero exit.
-- **A focus-dependent verb refuses; it does not guess.** With no client attached there is no focused
-  tab or pane, so `move-tab` without `--tab-id`, `focus-next-pane` and a bare `go-to-tab-name` each
-  print what is missing, exit 2, and change nothing. Pass an explicit target, or attach first.
-  **Creating is not focus-dependent**: `new-tab`, `new-tab --layout`, `new-pane --new-tab` and
-  `go-to-tab-name --create` all work here and make a real tab.
-
-`dump-screen` reads fresh content, but it is a focus-dependent verb too: pass `--pane-id` and it
-returns the grid for a pane in a non-focused tab of a detached session, because the grid is
-maintained from the pty whether or not the pane renders. Without one it exits 2 and lists the panes.
+- On macOS the cache ignores `XDG_CACHE_HOME`. **Never run `delete-all-sessions` on macOS**: it
+  deletes the real user's sessions. Delete scratch sessions by name.
+- From inside an agent, start the scratch server with the agent variables unset
+  (`env -u AGENT_SESSION_ID -u AGENT_KIND -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID`).
+- `docs/testing-live-sessions.md` has the reasons and the detached-session pitfalls.
 
 ## Adding a field, and which contract it crosses
 
@@ -361,114 +137,6 @@ Three surfaces look similar and cost very different amounts.
 
 Sockets are scoped by contract version, not by version string, so a fork build and a stock build of
 the same contract share sessions. Keep it that way.
-
-## When a launcher becomes the thing that creates the session
-
-Moving session creation out of a shell wrapper and into `zellij session up` surfaced three
-separate bugs in one day, and all three had the same shape: **something a login shell had always
-supplied, which an init-system launcher does not.** Each stayed invisible for as long as a shell
-happened to create the session first, and appeared the moment the launcher won the race.
-
-- **`TERM`.** launchd and systemd give a unit none. The server hands its own environment to every
-  pane shell, so a launcher-created session had `TERM=dumb` in every pane — keystrokes repeating,
-  `TERM environment variable not set`.
-- **systemd `KillMode`.** `session up` daemonizes and returns, so the default `control-group` mode
-  tore down the cgroup when the oneshot deactivated, killing the server it had just started.
-  `KillMode=process` fixes it. launchd has no equivalent reaping.
-- **A launch agent under a different name.** The macOS domain guard looked up the label it would
-  itself have installed, so it could not see a hand-written agent doing the same job, and fell
-  through to creating a Background-domain session — the exact outcome it exists to prevent.
-
-The rule that predicts the first one, and is worth applying to anything similar. It has two
-halves, and the second is easy to miss:
-
-> **What a shell re-derives.** A pane shell sources the rc chain, so it rebuilds most of its own
-> environment — `LANG`, `EDITOR`, and its own `PATH`. Verified: absent from the launcher's
-> environment, present in an interactive pane. These self-heal, and a launcher should not hold an
-> opinion about them.
->
-> **What nothing re-derives.** Anything describing the *connection* rather than the user's
-> preferences. `TERM` is the clear case. The socket directory was the other, which is why it is
-> now resolved inside the binary instead of exported.
->
-> **What the binary resolves once, for itself.** This is the half that looks like the first and
-> behaves like the second. `consts.rs` resolves the cache, session-info, plugin-artifact and
-> state/snapshot directories from `XDG_*` **in whatever environment the binary was launched in**,
-> and nothing ever re-derives them. A pane shell fixing its own `XDG_CACHE_HOME` does not move
-> the directory the *server* already chose.
-
-That third case is worth spelling out because its symptoms point away from the cause. When a
-launcher's `XDG_*` differs from a login shell's — and it does; a systemd user manager is seeded by
-PAM long before any rc file runs — plugin permission grants are written to a `permissions.kdl` no
-other invocation reads, so plugins re-prompt after every restart; `list-sessions` reads a stale
-`session_info`; and `snapshot list` looks in a different archive from the one `session down` wrote.
-Each of those reads as a bug in the feature, not as an environment split.
-
-The same trap applies to `PATH` in a way the first half hides. The server resolves commands
-against **its own** `PATH`, fixed at creation, so a layout `command` pane, `zellij run --` and
-`copy_command` all fail with "command not found" in a launcher-created session while an
-interactive pane beside them works — because the rc chain fixed the *shell's* `PATH` and never
-touched the server's.
-
-So a generated unit should hold **no opinion about the environment except the values that cannot
-be re-derived, plus the ones the binary resolves for itself.** `TERM` earns its place; so do
-`PATH` and anything feeding a directory in `consts.rs`. A hardcoded locale does not.
-
-The general lesson for the next change of this kind: when moving work from a shell into the
-binary, do not only test the path where a shell is still involved. Test the path where the
-launcher is the sole creator — reboot-like conditions — because that is where the assumptions
-that were silently carried by the shell all fail at once.
-
-## Rolling a new config key out before every machine has the binary
-
-**An unknown TOP-LEVEL key in `config.kdl` is ignored, not an error.** Verified by running a config
-carrying three new keys through the previous release's binary: `setup --check` still reported
-`CONFIG FILE: Well defined`.
-
-**A block that parses its own children used to reject an unknown one, failing the WHOLE config,
-not just the block.** `session_service` was the known example:
-
-```
-× Failed to parse Zellij configuration
-╰── Unknown session_service entry: "manage_my_session" (expected systemd, launchd, pin_exe, managed_session or restart_via_launchd)
-```
-
-(`managed_session` taught that lesson in 2026-08; `launchd { env }` paid for it again.) From
-nkmk.18 on, all three blocks — `session_service`, `pane_privacy` and `resurrect_command_hints` —
-warn and ignore an unknown name at every depth; see FORK.md's "An unknown key in
-`session_service` warns instead of failing the config" and "`pane_privacy` and
-`resurrect_command_hints` warn on a key they do not know". But the old rule is not dead: a
-machine still on ≤ nkmk.17 still rejects an unknown nested key in any of them.
-
-**From the release that carries FORK.md's "A setting this build does not know warns and is
-skipped, on every config surface", the whole config is tolerant.** An unknown name or enum value
-anywhere — a bind's action, a key spelling, a mode, an option value, a child of `ui`, `web_client`
-or a theme, a permission — warns with its file and line and is skipped; `setup --check` still
-reports the config as well defined. A malformed KNOWN thing (wrong type, bad syntax, a known action
-with bad arguments) still fails. An unknown `pane_privacy` value fails closed for that one rule: it
-takes the strictest known value, not the default. That entry lists the exceptions.
-
-Tolerance only helps a machine that runs it. **A machine still on an older build keeps that
-build's strict behaviour**: it rejects a new action, mode or option value exactly as before. So the
-oldest build in the fleet still gates a config change.
-
-So before seeding a new key, action or value ahead of the binary, check both sides: the surface
-must be a warn-and-ignore one in the build that ships it, and the OLDEST binary in the fleet must
-tolerate it too. Do not generalise a top-level probe to a nested key: test the key you actually
-intend to add, in the position you intend to add it, against the oldest release still running,
-and re-run `zellij setup --check` **before committing**. Getting this wrong breaks every machine
-that pulls the config, not just the one that is behind.
-
-That decides the rollout order for a config-only feature. The key can be added to a shared config
-first and the binaries upgraded afterwards, in any order — machines still on the old build ignore it
-until they catch up. There is no need to hold the config back, and no need to gate it per machine.
-
-The reverse is not true and is the trap: a shell alias, a service unit, or a script that calls a
-**new subcommand** breaks immediately on any machine that has not upgraded. Config is forgiving;
-the command surface is not. When a change spans both, land the config early and the callers last.
-
-Worth re-verifying rather than assuming if a future release changes config parsing — the check is
-two minutes: fetch the previous release's binary and run `setup --check` against the new config.
 
 <!-- Optional local rules, untracked. The import is skipped when the file is absent. -->
 @AGENTS.local.md

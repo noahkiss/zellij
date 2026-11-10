@@ -59,7 +59,7 @@ layout {
 | `show_session` | `true` | Session name on the left |
 | `max_tab_len` | unset | Hard cap on a tab name in characters (minimum 3) |
 | `session_gap` | `2` | Spaces between the session name and the first tab |
-| `session_alias` | unset | Comma-separated `from=to` display substitutions, e.g. `mysession=GFF`. Exact match only |
+| `session_alias` | unset | Comma-separated `from=to` display substitutions, e.g. `mysession=MS`. Exact match only |
 | `show_clock` | `true` | Clock on the right |
 | `timezone` | `UTC` | IANA zone name, e.g. `America/New_York` |
 | `clock_format` | `%-I:%M %p` | chrono strftime string; `%H:%M` for 24-hour |

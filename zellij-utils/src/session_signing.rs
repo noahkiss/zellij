@@ -1135,7 +1135,7 @@ impl SigningDir {
     /// **Without this file a switch is visible for exactly one run.** The run that signs compares
     /// the requirement before with the one after and says "re-grant". The next run has only the
     /// pin, and a pin always satisfies its own requirement - so it reported that the grants
-    /// "still hold" seven minutes after doctor had asked for them to be made again (m1p, nkmk.26).
+    /// "still hold" seven minutes after doctor had asked for them to be made again (nkmk.26).
     /// The file is that missing "before". It holds one designated requirement and nothing else.
     pub fn regrant_owed(&self) -> PathBuf {
         self.root.join("regrant-owed")
@@ -1152,7 +1152,7 @@ mod tests {
     /// Recorded from a pin signed with a Developer ID certificate.
     const DEVELOPER_ID: &str = "\
 designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"A1B2C3D4E5\"
-Executable=/Users/someone/.local/share/zellij/bin/zellij
+Executable=/Users/user/.local/share/zellij/bin/zellij
 Identifier=org.zellij.nkmk
 Format=Mach-O thin (arm64)
 Signature=Developer ID Application: Someone (A1B2C3D4E5)
@@ -1162,7 +1162,7 @@ TeamIdentifier=A1B2C3D4E5
     /// Recorded from a pin signed with an Apple Development certificate and our own requirement.
     const APPLE_DEVELOPMENT: &str = "\
 designated => identifier \"org.zellij.nkmk\" and anchor apple generic and certificate leaf[subject.OU] = \"A1B2C3D4E5\"
-Executable=/Users/someone/.local/share/zellij/bin/zellij
+Executable=/Users/user/.local/share/zellij/bin/zellij
 Identifier=org.zellij.nkmk
 Signature=Apple Development: someone@example.com (F6G7H8I9J0)
 ";
@@ -1170,7 +1170,7 @@ Signature=Apple Development: someone@example.com (F6G7H8I9J0)
     /// Recorded from a pin signed with a certificate we minted.
     const SELF_SIGNED: &str = "\
 designated => identifier \"org.zellij.nkmk\" and certificate leaf = H\"7f8c0b1a2d3e4f5061728394a5b6c7d8e9f00112\"
-Executable=/Users/someone/.local/share/zellij/bin/zellij
+Executable=/Users/user/.local/share/zellij/bin/zellij
 Identifier=org.zellij.nkmk
 Signature=zellij self-signed code signing
 ";
@@ -1178,14 +1178,14 @@ Signature=zellij self-signed code signing
     /// Recorded from a pin `codesign -s -` had signed - the state signing exists to leave.
     const AD_HOC: &str = "\
 designated => identifier \"org.zellij.nkmk\" and cdhash H\"a1b2c3d4e5f60718293a4b5c6d7e8f9001122334\"
-Executable=/Users/someone/.local/share/zellij/bin/zellij
+Executable=/Users/user/.local/share/zellij/bin/zellij
 Identifier=org.zellij.nkmk
 Signature=adhoc
 ";
 
     /// Recorded from a pin nothing had ever signed.
     const UNSIGNED: &str = "\
-/Users/someone/.local/share/zellij/bin/zellij: code object is not signed at all
+/Users/user/.local/share/zellij/bin/zellij: code object is not signed at all
 ";
 
     /// A context over a scratch directory, so a test drives the same code the Mac runs without

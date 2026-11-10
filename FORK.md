@@ -2898,10 +2898,10 @@ the entry it read and what the block does accept, so a misspelling reads as a mi
 An ignored entry is **not** written back out by `setup --dump-config`. It is not part of this
 build's configuration, and a dump that re-emitted it would claim otherwise.
 
-The rollout order this restores is the one AGENTS.md gives for a top-level key, now with no
-exception for a nested one: the config can go everywhere first and the binaries follow in any
-order. It does not extend to the **command surface** — a script or a unit calling a new subcommand
-still breaks on every machine that has not upgraded.
+The rollout order this restores is the one `docs/config-compatibility.md` gives for a top-level
+key, now with no exception for a nested one: the config can go everywhere first and the binaries
+follow in any order. It does not extend to the **command surface** — a script or a unit
+calling a new subcommand still breaks on every machine that has not upgraded.
 
 Scope is `session_service` and its children only. Upstream's own strict blocks are untouched. The
 fork's other two — `pane_privacy` and `resurrect_command_hints` — had the same rollout problem
@@ -3045,8 +3045,8 @@ Not plain warn-and-skip, on purpose:
 A skipped thing is not written back out by `setup --dump-config`.
 
 This is tolerance from this release onward only. A machine on an older build still rejects what
-its own build did not know, so the oldest binary in the fleet still gates a config change. See
-AGENTS.md, "Rolling a new config key out before every machine has the binary".
+its own build did not know, so the oldest binary that reads a shared config still gates a change
+to it. See `docs/config-compatibility.md`.
 
 ### A pinned copy of the binary (`pin_exe`)
 
@@ -5002,11 +5002,11 @@ pane size=1 borderless=true {
 }
 ```
 
-They arrived as separate repos (`zj-slim-bar`, `zj-slim-keybinds`) loaded through `file:` paths, and
+They arrived as separate plugin repos loaded through `file:` paths, and
 they are recreations of zellij's own `tab-bar` and `status-bar`/`compact-bar` — replacements for
 builtins, in the same category as the things they replace. Sources moved in, not artifacts: bundled
-has to mean rebuildable. `zj-slim-bar` became `slim-tab-bar` on the way, because the `zj-` prefix
-namespaced an external repo and there is nothing left to namespace.
+has to mean rebuildable. The tab bar took the name `slim-tab-bar` on the way: inside the fork
+there is no external repo left to namespace.
 
 What that buys: no `.wasm` to track in dotfiles, no plugin directory to keep in step, a bar that
 cannot go stale against the binary that loads it, a bar on a bare machine with no dotfiles, and one
@@ -5670,7 +5670,7 @@ $ zellij action watch --json
 {"event":"synced","seq":4,...}
 {"event":"pane_output","pane_id":"terminal_3","handle":"sunny-otter","last_output_at":1761900001234,"seq":5,...}
 {"event":"pane_exited","pane_id":"terminal_5","handle":"calm-fox","exit_status":1,"seq":6,...}
-{"event":"pane_changed","pane_id":"terminal_3","handle":"sunny-otter","tab_id":0,"title":"~/src","program_title":"~/src","pane_cwd":"/home/me/src","pane_command":"zsh","terminal_command":null,"command_state":"prompt","seq":7,...}
+{"event":"pane_changed","pane_id":"terminal_3","handle":"sunny-otter","tab_id":0,"title":"~/src","program_title":"~/src","pane_cwd":"/home/user/src","pane_command":"zsh","terminal_command":null,"command_state":"prompt","seq":7,...}
 ```
 
 A controller that drives zellij over the CLI, locally or over ssh, had to poll: `list-tree` for the
@@ -6324,8 +6324,8 @@ binary, a source-formula build. An anchored pin with no refresh pending is still
 (Superseded later in nkmk.30: the ladder is gone, and such a build is refused over an anchored
 pin. See the next entry.)
 
-**The first release pin owes a re-grant, once.** The mini's pin is anchored on Apple Development
-under another team, and m1p's on our minted certificate (`certificate leaf = H"…"`). The release
+**The first release pin owes a re-grant, once.** One Mac's pin is anchored on Apple Development
+under another team, and another's on our minted certificate (`certificate leaf = H"…"`). The release
 signature satisfies neither, so the switch is written to `signing/regrant-owed` through the nkmk.27
 machinery. Every doctor run then asks for the re-grant until `doctor --fix --regranted`. A second
 release over a pin already on the release requirement owes nothing and records nothing, and a
@@ -8898,13 +8898,13 @@ contract change, and no CLI flag added - every flag this uses (`--in-tab`, `--ne
 ### `zellij_create` types its command into a ready interactive shell
 
 ```
-# before - zellij_create {"command": "opsearch --read op://…"}
-action new-pane --in-tab=work-zj --no-focus --name=… -- /bin/zsh -c 'opsearch …'
+# before - zellij_create {"command": "secret-cli read …"}
+action new-pane --in-tab=work-zj --no-focus --name=… -- /bin/zsh -c 'secret-cli …'
   # `zsh -c` reads .zshenv only: no .zshrc, no aliases, no `mise activate`
 
 # after
 action new-pane --in-tab=work-zj --no-focus --name=… --wait-ready --ready-timeout=10
-action write-chars --pane-id=terminal_7 -- 'opsearch …'
+action write-chars --pane-id=terminal_7 -- 'secret-cli …'
 action send-keys --pane-id=terminal_7 -- Enter
   # result: ready: true, ready_by: prompt, ready_ms: 212, input_sent: true
 ```
@@ -9713,8 +9713,8 @@ The paste is a bracketed paste, followed by one space so the next word typed is 
 **Enter is never pressed**: the reference waits in the prompt for the person, or the caller's next
 `send-keys Enter`.
 
-**The store mirrors go-for-flight's upload store** (`src/lib/server/uploads.ts` there), so the two
-front ends share one set of rules:
+**The store mirrors the upload store of a companion web front end**, so the two front ends share
+one set of rules:
 
 - **Where:** `drops/` in the zellij cache directory: `$XDG_CACHE_HOME/zellij/drops` on Linux.
   On macOS the cache directory comes from the `directories` crate, which ignores `XDG_CACHE_HOME`,
@@ -9729,18 +9729,18 @@ front ends share one set of rules:
 - **Prune:** every call first deletes the `drop-*` regular files older than seven days, a refused
   call included. No timer.
 
-What differs from go-for-flight, and why:
+What differs from that web store, and why:
 
-- **Prefix `drop-`, not `gff-`.** The two stores are separate directories; the prefix is the
-  prune's guard, the same as there.
+- **Prefix `drop-`, not the web store's.** The two stores are separate directories; the prefix is
+  the prune's guard, the same as there.
 - **Private permissions.** The directory is `0700` and each drop `0600`. A drop is often a
   screenshot of anything.
-- **Prune first, in-process.** go-for-flight prunes after a save with `find -mtime +7`, which
+- **Prune first, in-process.** The web store prunes after a save with `find -mtime +7`, which
   rounds to whole days, so a file goes after eight. Here the cut is seven days to the second, and
   it runs before the store, so a refused call prunes too.
-- **No leading space.** go-for-flight's composer adds a space before `@path` when its own text
+- **No leading space.** The web composer adds a space before `@path` when its own text
   does not end in one. The CLI cannot see the pane's line, so it adds only the trailing space.
-- **Not images only.** go-for-flight's client refuses non-image files. A drop is any file.
+- **Not images only.** The web client refuses non-image files. A drop is any file.
 
 **The pane is looked up before anything is stored.** A handle nothing answers to is a miss,
 exit 2, with no file written and stdin unread. A plugin pane is an error, exit 1. A pane that a
@@ -10460,10 +10460,10 @@ prebuilt assets checked into `zellij-utils/assets/plugins/`.
 ## Releasing
 
 Each release gets a changelog at `changelogs/v<version>.md` — the commit range plus authored notes
-saying what changed and why. Write it before tagging; it is the single source of truth the `zellij`
-skill's references point at.
+saying what changed and why. Write it before tagging; it is the single source of truth for what
+a release holds.
 
-A release tag is never moved. The series on `main` was condensed on 2026-10-06 (AGENTS.md,
+A release tag is never moved. The series on `main` was condensed on 2026-10-06 (`docs/fork-history.md`,
 "Reordered history does not bisect"), so every tag up to `v0.45.1-nkmk.30` points at a commit on
 `backup/main-pre-condense-2026-10-06` rather than on `main`. The tree at each tag is the tree
 `main` had at that release; `git diff v0.45.1-nkmk.30 <condensed tip>` was empty when the rewrite

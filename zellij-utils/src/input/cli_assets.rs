@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn an_authored_layout_is_not_a_serialized_session() {
         assert!(!assets_for_layout(Some(LayoutInfo::File(
-            "/home/someone/.config/zellij/layouts/dev.kdl".to_owned(),
+            "/home/user/.config/zellij/layouts/dev.kdl".to_owned(),
             Default::default()
         )))
         .layout_is_a_serialized_session());

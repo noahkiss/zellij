@@ -1807,7 +1807,7 @@ mod tests {
 
     /// The env every call in this suite is built in unless it says otherwise.
     fn a_shell_env() -> CallEnv {
-        call_env(Some("/bin/zsh"), Some("/home/tester"), Path::new("/"), &[])
+        call_env(Some("/bin/zsh"), Some("/home/user"), Path::new("/"), &[])
     }
 
     fn built(tool: &str, value: Value, session: Option<&str>, env: &CallEnv) -> Vec<String> {
@@ -2399,7 +2399,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let brief = dir.path().join("it's a brief.md");
         std::fs::write(&brief, "- fix the test\n").unwrap();
-        let env = call_env(Some("/bin/zsh"), Some("/home/tester"), dir.path(), &[]);
+        let env = call_env(Some("/bin/zsh"), Some("/home/user"), dir.path(), &[]);
         let typed = |value: Value| {
             let env = &env;
             async move {
@@ -2783,7 +2783,7 @@ mod tests {
         assert_eq!(shell_for_command(None), "/bin/sh");
         assert_eq!(shell_for_command(Some(String::new())), "/bin/sh");
         assert_eq!(shell_for_command(Some("   ".to_owned())), "/bin/sh");
-        let no_shell = call_env(None, Some("/home/tester"), Path::new("/"), &[]);
+        let no_shell = call_env(None, Some("/home/user"), Path::new("/"), &[]);
         assert_eq!(
             built(
                 "zellij_create",
@@ -3094,7 +3094,7 @@ mod tests {
     fn a_shown_path_is_expanded_against_this_servers_environment() {
         let env = call_env(
             None,
-            Some("/home/tester"),
+            Some("/home/user"),
             Path::new("/"),
             &[("SHOTS", "/var/shots")],
         );
@@ -3106,7 +3106,7 @@ mod tests {
                 &env
             )
             .join(" "),
-            "action show --mode=auto -- /home/tester/a.png /var/shots/b.png rel/c.png"
+            "action show --mode=auto -- /home/user/a.png /var/shots/b.png rel/c.png"
         );
         // a lone string is a list of one
         assert_eq!(

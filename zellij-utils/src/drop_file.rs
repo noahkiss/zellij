@@ -6,7 +6,7 @@
 //! for a coding agent that reads `@` references, a plain path for one that does not, and a
 //! shell-quoted path at a shell. The reference is pasted, never submitted.
 //!
-//! The store follows go-for-flight's upload store, so the two front ends share one contract: a
+//! The store follows a companion web front end's upload store, so the two front ends share one contract: a
 //! collision-safe name that keeps only a safe extension, a 25 MiB ceiling, a write to a temporary
 //! name that is renamed into place only once it is whole, and anything older than seven days pruned
 //! on every call, with no timer.
@@ -18,10 +18,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::consts::ZELLIJ_CACHE_DIR;
 
-/// The largest file a drop accepts, in bytes: 25 MiB, the same ceiling as go-for-flight's uploads.
+/// The largest file a drop accepts, in bytes: 25 MiB, the same ceiling as the web front end's uploads.
 pub const MAX_DROP_BYTES: u64 = 25 * 1024 * 1024;
 
-/// A drop older than this is deleted by the next call. Seven days, as in go-for-flight.
+/// A drop older than this is deleted by the next call. Seven days, as in the web front end.
 pub const MAX_DROP_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Every stored drop's name starts with this. The prune deletes nothing else, so a store directory
@@ -86,7 +86,7 @@ pub struct StoredDrop {
 }
 
 /// The extension of `name`, kept only when it is safe: one to ten ASCII letters or digits,
-/// lower-cased, with its dot. Anything else is dropped, as go-for-flight's `safeExt` does.
+/// lower-cased, with its dot. Anything else is dropped, as the web front end does.
 pub fn safe_extension(name: &str) -> String {
     let base = Path::new(name)
         .file_name()
@@ -502,18 +502,18 @@ mod tests {
             reference(plain, ReferenceForm::Shell),
             "/c/zellij/drops/drop-1.png"
         );
-        let spaced = Path::new("/Users/a b/drops/drop-1.png");
+        let spaced = Path::new("/Users/x y/drops/drop-1.png");
         assert_eq!(
             reference(spaced, ReferenceForm::At),
-            "@\"/Users/a b/drops/drop-1.png\""
+            "@\"/Users/x y/drops/drop-1.png\""
         );
         assert_eq!(
             reference(spaced, ReferenceForm::Path),
-            "\"/Users/a b/drops/drop-1.png\""
+            "\"/Users/x y/drops/drop-1.png\""
         );
         assert_eq!(
             reference(spaced, ReferenceForm::Shell),
-            "'/Users/a b/drops/drop-1.png'"
+            "'/Users/x y/drops/drop-1.png'"
         );
     }
 
