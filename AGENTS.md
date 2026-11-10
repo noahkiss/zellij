@@ -137,6 +137,3 @@ Three surfaces look similar and cost very different amounts.
 
 Sockets are scoped by contract version, not by version string, so a fork build and a stock build of
 the same contract share sessions. Keep it that way.
-
-<!-- Optional local rules, untracked. The import is skipped when the file is absent. -->
-@AGENTS.local.md
