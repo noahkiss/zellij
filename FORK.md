@@ -4083,8 +4083,8 @@ prompt either.
 **From nkmk.34, in every mode.** The pass above ran only with `"agents"` or `"prefill"`, or a
 configured hint for the harness. Under the default `"all"` with no hint, a known agent was recorded
 with its whole argv, launch prompt included, so a restore offered to send the prompt again. Found
-on an agent that `zellij_create run_in=agent` started from a brief: `session-layout.kdl` held
-`args "--model" "haiku" "--" "<the brief>"`. The operator's rule is that a restored agent pane
+on an agent started with a prompt: `session-layout.kdl` held
+`args "--model" "haiku" "--" "<the prompt>"`. The operator's rule is that a restored agent pane
 holds only the bare resume, in any mode, so the live-session pass and the bare resume now run for
 every known harness whatever `resurrect_commands` says. `"all"` still keeps every other command
 whole: only claude, codex, opencode and pi change. A known agent with no session found gets its
@@ -4096,7 +4096,7 @@ from one offers the command that snapshot holds; the next serialization records 
 Only `"prefill"` types the bare form of an old snapshot.
 
 In the same patch, the `list-panes` table folds a newline, carriage return or tab in any cell to a
-space, as `list-agents` does, so an agent started with a multi-line prompt keeps its row on one
+space, as the `list-agents` table does (`dashed` in `zellij-utils/src/agent_detect.rs`), so an agent started with a multi-line prompt keeps its row on one
 line. `--json` keeps every value as it is.
 
 Files: `zellij-server/src/pty.rs` (`apply_resurrect_command_hints`),
@@ -9417,55 +9417,6 @@ an unknown pane answered as a miss.
 `src/mcp/invoke.rs` (`argv_in`, the refusals in `write_input_call`). Tests: the command line, a
 path beginning with a dash kept behind `--`, and the four refusals.
 
-### `zellij_create run_in=agent`: start an agent from a brief
-
-From nkmk.34, from the agent-orchestration plan. Handing a job to another agent meant making a
-pane, waiting for its shell, and typing a harness command with the brief quoted into it by hand.
-
-```
-zellij_create {"run_in": "agent", "command": "claude --model opus", "brief": "~/briefs/fix-ci.md",
-               "cwd": "~/src/app", "name": "fix-ci"}
-  # action new-pane --in-tab=work-zj --no-focus --cwd=/home/u/src/app --name=fix-ci --wait-ready ...
-  # then, once the shell is ready, typed:  claude --model opus -- "$(cat '/home/u/briefs/fix-ci.md')"
-pane_id: terminal_9
-handle: brisk-heron
-ready_by: prompt
-```
-
-- **`run_in` takes `agent`.** It is the `shell` mode with a different typed line: the pane is made
-  wherever `kind` says (the caller's `-zj` tab by default), its shell is waited for, and then the
-  harness is typed and Enter pressed. The answer is the pane's handle as soon as the line is typed;
-  `zellij_wait_for until=agent_idle` waits for the end of the first turn, and `zellij_read_pane
-  last_reply` reads what the agent said.
-- **`command` is the harness and its flags**, as the caller would type them. Its first word must be
-  claude, codex, opencode or pi (by basename, the same table `list-agents` matches), or the call is
-  refused. The model goes in it the harness's own way; all four take `--model`.
-- **`brief` is a file whose text is the first prompt.** The pane's own shell reads it:
-  `"$(cat '<path>')"`, after `--` so that a brief beginning with a dash is not read as a flag
-  (`--prompt` for opencode, which takes its first prompt as a flag). The text never passes through
-  the MCP call or the typed line, so it can be long and hold quotes and newlines. The path is
-  expanded like `cwd` and must be a file. Without `brief` the harness starts bare. `brief` with any
-  other `run_in` is refused.
-- **A restore does not send the brief again.** The brief reaches the harness as an argument, so it
-  is in the agent's argv, and `list-agents` shows it in `command`. nkmk.32's bare resume records a
-  known harness as argv0 and its session words only, in every `resurrect_commands` mode (see
-  [only its agents](#a-restored-session-offers-to-resume-its-agents-and-only-its-agents)), so the
-  restored pane is `claude --resume <id>`. Verified live on a spawned claude: `session-layout.kdl`
-  held `args "--resume" "<id>"`.
-- **The `list-agents` table folds a newline in a cell to a space**, so a multi-line brief in an
-  agent's command no longer splits its row in two. `--json` keeps the command as it is.
-- **`kind` takes `floating`** as well: a floating pane beside the caller's own, what `kind: pane`
-  with `floating: true` makes. The `floating` flag stays, so no caller breaks, and `brief` takes
-  the tool to ten parameters: the cap moved from nine to ten for it.
-
-The brief is typed as `"$(cat …)"`, which bash, zsh and fish 3.4+ read the same way. A shell
-without `$( )` (nu, older fish) gets the line literally. Files: `src/mcp/invoke.rs` (`run_in`,
-`typed_command`, `agent_command`, the `floating` kind), `src/mcp/tools.rs`,
-`zellij-utils/src/agent_detect.rs` (the table fold). Tests: the typed line
-for claude and opencode, a path with a quote in it, no brief, the refusals (not a harness, no
-command, no file, a brief without `run_in=agent`), the readiness wait, both spellings of a
-floating pane, and a multi-line command on one table row.
-
 ### `zellij_overview scope=my_agents`: the supervision view
 
 From nkmk.34, from the agent-orchestration plan. A session that started several agents had no one
@@ -9489,12 +9440,12 @@ zellij_overview {"scope": "my_agents"}
   whole seconds since the agent last reported a state, and `output_age_s`, since its pane last drew
   anything. A reader asked which agent has stalled should not have to subtract 13-digit numbers.
   The raw keys stay beside them. A working agent whose `output_age_s` keeps growing has stalled.
-- **`command` is cut to 120 characters there**, on one line. An agent started from a brief carries
-  the whole brief in its command line, and a supervisor polling the view would be handed every
-  brief on every call. `list-agents --json` keeps it whole.
+- **`command` is cut to 120 characters there**, on one line. An agent started with a prompt carries
+  the whole prompt in its command line, and a supervisor polling the view would be handed every
+  prompt on every call. `list-agents --json` keeps it whole.
 - **`scope=my_agents`** is the same answer kept to the agents in the caller's own `-zj` tab: the
-  tab `zellij_create` puts every pane in by default, and so every agent the caller started there
-  with `run_in=agent`. It is found the way `zellij_create` finds it, from the tab the server's own
+  tab `zellij_create` puts every pane in by default, and so every agent the caller started there.
+  It is found the way `zellij_create` finds it, from the tab the server's own
   pane is in. An agent a person moved out of that tab is no longer counted as the caller's, and
   one moved in is. `scope=agents` lists every agent in the session.
 
@@ -9572,11 +9523,7 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   clock.
 - **Files go over stdin.** A file the caller names lives on the caller's machine. `zellij_write_input`
   `file` sends its bytes over ssh stdin to `action drop-file --name=<its name> -- -`, so the
-  remote store, reference and paste are the ones a local drop makes. A `zellij_create`
-  `run_in=agent` brief is copied first, by a second remote script, into
-  `${TMPDIR:-/tmp}/zellij-mcp-files-<uid>` there (mode 0700). Each copy keeps its name behind a
-  unique prefix. The script removes copies older than seven days before it stores a new one. The
-  agent line then names the copy.
+  remote store, reference and paste are the ones a local drop makes.
 - **What changes for a create on another machine.** `kind: stacked` is refused:
   it needs the caller's own pane, which is not in that session. `agent_tab` and `tab` work. The
   agent tab is named after the caller's own tab on this machine, so a caller has one tab name on
@@ -9648,8 +9595,7 @@ MCP `zellij_create` accepts `stacked`, `agent_tab`, and `tab`.
 `agent_tab` remains the default and reuses the caller's `-zj` tab.
 `stacked` uses `--stacked --near-current-pane` and requires the caller's local pane.
 The tool rejects the removed `pane` and `floating` kinds and the `floating` parameter.
-Placement validation runs before session queries, brief reads, or remote uploads.
-This ordering prevents removed MCP kinds from uploading a brief before their rejection.
+Placement validation runs before any session query.
 
 Tests cover config parsing and rendering, client-only serialization, CLI placement,
 missing-anchor warnings, editor commands, and the MCP kinds and schema.
@@ -9840,10 +9786,10 @@ handle: bar-test
   `--stacked` for a plugin pane, and the pane would open tiled in the focused tab. `tab` runs
   `new-pane --new-tab`, because `new-tab --initial-plugin` takes no configuration; `name` names
   that tab.
-- **`brief` and `wait_ready` are refused** with a plugin, which has no shell. Without `name` the
+- **`wait_ready` is refused** with a plugin, which has no shell. Without `name` the
   pane keeps the title zellij gives a plugin.
 - The answer carries the pane's handle, so `zellij_read_pane` reads what the plugin draws.
-- The tool's parameter cap moves from ten to eleven for `plugin_config`.
+- `plugin_config` brings the tool to ten parameters, the cap.
 
 Two server fixes make the placement true. Both changed what the CLI does, not only the MCP:
 

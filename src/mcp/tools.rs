@@ -418,11 +418,9 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_create",
-        summary: "Make a pane to work in, optionally running a command in it, or start a \
-                  coding agent in one with a brief as its first prompt.",
+        summary: "Make a pane to work in, optionally running a command in it.",
         best_for: "starting work when you have no pane of your own yet. One pane per job is the \
-                   norm; after that, write to the one you have. With run_in=agent, handing a job \
-                   to another coding agent.",
+                   norm; after that, write to the one you have.",
         not_for:
             "running something in a pane that already exists - write to it instead. Not for a \
                   second pane when your first one is idle, and not for replacing a pane whose \
@@ -442,19 +440,9 @@ pub const TOOLS: &[ToolSpec] = &[
                time is reported as `ready: false` with the pane's handle, and nothing is typed. \
                The handle in the answer is the pane's address and survives a session restore; \
                use it, not the integer id, and pass `handle` yourself when you want to find the \
-               pane again by a name you chose. run_in=agent starts a coding agent: command is \
-               the harness and its flags (claude, codex, opencode or pi; pass the model the \
-               harness's own way, `--model` for all four), brief is a file whose text becomes its \
-               first prompt, cwd is where it works and name is what its frame says. It is typed \
-               into your shell once the shell is ready, like any shell command, and the call \
-               returns the pane's handle as soon as it is typed. Start the child, then wait for \
-               agent-change in the background; never poll the screen. Use zellij_wait_for \
-               until=agent_change and inspect new_state. Finished turns include a last reply line; \
-               zellij_read_pane last_reply reads the full reply. The brief is in the agent's command line, so list-agents shows \
-               it; a session restore brings the agent back as a resume of its session, without \
-               the brief. On another machine (session host/session) kind is agent_tab or tab, \
-               cwd is an absolute path there, exec runs through /bin/sh, and the brief is \
-               copied there first. run_in=plugin loads a plugin instead, configured by \
+               pane again by a name you chose. On another machine (session host/session) kind is \
+               agent_tab or tab, cwd is an absolute path there, and exec runs through /bin/sh. \
+               run_in=plugin loads a plugin instead, configured by \
                plugin_config; read what it draws with zellij_read_pane.",
         params: &[
             SESSION,
@@ -482,7 +470,7 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "run_in",
-                kind: ParamKind::Enum(&["shell", "exec", "agent", "plugin"]),
+                kind: ParamKind::Enum(&["shell", "exec", "plugin"]),
                 required: false,
                 from: None,
                 describe: "How `command` runs. shell, the default, types it into your interactive \
@@ -490,9 +478,7 @@ pub const TOOLS: &[ToolSpec] = &[
                            apply, and the pane stays a shell afterwards. exec runs it as \
                            `$SHELL -c`, which reads no interactive rc file, ends the pane's \
                            command when it ends, and keeps its exit status for zellij_wait_for \
-                           until=exit. agent is shell for a coding agent: `command` must start \
-                           claude, codex, opencode or pi, and `brief` becomes its first prompt. \
-                           plugin opens `command` as a plugin pane instead of a terminal: \
+                           until=exit. plugin opens `command` as a plugin pane instead of a terminal: \
                            `file:/path/to.wasm`, `zellij:<name>` or an alias. It takes kind \
                            agent_tab or tab, not stacked.",
                 default: Some(invoke::RUN_IN_DEFAULT),
@@ -535,17 +521,6 @@ pub const TOOLS: &[ToolSpec] = &[
                 required: false,
                 from: Some(("action new-pane", "--handle")),
                 describe: "",
-                default: None,
-            },
-            ParamSpec {
-                name: "brief",
-                kind: ParamKind::Str,
-                required: false,
-                from: None,
-                describe: "With run_in=agent: a file whose text is the agent's first prompt. \
-                           `~` and `$VAR` are expanded, and a relative path is taken from this \
-                           server's directory. The agent's shell reads it, so it can be long and \
-                           hold any characters.",
                 default: None,
             },
             ParamSpec {
@@ -1253,10 +1228,10 @@ mod tests {
                 "{} is not namespaced by its service",
                 tool.name
             );
-            // Keep each tool's argument list small enough to use reliably. Eleven since
+            // Keep each tool's argument list small enough to use reliably. Ten since
             // `zellij_create` took `plugin_config`; a plugin pane reuses `command` and `run_in`
             assert!(
-                tool.params.len() <= 11,
+                tool.params.len() <= 10,
                 "{} asks for more parameters than an agent can be expected to get right",
                 tool.name
             );

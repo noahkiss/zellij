@@ -254,7 +254,7 @@ impl AgentsView {
                 continue;
             };
             // an agent started with a prompt carries the whole prompt in its command line, and a
-            // supervisor polling this view would be handed every brief on every call
+            // supervisor polling this view would be handed every prompt on every call
             if let Some(command) = row.get("command").and_then(Value::as_str) {
                 let folded = command.split_whitespace().collect::<Vec<_>>().join(" ");
                 let short = if folded.chars().count() > AGENT_COMMAND_MAX {
@@ -626,20 +626,7 @@ async fn plan_in(
     create_kind_allowed(&read)?;
     plugin_pane(&read)?;
     let session = target_session.clone();
-    // a brief is a file on this machine; a pane on another machine reads the copy made there, and
-    // only once everything a refusal could be about has been checked
-    let brief_at = match remote_host {
-        Some(host) if run_in(&read)? == "agent" && read.string("brief").is_some() => {
-            remote_kind_allowed(&read)?;
-            agent_command(&read, env, None)?;
-            match brief_path(&read, env)? {
-                Some(path) => Some(remote::upload(host, &path).await?),
-                None => None,
-            }
-        },
-        _ => None,
-    };
-    let then_type = typed_command(&read, env, brief_at.as_deref())?.map(|command| TypeAfter {
+    let then_type = typed_command(&read)?.map(|command| TypeAfter {
         session: session.clone(),
         command,
     });
@@ -694,7 +681,7 @@ fn local_file(path: &str, env: &CallEnv, param: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
-/// Refuse removed placement options before querying a session or uploading a brief.
+/// Refuse removed placement options before querying a session.
 fn create_kind_allowed(args: &Args) -> Result<(), String> {
     if args.values.contains_key("floating") {
         return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
@@ -892,14 +879,13 @@ pub fn agent_key(
     }
 }
 
-/// How a create runs its `command`: `shell`, `exec`, `agent` or `plugin`, refused when it is none
-/// of them.
+/// How a create runs its `command`: `shell`, `exec` or `plugin`, refused when it is none of them.
 fn run_in(args: &Args) -> Result<String, String> {
     let run_in = args.enumerated("run_in", RUN_IN_DEFAULT);
     match run_in.as_str() {
-        "shell" | "exec" | "agent" | "plugin" => Ok(run_in),
+        "shell" | "exec" | "plugin" => Ok(run_in),
         other => Err(format!(
-            "`run_in` must be shell, exec, agent or plugin, not `{}`.",
+            "`run_in` must be shell, exec or plugin, not `{}`.",
             other
         )),
     }
@@ -921,14 +907,8 @@ fn plugin_pane(args: &Args) -> Result<Option<(String, Option<String>)>, String> 
     let plugin = args.required("command").map_err(|_| {
         "run_in=plugin needs `command`: the plugin, like `file:/path/to.wasm`.".to_owned()
     })?;
-    if let Some(param) = ["brief", "wait_ready"]
-        .into_iter()
-        .find(|param| args.values.contains_key(*param))
-    {
-        return Err(format!(
-            "A plugin pane has no shell, and takes no `{}`.",
-            param
-        ));
+    if args.values.contains_key("wait_ready") {
+        return Err("A plugin pane has no shell, and takes no `wait_ready`.".to_owned());
     }
     if args.enumerated("kind", CREATE_KIND_DEFAULT) == "stacked" {
         return Err(
@@ -955,73 +935,12 @@ fn plugin_pane(args: &Args) -> Result<Option<(String, Option<String>)>, String> 
 }
 
 /// The command a create types into its pane once the pane is ready: the `command` of a
-/// `run_in: shell` create, the harness and its brief for an `agent` one, and nothing for an
-/// `exec` one, which hands it to the server instead.
-///
-/// `brief_at` is where the brief is on the machine the pane is on, when that is not this one.
-fn typed_command(
-    args: &Args,
-    env: &CallEnv,
-    brief_at: Option<&str>,
-) -> Result<Option<String>, String> {
-    if args.string("brief").is_some() && run_in(args)? != "agent" {
-        return Err(
-            "`brief` is the first prompt of an agent: pass it with run_in=agent.".to_owned(),
-        );
-    }
+/// `run_in: shell` create, and nothing for an `exec` one, which hands it to the server instead.
+fn typed_command(args: &Args) -> Result<Option<String>, String> {
     Ok(match run_in(args)?.as_str() {
         "shell" => args.string("command"),
-        "agent" => Some(agent_command(args, env, brief_at)?),
         _ => None,
     })
-}
-
-/// The line an `agent` create types into its shell: the harness command as the caller wrote it,
-/// and the brief file's text as its first prompt, in the form that harness takes one.
-///
-/// The brief is read by the pane's own shell, `"$(cat '<path>')"`, so its text never passes
-/// through this command line, a shell history line keeps the short form, and quotes or newlines
-/// in it arrive as written. Everything after `--` is the prompt, so a brief that begins with a
-/// dash is not read as a flag. opencode takes its first prompt as `--prompt`.
-///
-/// A session restore records an agent pane as the bare resume of its session (nkmk.32), so the
-/// brief, which reaches the harness as an argument, is never typed again by a restore.
-///
-/// `brief_at` replaces the brief's own path with a copy's, for a pane on another machine.
-fn agent_command(args: &Args, env: &CallEnv, brief_at: Option<&str>) -> Result<String, String> {
-    let command = args.required("command").map_err(|_| {
-        "run_in=agent needs `command`: the harness to start, like `claude` or `codex --model \
-         o3`."
-            .to_owned()
-    })?;
-    let program = command.split_whitespace().next().unwrap_or_default();
-    let harness = zellij_utils::agent_detect::harness_for_command(program).ok_or_else(|| {
-        format!(
-            "`{}` is not a coding agent this build knows: run_in=agent starts claude, codex, \
-             opencode or pi.",
-            program
-        )
-    })?;
-    let Some(path) = brief_path(args, env)? else {
-        return Ok(command);
-    };
-    let path = match brief_at {
-        Some(copy) => copy.to_owned(),
-        None => path.to_string_lossy().into_owned(),
-    };
-    let quoted = format!("\"$(cat '{}')\"", path.replace('\'', "'\\''"));
-    Ok(match harness.kind {
-        "opencode" => format!("{} --prompt {}", command, quoted),
-        _ => format!("{} -- {}", command, quoted),
-    })
-}
-
-/// The brief file on this machine, refused when it is not a file. `None` without a brief.
-fn brief_path(args: &Args, env: &CallEnv) -> Result<Option<PathBuf>, String> {
-    match args.string("brief") {
-        Some(brief) => local_file(&brief, env, "brief").map(Some),
-        None => Ok(None),
-    }
 }
 
 /// The handle a create asked for, refused here by the rule the CLI's `--handle` applies.
@@ -1293,7 +1212,6 @@ fn argv_in(
                 "cwd",
                 "name",
                 "handle",
-                "brief",
                 "plugin_config",
             ]
             .into_iter()
@@ -1329,7 +1247,6 @@ fn argv_in(
             // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
             // ready - see `TypeAfter`. `exec` hands `command` to the server as `$SHELL -c`, as
             // every create did before, and waits for nothing
-            // an `agent` create is a shell create whose typed line is the harness and its brief
             let shell_mode = !matches!(run_in(&args)?.as_str(), "exec" | "plugin");
             let wait_ready = shell_mode && args.flag_or("wait_ready", true);
             // the end of every create's command line: the readiness wait, or the command after
@@ -2281,7 +2198,7 @@ mod tests {
             "zellij_create",
             json!({"kind": "stacked", "command": "make", "run_in": "login"})
         )
-        .contains("shell, exec, agent or plugin"));
+        .contains("shell, exec or plugin"));
     }
 
     #[tokio::test]
@@ -2333,77 +2250,6 @@ mod tests {
         .await
         .expect("a plan");
         assert!(plan.then_type.is_none());
-    }
-
-    #[tokio::test]
-    async fn an_agent_create_types_the_harness_with_its_brief_as_the_first_prompt() {
-        let dir = tempfile::tempdir().unwrap();
-        let brief = dir.path().join("it's a brief.md");
-        std::fs::write(&brief, "- fix the test\n").unwrap();
-        let env = call_env(Some("/bin/zsh"), Some("/home/user"), dir.path(), &[]);
-        let typed = |value: Value| {
-            let env = &env;
-            async move {
-                plan_in("zellij_create", &args(value), None, env, &Target::Local)
-                    .await
-                    .map(|plan| plan.then_type.map(|then_type| then_type.command))
-            }
-        };
-        let quoted = format!(
-            "\"$(cat '{}')\"",
-            brief.to_string_lossy().replace('\'', "'\\''")
-        );
-        assert_eq!(
-            typed(
-                json!({"kind": "stacked", "run_in": "agent", "command": "claude --model haiku",
-                         "brief": "it's a brief.md"})
-            )
-            .await,
-            Ok(Some(format!("claude --model haiku -- {}", quoted)))
-        );
-        // opencode takes its first prompt as a flag
-        assert_eq!(
-            typed(
-                json!({"kind": "stacked", "run_in": "agent", "command": "opencode",
-                         "brief": brief.to_string_lossy()})
-            )
-            .await,
-            Ok(Some(format!("opencode --prompt {}", quoted)))
-        );
-        // no brief starts the harness bare
-        assert_eq!(
-            typed(json!({"kind": "stacked", "run_in": "agent", "command": "/usr/bin/codex -m o3"}))
-                .await,
-            Ok(Some("/usr/bin/codex -m o3".to_owned()))
-        );
-        for (refused, says) in [
-            (
-                json!({"kind": "stacked", "run_in": "agent", "command": "vim"}),
-                "not a coding agent",
-            ),
-            (
-                json!({"kind": "stacked", "run_in": "agent"}),
-                "needs `command`",
-            ),
-            (
-                json!({"kind": "stacked", "run_in": "agent", "command": "pi", "brief": "nope.md"}),
-                "is not a file",
-            ),
-            (
-                json!({"kind": "stacked", "command": "ls", "brief": "it's a brief.md"}),
-                "with run_in=agent",
-            ),
-        ] {
-            let error = typed(refused.clone()).await.unwrap_err();
-            assert!(error.contains(says), "{}: {}", refused, error);
-        }
-        // an agent pane waits for its shell like any shell create
-        assert!(line(
-            "zellij_create",
-            json!({"kind": "stacked", "run_in": "agent", "command": "claude"}),
-            None
-        )
-        .contains("--wait-ready"));
     }
 
     #[test]
@@ -2462,11 +2308,6 @@ mod tests {
             assert!(refused.contains(said), "{}: {}", extra, refused);
         }
         assert!(refusal("zellij_create", json!({"run_in": "plugin"})).contains("needs `command`"));
-        assert!(refusal(
-            "zellij_create",
-            json!({"run_in": "plugin", "command": "zellij:strider", "brief": "b.md"})
-        )
-        .contains("`brief`"));
         assert!(refusal("zellij_create", json!({"plugin_config": ["a=1"]}))
             .contains("with run_in=plugin"));
         assert!(refusal(
@@ -3099,7 +2940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_create_placements_are_refused_before_reading_or_uploading_a_brief() {
+    async fn removed_create_placements_are_refused_on_another_machine() {
         let host = remote::RemoteHost {
             name: "boxa".into(),
             bin: None,
@@ -3119,9 +2960,6 @@ mod tests {
         ] {
             let mut request = args(placement);
             request.insert("command".into(), json!("claude"));
-            request.insert("run_in".into(), json!("agent"));
-            // A missing brief proves placement fails before file access or SSH.
-            request.insert("brief".into(), json!("/nonexistent/brief.md"));
             let result = plan_in(
                 "zellij_create",
                 &request,
@@ -3132,25 +2970,5 @@ mod tests {
             .await;
             assert!(matches!(result, Err(reason) if reason.contains(expected)));
         }
-    }
-
-    #[test]
-    fn a_remote_agent_reads_its_brief_from_the_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let brief = dir.path().join("brief.md");
-        std::fs::write(&brief, "do the thing").unwrap();
-        let read = args(json!({"command": "claude", "run_in": "agent",
-                               "brief": brief.display().to_string()}));
-        let typed = typed_command(
-            &Args::new(&read),
-            &a_remote_env(),
-            Some("/tmp/zellij-mcp-files-501/x-brief.md"),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            typed,
-            "claude -- \"$(cat '/tmp/zellij-mcp-files-501/x-brief.md')\""
-        );
     }
 }

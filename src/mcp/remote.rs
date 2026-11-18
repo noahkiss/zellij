@@ -483,16 +483,6 @@ if [ -z \"$b\" ]; then echo \"zellij was not found on $(hostname): give this hos
 remote_hosts\" >&2; exit 127; fi; \
 exec \"$b\" \"$@\"";
 
-/// The script that stores a file sent over stdin and prints where it went: `$1` is its name.
-///
-/// A brief lives on the caller's machine, and the remote pane can only read files on its own.
-/// It lands in a private directory under the remote temp dir, and anything there older than a week
-/// is removed first.
-pub const UPLOAD_ON_REMOTE: &str = "d=${TMPDIR:-/tmp}; d=${d%/}/zellij-mcp-files-$(id -u); \
-umask 077; mkdir -p \"$d\" || exit 1; \
-find \"$d\" -type f -mtime +7 -exec rm -f {} + 2>/dev/null; \
-f=\"$d/$1\"; cat > \"$f\" || exit 1; printf \"%s\\n\" \"$f\"";
-
 /// The line the remote login shell is given: `sh -c '<script>' sh '<arg>' ...`, every word quoted.
 pub fn remote_command(script: &str, args: &[String]) -> String {
     let mut words = vec![
@@ -658,56 +648,6 @@ pub async fn run(
     stdin: Option<Vec<u8>>,
 ) -> Result<Outcome, String> {
     run_line(&host.name, zellij_command(host, argv), stdin).await
-}
-
-/// Copy a file on this machine to `host`, and return the path it now has there.
-///
-/// The name on the remote side keeps the file's own name, behind a random prefix so two calls
-/// cannot collide, and with anything but letters, digits, `.`, `-` and `_` replaced.
-pub async fn upload(host: &RemoteHost, local: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(local)
-        .map_err(|e| format!("{} could not be read: {}", local.display(), e))?;
-    let name = local
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let safe: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || ".-_".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let stored = format!(
-        "{:x}-{:x}-{}-{}",
-        nanos,
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        safe
-    );
-    let outcome = run_line(
-        &host.name,
-        remote_command(UPLOAD_ON_REMOTE, &[stored]),
-        Some(bytes),
-    )
-    .await?;
-    let path = outcome.stdout.trim();
-    if outcome.is_error() || !path.starts_with('/') {
-        return Err(format!(
-            "{} could not be copied to {}: {}",
-            local.display(),
-            host.name,
-            outcome.stderr.trim()
-        ));
-    }
-    Ok(path.to_owned())
 }
 
 #[cfg(test)]
@@ -1160,42 +1100,5 @@ mod tests {
             route(&mut arguments, &hosts, "BOXB.local").unwrap(),
             Target::Local
         );
-    }
-
-    #[test]
-    fn an_upload_stores_stdin_privately_and_prints_where() {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(remote_command(UPLOAD_ON_REMOTE, &["x-brief.md".to_owned()]))
-            .env("TMPDIR", tmp.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"line one\nit's line two\n")
-            .unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success());
-        let path = String::from_utf8(out.stdout).unwrap().trim().to_owned();
-        assert!(
-            path.starts_with(&tmp.path().display().to_string()),
-            "{}",
-            path
-        );
-        assert!(path.ends_with("/x-brief.md"), "{}", path);
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "line one\nit's line two\n"
-        );
-        let dir = Path::new(&path).parent().unwrap();
-        let mode = std::fs::metadata(dir).unwrap().permissions().mode();
-        assert_eq!(mode & 0o077, 0, "the directory is private: {:o}", mode);
     }
 }
