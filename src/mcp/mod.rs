@@ -7,8 +7,8 @@
 //!
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
-//! * **Nine tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
-//!   fails if it grows past nine or if a tool asks for more than ten parameters.
+//! * **Eight tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
+//!   fails if it grows past eight or if a tool asks for more than ten parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
 //! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so
@@ -63,14 +63,12 @@ first time and reused after. It does not take the person's focus. That keeps you
 place and out of the pane they are looking at.
 
 Use kind=stacked to stack onto your own pane, or kind=tab for a new tab.
-zellij_create never splits or floats. zellij_show is the floating image viewer exception.
+zellij_create never splits or floats.
 
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
 each one is, including its live messaging name. Refresh the list before addressing another agent.
 Use your harness's messaging tool for named agents. Type into their panes when they have no messaging.
 The agents prompt and zellij://agents resource return the same live list.
-
-zellij_show puts image files in front of the person, in a pop-up pane they close with q.
 
 Sessions on other machines: write `session` as `host/session` - `boxa/work` - and every tool acts
 on that session over ssh, the same as on a local one. Only hosts listed in remote_hosts in

@@ -741,52 +741,6 @@ pub const TOOLS: &[ToolSpec] = &[
         destructive: true,
         idempotent: false,
     },
-    ToolSpec {
-        name: "zellij_show",
-        summary: "Show image files to the person in a pop-up pane that they close with q.",
-        best_for: "putting a screenshot, a chart or any other image in front of the person, inside \
-                   their terminal. Pass several files at once: the person flips between them with \
-                   the arrow keys.",
-        not_for: "looking at an image yourself - nothing of the image comes back to you, only the \
-                  pane's handle. Not for text, which belongs in a pane from zellij_create.",
-        follow_up: Some(
-            "zellij_wait_for until=exit on the handle to learn when the person has closed it, or \
-             zellij_close with operation=close_pane to close it for them",
-        ),
-        reports: &["action show"],
-        tips: "The pane floats over the tab the person is on and takes their focus, so the arrow \
-               keys and q reach it - unlike zellij_create, which never takes the focus. Paths are \
-               read on the \
-               machine this server runs on: absolute, or relative to this server's directory, and \
-               `~` and `$VAR` are expanded. A path that is not a file fails the call and no pane \
-               is made. The image travels inside the terminal stream, so a person attached over \
-               ssh sees it: in kitty graphics when their terminal draws them, and in coloured \
-               half-blocks when it does not. Reads PNG, JPEG, GIF and WebP.",
-        params: &[
-            SESSION,
-            ParamSpec {
-                name: "paths",
-                kind: ParamKind::StrList,
-                required: true,
-                from: Some(("action show", "files")),
-                describe: "The image files, in the order to show them. The first one is shown \
-                           first.",
-                default: None,
-            },
-            ParamSpec {
-                name: "mode",
-                kind: ParamKind::Enum(&["auto", "kitty", "blocks"]),
-                required: false,
-                from: Some(("action show", "--mode")),
-                describe: "",
-                default: Some("auto"),
-            },
-        ],
-        read_only: false,
-        // it adds a pane and takes the focus; it closes nothing and the person closes it with q
-        destructive: false,
-        idempotent: false,
-    },
 ];
 
 /// The tool by that name, or `None`.
@@ -1284,9 +1238,8 @@ mod tests {
 
     #[test]
     fn the_surface_stays_small_and_the_names_do_not_collide() {
-        // nine since nkmk.33, when `zellij_show` put an image in front of the person
         assert!(
-            TOOLS.len() <= 9,
+            TOOLS.len() <= 8,
             "the point of this server is a surface an agent can route through"
         );
         let mut names: Vec<&str> = TOOLS.iter().map(|tool| tool.name).collect();

@@ -93,8 +93,6 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "new-tab",
             // it makes a pane, and reports the one it made; `--list` alone changes nothing
             "reopen-pane",
-            // the viewer it opens is a pane like any other, and it reports the one it made
-            "show",
             "start-or-reload-plugin",
         ],
     },
@@ -286,11 +284,6 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action drop-file",
         shape: "record",
         keys: "path bytes pane_id handle agent form reference",
-    },
-    OutputSpec {
-        command: "action show",
-        shape: "record",
-        keys: "pane_id handle",
     },
     OutputSpec {
         command: "action edit",

@@ -1,5 +1,4 @@
 mod commands;
-mod image_viewer;
 mod mcp;
 mod new_pane_default;
 mod pane_default;
@@ -36,12 +35,6 @@ fn main() {
         std::env::set_var(zellij_utils::session_lifecycle::STRICT_VERSION_ENV, "1");
     }
 
-    // the viewer is a program in a pane, not a client of any session: it reads no config and asks
-    // no session anything
-    if let Some(Command::Sessions(Sessions::ViewImages { files, mode })) = opts.command {
-        std::process::exit(image_viewer::run(files, mode));
-    }
-
     {
         let config = Config::try_from(&opts).ok();
         if let Some(Command::Sessions(Sessions::ListAgents {
@@ -73,23 +66,7 @@ fn main() {
             action: cli_action,
         }) = opts.command
         {
-            // `show` is a `new-pane` running this binary's own viewer: rewritten here, so the
-            // session sees an ordinary create and the contract gains no verb
-            let cli_action = match *cli_action {
-                CliAction::Show {
-                    files,
-                    mode,
-                    blocking,
-                } => match image_viewer::show_as_new_pane(&files, mode, blocking) {
-                    Ok(new_pane) => new_pane,
-                    Err(message) => {
-                        eprintln!("{}", message);
-                        std::process::exit(1);
-                    },
-                },
-                other => other,
-            };
-            commands::send_action_to_session(cli_action, opts.session, config, json);
+            commands::send_action_to_session(*cli_action, opts.session, config, json);
             std::process::exit(0);
         }
         if let Some(Command::Subscribe(subscribe_cli)) = opts.command {

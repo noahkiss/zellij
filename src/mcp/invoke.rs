@@ -598,18 +598,6 @@ async fn plan_in(
             return Ok(plan);
         }
     }
-    if let (Some(host), "zellij_show") = (remote_host, tool) {
-        // refused for free before anything is copied
-        argv_in(tool, args, ambient_session, env, None)?;
-        let mut uploaded = Vec::new();
-        for path in read.strings("paths")? {
-            let path = local_file(&path, env, "paths")?;
-            uploaded.push(Value::String(remote::upload(host, &path).await?));
-        }
-        let mut args = args.clone();
-        args.insert("paths".to_owned(), Value::Array(uploaded));
-        return Ok(Call::One(argv_in(tool, &args, ambient_session, env, None)?).into());
-    }
     if tool == "zellij_overview" {
         let scope = read.enumerated("scope", "panes");
         if scope == "agents" || scope == "my_agents" {
@@ -1593,31 +1581,6 @@ fn argv_in(
                     other
                 )),
             }
-        },
-        "zellij_show" => {
-            let mode = args.enumerated("mode", "auto");
-            if !["auto", "kitty", "blocks"].contains(&mode.as_str()) {
-                return Err(format!(
-                    "`mode` must be auto, kitty or blocks, not `{}`.",
-                    mode
-                ));
-            }
-            let mut rest = vec![
-                "action".to_owned(),
-                "show".to_owned(),
-                flag_value("--mode", &mode),
-                // every path after this is a file, whatever its first character
-                "--".to_owned(),
-            ];
-            for path in args.strings("paths")? {
-                // a remote call's paths are the copies already made on that machine
-                rest.push(if env.remote {
-                    path
-                } else {
-                    expand_path(&path, env)?
-                });
-            }
-            Ok(scoped(rest))
         },
         other => Err(format!("`{}` is not a tool of this server.", other)),
     }
@@ -3037,65 +3000,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn showing_images_is_the_show_verb_with_every_path_after_a_double_dash() {
-        assert_eq!(
-            line(
-                "zellij_show",
-                json!({"paths": ["/s/a.png", "-odd name.png"]}),
-                Some("work")
-            ),
-            "-s work action show --mode=auto -- /s/a.png -odd name.png"
-        );
-        // one argv word per path, so a name with a space is not split
-        let argv = built(
-            "zellij_show",
-            json!({"paths": ["two words.png"], "mode": "blocks"}),
-            None,
-            &a_shell_env(),
-        );
-        assert_eq!(
-            argv,
-            vec!["action", "show", "--mode=blocks", "--", "two words.png"]
-        );
-    }
-
-    #[test]
-    fn a_shown_path_is_expanded_against_this_servers_environment() {
-        let env = call_env(
-            None,
-            Some("/home/user"),
-            Path::new("/"),
-            &[("SHOTS", "/var/shots")],
-        );
-        assert_eq!(
-            built(
-                "zellij_show",
-                json!({"paths": ["~/a.png", "$SHOTS/b.png", "rel/c.png"]}),
-                None,
-                &env
-            )
-            .join(" "),
-            "action show --mode=auto -- /home/user/a.png /var/shots/b.png rel/c.png"
-        );
-        // a lone string is a list of one
-        assert_eq!(
-            built("zellij_show", json!({"paths": "/a.png"}), None, &env).join(" "),
-            "action show --mode=auto -- /a.png"
-        );
-    }
-
-    #[test]
-    fn showing_nothing_or_in_an_unknown_mode_is_refused() {
-        assert!(refusal("zellij_show", json!({})).contains("`paths` is required"));
-        assert!(refusal("zellij_show", json!({"paths": []})).contains("`paths` is required"));
-        assert!(refusal("zellij_show", json!({"paths": [""]})).contains("non-empty strings"));
-        assert!(
-            refusal("zellij_show", json!({"paths": ["a.png"], "mode": "sixel"}))
-                .contains("`mode` must be auto, kitty or blocks")
-        );
-    }
-
     /// The process a call to another machine is built in.
     fn a_remote_env() -> CallEnv {
         let mut env = a_shell_env();
@@ -3228,20 +3132,6 @@ mod tests {
             .await;
             assert!(matches!(result, Err(reason) if reason.contains(expected)));
         }
-    }
-
-    #[test]
-    fn a_remote_show_passes_the_copies_paths_as_they_are() {
-        assert_eq!(
-            built(
-                "zellij_show",
-                json!({"paths": ["/tmp/zellij-mcp-files-501/x-shot.png"]}),
-                Some("work"),
-                &a_remote_env()
-            )
-            .join(" "),
-            "-s work action show --mode=auto -- /tmp/zellij-mcp-files-501/x-shot.png"
-        );
     }
 
     #[test]

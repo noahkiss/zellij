@@ -485,9 +485,9 @@ exec \"$b\" \"$@\"";
 
 /// The script that stores a file sent over stdin and prints where it went: `$1` is its name.
 ///
-/// A brief and an image live on the caller's machine, and the remote pane can only read files on
-/// its own. They land in a private directory under the remote temp dir, and anything there older
-/// than a week is removed first.
+/// A brief lives on the caller's machine, and the remote pane can only read files on its own.
+/// It lands in a private directory under the remote temp dir, and anything there older than a week
+/// is removed first.
 pub const UPLOAD_ON_REMOTE: &str = "d=${TMPDIR:-/tmp}; d=${d%/}/zellij-mcp-files-$(id -u); \
 umask 077; mkdir -p \"$d\" || exit 1; \
 find \"$d\" -type f -mtime +7 -exec rm -f {} + 2>/dev/null; \
