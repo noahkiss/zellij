@@ -40,12 +40,11 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "last-reply",
             "list-agents",
             "list-clients",
-            "list-events",
             "list-panes",
             "list-tabs",
             "list-tree",
             // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
-            // and this one changes nothing. It is also why the audit ring does not record it
+            // and this one changes nothing
             "wait",
             // a stream of what changed, which changes nothing itself
             "watch",
@@ -158,9 +157,6 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
 ];
 
 /// The band a `zellij action` verb belongs to, or `None` for a name that is not one.
-///
-/// Exported because the bands are not only a help-page heading: the action ring uses them to
-/// decide what is worth remembering, so "which verbs change nothing" is answered in one place.
 pub fn band_of(verb: &str) -> Option<&'static str> {
     ACTION_GROUPS
         .iter()
@@ -230,11 +226,6 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action list-clients",
         shape: "table",
         keys: "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY SIZE CURRENT",
-    },
-    OutputSpec {
-        command: "action list-events",
-        shape: "table",
-        keys: "AT VERB TARGET ORIGIN COUNT",
     },
     OutputSpec {
         command: "action list-panes",
@@ -398,7 +389,7 @@ How every one of these answers:
     header row. A nesting of them is an indented outline. Keys and columns are append-only:
     a release may add one, never rename or remove one.
   * `--json` carries the same information, structured. Listing and context verbs also take it after their name:
-    `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents`,
+    `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-agents`,
     `current-tab-info`, `last-reply`, `watch` and `whoami`. Every verb that reports a record takes it BEFORE the verb, as
     `zellij action --json close-pane --pane-id sunny-otter`, which answers `{\"closed\":
     \"terminal_3\"}`. For those listing and context verbs the two positions are the same call. A verb that reports

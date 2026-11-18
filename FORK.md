@@ -108,7 +108,7 @@ you how to read the next.
   verb that reports a record now has it, in front of the verb — see [`zellij action
   --json`](#zellij-action---json-answers-the-mutations-too). The verbs that were already answering
   in JSON keep their own trailing flag, and for those the two spellings are one call: `ls`,
-  `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-events`, `list-agents`,
+  `list-panes`, `list-tabs`, `list-tree`, `list-clients`, `list-agents`,
   `current-tab-info`. The payload commands refuse it and always will.
 - **Results go to stdout, diagnostics go to stderr.** A command whose output you are capturing never
   mixes an explanation into it.
@@ -626,7 +626,7 @@ pane that ends is held open instead by default: same event to a script, no messa
 stream. Asking the session is what covers both, and it covers a pane that closed outright as well.
 
 `wait` is in the `read` band. It changes nothing — the band says what a verb does to the session,
-not how long it takes — which is also why the [audit ring](#list-events) does not record it.
+not how long it takes.
 
 #### `--for ready`: a shell that is ready for input
 
@@ -996,58 +996,6 @@ otherwise had to do by tab id yourself. A tab with no panes still gets its line.
 `--json` is the same join rather than a summary of it: each tab exactly as `list-tabs --json`
 reports it, with its `list-panes --json` entries under a `panes` key. Asking for the tree never
 returns less than asking the two questions separately would.
-
-### `list-events`
-
-```
-$ zellij action list-events
-AT                        VERB        TARGET                  ORIGIN    COUNT
-2026-08-14T18:03:12.345Z  go-to-tab   tab_1 logs              client 1  1
-2026-08-14T18:03:14.902Z  scroll-up   terminal_3 sunny-otter  client 1  38
-2026-08-14T18:03:19.881Z  close-pane  terminal_3              cli       1
-```
-
-Who moved my tab. In a session a person and several agents are all driving at once, something
-changes and nobody knows which of them did it — and every other query in this fork answers what the
-session *is*, not what happened to it. The server keeps the last 256 things that changed, in
-memory, and this reads them back oldest first, so the end of the table is now.
-
-- **`ORIGIN` names the three ways an action can arrive**: `client 1` is somebody's keyboard,
-  `cli` is a `zellij action` call, `plugin 3` is a plugin. All three pass through the one function
-  that routes an action, so the ring sees keyboard and script alike rather than only the half a
-  script produces.
-- **`TARGET` is the name that was true at the time** — `terminal_3 sunny-otter`, `tab_1 logs`,
-  resolved as the action completed rather than when you read it. A pane the action closed has no
-  handle left to print, and shows its id alone. `-` means the action named nothing.
-- **A run of the same verb, on the same target, from the same origin is one row with a `COUNT`.**
-  A held scroll key is 38, not 38 rows: without that, the ring's whole capacity is one keypress and
-  the tab move you came looking for has already fallen out of it.
-- **`--json` carries the same rows**, structured.
-
-What is deliberately not in it:
-
-- **The `read` band**, which by definition changed nothing. The bands `zellij action --help` is
-  grouped by are the same list this reads, so the two can never disagree about which verbs matter.
-- **Keystrokes typed into a pane.** Every one is a `write`, and they would be the whole ring. The
-  same verbs *from the CLI* are recorded: a script writing into a pane is an event with an author
-  worth finding.
-- **Actions that failed.** The ring remembers what happened, not what was asked for.
-- **The CLI's own plumbing** — the target lookup every addressed call makes before it acts, and the
-  naming step that finishes a `new-pane --handle`. Each would put a row beside every real one,
-  describing it.
-
-`VERB` is the action the session ran, spelled the way the CLI spells its verbs wherever the two
-agree. One CLI verb can become several actions — `new-pane` is a `new-tiled-pane` or a
-`new-floating-pane`, and the ring says which — so it is not always the exact word that was typed.
-
-One thing to know about creations: a pane made with `--handle build` is recorded under the name it
-was *born* with, because the chosen name is given to it a moment later, by the client holding the
-report. The `close-pane` that comes after says `build`.
-
-This is a ring, not a log: it is bounded, it is in memory, nothing about it is written to disk, and
-it is gone when the server stops. It is for the question you are asking now. A consumer that follows
-the session as it changes reads [`zellij action watch`](#zellij-action-watch-the-session-pushes-its-changes)
-instead: its `seq` and `epoch` say whether a line was missed or the server restarted.
 
 ### `reopen-pane`: bring back a pane closed by mistake
 
@@ -5283,9 +5231,6 @@ server from before this, reads tag 28 as an unknown message, logs it and ignores
 times out waiting for `hello` rather than hanging. The verb is not an `Action`: it opens its own
 connection, as `subscribe` does.
 
-`list-events` stays a 256-entry ring in memory. It answers "who did that" after the fact; the watch
-stream, with its `seq` and `epoch`, is the path a consumer follows the session by.
-
 Capability: `action-watch`.
 
 ### `zellij mcp`: the CLI served over the Model Context Protocol
@@ -7249,9 +7194,7 @@ action reported nothing" and sends the caller `Action CliPipe ended without repo
 That message reached the client ahead of the plugin's real answer, so `zellij pipe` exited **2**
 about fifty milliseconds after it was called, whether or not anything was wrong. The pipe arm now
 returns where it finishes, the way [every other action that answers for itself
-does](#the-cli-output-convention), so nothing is sent on its behalf. The same return keeps the
-[audit ring](#list-events) off a streaming pipe, which would otherwise record a row
-per line.
+does](#the-cli-output-convention), so nothing is sent on its behalf.
 
 **With that gone, the hang underneath it is reachable.** Only a plugin that received the message
 can unblock a pipe, so a session with none listening — a bare layout, or a `--plugin` that was

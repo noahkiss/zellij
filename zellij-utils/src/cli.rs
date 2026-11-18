@@ -1305,32 +1305,6 @@ pub enum CliAction {
         )]
         timeout: u64,
     },
-    /// List what has changed the session lately, and who changed it
-    ///
-    /// The answer to "who moved my tab" in a session a person and several agents are all driving
-    /// at once. The server keeps the last 256 things that changed - in memory, never on disk -
-    /// with the time, the verb, what it touched and where it came from:
-    ///
-    /// one row each. The columns are AT (UTC, to the millisecond), VERB, TARGET, ORIGIN and
-    /// COUNT. Newest last, so the end of the table is now.
-    ///
-    /// TARGET is the name that was true at the time - `terminal_3 sunny-otter`, `tab_1 logs`, or
-    /// `-` for an action that named nothing. ORIGIN is `client N` for somebody's keyboard, `cli`
-    /// for a `zellij action` call, and `plugin N` for a plugin.
-    ///
-    /// What is NOT in it: anything in the `read` band, which changed nothing; keystrokes typed
-    /// into a pane, which would fill the ring by themselves; and actions that failed - the ring
-    /// remembers what happened, not what was asked for. A run of the same verb on the same target
-    /// from the same origin is one row with a `COUNT`, so a held scroll key does not push the tab
-    /// move you are looking for out of the ring.
-    ///
-    /// `VERB` is the action the session ran, spelled the way the CLI spells its verbs. One verb
-    /// can become several actions, so it is not always the exact word that was typed.
-    ListEvents {
-        /// Output as JSON
-        #[clap(long)]
-        json: bool,
-    },
     /// Keep running, and print one JSON line for every change the session makes
     ///
     /// The server pushes the lines as the changes happen. Every line carries `event`, `seq`
@@ -3031,7 +3005,6 @@ impl CliAction {
             | CliAction::ListTabs { json, .. }
             | CliAction::ListTree { json, .. }
             | CliAction::ListClients { json, .. }
-            | CliAction::ListEvents { json, .. }
             | CliAction::Watch { json }
             | CliAction::ListAgents { json, .. }
             | CliAction::Whoami { json, .. }
@@ -4465,7 +4438,6 @@ mod tests {
             vec!["list-tabs"],
             vec!["list-tree"],
             vec!["list-clients"],
-            vec!["list-events"],
             vec!["list-agents"],
             vec!["current-tab-info"],
         ] {

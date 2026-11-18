@@ -649,10 +649,6 @@ pub enum Action {
     ListTree {
         output_json: bool,
     },
-    /// The session's action ring: what changed lately, and who changed it.
-    ListEvents {
-        output_json: bool,
-    },
     /// fork addition: brings back a terminal pane that was closed lately, or lists the ones the
     /// session remembers.
     ///
@@ -2215,7 +2211,6 @@ impl Action {
                 output_json: json,
             }]),
             CliAction::ListTree { json } => Ok(vec![Action::ListTree { output_json: json }]),
-            CliAction::ListEvents { json } => Ok(vec![Action::ListEvents { output_json: json }]),
             CliAction::ReopenPane {
                 last: _,
                 handle,
