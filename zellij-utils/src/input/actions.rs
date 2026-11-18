@@ -678,22 +678,6 @@ pub enum Action {
         pane_id: PaneId,
         coordinates: FloatingPaneCoordinates,
     },
-    SetPaneFullscreen {
-        pane_id: Option<PaneId>,
-        fullscreen: bool,
-    },
-    SetPanePinned {
-        pane_id: Option<PaneId>,
-        pinned: bool,
-    },
-    SetPaneFloating {
-        pane_id: Option<PaneId>,
-        floating: bool,
-    },
-    SetSyncTab {
-        tab_id: Option<u32>,
-        sync: bool,
-    },
     TogglePaneBorderless {
         pane_id: PaneId,
     },
@@ -2290,22 +2274,6 @@ impl Action {
                     Err(e) => Err(e),
                 }
             },
-            CliAction::SetFullscreen { enabled, pane_id } => Ok(vec![Action::SetPaneFullscreen {
-                pane_id: parse_optional_pane_id(pane_id, resolve_pane_target)?,
-                fullscreen: enabled,
-            }]),
-            CliAction::SetPanePinned { enabled, pane_id } => Ok(vec![Action::SetPanePinned {
-                pane_id: parse_optional_pane_id(pane_id, resolve_pane_target)?,
-                pinned: enabled,
-            }]),
-            CliAction::SetPaneFloating { enabled, pane_id } => Ok(vec![Action::SetPaneFloating {
-                pane_id: parse_optional_pane_id(pane_id, resolve_pane_target)?,
-                floating: enabled,
-            }]),
-            CliAction::SetSyncTab { enabled, tab_id } => Ok(vec![Action::SetSyncTab {
-                tab_id: tab_id.map(|id| id as u32),
-                sync: enabled,
-            }]),
             // `wait` is answered by the client, which holds the caller for as long as the wait
             // lasts. It is intercepted before this, and reaching here means that interception was
             // removed and the command would otherwise go quiet
@@ -5183,17 +5151,6 @@ pub fn pane_ids_only(target: &str) -> Result<PaneId, String> {
             "'{}' can only be resolved against a running session",
             other
         )),
-    }
-}
-
-/// Parse an optional `--pane-id`. `None` means "whatever this client is focused on".
-fn parse_optional_pane_id(
-    pane_id: Option<String>,
-    resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
-) -> Result<Option<PaneId>, String> {
-    match pane_id {
-        None => Ok(None),
-        Some(pane_id) => resolve_pane_target(&pane_id).map(Some),
     }
 }
 

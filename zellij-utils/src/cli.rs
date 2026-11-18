@@ -1672,9 +1672,6 @@ pub enum CliAction {
         pane_id: Option<String>,
     },
     /// Toggle a pane between filling its tab and the tab's normal layout
-    ///
-    /// Use `set-fullscreen on|off` to say which state you want rather than flipping whichever one
-    /// the pane is in.
     ToggleFullscreen {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
@@ -1703,9 +1700,6 @@ pub enum CliAction {
         style: PaneFrameStyle,
     },
     /// Toggle whether typing into one pane of a tab types into all of them
-    ///
-    /// Use `set-sync-tab on|off` to say which state you want rather than flipping whichever one
-    /// the tab is in.
     ToggleActiveSyncTab {
         /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
         /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
@@ -2001,9 +1995,6 @@ pub enum CliAction {
         input_mode: InputMode,
     },
     /// Toggle a pane between floating and embedded in its tab's layout
-    ///
-    /// Use `set-pane-floating on|off` to say which state you want rather than flipping whichever
-    /// one the pane is in.
     TogglePaneEmbedOrFloating {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
@@ -2666,9 +2657,6 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         json: bool,
     },
     /// Toggle whether a floating pane stays on top of the other floating panes
-    ///
-    /// Use `set-pane-pinned on|off` to say which state you want rather than flipping whichever one
-    /// the pane is in.
     TogglePanePinned {
         /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
         /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
@@ -2713,65 +2701,6 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// the mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-    },
-    /// Set whether a pane is fullscreen, rather than toggling it
-    ///
-    /// Exits 0 if the state changed and 2 if it did not - both when the pane was already so and
-    /// when the pane does not exist. Only the failure prints a reason on stderr, so read stderr to
-    /// tell the two apart.
-    SetFullscreen {
-        /// on|off (also accepts true/false, yes/no, 1/0)
-        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
-        enabled: bool,
-        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
-        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Set whether a floating pane is pinned on top, rather than toggling it
-    ///
-    /// Exits 0 if the state changed and 2 if it did not - both when the pane was already so and
-    /// when the pane does not exist. Only the failure prints a reason on stderr, so read stderr to
-    /// tell the two apart.
-    SetPanePinned {
-        /// on|off (also accepts true/false, yes/no, 1/0)
-        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
-        enabled: bool,
-        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
-        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Set whether a pane floats or is embedded, rather than toggling it
-    ///
-    /// Exits 0 if the state changed and 2 if it did not - when the pane was already so, when the
-    /// pane does not exist, and when the layout refuses the move (the last tiled pane cannot
-    /// float). Only the failures print a reason on stderr, so read stderr to tell them apart.
-    SetPaneFloating {
-        /// on|off (also accepts true/false, yes/no, 1/0)
-        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
-        enabled: bool,
-        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
-        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Set whether input is synchronised across a tab's panes, rather than toggling it
-    ///
-    /// Exits 0 if the state changed and 2 if it did not - both when the tab was already so and
-    /// when the tab does not exist. Only the failure prints a reason on stderr, so read stderr to
-    /// tell the two apart.
-    SetSyncTab {
-        /// on|off (also accepts true/false, yes/no, 1/0)
-        #[clap(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
-        enabled: bool,
-        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
-        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
-        #[clap(short, long, value_parser)]
-        tab_id: Option<usize>,
     },
     /// Toggle whether a pane is drawn with a frame
     ///
@@ -3680,42 +3609,6 @@ mod tests {
                 pane_id: PaneId::Terminal(9)
             }]
         );
-    }
-
-    #[test]
-    fn a_setter_takes_a_boolish_value_and_an_optional_target() {
-        match parse_action(&["set-fullscreen", "on", "--pane-id", "terminal_1"]) {
-            CliAction::SetFullscreen { enabled, pane_id } => {
-                assert!(enabled);
-                assert_eq!(pane_id.as_deref(), Some("terminal_1"));
-            },
-            other => panic!("Expected SetFullscreen, got {:?}", other),
-        }
-        match parse_action(&["set-pane-pinned", "false"]) {
-            CliAction::SetPanePinned { enabled, pane_id } => {
-                assert!(!enabled);
-                assert_eq!(pane_id, None, "no target means the focused pane");
-            },
-            other => panic!("Expected SetPanePinned, got {:?}", other),
-        }
-        match parse_action(&["set-pane-floating", "1", "--pane-id", "3"]) {
-            CliAction::SetPaneFloating { enabled, .. } => assert!(enabled),
-            other => panic!("Expected SetPaneFloating, got {:?}", other),
-        }
-        match parse_action(&["set-sync-tab", "off", "--tab-id", "2"]) {
-            CliAction::SetSyncTab { enabled, tab_id } => {
-                assert!(!enabled);
-                assert_eq!(tab_id, Some(2));
-            },
-            other => panic!("Expected SetSyncTab, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn a_setter_refuses_a_missing_or_unreadable_value() {
-        assert!(action_parse_fails(&["set-fullscreen"]));
-        assert!(action_parse_fails(&["set-fullscreen", "maybe"]));
-        assert!(action_parse_fails(&["set-sync-tab"]));
     }
 
     #[test]

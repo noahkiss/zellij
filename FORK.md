@@ -4657,36 +4657,6 @@ The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) b
 that need it — resolving a builtin's bytes and watching its file — sit on different threads and
 neither carries the config.
 
-### Idempotent setters for the four remaining toggles
-
-```
-zellij action set-fullscreen on --pane-id terminal_3
-zellij action set-pane-pinned off --pane-id terminal_3
-zellij action set-pane-floating on
-zellij action set-sync-tab off --tab-id 2
-```
-
-Fullscreen, pinned, embed/float and tab sync could only be toggled. A controller that lost track of
-the state could not converge on it without reading first, and the read races anything else touching
-the session. Each now has a set-form, the shape the fork already gave floating-panes, borderless and
-the theme.
-
-The value is positional and boolish: `on`/`off`, `true`/`false`, `yes`/`no`, `1`/`0`. `--pane-id` and
-`--tab-id` are optional and default to what the calling client is focused on, so the interactive use
-stays short; naming the target explicitly is what makes the call work in a detached session. The
-toggles are untouched.
-
-Exit status follows `show-floating-panes`: **0** the state changed, **2** it was already so. A target
-that does not exist prints the reason on stderr and exits non-zero — every failing `zellij action`
-exits 2, because the client turns any error message into that one code, so **the message on stderr,
-not the exit status, is what separates a miss from a no-op**. `set-pane-floating` reports a refused
-move — the last tiled pane may not float, and an embed needs room — the same way, because reporting
-"already so" for a move that did not happen would be a lie. `set-fullscreen on` differs from the
-toggle in one more way: when another pane holds fullscreen, it hands fullscreen to the named pane
-instead of merely clearing it.
-
-Four `Action`s, contract tags 163-166.
-
 ### Breaking out a pane no tab owns is an error
 
 `break_multiple_panes_*` drops a pane id it cannot find, so a request naming only stale ids used to
@@ -5740,11 +5710,10 @@ is unrelated to this path — a slow `launchd` start (15-20s, measured) never re
 
 ### A plugin pinning a pane did not tell anyone it had
 
-`PluginCommand::SetFloatingPanePinned` reaches the same `Screen::set_floating_pane_pinned` the
-CLI's `set-pane-pinned` action does, but its `ScreenInstruction` handler stopped at the mutation -
-no render, no `log_and_report_session_state`. `set-pane-pinned` and its two CLI neighbours,
-`set-pane-floating` and `set-sync-tab`, all end the same handler with `screen.render(None)?;
-screen.log_and_report_session_state()?;`; this one was missing both. `PaneInfo.is_pinned` stayed
+`PluginCommand::SetFloatingPanePinned` reaches `Screen::set_floating_pane_pinned`, but its
+`ScreenInstruction` handler stopped at the mutation - no render, no `log_and_report_session_state`.
+It now ends with `screen.render(None)?; screen.log_and_report_session_state()?;` like its
+neighbours. `PaneInfo.is_pinned` stayed
 wrong for every subscriber - `list-panes --json`, `subscribe`, a plugin's own pane manifest - until
 some unrelated change touched the session and dragged a report along with it. A test already in the
 tree, `pane_info_reports_a_pinned_floating_pane`, worked around exactly this: it sent a `RenamePane`

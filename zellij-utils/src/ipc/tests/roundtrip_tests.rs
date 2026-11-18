@@ -3156,51 +3156,6 @@ fn test_client_messages() {
         is_cli_client: true,
     });
     test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SetPaneFullscreen {
-            pane_id: Some(PaneId::Terminal(1)),
-            fullscreen: true,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SetPanePinned {
-            pane_id: None,
-            pinned: false,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SetPaneFloating {
-            pane_id: Some(PaneId::Plugin(2)),
-            floating: true,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SetSyncTab {
-            tab_id: Some(3),
-            sync: true,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SetSyncTab {
-            tab_id: None,
-            sync: false,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::ListClients { output_json: false },
         terminal_id: Some(1),
         client_id: Some(100),
