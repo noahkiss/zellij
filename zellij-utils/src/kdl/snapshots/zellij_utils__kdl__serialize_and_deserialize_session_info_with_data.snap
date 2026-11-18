@@ -48,7 +48,6 @@ panes {
         tab_id 3
         is_plugin false
         is_focused true
-        focused_by_client_ids 1 2
         is_fullscreen true
         is_floating false
         is_suppressed false
@@ -73,7 +72,6 @@ panes {
         tab_id 3
         is_plugin true
         is_focused true
-        focused_by_client_ids 1 2
         is_fullscreen true
         is_floating false
         is_suppressed false

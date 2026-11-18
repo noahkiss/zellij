@@ -649,28 +649,10 @@ pub struct PaneInfo {
     pub has_pending_bell: bool,
     #[prost(message, repeated, tag="37")]
     pub pane_env: ::prost::alloc::vec::Vec<PaneEnvVar>,
-    #[prost(bool, tag="38")]
-    pub is_alternate_screen: bool,
-    #[prost(uint32, tag="39")]
-    pub scrollback_position: u32,
-    #[prost(uint32, tag="40")]
-    pub scrollback_length: u32,
-    #[prost(bool, tag="41")]
-    pub is_pinned: bool,
-    #[prost(uint32, optional, tag="42")]
-    pub logical_position: ::core::option::Option<u32>,
-    #[prost(bool, tag="43")]
-    pub is_borderless: bool,
-    #[prost(bool, tag="44")]
-    pub exclude_from_sync: bool,
-    #[prost(bool, tag="45")]
-    pub has_explicit_title: bool,
     #[prost(string, tag="46")]
     pub handle: ::prost::alloc::string::String,
     #[prost(uint32, tag="47")]
     pub tab_id: u32,
-    #[prost(uint32, repeated, tag="48")]
-    pub focused_by_client_ids: ::prost::alloc::vec::Vec<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

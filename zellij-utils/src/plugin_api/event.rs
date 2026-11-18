@@ -1840,11 +1840,6 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
             restored_from: protobuf_pane_info.restored_from,
             handle: protobuf_pane_info.handle,
             tab_id: protobuf_pane_info.tab_id as usize,
-            focused_by_client_ids: protobuf_pane_info
-                .focused_by_client_ids
-                .into_iter()
-                .map(|client_id| client_id as ClientId)
-                .collect(),
             pane_cwd: protobuf_pane_info.pane_cwd,
             pane_pid: protobuf_pane_info.pane_pid,
             pane_command: protobuf_pane_info.pane_command,
@@ -1855,14 +1850,6 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
                 .into_iter()
                 .map(|entry| (entry.name, entry.value))
                 .collect(),
-            is_alternate_screen: protobuf_pane_info.is_alternate_screen,
-            scrollback_position: protobuf_pane_info.scrollback_position as usize,
-            scrollback_length: protobuf_pane_info.scrollback_length as usize,
-            is_pinned: protobuf_pane_info.is_pinned,
-            logical_position: protobuf_pane_info.logical_position.map(|p| p as usize),
-            is_borderless: protobuf_pane_info.is_borderless,
-            exclude_from_sync: protobuf_pane_info.exclude_from_sync,
-            has_explicit_title: protobuf_pane_info.has_explicit_title,
         })
     }
 }
@@ -1916,11 +1903,6 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
             restored_from: pane_info.restored_from,
             handle: pane_info.handle,
             tab_id: pane_info.tab_id as u32,
-            focused_by_client_ids: pane_info
-                .focused_by_client_ids
-                .into_iter()
-                .map(|client_id| client_id as u32)
-                .collect(),
             pane_cwd: pane_info.pane_cwd,
             pane_pid: pane_info.pane_pid,
             pane_command: pane_info.pane_command,
@@ -1931,14 +1913,6 @@ impl TryFrom<PaneInfo> for ProtobufPaneInfo {
                 .into_iter()
                 .map(|(name, value)| PaneEnvVar { name, value })
                 .collect(),
-            is_alternate_screen: pane_info.is_alternate_screen,
-            scrollback_position: pane_info.scrollback_position as u32,
-            scrollback_length: pane_info.scrollback_length as u32,
-            is_pinned: pane_info.is_pinned,
-            logical_position: pane_info.logical_position.map(|p| p as u32),
-            is_borderless: pane_info.is_borderless,
-            exclude_from_sync: pane_info.exclude_from_sync,
-            has_explicit_title: pane_info.has_explicit_title,
         })
     }
 }
@@ -3054,7 +3028,6 @@ fn serialize_session_update_event_with_non_default_values() {
             note: String::new(),
             note_color: Default::default(),
             tab_id: 7,
-            focused_by_client_ids: vec![1, 2],
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -3095,20 +3068,11 @@ fn serialize_session_update_event_with_non_default_values() {
             pane_env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
                 .into_iter()
                 .collect(),
-            is_alternate_screen: true,
-            scrollback_position: 12,
-            scrollback_length: 4000,
-            is_pinned: true,
-            logical_position: Some(2),
-            is_borderless: true,
-            exclude_from_sync: true,
-            has_explicit_title: true,
         },
         PaneInfo {
             note: String::new(),
             note_color: Default::default(),
             tab_id: 7,
-            focused_by_client_ids: vec![1, 2],
             id: 1,
             is_plugin: true,
             is_focused: true,
@@ -3149,14 +3113,6 @@ fn serialize_session_update_event_with_non_default_values() {
             has_pending_bell: false,
             pane_env: Default::default(),
             // a plugin pane draws its own contents, so it has none of this either
-            is_alternate_screen: false,
-            scrollback_position: 0,
-            scrollback_length: 0,
-            is_pinned: false,
-            logical_position: None,
-            is_borderless: false,
-            exclude_from_sync: false,
-            has_explicit_title: false,
         },
     ];
     panes.insert(0, panes_list);

@@ -1331,6 +1331,10 @@ it left.
   the same map without the filter, so `session down` still records where the focus was.
 - **This is `PaneInfo`, so plugins see it too** — the honest value, on a field they already read.
   No field is added, `event.proto` is not touched, and no `TryFrom` moves.
+- **A focus move inside a tab refreshes the manifest.** Moving focus between panes of one tab only
+  renders, so `is_focused` described the old focus until something else reported. The render path
+  now rebuilds the pane state when a connected client's focus moved
+  (`Screen::focus_moved_since_last_report`).
 
 ### `report_pane_env`: named environment variables on every pane
 
@@ -4754,45 +4758,6 @@ The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) b
 that need it — resolving a builtin's bytes and watching its file — sit on different threads and
 neither carries the config.
 
-### Eight more things a pane already knew about itself
-
-```
-zellij action list-panes --all --json
-```
-
-Every one of these was a method on the server's `Pane` trait, answered for terminal and plugin panes
-alike, and readable nowhere outside the server. They are now stamped onto `PaneInfo` beside the
-rest, so they reach the CLI, plugins and peer sessions on the same path:
-
-- `is_alternate_screen` — the program is drawing on the alternate screen, i.e. a full-screen editor,
-  pager or TUI owns the pane rather than a shell sitting at a prompt. The cheapest way to tell those
-  apart, and the reason a pane's scrollback stops growing.
-- `scrollback_position` / `scrollback_length` — how far the pane is scrolled back from the bottom,
-  and how many lines it can scroll through. `0`/`0` for a plugin pane.
-- `is_pinned` — a floating pane pinned above the tiled layer. Always `false` for a tiled pane.
-- `logical_position` — the pane's position in the layout that placed it, which survives resizing and
-  reordering. `null` for a pane no layout placed.
-- `is_borderless` — the pane is drawn with no frame, so it shows no title.
-- `exclude_from_sync` — the pane is left out when the tab syncs input to all its panes.
-- `has_explicit_title` — a human named this pane. `title` is the display title whatever its source
-  and `program_title` is what the program called itself; neither could answer "did someone type
-  this name", which is what a consumer needs before overwriting it.
-
-**`frame_color_override` was assessed and skipped.** The survey read it as "the server already marks
-panes it considers failed and nothing outside sees it", but the mark is a one-second flash: the
-background job that sets it clears it again after `LONG_FLASH_DURATION_MS`
-(`background_jobs.rs`), and the same field also carries the multi-select highlight. A field sampled
-by a once-a-second manifest would report it at random, and the error text that would make it
-meaningful is not on the trait at all. If a "this pane failed" signal is wanted it should be its own
-recorded state, not a render override read sideways.
-
-`session-metadata.kdl` carries six of the eight, so a peer session reports them too. It does not
-carry `scrollback_position` or `scrollback_length`: those describe where one session's own viewport
-sits in a buffer that grows with every line of output, which a reader of another session can neither
-act on nor keep up with, and writing them would rewrite the file for every pane that produced a line.
-
-Proto tags 38-45.
-
 ### Idempotent setters for the four remaining toggles
 
 ```
@@ -7317,42 +7282,6 @@ The field crosses the plugin API: `event.proto` tag 47, regenerated prost output
 implementations. It is also carried by the KDL codec behind `session-metadata.kdl`, written beside
 `id` and read back optionally so metadata from an older build still parses. The client/server
 contract has no `PaneInfo` and is untouched.
-
-### Which clients are looking at a pane
-
-```
-zellij action list-panes --all --json | jq '.[] | {id, is_focused, focused_by_client_ids}'
-```
-
-`PaneInfo.is_focused` is one boolean for the whole session, so with two clients attached — a human
-and an agent, which is the normal case here — a consumer could not tell who was looking at what. It
-could invert `SessionInfo.pane_history` or ask `list-clients`, but both need a second lookup and the
-first keeps entries for clients that have gone.
-
-`PaneInfo` now carries `focused_by_client_ids`: the connected clients focused on this pane,
-ascending. `is_focused` is unchanged and is the same answer collapsed — true exactly when the list
-is not empty. Empty for a suppressed pane, and for a pane whose only focused client has detached: a
-detached client keeps its place in the focus map so it lands back where it was, but nobody is
-looking through it.
-
-The state was already there. `ActivePanes` is a per-client focus map, and
-[`is_focused` names a client that is still here](#is_focused-names-a-client-that-is-still-here)
-already established the connected-clients filter this reads through; this is the same lookup kept as
-a list rather than collapsed to a yes.
-
-**A focus move inside a tab now refreshes the manifest.** Moving focus between panes of one tab only
-renders — it never rebuilt the pane state — so `is_focused` described the focus the session had
-before the move until something else happened to report. The render path now rebuilds the manifest
-when the focus diff says somebody moved.
-
-**No client list is added to `SessionInfo`.** The survey paired this with one, but
-`SessionInfo.pane_history` already names every client and the last entry of each is its focused
-pane, and `Event::ListClients` / `zellij action list-clients` answer the same question with a
-running command attached. A third copy would cost a protobuf tag to say what is already said.
-
-The field crosses the plugin API: `event.proto` tag 48, regenerated prost output, both `TryFrom`
-implementations, and the KDL codec behind `session-metadata.kdl` — written beside `is_focused` only
-when it says something, and read back optionally. The client/server contract is untouched.
 
 ### `zellij pipe` answers, and gives up when nothing does
 

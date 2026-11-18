@@ -451,6 +451,7 @@ message ResurrectableSession {
 }
 
 message PaneInfo {
+    reserved 38 to 45, 48;
     uint32 id = 1;
     bool is_plugin = 2;
     bool is_focused = 3;
@@ -491,17 +492,8 @@ message PaneInfo {
     optional uint64 last_output_at = 35;
     bool has_pending_bell = 36;
     repeated PaneEnvVar pane_env = 37;
-    bool is_alternate_screen = 38;
-    uint32 scrollback_position = 39;
-    uint32 scrollback_length = 40;
-    bool is_pinned = 41;
-    optional uint32 logical_position = 42;
-    bool is_borderless = 43;
-    bool exclude_from_sync = 44;
-    bool has_explicit_title = 45;
     string handle = 46;
     uint32 tab_id = 47;
-    repeated uint32 focused_by_client_ids = 48;
 }
 
 message PaneEnvVar {
