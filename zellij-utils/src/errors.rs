@@ -364,7 +364,6 @@ pub enum ScreenContext {
     NextSwapLayout,
     OverrideLayout,
     OverrideLayoutComplete,
-    ReloadTemplate,
     QueryTabNames,
     NewTiledPluginPane,
     StartOrReloadPluginPane,
