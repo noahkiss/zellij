@@ -27,8 +27,8 @@ there is no prompt and nothing to seed — which matters here, because the pane 
 ## Build
 
 A builtin of this fork: `cargo xtask build` builds it with the rest and embeds it in the binary,
-so there is nothing to install. To iterate on it in a running session, point `builtin_plugin_dir`
-at the build output and let `plugin_watch` reload it — see FORK.md.
+so there is nothing to install. To iterate on it in a running session, load the build output as a
+`file:` plugin and let `plugin_watch` reload it.
 
 ```bash
 cargo build --target wasm32-wasip1 --release -p slim-keybinds

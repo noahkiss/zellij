@@ -57,7 +57,6 @@ pub const CAPABILITIES: &[&str] = &[
     // plugin development loop
     "plugin-watch",               // plugin_watch, hot-reload of file: plugins
     "plugin-permissions",         // plugin_permissions in config.kdl
-    "builtin-plugin-dir",         // builtin_plugin_dir, a builtin loaded from disk
     "builtin-slim-bars",          // zellij:slim-tab-bar, zellij:slim-keybinds
     "background-plugin-dispatch", // a background plugin gets updates with no client attached
     "web-request-timeout", // web_request times out, and reports the kind in x-zellij-error-kind

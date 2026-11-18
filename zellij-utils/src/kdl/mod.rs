@@ -3009,7 +3009,6 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "attach_to_session",
     "auto_layout",
     "bell_clear_delay_ms",
-    "builtin_plugin_dir",
     "client_async_worker_tasks",
     "command_pane_on_clean_exit",
     "copy_clipboard",
@@ -3183,9 +3182,6 @@ impl Options {
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "mouse_mode").map(|(v, _)| v);
         let plugin_watch =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "plugin_watch").map(|(v, _)| v);
-        let builtin_plugin_dir =
-            kdl_property_first_arg_as_string_or_error!(kdl_options, "builtin_plugin_dir")
-                .map(|(string, _entry)| expand_path(string));
         let expect_full_disk_access =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "expect_full_disk_access")
                 .map(|(v, _)| v);
@@ -3425,7 +3421,6 @@ impl Options {
             theme_dir,
             mouse_mode,
             plugin_watch,
-            builtin_plugin_dir,
             expect_full_disk_access,
             stale_build_notice,
             pane_frames,
@@ -3832,13 +3827,6 @@ impl Options {
         } else {
             None
         }
-    }
-    fn builtin_plugin_dir_to_kdl(&self) -> Option<KdlNode> {
-        self.builtin_plugin_dir.as_ref().map(|dir| {
-            let mut node = KdlNode::new("builtin_plugin_dir");
-            node.push(KdlValue::String(dir.display().to_string()));
-            node
-        })
     }
     fn snapshot_dir_to_kdl(&self) -> Option<KdlNode> {
         self.snapshot_dir.as_ref().map(|snapshot_dir| {
@@ -5928,9 +5916,6 @@ impl Options {
         }
         if let Some(theme_dir) = self.theme_dir_to_kdl(add_comments) {
             nodes.push(theme_dir);
-        }
-        if let Some(builtin_plugin_dir) = self.builtin_plugin_dir_to_kdl() {
-            nodes.push(builtin_plugin_dir);
         }
         if let Some(snapshot_dir) = self.snapshot_dir_to_kdl() {
             nodes.push(snapshot_dir);
@@ -10280,6 +10265,26 @@ fn a_retired_pane_privacy_block_warns_and_loads() {
     );
 }
 
+/// `builtin_plugin_dir` was a fork key that this build no longer reads. An old config that still
+/// carries it loads, with the key reported as unknown.
+#[test]
+fn a_retired_builtin_plugin_dir_key_warns_and_loads() {
+    let config = Config::from_kdl(
+        "builtin_plugin_dir \"/tmp/plugins\"\nsimplified_ui true",
+        None,
+    )
+    .unwrap();
+    assert_eq!(config.options.simplified_ui, Some(true));
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|w| w.contains("builtin_plugin_dir")),
+        "{:?}",
+        config.warnings
+    );
+}
+
 /// `report_pane_env` was a fork key that this build no longer reads. An old config that still
 /// carries it loads, with the key reported as unknown.
 #[test]
@@ -11277,7 +11282,6 @@ fn path_options_are_expanded() {
         theme_dir "${HOME}/.config/zellij/themes"
         scrollback_editor "~/bin/my-editor"
         snapshot_dir "~/.local/state/zellij/snapshots"
-        builtin_plugin_dir "~/src/zellij/target/wasm32-wasip1/release"
         web_server_cert "~/.config/zellij/cert.pem"
         web_server_key "/etc/zellij/key.pem"
     "#;
@@ -11313,13 +11317,6 @@ fn path_options_are_expanded() {
         options.snapshot_dir,
         Some(PathBuf::from(format!(
             "{}/.local/state/zellij/snapshots",
-            home
-        )))
-    );
-    assert_eq!(
-        options.builtin_plugin_dir,
-        Some(PathBuf::from(format!(
-            "{}/src/zellij/target/wasm32-wasip1/release",
             home
         )))
     );

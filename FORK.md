@@ -4552,29 +4552,6 @@ checks short-circuit to `Granted` (`wasm_bridge.rs`, `zellij_exports.rs`), so a 
 raised a prompt — in a bar, a pane nobody can focus to answer it. Zellij's own bars have never had
 one. The permission cache is no longer written for either bar.
 
-### A builtin can be developed like any other plugin (`builtin_plugin_dir`)
-
-Bundling would otherwise trade away this fork's headline feature for exactly the plugins most likely
-to be edited: a builtin lives in the binary, so `plugin_watch` had nothing to watch.
-
-`builtin_plugin_dir "<path>"` makes the server load `<path>/<name>.wasm` for a builtin when that
-file is there, and `plugin_watch` then watches it like any `file:` plugin — edit, `cargo build
---target wasm32-wasip1 --release`, and the running bar swaps to the new code.
-
-- A builtin with no file in the directory still loads its embedded copy, so overriding one plugin
-  leaves the rest alone.
-- An unreadable override falls back to the embedded copy with a warning instead of failing the load,
-  because a half-written `.wasm` mid-build must not take a bar down; the watcher reloads it when the
-  build finishes.
-- Only names in `BUILTIN_PLUGIN_NAMES` can be overridden — the directory must not silently shadow
-  anything else.
-- config.kdl only, and a development override: production runs the embedded copy, which is what
-  makes a builtin version-locked to its binary in the first place.
-
-The configured directory is recorded once in a `OnceLock` (`input/plugins.rs`) because the two places
-that need it — resolving a builtin's bytes and watching its file — sit on different threads and
-neither carries the config.
-
 ### Breaking out a pane no tab owns is an error
 
 `break_multiple_panes_*` drops a pane id it cannot find, so a request naming only stale ids used to
