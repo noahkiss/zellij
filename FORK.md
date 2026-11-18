@@ -5414,41 +5414,6 @@ refused while the question said yes, so only the callers that act on the *questi
 `pin_needs_refresh` now asks `is_the_same_file` first, in the same order the writer does — which is
 the property that function's doc comment already claimed.
 
-### Doctor sets aside a signing bundle that is not its own
-
-**Removed in nkmk.30.** Doctor no longer imports, mints or sets aside a signing bundle, so this
-behaviour went with the ladder. A `.foreign-` or `.broken-` bundle an older doctor set aside is left
-where it is. See [The per-Mac signing ladder is
-gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
-
-`zellij session doctor --sign` re-imports `signing/id.p12` rather than minting a second
-certificate, because the certificate's hash **is** the requirement every grant on the machine
-records. That rule is right and stays. What was missing is that a clean import proves the file was
-readable and proves nothing about whose certificate came out of it.
-
-A `signing/` directory written by an older `zellij-mac-setup` holds a certificate under its own
-common name. It imports without complaint, so nothing mints; the ladder still finds no
-`zellij self-signed code signing` identity; and doctor falls through to the Xcode steps with "no
-signing certificate for &lt;pin&gt;" — on every run, for ever, on a machine it could repair in one
-pass. `refresh_pin_through_signing` fails with it, so the pin stays on the superseded build after
-an upgrade and the grants keep pointing at a binary nobody runs.
-
-So `ensure_self_signed` now asks the keychain again after a **successful** import. If our
-certificate is still not on offer the bundle is set aside as `id.p12.foreign-<timestamp>` — kept,
-never deleted, exactly as an unreadable one is — and a new certificate is minted. The set-aside name
-says which fault it was: `.broken-` is a bundle Apple could not read, `.foreign-` is one that read
-perfectly and was not ours.
-
-Minting means the grants for the pinned copy have to be made once more, which the finding says. It
-is the only way out: doctor cannot sign with a certificate whose private key it does not control the
-naming of, and the alternative is the deadlock above.
-
-The report also names the impostor. When the ladder is empty and the keychain holds a
-zellij-titled certificate that is not ours, doctor prints its name and hash beside the "no signing
-certificate" line, so the reader is told they have the wrong certificate rather than none — the
-version of this that sent a real machine off to Xcode over a certificate that was never going to
-work.
-
 ### A release build is pinned with its own Developer ID, and nothing re-signs it
 
 ```
@@ -5977,35 +5942,6 @@ cannot cross-compile the tree (a vendored C dependency), so it was type-checked 
 module and its two macOS-only imports for one `cargo check` and then putting the gates back. The
 behaviour itself is still worth a run on a Mac.
 
-### A certificate that was minted is reported and backed up, whatever the import did
-
-**Removed in nkmk.30.** Nothing is minted or backed up any more. See [The per-Mac signing ladder is
-gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
-
-`ensure_self_signed` mints once in the life of a machine, and the certificate it makes cannot be
-made again: its hash **is** the requirement every grant on the machine records. The import that
-follows the mint was a `?`.
-
-So on a machine with no Apple certificate, with `doctor --fix` run over SSH, `openssl` minted
-perfectly and `security import` failed on a locked keychain — and the `?` threw away the whole
-findings list, the "minted a certificate of our own" line with it. The report said "no signing
-certificate" and pointed at Xcode. `back_up_identity` runs on the caller's `Ok` arm, so there was no
-second copy either. The machine's one and only certificate existed at a single path, unmentioned,
-one `rm -rf` from being lost for good.
-
-`ensure_self_signed` now fails with a `SelfSignedFailure` instead of a bare `String`: the findings
-it had already made, a `minted` flag, and the reason. The caller reports the findings first, backs
-the identity up when something was minted, and only then says what went wrong.
-
-The flag names the **file**, not the command. It is read from `bundle.exists()` before the `?`, so a
-mint that died before writing anything does not send the caller off to copy a file that is not
-there — which would print a `Needs you` about a certificate that does not exist.
-
-Testing this needed one new thing: `RecordedCommander::creating`, which lets a scripted command
-create a file the way the real one does. Without it a test could drive a mint as far as its first
-failure and never past it, because the recorded `openssl` writes no key for the lockdown step to
-find. Opt-in, so every existing commander still touches nothing.
-
 ### The process scan asks `ps` not to truncate
 
 `running_servers` ran `ps -eo pid=,command=`. BSD `ps` — which is macOS's — sizes its output from
@@ -6051,32 +5987,6 @@ spaced exe passes clean; the same unit with the quotes stripped produces
 **Every installed unit's bytes change**, so the first `session status` or `session up` after
 upgrading reports drift and asks for a `session enable`. That is the intended path and it is a
 one-time cost.
-
-### The key ACL grant names our own key
-
-**Removed in nkmk.30.** Doctor runs no `security set-key-partition-list` any more. See [The per-Mac
-signing ladder is gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
-
-`security set-key-partition-list -S apple-tool:,apple:,codesign: -s <keychain>` was passed no match
-term. `-s` selects every private key in the named keychain that can sign, and the keychain named is
-the user's **login** keychain — so this rewrote the partition list of every signing key on the
-machine, not ours.
-
-The `Rung::SelfSigned` guard at the call site scopes **when** the command runs, never what it
-touches, and the module's own comment two lines above it says that re-writing a key we did not
-create is not doctor's business. A Mac holding an Apple Development key whose certificate the ladder
-refused falls to the self-signed rung, so this is not a hypothetical arrangement: doctor replaced
-the partition list on the Xcode-managed key, and Xcode began raising key-access dialogs on builds
-that used to be silent.
-
-`-l <the certificate's common name>` now scopes it, matching the friendly name `openssl pkcs12
--name` writes into the bundle, with `-s` kept beside it so the match is narrower than either alone.
-
-**The flag is the part still worth confirming on a Mac.** If the label does not match, the command
-grants nothing rather than the wrong thing, and doctor's existing handling covers that exactly:
-this step is a convenience, a refusal is a `Needs you` saying "codesign may ask for the key", and
-the run goes on to sign. Losing the convenience is a worse outcome than before for us and a better
-one for everybody else's keys, which is why the change lands without waiting for the measurement.
 
 ### A plugin that failed says so afterwards
 
@@ -6165,48 +6075,6 @@ meant to replace.
 Proved by running it both ways on one tree: with the fallback, `start-or-reload-plugin` against a
 session with zero clients reloads the plugin; with the fallback alone removed, the same command on
 the same session never reaches the loader.
-
-### A keychain that will not answer is not a keychain with nothing in it
-
-**Removed in nkmk.30.** Doctor asks the keychain nothing any more. See [The per-Mac signing ladder
-is gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
-
-`find_identities` read `security find-identity` and returned a list. Both ways that command can fail
-came back as an empty one. The `Err` arm — the command not running at all — was mapped to
-`Vec::new()` outright, and the `Ok` arm never looked at `success`, which is where the real failure
-lands: the `Commander` contract reserves `Err` for a program that could not be started, so a
-`security` that ran and refused is `Ok` with `success: false` and an empty stdout. That parses to
-the same empty list a machine with no certificates at all produces.
-
-The consequence is the one thing on this path that cannot be undone. An empty list means an empty
-ladder, an empty ladder means the self-signed rung, and the self-signed rung mints. A Mac whose
-login keychain was locked or wedged — `User interaction is not allowed` — was therefore told it had
-no Apple certificate, and doctor would mint one over the identity it already held.
-
-`find_identities` now returns `Result<Vec<Identity>, String>`, and each of its three callers says
-what it does with an unanswered question. `sign_pin` stops before the ladder with a `Needs you`
-quoting `security`'s own refusal, saying in as many words that this is not the same as holding no
-certificate and that nothing was minted or signed. The re-listing after a mint falls back to an
-empty ladder, which is the Xcode-steps `Needs you` — the right place for a keychain that went away
-mid-run. And `judge_reimport` refuses to judge: an unanswered listing reads as `NotOurs`, which
-would have set aside the bundle that had just imported perfectly well, so a failure to ask now
-leaves the file where it is and says so.
-
-### A dry run's "would sign" is a repair, not a reassurance
-
-**Removed in nkmk.30.** Nothing signs, so no dry run says "would sign". See [The per-Mac signing
-ladder is gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
-
-`session doctor --dry-run` reaching a rung it could sign with filed the finding as `Already
-correct`. The branch is only reached because the pin's signature is wrong — unsigned, ad-hoc, or
-naming a code hash — so the line read as reassurance about the single thing that was broken. An
-ad-hoc pin reported "would sign &lt;pin&gt; with an Apple Development certificate" under the heading
-for what needs nothing done to it.
-
-It is a `Changed` now, which is what that status is for: doctor's own definition is "acted, and the
-thing is now right — also what a dry run records for a fix it would have made". The exit code does
-not move, because a dry run of work doctor does by itself is not waiting on a person. This is
-already what the sibling branch does for the certificate it would mint; the two now agree.
 
 ### The restart log stopped eating the front of its own warnings
 
@@ -8043,57 +7911,6 @@ field that names a command that is not running is wrong whether or not another f
 panes, and two call sites. No protobuf, no contract change — `PaneInfo::terminal_command` already
 exists and this changes only what fills it. Two tab unit tests: a dropped pane names nothing, and a
 pane that still holds still names its command, because that one can be re-run with ENTER.
-
-### A fall to another team's certificate is refused instead of dropping every grant
-
-**Removed in nkmk.30.** There is no walk to fall down. See [The per-Mac signing ladder is
-gone](#the-per-mac-signing-ladder-is-gone-a-release-is-signed-once-in-ci).
-
-```
-signing  Needs you   ~/.local/share/zellij/bin/zellij holds grants recorded against team
-                     A1B2C3D4E5, and the certificate below belongs to team Z9Y8X7W6V5
-                       Apple Development is the next rung down and it is not this pin's team
-                       a requirement naming another team is one macOS never recorded, so Full
-                       Disk Access and every other grant would stop applying without a word
-                       sign with a certificate of the granted team, or re-grant the
-                       permissions for the pin's path once another one is in place
-```
-
-[The signing ladder](#signing-the-pinned-copy-macos) walks past a rung that refuses, and the fall
-from a Developer ID to an Apple Development certificate is safe **because both write the same
-requirement** — `codesign` derives `leaf[subject.OU] = "TEAM"` for the first and
-`requirement_for` writes it by hand for the second. That holds only while the two carry one team,
-and nothing checked. A keychain holding certificates from two teams — a personal Apple ID and an
-employer's, on one laptop — fell to the other team's OU, wrote a requirement macOS had never
-recorded, and every grant against the old one stopped applying. Silently: `codesign --verify` on
-the result reports a perfectly valid signature, because the signature *is* valid; it is the grant
-that is gone. The symptom is a pane that cannot read a directory it read yesterday, weeks later,
-with nothing tying it to a doctor run. It was recorded as a known limitation from nkmk.7 and is now
-the check this entry describes.
-
-**The pin's own requirement decides, not the certificate the walk is standing on.** macOS keyed
-each grant to the requirement text it read off the pin when the user granted it, so the team named
-in *that* text is the team the grants belong to. `judge_fall` takes three strings — the team above,
-the team below, and the requirement the pin is anchored on — and reads the granted team out of the
-requirement, falling back to the certificate above only when the requirement names no team at all
-(the CN-anchored case). A candidate naming a different team is refused, the walk stops, and the pin
-and its grants are left exactly as they were: with a deferred refresh, the previous build is still
-pinned and still holds everything.
-
-**Two falls deliberately keep their pass, and guarding either would be worse.** An unsigned or
-ad-hoc pin holds no grant to lose — its requirement names its own code hash, which the last build
-already voided — so refusing there would leave the pin ad-hoc, the one state signing exists to
-remove. And a certificate whose team could not be read signs with the requirement `codesign`
-derives, which the ladder allows on purpose and already reports; refusing a fall on a team id
-nobody could read would block the commonest unreadable-keychain case on no evidence.
-
-`zellij-utils/src/session_signing.rs` only, and it is the shape the rest of that file already has:
-the decision is a pure function over three strings, the keychain is only where the strings come
-from. `team_of` reads a rung's team off its certificate — the Developer ID's for the first time,
-and only when a fall is actually being weighed, because the question costs two keychain commands.
-Three tests, all of which run on a machine with no keychain: the team read out of the requirement each rung
-writes, the seven-case verdict table, and a two-team keychain driven through `sign_pin`
-that proves the other team's certificate is never handed to `codesign`.
 
 ### Doctor keeps the certificate the grants name, and remembers a switch until the re-grant is made
 
