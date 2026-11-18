@@ -46,7 +46,7 @@ fn main() {
         let config = Config::try_from(&opts).ok();
         if let Some(Command::Sessions(Sessions::ListAgents {
             json,
-            report_withheld,
+            report_withheld: _,
             all_sessions,
             watch,
             changes_only,
@@ -56,7 +56,7 @@ fn main() {
             commands::send_action_to_session(
                 CliAction::ListAgents {
                     json,
-                    report_withheld,
+                    report_withheld: false,
                     all_sessions,
                     watch,
                     changes_only,

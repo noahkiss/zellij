@@ -372,12 +372,6 @@ impl ZellijMcp {
             // exit 2 is the fork's "well-formed request about something that is not there". It is
             // the reason a create tool can be honest: a pane that was not made says so, and there
             // is no id here to invent
-            //
-            // A pane privacy policy has no reason of its own here. It answers as the miss answers,
-            // to the byte, so that a caller cannot tell a withheld pane from one that was never
-            // there - a `withheld` reason would be the oracle the whole filter exists to deny.
-            // `zellij_overview` still carries the aggregate count, which is where a caller learns
-            // that its view is partial.
             structured.insert(
                 "reason".to_owned(),
                 json!(if outcome.is_miss() { "miss" } else { "error" }),
@@ -699,9 +693,7 @@ fn agents_resource_list() -> ListResourcesResult {
 /// --json` answer.
 fn terminal_pane_row(panes: &str, pane: &str) -> Option<Value> {
     let value: Value = serde_json::from_str(panes).ok()?;
-    let rows = value
-        .as_array()
-        .or_else(|| value.get("panes")?.as_array())?;
+    let rows = value.as_array()?;
     rows.iter()
         .find(|row| {
             if row.get("is_plugin").and_then(Value::as_bool) == Some(true) {
@@ -898,8 +890,8 @@ mod tests {
         assert!(named_agent_hint(rows, "quiet-fox").is_none());
         assert!(named_agent_hint(rows, "missing").is_none());
         assert!(named_agent_hint("invalid", "3").is_none());
-        let panes = r#"{"panes":[{"handle":"sunny-otter","id":3,"uuid":"test-uuid","agent":{"kind":"claude","name":"proj-45"}},
-            {"id":3,"is_plugin":true,"agent":{"kind":"claude","name":"wrong"}}],"withheld":0}"#;
+        let panes = r#"[{"handle":"sunny-otter","id":3,"uuid":"test-uuid","agent":{"kind":"claude","name":"proj-45"}},
+            {"id":3,"is_plugin":true,"agent":{"kind":"claude","name":"wrong"}}]"#;
         for target in ["test-uuid", "sunny-otter", "3", "terminal_3"] {
             assert_eq!(named_agent_hint(panes, target).as_deref(), Some(expected));
         }

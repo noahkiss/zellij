@@ -2,7 +2,6 @@
 use crate::cli::Command;
 use crate::data::{FloatingPaneCoordinates, InputMode, ThemeHue, WebSharing};
 use crate::input::layout::PercentOrFixed;
-use crate::pane_privacy::PanePrivacyOptions;
 use crate::resurrect_command_hints::{ResurrectCommandHints, ResurrectCommands};
 use crate::session_service::SessionServiceOptions;
 use clap::{Args, ValueEnum};
@@ -463,14 +462,6 @@ pub struct Options {
     #[serde(default)]
     pub session_service: Option<SessionServiceOptions>,
 
-    /// Which panes this session keeps to itself: the `pane_privacy` block. A pane the patterns
-    /// match is dropped from `list-panes` and every command naming it is refused, so that an agent
-    /// driving the session over the CLI cannot see or touch the work it names.
-    /// config.kdl only - a flag that turned the filter off would be a flag that turned it off.
-    #[clap(skip)]
-    #[serde(default)]
-    pub pane_privacy: Option<PanePrivacyOptions>,
-
     /// How to record the command of a pane running a tool that keeps its own session state, so
     /// that a resurrected pane offers to RESUME that state instead of starting over. A hint names
     /// a command, an environment variable the tool exports, and what to record when the variable
@@ -863,10 +854,6 @@ impl Options {
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
-        let pane_privacy = other
-            .pane_privacy
-            .clone()
-            .or_else(|| self.pane_privacy.clone());
         let resurrect_command_hints = other
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
@@ -982,7 +969,6 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
-            pane_privacy,
             resurrect_command_hints,
             resurrect_commands,
             report_pane_env,
@@ -1102,10 +1088,6 @@ impl Options {
         let session_service = other
             .session_service
             .or_else(|| self.session_service.clone());
-        let pane_privacy = other
-            .pane_privacy
-            .clone()
-            .or_else(|| self.pane_privacy.clone());
         let resurrect_command_hints = other
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
@@ -1221,7 +1203,6 @@ impl Options {
             session_aliases,
             session_restart_drop_env,
             session_service,
-            pane_privacy,
             resurrect_command_hints,
             resurrect_commands,
             report_pane_env,

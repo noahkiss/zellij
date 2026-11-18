@@ -1546,7 +1546,7 @@ fn refuse_if_agents_are_working(verb: &str, name: &str, force: bool, log_file: O
     // Asked twice before going ahead: one failed answer was seen in a live proof and did not
     // repeat, and a guard that gives up on the first miss is a guard a busy server can skip.
     let ask = || zellij_client::cli_client::agents_before_teardown(&make_os_input, name);
-    let (agents, withheld) = match ask().or_else(|_| {
+    let agents = match ask().or_else(|_| {
         std::thread::sleep(Duration::from_millis(500));
         ask()
     }) {
@@ -1560,16 +1560,7 @@ fn refuse_if_agents_are_working(verb: &str, name: &str, force: bool, log_file: O
         },
     };
     let busy = match teardown_guard(&agents, force) {
-        TeardownGuard::Proceed => {
-            if withheld > 0 {
-                eprintln!(
-                    "warning: {} pane(s) of '{}' are withheld by pane_privacy and were not \
-                     checked for working agents.",
-                    withheld, name
-                );
-            }
-            return;
-        },
+        TeardownGuard::Proceed => return,
         TeardownGuard::Refuse(busy) => busy,
     };
     let text = busy_refusal_text(verb, name, &busy);

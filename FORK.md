@@ -2904,29 +2904,19 @@ follow in any order. It does not extend to the **command surface** — a script 
 calling a new subcommand still breaks on every machine that has not upgraded.
 
 Scope is `session_service` and its children only. Upstream's own strict blocks are untouched. The
-fork's other two — `pane_privacy` and `resurrect_command_hints` — had the same rollout problem
-waiting in them until [the entry
-below](#pane_privacy-and-resurrect_command_hints-warn-on-a-key-they-do-not-know) softened them the
-same way.
+fork's other block, `resurrect_command_hints`, had the same rollout problem waiting in it until
+[the entry below](#resurrect_command_hints-warns-on-a-key-it-does-not-know) softened it the same
+way.
 
-### `pane_privacy` and `resurrect_command_hints` warn on a key they do not know
+### `resurrect_command_hints` warns on a key it does not know
 
-The rule the entry above wrote for `session_service`, now applied to the fork's other two blocks
-that parse their own children. They were the last places where a nested key could not be seeded
-into a shared config ahead of the binary, because an unknown child failed the WHOLE file:
-
-```
-× Failed to parse Zellij configuration
-╰── Unknown pane_privacy entry: "patterns_files" (expected patterns_file, pattern, ...)
-```
+The rule the entry above wrote for `session_service`, now applied to the fork's other block that
+parses its own children. It was the last place where a nested key could not be seeded into a
+shared config ahead of the binary, because an unknown child failed the WHOLE file.
 
 A name this build does not know is now **kept, logged and ignored**:
 
 ```kdl
-pane_privacy {
-    pattern "pretend-private"                  // read
-    some_key_from_a_later_build "whatever"     // ignored, with a warning
-}
 resurrect_command_hints {
     claude {
         match "claude"                         // read
@@ -2937,21 +2927,8 @@ resurrect_command_hints {
 }
 ```
 
-**An unknown VALUE in `pane_privacy` fails closed for that rule, not for the whole config.** The
-setting takes its strictest known value, with a warning naming the file and line, and the rest of
-the config loads. A privacy setting silently loosened is worse than one that refuses, so the
-fallback is never the default:
-
-| Setting | An unknown value becomes |
-|---|---|
-| `on_unknown_cwd "withold"` | `withhold` |
-| `tab_rule "some"` | `any` |
-| `match_fields "cwd" "hostname"` | every field this build knows: `cwd`, `command`, `title`, `tab_name` |
-
-A config with only known values reads exactly as before, and an `allow` or `all` the operator chose
-is not tightened. A malformed value (missing, or not a string) still fails the config. In
-`resurrect_command_hints`, a hint whose `resume_args` is not a string, or a hint that names no
-`match`, `env` or `resume_args` at all, still fails too. An unknown name means nobody who typed it
+A malformed value still fails the config: a hint whose `resume_args` is not a string, or a hint
+that names no `match`, `env` or `resume_args` at all. An unknown name means nobody who typed it
 expected THIS build to act on it, so it is ignored.
 
 `rewrite` stays a **known** name in a hint, not an unknown one. It is retired, and it has its own
@@ -2963,17 +2940,13 @@ The warnings reach the same two places as `session_service`'s, printed as one ru
 
 ```
 [CONFIG FILE]: Well defined.
-[CONFIG WARNING]: unknown pane_privacy entry "patterns_files", ignored (expected patterns_file,
-pattern, match_fields, on_unknown_cwd or tab_rule)
 [CONFIG WARNING]: unknown resurrect_command_hints entry "resume" in hint "claude", ignored
 (expected match, env or resume_args)
 ```
 
 A hint's warning names the hint it was read under, because a config carries several and the entry
-name alone would not say which one is short a setting.
-
-An ignored entry is **not** written back out by `setup --dump-config`, and a `pane_privacy` block
-holding nothing else is not written out at all — it sets nothing this build acts on.
+name alone would not say which one is short a setting. An ignored entry is **not** written back out
+by `setup --dump-config`.
 
 One implementation note worth keeping: in a hint, the unknown name is checked BEFORE the entry's
 value is read. Every entry this build knows carries a string, and the old code enforced that first,
@@ -3030,8 +3003,6 @@ not covered and stays as strict as upstream.
 
 Not plain warn-and-skip, on purpose:
 
-- **An unknown VALUE in `pane_privacy` fails closed for that rule.** The setting takes its strictest
-  known value (`withhold`, `any`, or every match field), not its default. See the entry above.
 - **`session_service` values.** No key there takes a value from a closed set: a string `pin_exe` is a
   path, and every other check is a type or a range (`watchdog_interval_secs 0`). Those are malformed
   known settings and still fail. Its unknown names warn, as before.
@@ -4189,7 +4160,7 @@ not degradable: `Config::from_kdl` fails the whole file, and every path into a s
 touched. Refusing `rewrite` would therefore have stopped every machine whose config still carried
 it, over a key that only decides how nicely a pane comes back. A skipped hint costs a resumable
 command; a refused config costs the session. That argument is now the whole block's: [an entry this
-build does not know](#pane_privacy-and-resurrect_command_hints-warn-on-a-key-they-do-not-know) is
+build does not know](#resurrect_command_hints-warns-on-a-key-it-does-not-know) is
 warned about and ignored rather than refused. `rewrite` is not one of those — it is a name this
 build knows, and the warning above is its own.
 
@@ -5622,7 +5593,7 @@ gains `session`. The table puts `SESSION` after `STATE`, last, as the append-onl
 answered before a session is chosen, so it needs no `-s`, ignores one, and with no session running
 prints the header alone and exits 0. A session that does not answer is named on stderr and left
 out: one wedged server should not hide every other agent on the machine. It exits 1 only when there
-were sessions and none answered. `--report-withheld` sums the withheld panes of every session.
+were sessions and none answered.
 
 **`--watch`** keeps running and prints one JSON line whenever an agent appears, changes, or goes:
 
@@ -5721,16 +5692,13 @@ long-lived command the server writes to as things change, one JSON object per li
 - **Order inside one change**: a tab opens before its panes, a pane opens before its agent, an
   agent's `gone` comes before its pane closes, a pane closes before its tab. `pane_changed` and
   then `pane_output` lines come last.
-- **A pane privacy policy** applies: a withheld pane is never on the stream, exactly as it is
-  never in `list-panes`, and a `pane_changed` line is built from the same filtered row, so it
-  shows nothing that row does not.
 - **`list-agents --watch`** writes no `pane_changed` line, and its `seq` does not count one.
 - **Exit 0** when the reader closes the pipe, noticed even on a quiet session (the client asks its
   stdout every half second). **Exit 2** when the session goes away. **Exit 2 at once**, within five
   seconds and with the reason on stderr, against a server that predates the command.
 
 **How the server knows.** Nothing new is tracked. The server builds the same pane list
-`list-panes` answers with, after the privacy policy, and the agents `list-agents` projects from
+`list-panes` answers with, and the agents `list-agents` projects from
 it, and each stream remembers what it last told its reader and sends the difference. It looks when
 the pane manifest is reported to plugins (every open, close, exit, move and rename), when the pty
 reports new process information (an agent's identity), after a render (OSC 7501 state and
@@ -5922,169 +5890,6 @@ harness's process, and a test runner's signals are not its to answer.
 
 It pairs with `session up` resuming by default: the reboot now leaves a current snapshot, and the
 `up` that follows it finds one.
-
-### `pane_privacy`: panes the session keeps to itself
-
-Some work is nobody's business but the person at the terminal's. A session can be told which panes
-those are, and the panes then stop existing as far as the command surface is concerned: their rows
-are gone from `list-panes`, `list-tabs`, `list-tree` and `list-agents`, and any command that names
-one answers exactly as it answers for a pane that was never there.
-
-```kdl
-pane_privacy {
-    patterns_file "/path/to/private-paths.txt"
-    pattern "some-extra-regex"
-    match_fields "cwd" "command"
-    on_unknown_cwd "withhold"
-    tab_rule "any"
-}
-```
-
-Every entry is optional. `patterns_file` names a file of one extended regular expression per line,
-`#` comments and blank lines ignored. `pattern` is the same thing written inline, and repeats. The
-environment variable `ZELLIJ_PANE_PRIVACY_FILE` overrides `patterns_file`, because which
-directories are private is a fact about a machine and one `config.kdl` is shared across several.
-
-Patterns are matched case-insensitively and are **not anchored**: a bare fragment matches anywhere
-in the value, which is what makes an existing list of private paths usable as-is. With no file, no
-pattern and no environment variable there is no policy, and the whole feature costs one
-`is_active()` per call.
-
-`match_fields` chooses which columns of a pane row a pattern is tried against — `cwd`, `command`,
-`title`, `tab_name`. The default is `cwd command`, where a private path lands on its own; a title
-and a tab name are the user's own text and are opt-in. `on_unknown_cwd` decides a terminal pane
-whose cwd is not known yet — `pane_cwd` is empty for about a second after a pane is created, and
-`withhold` (the default) closes that window. A plugin pane has no cwd by construction and is never
-withheld for lacking one. `tab_rule` decides how a tab inherits its panes' verdict: `any` (the
-default) withholds the whole tab when one pane matches, because a tab is the unit of work and its
-name alone can say what the work is.
-
-**Withholding is not redaction.** A withheld row is dropped, and the only thing left behind is a
-count. A redacted row still says where the private work is.
-
-Being top-level, the block is ignored by a binary that predates it, so it can go into a shared
-config ahead of the upgrade. Its own children were strict, so it could not be rolled out one key at
-a time — which is what every build before [the entry that softened
-it](#pane_privacy-and-resurrect_command_hints-warn-on-a-key-they-do-not-know) does. From that entry
-on, a build ignores a child it does not know, and a nested key can be seeded ahead of the binaries
-like any other.
-
-#### What it does to each command
-
-| Command | With a policy in force |
-|---|---|
-| `list-panes`, `list-tree` | withheld rows dropped; the table gains a `withheld: n` footer |
-| `list-panes --json` | still a bare array — `--report-withheld` switches it to `{"panes": [...], "withheld": n}` |
-| `list-agents` | the same, over the same walk; `--report-withheld` gives `{"agents": [...], "withheld": n}` |
-| `list-tabs` | withheld tabs dropped |
-| `dump-screen`, `wait`, `send-keys`, `write-chars`, `paste`, `close-pane`, `move-pane`, `stack-panes`, `break-pane`, `rename-pane`, and every other `--pane-id` verb | `No pane answers to '<target>'`, exit 2 — the unknown-pane answer |
-| a verb naming a withheld tab | that verb's own no-such-tab answer |
-| `new-pane --cwd`, `new-tab --cwd`, `run --cwd` under a matching directory | the directory is dropped and the command succeeds, as it does for a directory that does not exist |
-| `dump-layout`, `snapshot show`, `snapshot restore` | refused whole while any policy is active |
-| `snapshot list`, `ls` | unchanged |
-
-`new-pane --cwd DIR` with **no command** never reached the server with a directory in the first
-place: upstream drops the directory when there is no command to run in it, so the pane opens in the
-calling pane's cwd. The forms that do carry one — `new-pane --cwd DIR -- CMD`, `new-tab --cwd DIR`,
-`run --cwd DIR -- CMD` — are the ones the policy strips.
-
-**A refusal is the ordinary miss, byte for byte.** That is the guarantee, and it is stronger than
-"the message says nothing": a message that said "withheld" would be a yes/no oracle on whatever
-string the caller chose to pass, and because patterns are unanchored substrings, a loop over that
-oracle recovers the pattern list itself — the one thing the filter exists to hide. So:
-
-- a withheld pane id, handle or uuid gets `No pane answers to '<target>'` and exit 2, the same
-  sentence and the same exit code an id nothing holds gets;
-- a withheld tab gets whichever no-such-tab answer that verb already gives — `No tab with id 3`,
-  `No tab at position 3`, `Tab with id 3 not found`, or, for `rename-tab` by position, the silent
-  no-op that verb answers a miss with;
-- a `--cwd` the policy withholds is **dropped from the request** rather than refused. zellij
-  already ignores a directory it cannot use: a `--cwd` that does not exist makes the pane anyway,
-  in the server's own cwd, and `list-panes` reports it there. A withheld directory is treated as
-  that kind of directory, so the answer does not depend on whether the path matched.
-
-The one thing that still admits a policy is running is the aggregate `withheld: n` count on
-`--report-withheld` and in the MCP's `zellij_overview`. That is deliberate: a caller is entitled to
-know its view is partial. It is a count and never a name, so it says how much is missing and
-nothing about what. `dump-layout`, `snapshot show` and `snapshot restore` keep a plain refusal —
-they are whole documents with no per-target answer to imitate, so there is no oracle to build out
-of them, and their message names no pattern and no path.
-
-Three things the filter does not make indistinguishable, and all three are tab-shaped — the space of
-guesses there is the small integers, `list-tabs` has already said which tabs are missing, and none
-of them leaks a pattern:
-
-- `move-tab --tab-id N --to-index M` reports its ordinary miss with exit 1; the refusal is exit 2.
-- `go-to-tab-id N` **with no client attached** does nothing at all for a tab that is not there, so
-  the refusal speaks where the miss is silent. Attached, the two agree.
-- `go-to-tab-name` is not covered: a caller that guesses the *name* of a withheld tab reaches it.
-
-Each pane verb, by contrast, is matched exactly, and there are two sentences to match:
-`dump-screen`, `close-pane`, `focus-pane-id`, `toggle-pane-borderless` and `edit-scrollback` answer
-`No pane answers to 'terminal_9'`; everything else answers `Pane with id Terminal(9) not found`;
-`set-pane-borderless` says nothing at all. `pane_miss_refusal` in `route.rs` holds that mapping, and
-an E2E over 25 verbs is what found it — the two sentences are not interchangeable.
-
-`wait` was the one verb with no miss to imitate. An id form used to resolve to itself without
-anyone asking whether a pane held it, so `wait terminal_99 --for exit` on a pane that never existed
-returned `waited_ms: 0` and exit 0. `Screen::resolve_pane_target` now resolves an id against the
-pane list, like a handle, so an unknown id and a withheld one both answer
-`No pane answers to '<target>'` at exit 2.
-
-`list-panes --json` keeps the bare array because three parsers already read it: the `wait` poll,
-`list-agents`, and the MCP server. A caller that needs to tell a partial answer from a complete one
-asks for the envelope by name.
-
-#### Where the decision is made, and why there is only one
-
-**The server decides, in `route.rs`.** That is where every CLI verb arrives, so it is also where
-the `zellij mcp` server arrives — every MCP tool runs this binary's CLI in a child process. The
-filter therefore covers an agent holding the MCP tools and an agent holding a shell, without being
-written twice. There is no flag to turn it off for one call.
-
-Two points carry it:
-
-- **`Action::ResolvePaneTarget`.** Every `--pane-id` verb resolves its target through the server
-  before it acts. One refusal there covers all of them, `wait` included — which matters more than
-  it looks. `wait --for exit` polls `list-panes` and reads a pane that is not in the list as gone,
-  so a silently filtered pane would have been reported as `exit_status: -`: a wrong answer, not a
-  refusal. `wait` now asks the server to resolve even an id form, which it used to short-circuit,
-  and a withheld pane gets the same `No pane answers to '<target>'` an unknown one gets.
-- **A guard at the top of `route_action`**, over `privacy_target_of`. It catches anything that
-  reached the server with a pane or tab already resolved, and answers with that action's own miss.
-  A withheld `--cwd` is handled just before it, by `strip_withheld_cwds`, which edits the request
-  rather than refusing it.
-
-`snapshot show` and `snapshot restore` are the one decision outside the server, and it is a
-different decision: a snapshot is a file on disk with no session behind it to ask, so the only
-question is whether a policy exists at all.
-
-#### The wasm split
-
-`zellij-utils/src/pane_privacy.rs` holds the settings and nothing else — no regex, no file read, no
-environment. It is parsed by `kdl/mod.rs`, which builds for `wasm32-wasip1` along with every default
-plugin. The matcher lives in `zellij-server/src/pane_privacy.rs`, which never builds for wasm and
-already had `regex`. This is the same shape as `session_service`, for the same reason.
-
-One workspace dependency changed: `regex` gained the `unicode-case` feature. Without it the crate
-rejects `(?i)` outright, and the failure is a runtime parse error rather than a build error.
-
-#### Failing closed
-
-A `patterns_file` that cannot be read, or a pattern that does not compile, makes the policy
-**broken**: every pane is withheld and every targeted call answers as a miss, with the reason in the
-session log. A privacy filter that fails open is a filter that silently is not there.
-
-#### What it does not cover
-
-**The plugin API.** A plugin subscribed to `Event::PaneUpdate` receives every pane, withheld ones
-included. The filter sits in the CLI's route handlers, and the plugin event path does not pass
-through them. That is the right boundary for what this is for - a plugin is code the user installed,
-and the status bar has to know the panes exist to draw them - but it is not a sandbox, and a plugin
-is not a place to put something the policy is meant to hide from.
-
-**An attached client.** Anyone looking at the terminal sees the panes. The filter is about what the
-command surface answers, not about what is on screen.
 
 ### Creating a session never takes a live server's socket
 
@@ -6709,8 +6514,6 @@ Exit status 4: a caller that started this in a pane that closes on exit must che
   systemd units never tear a session down, so they are unchanged.
 - **A session that does not answer goes ahead**, with a warning, after a second try half a second
   later. A wedged server is what a restart is for. A session that is not running is not asked.
-- **Panes withheld by `pane_privacy` are not checked**, and a teardown that goes ahead says how
-  many there were.
 - With `detect_agents false` there are no agent rows, so nothing refuses.
 
 **Background subagents: `state_working`.** A Claude turn that ends while its background subagents
@@ -8160,15 +7963,8 @@ every pane there is, and a pane opened later joins the feed on its own.
   subscription. What does not happen is the exit: a named subscription ends when its last pane
   closes, because those panes were the request, while a wildcard outlives all of them and runs
   until the session does.
-- **`pane_privacy` is honoured, and this is the reason the expansion lives in the server.**
-  `SubscribeToPaneRenders` is a client/server message rather than a CLI action, so it does not pass
-  through the privacy guard in `route.rs` — a wildcard expanded anywhere else would hand a consumer
-  every withheld pane without it having named one. The wildcard resolves to what `list-panes --all`
-  would answer, filtered by the policy, and the filter is re-run on every delivery rather than once
-  at subscribe time, because what a policy withholds follows a pane's live command and title. A
-  pane the policy begins to withhold leaves the feed without being reported as closed. That
-  re-filtering builds the pane list on each render tick, which is the one cost here — it is paid
-  only by a session that has both a wildcard subscriber and an active policy.
+- **The wildcard is expanded in the server**, to every pane `list-panes --all` would answer, and
+  re-read on every delivery rather than once at subscribe time.
 
 The flag rides on the existing `SubscribeToPaneRendersMsg` (field 4), so it adds no message to the
 client/server contract and changes no numbering. A fork client's `--all` against a stock server of
@@ -8516,9 +8312,8 @@ nothing and exits **0** — nothing was asked for by name, so nothing is missing
 `--full` and `--ansi` shape every dump in the sweep. `--file` (and `--path`) writes the same bytes
 it would have printed, and a reader that stops reading — `| head -1` — ends the sweep quietly at 0,
 the answer [`session status`](#session-status-ends-quietly-when-the-reader-stops-reading) gives.
-`--all` sweeps the panes `list-panes` itself reports, in its order, so a pane privacy policy that
-withholds a pane withholds it here too, and the two commands cannot disagree about what the session
-holds.
+`--all` sweeps the panes `list-panes` itself reports, in its order, so the two commands cannot
+disagree about what the session holds.
 
 **The trap, for the next client that sends more than one message.** The session answers a CLI
 message with its report *and then* an `UnblockInputThread`, sent from the bottom of the route loop.
@@ -9743,9 +9538,7 @@ What differs from that web store, and why:
 - **Not images only.** The web client refuses non-image files. A drop is any file.
 
 **The pane is looked up before anything is stored.** A handle nothing answers to is a miss,
-exit 2, with no file written and stdin unread. A plugin pane is an error, exit 1. A pane that a
-pane-privacy policy withholds is not in the pane list, so it is a miss as well: nothing is pasted
-into a pane the caller cannot see.
+exit 2, with no file written and stdin unread. A plugin pane is an error, exit 1.
 
 **On the cheap surface.** `drop-file` is answered by the client, like `wait` and `list-agents`: it
 asks one `list-panes --json`, stores the file, and sends an ordinary `Paste`. No `Action`, no
@@ -9868,8 +9661,7 @@ the model wrote it.
 - **A miss, exit 2, says why**: the pane runs no agent; no session id is known yet (a codex or pi
   that has not been sent a message); opencode, whose sessions live in a database this build does
   not read; no transcript under the directory; or nothing written since the last prompt (the
-  report names the agent's `state`). The pane is resolved like every addressed verb, so a pane a
-  privacy policy withholds is refused before anything is read.
+  report names the agent's `state`). The pane is resolved like every addressed verb.
 - **It is the client's**, like `list-agents`: one `list-panes`, then a file read on this machine.
   No action, no contract change. The directories come from the CLI's own environment, not the
   agent's: an agent started with a different `CLAUDE_CONFIG_DIR` is looked for in the wrong place.
@@ -10009,12 +9801,11 @@ quiet.
 
 ```
 zellij_overview {"scope": "my_agents"}
-  # action list-agents --json --report-withheld, kept to the caller's own tab
-{"agents": [{"handle": "brisk-heron", "kind": "claude", "cwd": "/home/u/src/app",
-             "state": "blocked", "state_kind": "permission", "state_msg": "approve Bash: make",
-             "state_at": 1791821058267, "state_age_s": 42,
-             "last_output_at": 1791821058301, "output_age_s": 42, ...}],
- "withheld": 0}
+  # action list-agents --json, kept to the caller's own tab
+[{"handle": "brisk-heron", "kind": "claude", "cwd": "/home/u/src/app",
+  "state": "blocked", "state_kind": "permission", "state_msg": "approve Bash: make",
+  "state_at": 1791821058267, "state_age_s": 42,
+  "last_output_at": 1791821058301, "output_age_s": 42, ...}]
 ```
 
 - **`list-agents --json` rows gain `last_output_at`**, the pane's own (milliseconds since the
@@ -10097,7 +9888,7 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   `~/.local/bin` and `~/.cargo/bin`: a non-interactive ssh shell on macOS may not have Homebrew on
   `PATH`. `ZELLIJ_MCP_SSH` names a different ssh program, for tests. Exit 255 is ssh's own failure
   and is reported as "ssh could not reach <host>".
-- **`zellij_overview scope=fleet`** runs `list-agents --all-sessions --json --report-withheld` here
+- **`zellij_overview scope=fleet`** runs `list-agents --all-sessions --json` here
   and on every remote host at once, each bounded by 10 seconds. Every row gains `host`. The text is
   one line per agent, `host: session: handle kind state tab=… out=…s cwd`. A host that does not
   answer is one `unreachable` row, and one that answers with an error is one `error` row, never a
@@ -10227,7 +10018,7 @@ A named frame reads `project-1 · title`; changing the name refreshes the frame.
 `zellij action whoami` prints the caller's session, host, tab, pane handle, and agent name.
 It also lists other agents with names, tabs, handles, and states.
 `--json` returns the same context as JSON.
-The command requires `ZELLIJ_PANE_ID` and respects pane privacy.
+The command requires `ZELLIJ_PANE_ID`.
 The grouped action help and `--dump-surface` expose `whoami` as a read command.
 The dump also describes the top-level `list-agents` alias.
 

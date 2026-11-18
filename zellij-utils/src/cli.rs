@@ -195,7 +195,7 @@ pub struct SubscribeCli {
     pub pane_id: Vec<String>,
 
     /// Subscribe to every pane in the session, including panes opened after the subscription
-    /// starts. Panes a `pane_privacy` policy withholds are not included
+    /// starts
     #[clap(long, conflicts_with = "pane_id")]
     pub all: bool,
 
@@ -383,8 +383,8 @@ pub enum Sessions {
         /// Output as JSON
         #[clap(short, long)]
         json: bool,
-        /// Include the count of privacy-withheld panes
-        #[clap(long)]
+        /// Accepted and ignored: a retired flag that older callers still pass
+        #[clap(long, hide = true)]
         report_withheld: bool,
         /// List agents in every live session
         #[clap(long)]
@@ -2681,10 +2681,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
 
-        /// With --json, answer with {"panes": [...], "withheld": n} instead of the bare array, so
-        /// that a caller can tell a partial view from a complete one. Without a pane privacy
-        /// policy the count is always 0
-        #[clap(long, value_parser)]
+        /// Accepted and ignored: a retired flag that older callers still pass
+        #[clap(long, value_parser, hide = true)]
         report_withheld: bool,
     },
     /// List all tabs with their information
@@ -2746,8 +2744,8 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
 
-        /// With --json, answer with {"agents": [...], "withheld": n} instead of the bare array
-        #[clap(long, value_parser)]
+        /// Accepted and ignored: a retired flag that older callers still pass
+        #[clap(long, value_parser, hide = true)]
         report_withheld: bool,
 
         /// Ask every live session, not one. Each row gains `session` (a SESSION column, last).

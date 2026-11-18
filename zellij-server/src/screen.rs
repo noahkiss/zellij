@@ -9225,29 +9225,8 @@ impl Screen {
             }
         }
     }
-    /// Every pane a wildcard subscription covers: what `list-panes --all` would answer, minus
-    /// whatever a `pane_privacy` policy withholds.
-    ///
-    /// `SubscribeToPaneRenders` does not pass through the CLI's privacy guard in `route.rs`, so a
-    /// wildcard that did not ask here would hand out every withheld pane to a consumer that never
-    /// even named one. The filter is re-run on every delivery rather than once at subscribe time,
-    /// because what a policy withholds follows the pane's live command and title.
+    /// Every pane a wildcard subscription covers: what `list-panes --all` would answer.
     fn panes_a_wildcard_covers(&self) -> HashSet<zellij_utils::data::PaneId> {
-        let policy = crate::pane_privacy_policy();
-        if policy.is_active() {
-            let entries = self.collect_pane_list(true).unwrap_or_default();
-            let (kept, _withheld) = policy.filter(entries);
-            return kept
-                .iter()
-                .map(|entry| {
-                    if entry.pane_info.is_plugin {
-                        zellij_utils::data::PaneId::Plugin(entry.pane_info.id)
-                    } else {
-                        zellij_utils::data::PaneId::Terminal(entry.pane_info.id)
-                    }
-                })
-                .collect();
-        }
         self.tabs
             .values()
             .flat_map(|tab| tab.get_all_pane_ids())
@@ -9366,8 +9345,7 @@ impl Screen {
     /// A pane that has appeared since the last delivery gets an initial update of its own, the way
     /// a named pane does at subscribe time, so a consumer can tell a pane it has never seen from
     /// one that has merely changed. A pane that closed has already announced itself through
-    /// `SubscribedPaneClosed`; dropping it here as well covers a pane the policy has begun to
-    /// withhold, which is not a closure and must not be reported as one.
+    /// `SubscribedPaneClosed`, so it is dropped here without a second report.
     fn refresh_wildcard_subscriptions(&mut self) {
         if !self.pane_render_subscribers.values().any(|s| s.all_panes) {
             return;
@@ -9595,7 +9573,7 @@ impl Screen {
         }
     }
     /// What a session event stream compares: the tabs, and the pane list `list-panes` answers
-    /// with, after the pane privacy policy. A withheld pane is never on the stream.
+    /// with.
     fn session_event_model(&self) -> StreamModel {
         let mut tabs: Vec<&Tab> = self.tabs.values().collect();
         tabs.sort_by_key(|tab| tab.position);
@@ -9607,7 +9585,6 @@ impl Screen {
             })
             .collect();
         let panes = self.collect_pane_list(false).unwrap_or_default();
-        let (panes, _withheld) = crate::pane_privacy_policy().filter(panes);
         StreamModel::new(tabs, panes)
     }
     /// `zellij action watch`: the first lines of a new stream, and the stream kept for later.

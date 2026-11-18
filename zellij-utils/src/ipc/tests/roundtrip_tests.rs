@@ -473,7 +473,6 @@ fn test_client_messages() {
                 pane_frame_agent_name: None,
                 session_up_resume: None,
                 session_service: None,
-                pane_privacy: None,
                 resurrect_command_hints: None,
                 resurrect_commands: None,
                 default_floating_size: None,

@@ -696,14 +696,6 @@ impl Setup {
                         .chain(
                             config
                                 .options
-                                .pane_privacy
-                                .as_ref()
-                                .map(|pane_privacy| pane_privacy.unknown_entries.as_slice())
-                                .unwrap_or_default(),
-                        )
-                        .chain(
-                            config
-                                .options
                                 .resurrect_command_hints
                                 .as_ref()
                                 .map(|hints| hints.unknown_entries.as_slice())

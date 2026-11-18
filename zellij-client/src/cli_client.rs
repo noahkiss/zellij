@@ -15,8 +15,8 @@ use zellij_utils::{
     agent_detect,
     cli::{SubscribeCli, SubscribeFormat},
     data::{
-        ListAgentsEnvelope, ListAgentsResponse, ListPanesEnvelope, PaneCommandState, PaneDump,
-        PaneId, PaneListEntry, PaneProgramStatus, PaneTarget,
+        ListAgentsResponse, PaneCommandState, PaneDump, PaneId, PaneListEntry, PaneProgramStatus,
+        PaneTarget,
     },
     errors::prelude::*,
     input::actions::Action,
@@ -1051,23 +1051,21 @@ pub fn start_list_agents_client(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
     output_json: bool,
-    report_withheld: bool,
 ) -> i32 {
-    let (agents, withheld) = match agents_of_session(os_input, session_name) {
+    let agents = match agents_of_session(os_input, session_name) {
         Ok(answer) => answer,
         Err(message) => {
             eprintln!("{}", message);
             return 1;
         },
     };
-    print_agents(&agents, withheld, output_json, report_withheld, false)
+    print_agents(&agents, output_json, false)
 }
 
 /// `zellij action last-reply`: the agent's last reply, from its harness's transcript.
 ///
-/// The pane is resolved the way every addressed verb resolves one, so a pane a privacy policy
-/// withholds is refused before anything is read. Its row in the agent list names the harness and
-/// the session id, and [`crate::agent_reply`] finds and reads the transcript on this machine.
+/// The pane is resolved the way every addressed verb resolves one. Its row in the agent list
+/// names the harness and the session id, and [`crate::agent_reply`] finds and reads the transcript on this machine.
 ///
 /// Exit 0 printed a reply. Exit 2 is a miss with the reason on stderr: not an agent, no session
 /// id yet, a harness whose transcript this build does not read, no transcript file, or nothing
@@ -1086,7 +1084,7 @@ pub fn start_last_reply_client(
         },
     };
     let agents = match agents_of_session(make_os_input(), session_name) {
-        Ok((agents, _)) => agents,
+        Ok(agents) => agents,
         Err(message) => {
             eprintln!("{}", message);
             return 1;
@@ -1206,13 +1204,12 @@ pub fn start_list_agents_all_sessions_client(
     make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
     session_names: &[String],
     output_json: bool,
-    report_withheld: bool,
 ) -> i32 {
-    let (agents, withheld, answered) = agents_of_sessions(make_os_input, session_names);
+    let (agents, answered) = agents_of_sessions(make_os_input, session_names);
     if answered == 0 && !session_names.is_empty() {
         return 1;
     }
-    print_agents(&agents, withheld, output_json, report_withheld, true)
+    print_agents(&agents, output_json, true)
 }
 
 fn active_agents(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
@@ -1229,17 +1226,16 @@ fn agent_change_snapshot(
     session_name: &str,
     filter: Option<&[u32]>,
 ) -> Result<ListAgentsResponse, String> {
-    agent_snapshot(make_os_input, session_name, filter).map(|(agents, _)| agents)
+    agent_snapshot(make_os_input, session_name, filter)
 }
 
-/// The agents of one session as a teardown sees them, and how many panes the privacy policy
-/// withheld from the answer. `zellij session restart` and `session down` ask this before they
+/// The agents of one session as a teardown sees them. `zellij session restart` and `session down` ask this before they
 /// kill anything: the rows of `list-agents`, the caller's own pane marked, and the screen
 /// detector's `blocked` where an agent reported no state.
 pub fn agents_before_teardown(
     make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
     session_name: &str,
-) -> Result<(ListAgentsResponse, usize), String> {
+) -> Result<ListAgentsResponse, String> {
     agent_snapshot(make_os_input, session_name, None)
 }
 
@@ -1247,10 +1243,9 @@ fn agent_snapshot(
     make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
     session_name: &str,
     filter: Option<&[u32]>,
-) -> Result<(ListAgentsResponse, usize), String> {
-    let envelope = panes_of_session(make_os_input(), session_name)?;
-    let withheld = envelope.withheld;
-    let mut agents = active_agents(envelope.panes);
+) -> Result<ListAgentsResponse, String> {
+    let panes = panes_of_session(make_os_input(), session_name)?;
+    let mut agents = active_agents(panes);
     agent_detect::mark_self(
         &mut agents,
         std::env::var("ZELLIJ_PANE_ID")
@@ -1295,7 +1290,7 @@ fn agent_snapshot(
             }
         }
     }
-    Ok((agents, withheld))
+    Ok(agents)
 }
 
 fn enrich_agent_change(change: &mut agent_detect::AgentChange, agents: &ListAgentsResponse) {
@@ -1623,7 +1618,7 @@ pub fn start_list_agents_watch_client(
             },
             Some(live_sessions) => agents_of_sessions(make_os_input, &live_sessions()).0,
             None if !changes_only => match agents_of_session(make_os_input(), session_name) {
-                Ok((agents, _)) => agents,
+                Ok(agents) => agents,
                 Err(message) => {
                     eprintln!("{}", message);
                     return 2;
@@ -1715,7 +1710,6 @@ pub fn start_drop_file_client(
             show_geometry: false,
             show_all: false,
             output_json: true,
-            report_withheld: true,
         },
         "the panes of this session",
     ) {
@@ -1725,8 +1719,8 @@ pub fn start_drop_file_client(
             return 1;
         },
     };
-    let envelope: ListPanesEnvelope = match serde_json::from_str(&lines.join("\n")) {
-        Ok(envelope) => envelope,
+    let panes: Vec<PaneListEntry> = match serde_json::from_str(&lines.join("\n")) {
+        Ok(panes) => panes,
         Err(e) => {
             eprintln!(
                 "Could not read the pane list session '{}' answered with: {}",
@@ -1735,10 +1729,9 @@ pub fn start_drop_file_client(
             return 1;
         },
     };
-    // a pane the list does not carry is one a privacy policy withholds, or one that has gone since
-    // it was resolved. Either way nothing is pasted into a pane this caller cannot see
-    let Some(entry) = envelope
-        .panes
+    // a pane the list does not carry is one that has gone since it was resolved, so nothing is
+    // pasted into it
+    let Some(entry) = panes
         .into_iter()
         .find(|entry| !entry.pane_info.is_plugin && PaneId::Terminal(entry.pane_info.id) == pane)
     else {
@@ -1815,15 +1808,14 @@ pub fn start_whoami_client(
             return 2;
         },
     };
-    let envelope = match panes_of_session(os_input, session_name) {
-        Ok(envelope) => envelope,
+    let panes = match panes_of_session(os_input, session_name) {
+        Ok(panes) => panes,
         Err(message) => {
             eprintln!("{}", message);
             return 1;
         },
     };
-    let pane = match envelope
-        .panes
+    let pane = match panes
         .iter()
         .find(|p| !p.pane_info.is_plugin && p.pane_info.id == caller)
     {
@@ -1837,8 +1829,7 @@ pub fn start_whoami_client(
         session_name,
         zellij_utils::shared::short_hostname(),
         pane,
-        &envelope.panes,
-        envelope.withheld,
+        &panes,
     );
     if output_json {
         println!("{}", serde_json::to_string(&report).unwrap_or_default());
@@ -1853,7 +1844,6 @@ fn whoami_report(
     host: &str,
     pane: &PaneListEntry,
     panes: &[PaneListEntry],
-    withheld: usize,
 ) -> serde_json::Value {
     let others = agent_detect::agents_from_pane_list(panes.to_vec())
         .into_iter()
@@ -1866,7 +1856,7 @@ fn whoami_report(
         "tab_id": pane.pane_info.tab_id, "tab_name": pane.tab_name,
         "tab_position": pane.tab_position,
         "name": pane.agent.as_ref().and_then(|agent| agent.name.as_deref()),
-        "agents": others, "withheld": withheld,
+        "agents": others,
     })
 }
 
@@ -1894,20 +1884,17 @@ fn whoami_text(report: &serde_json::Value) -> String {
             ));
         }
     }
-    if report["withheld"].as_u64().unwrap_or(0) > 0 {
-        lines.push(format!("Privacy withheld {} panes.", report["withheld"]));
-    }
     lines.push("Agent list changes; run `zellij list-agents` before addressing another agent. To talk to an agent that has a name, message it by that name with your harness's messaging tool; type into its pane only when it has no messaging.".into());
     lines.join("\n")
 }
 
-/// The agents of one session, and how many of its panes a privacy policy withheld.
+/// The agents of one session.
 fn agents_of_session(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
-) -> Result<(ListAgentsResponse, usize), String> {
-    let envelope = panes_of_session(os_input, session_name)?;
-    let mut agents = agent_detect::agents_from_pane_list(envelope.panes);
+) -> Result<ListAgentsResponse, String> {
+    let panes = panes_of_session(os_input, session_name)?;
+    let mut agents = agent_detect::agents_from_pane_list(panes);
     agent_detect::mark_self(
         &mut agents,
         std::env::var("ZELLIJ_PANE_ID")
@@ -1915,13 +1902,13 @@ fn agents_of_session(
             .and_then(|id| id.parse().ok()),
         std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session_name),
     );
-    Ok((agents, envelope.withheld))
+    Ok(agents)
 }
 
 fn panes_of_session(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
-) -> Result<ListPanesEnvelope, String> {
+) -> Result<Vec<PaneListEntry>, String> {
     let lines = ask(
         os_input,
         session_name,
@@ -1932,37 +1919,31 @@ fn panes_of_session(
             show_geometry: false,
             show_all: false,
             output_json: true,
-            // always asked for, whatever the caller wants printed: the count is how this command
-            // knows its own answer is partial
-            report_withheld: true,
         },
         "the panes of this session",
     )?;
     // a session that answered with something other than a pane list is a bug rather than a
     // miss, so it is an error and says what it could not read
-    let envelope: ListPanesEnvelope = serde_json::from_str(&lines.join("\n")).map_err(|e| {
+    serde_json::from_str(&lines.join("\n")).map_err(|e| {
         format!(
             "Could not read the pane list session '{}' answered with: {}",
             session_name, e
         )
-    })?;
-    Ok(envelope)
+    })
 }
 
-/// The agents of several sessions, each row naming its session; the withheld panes summed; and
-/// how many sessions answered. A session that did not answer is named on stderr.
+/// The agents of several sessions, each row naming its session, and how many sessions
+/// answered. A session that did not answer is named on stderr.
 fn agents_of_sessions(
     make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
     session_names: &[String],
-) -> (ListAgentsResponse, usize, usize) {
+) -> (ListAgentsResponse, usize) {
     let mut agents = Vec::new();
-    let mut withheld = 0;
     let mut answered = 0;
     for session_name in session_names {
         match agents_of_session(make_os_input(), session_name) {
-            Ok((session_agents, session_withheld)) => {
+            Ok(session_agents) => {
                 answered += 1;
-                withheld += session_withheld;
                 agents.extend(session_agents.into_iter().map(|mut agent| {
                     agent.session = Some(session_name.clone());
                     agent
@@ -1971,26 +1952,12 @@ fn agents_of_sessions(
             Err(message) => eprintln!("session '{}': {}", session_name, message),
         }
     }
-    (agents, withheld, answered)
+    (agents, answered)
 }
 
-fn print_agents(
-    agents: &ListAgentsResponse,
-    withheld: usize,
-    output_json: bool,
-    report_withheld: bool,
-    with_session: bool,
-) -> i32 {
+fn print_agents(agents: &ListAgentsResponse, output_json: bool, with_session: bool) -> i32 {
     if output_json {
-        let json = if report_withheld {
-            serde_json::to_string_pretty(&ListAgentsEnvelope {
-                agents: agents.clone(),
-                withheld,
-            })
-        } else {
-            serde_json::to_string_pretty(agents)
-        };
-        match json {
+        match serde_json::to_string_pretty(agents) {
             Ok(json) => println!("{}", json),
             Err(e) => {
                 eprintln!("Could not write the agent list as JSON: {}", e);
@@ -2005,11 +1972,6 @@ fn print_agents(
         };
         for line in table {
             println!("{}", line);
-        }
-        // the walk this answer is filtered from was itself partial, and a reader looking for an
-        // agent that is not listed should know that before they go looking for the bug
-        if withheld > 0 {
-            println!("withheld: {}", withheld);
         }
     }
     0
@@ -2138,7 +2100,6 @@ pub fn start_dump_screen_client(
             show_geometry: false,
             show_all: false,
             output_json: true,
-            report_withheld: false,
         },
     ) {
         Answer::Reported(lines) => lines,
@@ -2299,9 +2260,6 @@ fn wait_for_exit(
                 show_geometry: false,
                 show_all: true,
                 output_json: true,
-                // a wait is about ONE pane, and a withheld pane is refused when the target is
-                // resolved, before the wait starts. The envelope would only be unwrapped again
-                report_withheld: false,
             },
             &pane.to_string(),
         )
@@ -2522,7 +2480,6 @@ fn wait_for_ready(
                     show_geometry: false,
                     show_all: true,
                     output_json: true,
-                    report_withheld: false,
                 },
                 &pane.to_string(),
             )
@@ -2763,7 +2720,6 @@ fn wait_for_agent(
                     show_geometry: false,
                     show_all: true,
                     output_json: true,
-                    report_withheld: false,
                 },
                 &pane.to_string(),
             )
@@ -3008,16 +2964,15 @@ mod tests {
             pane.pane_info.handle = format!("pane-{}", index);
             pane.tab_name = "coding".into();
         }
-        let report = whoami_report("scratch", "test-host", &panes[0], &panes, 2);
+        let report = whoami_report("scratch", "test-host", &panes[0], &panes);
         assert_eq!(report["name"], "project-0");
         assert_eq!(report["pane_id"], "terminal_7");
         assert_eq!(report["agents"].as_array().unwrap().len(), 1);
         assert_eq!(report["agents"][0]["name"], "project-1");
         let text = whoami_text(&report);
-        assert!(text.contains("Privacy withheld 2 panes."));
         assert!(text.ends_with("type into its pane only when it has no messaging."));
         panes[0].agent.as_mut().unwrap().name = None;
-        assert!(whoami_report("scratch", "test-host", &panes[0], &panes, 0)["name"].is_null());
+        assert!(whoami_report("scratch", "test-host", &panes[0], &panes)["name"].is_null());
     }
 
     fn blocking_pane(unblock_condition: Option<UnblockCondition>) -> Action {
@@ -3858,14 +3813,7 @@ fn pane_list_with_self(
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&lines.join("\n")) else {
         return lines;
     };
-    let rows = if value.is_array() {
-        value.as_array_mut()
-    } else {
-        value
-            .get_mut("panes")
-            .and_then(|panes| panes.as_array_mut())
-    };
-    let Some(rows) = rows else {
+    let Some(rows) = value.as_array_mut() else {
         return lines;
     };
     for row in rows {
@@ -3887,26 +3835,17 @@ mod pane_self_tests {
     use super::*;
     #[test]
     fn json_panes_mark_only_the_callers_session_and_pane() {
-        for envelope in [false, true] {
-            let json = if envelope {
-                r#"{"panes":[{"id":7},{"id":8},{"id":7,"is_plugin":true}],"withheld":1}"#
-            } else {
-                r#"[{"id":7},{"id":8},{"id":7,"is_plugin":true}]"#
-            };
-            let value: serde_json::Value = serde_json::from_str(
-                &pane_list_with_self(vec![json.into()], Some(7), true).join("\n"),
-            )
-            .unwrap();
-            let rows = if envelope { &value["panes"] } else { &value };
-            assert_eq!(rows[0]["self"], true);
-            assert_eq!(rows[1]["self"], false);
-            assert_eq!(rows[2]["self"], false);
-            let value: serde_json::Value = serde_json::from_str(
-                &pane_list_with_self(vec![json.into()], Some(7), false).join("\n"),
-            )
-            .unwrap();
-            let rows = if envelope { &value["panes"] } else { &value };
-            assert_eq!(rows[0]["self"], false);
-        }
+        let json = r#"[{"id":7},{"id":8},{"id":7,"is_plugin":true}]"#;
+        let rows: serde_json::Value =
+            serde_json::from_str(&pane_list_with_self(vec![json.into()], Some(7), true).join("\n"))
+                .unwrap();
+        assert_eq!(rows[0]["self"], true);
+        assert_eq!(rows[1]["self"], false);
+        assert_eq!(rows[2]["self"], false);
+        let rows: serde_json::Value = serde_json::from_str(
+            &pane_list_with_self(vec![json.into()], Some(7), false).join("\n"),
+        )
+        .unwrap();
+        assert_eq!(rows[0]["self"], false);
     }
 }

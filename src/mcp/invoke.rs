@@ -245,11 +245,7 @@ impl AgentsView {
     /// stalled" should not have to subtract 13-digit numbers. The raw keys stay beside them.
     pub fn shape(&self, stdout: &str, now_ms: u64) -> Option<String> {
         let mut answer: Value = serde_json::from_str(stdout.trim()).ok()?;
-        let rows = match &mut answer {
-            Value::Array(rows) => rows,
-            Value::Object(envelope) => envelope.get_mut("agents")?.as_array_mut()?,
-            _ => return None,
-        };
+        let rows = answer.as_array_mut()?;
         if let Some(tab) = &self.only_tab {
             rows.retain(|row| row.get("tab_name").and_then(Value::as_str) == Some(tab));
         }
@@ -501,18 +497,11 @@ async fn pane_list(target: &Target, session: Option<&str>) -> Option<String> {
 /// A tab with no panes is not a tab - closing the last pane of one closes it - so the pane list
 /// names every tab there is. An answer that will not parse counts as no tab, which makes the tab:
 /// that leaves an agent with somewhere to work rather than with a miss it cannot act on.
-///
-/// The one blind spot is a pane privacy policy, which can withhold every pane of a tab and so hide
-/// the tab with them. A second `-zj` tab is the cost, and it is visible in the tab bar.
 pub fn tab_exists(json: &str, tab: &str) -> bool {
     let Ok(panes) = serde_json::from_str::<Value>(json.trim()) else {
         return false;
     };
-    let Some(panes) = panes
-        .get("panes")
-        .and_then(Value::as_array)
-        .or_else(|| panes.as_array())
-    else {
+    let Some(panes) = panes.as_array() else {
         return false;
     };
     let tab = tab.trim();
@@ -532,12 +521,7 @@ pub fn tab_exists(json: &str, tab: &str) -> bool {
 /// handle. A pane nothing answers to is `None`, like a session that was not there.
 pub fn tab_of_pane(json: &str, pane: &str) -> Option<String> {
     let panes: Value = serde_json::from_str(json.trim()).ok()?;
-    // `--report-withheld` wraps the array; this call does not ask for it, but reading both costs a
-    // line and outlives the choice
-    let panes = panes
-        .get("panes")
-        .and_then(Value::as_array)
-        .or_else(|| panes.as_array())?;
+    let panes = panes.as_array()?;
     let pane = pane.trim();
     let (want_plugin, want_id) = match pane.split_once('_') {
         Some(("terminal", id)) => (false, id.parse::<u64>().ok()),
@@ -1130,21 +1114,16 @@ fn argv_in(
     match tool {
         "zellij_overview" => match args.enumerated("scope", "panes").as_str() {
             "sessions" => Ok(vec!["ls".to_owned(), "--json".to_owned()]),
-            // `--report-withheld` on both walks: an agent that is told a list is complete when it
-            // is not will go looking for the missing pane, and the count is the only thing a
-            // withheld pane leaves behind
             "agents" | "my_agents" => Ok(scoped(vec![
                 "action".to_owned(),
                 "list-agents".to_owned(),
                 "--json".to_owned(),
-                "--report-withheld".to_owned(),
             ])),
             "panes" => {
                 let mut rest = vec![
                     "action".to_owned(),
                     "list-panes".to_owned(),
                     "--json".to_owned(),
-                    "--report-withheld".to_owned(),
                 ];
                 if args.flag("include_hidden") {
                     rest.push("--all".to_owned());
@@ -1845,7 +1824,7 @@ mod tests {
     fn the_ambient_session_is_used_when_the_call_does_not_name_one() {
         assert_eq!(
             line("zellij_overview", json!({}), Some("work")),
-            "-s work action list-panes --json --report-withheld"
+            "-s work action list-panes --json"
         );
     }
 
@@ -1853,7 +1832,7 @@ mod tests {
     fn a_named_session_beats_the_ambient_one() {
         assert_eq!(
             line("zellij_overview", json!({"session": "other"}), Some("work")),
-            "-s other action list-panes --json --report-withheld"
+            "-s other action list-panes --json"
         );
     }
 
@@ -1861,7 +1840,7 @@ mod tests {
     fn a_call_with_no_session_anywhere_lets_the_cli_resolve_it() {
         assert_eq!(
             line("zellij_overview", json!({}), None),
-            "action list-panes --json --report-withheld"
+            "action list-panes --json"
         );
     }
 
@@ -1869,7 +1848,7 @@ mod tests {
     fn the_agent_scope_is_the_association_verb() {
         assert_eq!(
             line("zellij_overview", json!({"scope": "agents"}), Some("work")),
-            "-s work action list-agents --json --report-withheld"
+            "-s work action list-agents --json"
         );
     }
 
@@ -2185,28 +2164,27 @@ mod tests {
                 json!({"scope": "my_agents"}),
                 Some("work")
             ),
-            "-s work action list-agents --json --report-withheld"
+            "-s work action list-agents --json"
         );
-        let answer = r#"{"agents": [
+        let answer = r#"[
             {"handle": "a", "name": "project-1", "self": true, "tab_name": "dev-zj", "state": "working", "state_at": 1000000,
              "last_output_at": 1055000},
             {"handle": "b", "tab_name": "dev", "state": "done", "state_at": 1000000}
-        ], "withheld": 0}"#;
+        ]"#;
         let mine = AgentsView {
             only_tab: Some("dev-zj".to_owned()),
         }
         .shape(answer, 1_060_000)
         .unwrap();
         let mine: Value = serde_json::from_str(&mine).unwrap();
-        let rows = mine["agents"].as_array().unwrap();
+        let rows = mine.as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["handle"], "a");
         assert_eq!(rows[0]["name"], "project-1");
         assert_eq!(rows[0]["self"], true);
         assert_eq!(rows[0]["state_age_s"], 60);
         assert_eq!(rows[0]["output_age_s"], 5);
-        assert_eq!(mine["withheld"], 0);
-        // every agent, from a bare array too; a row with no output keeps no output age
+        // every agent; a row with no output keeps no output age
         let long = format!("claude -- {}\nmore", "x".repeat(300));
         let all = AgentsView { only_tab: None }
             .shape(
@@ -2644,11 +2622,7 @@ mod tests {
         assert!(tab_exists(panes, "work-zj"));
         assert!(tab_exists(panes, "work"));
         assert!(!tab_exists(panes, "notes-zj"));
-        // the shape `--report-withheld` wraps it in, and an answer that is not a pane list
-        let wrapped = r#"{"panes": [{"id": 0, "is_plugin": false, "handle": "sunny-otter",
-                          "tab_name": "work"}], "withheld": 1}"#;
-        assert!(tab_exists(wrapped, "work"));
-        assert!(!tab_exists(wrapped, "work-zj"));
+        // an answer that is not a pane list
         assert!(!tab_exists("not json", "work-zj"));
         // a tab is made when nothing says it is there, and reused when something does
         for (panes, tab, placement) in [
@@ -2771,10 +2745,6 @@ mod tests {
         // a pane nothing answers to, and an answer that is not a pane list
         assert_eq!(tab_of_pane(panes, "terminal_9"), None);
         assert_eq!(tab_of_pane("not json", "1"), None);
-        // and the shape `--report-withheld` wraps it in
-        let wrapped = r#"{"panes": [{"id": 0, "is_plugin": false, "handle": "sunny-otter",
-                          "tab_name": "work"}], "withheld": 1}"#;
-        assert_eq!(tab_of_pane(wrapped, "0"), Some("work".to_owned()));
     }
 
     #[test]

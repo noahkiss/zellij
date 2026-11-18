@@ -18,7 +18,6 @@ pub mod input;
 pub mod kdl;
 pub mod nested_session_contract;
 pub mod pane_handle;
-pub mod pane_privacy;
 pub mod pane_size;
 pub mod plugin_api;
 pub mod position;

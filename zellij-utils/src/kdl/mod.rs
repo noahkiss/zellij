@@ -20,7 +20,6 @@ use crate::input::permission::{GrantedPermission, PermissionCache, PluginPermiss
 use crate::input::plugins::PluginAliases;
 use crate::input::theme::{FrameConfig, Theme, Themes, UiConfig};
 use crate::input::web_client::WebClientConfig;
-use crate::pane_privacy::{MatchField, OnUnknownCwd, PanePrivacyOptions, TabRule};
 use crate::resurrect_command_hints::{
     ResurrectCommandHint, ResurrectCommandHints, ResurrectCommands,
 };
@@ -2985,18 +2984,6 @@ fn plist_value_to_kdl(name: &str, value: &PlistValue) -> KdlNode {
     node
 }
 
-/// The string value of a `pane_privacy` setting. A missing value, or one that is not a string, is
-/// malformed rather than unknown, and stays an error.
-fn pane_privacy_string_value(entry: &KdlNode) -> Result<&str, ConfigError> {
-    kdl_first_entry_as_string!(entry).ok_or_else(|| {
-        ConfigError::new_kdl_error(
-            format!("pane_privacy {} takes a string value", kdl_name!(entry)),
-            entry.span().offset(),
-            entry.span().len(),
-        )
-    })
-}
-
 /// Every top-level node a config may hold: the blocks [`Config::from_kdl`] reads, every option
 /// [`Options::from_kdl`] reads, `layout` (a layout file goes through the same parse for the
 /// options it carries) and `remote_hosts` (read by the MCP server from the same file). Anything
@@ -3056,7 +3043,6 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "pane_frame_agent_name",
     "pane_frame_style",
     "pane_frames",
-    "pane_privacy",
     "plugin_watch",
     "post_command_discovery_hook",
     "report_pane_env",
@@ -3259,10 +3245,6 @@ impl Options {
         };
         let session_service = match kdl_options.get("session_service") {
             Some(kdl_session_service) => Some(Self::session_service_from_kdl(kdl_session_service)?),
-            None => None,
-        };
-        let pane_privacy = match kdl_options.get("pane_privacy") {
-            Some(kdl_pane_privacy) => Some(Self::pane_privacy_from_kdl(kdl_pane_privacy)?),
             None => None,
         };
         let resurrect_command_hints = match kdl_options.get("resurrect_command_hints") {
@@ -3483,7 +3465,6 @@ impl Options {
             pane_frame_agent_name,
             session_up_resume,
             session_service,
-            pane_privacy,
             resurrect_command_hints,
             resurrect_commands,
             default_floating_size,
@@ -4095,167 +4076,6 @@ impl Options {
             }
         }
         node.set_children(entries);
-        Some(node)
-    }
-    /// The `pane_privacy` block: which panes this session keeps to itself.
-    ///
-    /// ```kdl
-    /// pane_privacy {
-    ///     patterns_file "/path/to/private-paths.txt"
-    ///     pattern "some-regex"
-    ///     match_fields "cwd" "command"
-    ///     on_unknown_cwd "withhold"
-    ///     tab_rule "any"
-    /// }
-    /// ```
-    ///
-    /// A TOP-LEVEL block, so a binary that predates the feature ignores the whole thing instead of
-    /// failing to parse the config. A CHILD this build does not know is now ignored the same way:
-    /// it is kept in [`PanePrivacyOptions::unknown_entries`], logged, and otherwise passed over, so
-    /// a new key can go into a shared config before every machine has the binary that reads it.
-    ///
-    /// A name this build KNOWS, given a value it cannot mean, fails closed for that one setting:
-    /// the setting takes its strictest known value, with a warning, and the rest of the config
-    /// loads. A privacy setting silently loosened is worse than one that refuses, so the fallback
-    /// is never the default: `on_unknown_cwd` becomes `withhold`, `tab_rule` becomes `any`, and a
-    /// `match_fields` naming an unknown field matches on every field this build knows.
-    ///
-    /// Nothing here compiles a pattern or reads a file. This function is built for wasm along with
-    /// the rest of the config parser, and the matcher is not.
-    fn pane_privacy_from_kdl(
-        kdl_pane_privacy: &KdlNode,
-    ) -> Result<PanePrivacyOptions, ConfigError> {
-        let mut pane_privacy = PanePrivacyOptions::default();
-        for entry in kdl_children_nodes_or_error!(kdl_pane_privacy, "empty pane_privacy block") {
-            let entry_name = kdl_name!(entry);
-            match entry_name {
-                "patterns_file" => {
-                    let path = kdl_first_entry_as_string!(entry).ok_or_else(|| {
-                        ConfigError::new_kdl_error(
-                            "patterns_file takes a path".into(),
-                            entry.span().offset(),
-                            entry.span().len(),
-                        )
-                    })?;
-                    pane_privacy.patterns_file = Some(PathBuf::from(path));
-                },
-                "pattern" => {
-                    for pattern in kdl_string_arguments!(entry) {
-                        pane_privacy.patterns.push(pattern.to_owned());
-                    }
-                },
-                "match_fields" => {
-                    let mut fields = Vec::new();
-                    let mut unknown_field = None;
-                    for field_name in kdl_string_arguments!(entry) {
-                        match MatchField::from_name(field_name) {
-                            Some(field) => {
-                                if !fields.contains(&field) {
-                                    fields.push(field);
-                                }
-                            },
-                            None => {
-                                unknown_field.get_or_insert(field_name);
-                            },
-                        }
-                    }
-                    if let Some(field_name) = unknown_field {
-                        // fail closed: a field this build cannot read might have been the one
-                        // that withholds a pane, so every field it can read is matched instead
-                        note_unknown(
-                            entry.span().offset(),
-                            format!(
-                                "unknown pane_privacy match field {:?}, so match_fields matches \
-                                 every field this build knows (cwd, command, title and tab_name)",
-                                field_name
-                            ),
-                        );
-                        fields = vec![
-                            MatchField::Cwd,
-                            MatchField::Command,
-                            MatchField::Title,
-                            MatchField::TabName,
-                        ];
-                    }
-                    pane_privacy.match_fields = Some(fields);
-                },
-                "on_unknown_cwd" => {
-                    let value = pane_privacy_string_value(entry)?;
-                    pane_privacy.on_unknown_cwd =
-                        Some(OnUnknownCwd::from_name(value).unwrap_or_else(|| {
-                            note_unknown(
-                                entry.span().offset(),
-                                format!(
-                                    "unknown pane_privacy on_unknown_cwd {:?}, so it is withhold, \
-                                     the strictest (expected withhold or allow)",
-                                    value
-                                ),
-                            );
-                            OnUnknownCwd::Withhold
-                        }));
-                },
-                "tab_rule" => {
-                    let value = pane_privacy_string_value(entry)?;
-                    pane_privacy.tab_rule = Some(TabRule::from_name(value).unwrap_or_else(|| {
-                        note_unknown(
-                            entry.span().offset(),
-                            format!(
-                                "unknown pane_privacy tab_rule {:?}, so it is any, the strictest \
-                                 (expected any or all)",
-                                value
-                            ),
-                        );
-                        TabRule::Any
-                    }));
-                },
-                other => {
-                    pane_privacy.note_unknown_entry(format!(
-                        "unknown pane_privacy entry {:?}, ignored (expected patterns_file, \
-                         pattern, match_fields, on_unknown_cwd or tab_rule)",
-                        other
-                    ));
-                },
-            }
-        }
-        Ok(pane_privacy)
-    }
-    fn pane_privacy_to_kdl(&self) -> Option<KdlNode> {
-        let pane_privacy = self.pane_privacy.as_ref()?;
-        // an entry this build ignored is not a setting it holds, so a block carrying nothing else
-        // is still nothing to write out
-        if pane_privacy.is_default_ignoring_unknown_entries() {
-            return None;
-        }
-        let mut node = KdlNode::new("pane_privacy");
-        let mut children = KdlDocument::new();
-        if let Some(patterns_file) = &pane_privacy.patterns_file {
-            let mut patterns_file_node = KdlNode::new("patterns_file");
-            patterns_file_node.push(KdlValue::String(patterns_file.display().to_string()));
-            children.nodes_mut().push(patterns_file_node);
-        }
-        for pattern in &pane_privacy.patterns {
-            let mut pattern_node = KdlNode::new("pattern");
-            pattern_node.push(KdlValue::String(pattern.to_owned()));
-            children.nodes_mut().push(pattern_node);
-        }
-        if let Some(match_fields) = &pane_privacy.match_fields {
-            let mut match_fields_node = KdlNode::new("match_fields");
-            for field in match_fields {
-                match_fields_node.push(KdlValue::String(field.name().to_owned()));
-            }
-            children.nodes_mut().push(match_fields_node);
-        }
-        if let Some(on_unknown_cwd) = &pane_privacy.on_unknown_cwd {
-            let mut on_unknown_cwd_node = KdlNode::new("on_unknown_cwd");
-            on_unknown_cwd_node.push(KdlValue::String(on_unknown_cwd.name().to_owned()));
-            children.nodes_mut().push(on_unknown_cwd_node);
-        }
-        if let Some(tab_rule) = &pane_privacy.tab_rule {
-            let mut tab_rule_node = KdlNode::new("tab_rule");
-            tab_rule_node.push(KdlValue::String(tab_rule.name().to_owned()));
-            children.nodes_mut().push(tab_rule_node);
-        }
-        node.set_children(children);
         Some(node)
     }
     /// The `session_service` block: extra directives for the unit `zellij session enable` writes.
@@ -6220,9 +6040,6 @@ impl Options {
         }
         if let Some(session_service) = self.session_service_to_kdl() {
             nodes.push(session_service);
-        }
-        if let Some(pane_privacy) = self.pane_privacy_to_kdl() {
-            nodes.push(pane_privacy);
         }
         if let Some(resurrect_command_hints) = self.resurrect_command_hints_to_kdl() {
             nodes.push(resurrect_command_hints);
@@ -10743,218 +10560,21 @@ fn default_floating_size_rejects_bad_values() {
     }
 }
 
+/// `pane_privacy` was a fork block that this build no longer reads. An old config that still
+/// carries one loads, with the block reported as an unknown key.
 #[test]
-fn pane_privacy_config_parsing() {
-    let config_with_pane_privacy = r#"
-        pane_privacy {
-            patterns_file "/invented/patterns.txt"
-            pattern "pretend-private"
-            pattern "another-one"
-            match_fields "cwd" "title"
-            on_unknown_cwd "allow"
-            tab_rule "all"
-        }
-    "#;
-    let config = Config::from_kdl(config_with_pane_privacy, None).unwrap();
-    let pane_privacy = config.options.pane_privacy.clone().unwrap();
-    assert_eq!(
-        pane_privacy.patterns_file,
-        Some(PathBuf::from("/invented/patterns.txt"))
-    );
-    assert_eq!(
-        pane_privacy.patterns,
-        vec!["pretend-private".to_owned(), "another-one".to_owned()]
-    );
-    assert_eq!(
-        pane_privacy.match_fields,
-        Some(vec![MatchField::Cwd, MatchField::Title])
-    );
-    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Allow));
-    assert_eq!(pane_privacy.tab_rule, Some(TabRule::All));
-    assert!(!pane_privacy.is_empty());
-}
-
-#[test]
-fn pane_privacy_defaults_when_the_block_names_only_a_pattern() {
+fn a_retired_pane_privacy_block_warns_and_loads() {
     let config = Config::from_kdl(
-        r#"
-        pane_privacy {
-            pattern "pretend-private"
-        }
-    "#,
+        "pane_privacy {\n    pattern \"pretend-private\"\n}\nsimplified_ui true",
         None,
     )
     .unwrap();
-    let pane_privacy = config.options.pane_privacy.clone().unwrap();
-    assert_eq!(pane_privacy.patterns_file, None);
-    assert_eq!(pane_privacy.match_fields, None);
-    assert_eq!(pane_privacy.on_unknown_cwd, None);
-    assert_eq!(pane_privacy.tab_rule, None);
-}
-
-#[test]
-fn no_pane_privacy_block_is_no_policy() {
-    let config = Config::from_kdl("", None).unwrap();
-    assert_eq!(config.options.pane_privacy, None);
-}
-
-/// A known name with an unknown VALUE fails closed for that one setting: it takes the strictest
-/// value this build knows, with a warning naming the line, and the rest of the config loads. A
-/// privacy setting silently loosened is worse than one refused, so the fallback is never the
-/// default.
-#[test]
-fn pane_privacy_fails_closed_for_a_value_it_does_not_know() {
-    let config = Config::from_kdl(
-        "pane_privacy {\n    pattern \"secret\"\n    match_fields \"cwd\" \"hostname\"\n    on_unknown_cwd \"maybe\"\n    tab_rule \"some\"\n}\nsimplified_ui true",
-        None,
-    )
-    .unwrap();
-    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
-    assert_eq!(pane_privacy.patterns, vec!["secret".to_owned()]);
-    assert_eq!(
-        pane_privacy.match_fields,
-        Some(vec![
-            MatchField::Cwd,
-            MatchField::Command,
-            MatchField::Title,
-            MatchField::TabName
-        ])
-    );
-    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Withhold));
-    assert_eq!(pane_privacy.tab_rule, Some(TabRule::Any));
     assert_eq!(config.options.simplified_ui, Some(true));
-    assert_eq!(config.warnings.len(), 3, "{:?}", config.warnings);
-    assert!(config.warnings[0].starts_with("line 3: ") && config.warnings[0].contains("hostname"));
-    assert!(config.warnings[1].starts_with("line 4: ") && config.warnings[1].contains("withhold"));
-    assert!(config.warnings[2].starts_with("line 5: ") && config.warnings[2].contains("any"));
-}
-
-/// A strict rule the operator wrote stays exactly as written beside one this build cannot read:
-/// only the unknown one is forced to its strictest value.
-#[test]
-fn a_known_strict_pane_privacy_rule_beside_an_unknown_value_is_kept() {
-    let config = Config::from_kdl(
-        "pane_privacy {\n    match_fields \"title\"\n    on_unknown_cwd \"withhold\"\n    tab_rule \"everything\"\n}",
-        None,
-    )
-    .unwrap();
-    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
-    assert_eq!(pane_privacy.match_fields, Some(vec![MatchField::Title]));
-    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Withhold));
-    assert_eq!(pane_privacy.tab_rule, Some(TabRule::Any));
-    assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
-    assert!(config.warnings[0].contains("\"everything\""));
-}
-
-/// Normal use does not change: a block of known values reads exactly as before, with no warning,
-/// and an `allow` or `all` the operator chose is not tightened.
-#[test]
-fn pane_privacy_with_only_known_values_is_unchanged() {
-    let config = Config::from_kdl(
-        "pane_privacy {\n    match_fields \"cwd\"\n    on_unknown_cwd \"allow\"\n    tab_rule \"all\"\n}",
-        None,
-    )
-    .unwrap();
-    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
-    assert_eq!(pane_privacy.match_fields, Some(vec![MatchField::Cwd]));
-    assert_eq!(pane_privacy.on_unknown_cwd, Some(OnUnknownCwd::Allow));
-    assert_eq!(pane_privacy.tab_rule, Some(TabRule::All));
-    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
-}
-
-/// A malformed value - missing, or not a string - is a mistake, not a newer build, and still fails.
-#[test]
-fn pane_privacy_rejects_values_it_cannot_read() {
-    for bad in [
-        "pane_privacy {\n on_unknown_cwd\n}",
-        "pane_privacy {\n tab_rule 3\n}",
-        "pane_privacy {\n match_fields 3\n}",
-        "pane_privacy {\n patterns_file\n}",
-        // no block at all: the entry is a bare node with no children, which is not a policy
-        "pane_privacy",
-    ] {
-        assert!(
-            Config::from_kdl(bad, None).is_err(),
-            "expected {:?} to be rejected",
-            bad
-        );
-    }
-}
-
-/// A binary that does not know an entry ignores it and says so, rather than failing the whole
-/// config - `patterns_files` for `patterns_file` is the misspelling that reads as if it should
-/// work. The warning has to name what the block does accept, so a misspelling reads as one.
-#[test]
-fn pane_privacy_ignores_an_entry_it_does_not_know_and_names_what_it_accepts() {
-    let config = Config::from_kdl(
-        "pane_privacy {
-    patterns_files \"/invented/patterns.txt\"
-    pattern \"pretend-private\"
-}",
-        None,
-    )
-    .unwrap();
-    let pane_privacy = config.options.pane_privacy.as_ref().unwrap();
-    assert_eq!(
-        pane_privacy.unknown_entries.len(),
-        1,
-        "{:?}",
-        pane_privacy.unknown_entries
-    );
-    let warning = &pane_privacy.unknown_entries[0];
-    assert!(warning.contains("\"patterns_files\""), "{}", warning);
-    assert!(warning.contains("expected patterns_file,"), "{}", warning);
-    assert!(warning.contains("on_unknown_cwd"), "{}", warning);
-    // the ignored entry named no file, and the entry beside it was still read
-    assert_eq!(pane_privacy.patterns_file, None);
-    assert_eq!(pane_privacy.patterns, vec!["pretend-private".to_owned()]);
-}
-
-/// An ignored entry is not part of this build's configuration, so a dump does not re-emit it - and
-/// a block holding nothing else is not written out at all.
-#[test]
-fn an_ignored_pane_privacy_entry_is_not_dumped() {
-    let config = Config::from_kdl(
-        "pane_privacy {
-    some_key_from_a_later_build \"whatever\"
-}",
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        config
-            .options
-            .pane_privacy
-            .as_ref()
-            .unwrap()
-            .unknown_entries
-            .len(),
-        1
-    );
-    let serialized = config.to_string(false);
     assert!(
-        !serialized.contains("some_key_from_a_later_build"),
-        "{}",
-        serialized
+        config.warnings.iter().any(|w| w.contains("pane_privacy")),
+        "{:?}",
+        config.warnings
     );
-    assert!(!serialized.contains("pane_privacy"), "{}", serialized);
-}
-
-#[test]
-fn pane_privacy_round_trips_through_kdl() {
-    let written = r#"
-        pane_privacy {
-            patterns_file "/invented/patterns.txt"
-            pattern "pretend-private"
-            match_fields "cwd" "command" "tab_name"
-            on_unknown_cwd "withhold"
-            tab_rule "any"
-        }
-    "#;
-    let config = Config::from_kdl(written, None).unwrap();
-    let serialized = config.to_string(false);
-    let read_back = Config::from_kdl(&serialized, None).unwrap();
-    assert_eq!(read_back.options.pane_privacy, config.options.pane_privacy);
 }
 
 #[test]

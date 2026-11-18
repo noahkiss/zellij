@@ -1061,7 +1061,6 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             pane_frame_agent_name: None,
             session_up_resume: None,
             session_service: None,
-            pane_privacy: None,
             resurrect_command_hints: None,
             resurrect_commands: None,
             default_floating_size: None,
@@ -2139,7 +2138,6 @@ impl From<crate::input::actions::Action>
                 show_geometry,
                 show_all,
                 output_json,
-                report_withheld,
             } => ActionType::ListPanes(ListPanesAction {
                 show_tab,
                 show_command,
@@ -2147,7 +2145,6 @@ impl From<crate::input::actions::Action>
                 show_geometry,
                 show_all,
                 output_json,
-                report_withheld,
             }),
             crate::input::actions::Action::TogglePanePinned => {
                 ActionType::TogglePanePinned(TogglePanePinnedAction {})
@@ -3150,7 +3147,6 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     show_geometry: list_panes_action.show_geometry,
                     show_all: list_panes_action.show_all,
                     output_json: list_panes_action.output_json,
-                    report_withheld: list_panes_action.report_withheld,
                 })
             },
             ActionType::ListTabs(list_tabs_action) => Ok(crate::input::actions::Action::ListTabs {

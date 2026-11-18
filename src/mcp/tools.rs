@@ -123,9 +123,7 @@ pub const TOOLS: &[ToolSpec] = &[
                session. scope=fleet lists every agent in every session on this machine and on \
                every host in remote_hosts, each row with its host and session; a host that does \
                not answer within 10 seconds is one `unreachable` row, and the rest still answer. \
-               To act on a fleet row, pass session as host/session. A `withheld` count above zero means the session keeps some panes to \
-               itself: they are not in this answer, no tool here will reach them, and there is \
-               nothing to ask for.",
+               To act on a fleet row, pass session as host/session.",
         params: &[
             SESSION,
             ParamSpec {

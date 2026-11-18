@@ -15,16 +15,10 @@ use super::remote::{self, RemoteHosts, Target};
 
 /// The command line asked of every host.
 pub fn list_agents_argv() -> Vec<String> {
-    [
-        "action",
-        "list-agents",
-        "--all-sessions",
-        "--json",
-        "--report-withheld",
-    ]
-    .iter()
-    .map(|word| (*word).to_owned())
-    .collect()
+    ["action", "list-agents", "--all-sessions", "--json"]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect()
 }
 
 /// What one host said, or why it said nothing.
@@ -97,43 +91,28 @@ async fn ask(target: &Target, argv: &[String]) -> Answer {
         .map(str::to_owned)
         .collect();
     let mut agents = Vec::new();
-    let mut withheld = 0;
     for name in names {
-        let one: Vec<String> = [
-            "-s",
-            name.as_str(),
-            "action",
-            "list-agents",
-            "--json",
-            "--report-withheld",
-        ]
-        .iter()
-        .map(|word| (*word).to_owned())
-        .collect();
+        let one: Vec<String> = ["-s", name.as_str(), "action", "list-agents", "--json"]
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect();
         // a session that does not answer is left out, as `--all-sessions` leaves it out
         let Ok(said) = invoke::run_on(target, &one, None).await else {
             continue;
         };
-        let Ok(Value::Object(mut envelope)) = serde_json::from_str::<Value>(said.stdout.trim())
-        else {
+        let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(said.stdout.trim()) else {
             continue;
         };
-        withheld += envelope
-            .get("withheld")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if let Some(Value::Array(rows)) = envelope.remove("agents") {
-            for mut row in rows {
-                if let Some(row) = row.as_object_mut() {
-                    row.insert("session".to_owned(), json!(name));
-                }
-                agents.push(row);
+        for mut row in rows {
+            if let Some(row) = row.as_object_mut() {
+                row.insert("session".to_owned(), json!(name));
             }
+            agents.push(row);
         }
     }
     Ok(Outcome {
         code: 0,
-        stdout: json!({"agents": agents, "withheld": withheld}).to_string(),
+        stdout: json!(agents).to_string(),
         stderr: String::new(),
     })
 }
@@ -167,18 +146,8 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, warnings: &[String]) -> 
         let shaped = view
             .shape(&outcome.stdout, now_ms)
             .and_then(|shaped| serde_json::from_str::<Value>(&shaped).ok());
-        let (rows, withheld) = match shaped {
-            Some(Value::Array(rows)) => (rows, 0),
-            Some(Value::Object(mut envelope)) => (
-                match envelope.remove("agents") {
-                    Some(Value::Array(rows)) => rows,
-                    _ => Vec::new(),
-                },
-                envelope
-                    .get("withheld")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            ),
+        let rows = match shaped {
+            Some(Value::Array(rows)) => rows,
             _ => {
                 let why = "its answer was not the JSON list-agents prints".to_owned();
                 lines.push(format!("{}: error: {}", host, why));
@@ -189,11 +158,7 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, warnings: &[String]) -> 
         if rows.is_empty() {
             lines.push(format!("{}: no agents", host));
         }
-        let mut summary = json!({"host": host, "agents": rows.len()});
-        if withheld > 0 {
-            summary["withheld"] = json!(withheld);
-        }
-        hosts.push(summary);
+        hosts.push(json!({"host": host, "agents": rows.len()}));
         for mut row in rows {
             if let Some(row) = row.as_object_mut() {
                 lines.push(row_line(host, row));
@@ -281,11 +246,11 @@ mod tests {
             .contains("project-1 (you) brisk-heron claude"));
     }
 
-    const BOXA: &str = r#"{"agents": [
+    const BOXA: &str = r#"[
         {"handle": "brisk-heron", "name": "project-1", "self": false, "kind": "claude", "session": "work", "tab_name": "build",
          "state": "blocked", "state_kind": "permission", "cwd": "/srv/app",
          "last_output_at": 1000000, "command": "claude"}
-    ], "withheld": 1}"#;
+    ]"#;
 
     #[test]
     fn rows_carry_their_host_and_a_silent_host_is_one_row() {
@@ -332,10 +297,7 @@ mod tests {
         assert_eq!(agents[0]["self"], false);
         assert_eq!(agents[0]["output_age_s"], json!(42));
         let hosts = &structured["result"]["hosts"];
-        assert_eq!(
-            hosts[0],
-            json!({"host": "boxa", "agents": 1, "withheld": 1})
-        );
+        assert_eq!(hosts[0], json!({"host": "boxa", "agents": 1}));
         assert!(hosts[1]["error"].as_str().unwrap().contains("exit 255"));
         assert_eq!(hosts[2], json!({"host": "boxc", "agents": 0}));
         assert_eq!(structured["diagnostics"], json!("a warning"));
@@ -409,8 +371,8 @@ mod tests {
              case \"$*\" in\n\
              *--all-sessions*) echo \"error: unexpected argument '--all-sessions' found\" >&2; exit 2;;\n\
              'ls --json') echo '[{\"name\": \"work\"}, {\"name\": \"gone\", \"is_dead\": true}]';;\n\
-             '-s work action list-agents --json --report-withheld') \
-             echo '{\"agents\": [{\"handle\": \"calm-otter\", \"kind\": \"codex\"}], \"withheld\": 0}';;\n\
+             '-s work action list-agents --json') \
+             echo '[{\"handle\": \"calm-otter\", \"kind\": \"codex\"}]';;\n\
              *) exit 9;;\n\
              esac\n",
         )

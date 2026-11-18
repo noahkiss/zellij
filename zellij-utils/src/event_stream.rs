@@ -1,10 +1,9 @@
 //! `zellij action watch --json`: the session's changes, pushed by the server as they happen.
 //!
 //! The server holds one [`EventStream`] per subscribed client. On every look it builds a
-//! [`StreamModel`] of the session - its tabs, its panes and the agents in them, after the pane
-//! privacy policy - and each stream turns the difference from its last look into lines. The lines
-//! are JSON, written here, so the client only prints them and the client/server contract carries
-//! one string per line.
+//! [`StreamModel`] of the session - its tabs, its panes and the agents in them - and each stream
+//! turns the difference from its last look into lines. The lines are JSON, written here, so the
+//! client only prints them and the client/server contract carries one string per line.
 //!
 //! Every line carries:
 //!

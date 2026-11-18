@@ -16,19 +16,19 @@ not just the block.** `session_service` was the known example:
 ```
 
 (`managed_session` taught that lesson in 2026-08; `launchd { env }` paid for it again.) From
-nkmk.18 on, all three blocks — `session_service`, `pane_privacy` and `resurrect_command_hints` —
-warn and ignore an unknown name at every depth; see FORK.md's "An unknown key in
-`session_service` warns instead of failing the config" and "`pane_privacy` and
-`resurrect_command_hints` warn on a key they do not know". But the old rule is not dead: a
-build at or before nkmk.17 still rejects an unknown nested key in any of them.
+nkmk.18 on, both blocks — `session_service` and `resurrect_command_hints` — warn and ignore an
+unknown name at every depth; see FORK.md's "An unknown key in `session_service` warns instead of
+failing the config" and "`resurrect_command_hints` warns on a key it does not know". But the old
+rule is not dead: a build at or before nkmk.17 still rejects an unknown nested key in either.
+`pane_privacy` was a third such block; the fork has since removed it, so a current build warns
+about it as an unknown top-level key.
 
 **From the release that carries FORK.md's "A setting this build does not know warns and is
 skipped, on every config surface", the whole config is tolerant.** An unknown name or enum value
 anywhere — a bind's action, a key spelling, a mode, an option value, a child of `ui`, `web_client`
 or a theme, a permission — warns with its file and line and is skipped; `setup --check` still
 reports the config as well defined. A malformed KNOWN thing (wrong type, bad syntax, a known action
-with bad arguments) still fails. An unknown `pane_privacy` value fails closed for that one rule: it
-takes the strictest known value, not the default. That entry lists the exceptions.
+with bad arguments) still fails. That entry lists the exceptions.
 
 Tolerance only helps an install that runs it. **An install still on an older build keeps that
 build's strict behaviour**: it rejects a new action, mode or option value exactly as before. So the
