@@ -1618,7 +1618,7 @@ Only a session that exists and cannot be removed is a failure. The top-level `de
 
 `up` run **by the init system's own job** on a session that is already healthy prints nothing. That
 pass is the watchdog tick, and its `ok ... already running` line was its only output: on Linux a
-journal line every `watchdog_interval_secs` (about 5,800 a day at 15 s), on macOS an append to the
+journal line every 15 seconds (about 5,800 a day), on macOS an append to the
 job's `.out.log` that nothing ever rotates. A user unit cannot filter it with `LogLevelMax=` —
 systemd honours that for the manager's own messages about the unit, but journald reads the
 per-unit level from `/run/systemd/units/`, which only the system manager writes, so the stream
@@ -2649,10 +2649,6 @@ generated for you. A watchdog interval is a local fact, and this block is now th
 local fact has into the file. A test asserts that every key the hand-written agents carried is
 expressible, and that each lands in the plist exactly once.
 
-`StartInterval` later grew a platform-neutral sibling, `watchdog_interval_secs`, which sets the
-same interval on both init systems at once; this hatch still wins over it on macOS, and the entry
-for that key says why.
-
 ### An unknown key in `session_service` warns instead of failing the config
 
 An unknown TOP-LEVEL key in `config.kdl` has always been ignored, which is what lets a config reach
@@ -2684,7 +2680,7 @@ session_service {
 ```
 
 **Only the unknown-NAME case softened.** A name this build knows, given a value it cannot mean, is
-still the whole config failing to parse: a wrong type, a `watchdog_interval_secs` of zero, a
+still the whole config failing to parse: a wrong type, a
 `pin_exe` that is neither a switch nor a path, a systemd line that is not `Key=value`, and every
 guard against an entry taking over what the generator owns. The operator meant that setting and is
 not getting it, which is worth stopping for. An unknown name means the opposite — nobody who typed
@@ -2697,7 +2693,7 @@ nothing:
 ```
 [CONFIG FILE]: Well defined.
 [CONFIG WARNING]: unknown session_service entry "some_key_from_a_later_build", ignored (expected
-systemd, launchd, pin_exe, restart_via_launchd or watchdog_interval_secs)
+systemd, launchd, pin_exe or restart_via_launchd)
 ```
 
 and the parse also logs it at `warn`, so a session already running says it too. Every warning names
@@ -2812,7 +2808,7 @@ not covered and stays as strict as upstream.
 Not plain warn-and-skip, on purpose:
 
 - **`session_service` values.** No key there takes a value from a closed set: a string `pin_exe` is a
-  path, and every other check is a type or a range (`watchdog_interval_secs 0`). Those are malformed
+  path, and every other check is a type (`restart_via_launchd 1`). Those are malformed
   known settings and still fail. Its unknown names warn, as before.
 - **`Direction` and `Resize` arguments of an action.** These are closed geometric sets, so a bad
   one is a wrong argument, not a newer name.
@@ -6332,60 +6328,6 @@ anything. An id form is looked up like a handle or a uuid: it needs nothing from
 answering it means a different query against a different list, for no change in what the prompt is
 about.
 
-### `watchdog_interval_secs`: one key retimes the watchdog on both platforms
-
-macOS could already be retimed and Linux could not. `StartInterval` is a plist key, so it went
-through the `launchd { keys { … } }` hatch like any other; the systemd timer's `OnBootSec=` and
-`OnUnitActiveSec=` were written from a constant, and the `systemd` sub-block has no `timer` section
-to reach them through — deliberately, since everything in that block writes into the *service*.
-So the one file the interval actually lives in on Linux was the one file the config could not
-touch.
-
-```kdl
-session_service {
-    watchdog_interval_secs 15
-}
-```
-
-Seconds, a whole number, at least 1. It is one neutral key rather than a pair because the two
-watchdogs are meant to tick together — the systemd timer exists so that Linux matches what
-`StartInterval` already gave macOS, and two keys would let a config drift the platforms apart while
-reading as if it had set *the* interval. Seconds and a bare integer because that is what launchd's
-key means and what systemd reads a unitless time span as; nothing here writes `15min`.
-
-**Linux**: both `OnBootSec=` and `OnUnitActiveSec=`, since the boot pass and the steady-state pass
-are the same check. The service file's own comment quotes the same number — it explains what the
-paired timer does, and a comment saying 60 beside a timer saying 15 is how the next person learns
-the wrong number.
-
-**macOS**: it becomes the DEFAULT for `StartInterval`, not an override of it. Resolution order is
-an explicit `launchd { keys { StartInterval N } }`, then this key, then the built-in default
-(15 since nkmk.17). The extra
-wins because it names launchd's own spelling and therefore one platform, which is the more specific
-of the two statements; the key is the fleet-wide default it falls back to. The key is still taken
-out of the extras and written once, so the plist is a plist.
-
-Unset, every generated file is byte-identical to what it was — asserted by comparing the output of
-all three generators against a default block.
-
-**A changed interval is drift, not an upgrade.** Nothing rewrites a unit because a config file
-changed: `session status` compares the installed files against what this build would generate, and
-the timer is one of the files `service_files` yields, so a machine whose config now says 15 reports
-the timer as drifted until `session enable` is re-run there. That is per machine, and it is the
-same shape as every other key in this block.
-
-`zellij setup --dump-service` still prints the service or the plist and never the timer, which is
-left exactly as it was. The consequence is worth knowing rather than fixing: on macOS the dump
-shows the interval, because `StartInterval` is a key on the job itself, while on Linux it appears
-only in the comment line — the file that carries it is not the file that command dumps.
-
-Nested key, so the rule of the day applied with no exceptions: `session_service` parses its own
-children, and an older build fails the **whole** config on `watchdog_interval_secs`, not just the
-block. It could not be seeded into a shared config ahead of the binary; it shipped with the code
-that accepts it, and every machine took the binary first. A key added after [the entry that
-softened that rule](#an-unknown-key-in-session_service-warns-instead-of-failing-the-config) is no
-longer held back this way.
-
 ### `--version` says which upstream base it was cut from
 
 The version string names the fork counter and nothing else, so `0.45.0-nkmk.16` answers *which
@@ -6458,8 +6400,7 @@ shape launchd understands, so the type refuses it at the parser instead of letti
 
 **TERM, PATH and XDG_STATE_HOME resolve in three steps**: the `env` block, then a name put through
 the `keys` hatch, then the generator's built-in default. `env` wins because it names the dictionary
-launchd actually reads, which is the more specific of the two statements — the same argument that
-makes `StartInterval` beat [`watchdog_interval_secs`](#watchdog_interval_secs-one-key-retimes-the-watchdog-on-both-platforms).
+launchd actually reads, which is the more specific of the two statements.
 Whichever half loses is still TAKEN OUT of the extras, so the variable is written exactly once and
 never also as a top-level key. A repeated name inside one `env` block is the later one, for the same
 reason: a dictionary with one key twice is not a plist, and a config file is read top to bottom.
@@ -6520,7 +6461,7 @@ seconds instead of a minute, on both platforms at once — the systemd timer's `
 
 Measured before changing: a pass over a healthy session costs 0.16–0.17 s, so at fifteen seconds
 the watchdog spends about one percent of its interval working, and the up-lock it takes is held
-for that sliver. `watchdog_interval_secs` still overrides in either direction.
+for that sliver. `launchd { keys { StartInterval N } }` still retimes macOS; Linux has no override.
 
 A machine that installed its units under the old default shows the timer as drifted in
 `session status` until `session enable` is re-run there. That is the drift check doing its job:

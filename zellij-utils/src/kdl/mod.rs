@@ -4083,33 +4083,6 @@ impl Options {
                 "pin_exe" => {
                     session_service.pin_exe = pin_exe_from_kdl(init_system)?;
                 },
-                // like `pin_exe`, not an init system but a property of the install, and the one
-                // entry here that means the same thing on both of them: how often the watchdog
-                // re-runs `session up`
-                "watchdog_interval_secs" => {
-                    let seconds = kdl_first_entry_as_i64!(init_system).ok_or_else(|| {
-                        ConfigError::new_kdl_error(
-                            "watchdog_interval_secs takes a whole number of seconds".to_owned(),
-                            init_system.span().offset(),
-                            init_system.span().len(),
-                        )
-                    })?;
-                    // Zero is the one an operator reaches for meaning "off", and it is not that:
-                    // `OnUnitActiveSec=0` re-runs the service as fast as systemd can start it.
-                    if seconds < 1 {
-                        return Err(ConfigError::new_kdl_error(
-                            format!(
-                                "watchdog_interval_secs is {} seconds; it must be at least 1 \
-                                 (remove the key for the default, or `session disable` to stop the \
-                                 watchdog)",
-                                seconds
-                            ),
-                            init_system.span().offset(),
-                            init_system.span().len(),
-                        ));
-                    }
-                    session_service.watchdog_interval_secs = Some(seconds as u64);
-                },
                 // like `pin_exe`, not an init system but a property of how the install is used
                 "restart_via_launchd" => {
                     session_service.restart_via_launchd =
@@ -4202,7 +4175,7 @@ impl Options {
                 other => {
                     session_service.note_unknown_entry(format!(
                         "unknown session_service entry {:?}, ignored (expected systemd, launchd, \
-                         pin_exe, restart_via_launchd or watchdog_interval_secs)",
+                         pin_exe or restart_via_launchd)",
                         other
                     ));
                 },
@@ -4230,12 +4203,6 @@ impl Options {
                 init_systems.nodes_mut().push(pin);
             },
             None => {},
-        }
-
-        if let Some(seconds) = session_service.watchdog_interval_secs {
-            let mut node = KdlNode::new("watchdog_interval_secs");
-            node.push(KdlValue::Base10(seconds as i64));
-            init_systems.nodes_mut().push(node);
         }
 
         if let Some(via_launchd) = session_service.restart_via_launchd {
@@ -10620,145 +10587,6 @@ fn restart_via_launchd_is_on_unless_the_config_turns_it_off() {
     ));
 }
 
-/// How often the watchdog re-checks, in seconds, on whichever platform generated the unit. The
-/// default is the half worth asserting: a config that has never mentioned this key must leave both
-/// generators writing exactly what they wrote before.
-#[test]
-fn watchdog_interval_secs_is_the_generators_own_unless_the_config_retimes_it() {
-    let unset = Config::from_kdl("", None).unwrap();
-    assert!(unset.options.session_service.is_none());
-    // the accessor is what both generators read, and unset means the built-in default
-    assert_eq!(
-        SessionServiceOptions::default().watchdog_interval_secs(),
-        15
-    );
-
-    // a `session_service` block that says other things still leaves the interval alone
-    let other_keys = Config::from_kdl(
-        "session_service {
-    restart_via_launchd false
-}",
-        None,
-    )
-    .unwrap();
-    let other_keys = other_keys.options.session_service.clone().unwrap();
-    assert_eq!(other_keys.watchdog_interval_secs, None);
-    assert_eq!(other_keys.watchdog_interval_secs(), 15);
-
-    let retimed = Config::from_kdl(
-        "session_service {
-    watchdog_interval_secs 15
-}",
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        retimed
-            .options
-            .session_service
-            .clone()
-            .unwrap()
-            .watchdog_interval_secs,
-        Some(15)
-    );
-    // and it survives being written out and read back, like every other key in this block
-    assert_eq!(
-        Config::from_kdl(&retimed.to_string(false), None)
-            .unwrap()
-            .options,
-        retimed.options
-    );
-    // the key alone is a block worth writing, so a config carrying only this does not round-trip
-    // to nothing
-    assert!(retimed.to_string(false).contains("watchdog_interval_secs"));
-}
-
-/// A binary that does not know `watchdog_interval_secs` ignores it and says so, naming the key it
-/// does accept. What this build owes in return is an error when the VALUE is wrong.
-#[test]
-fn watchdog_interval_secs_takes_whole_seconds_and_is_named_among_what_the_block_accepts() {
-    let config = Config::from_kdl(
-        "session_service {
-    watchdog_interval 15
-}",
-        None,
-    )
-    .unwrap();
-    let warnings = config
-        .options
-        .session_service
-        .as_ref()
-        .unwrap()
-        .unknown_entries
-        .clone();
-    assert_eq!(warnings.len(), 1, "{:?}", warnings);
-    assert!(
-        warnings[0].contains("watchdog_interval_secs"),
-        "{}",
-        warnings[0]
-    );
-    // the misspelling is ignored, so the interval is still the generator's own
-    assert_eq!(
-        config
-            .options
-            .session_service
-            .as_ref()
-            .unwrap()
-            .watchdog_interval_secs,
-        None
-    );
-
-    // a word is not a number of seconds
-    let error = Config::from_kdl(
-        "session_service {
-    watchdog_interval_secs \"often\"
-}",
-        None,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{:?}", error).contains("watchdog_interval_secs"),
-        "{:?}",
-        error
-    );
-
-    // nor is a fraction of one: systemd and launchd both read this as whole seconds
-    let error = Config::from_kdl(
-        "session_service {
-    watchdog_interval_secs 1.5
-}",
-        None,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{:?}", error).contains("watchdog_interval_secs"),
-        "{:?}",
-        error
-    );
-
-    // zero reads as "turn the watchdog off" and does the opposite - it asks for a re-check as fast
-    // as the init system can start one - so it is refused rather than honoured
-    let error = Config::from_kdl(
-        "session_service {
-    watchdog_interval_secs 0
-}",
-        None,
-    )
-    .unwrap_err();
-    let error = format!("{:?}", error);
-    assert!(error.contains("watchdog_interval_secs"), "{}", error);
-    assert!(error.contains("at least 1"), "{}", error);
-
-    let error = Config::from_kdl(
-        "session_service {
-    watchdog_interval_secs -15
-}",
-        None,
-    )
-    .unwrap_err();
-    assert!(format!("{:?}", error).contains("at least 1"), "{:?}", error);
-}
-
 /// The `env` block: the launchd side of what `systemd { service "Environment=..." }` already said.
 /// It has to survive being written out and read back, like every other entry in this block.
 #[test]
@@ -10948,7 +10776,6 @@ fn session_service_values_are_types_and_ranges_not_named_choices() {
     );
     for malformed in [
         "session_service {\n    restart_via_launchd 1\n}",
-        "session_service {\n    watchdog_interval_secs 0\n}",
         "session_service {\n    pin_exe 3\n}",
     ] {
         assert!(Config::from_kdl(malformed, None).is_err(), "{}", malformed);
@@ -10970,6 +10797,7 @@ fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() 
         r#"
         session_service {
             managed_session true
+            watchdog_interval_secs 15
             some_key_from_a_later_build "whatever"
             systemd {
                 service "Nice=-5"
@@ -11003,7 +10831,7 @@ fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() 
     // and each unknown one is named exactly once, in the words setup --check prints
     assert_eq!(
         session_service.unknown_entries.len(),
-        4,
+        5,
         "{:?}",
         session_service.unknown_entries
     );
@@ -11015,8 +10843,9 @@ fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() 
     );
     assert!(warnings.contains("sockets"), "{}", warnings);
     assert!(warnings.contains("sandbox"), "{}", warnings);
-    // a key a later build removed is just another name this build does not know
+    // keys a later build removed are just more names this build does not know
     assert!(warnings.contains("managed_session"), "{}", warnings);
+    assert!(warnings.contains("watchdog_interval_secs"), "{}", warnings);
 }
 
 /// A misspelled systemd section holding nothing is the case a softened error would have missed:
@@ -11050,9 +10879,7 @@ fn an_unknown_systemd_section_is_named_even_with_no_directives_in_it() {
 fn a_wrong_value_for_a_known_entry_is_still_an_error() {
     for bad in [
         // wrong type for a known key
-        "session_service {\n    watchdog_interval_secs \"often\"\n}",
-        // a known key, a value outside what it can mean
-        "session_service {\n    watchdog_interval_secs 0\n}",
+        "session_service {\n    restart_via_launchd \"yes\"\n}",
         "session_service {\n    pin_exe 3\n}",
         // a known systemd section, a line that is not a directive
         "session_service {\n    systemd {\n        service \"Nice\"\n    }\n}",

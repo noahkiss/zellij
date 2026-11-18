@@ -1678,7 +1678,7 @@ fn build_pair(ours: Option<&ExecutableIdentity>, theirs: Option<&ExecutableIdent
 ///
 /// From a shell, every time: a person typed `up`, and the answer must say what "already running"
 /// hides. From the init system's own job, once per [`build_pair`]: the watchdog asks every
-/// `watchdog_interval_secs`, and while a restart was owed the same four lines went to stderr on
+/// 15 seconds, and while a restart was owed the same four lines went to stderr on
 /// every tick - 25,615 copies on one Mac. `session status` and `session doctor` still report it on
 /// demand. A stamp that cannot be written costs the old behaviour, never the warning.
 fn warning_to_print(
@@ -1747,7 +1747,7 @@ fn up(name: &str, shape: UpShape, opts: &CliArgs) -> Result<(), ()> {
     let named_snapshot = matches!(shape, UpShape::Snapshot(_));
     if healthy && !named_snapshot {
         // Silent when the init system's own job is the caller. The watchdog runs this every
-        // `watchdog_interval_secs`, and on a healthy session this line was its only output: a
+        // 15 seconds, and on a healthy session this line was its only output: a
         // journal line per tick. A user unit cannot filter it with `LogLevelMax=` - journald reads
         // that setting for the SYSTEM manager's units only - so the line has to not be written. The
         // build warning below and every failure still go to stderr, and a pass that CREATES the
