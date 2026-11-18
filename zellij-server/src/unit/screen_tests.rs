@@ -6427,7 +6427,6 @@ fn subscriber_receives_initial_delivery() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
 
     let msgs = messages.lock().unwrap();
@@ -6457,7 +6456,6 @@ fn subscriber_receives_initial_with_scrollback() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         Some(0),
         false,
-        false,
     );
 
     let msgs = messages.lock().unwrap();
@@ -6486,7 +6484,6 @@ fn subscriber_no_update_on_unchanged_viewport() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -6524,7 +6521,6 @@ fn subscriber_receives_update_on_changed_viewport() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -6566,7 +6562,6 @@ fn slow_subscriber_keeps_its_subscription() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -6618,7 +6613,7 @@ fn a_busy_send_only_skips_the_pane_it_refused() {
     let accepted_pane = zellij_utils::data::PaneId::Terminal(1);
     let refused_pane = zellij_utils::data::PaneId::Terminal(2);
 
-    screen.subscribe_to_pane_renders(100, vec![accepted_pane, refused_pane], None, false, false);
+    screen.subscribe_to_pane_renders(100, vec![accepted_pane, refused_pane], None, false);
 
     // the channel has room for the first pane and not for the second
     pane_send_state
@@ -6698,7 +6693,6 @@ fn departed_subscriber_loses_its_subscription() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
 
     client_send_state
@@ -6733,7 +6727,6 @@ fn resubscribing_to_only_dead_panes_ends_the_subscription() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
     assert!(screen.pane_render_subscribers.contains_key(&100));
 
@@ -6742,7 +6735,6 @@ fn resubscribing_to_only_dead_panes_ends_the_subscription() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(999)],
         None,
-        false,
         false,
     );
     assert!(
@@ -6761,7 +6753,6 @@ fn subscriber_error_for_nonexistent_pane() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(999)],
         None,
-        false,
         false,
     );
 
@@ -6800,7 +6791,6 @@ fn subscriber_state_registered_for_multiple_panes() {
         ],
         None,
         false,
-        false,
     );
 
     let sub = screen.pane_render_subscribers.get(&100).unwrap();
@@ -6824,13 +6814,11 @@ fn multiple_subscribers_receive_updates() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
     screen.subscribe_to_pane_renders(
         101,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -6862,7 +6850,6 @@ fn subscriber_removed_on_remove_client() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
     assert!(screen.pane_render_subscribers.contains_key(&100));
 
@@ -6880,7 +6867,6 @@ fn subscriber_removed_when_all_panes_closed() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -6923,7 +6909,6 @@ fn subscriber_partial_close() {
             zellij_utils::data::PaneId::Terminal(2),
         ],
         None,
-        false,
         false,
     );
 
@@ -6974,7 +6959,6 @@ fn subscriber_full_close_sequence() {
         ],
         None,
         false,
-        false,
     );
 
     screen.notify_pane_closed_to_subscribers(zellij_utils::data::PaneId::Terminal(1));
@@ -7012,7 +6996,6 @@ fn delivery_path_a_and_b_produce_same_content() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -7088,98 +7071,6 @@ fn delivery_path_a_and_b_produce_same_content() {
 }
 
 #[test]
-fn a_wildcard_subscription_takes_every_pane_in_the_session() {
-    let size = Size { cols: 80, rows: 20 };
-    let (mut screen, messages) = create_new_screen_with_message_capture(size);
-    new_tab(&mut screen, 1, 0);
-    new_tab(&mut screen, 2, 1);
-
-    screen.subscribe_to_pane_renders(100, vec![], None, false, true);
-
-    let sub = screen.pane_render_subscribers.get(&100).unwrap();
-    assert!(sub.all_panes);
-    assert_eq!(
-        sub.pane_ids,
-        vec![
-            zellij_utils::data::PaneId::Terminal(1),
-            zellij_utils::data::PaneId::Terminal(2),
-        ]
-        .into_iter()
-        .collect::<HashSet<_>>(),
-        "both tabs' panes, without either being named"
-    );
-    assert_eq!(messages.lock().unwrap().get(&100).unwrap().len(), 2);
-}
-
-#[test]
-fn a_wildcard_subscription_picks_up_a_pane_opened_after_it() {
-    let size = Size { cols: 80, rows: 20 };
-    let (mut screen, messages) = create_new_screen_with_message_capture(size);
-    new_tab(&mut screen, 1, 0);
-
-    screen.subscribe_to_pane_renders(100, vec![], None, false, true);
-    messages.lock().unwrap().get_mut(&100).unwrap().clear();
-
-    let new_pane_id = PaneId::Terminal(2);
-    screen
-        .get_active_tab_mut(1)
-        .unwrap()
-        .horizontal_split(new_pane_id, None, 1, None, None)
-        .unwrap();
-
-    screen.deliver_to_pane_subscribers(None);
-
-    assert!(screen
-        .pane_render_subscribers
-        .get(&100)
-        .unwrap()
-        .pane_ids
-        .contains(&zellij_utils::data::PaneId::Terminal(2)));
-    let msgs = messages.lock().unwrap();
-    let client_msgs = msgs.get(&100).unwrap();
-    let initial_for_the_new_pane = client_msgs.iter().any(|m| {
-        matches!(
-            m,
-            ServerToClientMsg::PaneRenderUpdate {
-                pane_id: zellij_utils::data::PaneId::Terminal(2),
-                is_initial: true,
-                ..
-            }
-        )
-    });
-    assert!(
-        initial_for_the_new_pane,
-        "a pane the subscriber has never seen arrives as an initial delivery, got {:?}",
-        client_msgs
-    );
-}
-
-#[test]
-fn a_wildcard_subscription_outlives_the_panes_it_happens_to_hold() {
-    // a named subscription ends when its last pane closes, because the panes were the request. A
-    // wildcard asked for the session instead.
-    let size = Size { cols: 80, rows: 20 };
-    let (mut screen, messages) = create_new_screen_with_message_capture(size);
-    new_tab(&mut screen, 1, 0);
-
-    screen.subscribe_to_pane_renders(100, vec![], None, false, true);
-    screen.notify_pane_closed_to_subscribers(zellij_utils::data::PaneId::Terminal(1));
-
-    assert!(
-        screen.pane_render_subscribers.contains_key(&100),
-        "the wildcard subscription survives its last pane closing"
-    );
-    let msgs = messages.lock().unwrap();
-    let client_msgs = msgs.get(&100).unwrap();
-    assert!(
-        !client_msgs
-            .iter()
-            .any(|m| matches!(m, ServerToClientMsg::Exit { .. })),
-        "and the client is not told to exit"
-    );
-}
-
-#[test]
 fn subscriber_is_served_a_pane_the_render_report_does_not_carry() {
     // a tab nobody is looking at is not rendered, so its panes are absent from the report an
     // attached session delivers from. The subscriber asked for that pane and keeps getting it.
@@ -7192,7 +7083,6 @@ fn subscriber_is_served_a_pane_the_render_report_does_not_carry() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
     messages.lock().unwrap().get_mut(&100).unwrap().clear();
@@ -7250,7 +7140,6 @@ fn close_tab_notifies_subscribers() {
         100,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
-        false,
         false,
     );
 
@@ -7313,7 +7202,6 @@ fn close_pane_notifies_subscribers_via_instruction() {
             ],
             scrollback: None,
             ansi: false,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -7369,7 +7257,6 @@ fn integration_pty_bytes_delivered_to_subscriber() {
             pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
             scrollback: None,
             ansi: false,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -7445,7 +7332,6 @@ fn integration_pty_bytes_not_delivered_when_viewport_unchanged() {
             pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
             scrollback: None,
             ansi: false,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -7512,7 +7398,6 @@ fn integration_scrollback_from_pre_subscription_pty_bytes() {
             pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
             scrollback: Some(0),
             ansi: false,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -7630,7 +7515,6 @@ fn integration_no_scrollback_when_not_requested() {
             pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
             scrollback: None,
             ansi: false,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -7692,7 +7576,6 @@ fn integration_subscriber_survives_after_regular_client_detach() {
             pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
             scrollback: None,
             ansi: false,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -8832,14 +8715,12 @@ fn subscriber_ansi_flag_preserved_in_subscription() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
     screen.subscribe_to_pane_renders(
         101,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         true,
-        false,
     );
 
     assert!(
@@ -8864,14 +8745,12 @@ fn subscriber_ansi_and_plain_receive_different_content() {
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         false,
-        false,
     );
     screen.subscribe_to_pane_renders(
         101,
         vec![zellij_utils::data::PaneId::Terminal(1)],
         None,
         true,
-        false,
     );
 
     // Clear initial messages
@@ -8975,7 +8854,6 @@ fn integration_subscribe_with_ansi_flag() {
             pane_ids: vec![zellij_utils::data::PaneId::Terminal(0)],
             scrollback: None,
             ansi: true,
-            all_panes: false,
         });
     std::thread::sleep(std::time::Duration::from_millis(100));
 

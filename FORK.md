@@ -7303,40 +7303,6 @@ switch changes nothing, and a subscription made before a client attached keeps e
 - The cost is unchanged. All of it is behind the `is_empty()` gate on the subscriber map, so a
   session with no subscribers does the same work it did before.
 
-### `subscribe --all`: every pane, including the ones that do not exist yet
-
-```
-zellij subscribe --all --format json
-```
-
-A subscription had to name its panes, so a consumer that wanted the whole session had to list
-`list-panes` first and re-subscribe every time a pane was opened — and in the window between the
-two it saw nothing of the new pane. `--all` asks for the session instead of for panes. It takes
-every pane there is, and a pane opened later joins the feed on its own.
-
-- **`--all` and `--pane-id` are mutually exclusive**, and one of them is still required. A bare
-  `zellij subscribe` remains an error.
-- **A pane that joins later arrives as an initial delivery** — `is_initial: true`, the same framing
-  the named panes get at subscribe time — so a consumer can tell a pane it has never seen from one
-  that merely changed. It carries no scrollback even under `--scrollback`: a pane that has just
-  been created has none, and the flag describes the panes that were already there.
-- **A closing pane still says so.** `pane_closed` fires for a wildcard exactly as for a named
-  subscription. What does not happen is the exit: a named subscription ends when its last pane
-  closes, because those panes were the request, while a wildcard outlives all of them and runs
-  until the session does.
-- **The wildcard is expanded in the server**, to every pane `list-panes --all` would answer, and
-  re-read on every delivery rather than once at subscribe time.
-
-The flag rides on the existing `SubscribeToPaneRendersMsg` (field 4), so it adds no message to the
-client/server contract and changes no numbering. A fork client's `--all` against a stock server of
-the same contract subscribes to nothing, which is the same answer that contract gives for every
-other field it does not know.
-
-**The adjacent fail-open bug was already fixed** and is recorded here so nobody looks for it again:
-a re-subscribe naming only dead panes used to leave the old subscription in place. Since nkmk.17 it
-replaces it — the server drops the subscription and answers `Pane N not found`, on which the CLI
-exits 2.
-
 ### A plugin's `BeforeClose` handler gets a window to finish in
 
 `Event::BeforeClose` is a plugin's one chance to say anything on the way out — flush a queue, post

@@ -1005,7 +1005,6 @@ pub enum ScreenInstruction {
         pane_ids: Vec<zellij_utils::data::PaneId>,
         scrollback: Option<usize>,
         ansi: bool,
-        all_panes: bool,
     },
     NotifyPaneClosedToSubscribers {
         pane_id: zellij_utils::data::PaneId,
@@ -1602,8 +1601,6 @@ struct PaneRenderSubscription {
     pane_ids: HashSet<zellij_utils::data::PaneId>,
     previous_viewports: HashMap<zellij_utils::data::PaneId, Vec<String>>,
     ansi: bool,
-    /// A subscription that named no pane and takes whatever the session has, now and later.
-    all_panes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8992,21 +8989,12 @@ impl Screen {
             }
         }
     }
-    /// Every pane a wildcard subscription covers: what `list-panes --all` would answer.
-    fn panes_a_wildcard_covers(&self) -> HashSet<zellij_utils::data::PaneId> {
-        self.tabs
-            .values()
-            .flat_map(|tab| tab.get_all_pane_ids())
-            .map(|pane_id| pane_id.into())
-            .collect()
-    }
     fn subscribe_to_pane_renders(
         &mut self,
         subscriber_client_id: ClientId,
         pane_ids: Vec<zellij_utils::data::PaneId>,
         scrollback: Option<usize>,
         ansi: bool,
-        all_panes: bool,
     ) {
         let mut previous_viewports = HashMap::new();
         let mut valid_pane_ids = HashSet::new();
@@ -9018,16 +9006,6 @@ impl Screen {
             .keys()
             .find(|id| !self.watcher_clients.contains_key(id))
             .copied();
-
-        // a wildcard names no pane, so there is none to miss: it takes whatever the session has
-        let pane_ids: Vec<zellij_utils::data::PaneId> = if all_panes {
-            let mut wildcard: Vec<zellij_utils::data::PaneId> =
-                self.panes_a_wildcard_covers().into_iter().collect();
-            wildcard.sort();
-            wildcard
-        } else {
-            pane_ids
-        };
 
         for pane_id in &pane_ids {
             let server_pane_id: PaneId = (*pane_id).into();
@@ -9089,96 +9067,19 @@ impl Screen {
             }
         }
 
-        // a wildcard is a standing subscription: it named no pane, so it is kept even in the
-        // moment the session has none to give it
-        if !valid_pane_ids.is_empty() || all_panes {
+        if !valid_pane_ids.is_empty() {
             self.pane_render_subscribers.insert(
                 subscriber_client_id,
                 PaneRenderSubscription {
                     pane_ids: valid_pane_ids,
                     previous_viewports,
                     ansi,
-                    all_panes,
                 },
             );
         } else {
             // a subscribe that named no live pane replaces whatever this client was subscribed
             // to before, rather than leaving the server and the consumer disagreeing about it
             self.pane_render_subscribers.remove(&subscriber_client_id);
-        }
-    }
-    /// Bring every wildcard subscription up to date with the panes the session has now.
-    ///
-    /// A pane that has appeared since the last delivery gets an initial update of its own, the way
-    /// a named pane does at subscribe time, so a consumer can tell a pane it has never seen from
-    /// one that has merely changed. A pane that closed has already announced itself through
-    /// `SubscribedPaneClosed`, so it is dropped here without a second report.
-    fn refresh_wildcard_subscriptions(&mut self) {
-        if !self.pane_render_subscribers.values().any(|s| s.all_panes) {
-            return;
-        }
-        let covered = self.panes_a_wildcard_covers();
-        let regular_client_id = self
-            .connected_clients
-            .borrow()
-            .keys()
-            .find(|id| !self.watcher_clients.contains_key(id))
-            .copied();
-
-        let mut newly_covered: Vec<(ClientId, zellij_utils::data::PaneId)> = Vec::new();
-        for (subscriber_id, subscription) in &mut self.pane_render_subscribers {
-            if !subscription.all_panes {
-                continue;
-            }
-            for pane_id in covered.difference(&subscription.pane_ids) {
-                newly_covered.push((*subscriber_id, *pane_id));
-            }
-            subscription.pane_ids.retain(|id| covered.contains(id));
-            subscription
-                .previous_viewports
-                .retain(|id, _| covered.contains(id));
-        }
-
-        for (subscriber_id, pane_id) in newly_covered {
-            let server_pane_id: PaneId = pane_id.into();
-            let query_client_id = match server_pane_id {
-                PaneId::Plugin(_) => regular_client_id,
-                PaneId::Terminal(_) => None,
-            };
-            let ansi = self
-                .pane_render_subscribers
-                .get(&subscriber_id)
-                .map(|s| s.ansi)
-                .unwrap_or(false);
-            let contents = self.tabs.values().find_map(|tab| {
-                tab.get_pane_with_id(server_pane_id).map(|pane| {
-                    if ansi {
-                        pane.pane_contents_with_ansi(query_client_id, false, None)
-                    } else {
-                        pane.pane_contents(query_client_id, false, None)
-                    }
-                })
-            });
-            let Some(contents) = contents else {
-                continue;
-            };
-            if let Some(os_input) = &self.bus.os_input {
-                let _ = os_input.send_to_client(
-                    subscriber_id,
-                    ServerToClientMsg::PaneRenderUpdate {
-                        pane_id,
-                        viewport: contents.viewport.clone(),
-                        scrollback: None,
-                        is_initial: true,
-                    },
-                );
-            }
-            if let Some(subscription) = self.pane_render_subscribers.get_mut(&subscriber_id) {
-                subscription.pane_ids.insert(pane_id);
-                subscription
-                    .previous_viewports
-                    .insert(pane_id, contents.viewport);
-            }
         }
     }
     /// Build one contents map for every subscribed pane and deliver from it.
@@ -9190,7 +9091,6 @@ impl Screen {
     /// from its tab here, which is what the detached path always did for every pane — `report` is
     /// simply `None` there.
     fn deliver_to_pane_subscribers(&mut self, report: Option<&PaneRenderReport>) {
-        self.refresh_wildcard_subscriptions();
         let reported = report.and_then(|r| r.all_pane_contents.values().next());
         let reported_with_ansi = report.and_then(|r| r.all_pane_contents_with_ansi.values().next());
         let has_ansi_subscribers = self.pane_render_subscribers.values().any(|s| s.ansi);
@@ -9477,8 +9377,7 @@ impl Screen {
                         ServerToClientMsg::SubscribedPaneClosed { pane_id },
                     );
                 }
-                // a wildcard asked for the session, not for these panes: it outlives all of them
-                if subscription.pane_ids.is_empty() && !subscription.all_panes {
+                if subscription.pane_ids.is_empty() {
                     if let Some(os_input) = &self.bus.os_input {
                         let _ = os_input.send_to_client(
                             *subscriber_id,
@@ -14593,9 +14492,8 @@ pub(crate) fn screen_thread_main(
                 pane_ids,
                 scrollback,
                 ansi,
-                all_panes,
             } => {
-                screen.subscribe_to_pane_renders(client_id, pane_ids, scrollback, ansi, all_panes);
+                screen.subscribe_to_pane_renders(client_id, pane_ids, scrollback, ansi);
             },
             ScreenInstruction::NotifyPaneClosedToSubscribers { pane_id } => {
                 screen.notify_pane_closed_to_subscribers(pane_id);
