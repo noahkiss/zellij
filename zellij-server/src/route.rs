@@ -20,9 +20,8 @@ use zellij_utils::{
     channels::SenderWithContext,
     data::{
         ActionEvent, BareKey, ConnectToSession, Direction, Event, InputMode, KeyModifier,
-        ListPanesResponse, ListTabsResponse, NewPanePlacement, NoteColor,
-        PaneId as ZellijUtilsPaneId, PaneListEntry, PaneTarget, ResizeStrategy, TabInfo,
-        UnblockCondition,
+        ListPanesResponse, ListTabsResponse, NewPanePlacement, PaneId as ZellijUtilsPaneId,
+        PaneListEntry, PaneTarget, ResizeStrategy, TabInfo, UnblockCondition,
     },
     envs,
     errors::prelude::*,
@@ -2025,31 +2024,6 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
-        Action::SetPaneNote { pane_id, note } => {
-            // the report says what the pane now carries rather than that the command ran, so a
-            // script that set a note can read back the one it set - and a clear says so
-            match request_pane_note(&senders, pane_id.into(), note).with_context(err_context)? {
-                Some(Ok(Some((note, color)))) => send_output_to_client(
-                    cli_client_id,
-                    os_input.as_ref(),
-                    vec![format!("note: {}", note), format!("color: {}", color)],
-                ),
-                Some(Ok(None)) => send_output_to_client(
-                    cli_client_id,
-                    os_input.as_ref(),
-                    vec!["note: -".to_owned()],
-                ),
-                Some(Err(message)) => {
-                    send_error_to_client(cli_client_id, os_input.as_ref(), &message)
-                },
-                None => send_error_to_client(
-                    cli_client_id,
-                    os_input.as_ref(),
-                    "Timeout setting the pane note",
-                ),
-            }
-            drop(NotificationEnd::new(completion_tx));
-        },
         Action::ListPanes {
             show_tab: _,
             show_command: _,
@@ -2716,7 +2690,6 @@ fn target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usize>) {
         WriteToPaneId { pane_id, .. }
         | WriteCharsToPaneId { pane_id, .. }
         | SetPaneColor { pane_id, .. }
-        | SetPaneNote { pane_id, .. }
         | ChangeFloatingPaneCoordinates { pane_id, .. }
         | SignalPane { pane_id, .. }
         | TogglePaneBorderless { pane_id, .. }
@@ -3753,35 +3726,6 @@ fn format_events_table(events: &[ActionEvent]) -> Vec<String> {
     lines
 }
 
-/// Asks Screen to leave a note on a pane. `None` when Screen did not answer in time.
-fn request_pane_note(
-    senders: &ThreadSenders,
-    pane_id: PaneId,
-    note: Option<(String, NoteColor)>,
-) -> Result<Option<std::result::Result<Option<(String, NoteColor)>, String>>> {
-    use crossbeam::channel::{unbounded, RecvTimeoutError};
-    use std::time::Duration;
-
-    let (response_sender, response_receiver) = unbounded();
-    senders.send_to_screen(ScreenInstruction::SetPaneNote {
-        pane_id,
-        note,
-        response_channel: response_sender,
-    })?;
-
-    match response_receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(answer) => Ok(Some(answer)),
-        Err(RecvTimeoutError::Timeout) => {
-            log::error!("SetPaneNote timed out waiting for Screen response");
-            Ok(None)
-        },
-        Err(RecvTimeoutError::Disconnected) => {
-            log::error!("SetPaneNote channel disconnected");
-            Ok(None)
-        },
-    }
-}
-
 fn request_panes_from_screen(
     senders: &ThreadSenders,
     show_all: bool,
@@ -4643,7 +4587,7 @@ mod tests {
     fn the_pane_table_and_the_tree_both_carry_a_pane_note() {
         let mut noted = pane_entry(7, "sunny-otter");
         noted.pane_info.note = "exit 7".to_owned();
-        noted.pane_info.note_color = NoteColor::Error;
+        noted.pane_info.note_color = zellij_utils::data::NoteColor::Error;
         let table = format_panes_table(&[noted.clone()], true, true, true, true);
         assert!(table[0].contains("NOTE"), "{}", table[0]);
         // the colour rides with the words: it is what the note means, and a table without it

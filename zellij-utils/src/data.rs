@@ -2528,12 +2528,12 @@ pub struct PaneInfo {
     /// id, a uuid.
     #[serde(default)]
     pub handle: String,
-    /// A short note somebody left on this pane, drawn on its frame. Empty when there is none.
+    /// A short note the server left on this pane, drawn on its frame. Empty when there is none.
     ///
-    /// It describes the pane's live state - "waiting on review", "exit 7" - and is set either by
-    /// `zellij action set-pane-note` or by the server, which marks a pane whose command failed and
-    /// is being held open. It is not part of what the pane *is*, so it is not serialized into a
-    /// snapshot: a restored pane comes back without one.
+    /// It describes the pane's live state - "exit 7" on a command pane whose command failed and
+    /// is being held open, "plugin failed" on a plugin pane that failed. It is not part of what
+    /// the pane *is*, so it is not serialized into a snapshot: a restored pane comes back without
+    /// one.
     #[serde(default)]
     pub note: String,
     /// The colour `note` is drawn in. Meaningless, and `info`, when there is no note.

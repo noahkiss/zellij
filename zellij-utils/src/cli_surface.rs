@@ -121,7 +121,6 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "set-pane-borderless",
             "set-pane-color",
             "set-pane-floating",
-            "set-pane-note",
             "set-pane-pinned",
             "set-sync-tab",
             "show-floating-panes",
@@ -261,12 +260,6 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action wait",
         shape: "record",
         keys: "waited_ms exit_status matched ready_by idle_by state state_kind state_msg handle pane_id tab_id tab_name kind name old_state new_state event session last_reply",
-    },
-    OutputSpec {
-        command: "action set-pane-note",
-        shape: "record",
-        // a cleared note prints `note: -` alone: there is no colour left to report
-        keys: "note color",
     },
     OutputSpec {
         command: "action new-pane",

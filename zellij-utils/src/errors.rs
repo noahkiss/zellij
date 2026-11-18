@@ -401,7 +401,6 @@ pub enum ScreenContext {
     ListPanes,
     ResolvePaneTarget,
     SetPaneHandle,
-    SetPaneNote,
     RecordAction,
     ListEvents,
     ReopenPane,

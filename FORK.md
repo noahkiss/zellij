@@ -951,35 +951,23 @@ id: 1
 The session's own startup is untouched: it built its tabs against that same session size before any
 client attached, and always did.
 
-### Pane notes
+### Pane notes: a failed pane keeps a mark
 
-```
-$ zellij action set-pane-note build --color warn "waiting on review"
-note: waiting on review
-color: warn
+A short line the server draws on a pane's frame, saying what happened in that pane. The handle
+answers "which pane is this"; the note answers "what is going on in it". Only the server sets one.
 
-$ zellij action set-pane-note build          # no text clears it
-note: -
-```
-
-A short line drawn on the pane's frame, saying what is happening in that pane. The handle answers
-"which pane is this"; the note answers "what is going on in it", which is the question a session
-full of agent-driven panes leaves a human asking.
-
-- **Four colours, named for what they mean** — `--color error|warn|ok|info`, `info` by default.
-  They are not colour values: the note is drawn inside whatever theme the reader is using, and each
-  name maps onto the colour that theme already picked for that meaning, so a note is legible in all
-  of them.
-- **The server leaves one itself.** A command pane whose command exits non-zero and is held open is
-  marked `exit 7`, in `error`. The frame already said `EXIT CODE: 7` while the pane was held, but
-  that line goes when the pane is scrolled or re-run, and nothing outside the server could read it
-  at all. The note is the durable mark, and `list-panes` prints it. It is cleared when the pane is
-  re-run, or by hand.
+- **A failed command pane is marked.** A command pane whose command exits non-zero and is held open
+  is marked `exit 7`, in the theme's error colour. The frame already said `EXIT CODE: 7` while the
+  pane was held, but that line goes when the pane is scrolled or re-run, and nothing outside the
+  server could read it at all. The note is the durable mark, and `list-panes` prints it. It is
+  cleared when the pane is re-run.
+- **A failed plugin pane is marked too**: see [A plugin that failed says so
+  afterwards](#a-plugin-that-failed-says-so-afterwards).
 - **`list-panes` has a `NOTE` column and `list-tree` a `note:` field**, both `error:exit 7` —
   colour and words together, because the colour is the meaning and a table without it cannot tell a
-  pane that finished from one that failed. A pane with no note prints `-`.
-- **A note is not saved into a snapshot.** It describes the pane's live state, and a session
-  restored tomorrow would come back carrying yesterday's "waiting on review". A restored pane comes
+  pane that finished from one that failed. A pane with no note prints `-`. `list-panes --json`
+  carries `note` and `note_color`.
+- **A note is not saved into a snapshot.** It describes the pane's live state. A restored pane comes
   back unmarked, deliberately, which is the opposite of what a handle does.
 
 On the frame it sits immediately left of the handle, and is the last element offered room:
@@ -1054,7 +1042,7 @@ agree. One CLI verb can become several actions — `new-pane` is a `new-tiled-pa
 
 One thing to know about creations: a pane made with `--handle build` is recorded under the name it
 was *born* with, because the chosen name is given to it a moment later, by the client holding the
-report. The `set-pane-note` or the `close-pane` that comes after says `build`.
+report. The `close-pane` that comes after says `build`.
 
 This is a ring, not a log: it is bounded, it is in memory, nothing about it is written to disk, and
 it is gone when the server stops. It is for the question you are asking now. A consumer that follows
@@ -6385,8 +6373,6 @@ short line; the pane's body still carries the whole of it.
   which is where a re-run command pane drops its `exit 7`, and not when one succeeds — so a reload
   that fails again re-marks the pane a moment later, and a reload that hangs leaves no stale claim
   of failure standing.
-- Clearing on a reload takes a note somebody set by hand on that pane with it. That is what
-  re-running a command pane does to its note, and the two behaving differently would be worse.
 
 The frame's red flash (`AddRedPaneFrameColorOverride`) was the obvious hook and is the wrong one
 twice over: it is a one-second animation, and it is the same field the multi-select highlight uses,
