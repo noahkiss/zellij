@@ -584,7 +584,6 @@ pub enum PluginContext {
     Reconfigure,
     FailedToWriteConfigToDisk,
     ListClientsToPlugin,
-    ListSnapshotsToPlugin,
     ChangePluginHostDir,
     WebServerStarted,
     FailedToStartWebServer,

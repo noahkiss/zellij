@@ -29,9 +29,7 @@ pub use super::generated_api::api::{
         PluginConfigurationChangedPayload as ProtobufPluginConfigurationChangedPayload,
         PluginInfo as ProtobufPluginInfo, ResurrectableSession as ProtobufResurrectableSession,
         SelectedText as ProtobufSelectedText, SessionManifest as ProtobufSessionManifest,
-        SessionSnapshotInfo as ProtobufSessionSnapshotInfo,
-        SessionWarning as ProtobufSessionWarning, SnapshotPaneInfo as ProtobufSnapshotPaneInfo,
-        SnapshotTabInfo as ProtobufSnapshotTabInfo,
+        SessionWarning as ProtobufSessionWarning,
         SoftKeyboardVisibilityChangedPayload as ProtobufSoftKeyboardVisibilityChangedPayload,
         StyledText as ProtobufStyledText, StyledTextIndices as ProtobufStyledTextIndices,
         SyntaxError as ProtobufSyntaxError, TabInfo as ProtobufTabInfo,
@@ -48,14 +46,12 @@ use crate::data::{
     ClientId, ClientInfo, CopyDestination, Event, EventType, FileMetadata, HostTerminalThemeMode,
     InputMode, KeyWithModifier, LayoutInfo, LayoutMetadata, ModeInfo, Mouse, PaneContents, PaneId,
     PaneInfo, PaneManifest, PaneMetadata, PaneScrollbackResponse, PermissionStatus,
-    PluginCapabilities, PluginInfo, SelectedText, SessionInfo, SessionSnapshotInfo, SessionWarning,
-    SnapshotPaneInfo, SnapshotTabInfo, Style, StyledText, TabInfo, TabMetadata, WebServerStatus,
-    WebSharing,
+    PluginCapabilities, PluginInfo, SelectedText, SessionInfo, SessionWarning, Style, StyledText,
+    TabInfo, TabMetadata, WebServerStatus, WebSharing,
 };
 
 use crate::errors::prelude::*;
 use crate::input::actions::Action;
-use crate::pane_size::Size;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryFrom;
@@ -444,24 +440,6 @@ impl TryFrom<ProtobufEvent> for Event {
                 },
                 _ => Err("Malformed payload for the FailedToWriteConfigToDisk Event"),
             },
-            Some(ProtobufEventType::ListSnapshots) => match protobuf_event.payload {
-                Some(ProtobufEventPayload::ListSnapshotsPayload(mut list_snapshots_payload)) => {
-                    Ok(Event::ListSnapshots(
-                        list_snapshots_payload
-                            .snapshot_info
-                            .drain(..)
-                            .filter_map(|s| s.try_into().ok())
-                            .collect(),
-                    ))
-                },
-                _ => Err("Malformed payload for the ListSnapshots Event"),
-            },
-            Some(ProtobufEventType::SnapshotRestoreFailed) => match protobuf_event.payload {
-                Some(ProtobufEventPayload::SnapshotRestoreFailedPayload(payload)) => {
-                    Ok(Event::SnapshotRestoreFailed(payload.error))
-                },
-                _ => Err("Malformed payload for the SnapshotRestoreFailed Event"),
-            },
             Some(ProtobufEventType::HostFolderChanged) => match protobuf_event.payload {
                 Some(ProtobufEventPayload::HostFolderChangedPayload(
                     host_folder_changed_payload,
@@ -727,17 +705,6 @@ impl TryFrom<ProtobufEvent> for Event {
 impl TryFrom<ProtobufClientInfo> for ClientInfo {
     type Error = &'static str;
     fn try_from(protobuf_client_info: ProtobufClientInfo) -> Result<Self, &'static str> {
-        let terminal_size = match (
-            protobuf_client_info.terminal_rows,
-            protobuf_client_info.terminal_cols,
-        ) {
-            (Some(rows), Some(cols)) => Some(Size {
-                rows: rows as usize,
-                cols: cols as usize,
-            }),
-            // a half-filled size is no size: report nothing rather than a made-up dimension
-            _ => None,
-        };
         Ok(ClientInfo::new(
             protobuf_client_info.client_id as u16,
             protobuf_client_info
@@ -747,7 +714,6 @@ impl TryFrom<ProtobufClientInfo> for ClientInfo {
             protobuf_client_info.running_command,
             protobuf_client_info.is_current_client,
         )
-        .with_terminal_size(terminal_size)
         .with_tty(protobuf_client_info.tty))
     }
 }
@@ -760,101 +726,7 @@ impl TryFrom<ClientInfo> for ProtobufClientInfo {
             pane_id: Some(client_info.pane_id.try_into()?),
             running_command: client_info.running_command,
             is_current_client: client_info.is_current_client,
-            terminal_rows: client_info.terminal_size.map(|size| size.rows as u32),
-            terminal_cols: client_info.terminal_size.map(|size| size.cols as u32),
             tty: client_info.tty,
-        })
-    }
-}
-
-impl TryFrom<ProtobufSessionSnapshotInfo> for SessionSnapshotInfo {
-    type Error = &'static str;
-    fn try_from(protobuf_info: ProtobufSessionSnapshotInfo) -> Result<Self, &'static str> {
-        Ok(SessionSnapshotInfo {
-            id: protobuf_info.id,
-            session_name: protobuf_info.session_name,
-            saved_at: protobuf_info.saved_at,
-            reason: protobuf_info.reason,
-            zellij_version: protobuf_info.zellij_version,
-            tab_count: protobuf_info.tab_count as usize,
-            pane_count: protobuf_info.pane_count as usize,
-            tabs: protobuf_info
-                .tabs
-                .into_iter()
-                .filter_map(|t| t.try_into().ok())
-                .collect(),
-            layout_error: protobuf_info.layout_error,
-        })
-    }
-}
-
-impl TryFrom<SessionSnapshotInfo> for ProtobufSessionSnapshotInfo {
-    type Error = &'static str;
-    fn try_from(info: SessionSnapshotInfo) -> Result<Self, &'static str> {
-        Ok(ProtobufSessionSnapshotInfo {
-            id: info.id,
-            session_name: info.session_name,
-            saved_at: info.saved_at,
-            reason: info.reason,
-            zellij_version: info.zellij_version,
-            tab_count: info.tab_count as u32,
-            pane_count: info.pane_count as u32,
-            tabs: info
-                .tabs
-                .into_iter()
-                .filter_map(|t| t.try_into().ok())
-                .collect(),
-            layout_error: info.layout_error,
-        })
-    }
-}
-
-impl TryFrom<ProtobufSnapshotTabInfo> for SnapshotTabInfo {
-    type Error = &'static str;
-    fn try_from(protobuf_tab: ProtobufSnapshotTabInfo) -> Result<Self, &'static str> {
-        Ok(SnapshotTabInfo {
-            name: protobuf_tab.name,
-            panes: protobuf_tab
-                .panes
-                .into_iter()
-                .filter_map(|p| p.try_into().ok())
-                .collect(),
-        })
-    }
-}
-
-impl TryFrom<SnapshotTabInfo> for ProtobufSnapshotTabInfo {
-    type Error = &'static str;
-    fn try_from(tab: SnapshotTabInfo) -> Result<Self, &'static str> {
-        Ok(ProtobufSnapshotTabInfo {
-            name: tab.name,
-            panes: tab
-                .panes
-                .into_iter()
-                .filter_map(|p| p.try_into().ok())
-                .collect(),
-        })
-    }
-}
-
-impl TryFrom<ProtobufSnapshotPaneInfo> for SnapshotPaneInfo {
-    type Error = &'static str;
-    fn try_from(protobuf_pane: ProtobufSnapshotPaneInfo) -> Result<Self, &'static str> {
-        Ok(SnapshotPaneInfo {
-            name: protobuf_pane.name,
-            command: protobuf_pane.command,
-            is_floating: protobuf_pane.is_floating,
-        })
-    }
-}
-
-impl TryFrom<SnapshotPaneInfo> for ProtobufSnapshotPaneInfo {
-    type Error = &'static str;
-    fn try_from(pane: SnapshotPaneInfo) -> Result<Self, &'static str> {
-        Ok(ProtobufSnapshotPaneInfo {
-            name: pane.name,
-            command: pane.command,
-            is_floating: pane.is_floating,
         })
     }
 }
@@ -1241,21 +1113,6 @@ impl TryFrom<Event> for ProtobufEvent {
                         .filter_map(|c| c.try_into().ok())
                         .collect(),
                 })),
-            }),
-            Event::ListSnapshots(mut snapshot_info_list) => Ok(ProtobufEvent {
-                name: ProtobufEventType::ListSnapshots as i32,
-                payload: Some(event::Payload::ListSnapshotsPayload(ListSnapshotsPayload {
-                    snapshot_info: snapshot_info_list
-                        .drain(..)
-                        .filter_map(|s| s.try_into().ok())
-                        .collect(),
-                })),
-            }),
-            Event::SnapshotRestoreFailed(error) => Ok(ProtobufEvent {
-                name: ProtobufEventType::SnapshotRestoreFailed as i32,
-                payload: Some(event::Payload::SnapshotRestoreFailedPayload(
-                    SnapshotRestoreFailedPayload { error },
-                )),
             }),
             Event::HostFolderChanged(new_host_folder_path) => Ok(ProtobufEvent {
                 name: ProtobufEventType::HostFolderChanged as i32,
@@ -2609,8 +2466,6 @@ impl TryFrom<ProtobufEventType> for EventType {
             ProtobufEventType::CommandPaneReRun => EventType::CommandPaneReRun,
             ProtobufEventType::FailedToWriteConfigToDisk => EventType::FailedToWriteConfigToDisk,
             ProtobufEventType::ListClients => EventType::ListClients,
-            ProtobufEventType::ListSnapshots => EventType::ListSnapshots,
-            ProtobufEventType::SnapshotRestoreFailed => EventType::SnapshotRestoreFailed,
             ProtobufEventType::HostFolderChanged => EventType::HostFolderChanged,
             ProtobufEventType::FailedToChangeHostFolder => EventType::FailedToChangeHostFolder,
             ProtobufEventType::PastedText => EventType::PastedText,
@@ -2678,8 +2533,6 @@ impl TryFrom<EventType> for ProtobufEventType {
             EventType::CommandPaneReRun => ProtobufEventType::CommandPaneReRun,
             EventType::FailedToWriteConfigToDisk => ProtobufEventType::FailedToWriteConfigToDisk,
             EventType::ListClients => ProtobufEventType::ListClients,
-            EventType::ListSnapshots => ProtobufEventType::ListSnapshots,
-            EventType::SnapshotRestoreFailed => ProtobufEventType::SnapshotRestoreFailed,
             EventType::HostFolderChanged => ProtobufEventType::HostFolderChanged,
             EventType::FailedToChangeHostFolder => ProtobufEventType::FailedToChangeHostFolder,
             EventType::PastedText => ProtobufEventType::PastedText,
@@ -3827,56 +3680,6 @@ impl TryFrom<SelectedText> for ProtobufSelectedText {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn client_info(terminal_size: Option<Size>) -> ClientInfo {
-        ClientInfo::new(3, PaneId::Terminal(7), "zsh".to_owned(), true)
-            .with_terminal_size(terminal_size)
-    }
-
-    fn protobuf_client_info(
-        terminal_rows: Option<u32>,
-        terminal_cols: Option<u32>,
-    ) -> ProtobufClientInfo {
-        ProtobufClientInfo {
-            client_id: 3,
-            pane_id: Some(PaneId::Terminal(7).try_into().unwrap()),
-            running_command: "zsh".to_owned(),
-            is_current_client: true,
-            terminal_rows,
-            terminal_cols,
-            tty: None,
-        }
-    }
-
-    #[test]
-    fn client_info_roundtrips_through_protobuf() {
-        for size in [
-            Some(Size {
-                rows: 40,
-                cols: 160,
-            }),
-            None,
-        ] {
-            let client_info = client_info(size);
-            let protobuf: ProtobufClientInfo = client_info.clone().try_into().unwrap();
-            let roundtripped: ClientInfo = protobuf.try_into().unwrap();
-            assert_eq!(client_info, roundtripped);
-        }
-    }
-
-    #[test]
-    fn a_client_info_written_without_the_size_tags_reads_as_no_size() {
-        // an older plugin or server never writes the fork-only tags, so they arrive absent
-        let client_info: ClientInfo = protobuf_client_info(None, None).try_into().unwrap();
-        assert_eq!(client_info.terminal_size, None);
-        assert_eq!(client_info.terminal_area(), None);
-    }
-
-    #[test]
-    fn half_a_size_is_no_size() {
-        let client_info: ClientInfo = protobuf_client_info(Some(40), None).try_into().unwrap();
-        assert_eq!(client_info.terminal_size, None);
-    }
 
     #[test]
     fn pane_opened_roundtrips_through_protobuf() {

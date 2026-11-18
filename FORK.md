@@ -1580,70 +1580,6 @@ A restored layout runs its recorded commands, exactly as resurrection does today
 weeks ago is a sharper edge than a session that died minutes ago, so `snapshot show` prints the
 layout before `restore` acts on it. There is deliberately no confirmation prompt.
 
-#### A plugin can read the archive
-
-```rust
-subscribe(&[EventType::ListSnapshots]);
-list_snapshots();                            // answered by Event::ListSnapshots
-```
-
-`PluginCommand::ListSnapshots` asks the server for the archive and the answer arrives as
-`Event::ListSnapshots(Vec<SessionSnapshotInfo>)`, newest first. Each entry carries its sidecar — id,
-session name, when and why it was cut, the version that wrote it, and its tab and pane counts — plus
-the tabs and panes of the saved layout, each pane with its name and command.
-
-A **request** rather than a field on `SessionUpdate`, which is what the plan first proposed. Reading
-the archive walks a directory tree and parses every layout in it; `SessionUpdate` is broadcast to
-every subscribed plugin about once a second, and that work does not belong there. `ListClients` had
-already set the shape for an answer only the plugin that asked for it receives.
-
-The counts come from the sidecar and the tabs from the layout, which is why both are carried. A
-snapshot whose layout no longer parses still reports its size and arrives with `layout_error` set,
-rather than reading as an empty session: the same reasoning as `snapshot list` marking those entries
-instead of failing.
-
-Only a directory holding no `session-layout.kdl` at all is left out, and it says so:
-
-```
-WARN  snapshot <path> cannot be listed: it has no session-layout.kdl
-```
-
-One line as a directory enters that state and another only if the reason changes, using the same
-gating map as the dropped-session warning below — a picker left open would otherwise log an
-identical line per poll.
-
-New plugin-API tags only, nothing upstream renumbered: `EventType::ListSnapshots = 50` with payload
-`44`, and `CommandName::ListSnapshots = 230`. The command carries `ReadApplicationState`, alongside
-`ListClients` and `GetSessionList`.
-
-#### A plugin can restore one
-
-```rust
-restore_snapshot("1754251200000-a1b2c3d4", Some("a-new-name"));
-```
-
-`PluginCommand::RestoreSnapshot` is `zellij snapshot restore` reached from inside a session. The id
-is resolved against the archive, `session_name` restores under a different name exactly as
-`--session` does, and the layout file is handed to the same `SwitchSession` the resurrection path
-already uses — a restore has always been an attach that takes its layout from the archive rather
-than from the cache.
-
-**Restoring into a name that is already running is refused.** Left alone it would not fail, it would
-succeed as the wrong thing: the session exists, so the switch attaches to it and the layout is
-ignored, and the user gets the running session in place of the shape they picked. `attach --restore`
-refuses the same case for the same reason. The picker refuses it a second time, before the keypress,
-by marking the row.
-
-The server also trial-parses the layout before switching. Once the client has been told to switch
-there is no screen left to report a broken layout to, and the session it lands in would be empty.
-
-Refusals come back as `Event::SnapshotRestoreFailed` and are logged. A restore that works is not
-reported at all, because the client is already leaving.
-
-New tags only: `CommandName::RestoreSnapshot = 231` with payload `173`, and
-`EventType::SnapshotRestoreFailed = 51` with payload `45`. The command carries
-`ChangeApplicationState`, alongside `SwitchSession`.
-
 #### Adopting layouts the archive never saw
 
 ```
@@ -3527,184 +3463,22 @@ name would delete one instead. Each key tests its own modifiers.
 The widest tier of each help line advertises `<Del/Ctrl k>`; narrower tiers keep `<Del>` rather than
 drop a whole entry to fit it.
 
-### The session manager says why its list is empty
+### The server names the sessions its scan cannot list
 
-An empty session list used to be indistinguishable from a broken one. The plugin polls the server
-once a second for the list, and the poll's failure went into `Err(_) => return false` — the message
-naming what went wrong was thrown away, and the list stayed empty forever with nothing on screen to
-suggest a failure had happened at all. This fork's own machines have shown that empty list for
-months without ever producing a clue.
-
-The list area now carries the reason, since it is empty anyway:
-
-```
-Session list unavailable: Session-scan state not initialized
-```
-
-The message is the server's own, whatever it is, and it is logged as well. It is drawn as a plain
-line rather than through the plugin's error modal on purpose: that modal swallows the next keypress,
-and a failure that re-arms every second would make the plugin untypeable.
-
-A successful poll that simply returns nothing gets a line too:
-
-```
-No sessions to show: the server's scan of its socket and session-info dirs returned 0 live and 0 exited.
-```
-
-That case is the more likely one, and it is not an error anywhere in the server. The scan pairs each
-socket with a `session-metadata.kdl` under the session-info cache directory, and drops any session
-whose file is missing or does not parse — silently, reporting success with an empty list. `zellij
-ls`, which reads the sockets alone, keeps listing the session throughout. A user seeing a full
-`zellij ls` and an empty picker is looking at exactly that mismatch.
-
-The line reports the two counts the scan produced rather than asserting a cause. It used to claim
-the scan had returned nothing, which it could not know: the renderer was free to drop rows the scan
-*had* returned, and did. Those now have a notice of their own:
-
-```
-2 sessions hidden: the list drew fewer rows than the search returned.
-```
-
-The render cache counts the results it turns into rows and subtracts, so a row lost between the
-search and the screen reads as a bug instead of as an absence. This was the silent case that made
-the empty list unfalsifiable for so long.
-
-The welcome screen is exempt: it hides the current session deliberately, so an empty list there is
-normal.
-
-**The session you are in is drawn like any other row**, tagged `<CURRENT>` (`<C>` in a narrow pane)
-where the `[ATTACH]` tag would be. The single-screen list used to drop it in the render cache, so a
-user looking for their own session found nothing and could not tell a wrong list from a missing
-session. Upstream leaves it out on purpose — the single-screen session manager
-([#4821](https://github.com/zellij-org/zellij/pull/4821)) inherited the welcome screen's rule of
-never listing the session you are already in. That is right for a welcome screen and wrong for a
-picker someone opened to manage sessions.
-
-The row is fully selectable. An earlier pass made it visible but unselectable, which traded one dead
-end for another: rename, kill and the client actions all route through the selection, so a row the
-cursor refused to land on could not be acted on at all, and skipping past it read as a glitch. Only
-the one action that cannot work is refused — `ENTER` says `Already attached to this session.` and
-stays put. Kill, rename and `Ctrl+x` keep their meanings; Tab-complete still passes over it.
-
-A third silence has the same cure. The list gets whatever rows remain after the prompt and the help
-lines, and in a short pane that is none — the list vanished with no hint that height was the reason:
-
-```
-2 sessions hidden: the pane is too short to show the list.
-```
-
-Both list views say it, and neither says it when the list is genuinely empty or a filter matched
-nothing.
-
-The server names the sessions it drops, too, since the plugin can only report that something was
-missing and not which session or why:
+The scan behind the plugin session list and `zellij ls` pairs each socket with a
+`session-metadata.kdl` under the session-info cache directory. It drops any session whose file is
+missing or does not parse, silently, and reports success with a shorter list. The server now names
+each session it drops:
 
 ```
 WARN  session my-session is running but cannot be listed: its metadata file does not parse: ...
 ```
 
-One line per session as it enters that state, and another only if the reason changes — the scan runs
+One line per session as it enters that state, and another only if the reason changes. The scan runs
 on every poll of every session manager, roughly once a second each, so an unfiltered warning would
 be thousands of identical lines an hour. A session listed successfully again is forgotten, so a
-recurrence is reported rather than swallowed.
-
-### The session manager lists the attached clients, and detaches one of them
-
-`Ctrl+l` in the session manager shows every client attached to the current session:
-
-```
-Clients attached to this session: 2
-
-     Client              Focused pane   Running
-<↓↑> 1 (this client)     terminal 14    zsh
-     2                   terminal 7     nvim FORK.md
-```
-
-`↓↑` selects, `d` detaches the selected client, `ESC` goes back. A detached client keeps its
-session; it is the same outcome as that client pressing its own detach key.
-
-Before this the only thing the plugin could do about a second client was `Ctrl+x`, which
-disconnects *all* of them. Which client to keep was not a question it could ask, because nothing
-told the two apart.
-
-**The current client is listed but cannot be detached from here.** Pressing `d` on it says so
-instead. The session's own detach binding already does that job, and this is the one row where the
-screen reporting the outcome would vanish along with the client that was reading it.
-
-**The row identifies a client by what it is looking at, not by where it came from.** `pane_id` plus
-the command running in that pane is enough to tell two clients apart, and it is what a user
-recognises: the laptop is the one in `nvim FORK.md`. A tty name or `SSH_CONNECTION` was considered
-and rejected — a zellij client is always local to its server, so an ssh or mosh attach would report
-the server's own host, and the plumbing to carry either is much wider than what it would add.
-
-The list is polled once a second while it is open, because clients attach and detach with no event
-of their own. It clears on open rather than showing the previous answer: a stale client list is
-exactly the sort of thing someone would act on.
-
-Server side, `ClientInfo` and `Event::ListClients` already existed and nothing consumed them. What
-was missing was a way to detach a *named* client: the plugin API had `Detach` (yourself) and
-`DisconnectOtherClients` (everyone else) and nothing in between. `PluginCommand::DetachClients`
-fills that gap and reaches the same `ServerInstruction::DetachSession` that `Action::Detach` uses,
-under the `ChangeApplicationState` permission alongside the other two, as
-`CommandName::DetachClients = 229` with payload `172`.
-
-### The session manager picks a session out of the archive
-
-`Ctrl+e` in the session manager opens a chooser over every session shape worth reopening — the ones
-running now and the ones only the snapshot archive still has — with the tabs and panes of the
-selected one beside it:
-
-```
-Reopen a session (4): _
-
-Live sessions                    my-session
-  my-session                     2 tabs, 6 panes · this session
-Snapshots
-> a-session                      a-session
-  another-one                    3h 12m ago · 3 tabs, 7 panes · shutdown
-                                 1754251200000-a1b2c3d4
-
-                                 editing
-                                   nvim FORK.md
-                                   shell
-                                 logs
-                                   tail -f /var/log/syslog
-```
-
-Type to filter by name, `↓↑` selects, `ENTER` opens the selected row — attaching to a live session,
-or rebuilding an archived one — `Ctrl+r` restores a snapshot under a different name, and `ESC` goes
-back. Every key is bound only while the picker is up, so the help line replaces the usual one.
-
-**The preview is the point.** Until now the archive was a list of ids and timestamps in a terminal
-somewhere else; `zellij snapshot show` prints a whole layout file, which answers "what is in this"
-by making you read KDL. A snapshot's value is entirely in what it would give back, and that is a
-list of tabs and the panes in them.
-
-**Restoring over a running session is refused, and the row says so before the key is pressed.** The
-picker knows which names are live, so such a row is drawn dimmed and `ENTER` on it explains and
-points at `Ctrl+r`. The server refuses it a second time, because the picker's list is a poll old and
-the failure it prevents is silent: the switch would attach to the running session and discard the
-layout, handing back the wrong thing rather than nothing. A snapshot whose layout does not parse is
-refused the same way and for the same reason — it would land in an empty session.
-
-`Ctrl+r` is the way out, and it is `snapshot restore --session` under another name. It also makes a
-snapshot a template: restore the same shape beside a session that is still running.
-
-**The sources are a list, not two fields.** Adding another place to reopen a session from — the
-parked remote-session work is the obvious candidate — costs one variant and one builder, not a
-rewrite of every branch in the file. Selection runs over the rows of every source flattened
-together, so a new source changes what is in the list and nothing about moving through it.
-
-The archive is re-read once a second while the picker is open, because a snapshot is cut by a server
-this one knows nothing about: another session shutting down, a `delete-session`, a `save-session
---archive` elsewhere. The selection is carried by name and id across those reads, so a snapshot
-arriving at the top of the list does not move the row under the cursor. Below 60 columns the preview
-column is dropped rather than squeezed — two unreadable columns are worse than one readable one.
-
-`Ctrl+e` is not a mnemonic and there was no mnemonic left to take. `s` for snapshot, `h` for history
-and `a` for archive all switch modes in the default keybindings before a key reaches the plugin, and
-`r`, `d`, `x`, `w`, `k` and `l` are already bound inside it. The label in the help line does the work
-the letter cannot.
+recurrence is reported rather than swallowed. `report_dropped_sessions` in
+`zellij-utils/src/sessions.rs`.
 
 ### Focus wraps around the ends of a stack
 
@@ -4040,23 +3814,13 @@ builds that line by appending to a string and colouring each key by substring, s
 more `push_str` and the colour cannot land on the wrong characters. Built-in plugins are granted
 every permission, so `WriteToClipboard` costs no prompt.
 
-### The session manager's client list actually lists clients
+### `ListClients` lists every attached client, with its terminal size
 
-`Ctrl+l` reported no attached clients, whatever the truth was — for one client and for two, on every
-machine, since the list was added:
-
-```
-Clients attached to this session: 0
-The server reports no attached clients
-```
-
-The server builds that answer from a layout snapshot, and the plugin-facing path removed the
-requesting plugin's own pane from the snapshot first. That rule belongs to the layout *dump*, which
-nobody wants the session manager written into, and this path inherited it by passing
-`Some(plugin_id)` where `zellij action list-clients` passes `None` — which is exactly why the CLI
-was right all along. The session manager is a floating pane, and zellij focuses a new floating pane
-for every client in the tab, so that one pane was the focused pane of *every* attached client.
-Removing it removed the whole list.
+The plugin-facing `ListClients` answered with no clients, whatever the truth was. The server builds
+that answer from a layout snapshot, and the plugin path removed the requesting plugin's own pane
+from the snapshot first. That rule belongs to the layout *dump*, and this path inherited it by
+passing `Some(plugin_id)` where `zellij action list-clients` passes `None`. A plugin opened as a
+floating pane is the focused pane of every client in its tab, so removing it removed the whole list.
 
 The list also read one pane layer per tab — floating when floating panes were on screen, tiled
 otherwise. Floating visibility is per tab while focus is per client, so a client focused on a tiled
@@ -4064,29 +3828,10 @@ pane in a tab where someone else had floating panes up had no row anywhere. Both
 now, the off-screen one first, so a client remembered by both is described by the layer it is
 actually looking at.
 
-**Each row also carries that client's terminal size**, because a session is sized to its smallest
-attached client and nothing said which client that was:
-
-```
-     Client          Focused pane   Size    Running
-<↓↑> 1               terminal 14    160x40  zsh
-     2 (this client) terminal 7     100x28  nvim FORK.md
-```
-
-The smallest client by area is drawn in the emphasis colour — the same one the `(this client)`
-marker uses — so the terminal shrinking everyone else's grid is the one that stands out. The mark is
-withheld when every sized client is the same size, since a highlight that always fires says nothing,
-and a client whose size the server never recorded never wins the comparison.
-
-The value is `Screen`'s own `client_sizes` map, the same one `recompute_tab_size` takes the minimum
-of, so the number on screen is the number that decides the grid. It rides to the plugin thread on
-`SessionLayoutMetadata`, which already made that trip for `ListClients` — no new instruction, no new
-thread message.
-
-`ClientInfo` crosses the plugin protobuf, which this fork normally avoids. The two fields take
-fork-reserved tags **100** and **101** in `message ClientInfo`, leaving the low numbers free for
-upstream, and both are optional and read **both-or-none**: an older plugin against a newer server,
-or the reverse, reports no size rather than half of one.
+Each client's terminal size rides to the list on `SessionLayoutMetadata`, from `Screen`'s own
+`client_sizes` map — the one `recompute_tab_size` takes the minimum of. `zellij action
+list-clients` prints it as `SIZE` and as `terminal_size` in `--json`. The plugin API does not carry
+it: `ClientInfo` tags 100 and 101 in `event.proto` are reserved.
 
 ### Resume hints for serialized commands (`resurrect_command_hints`)
 
@@ -4817,8 +4562,8 @@ a `OnceLock` rather than through the `ClientOsApi` trait and its test fake.
 
 A floating pane that carries no coordinates of its own lands at half the viewport
 (`half_size_middle_geom`, `floating_pane_grid.rs`). Half a viewport is not enough for the plugins
-that open that way: the session manager truncates session names and its client list, the plugin
-manager truncates paths. The information is there; the pane is too small to show it.
+that open that way: the session manager truncates session names, the plugin manager truncates
+paths. The information is there; the pane is too small to show it.
 
 Nothing in config.kdl reached that geometry, and a keybinding cannot reach it either.
 `LaunchOrFocusPlugin` and `LaunchPlugin` have no coordinates on the action at all, and the KDL action
@@ -5295,9 +5040,9 @@ zellij action list-clients --json
 
 The client list was a human table only, so a controller had to parse fixed-width columns to learn
 who is attached and whose terminal is shrinking the grid. `--json` prints the `ClientInfo` array
-plugins already receive in `Event::ListClients` — `client_id`, `pane_id`, `running_command`,
-`is_current_client`, and the fork's `terminal_size` and `tty` where the server knows them. Nothing
-else goes to stdout, and no clients prints `[]`.
+plugins receive in `Event::ListClients` — `client_id`, `pane_id`, `running_command`,
+`is_current_client`, and the fork's `terminal_size` (CLI only) and `tty` where the server knows
+them. Nothing else goes to stdout, and no clients prints `[]`.
 
 `pane_id` is the serde form of the enum, `{"Terminal": 3}`, because this is the plugin-facing struct
 verbatim rather than a second shape to keep in step. `is_current_client` marks the client that asked;

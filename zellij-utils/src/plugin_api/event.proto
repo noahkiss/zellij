@@ -8,7 +8,7 @@ import "action.proto";
 package api.event;
 
 enum EventType {
-    reserved 43;
+    reserved 43, 50, 51;
     /// The input mode or relevant metadata changed
     ModeUpdate = 0;
     /// The tab state in the app was changed
@@ -75,8 +75,6 @@ enum EventType {
     // upstream ends at 49. Fork tags start here, flush against that maximum with no gap, so an
     // upstream event added at 50 collides on rebase: renumber the FORK side, never upstream's,
     // and keep the fork tags contiguous after the new upstream maximum.
-    ListSnapshots = 50;
-    SnapshotRestoreFailed = 51;
     PaneOpened = 52;
     PaneExited = 53;
     PluginDied = 54;
@@ -93,7 +91,7 @@ message EventNameList {
 }
 
 message Event {
-  reserved 37;
+  reserved 37, 44, 45;
   EventType name = 1;
   oneof payload {
     ModeUpdatePayload mode_update_payload = 2;
@@ -140,8 +138,6 @@ message Event {
     // upstream ends at 43. Fork tags start here, flush against that maximum with no gap, so an
     // upstream payload added at 44 collides on rebase: renumber the FORK side, never upstream's,
     // and keep the fork tags contiguous after the new upstream maximum.
-    ListSnapshotsPayload list_snapshots_payload = 44;
-    SnapshotRestoreFailedPayload snapshot_restore_failed_payload = 45;
     PaneOpenedPayload pane_opened_payload = 46;
     PaneExitedPayload pane_exited_payload = 47;
     PluginDiedPayload plugin_died_payload = 48;
@@ -170,37 +166,6 @@ message StyledText {
 
 message StyledTextIndices {
   repeated uint32 indices = 1;
-}
-
-message SnapshotRestoreFailedPayload {
-  string error = 1;
-}
-
-message ListSnapshotsPayload {
-  repeated SessionSnapshotInfo snapshot_info = 1;
-}
-
-message SessionSnapshotInfo {
-  string id = 1;
-  string session_name = 2;
-  uint64 saved_at = 3;
-  string reason = 4;
-  string zellij_version = 5;
-  uint32 tab_count = 6;
-  uint32 pane_count = 7;
-  repeated SnapshotTabInfo tabs = 8;
-  optional string layout_error = 9;
-}
-
-message SnapshotTabInfo {
-  optional string name = 1;
-  repeated SnapshotPaneInfo panes = 2;
-}
-
-message SnapshotPaneInfo {
-  optional string name = 1;
-  optional string command = 2;
-  bool is_floating = 3;
 }
 
 message HostTerminalThemeChangedPayload {
@@ -266,9 +231,8 @@ message ClientInfo {
   string running_command = 3;
   bool is_current_client = 4;
   // fork-only fields start at 100, leaving 5.. free for upstream
-  // the client's terminal size, absent when the server has not recorded one yet
-  optional uint32 terminal_rows = 100;
-  optional uint32 terminal_cols = 101;
+  // 100 and 101 were terminal_rows and terminal_cols, retired
+  reserved 100, 101;
   // the terminal device the client is attached to, absent when it has none
   optional string tty = 102;
 }

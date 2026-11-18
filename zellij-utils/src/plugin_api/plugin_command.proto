@@ -14,7 +14,7 @@ import "pane_frame_style.proto";
 package api.plugin_command;
 
 enum CommandName {
-  reserved 216, 219, 222;
+  reserved 216, 219, 222, 229, 230, 231;
   Subscribe = 0;
   Unsubscribe = 1;
   SetSelectable = 2;
@@ -218,13 +218,10 @@ enum CommandName {
   NewPane = 226;
   ToggleFocusNoUiFullscreen = 227;
   FocusHostSession = 228;
-  DetachClients = 229;
-  ListSnapshots = 230;
-  RestoreSnapshot = 231;
 }
 
 message PluginCommand {
-  reserved 165, 167;
+  reserved 165, 167, 172, 173;
   CommandName name = 1;
   oneof payload {
     SubscribePayload subscribe_payload = 2;
@@ -381,8 +378,6 @@ message PluginCommand {
     NewTiledPaneInTabPayload new_tiled_pane_in_tab_payload = 169;
     SetPaneFrameStylePayload set_pane_frame_style_payload = 170;
     ToggleFloatingPanesPayload toggle_floating_panes_payload = 171;
-    DetachClientsPayload detach_clients_payload = 172;
-    RestoreSnapshotPayload restore_snapshot_payload = 173;
   }
 }
 
@@ -673,15 +668,6 @@ message ShowPaneWithIdPayload {
 
 message NewTabsWithLayoutInfoPayload {
   event.LayoutInfo layout_info = 1;
-}
-
-message RestoreSnapshotPayload {
-  string snapshot_id = 1;
-  optional string session_name = 2;
-}
-
-message DetachClientsPayload {
-  repeated uint32 client_ids = 1;
 }
 
 message KillSessionsPayload {

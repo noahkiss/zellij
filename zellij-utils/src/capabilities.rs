@@ -37,8 +37,6 @@ pub const CAPABILITIES: &[&str] = &[
     // the snapshot archive
     "session-snapshots", // zellij snapshot list|show|restore|rm|prune, attach --restore
     "snapshot-import",   // zellij snapshot import
-    "snapshot-plugin-api", // PluginCommand::ListSnapshots / RestoreSnapshot
-    "snapshot-session-list", // the session manager picks a session out of the archive
     // pane and client identity, all of it in `list-panes --json` / `list-clients`
     "pane-uuid",                // PaneInfo.uuid
     "pane-restored-from",       // PaneInfo.restored_from
@@ -56,7 +54,6 @@ pub const CAPABILITIES: &[&str] = &[
     "plugin-died-event",  // Event::PluginDied, a crashed plugin says so
     "pane-opened-event",  // Event::PaneOpened, broadcast from every creation path
     "client-tty",         // ClientInfo.tty
-    "list-clients-fixed", // the session manager's client list actually lists clients
     "list-clients-json",  // zellij action list-clients --json
     "client-rootshell-pane", // list-clients --json rootshell_pane, from LC_ROOTSHELL_PANE
     "move-tab-to-index",  // zellij action move-tab --to-index
