@@ -1674,8 +1674,8 @@ lock's own 90 seconds with room to spare — the longest legitimate hold is a 10
 give up on a restart that is only slow, which is the race put back by hand.
 
 **The lock could not carry the shape across a handover (nkmk.26, 2026-10-02).** When a launch agent
-is loaded, or a managed session's unit is known, the restart's inner `up` does not create the
-session: it releases the lock and asks launchd or systemd to. The job it wakes runs a bare
+is loaded, the restart's inner `up` does not create the session: it releases the lock and asks
+launchd to. The job it wakes runs a bare
 `session up`, and a bare `up` resumes — so `restart --fresh` came back from the snapshot its own
 teardown had just archived, and `restart.log` reported success. On a Mac with an agent this was not
 a race but every time. `restart` now writes its shape to `<socket-dir>/.<name>.up.pending` before
@@ -2666,15 +2666,15 @@ the WHOLE file, not the block.
 ```
 
 So a nested key could not be seeded ahead of the binary, and a shared config carrying one would not
-load on any machine that was behind. `managed_session` and `launchd { env }` each paid that price,
-and each entry above says so.
+load on any machine that was behind. `managed_session` (since removed) and `launchd { env }` each
+paid that price.
 
 A name this build does not know is now **kept, logged and ignored**, at every depth this block
 parses — an entry of `session_service`, a section of `systemd`, a child of `launchd`:
 
 ```kdl
 session_service {
-    managed_session true                       // read
+    restart_via_launchd true                   // read
     some_key_from_a_later_build "whatever"     // ignored, with a warning
     systemd {
         service "Nice=-5"                      // read
@@ -2697,7 +2697,7 @@ nothing:
 ```
 [CONFIG FILE]: Well defined.
 [CONFIG WARNING]: unknown session_service entry "some_key_from_a_later_build", ignored (expected
-systemd, launchd, pin_exe, managed_session, restart_via_launchd or watchdog_interval_secs)
+systemd, launchd, pin_exe, restart_via_launchd or watchdog_interval_secs)
 ```
 
 and the parse also logs it at `warn`, so a session already running says it too. Every warning names
@@ -5804,15 +5804,14 @@ one caller-derived value and left two. `session doctor` and `session status` run
 reported the launch agent as "not what this config writes now". The same commands with the plist's
 own PATH said `drift none`. The comparison rendered PATH from the asking shell, and
 `StandardOutPath` and `StandardErrorPath` from its state directory. Following the report recorded
-the SSH shell's thinner PATH for the next server. With `managed_session` set, `session up` would
-have made that rewrite silently.
+the SSH shell's thinner PATH for the next server.
 
 Drift is now judged by `comparison_files`. It renders the unit from the config as before, but takes
 PATH and the two log paths from the unit already on disk, where it records them. The recorded PATH
 goes through the same hoist rule as a fresh one, so the same binary gives the same bytes and a new
 binary still leads with its own directory. `ProgramArguments`, TERM, the scheduling keys and every
 config extra are still rendered from the config, so a real change still reads as drift. `status`,
-`doctor`, `up`'s warning and `managed_session` all use it. systemd logs to the journal, so PATH is
+`doctor` and `up`'s warning all use it. systemd logs to the journal, so PATH is
 the only value it gains.
 
 Drift now names what differs. Doctor's note and the `status` line end in `ProgramArguments differs`
@@ -6132,75 +6131,6 @@ grants nothing rather than the wrong thing, and doctor's existing handling cover
 this step is a convenience, a refusal is a `Needs you` saying "codesign may ask for the key", and
 the run goes on to sign. Losing the convenience is a worse outcome than before for us and a better
 one for everybody else's keys, which is why the change lands without waiting for the measurement.
-
-### `managed_session`: the init system owns one session, and every create defers to it
-
-`session up` was already the only path that consulted the launch agent. Everything else that makes
-a session — typing `zellij`, `zellij -s <name>`, `zellij attach --create` — built a server here,
-from whatever binary was on `PATH`, in whatever session domain the shell happened to be in. The
-guards for all of that existed and were one caller short: `ensure_gui_session_domain` had exactly
-one, and it was `session up`.
-
-One key turns that around:
-
-```kdl
-session_name "the-one-session"
-session_service {
-    managed_session true
-}
-```
-
-Unset, nothing changes for anybody: no unit is written that nobody asked for, and every command
-creates a session exactly as it did before. Set, the unit for **`session_name`** becomes
-unconditional, and three things follow.
-
-**The name is `session_name`, matched whole.** No new key was needed — the name was already there
-and `session enable|status|up` already default to it. It is compared as a whole string, never as a
-prefix or a pattern, so `zellij -s scratch` on a machine whose `the-one-session` is managed is an
-ordinary ad-hoc session and stays one. Two DIFFERENT gates come out of that, and the split is the
-design: **installing** a unit needs the name to be the configured one, while **handing a create
-over** needs a loaded unit for that exact name. A machine can only ever grow units for the name it
-named.
-
-**`session enable` stops being a step somebody has to remember.** A thing the init system owns is
-not a thing to opt into once per machine and then keep in step by hand, so the command that is
-about to need the unit writes it: no unit, or a unit that is not what this config would generate,
-and it is installed or rewritten right there. `session enable` keeps working and now means "do it
-now" rather than "opt in". `session disable` still removes the unit, and now says out loud that the
-key will put it back — removing the key is how a removal is made to stick.
-
-**Every create goes through the unit.** On macOS that is `ensure_gui_session_domain` finally
-getting its second caller, unchanged: it kickstarts the loaded agent, and its `Aqua` arm is already
-the recursion guard for the agent's own `session up`. Linux gets the twin it never had —
-`systemctl --user start` on the generated service, whose `Type=oneshot` means the call returns when
-the `session up` it runs has finished. The guard there reads `/proc/self/cgroup` rather than an
-environment variable, for the same reason the macOS one reads launchd's own `XPC_SERVICE_NAME`: it
-is the init system's record of what it started, so it answers on units that are already installed
-and costs no change to a generated file. It compares a whole path **segment**, so
-`zellij-session-my.service` cannot answer for `zellij-session-mysession.service`.
-
-The interception is one function shadowing the `zellij_client::start_client` import, rather than
-two lines repeated at each of the six client call sites — a seventh call added later that quietly
-did not have them is the exact shape of the bug this entry is about.
-
-Two cases are deliberately not handed over. **`--restore <id>`** names a snapshot the unit was
-never given and could not honour, so it keeps its shape and is built here; the ordinary
-resurrection from the in-place cache IS handed over, and has to be — a managed session is created
-after a reboot or a crash, by which time there is a cache for it, so leaving it out would have left
-the feature almost never firing. And **the unit's own process** never asks the init system for
-anything, which is the whole of the recursion story.
-
-Failure behaves differently on the two paths, on purpose. The client path falls back to creating
-the session here, loudly: somebody is waiting at a terminal, and the fault this prevents is a
-session with fewer capabilities than it should have, not a session that does not exist. `session
-up` is stricter and reports a post-condition failure, because nobody is waiting for it.
-
-Nested key, so the rule of the day applied with no exceptions: `session_service` parses its own
-children, and an older build fails the **whole** config on `managed_session`, not just the block.
-Verified against `0.45.0-nkmk.15`, which answers `Unknown session_service entry: "managed_session"`
-and refuses the file. It could not be seeded into a shared config ahead of the binary; it shipped
-with the code that accepts it. This is one of the two keys that bought [the entry that softened
-that rule](#an-unknown-key-in-session_service-warns-instead-of-failing-the-config).
 
 ### A plugin that failed says so afterwards
 

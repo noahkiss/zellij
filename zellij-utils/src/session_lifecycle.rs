@@ -896,50 +896,6 @@ pub fn ensure_gui_session_domain(
     }
 }
 
-/// Whether `session` is the name the init system has been told to own.
-///
-/// TWO names, and the whole gate is that they are the same one. `managed_session` says "the session
-/// this config names is the init system's", and the name it refers to is `session_name`, which is
-/// already there and already what `session enable|status|up` default to. A name typed on the command
-/// line is managed only when it IS that name.
-///
-/// Matched whole, never as a prefix or a pattern. `zellij -s scratch` on a machine whose
-/// `mysession` is managed has to keep working exactly as it did, and a looser test would have
-/// this writing a launch agent for every throwaway name somebody types.
-pub fn is_managed_session_name(managed: bool, configured: Option<&str>, session: &str) -> bool {
-    managed && configured == Some(session)
-}
-
-/// What a path that is about to CREATE a managed session should do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManagedCreate {
-    /// Build the server here, exactly as every build before this one did.
-    CreateHere,
-    /// Ask the init system for it, then attach to what it made.
-    HandOff,
-}
-
-/// The decision itself, kept separate from the machine it is made about.
-///
-/// `unit_loaded` is the init system's own answer for THIS EXACT name - a loaded launchd job, or a
-/// unit the systemd user manager knows. A unit that is merely a file on disk is not something that
-/// can be asked for anything, so it is not a reason to defer.
-///
-/// `running_as_unit` is what stops this from being infinite, and it is the same guard
-/// [`gui_domain_action`] carries for its own arm: the process the unit runs reaches this code too,
-/// and without the flag it would ask the init system to start the job it already is.
-pub fn managed_create_action(
-    is_managed_name: bool,
-    unit_loaded: bool,
-    running_as_unit: bool,
-) -> ManagedCreate {
-    if is_managed_name && unit_loaded && !running_as_unit {
-        ManagedCreate::HandOff
-    } else {
-        ManagedCreate::CreateHere
-    }
-}
-
 /// Whether a `/proc/self/cgroup` body says this process is inside the systemd unit `unit`.
 ///
 /// Pure, so the parse can be exercised on a machine with no systemd. The body is one or more
@@ -972,8 +928,7 @@ pub fn running_as_systemd_unit(unit: &str) -> bool {
 
 /// Whether THIS process is the init system's own job for `session`.
 ///
-/// The one thing standing between "every create goes through the unit" and a process asking the
-/// init system to start the job it is. Both platforms answer from the init system's own record.
+/// Both platforms answer from the init system's own record.
 pub fn running_as_the_unit(session: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -988,41 +943,6 @@ pub fn running_as_the_unit(session: &str) -> bool {
         let _ = session;
         false
     }
-}
-
-/// Whether the word `systemctl is-enabled` printed means there is a unit the manager could start.
-///
-/// It prints a word for every state and exits non-zero for all but one, so the word is the answer
-/// and the exit status is not. `disabled` is deliberately a yes: a unit file the manager knows is
-/// one it can be asked to start, and only `not-found` means there is nothing there.
-pub fn systemd_unit_is_known(state: Option<&str>) -> bool {
-    !matches!(state, None | Some("not-found") | Some(""))
-}
-
-/// Ask the systemd user manager to create the session, and wait for it to have done so.
-///
-/// `Ok(true)` means systemd has been asked and the caller is to attach to what it made rather than
-/// building one here. `Ok(false)` means there was nothing to defer to and the caller is the creator
-/// after all - the same shape [`ensure_gui_session_domain`] answers in, so one caller can handle
-/// both platforms.
-///
-/// The wait is free: the generated unit is `Type=oneshot`, so `systemctl start` returns when the
-/// `session up` it runs has finished.
-#[cfg(target_os = "linux")]
-pub fn ensure_systemd_unit_session(session: &str) -> Result<bool, String> {
-    use crate::session_service::{systemctl, systemd_service_name};
-
-    let unit = systemd_service_name(session);
-    if !systemd_unit_is_known(systemctl::is_enabled(&unit).as_deref()) {
-        return Ok(false);
-    }
-    // the unit cannot be asked to start the unit
-    if running_as_systemd_unit(&unit) {
-        return Ok(false);
-    }
-    println!("      asking systemd for '{}' ({})", session, unit);
-    systemctl::start(&unit)?;
-    Ok(true)
 }
 
 /// Re-exported so the term logic and its callers still read `session_lifecycle::DEFAULT_TERM`.
@@ -5868,51 +5788,6 @@ dev.zellij.session.mysession = {
         );
     }
 
-    /// The gate that keeps `managed_session` from touching anything but the one name it is about.
-    #[test]
-    fn only_the_configured_session_name_is_managed() {
-        assert!(is_managed_session_name(
-            true,
-            Some("mysession"),
-            "mysession"
-        ));
-        // the ad-hoc session on the same machine, which must be untouched
-        assert!(!is_managed_session_name(true, Some("mysession"), "scratch"));
-        // a prefix of the managed name is a DIFFERENT name, not a match
-        assert!(!is_managed_session_name(true, Some("mysession"), "my"));
-        // the key off is the whole feature off
-        assert!(!is_managed_session_name(
-            false,
-            Some("mysession"),
-            "mysession"
-        ));
-        // and no `session_name` in the config means there is nothing for the key to refer to
-        assert!(!is_managed_session_name(true, None, "mysession"));
-    }
-
-    /// Three conditions, and every one of them is a veto. The last is the recursion guard.
-    #[test]
-    fn a_create_is_handed_over_only_when_a_loaded_unit_owns_the_name() {
-        assert_eq!(
-            managed_create_action(true, true, false),
-            ManagedCreate::HandOff
-        );
-        // a unit the init system does not hold cannot be asked for anything
-        assert_eq!(
-            managed_create_action(true, false, false),
-            ManagedCreate::CreateHere
-        );
-        assert_eq!(
-            managed_create_action(false, true, false),
-            ManagedCreate::CreateHere
-        );
-        // the unit's own process asking the init system for the unit is the loop this prevents
-        assert_eq!(
-            managed_create_action(true, true, true),
-            ManagedCreate::CreateHere
-        );
-    }
-
     /// The Linux half of the recursion guard, and the reason it reads a path SEGMENT: one session
     /// name being a prefix of another must not make one unit answer for the other.
     #[test]
@@ -5937,17 +5812,5 @@ dev.zellij.session.mysession = {
                   0::/user.slice/user-1000.slice/user@1000.service/zellij-session-x.service\n";
         assert!(cgroup_says_systemd_unit(v1, "zellij-session-x.service"));
         assert!(!cgroup_says_systemd_unit("", "zellij-session-x.service"));
-    }
-
-    /// `systemctl is-enabled` prints a word for every state and exits non-zero for all but one, so
-    /// the word is the answer. A DISABLED unit is still one the manager can be told to start.
-    #[test]
-    fn only_not_found_means_there_is_no_unit_to_start() {
-        assert!(systemd_unit_is_known(Some("enabled")));
-        assert!(systemd_unit_is_known(Some("disabled")));
-        assert!(systemd_unit_is_known(Some("static")));
-        assert!(!systemd_unit_is_known(Some("not-found")));
-        assert!(!systemd_unit_is_known(Some("")));
-        assert!(!systemd_unit_is_known(None));
     }
 }

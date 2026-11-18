@@ -4068,8 +4068,8 @@ impl Options {
     /// [`SessionServiceOptions::unknown_entries`], logged, and otherwise ignored, so a new key can
     /// go into a shared config before every machine has the binary that reads it. That is how an
     /// unknown TOP-LEVEL key has always behaved; a block that parses its own children lost the
-    /// property by accident, and `managed_session` and `launchd { env }` each cost a config that
-    /// would not load on any machine that was behind.
+    /// property by accident, and a nested key and `launchd { env }` each cost a config that would
+    /// not load on any machine that was behind.
     fn session_service_from_kdl(
         kdl_session_service: &KdlNode,
     ) -> Result<SessionServiceOptions, ConfigError> {
@@ -4082,18 +4082,6 @@ impl Options {
                 // name. It sits in this block because that is the block the unit is generated from
                 "pin_exe" => {
                     session_service.pin_exe = pin_exe_from_kdl(init_system)?;
-                },
-                // like `pin_exe`, not an init system but a property of the install: whether there is
-                // to be a unit for `session_name` at all, without anyone typing `session enable`
-                "managed_session" => {
-                    session_service.managed_session =
-                        Some(kdl_first_entry_as_bool!(init_system).ok_or_else(|| {
-                            ConfigError::new_kdl_error(
-                                "managed_session takes true or false".to_owned(),
-                                init_system.span().offset(),
-                                init_system.span().len(),
-                            )
-                        })?);
                 },
                 // like `pin_exe`, not an init system but a property of the install, and the one
                 // entry here that means the same thing on both of them: how often the watchdog
@@ -4214,7 +4202,7 @@ impl Options {
                 other => {
                     session_service.note_unknown_entry(format!(
                         "unknown session_service entry {:?}, ignored (expected systemd, launchd, \
-                         pin_exe, managed_session, restart_via_launchd or watchdog_interval_secs)",
+                         pin_exe, restart_via_launchd or watchdog_interval_secs)",
                         other
                     ));
                 },
@@ -4242,12 +4230,6 @@ impl Options {
                 init_systems.nodes_mut().push(pin);
             },
             None => {},
-        }
-
-        if let Some(managed) = session_service.managed_session {
-            let mut node = KdlNode::new("managed_session");
-            node.push(KdlValue::Bool(managed));
-            init_systems.nodes_mut().push(node);
         }
 
         if let Some(seconds) = session_service.watchdog_interval_secs {
@@ -10638,101 +10620,6 @@ fn restart_via_launchd_is_on_unless_the_config_turns_it_off() {
     ));
 }
 
-/// The switch that hands `session_name` to the init system. Default-OFF is the half worth
-/// asserting, and it is the opposite of the key above: a machine whose config nobody has touched
-/// must not have a unit written for it.
-#[test]
-fn managed_session_is_off_unless_the_config_turns_it_on() {
-    use crate::session_service::configured_managed_session;
-
-    let unset = Config::from_kdl("", None).unwrap();
-    assert!(!configured_managed_session(
-        unset.options.session_service.as_ref()
-    ));
-
-    // a `session_service` block that says other things still leaves it off
-    let other_keys = Config::from_kdl(
-        "session_service {
-    restart_via_launchd false
-}",
-        None,
-    )
-    .unwrap();
-    assert!(!configured_managed_session(
-        other_keys.options.session_service.as_ref()
-    ));
-
-    let on = Config::from_kdl(
-        "session_service {
-    managed_session true
-}",
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        on.options.session_service.clone().unwrap().managed_session,
-        Some(true)
-    );
-    assert!(configured_managed_session(
-        on.options.session_service.as_ref()
-    ));
-    // and it survives being written out and read back, like every other key in this block
-    assert_eq!(
-        Config::from_kdl(&on.to_string(false), None)
-            .unwrap()
-            .options,
-        on.options
-    );
-
-    let off = Config::from_kdl(
-        "session_service {
-    managed_session false
-}",
-        None,
-    )
-    .unwrap();
-    assert!(!configured_managed_session(
-        off.options.session_service.as_ref()
-    ));
-}
-
-/// A binary that does not know `managed_session` ignores it and says so, rather than failing the
-/// whole config - `manage_my_session` is the misspelling that taught the lesson. What this build
-/// owes in return is a warning naming the key it does accept, and an error when the VALUE is wrong.
-#[test]
-fn managed_session_takes_a_bool_and_is_named_among_what_the_block_accepts() {
-    let config = Config::from_kdl(
-        "session_service {
-    manage_my_session true
-}",
-        None,
-    )
-    .unwrap();
-    let warnings = config
-        .options
-        .session_service
-        .as_ref()
-        .unwrap()
-        .unknown_entries
-        .clone();
-    assert_eq!(warnings.len(), 1, "{:?}", warnings);
-    assert!(warnings[0].contains("manage_my_session"), "{}", warnings[0]);
-    assert!(warnings[0].contains("managed_session"), "{}", warnings[0]);
-
-    let error = Config::from_kdl(
-        "session_service {
-    managed_session \"yes\"
-}",
-        None,
-    )
-    .unwrap_err();
-    assert!(
-        format!("{:?}", error).contains("managed_session"),
-        "{:?}",
-        error
-    );
-}
-
 /// How often the watchdog re-checks, in seconds, on whichever platform generated the unit. The
 /// default is the half worth asserting: a config that has never mentioned this key must leave both
 /// generators writing exactly what they wrote before.
@@ -10749,7 +10636,7 @@ fn watchdog_interval_secs_is_the_generators_own_unless_the_config_retimes_it() {
     // a `session_service` block that says other things still leaves the interval alone
     let other_keys = Config::from_kdl(
         "session_service {
-    managed_session true
+    restart_via_launchd false
 }",
         None,
     )
@@ -11060,7 +10947,6 @@ fn session_service_values_are_types_and_ranges_not_named_choices() {
         Some(PinnedExe::At(PathBuf::from("some-later-keyword")))
     );
     for malformed in [
-        "session_service {\n    managed_session \"yes\"\n}",
         "session_service {\n    restart_via_launchd 1\n}",
         "session_service {\n    watchdog_interval_secs 0\n}",
         "session_service {\n    pin_exe 3\n}",
@@ -11105,7 +10991,6 @@ fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() 
     let session_service = config.options.session_service.as_ref().unwrap();
 
     // every known entry beside the unknown ones is still read
-    assert_eq!(session_service.managed_session, Some(true));
     assert_eq!(session_service.systemd.service, vec!["Nice=-5".to_owned()]);
     assert_eq!(
         session_service.launchd,
@@ -11118,7 +11003,7 @@ fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() 
     // and each unknown one is named exactly once, in the words setup --check prints
     assert_eq!(
         session_service.unknown_entries.len(),
-        3,
+        4,
         "{:?}",
         session_service.unknown_entries
     );
@@ -11130,6 +11015,8 @@ fn an_unknown_name_anywhere_in_session_service_is_ignored_rather_than_refused() 
     );
     assert!(warnings.contains("sockets"), "{}", warnings);
     assert!(warnings.contains("sandbox"), "{}", warnings);
+    // a key a later build removed is just another name this build does not know
+    assert!(warnings.contains("managed_session"), "{}", warnings);
 }
 
 /// A misspelled systemd section holding nothing is the case a softened error would have missed:
@@ -11163,7 +11050,6 @@ fn an_unknown_systemd_section_is_named_even_with_no_directives_in_it() {
 fn a_wrong_value_for_a_known_entry_is_still_an_error() {
     for bad in [
         // wrong type for a known key
-        "session_service {\n    managed_session \"yes\"\n}",
         "session_service {\n    watchdog_interval_secs \"often\"\n}",
         // a known key, a value outside what it can mean
         "session_service {\n    watchdog_interval_secs 0\n}",
