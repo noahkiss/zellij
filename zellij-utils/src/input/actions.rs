@@ -2299,11 +2299,6 @@ impl Action {
             CliAction::LastReply { .. } => {
                 Err("`last-reply` is run by the client, not sent as an action".into())
             },
-            // `drop-file` stores the file on this side and is sent as a `Paste`, so the contract
-            // gains no verb
-            CliAction::DropFile { .. } => {
-                Err("`drop-file` is run by the client, not sent as an action".into())
-            },
             CliAction::TogglePaneBorderless { pane_id } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);
                 match parsed_pane_id {

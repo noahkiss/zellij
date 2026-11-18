@@ -8751,106 +8751,6 @@ they were. A machine picks this up by re-installing the TUI plugin file. Tests: 
 checks each version's events, the zellij-only guard, the states and kinds, the control-character
 flattening and the per-session tracking.
 
-### `drop-file`: hand a pane a file, from any machine, in one command
-
-```
-$ ssh host zellij action drop-file --pane-id sunny-otter --name shot.png < shot.png
-path: /home/u/.cache/zellij/drops/drop-6f1c2a9e-0b4d-4c8e-9a51-3f0e7d2c1b44.png
-bytes: 48213
-pane_id: terminal_3
-handle: sunny-otter
-agent: claude
-form: at
-reference: @/home/u/.cache/zellij/drops/drop-6f1c2a9e-0b4d-4c8e-9a51-3f0e7d2c1b44.png
-```
-
-From nkmk.34. One contract for every front end that has a file and a pane: store the file on the
-session's machine, then paste the reference the pane's program understands. The pane's program
-only reads local files, so the bytes have to land where the session runs first. Stdin carries
-them, so one `ssh` command does the whole job: no SFTP step and no in-band protocol, and it works
-the same under ssh, tssh or mosh.
-
-```
-zellij action drop-file --pane-id <pane> [--name <file name>] [<path> | -]
-zellij action --json drop-file ...    # the same record as one JSON object
-```
-
-`--pane` is an alias of `--pane-id`, and the target is required. With no path and a pipe, the
-bytes come from stdin; `-` reads stdin even from a terminal.
-
-**The reference follows what runs in the pane**, as `list-agents` reports it:
-
-| Pane runs | `form` | Pasted |
-|---|---|---|
-| claude, opencode, pi | `at` | `@/abs/path` |
-| codex, or an agent this build does not know | `path` | `/abs/path` |
-| anything else (a shell) | `shell` | the path quoted for a POSIX shell |
-
-claude, opencode and pi read the file an `@path` in a prompt names; pi's own completion inserts
-that form. Codex's `@` only opens its file search in the composer, and the model sees the bare
-path, so codex gets the bare path. A path with whitespace is double-quoted in the two agent forms
-(`@"/a b/c.png"`) and single-quoted at a shell. The store's own names never contain any.
-
-The paste is a bracketed paste, followed by one space so the next word typed is a new word.
-**Enter is never pressed**: the reference waits in the prompt for the person, or the caller's next
-`send-keys Enter`.
-
-**The store mirrors the upload store of a companion web front end**, so the two front ends share
-one set of rules:
-
-- **Where:** `drops/` in the zellij cache directory: `$XDG_CACHE_HOME/zellij/drops` on Linux.
-  On macOS the cache directory comes from the `directories` crate, which ignores `XDG_CACHE_HOME`,
-  so it is `~/Library/Caches/org.Zellij-Contributors.Zellij/drops`.
-- **Name:** `drop-<uuid v4><ext>`. The extension is kept only when it is one to ten ASCII letters
-  or digits, lower-cased; `--name` supplies it, or the path argument's own name. Stdin without
-  `--name` stores a file with no extension, and an agent may then not know it is an image.
-- **Whole or nothing:** the bytes go to `<name>.part`, are counted, and are renamed into place
-  only when complete.
-- **Ceiling:** 25 MiB. A larger file is an error, exit 1, and the reading stops one byte past the
-  ceiling, so an oversized stdin is not read to its end. An empty file stores nothing and exits 2.
-- **Prune:** every call first deletes the `drop-*` regular files older than seven days, a refused
-  call included. No timer.
-
-What differs from that web store, and why:
-
-- **Prefix `drop-`, not the web store's.** The two stores are separate directories; the prefix is
-  the prune's guard, the same as there.
-- **Private permissions.** The directory is `0700` and each drop `0600`. A drop is often a
-  screenshot of anything.
-- **Prune first, in-process.** The web store prunes after a save with `find -mtime +7`, which
-  rounds to whole days, so a file goes after eight. Here the cut is seven days to the second, and
-  it runs before the store, so a refused call prunes too.
-- **No leading space.** The web composer adds a space before `@path` when its own text
-  does not end in one. The CLI cannot see the pane's line, so it adds only the trailing space.
-- **Not images only.** The web client refuses non-image files. A drop is any file.
-
-**The pane is looked up before anything is stored.** A handle nothing answers to is a miss,
-exit 2, with no file written and stdin unread. A plugin pane is an error, exit 1.
-
-**On the cheap surface.** `drop-file` is answered by the client, like `wait` and `list-agents`: it
-asks one `list-panes --json`, stores the file, and sends an ordinary `Paste`. No `Action`, no
-contract change, no plugin API. If the paste fails after the store, the error names the stored
-path.
-
-**On the MCP surface as `zellij_write_input` `file`**, from nkmk.34: see [handing a pane a
-file](#zellij_write_input-file-hand-a-pane-a-file-from-the-mcp).
-
-Proved against a scratch session, with stand-in `claude` and `codex` programs that turn bracketed
-paste on and record the bytes they receive. The claude pane received `ESC[200~@"<path>" ESC[201~`
-and no CR or LF; the codex pane the bare path; a bash prompt collected shell-quoted paths and ran
-none. A cache directory with a space in it gave the quoted forms. Exactly 25 MiB on stdin was
-stored, one byte more was refused for a path and for stdin, and no `.part` file was left. An
-eight-day-old drop was pruned; a six-day-old drop and an old file without the prefix were kept.
-Over one `ssh localhost` exec, a 300 KB file on stdin was stored byte-identical, the reference was
-pasted, and `action --json` printed the record.
-
-`zellij-utils/src/drop_file.rs` (new: the store, the prune and the reference forms),
-`CliAction::DropFile` in `cli.rs`, a refusal arm in `actions.rs`, the `mutate` band and an
-`OUTPUTS` row in `cli_surface.rs`, `start_drop_file_client` in `zellij-client/src/cli_client.rs`,
-and the dispatch in `src/commands.rs`. Tests: 15 in `drop_file.rs` cover the safe extension, the
-name, the whole-or-nothing write, the permissions, the empty and over-ceiling refusals, a path
-source, the prune's guard and age, and the reference forms and shell quoting.
-
 ### `zellij_wait_for until=agent_idle`: wait for an agent to stop working
 
 From nkmk.34, from the agent-orchestration plan. A session that drives agents in other panes had to
@@ -8988,49 +8888,6 @@ roots, the find, the tail read and the per-harness walk), `cli_client.rs`
 harness's depth, the tail read, every miss of `last_reply_of`, the key table and its refusals, the
 row match, and the paste-then-Enter sequence.
 
-### `zellij_write_input` `file`: hand a pane a file from the MCP
-
-From nkmk.34. `drop-file` had no MCP form, so an agent that wanted another agent to read a
-screenshot typed `@<path>` itself, in claude's form whatever the pane ran, and pointed at a file
-that could move or vanish before it was read.
-
-```
-zellij_write_input {"pane": "sunny-otter", "file": "~/shots/ci.png"}
-  # action drop-file --pane-id sunny-otter -- /home/u/shots/ci.png
-path: /home/u/.cache/zellij/drops/drop-<uuid>.png
-bytes: 48213
-pane_id: terminal_3
-handle: sunny-otter
-agent: claude
-form: at
-reference: @/home/u/.cache/zellij/drops/drop-<uuid>.png
-```
-
-- **`file` is a fourth input mode**, beside `keys`, `text` and `agent_action`. It runs `action
-  drop-file` on the path, so the copy, the 25 MiB ceiling, the prune and the per-harness
-  reference form are `drop-file`'s own: `@path` for claude, opencode and pi, the bare path for
-  codex, a shell-quoted path at a shell. The answer is `drop-file`'s record.
-- **Enter is never pressed.** The reference waits at the pane's prompt. The caller follows with
-  `text` and `submit: true` to say what to do with it, in a second call.
-- **The path is this server's.** `~` and `$VAR` are expanded, a relative path is taken from the
-  server's directory. `-` is refused: the CLI would read stdin,
-  and the server's child has none.
-- **Refused, nothing stored or pasted:** `file` with `keys` or `text` ("pass it alone"), with
-  `submit` or `agent_action` ("presses nothing"). A path that is not a file and a pane no one
-  answers to are `drop-file`'s own refusals, exit 1 and 2.
-- The tool stays at seven parameters.
-
-Proved over MCP stdio against a scratch session, with stand-in `claude` and `codex` programs that
-turn bracketed paste on and record the bytes they receive. A relative path, a `$PWD` path and an
-absolute path were each stored byte-identical in `drops/`; the claude pane received
-`ESC[200~@<path> ESC[201~`, the codex pane the bare path, and a bash pane's prompt held the path,
-not run. No CR or LF reached any pane. `submit` with `file` and a missing file were refused, and
-an unknown pane answered as a miss.
-
-`src/mcp/tools.rs` (the parameter, the tips, `action drop-file` in `reports`),
-`src/mcp/invoke.rs` (`argv_in`, the refusals in `write_input_call`). Tests: the command line, a
-path beginning with a dash kept behind `--`, and the four refusals.
-
 ### `zellij_overview scope=my_agents`: the supervision view
 
 From nkmk.34, from the agent-orchestration plan. A session that started several agents had no one
@@ -9135,9 +8992,6 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   structured result is `{agents, hosts}`, where `hosts` says per host how many agents it has, or
   its error. It takes no `session`. State and output ages are computed against this machine's
   clock.
-- **Files go over stdin.** A file the caller names lives on the caller's machine. `zellij_write_input`
-  `file` sends its bytes over ssh stdin to `action drop-file --name=<its name> -- -`, so the
-  remote store, reference and paste are the ones a local drop makes.
 - **What changes for a create on another machine.** `kind: stacked` is refused:
   it needs the caller's own pane, which is not in that session. `agent_tab` and `tab` work. The
   agent tab is named after the caller's own tab on this machine, so a caller has one tab name on
@@ -9167,12 +9021,12 @@ from the parsed config (`write_config_to_disk`) drops the block, as it drops com
 
 `src/mcp/remote.rs` (new: the block, `route`, quoting, the two remote scripts, ssh's argv, the
 upload), `src/mcp/fleet.rs` (new: the parallel ask, the older-build fallback, the merge),
-`src/mcp/invoke.rs` (`run_on`, `Plan.stdin`, `CallEnv.remote`, the remote arms of create, write,
+`src/mcp/invoke.rs` (`run_on`, `CallEnv.remote`, the remote arms of create, write,
 show and the agent tab), `src/mcp/mod.rs` (routing, `with_host`, the instructions),
 `src/mcp/tools.rs` (the `fleet` scope and the `session` text), `src/main.rs` (the config path),
 `zellij-utils/src/capabilities.rs`. Tests: the block, the `from` table (column, where, a missing file, an unknown column, an inline override, an upper-case local host) and their warnings, routing and the
 whitelist refusal, the local-host match, quoting through a real `sh`, the probe with `bin=` and
-on `PATH`, ssh's argv, the upload script, the remote argv of every create, drop and show arm,
+on `PATH`, ssh's argv, the upload script, the remote argv of every create and show arm,
 and the fleet merge through a stand-in ssh with one host down, one too old for
 `--all-sessions` and one past the bound.
 

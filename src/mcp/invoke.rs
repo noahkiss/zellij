@@ -99,17 +99,10 @@ pub async fn run(argv: &[String]) -> Result<Outcome, String> {
 }
 
 /// Run the CLI where the call is going: this machine, or another over ssh.
-///
-/// `stdin` is the bytes a remote verb reads in place of a file on its own machine - a drop. A
-/// local call never has any: the local CLI reads the file itself.
-pub async fn run_on(
-    target: &Target,
-    argv: &[String],
-    stdin: Option<Vec<u8>>,
-) -> Result<Outcome, String> {
+pub async fn run_on(target: &Target, argv: &[String]) -> Result<Outcome, String> {
     match target {
         Target::Local => run(argv).await,
-        Target::Remote(host) => remote::run(host, argv, stdin).await,
+        Target::Remote(host) => remote::run(host, argv).await,
     }
 }
 
@@ -222,9 +215,6 @@ pub struct Plan {
     /// `zellij_overview` with `scope: agents` or `my_agents`: how the agent list is shaped before
     /// it is returned. `None` for every other call.
     pub agents: Option<AgentsView>,
-    /// What a remote `zellij_write_input` `file` sends over stdin: the file's bytes, read on this
-    /// machine. `None` for every other call.
-    pub stdin: Option<Vec<u8>>,
 }
 
 /// How much of an agent's command line `zellij_overview` returns. Enough to tell agents apart.
@@ -285,7 +275,6 @@ impl From<Call> for Plan {
             call,
             then_type: None,
             agents: None,
-            stdin: None,
         }
     }
 }
@@ -485,7 +474,7 @@ async fn pane_list(target: &Target, session: Option<&str>) -> Option<String> {
         "list-panes".to_owned(),
         "--json".to_owned(),
     ]);
-    let outcome = run_on(target, &argv, None).await.ok()?;
+    let outcome = run_on(target, &argv).await.ok()?;
     if outcome.is_error() {
         return None;
     }
@@ -578,24 +567,9 @@ async fn plan_in(
     let target_session = read
         .string("session")
         .or_else(|| ambient_session.map(String::from));
-    let remote_host = match target {
-        Target::Remote(host) => Some(host),
-        Target::Local => None,
-    };
     if tool == "zellij_write_input" {
         if let Some(call) = write_input_call(&read, ambient_session, target).await? {
             return Ok(call.into());
-        }
-        if let (Some(_), Some(file)) = (remote_host, read.string("file")) {
-            // the file is on this machine and the pane is not: its bytes go over ssh's stdin, to
-            // a `drop-file` that reads `-`
-            let argv = argv_in(tool, args, ambient_session, env, None)?;
-            let path = local_file(&file, env, "file")?;
-            let bytes = std::fs::read(&path)
-                .map_err(|e| format!("`file` {} could not be read: {}", path.display(), e))?;
-            let mut plan: Plan = Call::One(argv).into();
-            plan.stdin = Some(bytes);
-            return Ok(plan);
         }
     }
     if tool == "zellij_overview" {
@@ -615,7 +589,6 @@ async fn plan_in(
                 call,
                 then_type: None,
                 agents: Some(AgentsView { only_tab }),
-                stdin: None,
             });
         }
     }
@@ -636,7 +609,6 @@ async fn plan_in(
             call,
             then_type,
             agents: None,
-            stdin: None,
         });
     }
     // before the session is asked anything: a handle the CLI would refuse is refused for free
@@ -649,7 +621,6 @@ async fn plan_in(
             call,
             then_type,
             agents: None,
-            stdin: None,
         });
     }
     let rename = pane_name(&read).map(|name| RenameAfter {
@@ -661,24 +632,7 @@ async fn plan_in(
         call,
         then_type,
         agents: None,
-        stdin: None,
     })
-}
-
-/// A file a caller named, on this machine: `~` and `$VAR` expanded, a relative path taken from
-/// this server's directory, and refused when it is not a file.
-fn local_file(path: &str, env: &CallEnv, param: &str) -> Result<PathBuf, String> {
-    let expanded = expand_path(path, env)?;
-    let path = Path::new(&expanded);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env.base.join(path)
-    };
-    if !path.is_file() {
-        return Err(format!("`{}` {} is not a file.", param, path.display()));
-    }
-    Ok(path)
 }
 
 /// Refuse removed placement options before querying a session.
@@ -717,13 +671,6 @@ async fn write_input_call(
 ) -> Result<Option<Call>, String> {
     let submit = args.flag("submit");
     let action = args.string("agent_action");
-    if args.string("file").is_some() && (submit || action.is_some()) {
-        return Err(
-            "`file` pastes a reference and presses nothing: pass it alone, then send the \
-             message about it with text and submit in a second call."
-                .to_owned(),
-        );
-    }
     if !submit && action.is_none() {
         return Ok(None);
     }
@@ -770,7 +717,6 @@ async fn write_input_call(
                 "list-agents".to_owned(),
                 "--json".to_owned(),
             ]),
-            None,
         )
         .await?;
         if agents.is_error() {
@@ -1131,52 +1077,6 @@ fn argv_in(
         },
         "zellij_write_input" => {
             let pane = args.required("pane")?;
-            if let Some(file) = args.string("file") {
-                if args.string("keys").is_some() || args.string("text").is_some() {
-                    return Err(
-                        "`file` pastes its own reference: pass it alone, without keys \
-                                or text."
-                            .to_owned(),
-                    );
-                }
-                // the CLI reads `-` as stdin, and this server's child has none to give
-                if file.trim() == "-" {
-                    return Err(
-                        "`file` is a path on this server's machine; there is no stdin to read \
-                         one from."
-                            .to_owned(),
-                    );
-                }
-                if env.remote {
-                    // the bytes arrive on stdin - see `plan_in` - and the name keeps the extension
-                    // the store and the pane's program go by
-                    let expanded = expand_path(&file, env)?;
-                    let name = Path::new(&expanded)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let mut rest = vec![
-                        "action".to_owned(),
-                        "drop-file".to_owned(),
-                        "--pane-id".to_owned(),
-                        pane,
-                    ];
-                    if !name.is_empty() {
-                        rest.push(flag_value("--name", &name));
-                    }
-                    rest.extend(["--".to_owned(), "-".to_owned()]);
-                    return Ok(scoped(rest));
-                }
-                return Ok(scoped(vec![
-                    "action".to_owned(),
-                    "drop-file".to_owned(),
-                    "--pane-id".to_owned(),
-                    pane,
-                    // the path is a file, whatever its first character
-                    "--".to_owned(),
-                    expand_path(&file, env)?,
-                ]));
-            }
             match (args.string("keys"), args.string("text")) {
                 (Some(_), Some(_)) => Err(
                     "Pass `keys` or `text`, not both: one presses keys and the other writes \
@@ -1497,19 +1397,6 @@ fn argv_in(
     }
 }
 
-/// A path as a caller writes it, with `~` and `$VAR` expanded against this server's environment.
-/// A relative path stays relative: the CLI resolves it against its own directory, which is this
-/// server's, and refuses one that is not a file.
-fn expand_path(path: &str, env: &CallEnv) -> Result<String, String> {
-    shellexpand::full_with_context(
-        path,
-        || env.home.clone(),
-        |name| Ok::<Option<String>, std::convert::Infallible>((env.var)(name)),
-    )
-    .map(|expanded| expanded.into_owned())
-    .map_err(|e| format!("`{}` could not be expanded: {}", path, e))
-}
-
 /// What the process around a call looks like, read once at the top of it.
 ///
 /// Every field answers a question about the caller rather than about the session, and none of them
@@ -1785,48 +1672,6 @@ mod tests {
             json!({"pane": "3", "keys": "Enter", "text": "hi"})
         )
         .contains("not both"));
-    }
-
-    #[test]
-    fn a_file_is_dropped_into_the_pane_and_never_submitted() {
-        assert_eq!(
-            line(
-                "zellij_write_input",
-                json!({"pane": "sunny-otter", "file": "-shot.png"}),
-                Some("work")
-            ),
-            "-s work action drop-file --pane-id sunny-otter -- -shot.png"
-        );
-        for refused in [
-            json!({"pane": "3", "file": "a.png", "text": "look"}),
-            json!({"pane": "3", "file": "a.png", "keys": "Enter"}),
-        ] {
-            assert!(
-                refusal("zellij_write_input", refused.clone()).contains("pass it alone"),
-                "{}",
-                refused
-            );
-        }
-        assert!(refusal("zellij_write_input", json!({"pane": "3", "file": "-"})).contains("stdin"));
-    }
-
-    #[tokio::test]
-    async fn a_file_is_not_submitted_or_mixed_with_an_agent_action() {
-        for refused in [
-            json!({"pane": "3", "file": "a.png", "submit": true}),
-            json!({"pane": "3", "file": "a.png", "agent_action": "approve"}),
-        ] {
-            let said = plan(
-                "zellij_write_input",
-                refused.as_object().unwrap(),
-                None,
-                &Target::Local,
-            )
-            .await
-            .err()
-            .expect("refused");
-            assert!(said.contains("presses nothing"), "{}", said);
-        }
     }
 
     #[test]
@@ -2840,58 +2685,6 @@ mod tests {
         let mut env = a_shell_env();
         env.remote = true;
         env
-    }
-
-    #[test]
-    fn a_remote_drop_reads_stdin_and_keeps_the_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let shot = dir.path().join("shot one.png");
-        std::fs::write(&shot, b"png").unwrap();
-        assert_eq!(
-            built(
-                "zellij_write_input",
-                json!({"pane": "sunny-otter", "file": shot.display().to_string()}),
-                Some("work"),
-                &a_remote_env()
-            )
-            .join(" "),
-            "-s work action drop-file --pane-id sunny-otter --name=shot one.png -- -"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_remote_drop_carries_the_bytes_of_the_local_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let shot = dir.path().join("shot.png");
-        std::fs::write(&shot, b"\x89PNG bytes").unwrap();
-        let host = remote::RemoteHost {
-            name: "boxa".into(),
-            bin: None,
-        };
-        let plan = plan_in(
-            "zellij_write_input",
-            &args(
-                json!({"pane": "sunny-otter", "file": shot.display().to_string(),
-                         "session": "work"}),
-            ),
-            None,
-            &a_remote_env(),
-            &Target::Remote(host.clone()),
-        )
-        .await
-        .ok()
-        .expect("a plan");
-        assert_eq!(plan.stdin.as_deref(), Some(&b"\x89PNG bytes"[..]));
-        // and a file that is not there is refused before ssh is run
-        let missing = plan_in(
-            "zellij_write_input",
-            &args(json!({"pane": "sunny-otter", "file": "/nonexistent/shot.png"})),
-            None,
-            &a_remote_env(),
-            &Target::Remote(host),
-        )
-        .await;
-        assert!(matches!(missing, Err(reason) if reason.contains("is not a file")));
     }
 
     #[test]

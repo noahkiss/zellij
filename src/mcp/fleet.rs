@@ -75,11 +75,11 @@ pub async fn gather(targets: Vec<(String, Target)>, timeout: Duration) -> Vec<(S
 /// asked for its sessions with `ls --json` and then for each session's agents, and the answer is
 /// put in the same shape, each row carrying its `session`.
 async fn ask(target: &Target, argv: &[String]) -> Answer {
-    let outcome = invoke::run_on(target, argv, None).await?;
+    let outcome = invoke::run_on(target, argv).await?;
     if outcome.code != 2 || !outcome.stderr.contains("--all-sessions") {
         return Ok(outcome);
     }
-    let sessions = invoke::run_on(target, &["ls".to_owned(), "--json".to_owned()], None).await?;
+    let sessions = invoke::run_on(target, &["ls".to_owned(), "--json".to_owned()]).await?;
     if sessions.is_error() {
         return Ok(sessions);
     }
@@ -97,7 +97,7 @@ async fn ask(target: &Target, argv: &[String]) -> Answer {
             .map(|word| (*word).to_owned())
             .collect();
         // a session that does not answer is left out, as `--all-sessions` leaves it out
-        let Ok(said) = invoke::run_on(target, &one, None).await else {
+        let Ok(said) = invoke::run_on(target, &one).await else {
             continue;
         };
         let Ok(Value::Array(rows)) = serde_json::from_str::<Value>(said.stdout.trim()) else {

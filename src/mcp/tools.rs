@@ -321,7 +321,7 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "zellij_write_input",
         summary: "Type into a named pane, as if at its keyboard, or send a coding agent in it a \
-                  message, a file, an interrupt or an answer to its approval prompt.",
+                  message, an interrupt or an answer to its approval prompt.",
         best_for: "driving a program that is already running in a pane - answering a prompt, \
                    sending a line to a shell, talking to an agent in another pane.",
         not_for: "starting something in a NEW pane, and not for a pane you have not named. There \
@@ -329,10 +329,10 @@ pub const TOOLS: &[ToolSpec] = &[
         follow_up: Some("zellij_wait_for or zellij_read_pane to see what the pane did with it"),
         // `keys` presses keys and `text` writes characters, which are two verbs, not one with a
         // flag: a tool that multiplexes says what each of its commands returns
-        reports: &["action send-keys", "action write-chars", "action drop-file"],
+        reports: &["action send-keys", "action write-chars"],
         tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
-               text is written literally and presses nothing. Pass one of keys, text, \
-               file or agent_action. This is the cheap way to do more work in a pane you already made: \
+               text is written literally and presses nothing. Pass one of keys, text or \
+               agent_action. This is the cheap way to do more work in a pane you already made: \
                reach for it before zellij_create. Prefer your harness's messaging tool for a named agent. \
                Successful input to a named agent adds a messaging hint. To send pane input, pass text with \
                submit=true: the text goes in as one bracketed paste, so its newlines do not send \
@@ -343,12 +343,7 @@ pub const TOOLS: &[ToolSpec] = &[
                its first option (allow once); deny refuses it. A call that does not fit the \
                state - approve when nothing is asked, interrupt when the agent is idle - is \
                refused and presses nothing. A question the agent asks (blocked, kind question) \
-               is answered with keys or text, not with approve. file hands the pane a file: it \
-               is copied into the session's drops directory and a reference to the copy is \
-               pasted at the pane's prompt, in the form what runs there reads - an at-sign path \
-               for claude, opencode and pi, the bare path for codex, a shell-quoted path at a \
-               shell. Enter is never pressed: follow with text and submit=true to say what to do \
-               with it. The answer names the stored path and the reference pasted.",
+               is answered with keys or text, not with approve.",
         params: &[
             SESSION,
             ParamSpec {
@@ -398,17 +393,6 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "Act on the coding agent in the pane: interrupt its work, approve its \
                            permission prompt, or deny it. The key is the one that agent expects, \
                            and nothing is pressed unless the agent's state fits.",
-                default: None,
-            },
-            ParamSpec {
-                name: "file",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("action drop-file", "file")),
-                describe: "A file on this server's machine to hand the pane: stored, and its \
-                           reference pasted without pressing Enter. `~` and `$VAR` are expanded, \
-                           and a relative path is taken from this server's directory. Up to 25 \
-                           MiB. Pass it alone, without keys, text or agent_action.",
                 default: None,
             },
         ],

@@ -140,7 +140,7 @@ impl ZellijMcp {
                 },
             };
         let then_type = plan.then_type;
-        let (argv, mut outcome) = match self.run_plan(plan.call, &target, plan.stdin).await {
+        let (argv, mut outcome) = match self.run_plan(plan.call, &target).await {
             Ok(ran) => ran,
             Err(message) => {
                 return with_host(failed(message, json!({"reason": "not_run"})), &target)
@@ -208,7 +208,7 @@ impl ZellijMcp {
             "list-panes".to_owned(),
             "--json".to_owned(),
         ]);
-        let outcome = invoke::run_on(target, &argv, None).await.ok()?;
+        let outcome = invoke::run_on(target, &argv).await.ok()?;
         if outcome.is_error() {
             return None;
         }
@@ -243,11 +243,10 @@ impl ZellijMcp {
         &self,
         plan: invoke::Call,
         target: &remote::Target,
-        stdin: Option<Vec<u8>>,
     ) -> Result<(Vec<String>, invoke::Outcome), String> {
         let (argv, rename) = match plan {
             invoke::Call::One(argv) => {
-                let outcome = invoke::run_on(target, &argv, stdin).await?;
+                let outcome = invoke::run_on(target, &argv).await?;
                 return Ok((argv, outcome));
             },
             invoke::Call::Sequence(argvs) => {
@@ -259,7 +258,7 @@ impl ZellijMcp {
                         ))
                         .await;
                     }
-                    let outcome = invoke::run_on(target, &argv, None).await?;
+                    let outcome = invoke::run_on(target, &argv).await?;
                     let failed = outcome.is_error();
                     ran = Some((argv, outcome));
                     if failed {
@@ -270,13 +269,13 @@ impl ZellijMcp {
             },
             invoke::Call::MakingAgentTab { argv, rename } => (argv, rename),
         };
-        let mut outcome = invoke::run_on(target, &argv, None).await?;
+        let mut outcome = invoke::run_on(target, &argv).await?;
         // `--new-tab` refuses `--name`, so the pane that arrived with the tab is named now. A
         // rename that fails is a pane with the wrong title, not a create that did not happen: it
         // is reported beside the create rather than instead of it, and a rename that could not be
         // run at all says so rather than vanishing
         if let (Some(rename), Some(pane)) = (rename, invoke::reported_pane_id(&outcome.stdout)) {
-            match invoke::run_on(target, &rename.argv(&pane), None).await {
+            match invoke::run_on(target, &rename.argv(&pane)).await {
                 Ok(renamed) if renamed.is_error() => {
                     also_said(&mut outcome.stderr, &renamed.stderr)
                 },
@@ -415,7 +414,7 @@ async fn type_into_created_pane(
         return false;
     }
     for argv in then_type.argvs(&pane) {
-        let failure = match invoke::run_on(target, &argv, None).await {
+        let failure = match invoke::run_on(target, &argv).await {
             Ok(said) if said.is_error() => (said.code, said.stderr),
             Ok(_) => continue,
             Err(message) => (1, message),
@@ -493,7 +492,7 @@ async fn created_pane_row(
     target: &remote::Target,
 ) -> Option<Value> {
     let [list, _] = then_type.read_back_argvs(pane);
-    let said = invoke::run_on(target, &list, None).await.ok()?;
+    let said = invoke::run_on(target, &list).await.ok()?;
     if said.is_error() {
         return None;
     }
@@ -521,7 +520,7 @@ async fn typed_command_seen(
                 return Some(true);
             }
         }
-        if let Ok(screen) = invoke::run_on(target, &dump, None).await {
+        if let Ok(screen) = invoke::run_on(target, &dump).await {
             if !screen.is_error() {
                 read_any = true;
                 if typed_on_screen(&screen.stdout, then_type.command()) {

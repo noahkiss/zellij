@@ -593,42 +593,22 @@ fn ssh_program() -> String {
         .unwrap_or_else(|| "ssh".to_owned())
 }
 
-/// Run one remote line on `host`, with `stdin` fed to it when there is any.
+/// Run one remote line on `host`.
 ///
 /// Exit 255 is ssh's own failure - the host did not answer, or refused the key - and says so,
 /// since the remote CLI never exits 255 and the bare ssh message does not name the cause.
-pub async fn run_line(
-    host: &str,
-    remote_line: String,
-    stdin: Option<Vec<u8>>,
-) -> Result<Outcome, String> {
+pub async fn run_line(host: &str, remote_line: String) -> Result<Outcome, String> {
     let program = ssh_program();
     let argv = ssh_argv(host, remote_line, control_dir().as_deref());
-    let mut child = tokio::process::Command::new(&program)
+    let output = tokio::process::Command::new(&program)
         .args(&argv)
-        .stdin(if stdin.is_some() {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("Could not run `{}` to reach {}: {}", program, host, e))?;
-    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        // written beside the wait, not before it: a remote that answers before it has read
-        // everything would otherwise fill its stdout pipe while this side is still writing
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let _ = pipe.write_all(&bytes).await;
-            let _ = pipe.shutdown().await;
-        });
-    }
-    let output = child
-        .wait_with_output()
+        .output()
         .await
-        .map_err(|e| format!("`{}` to {} failed: {}", program, host, e))?;
+        .map_err(|e| format!("Could not run `{}` to reach {}: {}", program, host, e))?;
     let code = output.status.code().unwrap_or(1);
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if code == 255 {
@@ -642,12 +622,8 @@ pub async fn run_line(
 }
 
 /// Run `zellij <argv>` on `host`.
-pub async fn run(
-    host: &RemoteHost,
-    argv: &[String],
-    stdin: Option<Vec<u8>>,
-) -> Result<Outcome, String> {
-    run_line(&host.name, zellij_command(host, argv), stdin).await
+pub async fn run(host: &RemoteHost, argv: &[String]) -> Result<Outcome, String> {
+    run_line(&host.name, zellij_command(host, argv)).await
 }
 
 #[cfg(test)]
