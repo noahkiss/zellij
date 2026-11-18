@@ -454,7 +454,6 @@ both are wanted in a script: the target proves *what*, `--yes` proves the destru
 
 What deliberately does not confirm:
 
-- **`signal-pane`** — the signal's NAME is the stated intent, and the target is already explicit.
 - **`session down`** — the fork takes a snapshot first, so it is recoverable.
 - **The write family** — it injects input but destroys nothing of its own; class-3 targeting is the
   guard it needs.
@@ -4701,34 +4700,6 @@ an error instead of a partial move.
 `zellij-server/src/screen.rs` (`panes_not_found` and the instruction handlers). Tests in
 `zellij-server/src/unit/screen_tests.rs`.
 
-### `signal-pane` — signal the process in a pane
-
-```
-zellij action signal-pane --pane-id terminal_3               # SIGINT
-zellij action signal-pane --pane-id terminal_3 --signal kill
-```
-
-Plugins could send SIGINT and SIGKILL to a pane; the CLI could not, and `write-chars $'\003'` is not
-the same thing — it asks whatever is reading the pty to interpret a keystroke, which a program that
-has turned off canonical input, or a pane whose reader has wedged, will not do. `--signal` takes
-`int`, `hup` or `kill`, the three the server can already deliver, and defaults to `int`.
-
-`--pane-id` is required: a signal is destructive enough that it should never fall back to whatever
-happens to be focused, and requiring it makes the command safe in a detached session. Naming a pane
-that does not exist, or a plugin pane, which runs no process, fails with the reason on stderr rather
-than warning into the log. A pane held open after its command exited fails the same way: its child
-was reaped, and the pid it ran with may since have been given to an unrelated process. Until
-nkmk.31 that refusal never fired in a running server, and the signal went to the dead pid: see [A
-held pane forgets its dead pid](#a-held-pane-forgets-its-dead-pid).
-
-The signal goes to the process zellij spawned for the pane — the pane's shell — which is what the
-plugin API has always done. A shell without job control runs its command in that same process, so
-this reaches the command; a shell with job control will handle the signal itself.
-
-This adds an `Action` and therefore a message to the client/server contract. Fork action messages
-start at **tag 160**, leaving 149-159 for upstream, so an upstream bump does not have to renumber
-anything the fork added.
-
 ### `zellij ls --json`
 
 ```
@@ -8530,8 +8501,8 @@ upstream's pty thread never messaged itself. The send failed, the failure was ig
   next pane's pty reuses the lowest free fd number - so the held pane answered with the newer
   pane's argv. A pane with no later pane did not leak, which is why this hid.
 - **A signal to a recycled pid.** `close-pane` sent SIGHUP to the dead pid, session teardown sent
-  SIGHUP then SIGKILL to its group, and `signal-pane` signalled it instead of refusing. Once the OS
-  hands that pid out again, any of the three can kill an unrelated process.
+  SIGHUP then SIGKILL to its group. Once the OS hands that pid out again, either can kill an
+  unrelated process.
 
 **The fix.** The pty thread's bus carries a sender to itself (`pty_thread_bus` in `lib.rs`, built
 in one place so a test builds the same bus). On `ChildProcessExited` the pane also forgets its pty

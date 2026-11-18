@@ -120,7 +120,7 @@ pub struct RgbColor {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Action {
-    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 160, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175")]
+    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 163, 164, 165, 166, 167, 168, 169, 172, 173, 174, 175")]
     pub action_type: ::core::option::Option<action::ActionType>,
 }
 /// Nested message and enum types in `Action`.
@@ -433,9 +433,8 @@ pub mod action {
         SelectCommandAtScrollPosition(super::SelectCommandAtScrollPositionAction),
         #[prost(message, tag="151")]
         CopyLastCommandOutput(super::CopyLastCommandOutputAction),
-        /// fork additions start at 160, leaving room below for upstream
-        #[prost(message, tag="160")]
-        SignalPane(super::SignalPaneAction),
+        /// fork additions start at 160, leaving room below for upstream; 160-162 and 170-171 are
+        /// reserved above
         #[prost(message, tag="163")]
         SetPaneFullscreen(super::SetPaneFullscreenAction),
         #[prost(message, tag="164")]
@@ -2356,14 +2355,6 @@ pub struct MoveTabToIndexAction {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SignalPaneAction {
-    #[prost(message, optional, tag="1")]
-    pub pane_id: ::core::option::Option<PaneId>,
-    #[prost(enumeration="PaneSignal", tag="2")]
-    pub signal: i32,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetPaneFullscreenAction {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
@@ -3212,38 +3203,6 @@ impl ThemeHue {
             "THEME_HUE_UNSPECIFIED" => Some(Self::Unspecified),
             "THEME_HUE_DARK" => Some(Self::Dark),
             "THEME_HUE_LIGHT" => Some(Self::Light),
-            _ => None,
-        }
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
-#[repr(i32)]
-pub enum PaneSignal {
-    Unspecified = 0,
-    Int = 1,
-    Hup = 2,
-    Kill = 3,
-}
-impl PaneSignal {
-    /// String value of the enum field names used in the ProtoBuf definition.
-    ///
-    /// The values are not transformed in any way and thus are considered stable
-    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
-    pub fn as_str_name(&self) -> &'static str {
-        match self {
-            PaneSignal::Unspecified => "PANE_SIGNAL_UNSPECIFIED",
-            PaneSignal::Int => "PANE_SIGNAL_INT",
-            PaneSignal::Hup => "PANE_SIGNAL_HUP",
-            PaneSignal::Kill => "PANE_SIGNAL_KILL",
-        }
-    }
-    /// Creates an enum from field names used in the ProtoBuf definition.
-    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
-        match value {
-            "PANE_SIGNAL_UNSPECIFIED" => Some(Self::Unspecified),
-            "PANE_SIGNAL_INT" => Some(Self::Int),
-            "PANE_SIGNAL_HUP" => Some(Self::Hup),
-            "PANE_SIGNAL_KILL" => Some(Self::Kill),
             _ => None,
         }
     }

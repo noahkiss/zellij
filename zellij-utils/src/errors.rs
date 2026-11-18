@@ -532,7 +532,6 @@ pub enum PtyContext {
     ListClientsToPlugin,
     ReportPluginCwd,
     SendSigintToPaneId,
-    SignalPaneId,
     SendSigkillToPaneId,
     GetPanePid,
     GetPaneRunningCommand,

@@ -1230,7 +1230,6 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::MoveTabByTabId { .. }
             | Action::MoveTabToIndex { .. }
             | Action::NewShellPane { .. }
-            | Action::SignalPane { .. }
             | Action::SetPaneFullscreen { .. }
             | Action::SetPanePinned { .. }
             | Action::SetPaneFloating { .. }

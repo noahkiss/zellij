@@ -670,23 +670,6 @@ fn what_the_environment_says_wins_and_bin_sh_is_still_the_last_resort() {
     assert_eq!(default_shell_from(None, || None), PathBuf::from("/bin/sh"));
 }
 
-#[test]
-fn each_signal_reaches_the_pane_process() {
-    for (signal, expected) in [
-        (PaneSignal::Int, "INT"),
-        (PaneSignal::Hup, "HUP"),
-        (PaneSignal::Kill, "KILL"),
-    ] {
-        let mock = MockOsApi::new();
-        let recorder = mock.clone();
-        let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
-        set_active_terminal(&mut pty, 1, 4242);
-
-        pty.signal_pane(PaneId::Terminal(1), signal).expect("TEST");
-        assert_eq!(recorder.signals_sent(), vec![(4242, expected)]);
-    }
-}
-
 /// The pid of a reaped child is the OS's to hand out again, so a pane that outlives its command
 /// must not keep it: signalling it would hit whatever process holds that number now.
 #[test]
@@ -737,46 +720,10 @@ fn a_held_pane_forgets_the_pid_of_its_reaped_child() {
         GetPanePidResponse::Err(_) => {},
         other => panic!("a held pane should report no pid, got {:?}", other),
     }
-    let result = pty.signal_pane(PaneId::Terminal(1), PaneSignal::Kill);
-    assert!(
-        result.unwrap_err().contains("no running process"),
-        "signalling a held pane should say there is no process, not signal a recycled pid"
-    );
     assert!(
         recorder.signals_sent().is_empty(),
         "nothing should have been signalled"
     );
-}
-
-#[test]
-fn signalling_a_pane_that_does_not_exist_is_an_error() {
-    let mock = MockOsApi::new();
-    let recorder = mock.clone();
-    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
-    set_active_terminal(&mut pty, 1, 4242);
-
-    let result = pty.signal_pane(PaneId::Terminal(7), PaneSignal::Int);
-    assert!(result.is_err(), "no pane 7");
-    assert!(
-        result.unwrap_err().contains("no running process"),
-        "the error names the miss"
-    );
-    assert!(
-        recorder.signals_sent().is_empty(),
-        "and nothing was signalled"
-    );
-}
-
-#[test]
-fn a_plugin_pane_has_no_process_to_signal() {
-    let mock = MockOsApi::new();
-    let recorder = mock.clone();
-    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
-    set_active_terminal(&mut pty, 1, 4242);
-
-    let result = pty.signal_pane(PaneId::Plugin(1), PaneSignal::Kill);
-    assert!(result.is_err(), "a plugin pane runs no process");
-    assert!(recorder.signals_sent().is_empty());
 }
 
 /// An idle session should not wake the screen thread once a second to tell it nothing.

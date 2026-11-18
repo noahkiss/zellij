@@ -123,7 +123,6 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "set-pane-pinned",
             "set-sync-tab",
             "show-floating-panes",
-            "signal-pane",
             "stack-panes",
             "toggle-active-sync-tab",
             "toggle-floating-panes",

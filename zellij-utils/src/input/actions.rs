@@ -8,7 +8,7 @@ use super::layout::{
 use crate::cli::CliAction;
 use crate::data::{
     CommandOrPlugin, Direction, KeyWithModifier, LayoutInfo, NewPanePlacement, OriginatingPlugin,
-    PaneId, PaneSignal, Resize, UnblockCondition,
+    PaneId, Resize, UnblockCondition,
 };
 use crate::data::{FloatingPaneCoordinates, InputMode, PaneTarget};
 use crate::home::{find_default_config_dir, get_layout_dir};
@@ -677,10 +677,6 @@ pub enum Action {
     ChangeFloatingPaneCoordinates {
         pane_id: PaneId,
         coordinates: FloatingPaneCoordinates,
-    },
-    SignalPane {
-        pane_id: PaneId,
-        signal: PaneSignal,
     },
     SetPaneFullscreen {
         pane_id: Option<PaneId>,
@@ -2339,16 +2335,6 @@ impl Action {
             // gains no verb
             CliAction::DropFile { .. } => {
                 Err("`drop-file` is run by the client, not sent as an action".into())
-            },
-            CliAction::SignalPane { pane_id, signal } => {
-                let parsed_pane_id = resolve_pane_target(&pane_id);
-                match parsed_pane_id {
-                    Ok(parsed_pane_id) => Ok(vec![Action::SignalPane {
-                        pane_id: parsed_pane_id,
-                        signal,
-                    }]),
-                    Err(e) => Err(e),
-                }
             },
             CliAction::TogglePaneBorderless { pane_id } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);

@@ -2,7 +2,7 @@ use super::test_framework::*;
 use crate::data::{
     BareKey, CommandOrPlugin, ConnectToSession, Direction, FloatingPaneCoordinates,
     HostTerminalThemeMode, InputMode, KeyModifier, KeyWithModifier, LayoutInfo, LayoutMetadata,
-    NewPanePlacement, OriginatingPlugin, PaneId, PaneSignal, PluginTag, Resize, WebSharing,
+    NewPanePlacement, OriginatingPlugin, PaneId, PluginTag, Resize, WebSharing,
 };
 use crate::input::actions::{Action, SearchDirection, SearchOption};
 use crate::input::cli_assets::CliAssets;
@@ -3195,24 +3195,6 @@ fn test_client_messages() {
         action: Action::SetSyncTab {
             tab_id: None,
             sync: false,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SignalPane {
-            pane_id: PaneId::Terminal(1),
-            signal: PaneSignal::Int,
-        },
-        terminal_id: Some(1),
-        client_id: Some(100),
-        is_cli_client: true,
-    });
-    test_client_roundtrip!(ClientToServerMsg::Action {
-        action: Action::SignalPane {
-            pane_id: PaneId::Plugin(2),
-            signal: PaneSignal::Kill,
         },
         terminal_id: Some(1),
         client_id: Some(100),

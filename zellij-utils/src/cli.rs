@@ -1,4 +1,4 @@
-use crate::data::{Direction, InputMode, PaneSignal, Resize, UnblockCondition};
+use crate::data::{Direction, InputMode, Resize, UnblockCondition};
 use crate::setup::Setup;
 use crate::{
     consts::{ZELLIJ_CONFIG_DIR_ENV, ZELLIJ_CONFIG_FILE_ENV},
@@ -2773,21 +2773,6 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Send a signal to the process running in a pane
-    ///
-    /// A pane that does not exist, or a plugin pane, which runs no process, prints the reason on
-    /// stderr and exits non-zero.
-    SignalPane {
-        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
-        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
-        /// in its PANE_ID and HANDLE columns
-        #[clap(short, long, value_parser)]
-        pane_id: String,
-        /// int (SIGINT), hup (SIGHUP) or kill (SIGKILL). It goes to the process the pane
-        /// started - the shell itself, where the pane runs one, not the command under it
-        #[clap(short, long, value_enum, value_parser, default_value = "int")]
-        signal: PaneSignal,
-    },
     /// Toggle whether a pane is drawn with a frame
     ///
     /// Use `set-pane-borderless` to say which state you want rather than flipping whichever one
@@ -3734,45 +3719,6 @@ mod tests {
     }
 
     #[test]
-    fn signal_pane_defaults_to_sigint() {
-        let action = parse_action(&["signal-pane", "--pane-id", "terminal_1"]);
-        match action {
-            CliAction::SignalPane { pane_id, signal } => {
-                assert_eq!(pane_id, "terminal_1");
-                assert_eq!(signal, PaneSignal::Int);
-            },
-            other => panic!("Expected SignalPane, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn signal_pane_takes_the_named_signal() {
-        for (name, expected) in [
-            ("int", PaneSignal::Int),
-            ("hup", PaneSignal::Hup),
-            ("kill", PaneSignal::Kill),
-        ] {
-            let action = parse_action(&["signal-pane", "--pane-id", "3", "--signal", name]);
-            match action {
-                CliAction::SignalPane { signal, .. } => assert_eq!(signal, expected),
-                other => panic!("Expected SignalPane, got {:?}", other),
-            }
-        }
-    }
-
-    #[test]
-    fn signal_pane_needs_a_pane_and_rejects_an_unknown_signal() {
-        assert!(action_parse_fails(&["signal-pane"]));
-        assert!(action_parse_fails(&[
-            "signal-pane",
-            "--pane-id",
-            "1",
-            "--signal",
-            "term"
-        ]));
-    }
-
-    #[test]
     fn go_to_pane_takes_no_focus() {
         // the same probe flag `go-to-tab-name` has, on the alias people reach for
         let action = parse_action(&["go-to-pane", "sunny-otter", "--no-focus"]);
@@ -4119,9 +4065,8 @@ mod tests {
             Some(("clear", true))
         );
         // the negative control, and the point of the table being here: the exempt verbs. Each is
-        // exempt for its own reason - the signal's name is the intent, the write family destroys
-        // nothing of its own, and `dump-screen` is a read-band verb
-        assert_eq!(asks(&["signal-pane", "--pane-id", "terminal_1"]), None);
+        // exempt for its own reason - the write family destroys nothing of its own, and
+        // `dump-screen` is a read-band verb
         assert_eq!(
             asks(&["write-chars", "hi", "--pane-id", "terminal_1"]),
             None

@@ -23,8 +23,7 @@ use zellij_utils::agent_detect::{self, AgentHarness};
 use zellij_utils::{
     data::{
         CommandOrPlugin, Event, FloatingPaneCoordinates, GetPaneCwdResponse, GetPanePidResponse,
-        GetPaneRunningCommandResponse, NewPanePlacement, OriginatingPlugin, PaneSignal,
-        SessionInfo,
+        GetPaneRunningCommandResponse, NewPanePlacement, OriginatingPlugin, SessionInfo,
     },
     errors::prelude::*,
     errors::{ContextType, PtyContext},
@@ -175,9 +174,6 @@ pub enum PtyInstruction {
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
     SendSigintToPaneId(PaneId),
-    /// The CLI's signal-to-pane. Unlike the two plugin instructions above it answers the caller:
-    /// naming a pane that does not exist, or one with no process, has to fail rather than warn.
-    SignalPaneId(PaneId, PaneSignal, Option<NotificationEnd>),
     SendSigkillToPaneId(PaneId),
     GetPanePid {
         pane_id: PaneId,
@@ -225,7 +221,6 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::ListClientsToPlugin(..) => PtyContext::ListClientsToPlugin,
             PtyInstruction::ReportPluginCwd(..) => PtyContext::ReportPluginCwd,
             PtyInstruction::SendSigintToPaneId(..) => PtyContext::SendSigintToPaneId,
-            PtyInstruction::SignalPaneId(..) => PtyContext::SignalPaneId,
             PtyInstruction::SendSigkillToPaneId(..) => PtyContext::SendSigkillToPaneId,
             PtyInstruction::GetPanePid { .. } => PtyContext::GetPanePid,
             PtyInstruction::GetPaneRunningCommand { .. } => PtyContext::GetPaneRunningCommand,
@@ -1290,16 +1285,6 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
             PtyInstruction::SendSigintToPaneId(pane_id) => {
                 pty.send_sigint_to_pane(pane_id);
             },
-            PtyInstruction::SignalPaneId(pane_id, signal, mut completion_tx) => {
-                if let Err(e) = pty.signal_pane(pane_id, signal) {
-                    log::error!("{}", e);
-                    if let Some(c) = completion_tx.as_mut() {
-                        c.set_exit_status(1);
-                        c.set_error_message(e);
-                    }
-                }
-                drop(completion_tx);
-            },
             PtyInstruction::SendSigkillToPaneId(pane_id) => {
                 pty.send_sigkill_to_pane(pane_id);
             },
@@ -2362,7 +2347,7 @@ impl Pty {
     ///
     /// Only a `hold_on_close` pane gets here: its process exits and the pane waits to be re-run.
     /// The OS is free to hand that pid number to an unrelated process the moment it is reaped, so
-    /// a held pane must neither report it as `pane_pid` nor let `signal-pane` deliver to it. A
+    /// a held pane must neither report it as `pane_pid` nor let a signal be delivered to it. A
     /// re-run spawns a fresh process and records the new pid.
     ///
     /// The session its agent held is kept, so the held pane still serializes and lists with it:
@@ -3374,41 +3359,6 @@ impl Pty {
                 )]));
             self.terminal_cwds.insert(terminal_id, path);
         }
-    }
-
-    /// Send `signal` to the process zellij spawned for `pane_id`.
-    ///
-    /// The error names which of the ways this can miss happened: a plugin pane, which has no
-    /// process to signal, or no live process for that terminal id - either no such pane, or a
-    /// held pane whose command already exited. A held pane has no pid of its own to signal: the
-    /// one it ran with was reaped, and that number now belongs to the OS to hand out again.
-    pub fn signal_pane(&self, pane_id: PaneId, signal: PaneSignal) -> Result<(), String> {
-        let terminal_id = match pane_id {
-            PaneId::Terminal(terminal_id) => terminal_id,
-            PaneId::Plugin(plugin_id) => {
-                return Err(format!(
-                    "Cannot signal plugin pane {}: it runs no process",
-                    plugin_id
-                ))
-            },
-        };
-        let child_pid = *self.id_to_child_pid.get(&terminal_id).ok_or_else(|| {
-            format!(
-                "Pane {:?} has no running process: it was not found, or its command has exited",
-                pane_id
-            )
-        })?;
-        let os_input = self
-            .bus
-            .os_input
-            .as_ref()
-            .ok_or_else(|| "no OS I/O interface found".to_owned())?;
-        let sent = match signal {
-            PaneSignal::Int => os_input.send_sigint(child_pid),
-            PaneSignal::Hup => os_input.kill(child_pid),
-            PaneSignal::Kill => os_input.force_kill(child_pid),
-        };
-        sent.map_err(|e| format!("failed to signal pane {:?}: {}", pane_id, e))
     }
 
     pub fn send_sigint_to_pane(&self, pane_id: PaneId) {

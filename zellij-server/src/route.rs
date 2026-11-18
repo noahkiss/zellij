@@ -2206,15 +2206,6 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::SignalPane { pane_id, signal } => {
-            senders
-                .send_to_pty(PtyInstruction::SignalPaneId(
-                    pane_id.into(),
-                    signal,
-                    Some(NotificationEnd::new(completion_tx)),
-                ))
-                .with_context(err_context)?;
-        },
         Action::TogglePanePinned => {
             senders
                 .send_to_screen(ScreenInstruction::TogglePanePinned(
