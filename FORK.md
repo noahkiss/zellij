@@ -1336,42 +1336,6 @@ it left.
   now rebuilds the pane state when a connected client's focus moved
   (`Screen::focus_moved_since_last_report`).
 
-### `report_pane_env`: named environment variables on every pane
-
-```kdl
-report_pane_env "CLAUDE_CODE_SESSION_ID" "MY_TOOL_ID"
-```
-
-`PaneInfo.pane_env` reports the variables this list names, found in the pane's processes. It answers
-the question a pid alone cannot: *which* instance of a tool is this pane — which agent session, which
-job — without a consumer having to read `/proc` itself or the pane having to announce anything.
-
-**It is an allowlist, and only an allowlist.** Unset means report nothing, there are no default
-entries, and the names are exact — no patterns, because a pattern is how a key nobody meant to
-publish gets published. An environment is full of secrets; the whole of one is never reported.
-
-The value is looked for on the pane's own child and then its descendants, nearest first, so a tool
-running inside the pane's shell answers for a name they both export. That walk is the one
-`resurrect_command_hints` already does, and it is the same code: `/proc/<pid>/environ` on Linux,
-`sysctl(KERN_PROCARGS2)` on macOS, nothing anywhere else. Both platforms are supported.
-
-Cost: nothing at all with the list unset, which is the default. With it set, the pty thread reads
-the process table once per second — once for the tick, not once per pane — and then one environment
-read per process it walks, **per pane, every tick**. The walk stops early only when every named
-variable has been found. So the cheap case is a pane whose own child exports all of them: one read.
-The expensive case is a name that is **not** there — an agent variable on a pane that is not running
-that agent — which costs a read of the pane's whole process subtree, every second, for as long as
-the pane lives. On macOS each of those reads allocates a `KERN_ARGMAX` buffer, about 1MB, because
-the kernel gives no way to ask how big the blob is. Keep the list short, and expect the panes that
-do not carry the names to be the ones paying for it.
-
-`pane_env` is the one new field that does **not** round-trip through `session-metadata.kdl`. Putting
-it on the event path is something a configuration opted into; writing the values into a file every
-session on the box can read, and which outlives the server, is a different exposure and was not.
-A peer session therefore reports an empty `pane_env` — read it from the session that owns the pane.
-
-Proto tag 37.
-
 ### The socket directory is visible, and `ls` warns about sessions outside it
 
 Every session operation is scoped to one socket directory, resolved from the environment
@@ -5022,8 +4986,8 @@ filtered to the panes that have one.
   operating system at all.
 - *Phase two runs only for a pane phase one matched.* The harness's own session id lives in the
   environment of the pane's processes, and that means walking the subtree - the same walk
-  `report_pane_env` does, on the same tick, through the same code. **A session with no agent pane in
-  it does not read the process table at all.**
+  `resurrect_command_hints` does, through the same code. **A session with no agent pane in it does
+  not read the process table at all.**
 - *And it runs once per pane, not once per second.* A walk is a full process-table read plus one
   environment read per descendant, and its answer does not change while the pane runs the same
   program. So a pane is walked when it appears, when its process is replaced, and - only while
@@ -5050,9 +5014,8 @@ without an id.
 CLI-only, and **not** on `PaneInfo`: no protobuf tag, no plugin contract, nothing to carry through a
 rebase. `list-agents` adds no `Action` and nothing to the client/server contract either - it is
 answered by the client from one `list-panes --json`, the way `wait` is. The identity variables are
-kept in a server-internal field and never folded into `PaneInfo.pane_env`, because that map is
-published over the plugin API and the `report_pane_env` allowlist that governs it never asked for
-them.
+kept in a server-internal field and never put on `PaneInfo`, which is published over the plugin
+API.
 
 Turn it off with the top-level key, on a machine where reading a process's environment is unwanted:
 

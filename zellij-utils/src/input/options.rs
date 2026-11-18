@@ -482,16 +482,6 @@ pub struct Options {
     #[serde(default)]
     pub resurrect_commands: Option<ResurrectCommands>,
 
-    /// Environment variables to report on every pane, by exact name, so that a consumer of the
-    /// pane list can tell what a pane is - which harness owns it, which session id it holds. The
-    /// environment holds secrets, so this is an allowlist and nothing else: unset means report
-    /// nothing, and there are no default entries. Names only, never patterns - a pattern is how a
-    /// key nobody meant to publish gets published.
-    /// config.kdl only - it is read by the server when it reports pane state.
-    #[clap(skip)]
-    #[serde(default)]
-    pub report_pane_env: Option<Vec<String>>,
-
     /// Whether to work out which panes are running a coding agent, so that `list-agents` and
     /// `list-panes` can say so. Default: true. Detection is by the pane's own command first, which
     /// costs nothing; only a pane that already matched has its processes read, and then only for
@@ -858,10 +848,6 @@ impl Options {
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
         let resurrect_commands = other.resurrect_commands.or(self.resurrect_commands);
-        let report_pane_env = other
-            .report_pane_env
-            .clone()
-            .or_else(|| self.report_pane_env.clone());
         let detect_agents = other.detect_agents.or(self.detect_agents);
         let pane_frame_agent_name = other.pane_frame_agent_name.or(self.pane_frame_agent_name);
         let session_up_resume = other.session_up_resume.or(self.session_up_resume);
@@ -971,7 +957,6 @@ impl Options {
             session_service,
             resurrect_command_hints,
             resurrect_commands,
-            report_pane_env,
             detect_agents,
             pane_frame_agent_name,
             session_up_resume,
@@ -1092,10 +1077,6 @@ impl Options {
             .resurrect_command_hints
             .or_else(|| self.resurrect_command_hints.clone());
         let resurrect_commands = other.resurrect_commands.or(self.resurrect_commands);
-        let report_pane_env = other
-            .report_pane_env
-            .clone()
-            .or_else(|| self.report_pane_env.clone());
         let detect_agents = other.detect_agents.or(self.detect_agents);
         let pane_frame_agent_name = other.pane_frame_agent_name.or(self.pane_frame_agent_name);
         let session_up_resume = other.session_up_resume.or(self.session_up_resume);
@@ -1205,7 +1186,6 @@ impl Options {
             session_service,
             resurrect_command_hints,
             resurrect_commands,
-            report_pane_env,
             detect_agents,
             pane_frame_agent_name,
             session_up_resume,

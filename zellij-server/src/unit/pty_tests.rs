@@ -230,7 +230,7 @@ fn make_pty_with_plugin_receiver(
     let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
     bus.os_input = Some(Box::new(mock));
     bus.senders.to_plugin = Some(plugin_sender);
-    let pty = Pty::new(bus, false, None, None, None, None, None, None);
+    let pty = Pty::new(bus, false, None, None, None, None, None);
     (pty, plugin_rx)
 }
 
@@ -284,7 +284,7 @@ fn make_pty_with_pty_receiver(
     let (mut bus, receivers) = real_pty_bus(mock);
     // the other receivers go with `receivers`; their sends are not what these tests read
     bus.senders.should_silently_fail = true;
-    let pty = Pty::new(bus, false, None, None, None, None, None, None);
+    let pty = Pty::new(bus, false, None, None, None, None, None);
     (pty, receivers.pty)
 }
 
@@ -298,7 +298,7 @@ fn make_pty_with_screen_receiver(
     bus.os_input = Some(Box::new(mock));
     bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
     bus.senders.to_screen = Some(SenderWithContext::new(screen_tx));
-    let pty = Pty::new(bus, false, None, None, None, None, None, None);
+    let pty = Pty::new(bus, false, None, None, None, None, None);
     (pty, screen_rx)
 }
 
@@ -826,7 +826,7 @@ fn an_unchanged_process_info_map_is_not_reported_again() {
 /// A pty with nothing wired up, for testing state it keeps for itself.
 fn make_bare_pty() -> Pty {
     let bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
-    Pty::new(bus, false, None, None, None, None, None, None)
+    Pty::new(bus, false, None, None, None, None, None)
 }
 
 /// A fingerprint that stands for "nothing that gets serialized has changed", so that these tests
@@ -1474,7 +1474,7 @@ fn the_live_list_reports_an_osc_session_while_its_agent_runs() {
 fn the_pty_threads_own_bus_can_tell_it_a_child_was_reaped() {
     let mock = MockOsApi::new();
     let (bus, receivers) = real_pty_bus(mock.clone());
-    let mut pty = Pty::new(bus, false, None, None, None, None, None, None);
+    let mut pty = Pty::new(bus, false, None, None, None, None, None);
     let held_command = RunCommand {
         command: PathBuf::from("/bin/does-not-matter"),
         hold_on_close: true,

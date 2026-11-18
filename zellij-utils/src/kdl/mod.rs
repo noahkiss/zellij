@@ -3045,7 +3045,6 @@ const KNOWN_TOP_LEVEL_NODES: &[&str] = &[
     "pane_frames",
     "plugin_watch",
     "post_command_discovery_hook",
-    "report_pane_env",
     "resurrect_command_hints",
     "resurrect_commands",
     "scroll_buffer_size",
@@ -3267,15 +3266,6 @@ impl Options {
             ),
             None => None,
         };
-        let report_pane_env = match kdl_options.get("report_pane_env") {
-            Some(kdl_report_env) => Some(
-                kdl_string_arguments!(kdl_report_env)
-                    .iter()
-                    .map(|name| name.to_string())
-                    .collect(),
-            ),
-            None => None,
-        };
         let pane_frame_agent_name =
             kdl_property_first_arg_as_bool_or_error!(kdl_options, "pane_frame_agent_name")
                 .map(|(v, _)| v);
@@ -3460,7 +3450,6 @@ impl Options {
             terminal_title_template,
             session_aliases,
             session_restart_drop_env,
-            report_pane_env,
             detect_agents,
             pane_frame_agent_name,
             session_up_resume,
@@ -3894,18 +3883,6 @@ impl Options {
             aliases.nodes_mut().push(alias_node);
         }
         node.set_children(aliases);
-        Some(node)
-    }
-    /// The `report_pane_env` node: the exact variable names to report on every pane.
-    fn report_pane_env_to_kdl(&self) -> Option<KdlNode> {
-        let names = self.report_pane_env.as_ref()?;
-        if names.is_empty() {
-            return None;
-        }
-        let mut node = KdlNode::new("report_pane_env");
-        for name in names {
-            node.push(KdlValue::String(name.to_owned()));
-        }
         Some(node)
     }
     /// The `resurrect_commands` key: which recorded commands a restored session offers.
@@ -6023,9 +6000,6 @@ impl Options {
         }
         if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
             nodes.push(session_restart_drop_env);
-        }
-        if let Some(report_pane_env) = self.report_pane_env_to_kdl() {
-            nodes.push(report_pane_env);
         }
         if let Some(enabled) = self.pane_frame_agent_name {
             let mut node = KdlNode::new("pane_frame_agent_name");
@@ -8338,8 +8312,6 @@ impl PaneInfo {
             pane_command,
             last_output_at,
             has_pending_bell,
-            // deliberately not carried - see the notes on `encode_to_kdl`
-            pane_env: Default::default(),
             id,
             is_plugin,
             is_focused,
@@ -8462,12 +8434,6 @@ impl PaneInfo {
         }
         // what the pane is running, and when it last said anything - the same rule again, written
         // only when there is something to write, so a saved layout's panes are unchanged
-        //
-        // `pane_env` is deliberately absent. Reporting it on the event path is something a
-        // configuration opted into; writing those values into a file on disk, which every session
-        // on the box can read and which outlives the server, is a different exposure and was not
-        // asked for. A peer session's `pane_env` is therefore always empty - read it from the
-        // session that owns the pane.
         if let Some(pane_cwd) = &self.pane_cwd {
             string_node!("pane_cwd", pane_cwd.to_string());
         }
@@ -8558,7 +8524,6 @@ fn serialize_and_deserialize_session_info_with_data() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
-            pane_env: Default::default(),
             id: 1,
             is_plugin: false,
             is_focused: true,
@@ -8601,7 +8566,6 @@ fn serialize_and_deserialize_session_info_with_data() {
             pane_command: None,
             last_output_at: None,
             has_pending_bell: false,
-            pane_env: Default::default(),
             id: 1,
             is_plugin: true,
             is_focused: true,
@@ -8840,37 +8804,6 @@ fn session_info_round_trip_keeps_the_process_and_activity_fields() {
     assert_eq!(round_tripped_pane.pane_command, pane.pane_command);
     assert_eq!(round_tripped_pane.last_output_at, pane.last_output_at);
     assert!(round_tripped_pane.has_pending_bell);
-}
-
-/// Reporting an environment variable on the event path was opted into. Writing it to a file every
-/// session on the box can read, and which outlives the server, was not.
-#[test]
-fn session_metadata_never_carries_the_pane_environment() {
-    let pane = PaneInfo {
-        id: 3,
-        pane_env: [("CLAUDE_CODE_SESSION_ID".to_owned(), "abc-123".to_owned())]
-            .into_iter()
-            .collect(),
-        ..Default::default()
-    };
-    let mut panes = HashMap::new();
-    panes.insert(0, vec![pane]);
-    let session_info = SessionInfo {
-        name: "env session".to_owned(),
-        panes: PaneManifest { panes },
-        ..Default::default()
-    };
-    let serialized = session_info.to_string();
-    assert!(
-        !serialized.contains("abc-123") && !serialized.contains("CLAUDE_CODE_SESSION_ID"),
-        "the environment must not reach session metadata: {}",
-        serialized
-    );
-
-    let deserialized = SessionInfo::from_string(&serialized, "not this session").unwrap();
-    assert!(deserialized.panes.panes.get(&0).unwrap()[0]
-        .pane_env
-        .is_empty());
 }
 
 #[test]
@@ -10274,21 +10207,6 @@ fn session_restart_drop_env_is_unset_by_default() {
 }
 
 #[test]
-fn report_pane_env_config_parsing() {
-    let config_with_report_pane_env = r#"
-        report_pane_env "CLAUDE_CODE_SESSION_ID" "MY_TOOL_ID"
-    "#;
-    let config = Config::from_kdl(config_with_report_pane_env, None).unwrap();
-    assert_eq!(
-        config.options.report_pane_env,
-        Some(vec![
-            "CLAUDE_CODE_SESSION_ID".to_string(),
-            "MY_TOOL_ID".to_string()
-        ])
-    );
-}
-
-#[test]
 fn resurrect_commands_config_parsing_and_round_trip() {
     assert_eq!(
         Config::from_kdl("", None)
@@ -10323,30 +10241,6 @@ fn an_unknown_resurrect_commands_mode_is_ignored() {
         let config = Config::from_kdl(config, None).unwrap();
         assert_eq!(config.options.resurrect_commands, None);
     }
-}
-
-/// The environment holds secrets, so nothing is reported that was not asked for by name.
-#[test]
-fn report_pane_env_is_unset_by_default() {
-    let config = Config::from_kdl("", None).unwrap();
-    assert_eq!(config.options.report_pane_env, None);
-}
-
-#[test]
-fn report_pane_env_survives_the_kdl_round_trip() {
-    let config = Config::from_kdl(r#"report_pane_env "MY_TOOL_ID""#, None).unwrap();
-    let written: String = config
-        .options
-        .to_kdl(false)
-        .iter()
-        .map(|node| node.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let reparsed = Config::from_kdl(&written, None).unwrap();
-    assert_eq!(
-        reparsed.options.report_pane_env,
-        Some(vec!["MY_TOOL_ID".to_string()])
-    );
 }
 
 #[test]
@@ -10432,6 +10326,26 @@ fn a_retired_pane_privacy_block_warns_and_loads() {
     assert_eq!(config.options.simplified_ui, Some(true));
     assert!(
         config.warnings.iter().any(|w| w.contains("pane_privacy")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// `report_pane_env` was a fork key that this build no longer reads. An old config that still
+/// carries it loads, with the key reported as unknown.
+#[test]
+fn a_retired_report_pane_env_key_warns_and_loads() {
+    let config = Config::from_kdl(
+        "report_pane_env \"CLAUDE_CODE_SESSION_ID\"\nsimplified_ui true",
+        None,
+    )
+    .unwrap();
+    assert_eq!(config.options.simplified_ui, Some(true));
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|w| w.contains("report_pane_env")),
         "{:?}",
         config.warnings
     );

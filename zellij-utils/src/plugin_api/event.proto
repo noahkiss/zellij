@@ -451,7 +451,7 @@ message ResurrectableSession {
 }
 
 message PaneInfo {
-    reserved 38 to 45, 48;
+    reserved 37 to 45, 48;
     uint32 id = 1;
     bool is_plugin = 2;
     bool is_focused = 3;
@@ -491,14 +491,8 @@ message PaneInfo {
     optional string pane_command = 34;
     optional uint64 last_output_at = 35;
     bool has_pending_bell = 36;
-    repeated PaneEnvVar pane_env = 37;
     string handle = 46;
     uint32 tab_id = 47;
-}
-
-message PaneEnvVar {
-  string name = 1;
-  string value = 2;
 }
 
 message IndexInPaneGroup {

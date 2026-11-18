@@ -559,7 +559,6 @@ impl SessionMetaData {
                     post_command_discovery_hook: new_config.options.post_command_discovery_hook,
                     resurrect_command_hints: new_config.options.resurrect_command_hints,
                     resurrect_commands: new_config.options.resurrect_commands,
-                    report_pane_env: new_config.options.report_pane_env,
                     detect_agents: new_config.options.detect_agents,
                     pane_frame_agent_name: new_config.options.pane_frame_agent_name,
                 })
@@ -2792,7 +2791,6 @@ fn init_session(
                 config_options.post_command_discovery_hook.clone(),
                 config_options.resurrect_command_hints.clone(),
                 config_options.resurrect_commands,
-                config_options.report_pane_env.clone(),
                 config_options.detect_agents,
             );
 

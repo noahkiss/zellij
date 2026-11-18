@@ -169,7 +169,6 @@ pub enum PtyInstruction {
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
         resurrect_commands: Option<ResurrectCommands>,
-        report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
         pane_frame_agent_name: Option<bool>,
     },
@@ -476,16 +475,11 @@ pub struct PaneProcessInfo {
     pub cwd: Option<PathBuf>,
     /// The foreground command if there is one, otherwise the pane's shell.
     pub command: Option<Vec<String>>,
-    /// The variables `report_pane_env` allows, found in the pane's processes. Empty unless the
-    /// configuration names some.
-    pub env: BTreeMap<String, String>,
     /// The session-id variables a coding harness exports, found in the pane's processes. Read only
     /// for a pane whose own command already matched a harness, and only for the fixed names in
     /// `agent_detect`.
     ///
-    /// Kept apart from `env` deliberately. `env` is published on `PaneInfo` over the plugin API,
-    /// and these were never asked for by the `report_pane_env` allowlist that governs it; this map
-    /// goes no further than the CLI-only pane list.
+    /// This map goes no further than the CLI-only pane list.
     pub agent_env: BTreeMap<String, String>,
     /// Claude’s current messaging name from its live process record.
     pub agent_name: Option<String>,
@@ -514,11 +508,6 @@ pub(crate) struct Pty {
     /// terminal_id -> command line, set aside by `prefill_for_resurrected` until the layout that
     /// opens those panes has reached the screen
     pending_prefills: Vec<(u32, String)>,
-    /// The exact env var names `report_pane_env` asks for. Empty means report nothing, which is
-    /// the default and the only safe one - an environment is full of secrets.
-    report_pane_env: Vec<String>,
-    /// terminal_id -> the allowlisted variables last found in that pane's processes
-    terminal_envs: HashMap<u32, BTreeMap<String, String>>,
     /// Whether to work out which panes run a coding agent at all. `detect_agents`, default true.
     detect_agents: bool,
     pub pane_frame_agent_name: bool,
@@ -1285,7 +1274,6 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                 post_command_discovery_hook,
                 resurrect_command_hints,
                 resurrect_commands,
-                report_pane_env,
                 detect_agents,
                 pane_frame_agent_name,
                 client_id: _,
@@ -1296,7 +1284,6 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>) -> Result<()> {
                     post_command_discovery_hook,
                     resurrect_command_hints,
                     resurrect_commands,
-                    report_pane_env,
                     detect_agents,
                 );
             },
@@ -1360,7 +1347,6 @@ impl Pty {
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
         resurrect_commands: Option<ResurrectCommands>,
-        report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
     ) -> Self {
         Pty {
@@ -1375,8 +1361,6 @@ impl Pty {
             resurrect_command_hints,
             resurrect_commands: resurrect_commands.unwrap_or(ResurrectCommands::All),
             pending_prefills: Vec::new(),
-            report_pane_env: report_pane_env.unwrap_or_default(),
-            terminal_envs: HashMap::new(),
             detect_agents: detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT),
             pane_frame_agent_name: false,
             last_reported_pane_frame_agent_name: None,
@@ -2449,7 +2433,6 @@ impl Pty {
                 self.held_panes.remove(&id);
                 self.terminal_cwds.remove(&id);
                 self.terminal_cmds.remove(&id);
-                self.terminal_envs.remove(&id);
                 self.terminal_foreground_cmds.remove(&id);
                 self.command_terminal_ids.remove(&id);
                 self.bus
@@ -2848,25 +2831,20 @@ impl Pty {
         self.report_pane_process_info();
     }
 
-    /// Read the allowlisted variables, and any coding agent's session id, out of the panes' processes.
+    /// Read any coding agent's session id out of the panes' processes.
     ///
-    /// Two readers share one walk of the process table, because both ask it the same question and
-    /// reading it twice a second would be silly.
-    ///
-    /// * `report_pane_env` is the configured allowlist. It costs nothing unless it names something,
-    ///   which by default it does not.
-    /// * Agent detection asks only about panes whose OWN command already matched a harness - which
-    ///   is a string compare against a cache this tick already filled, not a probe - and then only
-    ///   for the session-id variable names of the harness that matched. A session with no agent
-    ///   pane in it therefore reads nothing, and the process table is not touched at all.
+    /// Agent detection asks only about panes whose OWN command already matched a harness - which
+    /// is a string compare against a cache this tick already filled, not a probe - and then only
+    /// for the session-id variable names of the harness that matched. A session with no agent
+    /// pane in it therefore reads nothing, and the process table is not touched at all.
     ///
     /// A known live record avoids another walk until its process exits.
     /// Claude checks cached record metadata each tick; other missing identities retry every
     /// [`AGENT_ENV_RETRY_TICKS`]. Record changes refresh names without another process walk.
     ///
-    /// Either way the variable lives on a process the shell started, not on the shell, so this
-    /// walks down from the pane's own child - the same problem `resurrect_command_hints` solves,
-    /// and the same code solving it.
+    /// The variable lives on a process the shell started, not on the shell, so this walks down
+    /// from the pane's own child - the same problem `resurrect_command_hints` solves, and the same
+    /// code solving it.
     fn refresh_pane_envs(&mut self) {
         let mut agent_panes: Vec<(u32, u32, &'static AgentHarness)> = if self.detect_agents {
             self.id_to_child_pid
@@ -2954,23 +2932,10 @@ impl Pty {
             to_probe.push((*terminal_id, *child_pid, *harness));
         }
 
-        if self.report_pane_env.is_empty() && to_probe.is_empty() {
-            self.terminal_envs.clear();
+        if to_probe.is_empty() {
             return;
         }
         let process_tree = ProcessTree::read();
-        if self.report_pane_env.is_empty() {
-            self.terminal_envs.clear();
-        } else {
-            let vars = self.report_pane_env.clone();
-            self.terminal_envs = self
-                .id_to_child_pid
-                .iter()
-                .map(|(terminal_id, child_pid)| {
-                    (*terminal_id, process_tree.find_all_envs(*child_pid, &vars))
-                })
-                .collect();
-        }
         for (terminal_id, child_pid, harness) in to_probe {
             let identity_vars = agent_detect::identity_env_names_for(harness);
             let mut found = process_tree.find_all_envs(child_pid, &identity_vars);
@@ -3118,11 +3083,6 @@ impl Pty {
                         pid: self.id_to_child_pid.get(&terminal_id).copied(),
                         cwd: self.terminal_cwds.get(&terminal_id).cloned(),
                         command,
-                        env: self
-                            .terminal_envs
-                            .get(&terminal_id)
-                            .cloned()
-                            .unwrap_or_default(),
                         agent_env,
                         agent_name: self
                             .agent_record_cache
@@ -3145,7 +3105,6 @@ impl Pty {
                     pid: None,
                     cwd: self.terminal_cwds.get(terminal_id).cloned(),
                     command: None,
-                    env: BTreeMap::new(),
                     agent_env: held.agent_env.clone(),
                     agent_name: None,
                     agent_session_source: held.agent_session_source.clone(),
@@ -3325,14 +3284,12 @@ impl Pty {
         post_command_discovery_hook: Option<String>,
         resurrect_command_hints: Option<ResurrectCommandHints>,
         resurrect_commands: Option<ResurrectCommands>,
-        report_pane_env: Option<Vec<String>>,
         detect_agents: Option<bool>,
     ) {
         self.default_editor = default_editor;
         self.post_command_discovery_hook = post_command_discovery_hook;
         self.resurrect_command_hints = resurrect_command_hints;
         self.resurrect_commands = resurrect_commands.unwrap_or(ResurrectCommands::All);
-        self.report_pane_env = report_pane_env.unwrap_or_default();
         self.detect_agents = detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT);
     }
 

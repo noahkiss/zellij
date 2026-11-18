@@ -1056,7 +1056,6 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
             terminal_title_template: None,
             session_aliases: None,
             session_restart_drop_env: None,
-            report_pane_env: None,
             detect_agents: None,
             pane_frame_agent_name: None,
             session_up_resume: None,
