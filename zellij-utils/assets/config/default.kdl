@@ -675,8 +675,8 @@ load_plugins {
 // Opt-in, because only you know whether you mean zellij to hold that permission - and where you
 // do, the permission being absent IS the actionable fact: macOS keys the grant to an absolute
 // path, so every upgrade into a versioned directory silently invalidates it
-// The badge is a flag, not an instruction: the about page and `zellij session doctor` name the
-// exact path to add, because that is what the grant is keyed to
+// The badge is a flag, not an instruction: `zellij session doctor` names the exact path to add,
+// because that is what the grant is keyed to
 // Default: false
 //
 // expect_full_disk_access true

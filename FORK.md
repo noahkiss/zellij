@@ -3557,81 +3557,6 @@ declares - a layout that could name its own lineage could lie about it.
 is regenerated (`cargo xtask build`). `list-panes --json` gets the field for free - `PaneListEntry`
 flattens `PaneInfo`. The client/server contract has no `PaneInfo` and is untouched.
 
-### The about page names the binary macOS must trust
-
-`Ctrl+o` then `a` now ends with the path of the executable the **server** is running:
-
-```
-Server binary (macOS: grant Full Disk Access to this path):
-/Users/<user>/.local/share/zellij/zellij-pinned
-```
-
-The section above explains why that path matters on macOS: TCC keys a path-based client on its
-absolute path, so the string that has to be typed into Full Disk Access is a specific file, not
-"zellij". Until now the only way to learn it was a log line the user had to know to look for. It is
-on the one page whose whole job is telling you what you are running.
-
-The path is **resolved**. `current_exe()` returns whatever was invoked — usually a package manager's
-symlink on `PATH` — while TCC records the target, so the server canonicalizes before it hands the
-value over (`own_executable_path` in `session_lifecycle.rs`, shared with the startup probe rather
-than copied).
-
-**It arrives as plugin configuration, injected at the load seam.** `configuration_for_load`
-(`plugins/plugin_loader.rs`) adds the key `zellij_exe` to the configuration copy written into the
-plugin's memory immediately before `load()`. Not to the stored `PluginConfig`: that
-`initial_userspace_configuration` is half the key the plugin map dedupes and focuses instances by,
-so injecting there would make every `launch-or-focus-plugin zellij:about` miss the running instance
-and open a second pane. The load seam is the funnel every instantiation path goes through, including
-the clone made for each additional client. No `PluginCommand`, no `.proto`, no `zellij-tile` change.
-
-**The macOS hint is decided by the server, not the plugin**, through a second key
-`zellij_exe_hint`. The host running the server is the one TCC has an opinion about, and a client can
-be somewhere else entirely; the plugin has no way to ask. Off macOS the label is just
-`Server binary:`. Both variants cost the same two rows, and the path keeps its own line on either —
-sharing a line with the label costs it those columns, and the page truncates rather than wraps,
-which would hand the user a wrong path to paste.
-
-**It survives a short pane.** The page is a fixed block centred in whatever rows it has, and
-anything past the bottom is never drawn — the main screen wants exactly 18 rows, and one pane frame
-or a nested session's bars is enough to push the last component off. A paragraph can now be marked
-essential; `components_to_hide` drops the largest non-essential component first — the nine-row
-"What's new" list long before a one-line paragraph — until the page fits, and never drops an
-essential one or the help text. The path stays visible down to five interior rows. A component that
-did not draw also clears its rendered coordinates, so it stops answering clicks where it used to be.
-
-One limit: the about pane is a fixed 90 columns, so a path beyond roughly 78 characters is cut. Real
-install paths fit; a development build's path inside a deep worktree does not.
-
-**A second line names the path that survives an upgrade.** The resolved path answers "which build is
-this session running", and that is all it is good for: a package manager installs into a versioned
-directory, so the path the about page showed is gone at the next upgrade — and on macOS the Full
-Disk Access grant went with it, because TCC records the grant against the file. So the page shows
-both, when they differ:
-
-```
-Server binary (running):
-/home/linuxbrew/.linuxbrew/Cellar/zellij-nkmk/0.45.0-nkmk.4/bin/zellij
-Grant Full Disk Access to this path instead - it survives upgrades:
-/home/<user>/.local/share/zellij/bin/zellij
-```
-
-The second path is chosen by `resolve_service_exe` — the same function, in the same order, that
-decides what a generated service unit execs: the [pinned copy](#a-pinned-copy-of-the-binary-pin_exe)
-first, then a name on `PATH` whose canonical target is this same file. Nothing steadier found, or a
-pinned path with no file at it, and the line is left off entirely rather than pointing at something
-that does not exist; off macOS the label is `Stable path (survives upgrades):`.
-
-`pin_exe` is a config key and the plugin thread holds no config, so the server records it once at
-startup (`record_configured_pinned_exe`), where it already reads `config_options`. The plugin gets
-the answer as a third configuration key, `zellij_exe_stable`, through the same load seam.
-
-**`<c>` copies the path.** Nothing in the about pane could be selected with the mouse, so the one
-value on it a user has to act on had to be retyped by hand. `<c>` on the main screen copies the
-stable path, or the running one where there is no stable path, and the help line says so. Upstream
-builds that line by appending to a string and colouring each key by substring, so the hint is one
-more `push_str` and the colour cannot land on the wrong characters. Built-in plugins are granted
-every permission, so `WriteToClipboard` costs no prompt.
-
 ### `ListClients` lists every attached client, with its terminal size
 
 The plugin-facing `ListClients` answered with no clients, whatever the truth was. The server builds
@@ -4266,9 +4191,9 @@ FDA-gated file the startup probe uses last and reports a refusal — a real `ope
 tests permission bits while TCC denies at open. Opt-in, because only the user knows whether they
 mean zellij to hold that permission - and where they do, its absence IS the actionable fact whether
 or not it was ever granted. A probe that cannot answer — the file missing, or a failure that is not
-a permission one — is never reported as a denial. The badge is a flag, not an instruction: the
-[about page](#the-about-page-names-the-binary-macos-must-trust) and `session doctor` name the exact
-path, because the grant is keyed to that file and auto-registration was not observed to happen.
+a permission one — is never reported as a denial. The badge is a flag, not an instruction:
+`session doctor` names the exact path, because the grant is keyed to that file and
+auto-registration was not observed to happen.
 Non-macOS builds have no such permission, so `TCC` cannot appear.
 
 **A superseded build** (`stale_build_notice`, on by default) is asked of the path this server was
@@ -4310,11 +4235,9 @@ session socket. Each 30-second tick asks four rules of that record, in order:
 4. the start path is the pin, and the first `zellij` on `PATH` that is not the pin and not in the
    pin's directory is a different build from the recorded one.
 
-Rule 2 is the one that lights the badge on macOS. The about page's server path comes from the same
-record, so a Linux server whose page is first opened after a refresh no longer shows ` (deleted)`.
-It costs one `stat` of the executable and one of the socket per tick, plus the read the rules
+Rule 2 is the one that lights the badge on macOS. It costs one `stat` of the executable and one of the socket per tick, plus the read the rules
 already made. `zellij-utils/src/session_lifecycle.rs` holds the record and the rules;
-`zellij-server` records it in `start_server` and reads it in the loader and the warnings. Six unit
+`zellij-server` records it in `start_server` and reads it in the warnings. Six unit
 tests: a rewrite after the socket, an untouched file, a removed file, a newer build past the pin, a
 `PATH` that leads only to the pin, and the badge lit through the warnings.
 

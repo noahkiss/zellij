@@ -1270,7 +1270,7 @@ pub fn start_server(os_input: Box<dyn ServerOsApi>, socket_path: PathBuf) {
 
     // Record the build this server started as, while the file at its path is still that build.
     // An upgrade can rename a new build over it at any moment after this, and the superseded-build
-    // badge and the about page both need the identity from before that happens.
+    // badge needs the identity from before that happens.
     zellij_utils::session_lifecycle::record_running_build(socket_path.clone());
 
     // Before anything opens a descriptor, and while this is still the only thread. Only the real
@@ -2863,12 +2863,10 @@ fn init_session(
             let plugin_permissions = std::sync::Arc::new(config.plugin_permissions.clone());
             // this fork watches loaded plugin .wasm files by default - it is the point of the fork
             let plugin_watch = config_options.plugin_watch.unwrap_or(true);
-            // the about plugin names the binary a user should grant permissions to, and `pin_exe`
-            // is the config saying where that binary is kept - read here, where the config is
+            // `pin_exe` is the config saying where the binary is kept; the session warnings are
+            // asked from Screen, whose constructor takes thirty arguments already, so they are
+            // recorded here, where the config is
             let pinned_exe = configured_pinned_exe(config_options.session_service.as_ref());
-            crate::plugins::plugin_loader::record_configured_pinned_exe(pinned_exe.clone());
-            // the same reason for the session warnings: they are asked from Screen, whose
-            // constructor takes thirty arguments already
             crate::session_warnings::record_settings(crate::session_warnings::WarningSettings {
                 expect_full_disk_access: config_options.expect_full_disk_access.unwrap_or(false),
                 stale_build_notice: config_options.stale_build_notice.unwrap_or(true),
