@@ -17,7 +17,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::mpsc::Sender;
@@ -2376,14 +2376,6 @@ fn check_event_permission(
         | Event::CommandPaneOpened(..)
         | Event::CommandPaneExited(..)
         | Event::PaneClosed(..)
-        // the structural lifecycle events describe the same session state `PaneClosed` does, so
-        // they answer to the same permission
-        | Event::TabAdded(..)
-        | Event::TabRemoved(..)
-        | Event::TabRenamed(..)
-        | Event::FocusChanged(..)
-        | Event::ClientAttached(..)
-        | Event::ClientDetached(..)
         | Event::EditPaneOpened(..)
         | Event::EditPaneExited(..)
         | Event::FailedToWriteConfigToDisk(..)
@@ -2514,39 +2506,13 @@ pub fn apply_event_to_plugin(
     Ok(())
 }
 
-/// Plugins whose death has already been announced, so a crash is reported once per plugin id.
-///
-/// Announcing a crash sends an event, and delivering that event can crash another plugin - or the
-/// same one again on the next thing it is asked to do. Without this, two plugins that die on
-/// `PluginDied` would keep each other crashing forever. A reloaded plugin gets a new id, so it can
-/// be announced again.
-static ANNOUNCED_PLUGIN_CRASHES: LazyLock<Mutex<HashSet<PluginId>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
 pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: ThreadSenders) {
     let mut loading_indication = LoadingIndication::new("Panic!".to_owned());
-    loading_indication.indicate_loading_error(message.clone());
+    loading_indication.indicate_loading_error(message);
     let _ = senders.send_to_screen(ScreenInstruction::UpdatePluginLoadingStage(
         plugin_id,
         loading_indication,
     ));
-    // fork addition: a background plugin has no pane, so the loading error above has nowhere to go
-    // and its death has no symptom at all - the feed simply goes quiet. Tell every subscribed
-    // plugin instead, client-independently. Nothing here restarts anything.
-    // fail open on a poisoned lock: a duplicate announcement is noise, while a lost one leaves a
-    // dead background plugin with no symptom at all, and the poison would silence every crash for
-    // the life of the session
-    let is_first_crash = ANNOUNCED_PLUGIN_CRASHES
-        .lock()
-        .map(|mut announced| announced.insert(plugin_id))
-        .unwrap_or(true);
-    if is_first_crash {
-        let _ = senders.send_to_plugin(PluginInstruction::Update(vec![(
-            None,
-            None,
-            Event::PluginDied(plugin_id, message),
-        )]));
-    }
     // a dead plugin receives nothing, so stop building payloads for it - a crashed background
     // plugin has no pane whose closing would otherwise tell Screen it is gone
     let _ = senders.send_to_screen(ScreenInstruction::RemoveBackgroundPluginSubscriptions(
@@ -2585,72 +2551,4 @@ pub fn apply_before_close_event_to_plugin(
         ]))
         .context("failed to unblock input pipe");
     Ok(())
-}
-
-#[cfg(test)]
-mod plugin_crash_tests {
-    use super::*;
-    use zellij_utils::channels::{self, SenderWithContext};
-
-    fn senders_with_plugin_receiver() -> (
-        ThreadSenders,
-        channels::Receiver<(PluginInstruction, zellij_utils::errors::ErrorContext)>,
-    ) {
-        let (plugin_tx, plugin_rx) = channels::unbounded();
-        let mut senders = ThreadSenders::default().silently_fail_on_send();
-        senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
-        (senders, plugin_rx)
-    }
-
-    fn collect_plugin_died_events(
-        rx: &channels::Receiver<(PluginInstruction, zellij_utils::errors::ErrorContext)>,
-    ) -> Vec<(PluginId, String)> {
-        let mut events = vec![];
-        while let Ok((instruction, _)) = rx.try_recv() {
-            if let PluginInstruction::Update(updates) = instruction {
-                for (plugin_id, client_id, event) in updates {
-                    if let Event::PluginDied(dead_plugin_id, message) = event {
-                        assert!(
-                            plugin_id.is_none() && client_id.is_none(),
-                            "PluginDied must be broadcast, not targeted at {:?}/{:?}",
-                            plugin_id,
-                            client_id
-                        );
-                        events.push((dead_plugin_id, message));
-                    }
-                }
-            }
-        }
-        events
-    }
-
-    /// `ANNOUNCED_PLUGIN_CRASHES` is a process-global set, shared by every test in this binary and
-    /// never reset. The tests below stay independent only because each uses a plugin id of its own
-    /// (9001, 9002) that nothing else in the binary touches. A new test here MUST pick another
-    /// unused id, or it will see an announcement another test already consumed.
-    ///
-    /// A background plugin has no pane, so the loading-error indicator has nowhere to go and its
-    /// death is silent - which is indistinguishable from a session with nothing to say.
-    #[test]
-    fn a_crashed_plugin_is_announced_to_every_plugin() {
-        let (senders, rx) = senders_with_plugin_receiver();
-        handle_plugin_crash(9001, "it panicked".to_owned(), senders);
-
-        let events = collect_plugin_died_events(&rx);
-        assert_eq!(events, vec![(9001, "it panicked".to_owned())]);
-    }
-
-    /// Announcing a crash sends an event, and delivering an event is how a plugin crashes. One
-    /// announcement per plugin id is what stops that being a loop. Uses id 9002, distinct from the
-    /// test above - see the note there about the process-global set.
-    #[test]
-    fn a_plugin_that_keeps_crashing_is_announced_once() {
-        let (senders, rx) = senders_with_plugin_receiver();
-        handle_plugin_crash(9002, "it panicked".to_owned(), senders.clone());
-        handle_plugin_crash(9002, "it panicked again".to_owned(), senders.clone());
-        handle_plugin_crash(9002, "and again".to_owned(), senders);
-
-        let events = collect_plugin_died_events(&rx);
-        assert_eq!(events.len(), 1, "got: {:?}", events);
-    }
 }

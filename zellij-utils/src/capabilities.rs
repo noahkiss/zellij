@@ -50,9 +50,6 @@ pub const CAPABILITIES: &[&str] = &[
     "pane-alt-screen",          // PaneInfo.is_alternate_screen
     "pane-scrollback-position", // PaneInfo.scrollback_position, scrollback_length
     "pane-layout-fields", // PaneInfo.is_pinned, logical_position, is_borderless, exclude_from_sync, has_explicit_title
-    "pane-exited-event",  // Event::PaneExited, the exit status of any terminal pane
-    "plugin-died-event",  // Event::PluginDied, a crashed plugin says so
-    "pane-opened-event",  // Event::PaneOpened, broadcast from every creation path
     "client-tty",         // ClientInfo.tty
     "list-clients-json",  // zellij action list-clients --json
     "client-rootshell-pane", // list-clients --json rootshell_pane, from LC_ROOTSHELL_PANE

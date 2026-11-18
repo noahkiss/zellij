@@ -10,7 +10,7 @@ pub struct EventNameList {
 pub struct Event {
     #[prost(enumeration="EventType", tag="1")]
     pub name: i32,
-    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43, 46, 47, 48, 49, 50, 51, 52, 53, 54")]
+    #[prost(oneof="event::Payload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 39, 40, 41, 42, 43")]
     pub payload: ::core::option::Option<event::Payload>,
 }
 /// Nested message and enum types in `Event`.
@@ -98,29 +98,11 @@ pub mod event {
         SoftKeyboardVisibilityChangedPayload(super::SoftKeyboardVisibilityChangedPayload),
         #[prost(message, tag="42")]
         HintTextPayload(super::HintTextPayload),
-        #[prost(message, tag="43")]
-        ActivePaneScrollPayload(super::ActivePaneScrollPayload),
         /// upstream ends at 43. Fork tags start here, flush against that maximum with no gap, so an
         /// upstream payload added at 44 collides on rebase: renumber the FORK side, never upstream's,
         /// and keep the fork tags contiguous after the new upstream maximum.
-        #[prost(message, tag="46")]
-        PaneOpenedPayload(super::PaneOpenedPayload),
-        #[prost(message, tag="47")]
-        PaneExitedPayload(super::PaneExitedPayload),
-        #[prost(message, tag="48")]
-        PluginDiedPayload(super::PluginDiedPayload),
-        #[prost(message, tag="49")]
-        TabAddedPayload(super::TabAddedPayload),
-        #[prost(message, tag="50")]
-        TabRemovedPayload(super::TabRemovedPayload),
-        #[prost(message, tag="51")]
-        TabRenamedPayload(super::TabRenamedPayload),
-        #[prost(message, tag="52")]
-        FocusChangedPayload(super::FocusChangedPayload),
-        #[prost(message, tag="53")]
-        ClientAttachedPayload(super::ClientAttachedPayload),
-        #[prost(message, tag="54")]
-        ClientDetachedPayload(super::ClientDetachedPayload),
+        #[prost(message, tag="43")]
+        ActivePaneScrollPayload(super::ActivePaneScrollPayload),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -257,74 +239,6 @@ pub struct CommandPaneReRunPayload {
 pub struct PaneClosedPayload {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PaneOpenedPayload {
-    #[prost(message, optional, tag="1")]
-    pub pane_id: ::core::option::Option<PaneId>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PaneExitedPayload {
-    #[prost(message, optional, tag="1")]
-    pub pane_id: ::core::option::Option<PaneId>,
-    #[prost(int32, optional, tag="2")]
-    pub exit_status: ::core::option::Option<i32>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct PluginDiedPayload {
-    #[prost(uint32, tag="1")]
-    pub plugin_id: u32,
-    #[prost(string, tag="2")]
-    pub message: ::prost::alloc::string::String,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabAddedPayload {
-    #[prost(uint32, tag="1")]
-    pub tab_id: u32,
-    #[prost(uint32, tag="2")]
-    pub position: u32,
-    #[prost(string, tag="3")]
-    pub name: ::prost::alloc::string::String,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabRemovedPayload {
-    #[prost(uint32, tag="1")]
-    pub tab_id: u32,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct TabRenamedPayload {
-    #[prost(uint32, tag="1")]
-    pub tab_id: u32,
-    #[prost(string, tag="2")]
-    pub name: ::prost::alloc::string::String,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct FocusChangedPayload {
-    #[prost(uint32, tag="1")]
-    pub client_id: u32,
-    #[prost(message, optional, tag="2")]
-    pub pane_id: ::core::option::Option<PaneId>,
-    #[prost(uint32, tag="3")]
-    pub tab_id: u32,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ClientAttachedPayload {
-    #[prost(uint32, tag="1")]
-    pub client_id: u32,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ClientDetachedPayload {
-    #[prost(uint32, tag="1")]
-    pub client_id: u32,
 }
 /// duplicate of plugin_command.PaneId because protobuffs don't like recursive imports
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1046,19 +960,10 @@ pub enum EventType {
     HostTerminalThemeChanged = 46,
     SoftKeyboardVisibilityChanged = 47,
     HintText = 48,
-    ActivePaneScroll = 49,
     /// upstream ends at 49. Fork tags start here, flush against that maximum with no gap, so an
     /// upstream event added at 50 collides on rebase: renumber the FORK side, never upstream's,
     /// and keep the fork tags contiguous after the new upstream maximum.
-    PaneOpened = 52,
-    PaneExited = 53,
-    PluginDied = 54,
-    TabAdded = 55,
-    TabRemoved = 56,
-    TabRenamed = 57,
-    FocusChanged = 58,
-    ClientAttached = 59,
-    ClientDetached = 60,
+    ActivePaneScroll = 49,
 }
 impl EventType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1115,15 +1020,6 @@ impl EventType {
             EventType::SoftKeyboardVisibilityChanged => "SoftKeyboardVisibilityChanged",
             EventType::HintText => "HintText",
             EventType::ActivePaneScroll => "ActivePaneScroll",
-            EventType::PaneOpened => "PaneOpened",
-            EventType::PaneExited => "PaneExited",
-            EventType::PluginDied => "PluginDied",
-            EventType::TabAdded => "TabAdded",
-            EventType::TabRemoved => "TabRemoved",
-            EventType::TabRenamed => "TabRenamed",
-            EventType::FocusChanged => "FocusChanged",
-            EventType::ClientAttached => "ClientAttached",
-            EventType::ClientDetached => "ClientDetached",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1177,15 +1073,6 @@ impl EventType {
             "SoftKeyboardVisibilityChanged" => Some(Self::SoftKeyboardVisibilityChanged),
             "HintText" => Some(Self::HintText),
             "ActivePaneScroll" => Some(Self::ActivePaneScroll),
-            "PaneOpened" => Some(Self::PaneOpened),
-            "PaneExited" => Some(Self::PaneExited),
-            "PluginDied" => Some(Self::PluginDied),
-            "TabAdded" => Some(Self::TabAdded),
-            "TabRemoved" => Some(Self::TabRemoved),
-            "TabRenamed" => Some(Self::TabRenamed),
-            "FocusChanged" => Some(Self::FocusChanged),
-            "ClientAttached" => Some(Self::ClientAttached),
-            "ClientDetached" => Some(Self::ClientDetached),
             _ => None,
         }
     }

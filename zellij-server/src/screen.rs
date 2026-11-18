@@ -1698,9 +1698,8 @@ pub(crate) struct Screen {
     /// A map between this [`Screen`]'s tabs and their ID/key.
     tabs: BTreeMap<usize, Tab>,
     last_single_pane_tab_names: HashMap<usize, Option<String>>,
-    /// What the structural lifecycle events last told plugins, so the next report can be a diff.
-    /// See `report_tab_changes` and `report_focus_changes`.
-    last_reported_tabs: HashMap<usize, String>,
+    /// Each connected client's focus when the pane manifest was last built, so a focus move
+    /// inside a tab can rebuild it. See `focus_moved_since_last_report`.
     last_reported_focus: HashMap<ClientId, (PaneId, usize)>,
     pixel_dimensions: PixelDimensions,
     character_cell_size: Rc<RefCell<Option<SizeInPixels>>>,
@@ -2069,7 +2068,6 @@ impl Screen {
             global_last_active_tab_id: 0,
             tabs: BTreeMap::new(),
             last_single_pane_tab_names: HashMap::new(),
-            last_reported_tabs: HashMap::new(),
             last_reported_focus: HashMap::new(),
             terminal_emulator_colors: Rc::new(RefCell::new(Palette::default())),
             terminal_emulator_color_codes: Rc::new(RefCell::new(HashMap::new())),
@@ -4729,8 +4727,8 @@ impl Screen {
             }
 
             // focus that moved inside a tab reaches here and nowhere else, and the manifest
-            // reports who is looking at each pane, so it is rebuilt with it
-            if self.report_focus_changes() {
+            // reports which pane is focused, so it is rebuilt with it
+            if self.focus_moved_since_last_report() {
                 self.generate_and_report_pane_state()?;
             }
             let single_pane_names_changed = self.update_single_pane_tab_names();
@@ -5596,8 +5594,6 @@ impl Screen {
             self.followed_client_id = Some(client_id);
         }
 
-        self.broadcast_to_plugins(Event::ClientAttached(client_id));
-
         let mut tab_history = vec![];
         if let Some((_first_client, first_tab_history)) = self.tab_history.iter().next() {
             tab_history = first_tab_history.clone();
@@ -5669,10 +5665,6 @@ impl Screen {
     pub fn remove_client(&mut self, client_id: ClientId) -> Result<()> {
         let err_context = || format!("failed to remove client {client_id}");
 
-        self.broadcast_to_plugins(Event::ClientDetached(client_id));
-        // so a client that comes back is announced as focusing a pane again, rather than being
-        // taken for one that never moved
-        self.last_reported_focus.remove(&client_id);
         self.set_client_dimmed(client_id, false, None);
         let passthrough_panes: Vec<PaneId> = self
             .nested_guest_choices
@@ -6446,11 +6438,8 @@ impl Screen {
         self.revert_fit_disabled_without_reference_client()
             .with_context(err_context)?;
         self.reconcile_all_single_pane_focus();
-        // announced before the snapshots below, so a subscriber hears what changed and then sees
-        // the state that already reflects it
-        self.report_tab_changes();
         // the manifest below is rebuilt either way, so the return is not needed here
-        let _ = self.report_focus_changes();
+        let _ = self.focus_moved_since_last_report();
         // generate own session info
         let pane_manifest = self.generate_and_report_pane_state()?;
         let tab_infos = self.generate_and_report_tab_state()?;
@@ -9126,61 +9115,13 @@ impl Screen {
             }
         }
     }
-    /// fork addition: broadcast one event to every subscribed plugin
+    /// fork addition: whether any connected client's focus moved since the last call
     ///
-    /// `(None, None)` like `PaneClosed`, so it reaches background plugins and plugins in tabs
-    /// nobody is looking at, whether or not a client is attached.
-    fn broadcast_to_plugins(&self, event: Event) {
-        let _ = self
-            .bus
-            .senders
-            .send_to_plugin(PluginInstruction::Update(vec![(None, None, event)]));
-    }
-    /// fork addition: the tab lifecycle events, as a diff against what was last reported
-    ///
-    /// A tab is added, removed and renamed from a dozen call sites, and every one of them already
-    /// ends at `log_and_report_session_state`, so the change is found here by comparing with the
-    /// last report rather than announced from each site - the same shape
-    /// `update_single_pane_tab_names` already uses, and the reason a path added later cannot
-    /// forget to announce itself.
-    ///
-    /// `ClientAttached` and `ClientDetached` are NOT diffed: a client that attaches and leaves
-    /// between two reports would vanish from a diff, so those two are announced from the one place
-    /// each happens.
-    fn report_tab_changes(&mut self) {
-        let mut events = vec![];
-
-        let current_tabs: HashMap<usize, String> = self
-            .tabs
-            .values()
-            .map(|tab| (tab.id, tab.name.clone()))
-            .collect();
-        for tab in self.tabs.values() {
-            match self.last_reported_tabs.get(&tab.id) {
-                None => events.push(Event::TabAdded(tab.id, tab.position, tab.name.clone())),
-                Some(last_name) if last_name != &tab.name => {
-                    events.push(Event::TabRenamed(tab.id, tab.name.clone()))
-                },
-                Some(_) => {},
-            }
-        }
-        for tab_id in self.last_reported_tabs.keys() {
-            if !current_tabs.contains_key(tab_id) {
-                events.push(Event::TabRemoved(*tab_id));
-            }
-        }
-        self.last_reported_tabs = current_tabs;
-
-        self.broadcast_all_to_plugins(events);
-    }
-    /// fork addition: `FocusChanged`, as a diff against what was last reported
-    ///
-    /// Diffed for the same reason the tab events are, but from a second place as well. Moving
-    /// focus inside a tab only renders - it never reaches `log_and_report_session_state` - so a
-    /// diff taken only there would miss the commonest focus change there is. This costs two hash
-    /// lookups per connected client, and the render it hangs off is already debounced to 10ms.
-    fn report_focus_changes(&mut self) -> bool {
-        let mut events = vec![];
+    /// Moving focus inside a tab only renders - it never reaches `log_and_report_session_state` -
+    /// so `is_focused` in the pane manifest would describe the old focus until something else
+    /// reported. The render path asks this and rebuilds the manifest when it says yes. This costs
+    /// two hash lookups per connected client, and the render it hangs off is debounced to 10ms.
+    fn focus_moved_since_last_report(&mut self) -> bool {
         let mut current_focus = HashMap::new();
         let connected_clients: Vec<ClientId> =
             self.connected_clients.borrow().keys().copied().collect();
@@ -9191,27 +9132,13 @@ impl Screen {
             ) else {
                 continue;
             };
-            if self.last_reported_focus.get(&client_id) != Some(&(pane_id, tab_id)) {
-                events.push(Event::FocusChanged(client_id, pane_id.into(), tab_id));
-            }
             current_focus.insert(client_id, (pane_id, tab_id));
         }
+        let focus_moved = current_focus
+            .iter()
+            .any(|(client_id, focus)| self.last_reported_focus.get(client_id) != Some(focus));
         self.last_reported_focus = current_focus;
-
-        let focus_moved = !events.is_empty();
-        self.broadcast_all_to_plugins(events);
         focus_moved
-    }
-    fn broadcast_all_to_plugins(&self, events: Vec<Event>) {
-        if events.is_empty() {
-            return;
-        }
-        let _ = self.bus.senders.send_to_plugin(PluginInstruction::Update(
-            events
-                .into_iter()
-                .map(|event| (None, None, event))
-                .collect(),
-        ));
     }
     fn update_active_pane_ids(&mut self) {
         let connected_clients: Vec<ClientId> =

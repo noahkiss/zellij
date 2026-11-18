@@ -1009,36 +1009,6 @@ pub enum Event {
     CommandPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> -
     // exit_code
     PaneClosed(PaneId),
-    /// A pane was created in this session, whether or not a client is attached
-    ///
-    /// The counterpart of `PaneClosed`: it fires once per pane from every creation path - tiled,
-    /// floating, stacked, in-place, editor and layout-applied, terminal and plugin alike - and it
-    /// is broadcast to every subscribed plugin rather than to the client that asked for the pane.
-    /// A pane moved between tabs is not a new pane and does not fire it.
-    PaneOpened(PaneId),
-    /// The process in a terminal pane exited, with the status it exited with
-    ///
-    /// It fires for every terminal pane whatever started it - a layout, the CLI, a plugin or the
-    /// user - and it is broadcast to every subscribed plugin rather than to whoever asked for the
-    /// pane. `CommandPaneExited` reports the same thing to the one plugin that opened the pane;
-    /// this is the general signal, and until now a command pane started by a layout could fail
-    /// and tell nobody.
-    ///
-    /// The status is `None` when the process was killed by a signal or the exit status could not
-    /// be read. A pane that holds after exiting keeps reporting the status on `PaneInfo`; a pane
-    /// that closes is then announced by `PaneClosed`, which carries no status of its own.
-    PaneExited(PaneId, Option<i32>),
-    /// A plugin crashed and is no longer running
-    ///
-    /// The payload is the plugin's id and the error it died with. It is broadcast to every
-    /// subscribed plugin, so a supervisor hears about a background plugin whose death has no other
-    /// symptom: a background plugin has no pane, so the loading-error indicator zellij draws for a
-    /// crashed plugin has nowhere to go, and a consumer of its output cannot tell a quiet session
-    /// from a dead feed.
-    ///
-    /// Nothing restarts the plugin. Each crash is announced once per plugin id, so a plugin that
-    /// dies again on the next event cannot drive an announcement loop.
-    PluginDied(u32, String), // u32 - plugin_id, String - the error it died with
     EditPaneOpened(u32, Context),              // u32 - terminal_pane_id
     EditPaneExited(u32, Option<i32>, Context), // u32 - terminal_pane_id, Option<i32> - exit code
     CommandPaneReRun(u32, Context),            // u32 - terminal_pane_id, Option<i32> -
@@ -1075,34 +1045,6 @@ pub enum Event {
     SoftKeyboardVisibilityChanged(bool),
     HintText(BTreeMap<usize, StyledText>),
     ActivePaneScroll(Option<(usize, usize)>),
-    /// A tab was created in this session, whether or not a client is attached
-    ///
-    /// The payload is the tab's stable id, its position at the moment it was created, and its
-    /// name. Position is the only one of the three that can go stale: a later tab created before
-    /// this one, or a reorder, moves it. `TabUpdate` carries the current list.
-    TabAdded(usize, usize, String), // tab_id, position, name
-    /// A tab was closed. The payload is the tab's stable id.
-    ///
-    /// The tab is already gone when this fires, so the id is all there is to report - look it up
-    /// against the last `TabUpdate` if the name matters.
-    TabRemoved(usize), // tab_id
-    /// A tab was renamed. The payload is the tab's stable id and its new name.
-    ///
-    /// It fires for a rename from any source - the tab bar, `zellij action rename-tab`, a plugin -
-    /// and only when the name actually changes.
-    TabRenamed(usize, String), // tab_id, new name
-    /// A client's focus moved to another pane, in this or another tab
-    ///
-    /// The payload names the client, the pane it now looks at, and that pane's tab. Focus is per
-    /// client, so this fires once for the client that moved and says nothing about the others -
-    /// which is the point: with a human and an agent attached, "the focused pane" is two answers.
-    /// A switch to another tab reports the pane focused in it, since that is what the client is
-    /// now looking at.
-    FocusChanged(ClientId, PaneId, usize), // client_id, pane_id, tab_id
-    /// A client attached to this session
-    ClientAttached(ClientId),
-    /// A client detached from this session, or its connection went away
-    ClientDetached(ClientId),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2666,7 +2608,7 @@ pub struct PaneInfo {
     ///
     /// Empty for a suppressed pane, and for a pane whose only focused client has detached: a
     /// detached client keeps its place so it lands back where it was, but nobody is looking
-    /// through it. The counterpart push event is `FocusChanged`.
+    /// through it.
     #[serde(default)]
     pub focused_by_client_ids: Vec<ClientId>,
     /// The `TabInfo::tab_id` of the tab this pane is in

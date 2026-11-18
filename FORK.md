@@ -4793,84 +4793,6 @@ act on nor keep up with, and writing them would rewrite the file for every pane 
 
 Proto tags 38-45.
 
-### A crashed plugin says so (`Event::PluginDied`)
-
-When a plugin panics, zellij pushes a loading-error indication to the plugin's pane. A background
-plugin has no pane. So a background plugin - the kind that watches a session and forwards what it
-sees - died behind one `log::error!` and nothing else changed: no event, nothing to poll, and a feed
-that has gone quiet looks exactly like a session with nothing to say.
-
-`Event::PluginDied(plugin_id, message)` is broadcast to every subscribed plugin when a plugin
-crashes, carrying the error it died with. A supervisor plugin can therefore notice, and a consumer
-downstream of one can be told.
-
-- **Nothing restarts the plugin.** This is a signal, not a policy; reloading is the caller's
-  decision and belongs where the caller's configuration is.
-- **Each plugin id is announced once.** Announcing a crash sends an event, and delivering an event
-  is how a plugin crashes, so two plugins that die on `PluginDied` would otherwise keep each other
-  crashing forever. A reloaded plugin gets a new id and can be announced again.
-- The pane indicator is unchanged for plugins that have a pane.
-
-`SessionInfo.plugins` deliberately does **not** mark dead plugins, because it does not list live
-ones either: `Screen` builds every `SessionInfo` with an empty map, `populate_plugin_list` has no
-callers anywhere in the tree, and the KDL codec drops the field. Marking a list nobody fills would
-be a fiction; populating it is a separate piece of work.
-
-Proto: `EventType` 54, event payload 48.
-
-### `Event::PaneExited`, so a failed command pane tells someone
-
-A command pane that fails had exactly one way to say so, and it only worked for one kind of caller:
-`Event::CommandPaneExited` goes to the plugin that opened the pane. A pane started by a layout or by
-`zellij action new-pane -- <command>` has no such plugin, so its exit status was read in the pty
-thread and thrown away. `PaneClosed` fired, carrying no status. A build in a background tab could
-fail and nothing outside that tab ever knew.
-
-`Event::PaneExited(PaneId, Option<i32>)` is the same news told to everyone. It is broadcast like
-`PaneClosed`, from every path that spawns a terminal - the interactive one, the layout one and the
-re-run of a held command pane - so it works in a fully detached session. `CommandPaneExited` still
-goes to the originating plugin exactly as before.
-
-- The status is `None` when the process was killed by a signal or the status could not be read.
-  `None` is not zero, and a consumer deciding whether a job succeeded must not treat it as such.
-- It fires for a plain shell exiting too, which is the same event from zellij's point of view.
-- A pane that holds after exiting keeps reporting `exited` and `exit_status` on `PaneInfo`; a pane
-  configured to close is announced by `PaneClosed` immediately afterwards.
-- **The order of the two is decided by which end went first, and `PaneClosed` is often the one in
-  front.** When the *command* ends, the exit is broadcast and the close follows it, as above. When
-  something *closes the pane* — `close-pane`, a tab closing, the session ending — the pane is
-  announced closed and the exit arrives afterwards, because the process is not reaped until it has
-  been killed. A consumer that forgets a pane on `PaneClosed` therefore has nowhere to put the
-  status when it lands: keep the pane until its exit is in, or take the status off `PaneInfo` while
-  the pane is still listed. Observed on a fully detached session driven from the CLI.
-
-Proto: `EventType` 53, event payload 47.
-
-### `Event::PaneOpened`, the counterpart of `PaneClosed`
-
-`PaneClosed` was the only structural lifecycle event zellij had. It fires from every close path and
-reaches every subscribed plugin whether or not a client is attached, so pane *removal* was already
-observable in a detached session — while pane *creation* could only be recovered by diffing a pane
-manifest against the last one a consumer happened to see.
-
-`Event::PaneOpened(PaneId)` closes the asymmetry. It carries the same payload as `PaneClosed`, is
-broadcast the same way, and fires from every creation path: tiled, floating, stacked and
-no-preference panes, in-place and editor panes, the panes a layout builds when a tab is created,
-terminals and plugins alike.
-
-What it deliberately does not fire for:
-
-- **A pane that moved.** Toggling a pane between tiled and floating, breaking it out to another tab
-  or restacking it is the same pane with the same id and uuid. Only creation is announced.
-- **A pane that was not created.** A creation that finds no room for the pane drops it; the event is
-  sent only after the pane is found in the tab, because announcing one that does not exist is worse
-  than announcing nothing.
-
-Pair it with `PaneClosed` for a complete pane lifecycle without polling, and with `PaneInfo.uuid`
-when a consumer needs to tell a restored pane from the one it continues.
-
-Proto: `EventType` 52, event payload 46.
-
 ### Idempotent setters for the four remaining toggles
 
 ```
@@ -7396,52 +7318,6 @@ implementations. It is also carried by the KDL codec behind `session-metadata.kd
 `id` and read back optionally so metadata from an older build still parses. The client/server
 contract has no `PaneInfo` and is untouched.
 
-### Structural lifecycle events: tabs, focus and clients
-
-`PaneClosed`, and the fork's `PaneOpened` and `PaneExited`, were the only structural events in the
-tree. Everything else — a tab appearing, being renamed or closing, focus moving, a client arriving
-or leaving — had to be recovered by diffing successive `TabUpdate` and `PaneUpdate` snapshots. That
-is work every consumer repeats, and it is why a consumer with no client attached saw a different
-world from one with a client: the snapshot it diffed was gated on somebody being there.
-
-Six events, subscribed to like any other and gated on `ReadApplicationState`, the same permission
-`PaneClosed` answers to:
-
-| Event | Payload | Fires when |
-|---|---|---|
-| `TabAdded` | tab id, position, name | a tab is created, from any path including a layout |
-| `TabRemoved` | tab id | a tab closes |
-| `TabRenamed` | tab id, new name | a tab's name changes, from any source |
-| `FocusChanged` | client id, pane id, tab id | a client's focus moves, to another pane or another tab |
-| `ClientAttached` | client id | a client attaches |
-| `ClientDetached` | client id | a client detaches, or its connection goes away |
-
-All six are broadcast `(None, None)` like `PaneClosed`, so they reach background plugins and
-plugins in tabs nobody is looking at, whether or not a client is attached.
-
-**Focus is per client, and that is the point.** With a human and an agent attached to one session,
-"the focused pane" is two answers. `FocusChanged` fires for the client that moved and says nothing
-about the others.
-
-**Four of the six are found by diffing, rather than announced from each site.** A tab is renamed
-from nine call sites and focus moves from more than that; every one of them already ends at
-`log_and_report_session_state`, so the change is detected there by comparing with the last report.
-That is the shape the single-pane tab names already used, and it is why a path added later cannot
-forget to announce itself.
-
-**Focus is diffed from a second place as well**, because moving focus *inside* a tab only renders —
-it never reaches `log_and_report_session_state` — and that is the commonest focus change there is.
-The focus diff therefore also runs in `render_to_clients`, beside the single-pane tab name check.
-It costs two hash lookups per connected client, on a render that is already debounced to 10ms.
-
-`ClientAttached` and `ClientDetached` are the exceptions to the diffing: a client that attached and
-left between two reports would vanish from a diff, so those two are sent from the one place each
-happens.
-
-The events cross the plugin API: `event.proto` gains `EventType` values 55–60 and payload tags
-49–54, with regenerated prost output and both `TryFrom` implementations. The client/server contract
-is untouched.
-
 ### Which clients are looking at a pane
 
 ```
@@ -7467,8 +7343,7 @@ a list rather than collapsed to a yes.
 **A focus move inside a tab now refreshes the manifest.** Moving focus between panes of one tab only
 renders — it never rebuilt the pane state — so `is_focused` described the focus the session had
 before the move until something else happened to report. The render path now rebuilds the manifest
-when the focus diff says somebody moved. `Event::FocusChanged` is the push complement; this is the
-snapshot.
+when the focus diff says somebody moved.
 
 **No client list is added to `SessionInfo`.** The survey paired this with one, but
 `SessionInfo.pane_history` already names every client and the last entry of each is its focused
@@ -7782,14 +7657,11 @@ nothing to carry: `PaneListEntry` is CLI-only, so there is no protobuf tag, no r
 output, no second `TryFrom` and no plugin-visible contract. It is the cheapest of the three
 surfaces AGENTS.md ranks, and it answers the question that was asked.
 
-A `CommandStateChanged` event was the alternative, riding the pattern the [six lifecycle
-events](#structural-lifecycle-events-tabs-focus-and-clients) just established. It was not built,
-for two reasons. It would cost an `EventType` and a payload tag to tell plugins something no
-plugin here wants, and the CLI consumer — the one that does want it — cannot subscribe to plugin
-events at all. And a push event has to be *detected*, which means diffing every pane's marker state
-on a path that runs at render frequency; the six lifecycle events could be diffed inside
-`log_and_report_session_state` because their state was already being reported there, and this one
-is not. If a plugin ever needs it, the event is a separate patch on top of this one, and this
+A `CommandStateChanged` event was the alternative. It was not built, for two reasons. It would
+cost an `EventType` and a payload tag to tell plugins something no plugin here wants, and the CLI
+consumer — the one that does want it — cannot subscribe to plugin events at all. And a push event
+has to be *detected*, which means diffing every pane's marker state on a path that runs at render
+frequency, where nothing else reports it. If a plugin ever needs it, the event is a separate patch on top of this one, and this
 patch's grid accessor is what it would read.
 
 ### A client whose terminal dies detaches instead of crashing
