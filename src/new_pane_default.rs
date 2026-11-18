@@ -62,7 +62,6 @@ mod tests {
             no_focus: true,
             borderless: None,
             tab_id: None,
-            handle: None,
             ready: ReadyFlags::default(),
         };
         let rewritten = stacked_edit(action, Some(&config), PathBuf::from("/project")).unwrap();

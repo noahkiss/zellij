@@ -4033,7 +4033,6 @@ pub fn send_cli_new_pane_action_with_default_parameters() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4148,7 +4147,6 @@ pub fn send_cli_new_pane_action_with_split_direction() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4209,7 +4207,6 @@ pub fn send_cli_new_pane_action_with_command_and_cwd() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4281,7 +4278,6 @@ pub fn send_cli_new_pane_action_with_floating_pane_and_coordinates() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -4331,7 +4327,6 @@ pub fn send_cli_edit_action_with_default_parameters() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
-        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4377,7 +4372,6 @@ pub fn send_cli_edit_action_with_line_number() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
-        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -4423,7 +4417,6 @@ pub fn send_cli_edit_action_with_split_direction() {
         near_current_pane: false,
         no_focus: false,
         tab_id: None,
-        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100)); // give time for actions to be
@@ -6173,7 +6166,6 @@ pub fn send_cli_new_pane_in_place_with_close_replaced_pane() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -6231,7 +6223,6 @@ pub fn send_cli_edit_in_place_with_close_replaced_pane() {
         no_focus: false,
         borderless: None,
         tab_id: None,
-        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -9885,7 +9876,6 @@ pub fn send_cli_new_pane_action_with_tab_id() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -9953,7 +9943,6 @@ pub fn send_cli_new_floating_pane_action_with_tab_id() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -10009,7 +9998,6 @@ pub fn send_cli_edit_action_with_tab_id() {
         no_focus: false,
         borderless: None,
         tab_id: Some(0),
-        handle: None,
     };
     send_cli_action_to_server(&session_metadata, cli_edit_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -10072,7 +10060,6 @@ pub fn send_cli_new_pane_action_with_tab_id_and_direction() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: Some(false),
@@ -10139,7 +10126,6 @@ pub fn send_cli_new_pane_action_with_tab_id_and_stacked() {
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,

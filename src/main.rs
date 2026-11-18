@@ -97,7 +97,6 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
-            handle,
             ready,
         })) = opts.command
         {
@@ -143,7 +142,6 @@ fn main() {
                 new_tab: None,
                 in_tab: None,
                 near: None,
-                handle,
                 ready,
                 near_current_pane,
                 no_focus,
@@ -168,7 +166,6 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
-            handle,
         })) = opts.command
         {
             let cwd = None;
@@ -203,7 +200,6 @@ fn main() {
                 new_tab: None,
                 in_tab: None,
                 near: None,
-                handle,
                 near_current_pane: false,
                 no_focus,
                 ready: Default::default(),
@@ -230,7 +226,6 @@ fn main() {
             no_focus,
             borderless,
             tab_id,
-            handle,
             ready,
         })) = opts.command
         {
@@ -258,7 +253,6 @@ fn main() {
                 no_focus,
                 borderless,
                 tab_id,
-                handle,
                 ready,
             };
             commands::send_action_to_session(command_cli_action, opts.session, config, false);

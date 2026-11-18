@@ -2570,7 +2570,7 @@ mod pane_handle_tests {
 
     #[test]
     fn a_chosen_handle_survives_the_round_trip_like_any_other() {
-        // a name the caller picked is stored the same way a generated one is, so `--handle build`
+        // a name a layout picked is stored the same way a generated one is, so `handle="build"`
         // still reaches the pane after the session has been restored
         let manifest = manifest_with_handle(Some("build"));
         let layout = tiled_pane_layout_from_manifest(Some(&manifest), None);
@@ -2592,7 +2592,7 @@ mod pane_handle_tests {
 
     #[test]
     fn a_layout_handle_that_is_not_a_handle_is_a_layout_error() {
-        // the same grammar `--handle` is held to: a name that could be read as a pane id would
+        // the handle grammar: a name that could be read as a pane id would
         // reach the wrong pane the first time somebody typed it into `--pane-id`
         for rejected in ["terminal_1", "7", "Build"] {
             let layout = format!("layout {{\n    pane handle=\"{}\"\n}}", rejected);

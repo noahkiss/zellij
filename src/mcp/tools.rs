@@ -422,9 +422,10 @@ pub const TOOLS: &[ToolSpec] = &[
                one-shot command whose exit status you want, pass run_in=exec and follow with \
                zellij_wait_for until=exit, then read `exit_status`. A shell that is not ready in \
                time is reported as `ready: false` with the pane's handle, and nothing is typed. \
-               The handle in the answer is the pane's address and survives a session restore; \
-               use it, not the integer id, and pass `handle` yourself when you want to find the \
-               pane again by a name you chose. On another machine (session host/session) kind is \
+               The answer carries the pane's id and its generated handle. The handle is the \
+               pane's address and survives a session restore: use it, not the integer id, for \
+               every later call on the pane. You cannot choose a pane's name or handle; a pane \
+               running a command is named after the command. On another machine (session host/session) kind is \
                agent_tab or tab, cwd is an absolute path there, and exec runs through /bin/sh. \
                run_in=plugin loads a plugin instead, configured by \
                plugin_config; read what it draws with zellij_read_pane.",
@@ -487,24 +488,6 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "The directory the pane starts in. `~`, `$VAR` and a relative path are \
                            expanded against this server's own environment; a path that is not a \
                            directory fails the call rather than being ignored.",
-                default: None,
-            },
-            ParamSpec {
-                name: "name",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("action new-pane", "--name")),
-                describe:
-                    "What to call the pane, drawn on its frame. Without one a pane running a \
-                           command is named after the command.",
-                default: None,
-            },
-            ParamSpec {
-                name: "handle",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("action new-pane", "--handle")),
-                describe: "",
                 default: None,
             },
             ParamSpec {
@@ -1307,37 +1290,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn every_handle_flag_states_the_whole_rule_and_the_create_tool_carries_it() {
-        // `zellij_create` takes its `handle` text from `action new-pane --handle`, and that one
-        // flag kept the short help after the other four were fixed - so `plugin-check` still
-        // looked valid in the one place an agent reads it. Every `--handle` says the same thing.
-        let handles: Vec<(&str, &str)> = cli_surface::surface_commands()
-            .iter()
-            // `reopen-pane --handle` names a closed pane to find, not a handle to give one
-            .filter(|command| !command.path.ends_with("reopen-pane"))
-            .filter_map(|command| {
-                command
-                    .arg("--handle")
-                    .map(|arg| (command.path.as_str(), arg.about.as_str()))
-            })
-            .collect();
-        assert!(handles.len() >= 5, "found only {:?}", handles);
-        for (path, about) in &handles {
-            assert!(
-                about.contains("cannot be terminal or plugin"),
-                "`zellij {} --handle` does not state the whole rule: {}",
-                path,
-                about
-            );
-        }
-        let create = TOOLS
-            .iter()
-            .find(|tool| tool.name == "zellij_create")
-            .unwrap();
-        let handle = create.params.iter().find(|p| p.name == "handle").unwrap();
-        assert!(param_description(handle).contains("cannot be terminal or plugin"));
     }
 }

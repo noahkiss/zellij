@@ -700,20 +700,6 @@ pub enum Sessions {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself: up to
-        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
-        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
-        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
-        /// error, and nothing is created
-        #[clap(
-            long,
-            value_parser = chosen_handle,
-            conflicts_with("blocking"),
-            conflicts_with("block_until_exit"),
-            conflicts_with("block_until_exit_success"),
-            conflicts_with("block_until_exit_failure")
-        )]
-        handle: Option<String>,
 
         #[clap(flatten)]
         ready: ReadyFlags,
@@ -774,13 +760,6 @@ pub enum Sessions {
         /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself: up to
-        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
-        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
-        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
-        /// error, and nothing is created
-        #[clap(long, value_parser = chosen_handle)]
-        handle: Option<String>,
     },
     /// Open a file in a new pane running your $EDITOR
     ///
@@ -848,13 +827,6 @@ pub enum Sessions {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself: up to
-        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
-        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
-        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
-        /// error, and nothing is created
-        #[clap(long, value_parser = chosen_handle)]
-        handle: Option<String>,
 
         #[clap(flatten)]
         ready: ReadyFlags,
@@ -1163,8 +1135,8 @@ impl Default for WaitFor {
 
 /// `--wait-ready` and `--ready-timeout`, on every verb that makes a pane for a caller to type into.
 ///
-/// Held by the client, like `--handle`: it waits once the report names the pane, so nothing about
-/// it reaches the action or the client/server contract.
+/// Held by the client: it waits once the report names the pane, so nothing about it reaches the
+/// action or the client/server contract.
 #[derive(Args, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadyFlags {
     /// Wait until the new pane's shell is ready for input before answering, as `zellij action
@@ -1719,21 +1691,6 @@ pub enum CliAction {
         #[clap(short, long, value_parser)]
         name: Option<String>,
 
-        /// The handle to give the pane, instead of the two-word one it would name itself: up to
-        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
-        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
-        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
-        /// error, and nothing is created
-        #[clap(
-            long,
-            value_parser = chosen_handle,
-            conflicts_with("blocking"),
-            conflicts_with("block_until_exit"),
-            conflicts_with("block_until_exit_success"),
-            conflicts_with("block_until_exit_failure")
-        )]
-        handle: Option<String>,
-
         /// Close the pane immediately when its command exits
         #[clap(short, long, requires("command"))]
         close_on_exit: bool,
@@ -1805,8 +1762,8 @@ pub enum CliAction {
 
         /// Put the pane in a tab of its own, made now, and report `tab_id:` as well as the pane.
         /// With a NAME the tab is called that; bare, zellij names it as it names any new tab. The
-        /// pane in it cannot be named with --name or drawn with --borderless: use --handle, or
-        /// rename it once it is there
+        /// pane in it cannot be named with --name or drawn with --borderless: rename it once it
+        /// is there
         #[clap(
             long,
             value_name = "NAME",
@@ -1940,13 +1897,6 @@ pub enum CliAction {
             conflicts_with("in_place")
         )]
         tab_id: Option<usize>,
-        /// The handle to give the pane, instead of the two-word one it would name itself: up to
-        /// four words of lowercase letters and digits joined by dashes, eg. build or web-2, with a
-        /// letter somewhere, at most 16 characters a word and 40 in all. The first word cannot be
-        /// terminal or plugin, which read as a pane id. A handle another live pane holds is an
-        /// error, and nothing is created
-        #[clap(long, value_parser = chosen_handle)]
-        handle: Option<String>,
 
         #[clap(flatten)]
         ready: ReadyFlags,
@@ -2321,8 +2271,7 @@ pub enum CliAction {
     /// Focus a plugin's pane if it is already running, otherwise open it
     ///
     /// Prints nothing: the plugin's pane is built on the plugin thread after this has been
-    /// answered, so there is no id to report. `list-panes` is how you find the pane afterwards,
-    /// and it is why this verb takes no `--handle`.
+    /// answered, so there is no id to report. `list-panes` is how you find the pane afterwards.
     LaunchOrFocusPlugin {
         /// Open it as a floating pane
         #[clap(short, long, value_parser)]
@@ -2757,33 +2706,9 @@ pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -
         .unwrap()
 }
 
-/// A `--handle` value, refused at the parser when it is not a handle anyone could choose.
-///
-/// The reasons live in `pane_handle` with the grammar they come from; this is the clap end of it,
-/// so a bad name is caught before a pane is made rather than after.
-fn chosen_handle(value: &str) -> Result<String, String> {
-    match crate::pane_handle::chosen_handle_error(value) {
-        Some(reason) => Err(reason),
-        None => Ok(value.to_owned()),
-    }
-}
-
 impl CliAction {
-    /// The handle `--handle` chose, taken out of the request for the client to apply.
-    ///
-    /// A pane names itself when it is born and the CLI has no say in that moment, so a chosen
-    /// handle is given to the pane just after, by the client that is holding the report and knows
-    /// which pane was made. Taking it here is what keeps a handle from also travelling as part of
-    /// the creation action, where nothing would look at it.
-    pub fn take_chosen_handle(&mut self) -> Option<String> {
-        match self {
-            CliAction::NewPane { handle, .. } | CliAction::Edit { handle, .. } => handle.take(),
-            _ => None,
-        }
-    }
-
-    /// The deadline `--wait-ready` set, taken out of the request for the client to hold, as
-    /// `--handle` is. `Ok(None)` is a request that did not ask.
+    /// The deadline `--wait-ready` set, taken out of the request for the client to hold.
+    /// `Ok(None)` is a request that did not ask.
     ///
     /// Refused alongside a blocking wait: that one replaces the report with the command's exit
     /// status, and a pane that is ready is one a caller is about to type into, not one it waits
@@ -4086,14 +4011,6 @@ mod tests {
     }
 
     #[test]
-    fn a_chosen_handle_is_taken_out_of_the_request() {
-        let mut action = parse_action(&["new-pane", "--handle", "build"]);
-        assert_eq!(action.take_chosen_handle().as_deref(), Some("build"));
-        // taken once: the client applies it, and it must not also travel with the action
-        assert_eq!(action.take_chosen_handle(), None);
-    }
-
-    #[test]
     fn a_pipe_deadline_is_taken_out_of_the_request() {
         let mut action = parse_action(&["pipe", "--timeout", "5", "--name", "logs"]);
         assert_eq!(
@@ -4254,23 +4171,6 @@ mod tests {
     }
 
     #[test]
-    fn every_command_that_makes_a_pane_can_be_told_what_to_call_it() {
-        // one address mechanism, on every surface that creates a pane - a caller should not have
-        // to know which verb made the pane to know whether it could have named it
-        for args in [vec!["edit", "--handle", "notes", "/tmp/x"]] {
-            let mut action = parse_action(&args);
-            assert_eq!(
-                action.take_chosen_handle().as_deref(),
-                Some(args[2]),
-                "`{}` did not carry its handle",
-                args.join(" ")
-            );
-            // taken once: the client applies it, and it must not also travel with the action
-            assert_eq!(action.take_chosen_handle(), None);
-        }
-    }
-
-    #[test]
     fn wait_ready_is_taken_out_of_every_creating_verb() {
         for args in [
             vec!["new-pane", "--wait-ready"],
@@ -4380,96 +4280,6 @@ mod tests {
             };
             assert!(ready.wait_ready, "{:?}", args);
         }
-    }
-
-    #[test]
-    fn the_top_level_creating_commands_take_a_handle_too() {
-        // `zellij run` and `zellij edit` are the shorthands a person actually types
-        let cli = parse_cli(
-            ["zellij", "run", "--handle", "build", "--", "cargo", "watch"]
-                .iter()
-                .map(|a| a.to_string())
-                .collect(),
-        )
-        .expect("`zellij run --handle` parses");
-        match cli.command {
-            Some(Command::Sessions(Sessions::Run { handle, .. })) => {
-                assert_eq!(handle.as_deref(), Some("build"))
-            },
-            other => panic!("Expected Run, got {:?}", other),
-        }
-        let cli = parse_cli(
-            ["zellij", "edit", "--handle", "notes", "/tmp/x"]
-                .iter()
-                .map(|a| a.to_string())
-                .collect(),
-        )
-        .expect("`zellij edit --handle` parses");
-        match cli.command {
-            Some(Command::Sessions(Sessions::Edit { handle, .. })) => {
-                assert_eq!(handle.as_deref(), Some("notes"))
-            },
-            other => panic!("Expected Edit, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn a_handle_is_refused_on_the_new_surfaces_by_the_same_grammar() {
-        // the negative control, and the point of one parser: a name that reads like an id is
-        // refused wherever it is typed, not only on the verb it was first offered on
-        for args in [
-            vec!["edit", "--handle", "terminal_1", "/tmp/x"],
-            vec!["edit", "--handle", "7", "/tmp/x"],
-            vec!["edit", "--handle", "Board", "/tmp/x"],
-            vec!["edit", "--handle", "plugin-2", "/tmp/x"],
-        ] {
-            assert!(
-                action_parse_fails(&args),
-                "expected `{}` to be refused",
-                args.join(" ")
-            );
-        }
-    }
-
-    #[test]
-    fn a_handle_that_could_be_read_as_an_id_is_refused_at_the_parser() {
-        for rejected in ["terminal_1", "7", "Build", "my handle", "terminal-1"] {
-            assert!(
-                action_parse_fails(&["new-pane", "--handle", rejected]),
-                "expected `--handle {}` to be refused",
-                rejected
-            );
-        }
-        // the negative control: a name a person would pick goes through
-        assert_eq!(
-            parse_action(&["new-pane", "--handle", "my-build"]).take_chosen_handle(),
-            Some("my-build".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_handle_cannot_ride_with_a_command_that_prints_no_pane() {
-        // the blocking family answers with an exit status instead of a `pane_id:`, and the handle
-        // is applied to the pane the report names
-        for waiting in [
-            "--blocking",
-            "--block-until-exit",
-            "--block-until-exit-success",
-            "--block-until-exit-failure",
-        ] {
-            assert!(
-                action_parse_fails(&["new-pane", "--handle", "build", waiting]),
-                "expected `--handle` with `{}` to be refused",
-                waiting
-            );
-        }
-    }
-
-    #[test]
-    fn an_unapplied_handle_never_reaches_the_session() {
-        let error = actions_of(&["new-pane", "--handle", "build"])
-            .expect_err("a handle still on the request is not an action");
-        assert!(error.contains("--handle"), "got: {}", error);
     }
 
     #[test]

@@ -1299,11 +1299,7 @@ fn attach_with_cli_client(
             std::process::exit(exit_status);
         }
     }
-    // `--handle` is applied to the pane once it exists, by the client that gets the report. It is
-    // checked against the live panes first, so a name that is already taken is an error before
-    // anything is created rather than a pane that came out under a name nobody asked for
     let mut cli_action = cli_action;
-    let chosen_handle = cli_action.take_chosen_handle();
     // `pipe --timeout` is the client's to hold: the session has nothing to time out, and keeping it
     // here is what keeps the flag off `Action::CliPipe` and off the client/server contract
     let pipe_timeout = cli_action.take_pipe_timeout();
@@ -1315,16 +1311,6 @@ fn attach_with_cli_client(
             std::process::exit(2);
         },
     };
-    if let Some(handle) = &chosen_handle {
-        if let Ok(taken_by) = resolve_pane_target(handle) {
-            eprintln!(
-                "The handle '{}' is taken by {} in this session. Handles name one pane at a time, \
-                 and this one is not rerolled: pick another, or close that pane.",
-                handle, taken_by
-            );
-            std::process::exit(1);
-        }
-    }
     // `--near` names the pane the new one opens beside. It is resolved here, like every other pane
     // target, and travels as the pane this command came from - the channel `--near-current-pane`
     // reads out of the environment
@@ -1417,7 +1403,6 @@ fn attach_with_cli_client(
                 session_name,
                 actions,
                 anchor_pane,
-                chosen_handle,
                 pipe_timeout,
                 structure_report,
                 ready_timeout.map(|timeout| zellij_client::cli_client::WaitReady {

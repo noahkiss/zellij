@@ -1998,30 +1998,6 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
-        Action::SetPaneHandle { pane_id, handle } => {
-            // the pane was made a moment ago and named itself; this is the caller's name for it,
-            // and the one thing it may not do is reach a pane that is already answering to it
-            match request_pane_handle(&senders, pane_id.into(), handle.clone())
-                .with_context(err_context)?
-            {
-                Some(Ok(())) => {
-                    send_output_to_client(
-                        cli_client_id,
-                        os_input.as_ref(),
-                        vec![format!("handle: {}", handle)],
-                    );
-                },
-                Some(Err(message)) => {
-                    send_error_to_client(cli_client_id, os_input.as_ref(), &message)
-                },
-                None => send_error_to_client(
-                    cli_client_id,
-                    os_input.as_ref(),
-                    "Timeout setting the pane handle",
-                ),
-            }
-            drop(NotificationEnd::new(completion_tx));
-        },
         Action::ListPanes {
             show_tab: _,
             show_command: _,
@@ -3091,8 +3067,8 @@ pub(crate) fn route_thread_main(
                         },
                         ClientToServerMsg::ClientExited => {
                             // the removal is announced once, after the route loop below - not here.
-                            // Announcing it twice is what made `new-pane --handle` report a miss for
-                            // a pane it had made: see the comment on that announcement
+                            // Announcing it twice is what made `new-pane` report a miss for a pane it
+                            // had made: see the comment on that announcement
                             return Ok(true);
                         },
                         ClientToServerMsg::KillSession => {
@@ -3375,9 +3351,9 @@ pub(crate) fn route_thread_main(
     // well frees the id while this thread is still running, the process's next connection is given
     // that same id, and the second announcement then removes THAT connection's sender. Dropping a
     // sender writes `Exit { Disconnect }` down its socket, which the new client reads as the answer
-    // to the command it just sent. That is how `new-pane --handle` came to report "no pane was
-    // created" for a pane the session had made and confirmed: the `--handle` preflight connection
-    // closed, and its route thread tore down the connection that replaced it.
+    // to the command it just sent. That is how `new-pane` came to report "no pane was created" for
+    // a pane the session had made and confirmed: a preflight connection closed, and its route
+    // thread tore down the connection that replaced it.
     let _ = to_server.send(ServerInstruction::RemoveClient(client_id));
     Ok(())
 }
@@ -3404,35 +3380,6 @@ fn request_pane_target_resolution(
         },
         Err(RecvTimeoutError::Disconnected) => {
             log::error!("ResolvePaneTarget channel disconnected");
-            Ok(None)
-        },
-    }
-}
-
-/// Asks Screen to give a pane a chosen handle. `None` when Screen did not answer in time.
-fn request_pane_handle(
-    senders: &ThreadSenders,
-    pane_id: PaneId,
-    handle: String,
-) -> Result<Option<std::result::Result<(), String>>> {
-    use crossbeam::channel::{unbounded, RecvTimeoutError};
-    use std::time::Duration;
-
-    let (response_sender, response_receiver) = unbounded();
-    senders.send_to_screen(ScreenInstruction::SetPaneHandle {
-        pane_id,
-        handle,
-        response_channel: response_sender,
-    })?;
-
-    match response_receiver.recv_timeout(Duration::from_secs(1)) {
-        Ok(answer) => Ok(Some(answer)),
-        Err(RecvTimeoutError::Timeout) => {
-            log::error!("SetPaneHandle timed out waiting for Screen response");
-            Ok(None)
-        },
-        Err(RecvTimeoutError::Disconnected) => {
-            log::error!("SetPaneHandle channel disconnected");
             Ok(None)
         },
     }

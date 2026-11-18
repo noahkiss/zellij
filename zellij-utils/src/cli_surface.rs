@@ -389,8 +389,7 @@ How every one of these answers:
     well-formed call ends without acting: a miss (a closed pane, a tab by a name nothing answers
     to), a refusal by one of the three classes below, a confirm nothing could answer or that you
     declined, a wait that timed out, and a call this parser would not take. A 1 means the call
-    could not be carried out at all - a regex that does not compile, a handle already taken, a
-    server that failed.
+    could not be carried out at all - a regex that does not compile, a server that failed.
   * A command that only acts prints nothing. The ones that report say so in their own --help.
   * Three classes decide what a verb does when you do not tell it what to act on. Moving focus,
     scrolling, switching mode and every CREATING verb work anywhere: placement relative to where
@@ -407,7 +406,7 @@ How every one of these answers:
 
 A pane is addressed by any of `terminal_1`, `plugin_2`, a bare integer (3 means terminal_3), a
 two-word handle like `sunny-otter`, or a pane uuid. The handle is the pane's address: it is
-assigned when the pane is created - or chosen then, with `new-pane --handle` - it survives a session
+assigned when the pane is created, every creating command reports it, it survives a session
 restore, and `list-panes` prints it.
 
   zellij action dump-screen --pane-id sunny-otter

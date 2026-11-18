@@ -157,9 +157,8 @@ pub const MAX_HANDLE_LEN: usize = 40;
 /// - a bare integer: a handle has at least one letter in it
 /// - a uuid: five dash-separated groups, and a handle is at most four words
 ///
-/// It is a *grammar* rather than a word list because a handle can be chosen - `zellij action
-/// new-pane --handle build` - and the CLI has no way to know which names a session's panes were
-/// given. So a well-formed name that no pane answers to is a miss (exit 2) rather than malformed
+/// It is a *grammar* rather than a word list because a layout can name a handle - `pane
+/// handle="build"` - and the CLI has no way to know which names a session's panes were given. So a well-formed name that no pane answers to is a miss (exit 2) rather than malformed
 /// input (exit 1); only a string that is not a handle in any session is refused by the parser.
 pub fn is_handle_shaped(candidate: &str) -> bool {
     handle_grammar_error(candidate).is_none()
@@ -168,7 +167,7 @@ pub fn is_handle_shaped(candidate: &str) -> bool {
 /// Why `candidate` is not shaped like a handle, in words a caller can print.
 ///
 /// `None` means it is. This is [`is_handle_shaped`] with its reasons kept, for the one caller that
-/// has somebody to tell: whoever typed `--handle`.
+/// has somebody to tell: whoever wrote a layout's `handle`.
 pub fn handle_grammar_error(candidate: &str) -> Option<String> {
     let says = |reason: &str| Some(format!("'{}' is not a handle: {}", candidate, reason));
     if candidate.is_empty() {

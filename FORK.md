@@ -376,7 +376,7 @@ of what moved to get there.
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
 | `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id. A pane no tab took is not reported at all: [the miss says so and exits 2](#a-pane-is-reported-only-once-a-tab-has-taken-it) |
-| `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
+| `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0: the plugin's pane is built after the action is answered, so there is no id to report |
 | `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
 | `rename-tab --tab-id`, `edit-scrollback --pane-id`, `toggle-pane-borderless --pane-id` | a target nothing answers to exits 2 with `No tab with id 99` / `No pane answers to 'terminal_99'`, like every sibling. All three used to log the miss server-side and exit 0, which reads as a rename, an editor and a toggle that happened |
@@ -486,10 +486,10 @@ A tab arrives with a pane in it, so this is one action and not two: the command 
 tab as its first pane, which is why the tab holds the command's pane rather than a shell with the
 command's pane beside it. The tab is built from the session's own new-tab template like every other
 tab, so it keeps its status bars and its panes are written into the saved layout. Bare, zellij names
-the tab as it names any new tab. `--cwd`, `--close-on-exit`, `--start-suspended`, `--plugin`,
-`--handle` and `--no-focus` all mean what they mean elsewhere; `--name` and `--borderless` do not
-travel, because the first pane of a new tab is described by its command and nothing else - both are
-refused rather than dropped. Name the pane with `--handle`, or rename it once it is there.
+the tab as it names any new tab. `--cwd`, `--close-on-exit`, `--start-suspended`, `--plugin` and
+`--no-focus` all mean what they mean elsewhere; `--name` and `--borderless` do not travel, because
+the first pane of a new tab is described by its command and nothing else - both are refused rather
+than dropped. Rename the pane once it is there.
 
 `--new-tab` is the one placement flag that **does** move the focus: whoever is attached is taken to
 the new tab, the way `new-tab` itself takes them. That is what a caller opening a tab usually means,
@@ -733,8 +733,7 @@ error without `--wait-ready`.
   for the command to end and answer with its status in place of the report; a ready pane is one you
   type into. The refusal is in `CliAction::take_wait_ready`, not clap, because the blocking flags
   differ by verb and `run` arrives with them already folded into one condition.
-- **It is the client's to hold**, like `--handle`: taken off the request before the action is
-  built, so nothing about it reaches the action or the client/server contract.
+- **It is the client's to hold**: taken off the request before the action is built, so nothing about it reaches the action or the client/server contract.
 - `action --json` carries both lines: `"ready_by": "prompt"`, `"ready_ms": 252`.
 
 There is no `run --shell`. Running a command inside the user's interactive shell is what the MCP
@@ -761,8 +760,9 @@ zellij action dump-screen --pane-id sunny-otter
 
 - **Every `--pane-id` takes one**, alongside `terminal_1`, `plugin_2`, a bare integer and a pane
   uuid. One parser serves all four forms, so a handle works anywhere an id does.
-- **It can be chosen** — `zellij action new-pane --handle build`, or `handle "build"` on a pane in a
-  layout — and otherwise the pane names itself. See [choosing one](#choosing-a-handle) below.
+- **The pane names itself.** No creating command takes a handle: every one reports the handle the
+  pane generated, and the caller addresses the pane by it. A layout may name one; see
+  [handles in a layout](#handles-in-a-layout) below.
 - **It survives a restore, and the uuid does not.** The handle is serialized into the session
   snapshot and the restored pane comes back under it. The uuid is the pane's *lineage* and rotates,
   because a restored pane is a new process (`restored_from` links it to the old one). Address and
@@ -793,7 +793,7 @@ No two live panes share a word, not just a whole handle. `zellij-server/src/pane
 the reserved-word set from every live and reserved handle's dash-separated segments, dropping a
 purely numeric one — the `-2` of a suffix fallback is not a word — and a fresh draw is refused if
 either of its words is already in that set (`shares_a_word`, replacing the old exact-match
-`is_spoken_for` for generation). A restored or chosen handle is exempt from this check — it is taken
+`is_spoken_for` for generation). A restored handle, or one a layout names, is exempt from this check — it is taken
 verbatim by `HeldHandle::claim` — so reservation is a property of *generation*, not of the registry
 as a whole. One consequence worth knowing: since each generated pane spends one adjective and one
 noun, a session can hold at most 504 word-reservation-generated panes at once (the shorter of the two
@@ -805,60 +805,32 @@ a random offset (so an unlucky run of rerolls still finds a free pair, in bounde
 every pair in the space is refused does it fall back to the pre-existing numeric suffix — `-2`,
 `-3` and so on — so generation always returns something.
 
-#### Choosing a handle
+#### Handles in a layout
 
-```
-zellij action new-pane --handle build -- cargo watch
-zellij run --handle build -- cargo watch
-zellij edit --handle notes ~/notes.md
-zellij plugin --handle board -- file:/path/to.wasm
-```
 ```kdl
 layout {
     pane handle="build" command="cargo" { args "watch" }
 }
 ```
 
-**Every command that reports the pane it made takes it**, on the same terms: `new-pane` and `edit`
-under `zellij action`, and the `run`, `edit` and `plugin` shorthands beside them. A caller should
-not have to know which verb made the pane to know whether it could have named it.
-
-`action launch-plugin` and `action launch-or-focus-plugin` are the exception, and the reason is
-worth writing down: **they print nothing at all.** A plugin's pane is built on the plugin thread
-after the action has already been answered, so nothing comes back carrying an id - and a chosen
-handle is applied to the pane the report names. The surface map used to promise `pane_id:` and
-`handle:` for both; it never printed either, and the promise has been removed rather than the
-reader being taught a report that never arrives. `zellij plugin` goes through the pane-creating
-path instead, reports what it made, and takes `--handle`.
-
-A generated handle is memorable but not predictable, and a script that wants to reach the pane it
-just made has to read the id out of the report and carry it. A chosen handle is the other way round:
-the caller decides the address before the pane exists, and every later command already knows it.
+No CLI verb and no MCP parameter chooses a handle: a pane names itself, and the creation report
+says what it chose. A layout is the one place a name is written ahead of the pane.
 
 - **The grammar** is up to four lowercase words joined by dashes, each at most 16 characters, at
   most 40 in all, at least one letter somewhere. That is what keeps one `--pane-id` able to take
-  four forms: `terminal_1` has an underscore, `7` is all digits, a uuid is five groups. A name that
-  reads like one of those is refused when it is typed, not when it is used. So is a name whose first
-  word is `terminal` or `plugin` — `terminal-1` beside `terminal_1` is a name that gets typed wrong
-  on the day it matters.
-- **A handle a live pane already holds is an error**, exit 1, and nothing is created. A generated
-  handle rerolls around a collision; a chosen one must not, because the caller asked for *this*
-  name and a different one would answer a question nobody put. The check happens before the pane is
-  made, so the refusal costs nothing.
-- **The pane names itself first.** A pane is born with a generated handle and the chosen one is
-  given to it immediately after, by the client that holds the report — so `handle:` in the report is
-  always the name the caller asked for. This is also why `--handle` cannot ride with the blocking
-  family: those answer with an exit status instead of a report naming a pane.
+  four forms: `terminal_1` has an underscore, `7` is all digits, a uuid is five groups. A name whose
+  first word is `terminal` or `plugin` is refused too — `terminal-1` beside `terminal_1` is a name
+  that gets typed wrong on the day it matters.
 - **It is stored like any other handle**, which means it survives a restore: the snapshot carries
   `pane_handle="build"` and the pane comes back at that address. It also survives the trip to the
   server, which is what makes `new-tab --layout` and `zellij --layout` honour a `handle` a layout
   wrote: the client/server contract carries it alongside the pane's other declared properties.
   `restored_from` deliberately does not cross - that is provenance the server assigns, and a sender
   declaring it would be claiming a history it does not have.
-- **In a layout**, `handle` is the spelling a person writes and `pane_handle` is what serialization
-  writes; both reach the same field, and a saved layout keeps working. A layout that names a handle
-  another pane in the same layout already took loses the tie rather than failing the restore — a
-  session coming back is not a place to refuse work — so the last pane to ask gets a generated name.
+- **`handle` is the spelling a person writes and `pane_handle` is what serialization writes**; both
+  reach the same field, and a saved layout keeps working. A layout that names a handle another pane
+  in the same layout already took loses the tie rather than failing the restore — a session coming
+  back is not a place to refuse work — so the last pane to ask gets a generated name.
 
 #### On the frame
 
@@ -1558,18 +1530,18 @@ ran missed:
 ```
 $ zellij -s S action break-pane --pane-id terminal_0 --no-focus
 tab_id: 1
-$ zellij -s S action new-pane --in-tab 1 --handle ghost1
+$ zellij -s S action new-pane --in-tab 1
 pane_id: terminal_1
-handle: ghost1                        # exit 0, and terminal_1 is in no `list-panes`
-$ zellij -s S action wait ghost1 --for exit
-No pane answers to 'ghost1'
+handle: brave-lynx                    # exit 0, and terminal_1 is in no `list-panes`
+$ zellij -s S action wait brave-lynx --for exit
+No pane answers to 'brave-lynx'
 ```
 
 The id is now written into the report **after** the placement, and only for a pane some tab really
 holds. A miss says so and exits 2:
 
 ```
-$ zellij -s S action new-pane --in-tab 1 --handle ghost1
+$ zellij -s S action new-pane --in-tab 1
 No pane was created: the session took the request and reported no pane.
 ```
 
@@ -1596,12 +1568,12 @@ which door it came through.
 
 Holding the client to a report makes a lost report indistinguishable from a pane that was never
 made, so a report the session wrote and the client never received now reads as a miss. That is what
-`new-pane --handle` did, about one call in ten: the pane was there in `list-panes` under a generated
-handle while the CLI said none had been made.
+`new-pane` with a chosen handle (a flag since removed) did, about one call in ten: the pane was there
+in `list-panes` under a generated handle while the CLI said none had been made.
 
-Nothing about the pane was at fault. `--handle` is checked against the live panes before anything is
-created, and that check is a whole extra connection, made and closed immediately before the one that
-carries the `new-pane`. A client id is the lowest number not in use, so in a session nothing is
+Nothing about the pane was at fault. The chosen handle was checked against the live panes before
+anything was created, and that check was a whole extra connection, made and closed immediately
+before the one that carried the `new-pane`. A client id is the lowest number not in use, so in a session nothing is
 attached to both connections are client 1 — and a route thread announced its client's removal twice,
 once as the client left and once as the thread ended. The first announcement freed the id, the next
 connection was given it, and the second announcement removed **that** connection's sender. Dropping
@@ -5257,14 +5229,7 @@ new build. Two unit tests cover the suffix and the fallback.
 **The key and handle docs say what the CLI accepts (nkmk.26, 2026-10-02).** `zellij_write_input` taught
 `C-c` and `Escape`, and the key parser refuses both: it takes `Ctrl c` and `Esc`. It also said
 `keys` took several keys, but the whole string is one `send-keys` argument, so it is one key per
-call. A test now parses every backticked key in the tool's text. `zellij_create`'s `handle`
-carried the `--handle` help, which said only "lowercase words joined by dashes" — so
-`plugin-check` looked valid and the CLI refused it as too close to `plugin_1`. The help on all
-five `--handle` flags now states the whole rule, and `zellij_create` checks a handle with the
-CLI's own `chosen_handle_error` before it runs anything, including the tab lookup an `agent_tab`
-create makes first. The first cut fixed four and missed `action new-pane`, the one
-`zellij_create` reads; the RC proof caught it in `tools/list`. A test now requires every
-`--handle` in the CLI surface, and `zellij_create`'s description, to state the rule.
+call. A test now parses every backticked key in the tool's text.
 
 ### `session up` comes back with the shape the session had
 
@@ -7617,8 +7582,7 @@ A client that asks one question and exits can ignore the second message; a clien
 cannot, because the unblock it left behind is the first thing the next question reads — and every
 answer after that is one question late, which reads as an empty dump for a pane that is plainly
 there. `ask_in_sequence` reads *through* the unblock and leaves the connection on a message
-boundary. `start_cli_client` survives the same hazard by accident: its `--handle` follow-up throws
-its own answer away.
+boundary.
 
 `Action::actions_from_cli` refuses a sweep rather than building one action out of it. Nothing on
 the CLI path reaches that — the client takes the sweep first — but the integration harness builds
@@ -7874,9 +7838,9 @@ before the CLI runs:
 `zellij_wait_for` or `list-panes`, exactly as before.
 
 **The cost, and it is visible: the pane's title and its `terminal_command` now name the shell** -
-an unnamed pane reads `/path/to/zsh -c sleep 30` where it used to read `sleep`. A `name` says what a
-pane is for and is the right fix where that matters; the consumer repo never makes command panes, so
-nothing there reads either field.
+an unnamed pane read `/path/to/zsh -c sleep 30` where it used to read `sleep`. The tool now names a
+command pane after its command (below); the consumer repo never makes command panes, so nothing
+there reads either field.
 
 CLI-side only: `src/mcp/invoke.rs` and one dependency the tree already carried (`shellexpand`). No
 protobuf, no contract change, and `zellij action new-pane` itself is untouched.
@@ -7922,23 +7886,23 @@ in, so whether the agent's own tab exists is a second read of a payload the crea
 fetching. The create then runs once, `--in-tab=` or `--new-tab=` decided before anything ran. The
 alternative was written first and does not work: asking with `--in-tab` and reading the refusal as
 the signal to make the tab cannot tell the two exit **2**s apart, because the CLI exits 2 for a tab
-nothing answers to *and* for a command line clap will not parse. `zellij_create {"name":
-"--force"}` was the second, and it made a **duplicate** `work-zj` tab beside the first - nothing in
+nothing answers to *and* for a command line clap will not parse. A pane name beginning with a
+dash was the second, and it made a **duplicate** `work-zj` tab beside the first - nothing in
 the server dedupes tab names.
 
 **Every value-taking flag is passed as `--flag=value`.** `--name --force` is a usage error;
-`--name=--force` is a name. The tool builds `--name=`, `--handle=`, `--cwd=`, `--in-tab=`,
-`--new-tab=` and `--pane-id=` that way, so a value beginning with a dash - a caller's own `name`,
-or the command a pane is named after - reaches the CLI as a value.
+`--name=--force` is a name. The tool builds `--name=`, `--cwd=`, `--in-tab=`, `--new-tab=` and
+`--pane-id=` that way, so a value beginning with a dash - the command a pane is named after -
+reaches the CLI as a value.
 
 **Two agents can still both make the tab.** Their panes have to share a tab, so they resolve the
 same `-zj` name, and one agent's own calls are serialized. Both then see no tab and both create
 one; the server has no duplicate-name check. Two tabs of one name is the cost, and it is visible in
 the tab bar.
 
-**An unnamed command pane is titled with its command.** The shell wrap above is why it needed
-saying: the pane's title was `/path/to/zsh -c cargo test`. Without a `name`, the command is now the
-name, whitespace collapsed and cut to 48 characters with an ellipsis.
+**A command pane is titled with its command.** The shell wrap above is why it needed saying: the
+pane's title was `/path/to/zsh -c cargo test`. The command is now the name, whitespace collapsed
+and cut to 48 characters with an ellipsis. The caller does not choose a pane's name.
 
 **`close_pane` and `close_tab` moved to their own tool.** Per-verb gating is the reason this
 server exists at all - this file's own words, "an MCP client allows or denies each tool by name" -
@@ -9177,11 +9141,11 @@ which is the person's. So agents started a throwaway background session for ever
 
 ```
 zellij_create {"run_in": "plugin", "command": "file:/tmp/bar.wasm",
-               "plugin_config": ["data_file=/tmp/d.json"], "handle": "bar-test"}
-  # action new-pane --in-tab=work-zj --no-focus --handle=bar-test --plugin=file:/tmp/bar.wasm
+               "plugin_config": ["data_file=/tmp/d.json"]}
+  # action new-pane --in-tab=work-zj --no-focus --plugin=file:/tmp/bar.wasm
   #   --configuration=data_file=/tmp/d.json
 pane_id: plugin_12
-handle: bar-test
+handle: brave-lynx
 ```
 
 - **`run_in` takes `plugin`.** `command` is then the plugin: a `file:` path, a `zellij:` plugin
@@ -9190,12 +9154,11 @@ handle: bar-test
   `--configuration` cannot carry it. `plugin_config` with any other `run_in` is refused.
 - **`kind` is `agent_tab` (the default) or `tab`.** `stacked` is refused: the CLI drops
   `--stacked` for a plugin pane, and the pane would open tiled in the focused tab. `tab` runs
-  `new-pane --new-tab`, because `new-tab --initial-plugin` takes no configuration; `name` names
-  that tab.
-- **`wait_ready` is refused** with a plugin, which has no shell. Without `name` the
-  pane keeps the title zellij gives a plugin.
+  `new-pane --new-tab`, because `new-tab --initial-plugin` takes no configuration.
+- **`wait_ready` is refused** with a plugin, which has no shell. The pane keeps the title zellij
+  gives a plugin.
 - The answer carries the pane's handle, so `zellij_read_pane` reads what the plugin draws.
-- `plugin_config` brings the tool to ten parameters, the cap.
+- The tool takes eight parameters.
 
 Two server fixes make the placement true. Both changed what the CLI does, not only the MCP:
 
@@ -9205,8 +9168,7 @@ Two server fixes make the placement true. Both changed what the CLI does, not on
   attached, nowhere: `No pane was created`. `AddPlugin` now uses the requested tab when it is a
   different tab from the client's. Where the two agree, nothing changes.
 - **`new-pane --plugin --new-tab` reports the plugin.** The report took the first plugin of a
-  `HashMap`, so it could name the tab template's tab bar or status bar, and `--handle` went onto
-  that bar. The plugin thread now names the pane it put into the template's empty slot, and
+  `HashMap`, so it could name the tab template's tab bar or status bar. The plugin thread now names the pane it put into the template's empty slot, and
   `ApplyLayout` keeps that name instead of picking one.
 
 Files: `src/mcp/invoke.rs` (`run_in`, `plugin_pane`, the create arms), `src/mcp/tools.rs`,

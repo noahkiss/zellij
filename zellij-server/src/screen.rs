@@ -836,12 +836,6 @@ pub enum ScreenInstruction {
         target: PaneTarget,
         response_channel: crossbeam::channel::Sender<Option<PaneId>>,
     },
-    /// Gives a live pane the handle its creator chose. `Err` carries the sentence to print.
-    SetPaneHandle {
-        pane_id: PaneId,
-        handle: String,
-        response_channel: crossbeam::channel::Sender<Result<(), String>>,
-    },
     /// fork addition: brings back the newest closed terminal pane, or the newest one that had
     /// `handle`. See `crate::closed_panes`.
     ReopenPane {
@@ -1307,7 +1301,6 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ListClientsMetadata(..) => ScreenContext::ListClientsMetadata,
             ScreenInstruction::ListPanes { .. } => ScreenContext::ListPanes,
             ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
-            ScreenInstruction::SetPaneHandle { .. } => ScreenContext::SetPaneHandle,
             ScreenInstruction::ReopenPane { .. } => ScreenContext::ReopenPane,
             ScreenInstruction::ListClosedPanes { .. } => ScreenContext::ListClosedPanes,
             ScreenInstruction::ExpectReopenedPane { .. } => ScreenContext::ReopenPane,
@@ -6176,15 +6169,14 @@ impl Screen {
             })
     }
 
-    /// Gives a live pane the handle its creator chose for it.
+    /// Gives a live pane back a handle it held before: a reopened pane's old name.
     ///
     /// The name has to be free among the session's live panes: a handle is an address, and an
-    /// address that reached two panes would be no address at all. A taken one is refused here
-    /// rather than rerolled the way a generated handle is - the caller asked for this name, and a
-    /// different one would answer a question nobody put.
+    /// address that reached two panes would be no address at all. A taken one is refused here,
+    /// and the reopened pane keeps the handle it generated.
     ///
     /// The pane's own handle counts as free for it: setting the name a pane already answers to
-    /// changes nothing and says so, rather than pushing the pane off its own address.
+    /// changes nothing.
     pub fn set_pane_handle(&mut self, pane_id: PaneId, handle: &str) -> Result<(), String> {
         let pane = self
             .tabs
@@ -10760,14 +10752,6 @@ pub(crate) fn screen_thread_main(
                 response_channel,
             } => {
                 let _ = response_channel.send(screen.resolve_pane_target(&target));
-            },
-            ScreenInstruction::SetPaneHandle {
-                pane_id,
-                handle,
-                response_channel,
-            } => {
-                let _ = response_channel.send(screen.set_pane_handle(pane_id, &handle));
-                screen.render(None)?;
             },
             ScreenInstruction::ListClosedPanes { response_channel } => {
                 let _ = response_channel.send(screen.closed_panes.list());

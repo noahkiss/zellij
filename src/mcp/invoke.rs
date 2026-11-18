@@ -611,8 +611,6 @@ async fn plan_in(
             agents: None,
         });
     }
-    // before the session is asked anything: a handle the CLI would refuse is refused for free
-    chosen_handle(&read)?;
     let (tab, placement) = agent_tab(env, own_session, target, target_session.as_deref()).await;
     let argv = argv_in(tool, args, ambient_session, env, Some((&tab, placement)))?;
     if placement == TabPlacement::Existing {
@@ -889,28 +887,13 @@ fn typed_command(args: &Args) -> Result<Option<String>, String> {
     })
 }
 
-/// The handle a create asked for, refused here by the rule the CLI's `--handle` applies.
-///
-/// The CLI would refuse it too, but only after a process was spawned to ask - and for an
-/// `agent_tab` create, after the session was asked about the tab first.
-fn chosen_handle(args: &Args) -> Result<Option<String>, String> {
-    match args.string("handle") {
-        Some(handle) => match zellij_utils::pane_handle::chosen_handle_error(&handle) {
-            Some(reason) => Err(reason),
-            None => Ok(Some(handle)),
-        },
-        None => Ok(None),
-    }
-}
-
-/// The name a created pane is given: the caller's own, or the command it runs.
+/// The name a created pane is given: the command it runs. The caller does not choose it.
 fn pane_name(args: &Args) -> Option<String> {
     // a plugin pane is titled by its plugin already
     if args.enumerated("run_in", RUN_IN_DEFAULT) == "plugin" {
-        return args.string("name");
+        return None;
     }
-    args.string("name")
-        .or_else(|| args.string("command").as_deref().map(default_pane_name))
+    args.string("command").as_deref().map(default_pane_name)
 }
 
 /// The command line a tool call becomes, after the binary's own name.
@@ -1099,23 +1082,15 @@ fn argv_in(
                     "--".to_owned(),
                     text,
                 ])),
-                (None, None) => Err("Nothing to send: pass `keys`, `text` or `file`.".to_owned()),
+                (None, None) => Err("Nothing to send: pass `keys` or `text`.".to_owned()),
             }
         },
         "zellij_create" if args.string("reopen").is_some() => {
             let reopen = args.string("reopen").unwrap_or_default();
             // the pane comes back as it was: its tab, its directory, its handle, its line
-            if let Some(param) = [
-                "kind",
-                "command",
-                "run_in",
-                "cwd",
-                "name",
-                "handle",
-                "plugin_config",
-            ]
-            .into_iter()
-            .find(|param| args.values.contains_key(*param))
+            if let Some(param) = ["kind", "command", "run_in", "cwd", "plugin_config"]
+                .into_iter()
+                .find(|param| args.values.contains_key(*param))
             {
                 return Err(format!(
                     "`reopen` brings a closed pane back as it was, and takes no `{}`.",
@@ -1195,9 +1170,6 @@ fn argv_in(
                             rest.push(flag_value("--name", &name));
                         }
                     }
-                    if let Some(handle) = chosen_handle(&args)? {
-                        rest.push(flag_value("--handle", &handle));
-                    }
                     with_plugin(&mut rest);
                     finish(&mut rest);
                 },
@@ -1212,24 +1184,14 @@ fn argv_in(
                     if let Some(name) = pane_name(&args) {
                         rest.push(flag_value("--name", &name));
                     }
-                    if let Some(handle) = chosen_handle(&args)? {
-                        rest.push(flag_value("--handle", &handle));
-                    }
                     finish(&mut rest);
                 },
                 "tab" if plugin.is_some() => {
-                    // `new-tab` takes no plugin configuration; `new-pane --new-tab` does, and
-                    // names the tab as `new-tab --name` would
+                    // `new-tab` takes no plugin configuration; `new-pane --new-tab` does
                     rest.push("new-pane".to_owned());
-                    rest.push(match args.string("name") {
-                        Some(name) => flag_value("--new-tab", &name),
-                        None => "--new-tab".to_owned(),
-                    });
+                    rest.push("--new-tab".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
-                    }
-                    if let Some(handle) = chosen_handle(&args)? {
-                        rest.push(flag_value("--handle", &handle));
                     }
                     with_plugin(&mut rest);
                 },
@@ -1237,16 +1199,6 @@ fn argv_in(
                     rest.push("new-tab".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
-                    }
-                    if let Some(name) = args.string("name") {
-                        rest.push(flag_value("--name", &name));
-                    }
-                    if args.string("handle").is_some() {
-                        return Err(
-                            "`handle` names a pane, and a tab is not one. Make the tab, then read \
-                             back the handle of the pane it came with."
-                                .to_owned(),
-                        );
                     }
                     finish(&mut rest);
                 },
@@ -2106,7 +2058,7 @@ mod tests {
     #[test]
     fn a_plugin_create_loads_the_plugin_in_the_agents_tab_and_waits_for_no_shell() {
         let plugin = json!({"run_in": "plugin", "command": "file:/tmp/bar.wasm",
-                            "plugin_config": ["data_file=/tmp/d", "mode=a=b"], "handle": "bar-test"});
+                            "plugin_config": ["data_file=/tmp/d", "mode=a=b"]});
         assert_eq!(
             in_agent_tab(
                 plugin.clone(),
@@ -2114,21 +2066,21 @@ mod tests {
                 "work-zj",
                 TabPlacement::Existing
             ),
-            "-s work action new-pane --in-tab=work-zj --no-focus --handle=bar-test \
+            "-s work action new-pane --in-tab=work-zj --no-focus \
              --plugin=file:/tmp/bar.wasm --configuration=data_file=/tmp/d,mode=a=b"
         );
         assert_eq!(
             in_agent_tab(plugin, Some("work"), "work-zj", TabPlacement::Made),
-            "-s work action new-pane --new-tab=work-zj --no-focus --handle=bar-test \
+            "-s work action new-pane --new-tab=work-zj --no-focus \
              --plugin=file:/tmp/bar.wasm --configuration=data_file=/tmp/d,mode=a=b"
         );
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "tab", "run_in": "plugin", "command": "zellij:strider", "name": "files"}),
+                json!({"kind": "tab", "run_in": "plugin", "command": "zellij:strider"}),
                 None
             ),
-            "action new-pane --new-tab=files --plugin=zellij:strider"
+            "action new-pane --new-tab --plugin=zellij:strider"
         );
     }
 
@@ -2161,52 +2113,12 @@ mod tests {
         assert_eq!(
             line(
                 "zellij_create",
-                json!({"kind": "stacked", "command": "cargo test", "handle": "test-run", "run_in": "exec"}),
+                json!({"kind": "stacked", "command": "cargo test", "run_in": "exec"}),
                 Some("work")
             ),
-            "-s work action new-pane --near-current-pane --stacked --name=cargo test --handle=test-run -- \
+            "-s work action new-pane --near-current-pane --stacked --name=cargo test -- \
              /bin/zsh -c cargo test"
         );
-    }
-
-    #[test]
-    fn a_handle_the_cli_would_refuse_is_refused_before_anything_runs() {
-        // lowercase words joined by dashes, and still not a handle: it reads as plugin_1
-        let refused = refusal(
-            "zellij_create",
-            json!({"kind": "stacked", "handle": "plugin-check"}),
-        );
-        assert!(
-            refused.contains("too close to the pane id"),
-            "got: {}",
-            refused
-        );
-        assert!(refusal(
-            "zellij_create",
-            json!({"kind": "stacked", "handle": "Build"})
-        )
-        .contains("lowercase"));
-        assert!(line(
-            "zellij_create",
-            json!({"kind": "stacked", "handle": "check-plugin"}),
-            None
-        )
-        .contains("--handle=check-plugin"));
-    }
-
-    #[tokio::test]
-    async fn an_agent_tab_create_refuses_a_bad_handle_before_asking_the_session() {
-        // `agent_tab` asks the session which tab it is in; a handle the CLI would refuse is
-        // refused first, so no process is spawned to find out what the answer already is
-        let call = plan_in(
-            "zellij_create",
-            &args(json!({"handle": "terminal-1"})),
-            Some("no-such-session-mcp-test"),
-            &a_shell_env(),
-            &Target::Local,
-        )
-        .await;
-        assert!(matches!(call, Err(reason) if reason.contains("too close to the pane id")));
     }
 
     #[test]
@@ -2287,13 +2199,13 @@ mod tests {
         // a tab nothing answers to. `--name=--force` is the form that cannot be read as a flag
         assert_eq!(
             in_agent_tab(
-                json!({"name": "--force", "command": "echo hi", "run_in": "exec"}),
+                json!({"command": "--force", "run_in": "exec"}),
                 Some("work"),
                 "work-zj",
                 TabPlacement::Existing
             ),
             "-s work action new-pane --in-tab=work-zj --no-focus --name=--force -- /bin/zsh -c \
-             echo hi"
+             --force"
         );
         // and the same for a pane named after a command that starts with a flag
         assert_eq!(
@@ -2309,10 +2221,6 @@ mod tests {
             in_agent_tab(json!({}), None, "-zj", TabPlacement::Existing).contains("--in-tab=-zj")
         );
         assert!(in_agent_tab(json!({}), None, "-zj", TabPlacement::Made).contains("--new-tab=-zj"));
-        // as does a handle and a tab's own name
-        assert!(
-            line("zellij_create", json!({"kind": "tab", "name": "-x"}), None).contains("--name=-x")
-        );
     }
 
     #[test]
@@ -2348,13 +2256,13 @@ mod tests {
             "{}",
             cut
         );
-        // a name the caller gave beats the command
+        // the caller does not choose the name: the command does
         assert!(line(
             "zellij_create",
-            json!({"kind": "stacked", "command": "cargo test", "name": "tests"}),
+            json!({"kind": "stacked", "command": "cargo test", "run_in": "exec"}),
             None
         )
-        .contains("--name=tests --"));
+        .contains("--name=cargo test --"));
         // and a pane with no command is not given one
         assert!(!line("zellij_create", json!({"kind": "stacked"}), None).contains("--name"));
     }
@@ -2416,7 +2324,7 @@ mod tests {
         let command = "cd /tmp && echo \"hello world\" $HOME | cat";
         let argv = built(
             "zellij_create",
-            json!({"kind": "stacked", "command": command, "name": "shell", "run_in": "exec"}),
+            json!({"kind": "stacked", "command": command, "run_in": "exec"}),
             None,
             &a_shell_env(),
         );
@@ -2427,7 +2335,7 @@ mod tests {
                 "new-pane",
                 "--near-current-pane",
                 "--stacked",
-                "--name=shell",
+                &format!("--name={}", default_pane_name(command)),
                 "--",
                 "/bin/zsh",
                 "-c",
@@ -2549,10 +2457,6 @@ mod tests {
 
     #[test]
     fn a_tab_is_not_given_a_panes_arguments() {
-        assert!(
-            refusal("zellij_create", json!({"kind": "tab", "handle": "x"}))
-                .contains("names a pane")
-        );
         assert!(
             refusal("zellij_create", json!({"kind": "tab", "floating": true}))
                 .contains("`floating` is unsupported")

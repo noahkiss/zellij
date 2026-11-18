@@ -138,8 +138,8 @@ message Action {
   reserved 140;
   // fork: signal-pane, the break-pane CLI's two actions and the four idempotent setters, removed
   reserved 160, 161, 162, 163, 164, 165, 166;
-  // fork: set-pane-note and list-events, removed
-  reserved 170, 171;
+  // fork: the chosen-handle action, set-pane-note and list-events, removed
+  reserved 169, 170, 171;
   oneof action_type {
     QuitAction quit = 1;
     WriteAction write = 2;
@@ -296,11 +296,10 @@ message Action {
     ScrollToNextPromptAction scroll_to_next_prompt = 149;
     SelectCommandAtScrollPositionAction select_command_at_scroll_position = 150;
     CopyLastCommandOutputAction copy_last_command_output = 151;
-    // fork additions start at 160, leaving room below for upstream; 160-166 and 170-171 are
+    // fork additions start at 160, leaving room below for upstream; 160-166 and 169-171 are
     // reserved above
     ResolvePaneTargetAction resolve_pane_target = 167;
     ListTreeAction list_tree = 168;
-    SetPaneHandleAction set_pane_handle = 169;
     MoveTabToIndexAction move_tab_to_index = 172;
     NewShellPaneAction new_shell_pane = 173;
     ReopenPaneAction reopen_pane = 174;
@@ -402,10 +401,6 @@ message ListClientsAction {
 }
 message ResolvePaneTargetAction {
   string target = 1;
-}
-message SetPaneHandleAction {
-  PaneId pane_id = 1;
-  string handle = 2;
 }
 message ListTreeAction {
   bool output_json = 1;

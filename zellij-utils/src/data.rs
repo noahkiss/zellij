@@ -3509,7 +3509,7 @@ mod pane_target_tests {
 
     #[test]
     fn a_chosen_handle_names_a_pane_like_a_generated_one() {
-        // `--handle build` is a name a caller picked, and every `--pane-id` has to take it back
+        // `handle="build"` is a name a layout picked, and every `--pane-id` has to take it back
         for chosen in ["build", "my-build", "web-2"] {
             assert_eq!(
                 PaneTarget::from_str(chosen),

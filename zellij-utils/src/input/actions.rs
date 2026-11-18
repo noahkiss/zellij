@@ -627,16 +627,6 @@ pub enum Action {
     ResolvePaneTarget {
         target: String,
     },
-    /// Gives a pane the handle its creator chose for it.
-    ///
-    /// A pane names itself when it is born, and this is how a caller who had a name in mind says
-    /// so. The name must be free among the session's live panes: a handle is an address, and the
-    /// one thing an address may not do is reach two panes. A taken one is refused rather than
-    /// rerolled, because rerolling would hand back a name the caller did not ask for.
-    SetPaneHandle {
-        pane_id: PaneId,
-        handle: String,
-    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
@@ -1215,16 +1205,7 @@ impl Action {
                 tab_id,
                 in_tab,
                 near,
-                handle,
             } => {
-                if handle.is_some() {
-                    // a chosen handle is given to the pane after it is made, by the client holding
-                    // the report. Reaching here means it would have been dropped in silence.
-                    return Err(
-                        "`--handle` is applied once the pane exists, and it was still on the request when the action was built."
-                            .to_owned(),
-                    );
-                }
                 if near.is_some() {
                     // `--near` is resolved and carried by the client, which is what holds the
                     // connection to the server. Reaching here means nobody did that, and the pane
@@ -1533,8 +1514,6 @@ impl Action {
                 no_focus,
                 borderless,
                 tab_id,
-                // taken by the client before this, and applied once the pane exists
-                handle: _,
             } => {
                 let mut file = file;
                 let current_dir = get_current_dir();
@@ -4500,7 +4479,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4563,7 +4541,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4619,7 +4596,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4704,7 +4680,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4765,7 +4740,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4813,7 +4787,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4870,7 +4843,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4924,7 +4896,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -4967,7 +4938,6 @@ mod tests {
             no_focus: false,
             borderless: None,
             tab_id: Some(4),
-            handle: None,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -5006,7 +4976,6 @@ mod tests {
             no_focus: false,
             borderless: None,
             tab_id: None,
-            handle: None,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -5056,7 +5025,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,
@@ -5110,7 +5078,6 @@ mod tests {
             new_tab: None,
             in_tab: None,
             near: None,
-            handle: None,
             near_current_pane: false,
             no_focus: false,
             borderless: None,

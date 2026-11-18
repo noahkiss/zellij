@@ -320,7 +320,6 @@ fn new_pane_cli_action(
         new_tab: None,
         in_tab: None,
         near: None,
-        handle: None,
         near_current_pane: false,
         no_focus: false,
         borderless: None,
@@ -628,8 +627,6 @@ impl TestSession {
                     &session_name,
                     actions,
                     // no `--near`: the anchor is whatever the client's environment says
-                    None,
-                    // no `--handle`: the pane keeps the one it named itself
                     None,
                     pipe_timeout,
                     // no `action --json`: the harness reads the report's own lines

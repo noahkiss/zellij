@@ -1325,7 +1325,6 @@ impl From<crate::input::actions::Action>
             SetPaneBorderlessAction,
             SetPaneColorAction,
             SetPaneFrameStyleAction,
-            SetPaneHandleAction,
             ShowFloatingPanesAction,
             SkipConfirmAction,
             StackPanesAction,
@@ -2084,12 +2083,6 @@ impl From<crate::input::actions::Action>
             },
             crate::input::actions::Action::ResolvePaneTarget { target } => {
                 ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
-            },
-            crate::input::actions::Action::SetPaneHandle { pane_id, handle } => {
-                ActionType::SetPaneHandle(SetPaneHandleAction {
-                    pane_id: Some(pane_id.into()),
-                    handle,
-                })
             },
             crate::input::actions::Action::ListTree { output_json } => {
                 ActionType::ListTree(ListTreeAction { output_json })
@@ -3037,13 +3030,6 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
             ActionType::ResolvePaneTarget(a) => {
                 Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
             },
-            ActionType::SetPaneHandle(a) => Ok(crate::input::actions::Action::SetPaneHandle {
-                pane_id: a
-                    .pane_id
-                    .ok_or_else(|| anyhow!("SetPaneHandle missing pane_id"))?
-                    .try_into()?,
-                handle: a.handle,
-            }),
             ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
                 output_json: a.output_json,
             }),
