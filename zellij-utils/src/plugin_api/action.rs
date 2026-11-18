@@ -1231,8 +1231,6 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::MoveTabToIndex { .. }
             | Action::NewShellPane { .. }
             | Action::SignalPane { .. }
-            | Action::BreakPanesToNewTab { .. }
-            | Action::BreakPanesToTabWithId { .. }
             | Action::SetPaneFullscreen { .. }
             | Action::SetPanePinned { .. }
             | Action::SetPaneFloating { .. }

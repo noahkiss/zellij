@@ -136,6 +136,8 @@ enum AnsiCode {
 
 message Action {
   reserved 140;
+  // fork: the break-pane CLI's two actions, removed
+  reserved 161, 162;
   oneof action_type {
     QuitAction quit = 1;
     WriteAction write = 2;
@@ -294,8 +296,6 @@ message Action {
     CopyLastCommandOutputAction copy_last_command_output = 151;
     // fork additions start at 160, leaving room below for upstream
     SignalPaneAction signal_pane = 160;
-    BreakPanesToNewTabAction break_panes_to_new_tab = 161;
-    BreakPanesToTabWithIdAction break_panes_to_tab_with_id = 162;
     SetPaneFullscreenAction set_pane_fullscreen = 163;
     SetPanePinnedAction set_pane_pinned = 164;
     SetPaneFloatingAction set_pane_floating = 165;
@@ -1397,18 +1397,6 @@ enum PaneSignal {
 }
 
 message SignalPaneAction { PaneId pane_id = 1; PaneSignal signal = 2; }
-
-message BreakPanesToNewTabAction {
-  repeated PaneId pane_ids = 1;
-  optional string name = 2;
-  bool no_focus = 3;
-}
-
-message BreakPanesToTabWithIdAction {
-  repeated PaneId pane_ids = 1;
-  uint32 tab_id = 2;
-  bool no_focus = 3;
-}
 
 message SetPaneFullscreenAction { optional PaneId pane_id = 1; bool fullscreen = 2; }
 message SetPanePinnedAction { optional PaneId pane_id = 1; bool pinned = 2; }

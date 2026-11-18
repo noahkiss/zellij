@@ -376,7 +376,6 @@ of what moved to get there.
 | `close-tab`, `close-tab-by-id` | `closed: <tab id> <tab name>` |
 | `move-tab` | `from:` and `to:` display positions |
 | `new-pane`, `new-tab`, `edit` | `pane_id:`, `handle:` and `tab_id:` where each applies, instead of a bare id. A pane no tab took is not reported at all: [the miss says so and exits 2](#a-pane-is-reported-only-once-a-tab-has-taken-it) |
-| `break-pane` | `tab_id:` — the tab it made. The pane it moved kept the id and handle it already had |
 | `launch-plugin`, `launch-or-focus-plugin` | nothing, exit 0. See [choosing a handle](#choosing-a-handle) for why |
 | `are-floating-panes-visible` | `visible: true` or `visible: false`, exit 0 either way. Only a tab nothing answers to is a miss |
 | `dump-screen` | takes its path as an argument as well as `--path`. Without `--pane-id` it prints the panes it could have dumped, on stderr, and exits 2. A `--pane-id` nothing answers to is a miss too, rather than an empty dump |
@@ -393,7 +392,7 @@ verbs are in three classes, and a new verb is put in one when it is written:
 | Class | What it means with no target | Verbs | Which of them confirm |
 |---|---|---|---|
 | 1 | Works anywhere | focus movement, `go-to-next-tab`/`go-to-previous-tab`, the scroll and page family, `toggle-fullscreen`, `toggle-floating-panes`, `toggle-pane-frames`, `toggle-pane-borderless`, `switch-mode`, and every creating verb (`new-pane`, `new-tab`, `run`, `edit`) | no |
-| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `undo-rename-pane`, `undo-rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-pane-backwards`, `move-tab`, the `break-pane` family, `toggle-pane-embed-or-floating`, `toggle-pane-pinned`, `clear` | `clear` |
+| 2 | The focused thing, inside the session only | `rename-pane`, `rename-tab`, `undo-rename-pane`, `undo-rename-tab`, `edit-scrollback`, `resize`, `move-pane`, `move-pane-backwards`, `move-tab`, `toggle-pane-embed-or-floating`, `toggle-pane-pinned`, `clear` | `clear` |
 | 3 | Refused: name it | `close-pane`, `close-tab`, `write`, `write-chars`, `send-keys`, `paste` | `close-pane`, `close-tab` |
 
 **Class 1 is additive**, and placement relative to wherever you are is the whole point of it. A
@@ -404,8 +403,6 @@ a class to reason about.
 **Class 2 is the recoverable half.** Inside a pane, "focused" is the pane your hands are on and
 nothing changes. From a script it exits 2 — a refusal changes nothing — and names the `--pane-id`
 or `--tab-id` that answers it.
-`break-pane-right` and `break-pane-left` cannot name a target at all, so from outside they are
-refused outright, pointing at `break-pane --pane-id`.
 
 **Class 3 always names its target, from inside too** — that is what moved. Run from inside a pane,
 "the focused pane" is the shell that ran the command: a targetless `write-chars` types into the
@@ -1680,7 +1677,7 @@ whose whole point is a pane means no pane, which is a miss rather than a silent 
 creations are untouched and still print the id and the handle.
 
 This is not a fix for one tab. An unsized tab is how it showed up — a tab no client had ever
-attached to had no size to place a pane in, and `break-pane` makes one on a detached session — but a
+attached to had no size to place a pane in, and `break-pane` (since removed) made one on a detached session — but a
 targetless `new-pane` on such a session ghosted the same way, and so did `new-pane --plugin`. Any
 future route that declines a pane is reported honestly without knowing about this.
 
@@ -4904,34 +4901,18 @@ instead of merely clearing it.
 
 Four `Action`s, contract tags 163-166.
 
-### Move a pane between tabs from the CLI (`break-pane`)
+### Breaking out a pane no tab owns is an error
 
-```
-zellij action break-pane                                          # the focused pane, new tab
-zellij action break-pane --pane-id terminal_3 --name build --no-focus
-zellij action break-pane-to-tab --pane-id terminal_3 --tab-id 2
-zellij action break-pane-right                                    # focused pane, new tab to the right
-zellij action break-pane-left
-```
+`break_multiple_panes_*` drops a pane id it cannot find, so a request naming only stale ids used to
+move nothing, report success, and — for a new tab — leave an empty tab behind. The screen's
+`BreakPanesToNewTab`, `BreakPanesToTabWithId` and `BreakPanesToTabWithIndex` instructions now check
+every pane first and fail naming the first miss, changing nothing. A missing tab fails the same
+way. The plugin calls `break_panes_to_new_tab`, `break_panes_to_tab_with_id` and
+`break_panes_to_tab_with_index` reach these instructions, so a plugin passing a stale pane id gets
+an error instead of a partial move.
 
-`Action::BreakPane*` existed and plugins had all three `break_panes_to_*` calls, but the word `break`
-appeared nowhere in `cli.rs`, so reorganising a session across tabs was the one structural edit the
-CLI could not make. All of it is exposed now.
-
-`break-pane` moves panes into a new tab. Without `--pane-id` it moves the focused pane, which is what
-the keybinding does. With one or more `--pane-id` it moves exactly those, which is what makes it work
-in a detached session. `--name` names the new tab and `--no-focus` leaves focus where it is.
-`break-pane-to-tab` moves them into an existing tab and requires both `--pane-id` and `--tab-id`.
-Both print the affected tab's id.
-
-**A pane that no tab owns is now an error rather than a silent skip.** `break_multiple_panes_*`
-drops a pane id it cannot find, so a request naming only stale ids used to move nothing, report
-success, and — for a new tab — leave an empty tab behind. Both instructions now check every pane
-first and fail naming the first miss, changing nothing. A missing `--tab-id` fails the same way.
-This applies to the plugin calls that share these instructions too: a plugin passing a stale pane id
-now gets an error instead of a partial move.
-
-Two `Action`s, contract tags 161 and 162.
+`zellij-server/src/screen.rs` (`panes_not_found` and the instruction handlers). Tests in
+`zellij-server/src/unit/screen_tests.rs`.
 
 ### `signal-pane` — signal the process in a pane
 
@@ -8392,7 +8373,7 @@ name, whitespace collapsed and cut to 48 characters with an ellipsis.
 server exists at all - this file's own words, "an MCP client allows or denies each tool by name" -
 and one `zellij_arrange` bundling four reversible moves with two irreversible closes meant a client
 that wanted to allow a pane to be moved had to allow a tab to be closed. `zellij_arrange` keeps
-`move_pane`, `move_tab`, `stack_panes`, `break_pane` and is no longer flagged destructive; the new
+`move_pane`, `move_tab` and `stack_panes` and is no longer flagged destructive; the new
 `zellij_close` takes the two closes and is. That spends the eighth and last tool slot, and the cap
 test now pins the surface shut.
 

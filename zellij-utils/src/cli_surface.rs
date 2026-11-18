@@ -81,10 +81,6 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
         name: "create",
         blurb: "make a pane or a tab; each reports the id and handle of what it made",
         commands: &[
-            "break-pane",
-            "break-pane-left",
-            "break-pane-right",
-            "break-pane-to-tab",
             "edit",
             "edit-scrollback",
             "launch-or-focus-plugin",
@@ -296,11 +292,6 @@ const OUTPUTS: &[OutputSpec] = &[
         keys: "tab_id pane_id handle ready_by ready_ms",
     },
     OutputSpec {
-        command: "action break-pane",
-        shape: "record",
-        keys: "tab_id",
-    },
-    OutputSpec {
         command: "action close-pane",
         shape: "record",
         keys: "closed",
@@ -430,8 +421,8 @@ How every one of these answers:
   * A command that only acts prints nothing. The ones that report say so in their own --help.
   * Three classes decide what a verb does when you do not tell it what to act on. Moving focus,
     scrolling, switching mode and every CREATING verb work anywhere: placement relative to where
-    you are is their point. Recoverable mutations - rename, resize, move, break-pane,
-    edit-scrollback, clear - mean the focused thing INSIDE the session, and are refused from a
+    you are is their point. Recoverable mutations - rename, resize, move, edit-scrollback,
+    clear - mean the focused thing INSIDE the session, and are refused from a
     script, where \"focused\" is something you have never seen. `close-pane`, `close-tab`, `write`,
     `write-chars`, `send-keys` and `paste` always name their target, from inside too: there the
     focused pane is the shell that ran the command. `--focused` (`--current`) is how you name that

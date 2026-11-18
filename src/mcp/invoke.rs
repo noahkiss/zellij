@@ -1410,12 +1410,6 @@ fn argv_in(
                     rest.extend(panes.split_whitespace().map(|pane| pane.to_owned()));
                     rest
                 },
-                "break_pane" => vec![
-                    "action".to_owned(),
-                    "break-pane".to_owned(),
-                    "--pane-id".to_owned(),
-                    args.required("pane")?,
-                ],
                 "close_pane" | "close_tab" => {
                     return Err(format!(
                         "`{}` closes something, which is `zellij_close`'s job rather than this \
@@ -1427,7 +1421,7 @@ fn argv_in(
             };
             Ok(scoped(rest))
         },
-        // the two that cannot be undone, kept apart from the four that can. The CLI confirms them
+        // the two that cannot be undone, kept apart from the three that can. The CLI confirms them
         // for a person and refuses off a terminal; a tool call has already been approved by
         // whatever gates tool calls, so it answers the confirmation here rather than hanging on a
         // prompt nobody can see

@@ -1212,8 +1212,6 @@ impl From<crate::input::actions::Action>
             BreakPaneAction,
             BreakPaneLeftAction,
             BreakPaneRightAction,
-            BreakPanesToNewTabAction,
-            BreakPanesToTabWithIdAction,
             ChangeFloatingPaneCoordinatesAction,
             ClearScreenAction,
             ClearScreenByPaneIdAction,
@@ -2372,24 +2370,6 @@ impl From<crate::input::actions::Action>
             crate::input::actions::Action::SetSyncTab { tab_id, sync } => {
                 ActionType::SetSyncTab(SetSyncTabAction { tab_id, sync })
             },
-            crate::input::actions::Action::BreakPanesToNewTab {
-                pane_ids,
-                name,
-                no_focus,
-            } => ActionType::BreakPanesToNewTab(BreakPanesToNewTabAction {
-                pane_ids: pane_ids.into_iter().map(|id| id.into()).collect(),
-                name,
-                no_focus,
-            }),
-            crate::input::actions::Action::BreakPanesToTabWithId {
-                pane_ids,
-                tab_id,
-                no_focus,
-            } => ActionType::BreakPanesToTabWithId(BreakPanesToTabWithIdAction {
-                pane_ids: pane_ids.into_iter().map(|id| id.into()).collect(),
-                tab_id,
-                no_focus,
-            }),
             crate::input::actions::Action::SignalPane { pane_id, signal } => {
                 ActionType::SignalPane(SignalPaneAction {
                     pane_id: Some(pane_id.into()),
@@ -3447,28 +3427,6 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 tab_id: a.tab_id,
                 sync: a.sync,
             }),
-            ActionType::BreakPanesToNewTab(a) => {
-                Ok(crate::input::actions::Action::BreakPanesToNewTab {
-                    pane_ids: a
-                        .pane_ids
-                        .into_iter()
-                        .map(|id| id.try_into())
-                        .collect::<Result<Vec<_>>>()?,
-                    name: a.name,
-                    no_focus: a.no_focus,
-                })
-            },
-            ActionType::BreakPanesToTabWithId(a) => {
-                Ok(crate::input::actions::Action::BreakPanesToTabWithId {
-                    pane_ids: a
-                        .pane_ids
-                        .into_iter()
-                        .map(|id| id.try_into())
-                        .collect::<Result<Vec<_>>>()?,
-                    tab_id: a.tab_id,
-                    no_focus: a.no_focus,
-                })
-            },
             ActionType::SignalPane(a) => Ok(crate::input::actions::Action::SignalPane {
                 pane_id: a
                     .pane_id

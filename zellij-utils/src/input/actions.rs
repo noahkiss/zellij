@@ -711,16 +711,6 @@ pub enum Action {
         tab_id: Option<u32>,
         sync: bool,
     },
-    BreakPanesToNewTab {
-        pane_ids: Vec<PaneId>,
-        name: Option<String>,
-        no_focus: bool,
-    },
-    BreakPanesToTabWithId {
-        pane_ids: Vec<PaneId>,
-        tab_id: u32,
-        no_focus: bool,
-    },
     TogglePaneBorderless {
         pane_id: PaneId,
     },
@@ -2334,36 +2324,6 @@ impl Action {
                 tab_id: tab_id.map(|id| id as u32),
                 sync: enabled,
             }]),
-            CliAction::BreakPane {
-                pane_id,
-                name,
-                no_focus,
-            } => {
-                if pane_id.is_empty() {
-                    // no explicit target: the focused pane, which is what the keybinding does
-                    return Ok(vec![Action::BreakPane]);
-                }
-                let pane_ids = parse_pane_ids(&pane_id, resolve_pane_target)?;
-                Ok(vec![Action::BreakPanesToNewTab {
-                    pane_ids,
-                    name,
-                    no_focus,
-                }])
-            },
-            CliAction::BreakPaneToTab {
-                pane_id,
-                tab_id,
-                no_focus,
-            } => {
-                let pane_ids = parse_pane_ids(&pane_id, resolve_pane_target)?;
-                Ok(vec![Action::BreakPanesToTabWithId {
-                    pane_ids,
-                    tab_id,
-                    no_focus,
-                }])
-            },
-            CliAction::BreakPaneRight => Ok(vec![Action::BreakPaneRight]),
-            CliAction::BreakPaneLeft => Ok(vec![Action::BreakPaneLeft]),
             // `wait` is answered by the client, which holds the caller for as long as the wait
             // lasts. It is intercepted before this, and reaching here means that interception was
             // removed and the command would otherwise go quiet
@@ -5306,16 +5266,6 @@ pub fn pane_ids_only(target: &str) -> Result<PaneId, String> {
             other
         )),
     }
-}
-
-fn parse_pane_ids(
-    pane_ids: &[String],
-    resolve_pane_target: &dyn Fn(&str) -> Result<PaneId, String>,
-) -> Result<Vec<PaneId>, String> {
-    pane_ids
-        .iter()
-        .map(|pane_id| resolve_pane_target(pane_id))
-        .collect()
 }
 
 /// Parse an optional `--pane-id`. `None` means "whatever this client is focused on".

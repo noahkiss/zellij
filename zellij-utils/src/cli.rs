@@ -2831,46 +2831,6 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Move panes out into a tab of their own
-    ///
-    /// Returns: `tab_id: <id>` for the new tab.
-    BreakPane {
-        /// A pane to move, repeat the flag for more than one: terminal_1, plugin_2, a bare
-        /// integer, a handle like sunny-otter, or a pane uuid. Without this, the focused pane
-        #[clap(short, long, value_parser)]
-        pane_id: Vec<String>,
-        /// Name for the new tab. Without one the tab is numbered
-        #[clap(short, long, value_parser)]
-        name: Option<String>,
-        /// Leave every client's focus where it is, instead of following the panes
-        #[clap(long, value_parser)]
-        no_focus: bool,
-    },
-    /// Move panes into an existing tab
-    ///
-    /// A tab or pane that does not exist prints the reason on stderr and exits non-zero.
-    BreakPaneToTab {
-        /// A pane to move, repeat the flag for more than one: terminal_1, plugin_2, a bare
-        /// integer, a handle like sunny-otter, or a pane uuid
-        #[clap(short, long, value_parser, required(true))]
-        pane_id: Vec<String>,
-        /// The tab to move them into, by the stable id in the TAB_ID column of `list-tabs`
-        #[clap(short, long, value_parser)]
-        tab_id: u32,
-        /// Leave every client's focus where it is, instead of following the panes
-        #[clap(long, value_parser)]
-        no_focus: bool,
-    },
-    /// Move the focused pane into a new tab to the right of its own
-    ///
-    /// Names no pane, so it means nothing from outside the session and is refused there. Use
-    /// `break-pane --pane-id` from a script.
-    BreakPaneRight,
-    /// Move the focused pane into a new tab to the left of its own
-    ///
-    /// Names no pane, so it means nothing from outside the session and is refused there. Use
-    /// `break-pane --pane-id` from a script.
-    BreakPaneLeft,
     /// Send a signal to the process running in a pane
     ///
     /// A pane that does not exist, or a plugin pane, which runs no process, prints the reason on
@@ -3335,9 +3295,6 @@ pub fn target_class(action: &CliAction) -> TargetClass {
         | CliAction::MovePane { .. }
         | CliAction::MovePaneBackwards { .. }
         | CliAction::MoveTab { .. }
-        | CliAction::BreakPane { .. }
-        | CliAction::BreakPaneRight
-        | CliAction::BreakPaneLeft
         | CliAction::TogglePaneEmbedOrFloating { .. }
         | CliAction::TogglePanePinned { .. } => TargetClass::InsideOnly,
         _ => TargetClass::Anywhere,
@@ -3366,9 +3323,7 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
     let class = target_class(action);
     let (verb, flag, lister, named) = match action {
         CliAction::ClosePane {
-            pane_id,
-            focused,
-            ..
+            pane_id, focused, ..
         } => (
             "close-pane",
             "--pane-id",
@@ -3408,9 +3363,7 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
             named(pane_id.is_some(), *focused),
         ),
         CliAction::Clear {
-            pane_id,
-            focused,
-            ..
+            pane_id, focused, ..
         } => (
             "clear",
             "--pane-id",
@@ -3418,9 +3371,7 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
             named(pane_id.is_some(), *focused),
         ),
         CliAction::CloseTab {
-            tab_id,
-            focused,
-            ..
+            tab_id, focused, ..
         } => (
             "close-tab",
             "--tab-id",
@@ -3444,12 +3395,6 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
             "--tab-id",
             "list-tabs",
             named(tab_id.is_some(), false),
-        ),
-        CliAction::BreakPane { pane_id, .. } => (
-            "break-pane",
-            "--pane-id",
-            "list-panes",
-            named(!pane_id.is_empty(), false),
         ),
         CliAction::Resize { pane_id, .. } => (
             "resize",
@@ -3499,15 +3444,6 @@ pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<St
             "list-tabs",
             named(tab_id.is_some(), false),
         ),
-        // these two name no pane at all, by design - they are keybindings that happen to be
-        // reachable from the CLI, so the way to aim them is to use the verb that can be aimed
-        CliAction::BreakPaneRight | CliAction::BreakPaneLeft if !inside_the_session => {
-            return Some(
-                "`break-pane-right` and `break-pane-left` act on the focused pane and cannot name \
-                 one, so they mean nothing from outside a pane. Use `break-pane --pane-id` instead."
-                    .to_owned(),
-            )
-        },
         _ => return None,
     };
     let thing = if flag == "--pane-id" { "pane" } else { "tab" };
@@ -3857,65 +3793,6 @@ mod tests {
     }
 
     #[test]
-    fn break_pane_takes_several_panes_and_a_name() {
-        let action = parse_action(&[
-            "break-pane",
-            "--pane-id",
-            "terminal_1",
-            "--pane-id",
-            "plugin_2",
-            "--name",
-            "build",
-            "--no-focus",
-        ]);
-        match action {
-            CliAction::BreakPane {
-                pane_id,
-                name,
-                no_focus,
-            } => {
-                assert_eq!(pane_id, vec!["terminal_1", "plugin_2"]);
-                assert_eq!(name.as_deref(), Some("build"));
-                assert!(no_focus);
-            },
-            other => panic!("Expected BreakPane, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn break_pane_with_no_target_means_the_focused_pane() {
-        let action = parse_action(&["break-pane"]);
-        match action {
-            CliAction::BreakPane {
-                pane_id, no_focus, ..
-            } => {
-                assert!(pane_id.is_empty());
-                assert!(!no_focus);
-            },
-            other => panic!("Expected BreakPane, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn break_pane_to_tab_needs_both_ends() {
-        let action = parse_action(&["break-pane-to-tab", "--pane-id", "3", "--tab-id", "2"]);
-        match action {
-            CliAction::BreakPaneToTab {
-                pane_id,
-                tab_id,
-                no_focus,
-            } => {
-                assert_eq!(pane_id, vec!["3"]);
-                assert_eq!(tab_id, 2);
-                assert!(!no_focus);
-            },
-            other => panic!("Expected BreakPaneToTab, got {:?}", other),
-        }
-        assert!(action_parse_fails(&["break-pane-to-tab", "--tab-id", "2"]));
-        assert!(action_parse_fails(&["break-pane-to-tab", "--pane-id", "3"]));
-    }
-
-    #[test]
     fn signal_pane_defaults_to_sigint() {
         let action = parse_action(&["signal-pane", "--pane-id", "terminal_1"]);
         match action {
@@ -3995,9 +3872,6 @@ mod tests {
             vec!["close-pane"],
             vec!["close-tab"],
             vec!["move-tab", "left"],
-            vec!["break-pane"],
-            vec!["break-pane-right"],
-            vec!["break-pane-left"],
             vec!["write", "27"],
             vec!["write-chars", "hello"],
             vec!["clear"],
@@ -4038,9 +3912,6 @@ mod tests {
         // "the focused pane" is the shell that ran the command
         for args in [
             vec!["move-tab", "left"],
-            vec!["break-pane"],
-            vec!["break-pane-right"],
-            vec!["break-pane-left"],
             vec!["clear"],
             vec!["edit-scrollback"],
             vec!["rename-pane", "build"],
@@ -4061,7 +3932,6 @@ mod tests {
             vec!["close-pane", "--pane-id", "terminal_1"],
             vec!["close-tab", "--tab-id", "2"],
             vec!["move-tab", "left", "--tab-id", "2"],
-            vec!["break-pane", "--pane-id", "terminal_1"],
             vec!["write", "27", "--pane-id", "terminal_1"],
             vec!["write-chars", "hello", "--pane-id", "sunny-otter"],
             vec!["clear", "--pane-id", "terminal_1"],

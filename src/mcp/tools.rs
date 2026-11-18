@@ -551,7 +551,7 @@ pub const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "zellij_arrange",
-        summary: "Move, stack or break out a pane or a tab, always by explicit target.",
+        summary: "Move or stack a pane or a tab, always by explicit target.",
         best_for: "reshaping a session you already have an overview of. Nothing here loses \
                    anything: every operation can be moved back.",
         not_for: "closing anything - that is zellij_close. Not for anything you cannot name a \
@@ -561,18 +561,17 @@ pub const TOOLS: &[ToolSpec] = &[
             "action move-pane",
             "action move-tab",
             "action stack-panes",
-            "action break-pane",
         ],
         tips: "",
         params: &[
             SESSION,
             ParamSpec {
                 name: "operation",
-                kind: ParamKind::Enum(&["move_pane", "move_tab", "stack_panes", "break_pane"]),
+                kind: ParamKind::Enum(&["move_pane", "move_tab", "stack_panes"]),
                 required: true,
                 from: None,
-                describe: "What to do. move_pane and break_pane take pane; move_tab takes tab; \
-                           stack_panes takes panes.",
+                describe: "What to do. move_pane takes pane; move_tab takes tab; stack_panes \
+                           takes panes.",
                 default: None,
             },
             ParamSpec {
@@ -580,7 +579,7 @@ pub const TOOLS: &[ToolSpec] = &[
                 kind: ParamKind::Str,
                 required: false,
                 from: Some(("action move-pane", "--pane-id")),
-                describe: "The pane to move or break out: its handle, like sunny-otter, or \
+                describe: "The pane to move: its handle, like sunny-otter, or \
                            terminal_1, plugin_2, a bare integer or a pane uuid.",
                 default: None,
             },

@@ -2253,38 +2253,6 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
-        Action::BreakPanesToNewTab {
-            pane_ids,
-            name,
-            no_focus,
-        } => {
-            let default_shell = default_shell.clone();
-            senders
-                .send_to_screen(ScreenInstruction::BreakPanesToNewTab {
-                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
-                    default_shell,
-                    should_change_focus_to_new_tab: !no_focus,
-                    new_tab_name: name,
-                    client_id,
-                    completion_tx: Some(NotificationEnd::new(completion_tx)),
-                })
-                .with_context(err_context)?;
-        },
-        Action::BreakPanesToTabWithId {
-            pane_ids,
-            tab_id,
-            no_focus,
-        } => {
-            senders
-                .send_to_screen(ScreenInstruction::BreakPanesToTabWithId {
-                    pane_ids: pane_ids.into_iter().map(|p| p.into()).collect(),
-                    tab_id: tab_id as usize,
-                    should_change_focus_to_target_tab: !no_focus,
-                    client_id,
-                    completion_tx: Some(NotificationEnd::new(completion_tx)),
-                })
-                .with_context(err_context)?;
-        },
         Action::SignalPane { pane_id, signal } => {
             senders
                 .send_to_pty(PtyInstruction::SignalPaneId(
@@ -2780,7 +2748,6 @@ fn target_of(action: &Action) -> (Option<ZellijUtilsPaneId>, Option<usize>) {
         | RenamePaneByPaneId { pane_id, .. } => (*pane_id, None),
         GoToTab { index, .. } => (None, Some(*index as usize)),
         RenameTab { tab_index, .. } => (None, Some(*tab_index as usize)),
-        BreakPanesToTabWithId { tab_id, .. } => (None, Some(*tab_id as usize)),
         CloseTabById { id } | RenameTabById { id, .. } | MoveTabByTabId { id, .. } => {
             (None, Some(*id as usize))
         },
