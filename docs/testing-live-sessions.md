@@ -15,6 +15,7 @@ export ZELLIJ_SOCKET_DIR=/tmp/zj-test/sock    # sockets, and therefore which ser
 export ZELLIJ_CONFIG_DIR=/tmp/zj-test/config  # config.kdl, and the key permission grants use
 export XDG_CACHE_HOME=/tmp/zj-test/cache      # session_info, plugin artifacts, permissions.kdl
 export XDG_STATE_HOME=/tmp/zj-test/state      # the snapshot archive
+export XDG_DATA_HOME=/tmp/zj-test/data        # the pinned binary (`pin_exe`), on Linux
 ```
 
 `ZELLIJ_SOCKET_DIR` and `ZELLIJ_CONFIG_DIR` are read directly, and the fork reads `XDG_STATE_HOME`
@@ -22,6 +23,16 @@ by hand, so those three work on every platform. **`XDG_CACHE_HOME` does not.** T
 the `directories` crate, which honours the XDG variables on Linux and ignores them on macOS — so on
 macOS the cache stays in the user's real one and only the session name keeps a test apart from live
 state.
+
+**The pin is the other path that does not move with the session.** With `pin_exe true` in the
+config, `session up`, `session restart`, `session enable`, `session doctor --fix` and every
+interactive launch copy the running build to the pin, and the real launcher runs the pin. A scratch
+run from a dev build that reaches the real pin puts that build under the real session. The pin path
+comes from the `directories` crate (`canonical_pinned_exe` in `zellij-utils/src/session_service.rs`):
+
+- On Linux it is `$XDG_DATA_HOME/zellij/bin/zellij`, so the `XDG_DATA_HOME` export above moves it.
+- On macOS it is `~/Library/Application Support/zellij/bin/zellij`, and `XDG_DATA_HOME` does not
+  move it. Use a scratch config with no `pin_exe`, or with `pin_exe "<scratch path>"`.
 
 **So never run `delete-all-sessions` on macOS, scratch environment or not.** It does not read the
 session list you set up. `delete_all_sessions` (`src/commands.rs:410`) takes its targets from

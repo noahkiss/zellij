@@ -112,10 +112,13 @@ export ZELLIJ_SOCKET_DIR=/tmp/zj-test/sock
 export ZELLIJ_CONFIG_DIR=/tmp/zj-test/config
 export XDG_CACHE_HOME=/tmp/zj-test/cache
 export XDG_STATE_HOME=/tmp/zj-test/state
+export XDG_DATA_HOME=/tmp/zj-test/data
 ```
 
 - On macOS the cache ignores `XDG_CACHE_HOME`. **Never run `delete-all-sessions` on macOS**: it
   deletes the real user's sessions. Delete scratch sessions by name.
+- The pin lives under `XDG_DATA_HOME` on Linux; `session up` and `session restart` write it. On
+  macOS it ignores `XDG_DATA_HOME`: give the scratch config no `pin_exe`, or a scratch path.
 - From inside an agent, start the scratch server with the agent variables unset
   (`env -u AGENT_SESSION_ID -u AGENT_KIND -u CLAUDECODE -u CLAUDE_CODE_SESSION_ID`).
 - `docs/testing-live-sessions.md` has the reasons and the detached-session pitfalls.
