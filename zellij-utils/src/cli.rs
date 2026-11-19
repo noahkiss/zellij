@@ -2524,6 +2524,78 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
     },
+    /// Send the coding agent in another pane a message, typed in only when it is safe
+    ///
+    /// The target is one word, matched against `list-agents`: a pane handle, a tab name, an
+    /// agent name, or the name of the agent's project directory. Exactly one agent must match;
+    /// none or several is a miss, exit 2, with the candidates on stderr.
+    ///
+    /// The session types the message in - one bracketed paste, then Enter - only when the agent
+    /// reported `idle`, `done` or `error`, nothing typed into its prompt is waiting there, and no
+    /// key reached the pane in the last 5 seconds. The check and the typing happen in one step on
+    /// the server, and a key that arrives meanwhile waits behind the Enter. Otherwise the session
+    /// holds the message, tries again every second, and drops it when it expires. A held message
+    /// survives a restart of the session. The message goes in under a one-line envelope that names
+    /// the sender and says how to reply.
+    ///
+    ///   zellij action send-message --to develop -- 'The build is green; go ahead.'
+    ///   zellij action send-message --reply-to m3k9x2q -- 'Done.'
+    ///
+    /// Returns: one record of id, status (delivered, queued, refused or expired), reason, pane,
+    /// handle, session, agent and the times; with --wait, the record once the message went in or
+    /// the wait ran out. Exit 0 for delivered and queued, 2 for refused, expired or a target that
+    /// matched no agent or several.
+    SendMessage {
+        /// Who gets it: a pane handle, a tab name, an agent name or a project directory name
+        #[clap(long, value_parser, required_unless_present = "reply-to")]
+        to: Option<String>,
+
+        /// Answer a message this session delivered: its sender is the target. With --to, the
+        /// target is --to's and this only names the message answered
+        #[clap(long, value_parser)]
+        reply_to: Option<String>,
+
+        /// The message. `-` reads it from stdin
+        #[clap(value_parser)]
+        text: String,
+
+        /// Seconds a held message waits before it expires
+        #[clap(long, value_parser, default_value = "1800")]
+        expire_s: u64,
+
+        /// Block until the message is delivered, for at most this many seconds
+        #[clap(long, value_parser)]
+        wait: Option<u64>,
+
+        /// The sender, as host/session/handle. Defaults to this pane on this machine
+        #[clap(long, value_parser)]
+        from: Option<String>,
+
+        /// The sender's agent name, for the envelope
+        #[clap(long, value_parser)]
+        from_name: Option<String>,
+
+        /// Look for the target in every live session on this machine, not one
+        #[clap(long, value_parser)]
+        all_sessions: bool,
+
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
+    /// Show the messages this session holds for its agents, or one message by id
+    ///
+    /// Returns: the records `send-message` prints, held ones first, then the ones delivered lately.
+    /// Exit 2 when an id names no message this session knows.
+    MessageStatus {
+        /// One message id
+        #[clap(value_parser)]
+        id: Option<String>,
+
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// Get information about the currently active tab
     ///
     /// Returns: `name:`, `id:` and `position:` lines, or the full TabInfo with --json
@@ -2775,6 +2847,8 @@ impl CliAction {
             | CliAction::ListAgents { json, .. }
             | CliAction::Whoami { json, .. }
             | CliAction::LastReply { json, .. }
+            | CliAction::SendMessage { json, .. }
+            | CliAction::MessageStatus { json, .. }
             | CliAction::CurrentTabInfo { json, .. } => {
                 *json = true;
                 true

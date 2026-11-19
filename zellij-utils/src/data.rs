@@ -2614,6 +2614,11 @@ pub struct PaneListEntry {
     /// prefill is still waiting in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefilled_command: Option<String>,
+    /// fork addition: messages from other agents the session holds for this pane, waiting for the
+    /// agent to be idle and its prompt clear (`zellij action send-message`). Written only when
+    /// there are some.
+    #[serde(default, skip_serializing_if = "is_no_messages")]
+    pub queued_messages: usize,
     /// What a program in the pane last said it is doing, over `OSC 7501`: the `state`, `state_*`
     /// keys of [`PaneProgramStatus`], flattened onto the row. Absent when no program has reported.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
@@ -2674,6 +2679,10 @@ pub struct PaneProgramStatus {
         skip_serializing_if = "is_zero_count"
     )]
     pub working: u32,
+}
+
+fn is_no_messages(count: &usize) -> bool {
+    *count == 0
 }
 
 fn is_zero_count(count: &u32) -> bool {
@@ -2750,6 +2759,11 @@ pub struct AgentListEntry {
     /// a one-session list is about the session it was asked of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// fork addition: messages the session holds for this agent, from the pane's
+    /// `queued_messages`. Never serialized here: `list-agents --json` writes it as `queued` on its
+    /// own row, and `action watch` keeps the keys it had.
+    #[serde(skip)]
+    pub queued_messages: usize,
 }
 
 pub type ListAgentsResponse = Vec<AgentListEntry>;

@@ -642,6 +642,27 @@ pub enum Action {
         list: bool,
         output_json: bool,
     },
+    /// fork addition: a message for the coding agent in a terminal pane, typed in only when the
+    /// agent is idle and nobody is typing there, and otherwise held by the session until then.
+    ///
+    /// The server answers with one JSON record: `delivered`, `queued` or `refused`. See
+    /// `zellij-server/src/agent_mail.rs`.
+    SendMessage {
+        terminal_id: u32,
+        text: String,
+        /// The sender's address, `host/session/handle`, as the envelope names it.
+        from: String,
+        from_name: Option<String>,
+        /// The message this one answers.
+        reply_to: Option<String>,
+        /// How long a held message waits before it expires.
+        expire_s: u64,
+    },
+    /// fork addition: the record of one message this session holds or delivered, or of all of
+    /// them. JSON.
+    MessageStatus {
+        id: Option<String>,
+    },
     ListTabs {
         show_state: bool,
         show_dimensions: bool,
@@ -2232,6 +2253,14 @@ impl Action {
             // session has nothing to add, so it is the client's, like `list-agents`
             CliAction::LastReply { .. } => {
                 Err("`last-reply` is run by the client, not sent as an action".into())
+            },
+            // `send-message` resolves its target from the agent list first, and `message-status`
+            // waits on a record: both are the client's, which then sends the actions below
+            CliAction::SendMessage { .. } => {
+                Err("`send-message` is run by the client, not sent as an action".into())
+            },
+            CliAction::MessageStatus { .. } => {
+                Err("`message-status` is run by the client, not sent as an action".into())
             },
             CliAction::TogglePaneBorderless { pane_id } => {
                 let parsed_pane_id = resolve_pane_target(&pane_id);

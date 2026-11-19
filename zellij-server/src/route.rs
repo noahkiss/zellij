@@ -2091,6 +2091,73 @@ pub(crate) fn route_action(
             }
             drop(NotificationEnd::new(completion_tx));
         },
+        Action::SendMessage {
+            terminal_id,
+            text,
+            from,
+            from_name,
+            reply_to,
+            expire_s,
+        } => {
+            use crossbeam::channel::unbounded;
+            let (response_sender, response_receiver) = unbounded();
+            senders
+                .send_to_screen(ScreenInstruction::SendAgentMessage {
+                    terminal_id,
+                    text,
+                    from,
+                    from_name,
+                    reply_to,
+                    expire_s,
+                    response_channel: response_sender,
+                })
+                .with_context(err_context)?;
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(record) => send_output_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    vec![serde_json::to_string(&record).unwrap_or_default()],
+                ),
+                Err(_) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout sending the message",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        Action::MessageStatus { id } => {
+            use crossbeam::channel::unbounded;
+            let (response_sender, response_receiver) = unbounded();
+            senders
+                .send_to_screen(ScreenInstruction::AgentMessageStatus {
+                    id: id.clone(),
+                    response_channel: response_sender,
+                })
+                .with_context(err_context)?;
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(Some(records)) => send_output_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    vec![serde_json::to_string(&records).unwrap_or_default()],
+                ),
+                // an id this session does not know is a miss, exit 2, like a pane nothing holds
+                Ok(None) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    &format!(
+                        "No message '{}' in this session. `zellij action message-status` lists the ones it holds or delivered lately.",
+                        id.unwrap_or_default()
+                    ),
+                ),
+                Err(_) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout reading the session's messages",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::ReopenPane {
             handle,
             list: false,
@@ -4038,6 +4105,7 @@ mod tests {
             input_since_prompt: false,
             input_since_state: false,
             prefilled_command: None,
+            queued_messages: 0,
         }
     }
 

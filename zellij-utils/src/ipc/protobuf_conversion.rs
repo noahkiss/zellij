@@ -1253,6 +1253,7 @@ impl From<crate::input::actions::Action>
             ListPanesAction,
             ListTabsAction,
             ListTreeAction,
+            MessageStatusAction,
             MouseEventAction,
             MoveFocusAction,
             MoveFocusOrTabAction,
@@ -1318,6 +1319,7 @@ impl From<crate::input::actions::Action>
             SearchInputAction,
             SearchToggleOptionAction,
             SelectCommandAtScrollPositionAction,
+            SendMessageAction,
             SetDarkThemeAction,
             SetLightThemeAction,
             SetPaneBorderlessAction,
@@ -2089,6 +2091,24 @@ impl From<crate::input::actions::Action>
                 list,
                 output_json,
             }),
+            crate::input::actions::Action::SendMessage {
+                terminal_id,
+                text,
+                from,
+                from_name,
+                reply_to,
+                expire_s,
+            } => ActionType::SendMessage(SendMessageAction {
+                terminal_id,
+                text,
+                from,
+                from_name,
+                reply_to,
+                expire_s,
+            }),
+            crate::input::actions::Action::MessageStatus { id } => {
+                ActionType::MessageStatus(MessageStatusAction { id })
+            },
             crate::input::actions::Action::ListPanes {
                 show_tab,
                 show_command,
@@ -3028,6 +3048,17 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                 list: a.list,
                 output_json: a.output_json,
             }),
+            ActionType::SendMessage(a) => Ok(crate::input::actions::Action::SendMessage {
+                terminal_id: a.terminal_id,
+                text: a.text,
+                from: a.from,
+                from_name: a.from_name,
+                reply_to: a.reply_to,
+                expire_s: a.expire_s,
+            }),
+            ActionType::MessageStatus(a) => {
+                Ok(crate::input::actions::Action::MessageStatus { id: a.id })
+            },
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {
                     show_tab: list_panes_action.show_tab,

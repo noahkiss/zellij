@@ -1050,6 +1050,20 @@ fn argv_in(
             };
             Ok(scoped(rest))
         },
+        // `zellij_send` is routed and given its sender in `ZellijMcp::send`; this is its command
+        // line on this machine, from a caller with no pane of its own
+        "zellij_send" => {
+            let route = super::send::Route {
+                target: Target::Local,
+                session: args.string("session"),
+                to: args.required("to")?,
+            };
+            let sender = super::send::Sender {
+                address: "-/-/mcp".to_owned(),
+                name: None,
+            };
+            super::send::argv(&route, &sender, args.values)
+        },
         other => Err(format!("`{}` is not a tool of this server.", other)),
     }
 }

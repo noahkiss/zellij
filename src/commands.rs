@@ -655,6 +655,24 @@ pub(crate) fn send_action_to_session(
     // `list-agents --all-sessions` is a question about the machine rather than about one session,
     // so it is answered before a session is chosen - and with none running, it is an empty list
     // rather than a miss
+    // `send-message --all-sessions` looks for its target on the whole machine, so it too is
+    // answered before a session is chosen
+    if let zellij_utils::cli::CliAction::SendMessage {
+        all_sessions: true, ..
+    } = &cli_action
+    {
+        let mut names: Vec<String> = get_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        let own = requested_session_name
+            .clone()
+            .or_else(|| envs::get_session_name().ok());
+        let exit_status = send_message(&cli_action, own.as_deref(), &names, output_json);
+        process::exit(exit_status);
+    }
     if let zellij_utils::cli::CliAction::ListAgents {
         json,
         all_sessions: true,
@@ -1106,6 +1124,28 @@ fn attach_with_cli_client(
             )),
             session_name,
             *json,
+        );
+        std::process::exit(exit_status);
+    }
+    // `send-message` resolves its target from the agent list first, then sends the action itself;
+    // `message-status` is one question, printed by the client
+    if let zellij_utils::cli::CliAction::SendMessage { .. } = &cli_action {
+        let exit_status = send_message(
+            &cli_action,
+            Some(session_name),
+            &[session_name.to_owned()],
+            output_json,
+        );
+        std::process::exit(exit_status);
+    }
+    if let zellij_utils::cli::CliAction::MessageStatus { id, json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_message_status_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            id.as_deref(),
+            *json || output_json,
         );
         std::process::exit(exit_status);
     }
@@ -1949,4 +1989,46 @@ pub fn get_config_options_from_cli_args(opts: &CliArgs) -> Result<Options, Strin
     Setup::from_cli_args(&opts)
         .map(|(_, _, config_options, _, _)| config_options)
         .map_err(|e| e.to_string())
+}
+
+/// fork addition: `zellij action send-message`, run by the client.
+fn send_message(
+    cli_action: &zellij_utils::cli::CliAction,
+    own_session: Option<&str>,
+    sessions: &[String],
+    output_json: bool,
+) -> i32 {
+    let zellij_utils::cli::CliAction::SendMessage {
+        to,
+        reply_to,
+        text,
+        expire_s,
+        wait,
+        from,
+        from_name,
+        json,
+        ..
+    } = cli_action
+    else {
+        return 1;
+    };
+    zellij_client::cli_client::start_send_message_client(
+        &|| {
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            ))
+        },
+        own_session,
+        sessions,
+        zellij_client::cli_client::SendMessageRequest {
+            to: to.clone(),
+            reply_to: reply_to.clone(),
+            text: text.clone(),
+            expire_s: *expire_s,
+            wait_s: *wait,
+            from: from.clone(),
+            from_name: from_name.clone(),
+            json: *json || output_json,
+        },
+    )
 }

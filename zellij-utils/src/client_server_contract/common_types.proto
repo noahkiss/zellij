@@ -305,6 +305,10 @@ message Action {
     MoveTabToIndexAction move_tab_to_index = 172;
     NewShellPaneAction new_shell_pane = 173;
     ReopenPaneAction reopen_pane = 174;
+    // fork additions from 900 on: a block of its own, well clear of upstream's numbering and of
+    // the 160+ fork block above, so a rebase never collides with either
+    SendMessageAction send_message = 900;
+    MessageStatusAction message_status = 901;
   }
 }
 
@@ -407,6 +411,17 @@ message ReopenPaneAction {
   optional string handle = 1;
   bool list = 2;
   bool output_json = 3;
+}
+message SendMessageAction {
+  uint32 terminal_id = 1;
+  string text = 2;
+  string from = 3;
+  optional string from_name = 4;
+  optional string reply_to = 5;
+  uint64 expire_s = 6;
+}
+message MessageStatusAction {
+  optional string id = 1;
 }
 message ListPanesAction {
   bool show_tab = 1;

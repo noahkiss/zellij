@@ -1,5 +1,6 @@
 pub mod agent_detect;
 pub mod agent_hooks;
+pub mod agent_mail;
 pub mod capabilities;
 pub mod cli;
 pub mod cli_surface;

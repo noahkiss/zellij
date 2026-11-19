@@ -587,6 +587,7 @@ mod tests {
             input_since_prompt: false,
             input_since_state: false,
             prefilled_command: None,
+            queued_messages: 0,
             program_status: None,
         }
     }

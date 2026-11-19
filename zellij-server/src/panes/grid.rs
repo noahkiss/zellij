@@ -3759,6 +3759,14 @@ impl Grid {
         None
     }
 
+    /// fork addition: [`Grid::note_typed_input`], with the bytes, which the agent prompt's draft
+    /// follows for `send-message`'s guard.
+    pub fn note_typed_bytes(&mut self, bytes: &[u8]) {
+        self.note_typed_input();
+        self.program_status
+            .note_typed(bytes, std::time::Instant::now());
+    }
+
     /// Record that input was typed into this pane: a key, a paste, `write-chars`.
     pub fn note_typed_input(&mut self) {
         self.input_since_prompt = true;

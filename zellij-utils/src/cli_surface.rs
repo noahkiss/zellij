@@ -43,6 +43,7 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "list-panes",
             "list-tabs",
             "list-tree",
+            "message-status",
             // `wait` blocks, which no other read verb does, but a band says what a verb *changes*
             // and this one changes nothing
             "wait",
@@ -114,6 +115,8 @@ pub const ACTION_GROUPS: &[ActionGroup] = &[
             "rename-tab-by-id",
             "resize",
             "send-keys",
+            // types a message in when the agent is idle, or holds it until then
+            "send-message",
             "set-pane-borderless",
             "set-pane-color",
             "show-floating-panes",
@@ -198,6 +201,16 @@ const OUTPUTS: &[OutputSpec] = &[
         command: "action last-reply",
         shape: "payload",
         keys: "",
+    },
+    OutputSpec {
+        command: "action send-message",
+        shape: "record",
+        keys: crate::agent_mail::RECORD_KEYS,
+    },
+    OutputSpec {
+        command: "action message-status",
+        shape: "record",
+        keys: crate::agent_mail::RECORD_KEYS,
     },
     OutputSpec {
         command: "action list-agents",

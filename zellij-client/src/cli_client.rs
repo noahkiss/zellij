@@ -1683,6 +1683,14 @@ struct AgentRow<'a> {
     /// The tokens the last answer's prompt took. No percentage: the window is not recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_tokens: Option<u64>,
+    /// Messages from other agents the session holds for this one (`send-message`). Written only
+    /// when there are some.
+    #[serde(skip_serializing_if = "is_no_count")]
+    queued: usize,
+}
+
+fn is_no_count(count: &usize) -> bool {
+    *count == 0
 }
 
 /// How long `list-agents --json` waits for transcripts, all agents together. A row whose
@@ -1741,6 +1749,7 @@ fn agent_rows<'a>(
             message_to: meta.message_to,
             chat_started_at: meta.started_at,
             context_tokens: meta.context_tokens,
+            queued: agent.queued_messages,
         })
         .collect()
 }
@@ -2732,6 +2741,281 @@ pub fn start_subscribe_client(
     os_input.send_to_server(ClientToServerMsg::ClientExited);
 }
 
+/// fork addition: what `zellij action send-message` was asked to do.
+pub struct SendMessageRequest {
+    pub to: Option<String>,
+    pub reply_to: Option<String>,
+    pub text: String,
+    pub expire_s: u64,
+    pub wait_s: Option<u64>,
+    pub from: Option<String>,
+    pub from_name: Option<String>,
+    pub json: bool,
+}
+
+/// fork addition: `zellij action send-message`.
+///
+/// Resolves the target against the agents of `sessions` (or, for a reply, against the session the
+/// answered message came from), then hands the message to that session's server, which types it in
+/// or holds it. See `zellij_utils::agent_mail`.
+///
+/// Exit 0 for `delivered` and `queued`. Exit 2 for `refused`, `expired`, and a target that names no
+/// agent, several, or a pane without one. Exit 1 for a session that could not be asked.
+pub fn start_send_message_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    own_session: Option<&str>,
+    sessions: &[String],
+    request: SendMessageRequest,
+) -> i32 {
+    use zellij_utils::agent_mail::{Address, Status};
+    let text = if request.text == "-" {
+        let mut text = String::new();
+        if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut text) {
+            eprintln!("Could not read the message from stdin: {}", e);
+            return 1;
+        }
+        text
+    } else {
+        request.text.clone()
+    };
+    if text.trim().is_empty() {
+        eprintln!("The message is empty.");
+        return 2;
+    }
+    let (target, scope): (String, Vec<String>) = match (&request.reply_to, &request.to) {
+        (_, Some(to)) => (to.clone(), sessions.to_vec()),
+        (Some(id), None) => {
+            let Some(own) = own_session else {
+                eprintln!(
+                    "--reply-to looks the message up in the session that delivered it: run it inside that session, or pass --session."
+                );
+                return 2;
+            };
+            let record = match message_records(make_os_input(), own, Some(id)) {
+                Ok(mut records) if !records.is_empty() => records.remove(0),
+                Ok(_) => {
+                    eprintln!("No message '{}' in session '{}'.", id, own);
+                    return 2;
+                },
+                Err(message) => {
+                    eprintln!("{}", message);
+                    return 2;
+                },
+            };
+            let Some(address) = Address::parse(&record.from) else {
+                eprintln!(
+                    "Message {} carries no address to reply to: '{}'.",
+                    id, record.from
+                );
+                return 2;
+            };
+            if !address.host.is_empty() && !is_this_host(&address.host) {
+                eprintln!(
+                    "Message {} came from {}, which is another machine. Reply with zellij_send reply_to={}, or on that machine: zellij --session {} action send-message --to {} -- <text>",
+                    id, address.host, id, address.session, address.handle
+                );
+                return 2;
+            }
+            (address.handle, vec![address.session])
+        },
+        (None, None) => {
+            eprintln!("Pass --to <agent> or --reply-to <message id>.");
+            return 2;
+        },
+    };
+
+    // every pane of every session in scope, and the agents among them
+    let mut listed: Vec<(String, Vec<PaneListEntry>, ListAgentsResponse)> = Vec::new();
+    for session in &scope {
+        match panes_of_session(make_os_input(), session) {
+            Ok(panes) => {
+                let agents = active_agents(panes.clone());
+                listed.push((session.clone(), panes, agents));
+            },
+            Err(message) if scope.len() > 1 => eprintln!("session '{}': {}", session, message),
+            Err(message) => {
+                eprintln!("{}", message);
+                return 1;
+            },
+        }
+    }
+    let candidates: Vec<crate::agent_send::Candidate> = listed
+        .iter()
+        .flat_map(|(session, panes, agents)| {
+            panes
+                .iter()
+                .filter(|pane| !pane.pane_info.exited && !pane.pane_info.is_held)
+                .map(move |pane| crate::agent_send::Candidate {
+                    session: session.as_str(),
+                    pane,
+                    agent: agents.iter().find(|a| a.pane_id == pane.pane_info.id),
+                })
+        })
+        .collect();
+    let (session, terminal_id) = match crate::agent_send::resolve(&target, &candidates) {
+        crate::agent_send::Resolved::One {
+            session,
+            terminal_id,
+        } => (session, terminal_id),
+        crate::agent_send::Resolved::NotAgent { session, handle } => {
+            eprintln!(
+                "{}/{} runs no coding agent, so there is nobody to message. Type into it with zellij_write_input, or zellij action paste.",
+                session, handle
+            );
+            return 2;
+        },
+        crate::agent_send::Resolved::Nothing(lines) if lines.is_empty() => {
+            eprintln!(
+                "No agent answers to '{}': no coding agent runs in {}.",
+                target,
+                if scope.len() == 1 {
+                    format!("session '{}'", scope[0])
+                } else {
+                    "any session on this machine".to_owned()
+                }
+            );
+            return 2;
+        },
+        crate::agent_send::Resolved::Nothing(lines) => {
+            eprintln!("No agent answers to '{}'. The agents:", target);
+            lines.iter().for_each(|line| eprintln!("  {}", line));
+            return 2;
+        },
+        crate::agent_send::Resolved::Several(lines) => {
+            eprintln!(
+                "'{}' names {} agents; pass a handle, or session/handle:",
+                target,
+                lines.len()
+            );
+            lines.iter().for_each(|line| eprintln!("  {}", line));
+            return 2;
+        },
+    };
+
+    let (from, own_name) = match &request.from {
+        Some(from) => (from.clone(), None),
+        None => sender_address(make_os_input),
+    };
+    let action = Action::SendMessage {
+        terminal_id,
+        text,
+        from,
+        from_name: request.from_name.clone().or(own_name),
+        reply_to: request.reply_to.clone(),
+        expire_s: request.expire_s,
+    };
+    let mut record = match ask(make_os_input(), &session, action, "the message").and_then(|lines| {
+        serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(
+            lines.first().map(String::as_str).unwrap_or(""),
+        )
+        .map_err(|e| format!("Could not read the session's answer: {}", e))
+    }) {
+        Ok(record) => record,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    if let (Some(wait_s), Status::Queued) = (request.wait_s, record.status) {
+        let deadline = Instant::now() + Duration::from_secs(wait_s);
+        while record.status == Status::Queued && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            match message_records(make_os_input(), &session, Some(&record.id)) {
+                Ok(mut records) if !records.is_empty() => record = records.remove(0),
+                _ => break,
+            }
+        }
+    }
+    if request.json {
+        println!("{}", serde_json::to_string(&record).unwrap_or_default());
+    } else {
+        println!("{}", record.line());
+    }
+    match record.status {
+        Status::Delivered | Status::Queued => 0,
+        Status::Refused | Status::Expired => 2,
+    }
+}
+
+/// fork addition: `zellij action message-status`.
+pub fn start_message_status_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    id: Option<&str>,
+    output_json: bool,
+) -> i32 {
+    match message_records(os_input, session_name, id) {
+        Ok(records) => {
+            if output_json {
+                let json = match (id, records.first()) {
+                    (Some(_), Some(record)) => serde_json::to_string(record),
+                    _ => serde_json::to_string(&records),
+                };
+                println!("{}", json.unwrap_or_default());
+            } else {
+                records
+                    .iter()
+                    .for_each(|record| println!("{}", record.line()));
+            }
+            0
+        },
+        Err(message) => {
+            eprintln!("{}", message);
+            2
+        },
+    }
+}
+
+fn message_records(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    id: Option<&str>,
+) -> Result<Vec<zellij_utils::agent_mail::MessageRecord>, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::MessageStatus {
+            id: id.map(str::to_owned),
+        },
+        id.unwrap_or("the messages"),
+    )?;
+    serde_json::from_str(lines.first().map(String::as_str).unwrap_or("[]"))
+        .map_err(|e| format!("Could not read the session's messages: {}", e))
+}
+
+/// This pane's address, `host/session/handle`, and the name of the agent in it, from the
+/// environment zellij gives every pane. Outside a pane, `host/-/cli`.
+fn sender_address(make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>) -> (String, Option<String>) {
+    let host = zellij_utils::shared::short_hostname();
+    let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
+    let pane_id: Option<u32> = std::env::var("ZELLIJ_PANE_ID")
+        .ok()
+        .and_then(|id| id.parse().ok());
+    let (Some(session), Some(pane_id)) = (session, pane_id) else {
+        return (format!("{}/-/cli", host), None);
+    };
+    let Ok(panes) = panes_of_session(make_os_input(), &session) else {
+        return (format!("{}/{}/terminal_{}", host, session, pane_id), None);
+    };
+    let pane = panes
+        .iter()
+        .find(|pane| !pane.pane_info.is_plugin && pane.pane_info.id == pane_id);
+    let handle = pane
+        .map(|pane| pane.pane_info.handle.clone())
+        .filter(|handle| !handle.is_empty())
+        .unwrap_or_else(|| format!("terminal_{}", pane_id));
+    let name = pane
+        .and_then(|pane| pane.agent.as_ref())
+        .and_then(|agent| agent.name.clone());
+    (format!("{}/{}/{}", host, session, handle), name)
+}
+
+/// Whether `host` names this machine: its short name, or a longer name that starts with it.
+fn is_this_host(host: &str) -> bool {
+    let local = zellij_utils::shared::short_hostname();
+    host == local || host.split('.').next() == Some(local)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2999,6 +3283,7 @@ mod tests {
                 input_since_prompt: false,
                 input_since_state: false,
                 prefilled_command: None,
+                queued_messages: 0,
             })
             .collect();
         serde_json::to_string(&entries).unwrap()
@@ -3484,6 +3769,7 @@ mod tests {
             program_status: None,
             session: None,
             last_output_at: None,
+            queued_messages: 0,
         }
     }
 
@@ -3588,11 +3874,12 @@ mod tests {
              {\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":10}}}\n",
         )
         .unwrap();
-        let agents = vec![
+        let mut agents = vec![
             agent_row(1, "claude", Some("s1")),
             agent_row(2, "codex", Some("s2")),
             agent_row(3, "claude", Some("gone")),
         ];
+        agents[1].queued_messages = 2;
         let none = |_: &str| None;
         let rows = agent_rows(&agents, &none, Some(home), Duration::from_secs(10));
         let json: serde_json::Value = serde_json::to_value(&rows).unwrap();
@@ -3603,6 +3890,9 @@ mod tests {
         // the agent's own keys are still there, unchanged
         assert_eq!(json[0]["handle"], "pane-1");
         assert_eq!(json[0]["kind"], "claude");
+        // held messages show as a count, only where there are some
+        assert_eq!(json[1]["queued"], 2);
+        assert!(json[0].get("queued").is_none());
         for row in [&json[1], &json[2]] {
             assert_eq!(row["message_route"], "pane");
             assert!(row.get("message_to").is_none());

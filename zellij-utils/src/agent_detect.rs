@@ -328,6 +328,7 @@ pub fn agents_from_pane_list(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
                 last_output_at: entry.pane_info.last_output_at,
                 program_status: entry.program_status.clone(),
                 session: None,
+                queued_messages: entry.queued_messages,
             })
         })
         .collect()
@@ -752,6 +753,7 @@ mod tests {
             input_since_prompt: false,
             input_since_state: false,
             prefilled_command: None,
+            queued_messages: 0,
         };
         let agents = agents_from_pane_list(vec![entry]);
         assert_eq!(agents.len(), 1);
@@ -788,6 +790,7 @@ mod tests {
             input_since_prompt: false,
             input_since_state: false,
             prefilled_command: None,
+            queued_messages: 0,
             program_status: Some(status.clone()),
         };
         let pane_json = serde_json::to_value(&entry).unwrap();
@@ -845,6 +848,7 @@ mod tests {
                 ..Default::default()
             }),
             session: session.map(str::to_owned),
+            queued_messages: 0,
         }
     }
 
@@ -1178,6 +1182,7 @@ mod name_tests {
             last_output_at: None,
             program_status: None,
             session: None,
+            queued_messages: 0,
         };
         agent.agent.name = Some("project-7".into());
         let mut agents = vec![agent];

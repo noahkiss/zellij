@@ -202,12 +202,11 @@ pub fn merge(
 }
 
 /// The one instruction an agent listing carries: how to send a message to a row.
-pub const HOW_TO_MESSAGE: &str = "To message an agent: when its pane entry has message_to, send \
-the message to that address with your harness's messaging tool; it works from any machine. A \
-claude agent on this machine also takes its name there. Otherwise type into its pane: \
-zellij_write_input with the entry's address (session = host/session, pane = handle) and \
-submit=true. \"X on <machine>\" usually means the tab named X on that host; the target is the \
-agent in that tab.";
+pub const HOW_TO_MESSAGE: &str = "To message an agent, call zellij_send with to = \
+host/tab, host/handle or the agent's name: \"X on <machine>\" is to=<machine>/X, and one agent \
+must match. It waits until that agent is idle and nobody is typing there, and says delivered, \
+queued or refused. A pane entry's address works as to = host/session/handle. message_to, when \
+present, is a second route: the harness's own messaging tool.";
 
 /// The agent rows as a person refers to them: host, then tab, then pane.
 ///

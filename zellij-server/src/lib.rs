@@ -15,6 +15,7 @@ pub use pane_handles::SEQUENTIAL_HANDLES_VAR;
 pub mod panes;
 pub mod tab;
 
+pub mod agent_mail;
 pub mod background_jobs;
 mod bell_dwell;
 mod closed_panes;

@@ -251,6 +251,10 @@ pub struct ProgramStatusRecords {
     prompt_seq: u64,
     /// Input was typed into the pane after the last report. See [`Self::input_since_report`].
     input_since_report: bool,
+    /// fork addition: what a person typed into the program's prompt since it last took one up,
+    /// and when a key last reached the pane. What `send-message`'s guard reads.
+    draft: crate::agent_mail::Draft,
+    last_input_at: Option<std::time::Instant>,
 }
 
 impl ProgramStatusRecords {
@@ -264,6 +268,10 @@ impl ProgramStatusRecords {
             },
             Message::Report(report) => {
                 self.input_since_report = false;
+                // a program that starts working took up whatever its prompt held
+                if report.state == State::Working {
+                    self.draft.taken_up();
+                }
                 self.seq += 1;
                 self.records.insert(
                     report.id,
@@ -331,6 +339,7 @@ impl ProgramStatusRecords {
     /// starting to report here, and every record in the pane belongs to one that came before it.
     pub fn program_started(&mut self) {
         self.records.clear();
+        self.draft.taken_up();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -340,6 +349,39 @@ impl ProgramStatusRecords {
     /// Input was typed into the pane: a key, a paste, `write-chars`.
     pub fn note_input(&mut self) {
         self.input_since_report = true;
+    }
+
+    /// fork addition: the bytes of that input, which the draft follows, and when they came.
+    pub fn note_typed(&mut self, bytes: &[u8], now: std::time::Instant) {
+        let working = self
+            .summary()
+            .is_some_and(|summary| summary.state == State::Working.as_str());
+        self.draft.note(bytes, working, now);
+        self.last_input_at = Some(now);
+    }
+
+    /// fork addition: whether text a person typed into the prompt is waiting there unsent.
+    pub fn draft_pending(&self, now: std::time::Instant) -> bool {
+        self.draft.pending(now)
+    }
+
+    /// fork addition: whether a message the session typed in waits for the program to take it up.
+    pub fn message_pending(&self, now: std::time::Instant) -> bool {
+        self.draft.sent_by_session(now)
+    }
+
+    /// fork addition: how long since a key last reached the pane.
+    pub fn since_input(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.last_input_at
+            .map(|at| now.saturating_duration_since(at))
+    }
+
+    /// fork addition: the session typed a message in and pressed Enter. The state the program
+    /// reported is from before it, as after any input, and its prompt holds a submitted line until
+    /// it says it took it up. A key's time is left alone: this was no person typing.
+    pub fn note_delivered(&mut self, now: std::time::Instant) {
+        self.input_since_report = true;
+        self.draft.delivered(now);
     }
 
     /// Whether input was typed into the pane after the program last reported or cleared.

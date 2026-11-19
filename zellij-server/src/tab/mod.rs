@@ -301,6 +301,18 @@ pub(crate) struct Tab {
 }
 
 // FIXME: Use a struct that has a pane_type enum, to reduce all of the duplication
+/// fork addition: a terminal pane's prompt, as `send-message`'s guard reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPrompt {
+    pub program_status: Option<zellij_utils::data::PaneProgramStatus>,
+    /// Text a person typed is waiting in the prompt unsent.
+    pub draft_pending: bool,
+    /// A message the session typed in waits for the program to report it took it up.
+    pub message_pending: bool,
+    /// How long since a key last reached the pane.
+    pub since_input: Option<std::time::Duration>,
+}
+
 pub trait Pane {
     fn x(&self) -> usize;
     fn y(&self) -> usize;
@@ -908,6 +920,13 @@ pub trait Pane {
     fn input_since_state(&self) -> bool {
         false
     }
+    /// fork addition: what `send-message`'s guard reads about the prompt of the program in this
+    /// pane. Only a terminal pane has one.
+    fn agent_prompt(&self, _now: std::time::Instant) -> Option<AgentPrompt> {
+        None
+    }
+    /// fork addition: the session typed a message into this pane and submitted it.
+    fn note_message_delivered(&mut self, _now: std::time::Instant) {}
     fn update_exit_status(&mut self, _exit_status: i32) {}
     fn set_plugin_regex_highlights(
         &mut self,

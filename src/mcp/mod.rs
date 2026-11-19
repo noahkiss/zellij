@@ -7,8 +7,8 @@
 //!
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
-//! * **Six tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
-//!   fails if it grows past six or if a tool asks for more than nine parameters.
+//! * **Seven tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
+//!   fails if it grows past seven or if a tool asks for more than nine parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
 //! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so
@@ -20,6 +20,7 @@
 mod fleet;
 pub mod invoke;
 pub mod remote;
+pub mod send;
 pub mod tools;
 
 use std::future::Future;
@@ -67,15 +68,16 @@ zellij_create never splits or floats.
 
 zellij_overview with scope=agents answers which panes are running a coding agent, and which agent
 each one is, including its live messaging name. Refresh the list before addressing another agent.
-Use your harness's messaging tool for named agents. Type into their panes when they have no messaging.
+To message another agent, on this machine or another, use zellij_send: it finds the agent by host,
+tab, handle, name or project, and types the message in only when that agent is idle and nobody is
+typing there. Use zellij_write_input for a pane that runs no agent.
 The agents prompt and zellij://agents resource return the same live list.
 
 Sessions on other machines: write `session` as `host/session` - `boxa/work` - and every tool acts
 on that session over ssh, the same as on a local one. Only hosts listed in remote_hosts in
 config.kdl are reachable. zellij_overview with scope=fleet lists the coding agents in every
-session on every listed host, one row per agent, with its host and session.
-To message an agent on another machine or of another harness, call zellij_overview scope=fleet
-first and follow its how_to_message.";
+session on every listed host, one row per agent, with its host and session. `develop on boxa`
+is zellij_send to=boxa/develop.";
 
 /// The server itself. It holds nothing: every answer comes from a child process.
 #[derive(Clone, Debug, Default)]
@@ -117,6 +119,9 @@ impl ZellijMcp {
                 );
             }
             return fleet::overview(&self.remote_hosts(), local).await;
+        }
+        if name == "zellij_send" {
+            return self.send(&arguments, local).await;
         }
         // `host/session` picks the machine and leaves the bare session for the command line
         let hosts = if arguments
@@ -187,6 +192,134 @@ impl ZellijMcp {
             }
         }
         with_host(result, &target)
+    }
+
+    /// `zellij_send`: resolve where the message goes, then run `action send-message` there.
+    async fn send(&self, arguments: &Map<String, Value>, local: &str) -> CallToolResult {
+        let hosts = self.remote_hosts();
+        let local_name = hosts.local_name(local);
+        let ambient = self.ambient_session.clone();
+        let bad = |message: String| failed(message, json!({"reason": "bad_arguments"}));
+        // a reply finds its way back from the message it answers, which this session delivered
+        let to = match (
+            arguments.get("to").and_then(Value::as_str),
+            arguments.get("reply_to").and_then(Value::as_str),
+        ) {
+            (Some(to), _) if !to.is_empty() => to.to_owned(),
+            (_, Some(id)) => {
+                let mut argv = Vec::new();
+                if let Some(session) = &ambient {
+                    argv.extend(["-s".to_owned(), session.clone()]);
+                }
+                argv.extend(
+                    ["action", "message-status", id, "--json"]
+                        .iter()
+                        .map(|word| word.to_string()),
+                );
+                let record = match invoke::run_on(&remote::Target::Local, &argv).await {
+                    Ok(outcome) if !outcome.is_error() => {
+                        serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(
+                            outcome.stdout.trim(),
+                        )
+                        .ok()
+                    },
+                    _ => None,
+                };
+                let Some(address) = record
+                    .as_ref()
+                    .and_then(|record| zellij_utils::agent_mail::Address::parse(&record.from))
+                else {
+                    return failed(
+                        format!(
+                            "No message '{}' was delivered in this session, so there is no sender to reply to. Pass `to` instead.",
+                            id
+                        ),
+                        json!({"reason": "miss"}),
+                    );
+                };
+                if address.host.is_empty() || remote::is_local(&address.host, local) {
+                    format!("{}/{}/{}", local_name, address.session, address.handle)
+                } else if hosts.find(&address.host).is_none() {
+                    return failed(
+                        format!(
+                            "Message {} came from {}, which is not listed in remote_hosts in config.kdl, so a reply cannot reach it. Its sender is {}.",
+                            id, address.host, address
+                        ),
+                        json!({"reason": "bad_arguments", "from": address.to_string()}),
+                    );
+                } else {
+                    address.to_string()
+                }
+            },
+            _ => {
+                return bad("Pass `to` (who gets the message) or `reply_to` (a message id).".into())
+            },
+        };
+        let session = arguments.get("session").and_then(Value::as_str);
+        let route = match send::route(&to, session, &hosts, local) {
+            Ok(route) => route,
+            Err(message) => return bad(message),
+        };
+        // who this is from: this server's own pane, read on this machine
+        let pane_id = std::env::var("ZELLIJ_PANE_ID")
+            .ok()
+            .and_then(|id| id.parse().ok());
+        let panes = match (&ambient, pane_id) {
+            (Some(session), Some(_)) => invoke::run_on(
+                &remote::Target::Local,
+                &[
+                    "-s".to_owned(),
+                    session.clone(),
+                    "action".to_owned(),
+                    "list-panes".to_owned(),
+                    "--json".to_owned(),
+                ],
+            )
+            .await
+            .map(|outcome| outcome.stdout)
+            .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let sender = send::sender(&local_name, ambient.as_deref(), pane_id, &panes);
+        let argv = match send::argv(&route, &sender, arguments) {
+            Ok(argv) => argv,
+            Err(message) => return bad(message),
+        };
+        let outcome = match invoke::run_on(&route.target, &argv).await {
+            Ok(outcome) => outcome,
+            Err(message) => {
+                return with_host(failed(message, json!({"reason": "not_run"})), &route.target)
+            },
+        };
+        if outcome.is_error() && send::verb_unknown(&outcome.stderr) {
+            let host = route.target.host().unwrap_or(&local_name).to_owned();
+            return with_host(
+                failed(
+                    format!(
+                        "{} runs a zellij without send-message, so the message was not sent. Nothing was typed: a message pasted without the guard can land in a person's half-written prompt. Upgrade zellij there, or type it yourself with zellij_write_input after checking the pane with zellij_read_pane.",
+                        host
+                    ),
+                    json!({"reason": "remote_too_old"}),
+                ),
+                &route.target,
+            );
+        }
+        let record =
+            serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(outcome.stdout.trim())
+                .ok();
+        let mut result = self.report(&argv, outcome, None);
+        // a record is the answer whatever its status: its keys at the top, where a caller looks
+        // for `status`, and its one line as the text
+        if let (Some(record), Some(Value::Object(structured))) =
+            (record, result.structured_content.as_mut())
+        {
+            structured.remove("reason");
+            if let Ok(Value::Object(keys)) = serde_json::to_value(&record) {
+                structured.extend(keys);
+            }
+            result.content = vec![ContentBlock::text(record.line())];
+        }
+        with_host(result, &route.target)
     }
 
     /// `scope=agents` and `my_agents`: the rows grouped by host, tab and pane, as `scope=fleet`
@@ -800,14 +933,15 @@ fn looks_like_uuid(pane: &str) -> bool {
             .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// What `zellij_write_input` adds when the pane it typed into runs an agent a harness can message.
+/// What `zellij_write_input` adds when the pane it typed into runs a coding agent.
 ///
-/// `agents` is the session's `list-agents --json`. A row with `message_to` gets that address, from
-/// any machine. A named claude on this machine takes its name too. Any other agent - another
-/// harness, or a claude elsewhere with no bridge - gets no hint: typing into its pane is the way in.
+/// `agents` is the session's `list-agents --json`. Any agent row points at `zellij_send`, which
+/// waits for the agent to be idle and its prompt clear. A row with `message_to` names that address
+/// too, as the harness's own route. A pane with no agent gets no hint.
 fn agent_hint(agents: &str, pane: &str, remote: bool) -> Option<String> {
     let row = terminal_pane_row(agents, pane)?;
     let kind = row.get("kind")?.as_str()?;
+    let handle = row.get("handle").and_then(Value::as_str).unwrap_or(pane);
     let name = row
         .get("name")
         .and_then(Value::as_str)
@@ -816,20 +950,20 @@ fn agent_hint(agents: &str, pane: &str, remote: bool) -> Option<String> {
         .get("message_to")
         .and_then(Value::as_str)
         .filter(|to| !to.is_empty());
-    let by_name = !remote && kind == "claude" && name.is_some();
     let runs = match name {
         Some(name) => format!("this pane runs {} `{}`", kind, name),
         None => format!("this pane runs {}", kind),
     };
-    match (message_to, by_name) {
-        (Some(to), true) => Some(format!(
-            "{}; prefer messaging it by name, or at `{}` from any machine",
-            runs, to
-        )),
-        (Some(to), false) => Some(format!("{}; prefer messaging it at `{}`", runs, to)),
-        (None, true) => Some(format!("{}; prefer messaging it by name", runs)),
-        (None, false) => None,
+    let same_session = if remote { " with the same session" } else { "" };
+    let mut hint = format!(
+        "{}; to message it, use zellij_send to={}{}: it waits until the agent is idle and \
+         nobody is typing there",
+        runs, handle, same_session
+    );
+    if let Some(to) = message_to {
+        hint.push_str(&format!(", or your harness's messaging tool at `{}`", to));
     }
+    Some(hint)
 }
 
 impl ServerHandler for ZellijMcp {
@@ -988,46 +1122,32 @@ mod tests {
     }
 
     #[test]
-    fn input_hint_only_names_the_target_agent() {
+    fn input_hint_points_every_agent_at_zellij_send() {
         let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude","name":"proj-45"},
-            {"handle":"quiet-fox","pane_id":4,"kind":"codex","name":null},
-            {"handle":"named-fox","pane_id":5,"kind":"codex","name":"helper"}]"#;
-        let expected = "this pane runs claude `proj-45`; prefer messaging it by name";
+            {"handle":"quiet-fox","pane_id":4,"kind":"codex","name":null}]"#;
+        let expected = "this pane runs claude `proj-45`; to message it, use zellij_send \
+                        to=sunny-otter: it waits until the agent is idle and nobody is typing there";
         for target in ["sunny-otter", "3", "terminal_3"] {
             assert_eq!(agent_hint(rows, target, false).as_deref(), Some(expected));
         }
-        assert!(agent_hint(rows, "quiet-fox", false).is_none());
+        assert_eq!(
+            agent_hint(rows, "quiet-fox", true).as_deref(),
+            Some(
+                "this pane runs codex; to message it, use zellij_send to=quiet-fox with the same \
+                 session: it waits until the agent is idle and nobody is typing there"
+            )
+        );
         assert!(agent_hint(rows, "missing", false).is_none());
         assert!(agent_hint("invalid", "3", false).is_none());
-        // another harness has no harness route, named or not
-        assert!(agent_hint(rows, "named-fox", false).is_none());
-        // a claude on another machine is not reached by its name
-        assert!(agent_hint(rows, "sunny-otter", true).is_none());
     }
 
     #[test]
     fn input_hint_gives_the_message_address_when_the_row_has_one() {
         let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude","name":"proj-45",
-              "message_to":"bridge:session_01A","message_route":"harness"},
-            {"handle":"calm-owl","pane_id":4,"kind":"claude","name":null,
-              "message_to":"bridge:session_01B","message_route":"harness"},
-            {"handle":"quiet-fox","pane_id":5,"kind":"codex","message_route":"pane"}]"#;
-        assert_eq!(
-            agent_hint(rows, "sunny-otter", false).as_deref(),
-            Some(
-                "this pane runs claude `proj-45`; prefer messaging it by name, or at \
-                 `bridge:session_01A` from any machine"
-            )
-        );
-        assert_eq!(
-            agent_hint(rows, "sunny-otter", true).as_deref(),
-            Some("this pane runs claude `proj-45`; prefer messaging it at `bridge:session_01A`")
-        );
-        assert_eq!(
-            agent_hint(rows, "calm-owl", false).as_deref(),
-            Some("this pane runs claude; prefer messaging it at `bridge:session_01B`")
-        );
-        assert!(agent_hint(rows, "quiet-fox", true).is_none());
+              "message_to":"bridge:session_01A","message_route":"harness"}]"#;
+        assert!(agent_hint(rows, "sunny-otter", false).unwrap().ends_with(
+            "nobody is typing there, or your harness's messaging tool at `bridge:session_01A`"
+        ));
         assert!(looks_like_uuid("0f3c1a2b-aaaa-bbbb-cccc-1234567890ab"));
         assert!(!looks_like_uuid("sunny-otter"));
         assert!(!looks_like_uuid("terminal_3"));

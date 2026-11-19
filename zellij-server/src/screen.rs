@@ -836,6 +836,27 @@ pub enum ScreenInstruction {
     ListClosedPanes {
         response_channel: crossbeam::channel::Sender<Vec<ClosedPane>>,
     },
+    /// fork addition: `send-message`. Deliver a message to the agent in this terminal pane now,
+    /// or hold it; the record says which. See `crate::agent_mail`.
+    SendAgentMessage {
+        terminal_id: u32,
+        text: String,
+        from: String,
+        from_name: Option<String>,
+        reply_to: Option<String>,
+        expire_s: u64,
+        response_channel: crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>,
+    },
+    /// fork addition: `message-status`: one message's record, or every record. `None` answers an
+    /// id this session does not know.
+    AgentMessageStatus {
+        id: Option<String>,
+        response_channel:
+            crossbeam::channel::Sender<Option<Vec<zellij_utils::agent_mail::MessageRecord>>>,
+    },
+    /// fork addition: try the held messages again, and expire the overdue ones. Sent once a
+    /// second while any are held.
+    DrainAgentMessages,
     /// fork addition: the pty is about to hand over a reopened pane, which takes back this
     /// handle the moment a tab takes it - before the creation is reported.
     ExpectReopenedPane {
@@ -1290,6 +1311,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             ScreenInstruction::ResolvePaneTarget { .. } => ScreenContext::ResolvePaneTarget,
             ScreenInstruction::ReopenPane { .. } => ScreenContext::ReopenPane,
             ScreenInstruction::ListClosedPanes { .. } => ScreenContext::ListClosedPanes,
+            ScreenInstruction::SendAgentMessage { .. } => ScreenContext::SendAgentMessage,
+            ScreenInstruction::AgentMessageStatus { .. } => ScreenContext::AgentMessageStatus,
+            ScreenInstruction::DrainAgentMessages => ScreenContext::DrainAgentMessages,
             ScreenInstruction::ExpectReopenedPane { .. } => ScreenContext::ReopenPane,
             ScreenInstruction::ListTabs { .. } => ScreenContext::ListTabs,
             ScreenInstruction::GetCurrentTabInfo { .. } => ScreenContext::GetCurrentTabInfo,
@@ -1788,6 +1812,13 @@ pub(crate) struct Screen {
     pending_prefills: HashMap<u32, String>,
     /// fork addition: the last few closed terminal panes; see `crate::closed_panes`.
     closed_panes: ClosedPanes,
+    /// fork addition: messages from other agents, held for this session's agents until they can
+    /// go in; see `crate::agent_mail`.
+    agent_mail: crate::agent_mail::Mailbox,
+    /// fork addition: whether the thread that drives `DrainAgentMessages` runs.
+    agent_mail_ticking: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// fork addition: the guard's quiet window; `agent_mail::QUIET_MS` outside tests.
+    agent_mail_quiet_ms: u64,
     /// fork addition: a reopened pane's old handle, waiting for the pane to exist. See
     /// `ScreenInstruction::ExpectReopenedPane`.
     pending_reopen_handles: HashMap<u32, String>,
@@ -2064,6 +2095,9 @@ impl Screen {
             pane_process_info: HashMap::new(),
             pending_prefills: HashMap::new(),
             closed_panes: ClosedPanes::default(),
+            agent_mail: Default::default(),
+            agent_mail_ticking: Default::default(),
+            agent_mail_quiet_ms: zellij_utils::agent_mail::QUIET_MS,
             pending_reopen_handles: HashMap::new(),
             reopen_in_new_tab: HashMap::new(),
             detect_agents: DETECT_AGENTS_DEFAULT,
@@ -5927,6 +5961,7 @@ impl Screen {
             pane_info: PaneInfo,
             tab: &crate::tab::Tab,
             agent: Option<PaneAgent>,
+            mailbox: &crate::agent_mail::Mailbox,
         ) -> PaneListEntry {
             // the markers are on the pane's own grid, so this is a lookup by id rather than
             // something `pane_infos_for_tab` could have carried out
@@ -5953,6 +5988,11 @@ impl Screen {
                 && tab
                     .get_pane_with_id(PaneId::Terminal(pane_info.id))
                     .map_or(false, |pane| pane.input_since_state());
+            let queued_messages = if pane_info.is_plugin {
+                0
+            } else {
+                mailbox.held_for(&pane_info.handle)
+            };
             let prefilled_command = if pane_info.is_plugin {
                 None
             } else {
@@ -5970,6 +6010,7 @@ impl Screen {
                 input_since_prompt,
                 input_since_state,
                 prefilled_command,
+                queued_messages,
             }
         }
 
@@ -5985,7 +6026,12 @@ impl Screen {
             for pane_info in pane_infos {
                 if should_include_pane(&pane_info, show_all) {
                     let agent = self.agent_in_pane(&pane_info);
-                    pane_entries.push(create_pane_list_entry(pane_info, tab, agent));
+                    pane_entries.push(create_pane_list_entry(
+                        pane_info,
+                        tab,
+                        agent,
+                        &self.agent_mail,
+                    ));
                 }
             }
         }
@@ -6175,6 +6221,231 @@ impl Screen {
         }
         pane.set_pane_handle(handle);
         Ok(())
+    }
+
+    /// fork addition: `send-message`. The message goes in now if the guard passes, is held if the
+    /// agent is busy or a person is typing, and is refused if the pane runs no agent that could
+    /// take it. An `expire_s` of 0 asks for no holding: what would be held is refused instead.
+    pub fn send_agent_message(
+        &mut self,
+        terminal_id: u32,
+        text: String,
+        from: String,
+        from_name: Option<String>,
+        reply_to: Option<String>,
+        expire_s: u64,
+    ) -> zellij_utils::agent_mail::MessageRecord {
+        use zellij_utils::agent_mail::{Decision, MessageRecord, Reason, Status};
+        let now_ms = crate::program_status::now_ms();
+        let pane = self.agent_mail_pane(|info| !info.is_plugin && info.id == terminal_id);
+        let mut stored = crate::agent_mail::Stored {
+            record: MessageRecord {
+                id: self.agent_mail.new_id(),
+                status: Status::Queued,
+                reason: None,
+                pane_id: format!("terminal_{}", terminal_id),
+                handle: pane
+                    .as_ref()
+                    .map(|(info, _)| info.handle.clone())
+                    .unwrap_or_default(),
+                session: self.session_name.clone(),
+                agent: pane
+                    .as_ref()
+                    .and_then(|(_, agent)| agent.as_ref().map(|a| a.kind.clone())),
+                from,
+                from_name,
+                reply_to,
+                queued_at: now_ms,
+                expires_at: now_ms.saturating_add(expire_s.saturating_mul(1000)),
+                delivered_at: None,
+            },
+            text,
+        };
+        let decision = match pane {
+            Some((_, agent)) => self.try_deliver_agent_message(terminal_id, agent, &stored),
+            None => Decision::Refuse(Reason::PaneGone),
+        };
+        match decision {
+            Decision::Deliver => {
+                stored.record.status = Status::Delivered;
+                stored.record.delivered_at = Some(now_ms);
+                let record = stored.record.clone();
+                self.agent_mail.remember(stored);
+                record
+            },
+            Decision::Hold(reason) if expire_s > 0 => {
+                stored.record.reason = Some(reason);
+                let record = stored.record.clone();
+                self.agent_mail.hold(stored);
+                self.start_agent_mail_ticker();
+                record
+            },
+            Decision::Hold(reason) | Decision::Refuse(reason) => {
+                stored.record.status = Status::Refused;
+                stored.record.reason = Some(reason);
+                stored.record.expires_at = now_ms;
+                stored.record
+            },
+        }
+    }
+
+    /// fork addition: the held messages, tried again in the order they came; the overdue ones
+    /// expire. One message per pane per round: a delivered one leaves the agent's prompt
+    /// submitted, and the next waits for the turn it starts to end.
+    pub fn drain_agent_messages(&mut self) {
+        use zellij_utils::agent_mail::{Decision, Reason};
+        let now_ms = crate::program_status::now_ms();
+        self.agent_mail.expire(now_ms);
+        let held: Vec<crate::agent_mail::Stored> = self.agent_mail.held().to_vec();
+        let mut tried = HashSet::new();
+        for stored in held {
+            if !tried.insert(stored.record.handle.clone()) {
+                continue;
+            }
+            let handle = stored.record.handle.clone();
+            let pane = self.agent_mail_pane(|info| !info.is_plugin && info.handle == handle);
+            let Some((info, agent)) = pane else {
+                // a pane a restore is bringing back gets its handle again: wait for it
+                self.agent_mail
+                    .set_reason(&stored.record.id, Reason::PaneGone, None);
+                continue;
+            };
+            let pane_id = format!("terminal_{}", info.id);
+            match self.try_deliver_agent_message(info.id, agent, &stored) {
+                Decision::Deliver => {
+                    self.agent_mail
+                        .delivered(&stored.record.id, pane_id, now_ms);
+                },
+                Decision::Hold(reason) | Decision::Refuse(reason) => {
+                    // a pane whose agent went away keeps the message until it expires: the agent
+                    // may be started again under the same handle
+                    self.agent_mail
+                        .set_reason(&stored.record.id, reason, Some(pane_id));
+                },
+            }
+        }
+        if self.agent_mail.is_empty() {
+            self.agent_mail_ticking
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// fork addition: the guard and the write, in one step on this thread. A key a person presses
+    /// is handled on this same thread, so none can be read between the look and the paste; one
+    /// pressed after it is queued behind the Enter by the pty writer.
+    fn try_deliver_agent_message(
+        &mut self,
+        terminal_id: u32,
+        agent: Option<PaneAgent>,
+        stored: &crate::agent_mail::Stored,
+    ) -> zellij_utils::agent_mail::Decision {
+        use zellij_utils::agent_mail::{self, Decision, GuardFacts};
+        let now = std::time::Instant::now();
+        let prompt = self
+            .tabs
+            .values()
+            .find_map(|tab| tab.get_pane_with_id(PaneId::Terminal(terminal_id)))
+            .and_then(|pane| pane.agent_prompt(now));
+        // a message this session just typed in is the agent's turn, until it reports one
+        let state = if prompt.as_ref().is_some_and(|prompt| prompt.message_pending) {
+            Some("working".to_owned())
+        } else {
+            prompt
+                .as_ref()
+                .and_then(|prompt| prompt.program_status.as_ref())
+                .map(|status| status.state.clone())
+        };
+        let facts = GuardFacts {
+            agent_kind: agent.as_ref().map(|agent| agent.kind.as_str()),
+            state: state.as_deref(),
+            draft_pending: prompt.as_ref().is_some_and(|prompt| prompt.draft_pending),
+            since_input_ms: prompt
+                .as_ref()
+                .and_then(|prompt| prompt.since_input)
+                .map(|since| since.as_millis() as u64),
+            quiet_ms: self.agent_mail_quiet_ms,
+        };
+        let decision = agent_mail::guard(&facts);
+        if decision != Decision::Deliver {
+            return decision;
+        }
+        let envelope = agent_mail::envelope(
+            &stored.record.id,
+            &stored.record.from,
+            stored.record.from_name.as_deref(),
+            stored.record.reply_to.as_deref(),
+        );
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.extend_from_slice(agent_mail::wrapped(&envelope, &stored.text).as_bytes());
+        paste.extend_from_slice(b"\x1b[201~");
+        let sent = self
+            .bus
+            .senders
+            .send_to_pty_writer(PtyWriteInstruction::Write(paste, terminal_id, None))
+            .and_then(|_| {
+                self.bus
+                    .senders
+                    .send_to_pty_writer(PtyWriteInstruction::WriteNotBefore(
+                        b"\r".to_vec(),
+                        terminal_id,
+                        now + crate::agent_mail::ENTER_DELAY,
+                    ))
+            });
+        if let Err(e) = sent {
+            log::error!("could not type message {}: {}", stored.record.id, e);
+            return Decision::Hold(agent_mail::Reason::Working);
+        }
+        if let Some(pane) = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(PaneId::Terminal(terminal_id)))
+        {
+            pane.note_message_delivered(now);
+        }
+        Decision::Deliver
+    }
+
+    /// fork addition: the first pane `matches` picks, and the agent in it.
+    fn agent_mail_pane(
+        &self,
+        matches: impl Fn(&PaneInfo) -> bool,
+    ) -> Option<(PaneInfo, Option<PaneAgent>)> {
+        self.tabs
+            .values()
+            .flat_map(|tab| self.pane_infos_for_tab(tab))
+            .find(|info| matches(info))
+            .map(|info| {
+                let agent = self.agent_in_pane(&info);
+                (info, agent)
+            })
+    }
+
+    /// fork addition: a thread that asks for `DrainAgentMessages` once a second, for as long as
+    /// any message is held. Started again by the next held message once it stops.
+    fn start_agent_mail_ticker(&self) {
+        use std::sync::atomic::Ordering;
+        if self.agent_mail_ticking.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ticking = self.agent_mail_ticking.clone();
+        let senders = self.bus.senders.clone();
+        let started = std::thread::Builder::new()
+            .name("agent_mail".to_owned())
+            .spawn(move || {
+                while ticking.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if senders
+                        .send_to_screen(ScreenInstruction::DrainAgentMessages)
+                        .is_err()
+                    {
+                        ticking.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
+        if started.is_err() {
+            self.agent_mail_ticking.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Which pane, if any, a CLI target names.
@@ -9454,6 +9725,16 @@ pub(crate) fn screen_thread_main(
         web_server_port,
         nested_session_handling,
     );
+    // fork addition: the messages an earlier server held for this session's agents
+    screen.agent_mail = crate::agent_mail::Mailbox::open(
+        zellij_utils::consts::ZELLIJ_STATE_DIR
+            .join("messages")
+            .join(&screen.session_name),
+        crate::program_status::now_ms(),
+    );
+    if !screen.agent_mail.is_empty() {
+        screen.start_agent_mail_ticker();
+    }
     screen.host_theme_dark_styling = host_theme_dark_styling;
     screen.host_theme_light_styling = host_theme_light_styling;
     screen.paste_buffer_read_enabled = dangerously_enable_paste_buffer_read;
@@ -10497,6 +10778,41 @@ pub(crate) fn screen_thread_main(
             },
             ScreenInstruction::ListClosedPanes { response_channel } => {
                 let _ = response_channel.send(screen.closed_panes.list());
+            },
+            ScreenInstruction::SendAgentMessage {
+                terminal_id,
+                text,
+                from,
+                from_name,
+                reply_to,
+                expire_s,
+                response_channel,
+            } => {
+                let record = screen.send_agent_message(
+                    terminal_id,
+                    text,
+                    from,
+                    from_name,
+                    reply_to,
+                    expire_s,
+                );
+                let _ = response_channel.send(record);
+            },
+            ScreenInstruction::AgentMessageStatus {
+                id,
+                response_channel,
+            } => {
+                let records = match id {
+                    Some(id) => screen
+                        .agent_mail
+                        .get(&id)
+                        .map(|stored| vec![stored.record.clone()]),
+                    None => Some(screen.agent_mail.records()),
+                };
+                let _ = response_channel.send(records);
+            },
+            ScreenInstruction::DrainAgentMessages => {
+                screen.drain_agent_messages();
             },
             ScreenInstruction::ExpectReopenedPane {
                 terminal_id,

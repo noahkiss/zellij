@@ -8,6 +8,7 @@ mod os_input_output_unix;
 mod os_input_output_windows;
 
 pub mod agent_reply;
+pub mod agent_send;
 pub mod cli_client;
 mod command_is_executing;
 mod input_handler;

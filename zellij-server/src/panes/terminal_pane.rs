@@ -504,9 +504,10 @@ impl Pane for TerminalPane {
             // a fresh one, and a prefilled line is no longer untouched. Every route that writes
             // user bytes - a key, a paste, `write`/`write-chars`, a plugin - arrives through here.
             // See `Grid::input_since_prompt` and `Grid::prefilled_command`.
-            if matches!(&adjusted, Some(AdjustedInput::WriteBytesToTerminal(bytes)) if !bytes.is_empty())
-            {
-                self.grid.note_typed_input();
+            if let Some(AdjustedInput::WriteBytesToTerminal(bytes)) = &adjusted {
+                if !bytes.is_empty() {
+                    self.grid.note_typed_bytes(bytes);
+                }
             }
             adjusted
         }
@@ -1454,6 +1455,18 @@ impl Pane for TerminalPane {
     }
     fn input_since_state(&self) -> bool {
         self.grid.program_status.input_since_report()
+    }
+    fn agent_prompt(&self, now: std::time::Instant) -> Option<crate::tab::AgentPrompt> {
+        Some(crate::tab::AgentPrompt {
+            program_status: self.grid.program_status.summary(),
+            draft_pending: self.grid.program_status.draft_pending(now)
+                && !self.grid.program_status.message_pending(now),
+            message_pending: self.grid.program_status.message_pending(now),
+            since_input: self.grid.program_status.since_input(now),
+        })
+    }
+    fn note_message_delivered(&mut self, now: std::time::Instant) {
+        self.grid.program_status.note_delivered(now);
     }
     fn update_exit_status(&mut self, exit_status: i32) {
         if let Some(notification_end) = self.notification_end.as_mut() {

@@ -8808,7 +8808,7 @@ alias column. MCP-side only; no contract change.
 
 ```
 zellij_overview {"scope": "fleet"}
-To message an agent: when its pane entry has message_to, send the message to that address ...
+To message an agent, call zellij_send with to = host/tab, host/handle or the agent's name ...
 [{"host": "boxa", "host_alias": "a", "tabs": [
    {"session": "work", "tab": "develop", "panes": [
      {"handle": "brisk-heron", "kind": "claude", "name": "develop-1", "title": "Fix the build",
@@ -8824,9 +8824,9 @@ way a message goes. `zellij_overview` with `scope=agents`, `my_agents` and `flee
 grouped the way a person names an agent: host, then tab (with its session), then pane.
 
 - **The text** is one instruction, `how_to_message`, then the grouped view as JSON. The
-  instruction is static: use `message_to` with the harness's messaging tool when a pane has it;
-  otherwise type into the pane with `zellij_write_input` at the pane's `address`; "X on
-  <machine>" usually means the tab named X on that host.
+  instruction is static: message an agent with `zellij_send` (see "Agent messages wait until the
+  agent is idle and nobody is typing"); "X on <machine>" is `to=<machine>/X`; `message_to`, when a
+  pane has it, is a second route through the harness's own messaging tool.
 - **Each pane entry keeps every key of its row**, and gains `display_title` (the title, or `new
   session` when it is empty or only the harness's name, like claude's `Claude Code`), `chat_age_s`
   (from `chat_started_at`) and `address`, the `session` and `pane` `zellij_write_input` takes.
@@ -8846,31 +8846,128 @@ row with no session, and the fleet merge's text and structure. MCP-side only; no
 ### The `zellij_write_input` hint names the address that reaches the agent
 
 ```text
-this pane runs claude `project-1`; prefer messaging it by name, or at `bridge:session_01AbC` from any machine
-this pane runs claude `project-1`; prefer messaging it at `bridge:session_01AbC`   # another machine
+this pane runs claude `project-1`; to message it, use zellij_send to=brisk-heron: it waits until the agent is idle and nobody is typing there, or your harness's messaging tool at `bridge:session_01AbC`
 ```
 
-After a successful `zellij_write_input`, the hint used to tell the caller to message any named
-agent by name: a codex too, and a claude on another machine, where no name reaches it. The hint now
-reads the target's `list-agents --json` row (not `list-panes`), and says only what works:
+After a successful `zellij_write_input` into a pane that runs a coding agent, the hint points at
+`zellij_send`, the guarded route, for every harness and every machine. A target on another machine
+adds "with the same session". A row with `message_to` names that address as a second route. A
+pane with no agent gets no hint. The hint reads the target's `list-agents --json` row; a pane
+addressed by uuid is looked up by its handle through one `list-panes`, since an agent row has no
+uuid.
 
-| target row | hint |
-|---|---|
-| has `message_to`, a named claude on this machine | message it by name, or at `message_to` |
-| has `message_to`, any other | message it at `message_to` |
-| no `message_to`, a named claude on this machine | message it by name (unchanged) |
-| no `message_to`, any other: another harness, a remote claude without a bridge | no hint |
-
-A pane addressed by uuid is looked up by its handle through one `list-panes`, since an agent row
-has no uuid.
-
-The MCP server's instructions gain one static sentence: to message an agent on another machine or
-of another harness, call `zellij_overview scope=fleet` first and follow its `how_to_message`. The
-instructions stay static, so a client's prompt cache holds.
-
-`src/mcp/mod.rs` (`input_hint`, `agent_hint`, `looks_like_uuid`, `INSTRUCTIONS`). Tests: each
-row of the table, a local and a remote target, and the uuid shape. MCP-side only; no contract
+`src/mcp/mod.rs` (`input_hint`, `agent_hint`, `looks_like_uuid`). Tests: an agent with and
+without `message_to`, a local and a remote target, and the uuid shape. MCP-side only; no contract
 change.
+
+### Agent messages wait until the agent is idle and nobody is typing
+
+```
+zellij_send {"to": "boxa/develop", "text": "The build is green; go ahead."}
+  # ssh boxa: zellij action send-message --to develop --all-sessions --from here/main/brisk-heron ...
+{"id": "m3k9x2q", "status": "queued", "reason": "draft", "pane_id": "terminal_3",
+ "handle": "sunny-otter", "session": "work", "agent": "claude", "from": "here/main/brisk-heron",
+ "queued_at": 1795120865694, "expires_at": 1795122665694}
+```
+
+Typing a message into another agent's pane (`zellij_write_input submit`) pasted it into whatever
+was in that prompt. A person halfway through a sentence there had the message and their sentence
+sent as one prompt. The session that owns the pane now owns delivery: it types a message in only
+when that cannot mix with a person's typing, and otherwise holds it.
+
+**`zellij action send-message --to <target> [--reply-to <id>] -- <text>`** (`-` reads stdin).
+
+- **The target** is one word matched against `list-agents`: a pane handle or pane id, a tab name,
+  an agent name, or the name of the agent's project directory, compared without case.
+  `session/word` keeps the search to one session; `--all-sessions` searches every session on the
+  machine. A handle or id wins outright. Otherwise exactly one agent must answer: none or several
+  is a miss, exit 2, with the candidates on stderr. A pane with no agent is refused: type into it
+  with `zellij_write_input`.
+- **The guard** runs on the server, and the message goes in only when all three hold:
+
+  | check | default | why |
+  |---|---|---|
+  | the agent's `OSC 7501` state is `idle`, `done` or `error` | - | its turn is over; `error` reads as idle, as `wait --for agent-idle` reads it |
+  | no unsent text in its prompt | - | the original failure |
+  | no key reached the pane lately | 5 s | outlasts the pauses of a person typing; a draft holds a message however old it is, so this only covers the moment around a key |
+
+  `working` holds (`reason: working`), `blocked` holds (`blocked`: a permission or question
+  prompt is open and an Enter would answer it). A claude or pi that has not reported yet holds
+  (`starting`). An agent that reports no state - opencode, codex without the hooks `zellij setup
+  --agent-hooks` prints - is refused (`no_state`): nothing says when it is idle.
+- **The draft** is read from the bytes that reach the pane, the same ones that set
+  `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
+  Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc
+  on an idle agent, an Alt chord) makes the draft unknown, which holds until the agent next
+  reports `working`. Enter on text holds for up to 10 s until the agent says it took the line.
+  Both keyboard encodings are read, legacy and the kitty protocol.
+- **Atomic.** The check, the paste and the Enter are one step on the screen thread, where every
+  key a client sends is also handled. The paste goes out as one write, and the Enter 150 ms later
+  as a write the pty writer holds back; any write to that pane queued after it - a key pressed
+  meanwhile - waits behind the Enter. Other panes are not held.
+- **Held messages** are kept by the receiving session, one JSON file each under
+  `$XDG_STATE_HOME/zellij/messages/<session>/`, so they survive a restart of its server. The server
+  tries them once a second, in order, one per pane per round; a message just delivered counts as
+  the agent's turn until it reports one. A held message expires after `--expire-s` (1800 by
+  default); `0` means deliver now or refuse. A pane is found again by its handle, so a restored
+  pane gets its messages. The last 100 settled messages are kept for a week, for `--reply-to`.
+- **The envelope**, one line above the text, marked as another agent's:
+
+  ```text
+  [message m3k9x2q from agent builder at boxa/work/brisk-heron; not from the person; reply with zellij_send reply_to=m3k9x2q]
+  ```
+
+  Control characters other than newline and tab are stripped from the text, so it cannot end the
+  paste or press a key.
+- **The answer** is one record (`--json`, or a line): `delivered`, `queued` with a `reason`,
+  `refused`, or `expired`. Exit 0 for delivered and queued, 2 otherwise. `--wait <s>` blocks until
+  a held message goes in. **`zellij action message-status [<id>]`** prints the held records, then
+  the settled ones. `--reply-to <id>` alone looks up that message's sender in this session and
+  sends there; a sender on another machine is refused with the command to run (the MCP tool
+  routes it).
+- **The listings** show held messages: `list-panes --json` rows gain `queued_messages`, and
+  `list-agents --json` rows gain `queued`, each only when there are some. The pane frame shows
+  nothing: the frame is drawn from state the screen does not push for this, and the listing is
+  where a supervisor looks.
+
+**`zellij_send`** is the seventh MCP tool: `to`, `text`, `reply_to`, `expire_s`, `wait_s` and
+`session`. `to` may start with a host or its `remote_hosts` alias - `boxa/develop`,
+`boxa/work/develop` - and the tool runs `send-message` on that machine over ssh, so the message is
+held there. With no session named, every session there is searched. The sender is this server's own
+pane (`host/session/handle` and the agent's name). `reply_to` alone looks the message up in this
+session and routes the reply to its sender's host. A machine whose zellij has no `send-message`
+is refused (`reason: remote_too_old`) rather than typed into: the unguarded paste is the failure
+this exists to stop. The server instructions and `how_to_message` name `zellij_send` as the way to
+message an agent; `message_to` stays in the listing as the harness's own route.
+
+Contract: two `Action` messages, `SendMessageAction` (tag 900) and `MessageStatusAction` (tag 901),
+in a new fork block from 900, clear of upstream's numbering and the 160+ block. A stock client
+cannot send them; a fork client against a stock server of the same contract gets nothing for these
+two actions. No plugin-API change. Capability: `agent-send-message`.
+
+Limits:
+
+- The draft is an estimate from bytes. Text that reaches the prompt without a key - a harness
+  restoring a draft on its own, a paste into the host terminal that bypasses zellij - is not seen.
+- A program that forges an `OSC 7501` `idle` over a dialog can let a message's Enter answer it.
+- A held message names its pane by handle; a session renamed while messages are held leaves them
+  in the old name's directory.
+- An agent that never reports again (a codex whose hooks were removed) keeps a held message until
+  it expires.
+
+Files: `zellij-utils/src/agent_mail.rs` (record, envelope, guard, address),
+`input/actions.rs`, `cli.rs`, `cli_surface.rs`, `capabilities.rs`, `data.rs`
+(`queued_messages`), `client_server_contract/common_types.proto`, `ipc/protobuf_conversion.rs`;
+`zellij-server/src/agent_mail.rs` (`Draft`, `Mailbox`), `pty_writer.rs` (`WriteNotBefore`),
+`program_status.rs`, `panes/grid.rs`, `panes/terminal_pane.rs`, `tab/mod.rs` (`AgentPrompt`),
+`screen.rs` (send, drain, ticker), `route.rs`; `zellij-client/src/agent_send.rs`,
+`cli_client.rs`; `src/commands.rs`; `src/mcp/send.rs`, `mod.rs`, `tools.rs`, `fleet.rs`,
+`invoke.rs`. Tests: the guard table, the envelope and text cleaning, the draft on every key class,
+the mailbox's save, restore, expiry and pruning, the pty writer's held write, target resolution
+(names, tabs, projects, ambiguity, sessions, a shell pane), the MCP route, sender, command line
+and old-build detection, and on the screen: delivery to an idle agent, a key after it, a draft
+held and left alone then delivered after its turn, a cleared draft, the quiet window, and the
+working, blocked, shell and no-wait cases.
 
 ## Assessed and deliberately not built
 

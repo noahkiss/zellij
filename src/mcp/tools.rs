@@ -1,4 +1,4 @@
-//! The six tools, and the half of each one that is generated rather than written.
+//! The seven tools, and the half of each one that is generated rather than written.
 //!
 //! A tool's description is routing logic: it decides whether the tool is called at all, so the
 //! part that says what the tool is FOR is written by hand and kept blunt. The part that says what
@@ -7,7 +7,7 @@
 //! real CLI flag. A flag renamed in `cli.rs` therefore cannot leave a stale description behind:
 //! `every_parameter_names_a_real_argument` fails the build instead.
 //!
-//! Six, not one per verb. `zellij action` has eighty-seven of those, and a surface nobody can
+//! Seven, not one per verb. `zellij action` has eighty-seven of those, and a surface nobody can
 //! route through is worse than a small one that names its own follow-ups.
 
 use std::borrow::Cow;
@@ -333,8 +333,9 @@ pub const TOOLS: &[ToolSpec] = &[
         tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
                text is written literally and presses nothing. Pass one of keys or text. This \
                is the cheap way to do more work in a pane you already made: reach for it before \
-               zellij_create. Prefer your harness's messaging tool for a named agent. \
-               Successful input to a named agent adds a messaging hint. To send pane input, pass text with \
+               zellij_create. To message a coding agent, use zellij_send: it waits until the \
+               agent is idle and nobody is typing there. Successful input to an agent adds that \
+               hint. To send pane input, pass text with \
                submit=true: the text goes in as one bracketed paste, so its newlines do not send \
                it early, and then Enter sends it. Follow with zellij_wait_for until=agent_idle.",
         params: &[
@@ -376,6 +377,81 @@ pub const TOOLS: &[ToolSpec] = &[
                 from: None,
                 describe: "With text: paste it as one bracketed paste, then press Enter. How to \
                            send a message to a coding agent, or several lines to a shell at once.",
+                default: None,
+            },
+        ],
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+    },
+    ToolSpec {
+        name: "zellij_send",
+        summary: "Send a message to a coding agent in another pane, on this machine or another, \
+                  typed in only when that agent is idle and nobody is typing there.",
+        best_for: "telling another agent something - a request, an answer, a hand-off - by host, \
+                   tab, handle, agent name or project. `develop on boxa` is to=boxa/develop.",
+        not_for: "a pane that runs no coding agent - type into that with zellij_write_input - and \
+                  not for keys or a command line.",
+        follow_up: Some(
+            "zellij_wait_for until=agent_idle on the receiver once it says delivered, or \
+             wait_s to block until a held message goes in",
+        ),
+        reports: &["action send-message"],
+        tips: "The receiving session types the message in as one paste and an Enter only when the \
+               agent reported idle, done or error, no unsent text is in its prompt, and no key \
+               reached the pane in the last 5 seconds. Otherwise it holds the message and tries \
+               again each second: status queued, with reason working, blocked, draft, typing or \
+               starting. A held message survives a restart of that session and expires after \
+               expire_s. Refused means not sent: not_agent, no_state, or a target that named no \
+               agent or several, with the candidates listed. The receiver reads one line above \
+               your text that names you and the message id; it answers with reply_to=<id>. A \
+               machine whose zellij has no send-message is refused, not typed into.",
+        params: &[
+            SESSION,
+            ParamSpec {
+                name: "to",
+                kind: ParamKind::Str,
+                required: false,
+                from: Some(("action send-message", "--to")),
+                describe: "Who gets it: a pane handle, a tab name, an agent name or a project \
+                           directory name, optionally after host/ and session/: boxa/develop, \
+                           boxa/work/develop. With no session, every session on that machine \
+                           is searched; exactly one agent must match. Required unless reply_to.",
+                default: None,
+            },
+            ParamSpec {
+                name: "text",
+                kind: ParamKind::Str,
+                required: true,
+                from: Some(("action send-message", "text")),
+                describe: "The message. Newlines are kept; it is sent as one paste.",
+                default: None,
+            },
+            ParamSpec {
+                name: "reply_to",
+                kind: ParamKind::Str,
+                required: false,
+                from: Some(("action send-message", "--reply-to")),
+                describe: "The id of a message you received, from its first line. Without `to`, \
+                           the reply goes to that message's sender, wherever it is.",
+                default: None,
+            },
+            ParamSpec {
+                name: "expire_s",
+                kind: ParamKind::Int,
+                required: false,
+                from: Some(("action send-message", "--expire-s")),
+                describe: "How long a held message waits before it expires. 0 means deliver now \
+                           or not at all.",
+                default: Some("1800"),
+            },
+            ParamSpec {
+                name: "wait_s",
+                kind: ParamKind::Int,
+                required: false,
+                from: Some(("action send-message", "--wait")),
+                describe: "Block until a held message is delivered, for at most this many \
+                           seconds. Keep it under your client's own request deadline.",
                 default: None,
             },
         ],
@@ -554,9 +630,9 @@ pub fn tool_list() -> Vec<Tool> {
     TOOLS.iter().map(describe).collect()
 }
 
-/// The shape of every tool's `structuredContent`, which is the same for all six.
+/// The shape of every tool's `structuredContent`, which is the same for all seven.
 ///
-/// One schema rather than six, because every tool is the same child process reported the same
+/// One schema rather than seven, because every tool is the same child process reported the same
 /// way: how the CLI exited, what it printed - parsed when it printed JSON, carried as lines when
 /// it did not - and, on a failure, whether it was a miss or an error. The per-tool part is the
 /// `result` payload, whose shape the `Returns:` line already describes in the words the surface
@@ -1027,7 +1103,7 @@ mod tests {
     #[test]
     fn the_surface_stays_small_and_the_names_do_not_collide() {
         assert!(
-            TOOLS.len() <= 6,
+            TOOLS.len() <= 7,
             "the point of this server is a surface an agent can route through"
         );
         let mut names: Vec<&str> = TOOLS.iter().map(|tool| tool.name).collect();

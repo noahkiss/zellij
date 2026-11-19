@@ -18357,3 +18357,225 @@ pub fn a_new_tab_keeps_the_pane_the_plugin_thread_named() {
     assert_eq!(result.affected_pane_id, Some(PaneId::Plugin(8)));
     assert_eq!(result.affected_tab_id, Some(1));
 }
+
+// fork addition: `send-message`'s guard and write, on a screen with a fake claude in pane 1.
+
+type PtyWriterReceiver = Receiver<(PtyWriteInstruction, ErrorContext)>;
+
+fn screen_with_claude(quiet_ms: u64) -> (Screen, PtyWriterReceiver) {
+    let mut screen = create_new_screen(
+        Size {
+            cols: 121,
+            rows: 20,
+        },
+        true,
+        true,
+    );
+    let (to_pty_writer, pty_writer_receiver): ChannelWithContext<PtyWriteInstruction> =
+        channels::unbounded();
+    screen.bus.senders.to_pty_writer = Some(SenderWithContext::new(to_pty_writer));
+    new_tab(&mut screen, 1, 0);
+    screen.pane_process_info.insert(
+        1,
+        crate::pty::PaneProcessInfo {
+            pid: Some(4242),
+            cwd: Some(PathBuf::from("/src/app")),
+            command: Some(vec!["claude".to_owned()]),
+            agent_env: Default::default(),
+            agent_name: None,
+            agent_session_source: None,
+            osc_agent_session: None,
+        },
+    );
+    screen.agent_mail_quiet_ms = quiet_ms;
+    (screen, pty_writer_receiver)
+}
+
+fn agent_reports(screen: &mut Screen, state: &str) {
+    let report = format!("\x1b]7501;state={}:app=claude-code\x07", state);
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .handle_pty_bytes(1, report.into_bytes())
+        .unwrap();
+}
+
+fn person_types(screen: &mut Screen, bytes: &[u8]) {
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .write_to_pane_id(
+            &None,
+            bytes.to_vec(),
+            false,
+            PaneId::Terminal(1),
+            Some(1),
+            None,
+        )
+        .unwrap();
+}
+
+fn send(screen: &mut Screen, text: &str) -> zellij_utils::agent_mail::MessageRecord {
+    screen.send_agent_message(
+        1,
+        text.to_owned(),
+        "boxa/work/brisk-heron".to_owned(),
+        Some("builder".to_owned()),
+        None,
+        60,
+    )
+}
+
+/// What reached the pty writer for pane 1, in order: `w:` for a write, `at:` for one held to
+/// an instant.
+fn pty_writes(receiver: &PtyWriterReceiver) -> Vec<String> {
+    receiver
+        .try_iter()
+        .filter_map(|(instruction, _)| match instruction {
+            PtyWriteInstruction::Write(bytes, 1, _) => {
+                Some(format!("w:{}", String::from_utf8_lossy(&bytes)))
+            },
+            PtyWriteInstruction::WriteNotBefore(bytes, 1, _) => {
+                Some(format!("at:{}", String::from_utf8_lossy(&bytes)))
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_message_to_an_idle_agent_goes_in_as_one_paste_and_a_held_enter() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Delivered, "{record:?}");
+    assert_eq!(record.agent.as_deref(), Some("claude"));
+    let sent = pty_writes(&writes);
+    assert_eq!(
+        sent,
+        vec![
+            format!(
+                "w:\x1b[200~[message {} from agent builder at boxa/work/brisk-heron; not from \
+                 the person; reply with zellij_send reply_to={}]\nRun the tests.\x1b[201~",
+                record.id, record.id
+            ),
+            "at:\r".to_owned(),
+        ]
+    );
+    // the agent's `idle` is from before the message: the next one waits for its turn
+    let second = send(&mut screen, "And then the lint.");
+    assert_eq!(second.status, Status::Queued);
+    assert_eq!(
+        second.reason,
+        Some(zellij_utils::agent_mail::Reason::Working)
+    );
+    // a key pressed right after queues behind the Enter, in the one channel the writer drains in
+    // order (see pty_writer's held-write test for the hold itself)
+    person_types(&mut screen, b"x");
+    assert_eq!(pty_writes(&writes), vec!["w:x".to_owned()]);
+}
+
+#[test]
+fn a_message_against_a_persons_draft_is_held_and_the_draft_left_alone() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    // the original bug: a message typed into a prompt that held half a sentence went out with it
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "done");
+    person_types(&mut screen, b"half a tho");
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(record.reason, Some(Reason::Draft));
+    assert_eq!(pty_writes(&writes), vec!["w:half a tho".to_owned()]);
+    assert_eq!(
+        screen.collect_pane_list(false).unwrap()[0].queued_messages,
+        1
+    );
+
+    // still held on the next round, while the draft stays
+    screen.drain_agent_messages();
+    assert!(pty_writes(&writes).is_empty());
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Queued
+    );
+
+    // the person submits it; the agent works on it, then finishes
+    person_types(&mut screen, b"\r");
+    agent_reports(&mut screen, "working");
+    screen.drain_agent_messages();
+    assert_eq!(pty_writes(&writes), vec!["w:\r".to_owned()]);
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.reason,
+        Some(Reason::Working)
+    );
+    agent_reports(&mut screen, "done");
+    screen.drain_agent_messages();
+    let sent = pty_writes(&writes);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        sent[0].starts_with("w:\x1b[200~[message ") && sent[0].ends_with("Run the tests.\x1b[201~")
+    );
+    assert_eq!(sent[1], "at:\r");
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+    assert_eq!(
+        screen.collect_pane_list(false).unwrap()[0].queued_messages,
+        0
+    );
+}
+
+#[test]
+fn a_cleared_draft_lets_a_held_message_in() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    person_types(&mut screen, b"nev");
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(pty_writes(&writes), vec!["w:nev".to_owned()]);
+    person_types(&mut screen, b"\x7f\x7f\x7f");
+    screen.drain_agent_messages();
+    let sent = pty_writes(&writes);
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[0], "w:\x7f\x7f\x7f");
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+}
+
+#[test]
+fn a_key_just_before_the_send_holds_it_for_the_quiet_window() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    let (mut screen, writes) = screen_with_claude(zellij_utils::agent_mail::QUIET_MS);
+    agent_reports(&mut screen, "idle");
+    // a key that changes nothing in the prompt: the cursor moves
+    person_types(&mut screen, b"\x1b[D");
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(record.reason, Some(Reason::Typing));
+    assert_eq!(pty_writes(&writes), vec!["w:\x1b[D".to_owned()]);
+}
+
+#[test]
+fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    assert_eq!(send(&mut screen, "a").reason, Some(Reason::Working));
+    agent_reports(&mut screen, "blocked");
+    assert_eq!(send(&mut screen, "b").reason, Some(Reason::Blocked));
+    // expire_s 0: deliver now or not at all
+    let now_only = screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, 0);
+    assert_eq!(now_only.status, Status::Refused);
+    assert_eq!(now_only.reason, Some(Reason::Blocked));
+    assert!(pty_writes(&writes).is_empty());
+    // the same pane without an agent in it
+    screen.pane_process_info.clear();
+    let shell = send(&mut screen, "d");
+    assert_eq!(shell.status, Status::Refused);
+    assert_eq!(shell.reason, Some(Reason::NotAgent));
+}
