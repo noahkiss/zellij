@@ -7801,11 +7801,16 @@ impl Tab {
         self.tiled_panes
             .add_pane_to_stack_of_pane_id(pane_id, pane, root_pane_id);
         self.set_should_clear_display_before_rendering();
-        // Move hidden stack-list members before reapplying visible frames.
-        self.sync_stacked_pane_list_mode();
+        // before a stack list hides every member but the expanded one: after it, the new pane
+        // is no longer in a stack to expand, and a focus left on a hidden member stays there
         if should_focus {
             self.tiled_panes.expand_pane_in_stack(pane_id);
+        } else {
+            self.tiled_panes
+                .keep_focused_pane_expanded_in_stack_of(pane_id);
         }
+        // Move hidden stack-list members before reapplying visible frames.
+        self.sync_stacked_pane_list_mode();
         self.tiled_panes.reapply_pane_frames();
         self.swap_layouts.set_is_tiled_damaged();
         Ok(())
@@ -7823,6 +7828,11 @@ impl Tab {
         self.dissolve_stack_lists_for_classic_mutation();
         self.tiled_panes
             .add_pane_to_stack_of_active_pane(pane_id, pane, client_id);
+        // before a stack list hides every member but the expanded one
+        if !should_focus {
+            self.tiled_panes
+                .keep_focused_pane_expanded_in_stack_of(pane_id);
+        }
         // Move hidden stack-list members before reapplying visible frames.
         self.sync_stacked_pane_list_mode();
         if should_focus {

@@ -1013,6 +1013,43 @@ impl TiledPanes {
         self.set_force_render();
         self.reapply_pane_frames();
     }
+    /// After `pane_id` joined a stack without taking focus, expand the pane a client is focused
+    /// on in that stack, if there is one.
+    ///
+    /// Joining a stack expands the newcomer and collapses the pane that was expanded. When a client
+    /// is focused on that pane, it stays the active pane while collapsed to its title line: it is
+    /// hidden, still highlighted, and a click on it does nothing because it is already active. A
+    /// stack list then takes it out of the grid altogether.
+    ///
+    /// So the focused pane is expanded again and the newcomer waits collapsed. With no client
+    /// focused in the stack, the newcomer stays expanded. Focus is not changed either way. Call
+    /// this before the stack list is synced, while the stack is still in the grid.
+    pub fn keep_focused_pane_expanded_in_stack_of(&mut self, pane_id: PaneId) {
+        let Some(stack_id) = self
+            .panes
+            .get(&pane_id)
+            .and_then(|p| p.current_geom().stacked)
+        else {
+            return;
+        };
+        let pane_ids_in_stack =
+            StackedPanes::new_from_btreemap(&mut self.panes, &self.panes_to_hide)
+                .pane_ids_in_stack(stack_id);
+        let mut connected_clients: Vec<ClientId> =
+            self.connected_clients.borrow().iter().copied().collect();
+        connected_clients.sort_unstable();
+        let focused_in_stack = connected_clients.iter().find_map(|client_id| {
+            self.active_panes
+                .get(client_id)
+                .copied()
+                .filter(|focused| *focused != pane_id && pane_ids_in_stack.contains(focused))
+        });
+        if let Some(focused) = focused_in_stack {
+            let _ = StackedPanes::new_from_btreemap(&mut self.panes, &self.panes_to_hide)
+                .expand_pane(&focused);
+            self.set_force_render();
+        }
+    }
     pub fn expand_pane_in_stack(&mut self, pane_id: PaneId) -> Vec<PaneId> {
         // returns all pane ids in stack
         match StackedPanes::new_from_btreemap(&mut self.panes, &self.panes_to_hide)

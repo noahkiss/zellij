@@ -8528,6 +8528,37 @@ named after its command.
 (`create_kind_allowed`, the `tab` arm of `argv_in`). Tests: the tab's name on the command line, a
 name that starts with a dash, and the refusals. CLI-side only; no contract change.
 
+### A pane stacked in the background leaves the focused pane expanded
+
+```
+# the person is focused on terminal_0; an agent in terminal_0's stack runs
+ZELLIJ_PANE_ID=0 zellij action new-pane --near-current-pane --stacked
+# before: terminal_1 expanded, terminal_0 collapsed (hidden in a stack list) and still focused
+# after:  terminal_0 expanded and focused, terminal_1 waits collapsed
+```
+
+A pane that joins a stack always took the expanded slot. When it joined without focus - an
+anchored `--near-current-pane` stack, or `--stacked --no-focus` - the pane the person was focused
+on collapsed but stayed the active pane. With stack lists (`stacked_pane_list`, on by default) it
+was hidden outright. The active-pane highlight sat on a pane nobody could see, and a click on it did
+nothing, because the server held it as active already.
+
+The rule now: a pane stacked without focus does not take the expanded slot from a pane a client is
+focused on. That pane stays expanded and focused, and the new pane waits collapsed behind it. In a
+stack nobody is focused in, the new pane expands as before. The fix runs before the stack list is
+synced, which also fixes an anchored stack WITH focus: there the client's focus used to stay on the
+member the list had just hidden.
+
+`zellij-server/src/panes/tiled_panes/mod.rs` (`keep_focused_pane_expanded_in_stack_of`) and
+`zellij-server/src/tab/mod.rs` (`add_stacked_pane_to_pane_id`, `add_stacked_pane_to_active_pane`).
+Tests in `tab_tests.rs`, each with and without stack lists: the anchored and the active-pane route
+keep the focused pane shown, a stack nobody is focused in shows the new pane, and a focused stack
+create takes both focus and the expanded slot. No contract change.
+
+Not changed: a tiled `new-pane --no-focus` in a tab with no room left joins a stack through
+`expand_pane_in_stack`, which moves every client focused in that stack to the new pane. Focus and
+expansion agree there, but the focus moves.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

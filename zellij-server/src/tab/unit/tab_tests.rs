@@ -18244,6 +18244,116 @@ fn a_pane_that_still_holds_still_names_its_command() {
     );
 }
 
+// fork addition: a pane stacked without focus - an agent's `new-pane --stacked --near-current-pane`
+// - collapsed the pane the person was focused on and left it active: hidden, highlighted, and deaf
+// to a click. The focused pane stays expanded, and the newcomer waits collapsed behind it. Each
+// test runs with classic in-grid stacks and with stack lists (`stacked_pane_list`, the default),
+// where only the expanded member stays in the grid.
+
+/// Whether a stack member is the one on screen: in the grid, and not collapsed to a title line.
+fn stack_member_is_shown(tab: &Tab, pid: u32) -> bool {
+    tab.tiled_panes
+        .panes
+        .get(&PaneId::Terminal(pid))
+        .map(|pane| !pane.position_and_size().rows.is_fixed())
+        .unwrap_or(false)
+}
+
+fn tab_for_stack_test(stack_list: bool) -> Tab {
+    let tab = create_new_tab(Size { cols: 80, rows: 24 }, true);
+    *tab.stacked_pane_list.borrow_mut() = stack_list;
+    tab
+}
+
+#[test]
+fn a_pane_stacked_without_focus_does_not_collapse_the_focused_pane() {
+    for stack_list in [false, true] {
+        // the anchored route (`--near-current-pane`) and the client's own active pane
+        for anchored in [true, false] {
+            let mut tab = tab_for_stack_test(stack_list);
+            assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Terminal(1)));
+            tab.new_stacked_pane(
+                PaneId::Terminal(2),
+                None,
+                None,
+                false,
+                false,
+                anchored.then_some(PaneId::Terminal(1)),
+                (!anchored).then_some(1),
+                None,
+                None,
+            )
+            .unwrap();
+            let case = format!("stack_list: {stack_list}, anchored: {anchored}");
+            assert_eq!(
+                tab.get_active_pane_id(1),
+                Some(PaneId::Terminal(1)),
+                "focus stays where it was ({case})"
+            );
+            assert!(
+                stack_member_is_shown(&tab, 1),
+                "the focused pane stays shown ({case})"
+            );
+            assert!(
+                !stack_member_is_shown(&tab, 2),
+                "the new pane waits behind it ({case})"
+            );
+            assert!(tab.get_all_pane_ids().contains(&PaneId::Terminal(2)));
+        }
+    }
+}
+
+#[test]
+fn a_pane_stacked_without_focus_expands_in_a_stack_nobody_is_focused_in() {
+    for stack_list in [false, true] {
+        let mut tab = tab_for_stack_test(stack_list);
+        tab.vertical_split(PaneId::Terminal(3), None, 1, None, None)
+            .unwrap();
+        assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Terminal(3)));
+        tab.new_stacked_pane(
+            PaneId::Terminal(2),
+            None,
+            None,
+            false,
+            false,
+            Some(PaneId::Terminal(1)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Terminal(3)));
+        assert!(stack_member_is_shown(&tab, 2), "stack_list: {stack_list}");
+        assert!(!stack_member_is_shown(&tab, 1), "stack_list: {stack_list}");
+    }
+}
+
+#[test]
+fn a_pane_stacked_with_focus_takes_the_focus_and_the_expansion() {
+    for stack_list in [false, true] {
+        let mut tab = tab_for_stack_test(stack_list);
+        tab.new_stacked_pane(
+            PaneId::Terminal(2),
+            None,
+            None,
+            false,
+            true,
+            Some(PaneId::Terminal(1)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            tab.get_active_pane_id(1),
+            Some(PaneId::Terminal(2)),
+            "stack_list: {stack_list}"
+        );
+        assert!(stack_member_is_shown(&tab, 2), "stack_list: {stack_list}");
+        assert!(!stack_member_is_shown(&tab, 1), "stack_list: {stack_list}");
+    }
+}
+
 #[test]
 fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
     for explicit_target in [true, false] {
@@ -18268,10 +18378,12 @@ fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
                 None,
             )
             .unwrap();
-            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(2)).unwrap();
+            // a pane stacked without focus waits collapsed behind the focused one
+            let (front, back) = if should_focus { (2, 1) } else { (1, 2) };
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(front)).unwrap();
             let expected = (expanded.get_content_rows(), expanded.get_content_columns());
             assert_eq!(expected, (21, 78));
-            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
             assert_eq!(collapsed.rows(), 1);
             assert_eq!(
                 (
@@ -18295,7 +18407,7 @@ fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
                 rows: 30,
             })
             .unwrap();
-            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(2)).unwrap();
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(front)).unwrap();
             let expected = (expanded.get_content_rows(), expanded.get_content_columns());
             assert_eq!(expected, (27, 98));
             let writes = drain_pty_writer(&rx);
@@ -18311,7 +18423,7 @@ fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
                     .last();
                 assert_eq!(last_size, Some(expected));
             }
-            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
             assert_eq!(
                 (
                     collapsed.get_terminal_rows(),
@@ -18320,12 +18432,12 @@ fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
                 expected
             );
             assert_eq!(collapsed.rows(), 1);
-            tab.handle_pty_bytes(1, format!("\x1b[{};1Hlast row", expected.0).into_bytes())
+            tab.handle_pty_bytes(back, format!("\x1b[{};1Hlast row", expected.0).into_bytes())
                 .unwrap();
-            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            let collapsed = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
             assert!(collapsed.dump_screen(false, None).contains("last row"));
-            tab.tiled_panes.expand_pane_in_stack(PaneId::Terminal(1));
-            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+            tab.tiled_panes.expand_pane_in_stack(PaneId::Terminal(back));
+            let expanded = tab.tiled_panes.panes.get(&PaneId::Terminal(back)).unwrap();
             assert_eq!(
                 (
                     expanded.get_terminal_rows(),
