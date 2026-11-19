@@ -73,7 +73,9 @@ The agents prompt and zellij://agents resource return the same live list.
 Sessions on other machines: write `session` as `host/session` - `boxa/work` - and every tool acts
 on that session over ssh, the same as on a local one. Only hosts listed in remote_hosts in
 config.kdl are reachable. zellij_overview with scope=fleet lists the coding agents in every
-session on every listed host, one row per agent, with its host and session.";
+session on every listed host, one row per agent, with its host and session.
+To message an agent on another machine or of another harness, call zellij_overview scope=fleet
+first and follow its how_to_message.";
 
 /// The server itself. It holds nothing: every answer comes from a child process.
 #[derive(Clone, Debug, Default)]
@@ -266,20 +268,29 @@ impl ZellijMcp {
                     self.ambient_session.as_deref()
                 }
             });
-        let mut argv = Vec::new();
-        if let Some(session) = session {
-            argv.extend(["-s".to_owned(), session.to_owned()]);
+        let ask = |verb: &str| {
+            let mut argv = Vec::new();
+            if let Some(session) = session {
+                argv.extend(["-s".to_owned(), session.to_owned()]);
+            }
+            argv.extend(["action".to_owned(), verb.to_owned(), "--json".to_owned()]);
+            argv
+        };
+        let answer = |argv: Vec<String>| async move {
+            let outcome = invoke::run_on(target, &argv).await.ok()?;
+            (!outcome.is_error()).then_some(outcome.stdout)
+        };
+        let agents = answer(ask("list-agents")).await?;
+        let mut pane = pane.to_owned();
+        // an agent row has no uuid: a pane named by one is looked up by its handle
+        if terminal_pane_row(&agents, &pane).is_none() && looks_like_uuid(&pane) {
+            let panes = answer(ask("list-panes")).await?;
+            pane = terminal_pane_row(&panes, &pane)?
+                .get("handle")?
+                .as_str()?
+                .to_owned();
         }
-        argv.extend([
-            "action".to_owned(),
-            "list-panes".to_owned(),
-            "--json".to_owned(),
-        ]);
-        let outcome = invoke::run_on(target, &argv).await.ok()?;
-        if outcome.is_error() {
-            return None;
-        }
-        named_agent_hint(&outcome.stdout, pane)
+        agent_hint(&agents, &pane, target.is_remote())
     }
 
     async fn live_agents(&self) -> Result<String, ErrorData> {
@@ -780,18 +791,45 @@ fn terminal_pane_row(panes: &str, pane: &str) -> Option<Value> {
         .cloned()
 }
 
-fn named_agent_hint(panes: &str, pane: &str) -> Option<String> {
-    let row = terminal_pane_row(panes, pane)?;
-    let agent = row.get("agent").unwrap_or(&row);
-    let name = agent.get("name")?.as_str()?;
-    let kind = agent.get("kind")?.as_str()?;
-    if name.is_empty() {
-        return None;
+/// Whether a pane address is a uuid, `8-4-4-4-12` hex digits, rather than a handle or an id.
+fn looks_like_uuid(pane: &str) -> bool {
+    let groups: Vec<&str> = pane.split('-').collect();
+    groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// What `zellij_write_input` adds when the pane it typed into runs an agent a harness can message.
+///
+/// `agents` is the session's `list-agents --json`. A row with `message_to` gets that address, from
+/// any machine. A named claude on this machine takes its name too. Any other agent - another
+/// harness, or a claude elsewhere with no bridge - gets no hint: typing into its pane is the way in.
+fn agent_hint(agents: &str, pane: &str, remote: bool) -> Option<String> {
+    let row = terminal_pane_row(agents, pane)?;
+    let kind = row.get("kind")?.as_str()?;
+    let name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty());
+    let message_to = row
+        .get("message_to")
+        .and_then(Value::as_str)
+        .filter(|to| !to.is_empty());
+    let by_name = !remote && kind == "claude" && name.is_some();
+    let runs = match name {
+        Some(name) => format!("this pane runs {} `{}`", kind, name),
+        None => format!("this pane runs {}", kind),
+    };
+    match (message_to, by_name) {
+        (Some(to), true) => Some(format!(
+            "{}; prefer messaging it by name, or at `{}` from any machine",
+            runs, to
+        )),
+        (Some(to), false) => Some(format!("{}; prefer messaging it at `{}`", runs, to)),
+        (None, true) => Some(format!("{}; prefer messaging it by name", runs)),
+        (None, false) => None,
     }
-    Some(format!(
-        "this pane runs {} `{}`; prefer messaging it by name",
-        kind, name
-    ))
 }
 
 impl ServerHandler for ZellijMcp {
@@ -952,19 +990,47 @@ mod tests {
     #[test]
     fn input_hint_only_names_the_target_agent() {
         let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude","name":"proj-45"},
-            {"handle":"quiet-fox","pane_id":4,"kind":"codex","name":null}]"#;
+            {"handle":"quiet-fox","pane_id":4,"kind":"codex","name":null},
+            {"handle":"named-fox","pane_id":5,"kind":"codex","name":"helper"}]"#;
         let expected = "this pane runs claude `proj-45`; prefer messaging it by name";
         for target in ["sunny-otter", "3", "terminal_3"] {
-            assert_eq!(named_agent_hint(rows, target).as_deref(), Some(expected));
+            assert_eq!(agent_hint(rows, target, false).as_deref(), Some(expected));
         }
-        assert!(named_agent_hint(rows, "quiet-fox").is_none());
-        assert!(named_agent_hint(rows, "missing").is_none());
-        assert!(named_agent_hint("invalid", "3").is_none());
-        let panes = r#"[{"handle":"sunny-otter","id":3,"uuid":"test-uuid","agent":{"kind":"claude","name":"proj-45"}},
-            {"id":3,"is_plugin":true,"agent":{"kind":"claude","name":"wrong"}}]"#;
-        for target in ["test-uuid", "sunny-otter", "3", "terminal_3"] {
-            assert_eq!(named_agent_hint(panes, target).as_deref(), Some(expected));
-        }
+        assert!(agent_hint(rows, "quiet-fox", false).is_none());
+        assert!(agent_hint(rows, "missing", false).is_none());
+        assert!(agent_hint("invalid", "3", false).is_none());
+        // another harness has no harness route, named or not
+        assert!(agent_hint(rows, "named-fox", false).is_none());
+        // a claude on another machine is not reached by its name
+        assert!(agent_hint(rows, "sunny-otter", true).is_none());
+    }
+
+    #[test]
+    fn input_hint_gives_the_message_address_when_the_row_has_one() {
+        let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude","name":"proj-45",
+              "message_to":"bridge:session_01A","message_route":"harness"},
+            {"handle":"calm-owl","pane_id":4,"kind":"claude","name":null,
+              "message_to":"bridge:session_01B","message_route":"harness"},
+            {"handle":"quiet-fox","pane_id":5,"kind":"codex","message_route":"pane"}]"#;
+        assert_eq!(
+            agent_hint(rows, "sunny-otter", false).as_deref(),
+            Some(
+                "this pane runs claude `proj-45`; prefer messaging it by name, or at \
+                 `bridge:session_01A` from any machine"
+            )
+        );
+        assert_eq!(
+            agent_hint(rows, "sunny-otter", true).as_deref(),
+            Some("this pane runs claude `proj-45`; prefer messaging it at `bridge:session_01A`")
+        );
+        assert_eq!(
+            agent_hint(rows, "calm-owl", false).as_deref(),
+            Some("this pane runs claude; prefer messaging it at `bridge:session_01B`")
+        );
+        assert!(agent_hint(rows, "quiet-fox", true).is_none());
+        assert!(looks_like_uuid("0f3c1a2b-aaaa-bbbb-cccc-1234567890ab"));
+        assert!(!looks_like_uuid("sunny-otter"));
+        assert!(!looks_like_uuid("terminal_3"));
     }
 
     #[test]

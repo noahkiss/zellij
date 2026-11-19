@@ -8380,7 +8380,8 @@ After successful `zellij_write_input`, a named target adds this hint:
 this pane runs claude `project-1`; prefer messaging it by name
 ```
 
-The hint never blocks input. Unnamed agents receive no hint.
+The hint never blocks input. Which agents get one, and with which address, is in "The
+`zellij_write_input` hint names the address that reaches the agent".
 
 ### The forwarding panic test follows the build's assertion mode
 
@@ -8841,6 +8842,35 @@ grouped the way a person names an agent: host, then tab (with its session), then
 `src/mcp/mod.rs` (`group_agents`), `src/mcp/tools.rs` (the tip). Tests: the grouping order by
 host, session and tab, every row key kept, the titles, the chat age, local and remote addresses, a
 row with no session, and the fleet merge's text and structure. MCP-side only; no contract change.
+
+### The `zellij_write_input` hint names the address that reaches the agent
+
+```text
+this pane runs claude `project-1`; prefer messaging it by name, or at `bridge:session_01AbC` from any machine
+this pane runs claude `project-1`; prefer messaging it at `bridge:session_01AbC`   # another machine
+```
+
+After a successful `zellij_write_input`, the hint used to tell the caller to message any named
+agent by name: a codex too, and a claude on another machine, where no name reaches it. The hint now
+reads the target's `list-agents --json` row (not `list-panes`), and says only what works:
+
+| target row | hint |
+|---|---|
+| has `message_to`, a named claude on this machine | message it by name, or at `message_to` |
+| has `message_to`, any other | message it at `message_to` |
+| no `message_to`, a named claude on this machine | message it by name (unchanged) |
+| no `message_to`, any other: another harness, a remote claude without a bridge | no hint |
+
+A pane addressed by uuid is looked up by its handle through one `list-panes`, since an agent row
+has no uuid.
+
+The MCP server's instructions gain one static sentence: to message an agent on another machine or
+of another harness, call `zellij_overview scope=fleet` first and follow its `how_to_message`. The
+instructions stay static, so a client's prompt cache holds.
+
+`src/mcp/mod.rs` (`input_hint`, `agent_hint`, `looks_like_uuid`, `INSTRUCTIONS`). Tests: each
+row of the table, a local and a remote target, and the uuid shape. MCP-side only; no contract
+change.
 
 ## Assessed and deliberately not built
 
