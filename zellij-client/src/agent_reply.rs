@@ -315,6 +315,223 @@ pub fn last_reply(kind: &str, transcript: &str) -> LastReply {
     }
 }
 
+/// What `list-agents` reads out of a claude transcript about the chat itself, beside the reply.
+///
+/// claude records, in its transcript, a few facts no screen shows: the Remote Control session it
+/// is connected to (`{"type":"bridge-session","bridgeSessionId":"cse_<X>"}`, repeated through the
+/// file, the last one current) and each answer's token counts (`message.usage`). Both are
+/// undocumented, so every miss is "not known" rather than an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatMeta {
+    /// The address a harness's messaging tool takes for this chat from any machine:
+    /// `bridge:session_<X>`, from the last `bridge-session` record.
+    pub message_to: Option<String>,
+    /// When the chat began, in milliseconds since the epoch: the first record's `timestamp`, or
+    /// the file's birth when the head of the file has none.
+    pub started_at: Option<u64>,
+    /// The prompt the last answer was given, in tokens: input plus cache read plus cache
+    /// creation. The model's context window is not in the transcript, so no percentage is made.
+    pub context_tokens: Option<u64>,
+}
+
+/// How far back from a transcript's end the meta scan reads, at most.
+pub const META_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+/// How much of a transcript's start is read for its first `timestamp`.
+const META_HEAD_BYTES: u64 = 64 * 1024;
+/// One backward read of the meta scan.
+const META_CHUNK_BYTES: u64 = 256 * 1024;
+
+/// The messaging address for a `bridgeSessionId`: `cse_<X>` is `bridge:session_<X>`. Anything
+/// else, or an `<X>` that is not a plain token, is no address.
+pub fn bridge_address(bridge_session_id: &str) -> Option<String> {
+    let rest = bridge_session_id.strip_prefix("cse_")?;
+    let plain = !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+    plain.then(|| format!("bridge:session_{}", rest))
+}
+
+/// The tail facts, filled from the last line backwards: the first value found is the newest.
+#[derive(Debug, Default)]
+struct TailFacts {
+    message_to: Option<String>,
+    bridge_seen: bool,
+    context_tokens: Option<u64>,
+}
+
+impl TailFacts {
+    fn done(&self) -> bool {
+        self.bridge_seen && self.context_tokens.is_some()
+    }
+
+    /// One transcript line, newest first. Lines are matched as text before they are parsed, so a
+    /// tail of tool output costs a substring search per line, not a JSON parse.
+    fn note(&mut self, line: &str) {
+        if !self.bridge_seen && line.contains("\"bridge-session\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                if value.get("type").and_then(Value::as_str) == Some("bridge-session") {
+                    self.bridge_seen = true;
+                    self.message_to = value
+                        .get("bridgeSessionId")
+                        .and_then(Value::as_str)
+                        .and_then(bridge_address);
+                }
+            }
+        }
+        if self.context_tokens.is_none()
+            && line.contains("\"usage\"")
+            && line.contains("\"assistant\"")
+        {
+            if let Ok(value) = serde_json::from_str::<Value>(line) {
+                self.context_tokens = prompt_tokens(&value);
+            }
+        }
+    }
+}
+
+/// The prompt size of one claude assistant line, or `None` for any other line. A subagent's line
+/// is another conversation's, and a line with no tokens at all (a synthetic error message) says
+/// nothing about the context.
+fn prompt_tokens(line: &Value) -> Option<u64> {
+    if line.get("type").and_then(Value::as_str) != Some("assistant")
+        || line.get("isSidechain").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let usage = line.get("message")?.get("usage")?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let total = count("input_tokens")
+        + count("cache_read_input_tokens")
+        + count("cache_creation_input_tokens");
+    (total > 0).then_some(total)
+}
+
+/// The facts in a transcript's text, as the backward scan would find them.
+#[cfg(test)]
+fn tail_facts_of(text: &str) -> TailFacts {
+    let mut facts = TailFacts::default();
+    for line in text.lines().rev() {
+        facts.note(line);
+        if facts.done() {
+            break;
+        }
+    }
+    facts
+}
+
+/// Walk a file's lines from its end backwards, at most `cap` bytes, `chunk` bytes per read, until
+/// `facts` has everything. A line longer than `cap` ends the walk.
+fn scan_backward(path: &Path, cap: u64, chunk: u64, facts: &mut TailFacts) -> std::io::Result<()> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let floor = len.saturating_sub(cap);
+    let mut pos = len;
+    // the start of the line the previous read began inside
+    let mut carry: Vec<u8> = Vec::new();
+    while pos > floor && !facts.done() {
+        let start = pos.saturating_sub(chunk).max(floor);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; (pos - start) as usize];
+        file.read_exact(&mut bytes)?;
+        bytes.extend_from_slice(&carry);
+        let whole_from = if start == 0 {
+            0
+        } else {
+            match bytes.iter().position(|byte| *byte == b'\n') {
+                Some(newline) => newline + 1,
+                None => {
+                    carry = bytes;
+                    pos = start;
+                    continue;
+                },
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes[whole_from..]);
+        for line in text.lines().rev() {
+            facts.note(line);
+            if facts.done() {
+                return Ok(());
+            }
+        }
+        carry = bytes[..whole_from].to_vec();
+        pos = start;
+    }
+    Ok(())
+}
+
+/// The first `timestamp` in the first `META_HEAD_BYTES` of a transcript, in milliseconds.
+fn first_timestamp(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let mut head = Vec::new();
+    file.take(META_HEAD_BYTES).read_to_end(&mut head).ok()?;
+    String::from_utf8_lossy(&head)
+        .lines()
+        .filter(|line| line.contains("\"timestamp\""))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| {
+            let stamp = value.get("timestamp")?.as_str()?;
+            let at = humantime::parse_rfc3339(stamp).ok()?;
+            at.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|since| since.as_millis() as u64)
+        })
+}
+
+/// [`ChatMeta`] of a claude transcript, reading its head and at most `cap` bytes of its tail.
+pub fn chat_meta_with_cap(path: &Path, cap: u64) -> ChatMeta {
+    let mut facts = TailFacts::default();
+    let _ = scan_backward(path, cap, META_CHUNK_BYTES.min(cap.max(1)), &mut facts);
+    let started_at = first_timestamp(path).or_else(|| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.created())
+            .ok()
+            .and_then(|born| born.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| since.as_millis() as u64)
+    });
+    ChatMeta {
+        message_to: facts.message_to,
+        started_at,
+        context_tokens: facts.context_tokens,
+    }
+}
+
+/// [`ChatMeta`] of a claude transcript, bounded by [`META_TAIL_BYTES`].
+pub fn chat_meta(path: &Path) -> ChatMeta {
+    chat_meta_with_cap(path, META_TAIL_BYTES)
+}
+
+/// claude's project directory name for a working directory: every character that is not a letter
+/// or a digit becomes `-`. Tried before the walk of every project directory.
+pub fn claude_project_dir(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The claude transcript of session `id`, looked for first in the directory its `cwd` maps to,
+/// then by [`find_transcript`]'s walk.
+pub fn find_claude_transcript(root: &Path, id: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    let plain = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !id.contains("..");
+    if !plain {
+        return None;
+    }
+    if let Some(cwd) = cwd {
+        let direct = root
+            .join(claude_project_dir(cwd))
+            .join(format!("{}.jsonl", id));
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+    find_transcript("claude", root, id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,5 +675,124 @@ not json at all
         assert!(tail.len() as u64 <= TAIL_BYTES);
         assert!(tail.starts_with('x'));
         assert!(tail.ends_with("{\"last\":true}\n"));
+    }
+
+    const BRIDGE_OLD: &str =
+        r#"{"type":"bridge-session","sessionId":"s","bridgeSessionId":"cse_OLD1"}"#;
+    const BRIDGE_NEW: &str =
+        r#"{"type":"bridge-session","sessionId":"s","bridgeSessionId":"cse_01NewAbc"}"#;
+    const ANSWER: &str = r#"{"type":"assistant","timestamp":"2026-11-19T10:00:05.000Z","message":{"role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":50},"content":[{"type":"text","text":"ok"}]}}"#;
+
+    #[test]
+    fn a_bridge_session_id_becomes_the_address_the_messaging_tool_takes() {
+        assert_eq!(
+            bridge_address("cse_01QoVc8m9ajcz").as_deref(),
+            Some("bridge:session_01QoVc8m9ajcz")
+        );
+        for bad in ["", "cse_", "session_01Q", "cse_a b", "cse_x;rm", "01Q"] {
+            assert_eq!(bridge_address(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn the_last_bridge_record_is_the_current_one_and_a_missing_one_is_no_address() {
+        let text = format!(
+            "{}\n{}\n{}\n{}\n",
+            BRIDGE_OLD, ANSWER, BRIDGE_NEW, r#"{"type":"user","message":{"content":"hi"}}"#
+        );
+        let facts = tail_facts_of(&text);
+        assert_eq!(facts.message_to.as_deref(), Some("bridge:session_01NewAbc"));
+        assert_eq!(facts.context_tokens, Some(1102));
+        let facts = tail_facts_of(&format!("{}\n", ANSWER));
+        assert_eq!(facts.message_to, None);
+        assert_eq!(facts.context_tokens, Some(1102));
+    }
+
+    #[test]
+    fn a_malformed_bridge_record_or_usage_is_not_known_rather_than_an_error() {
+        let text = [
+            r#"{"type":"bridge-session","bridgeSessionId":"cse_GOOD"}"#,
+            // newer, and malformed: it is the current record, and it has no address
+            r#"{"type":"bridge-session","bridgeSessionId":42}"#,
+            r#"{"type":"bridge-session" truncated"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"usage":{"input_tokens":9}}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        let facts = tail_facts_of(&text);
+        assert_eq!(facts.message_to, None);
+        assert!(facts.bridge_seen);
+        assert_eq!(facts.context_tokens, None);
+    }
+
+    #[test]
+    fn chat_meta_reads_the_head_for_its_start_and_the_tail_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let filler = format!(
+            "{{\"type\":\"progress\",\"data\":\"{}\"}}\n",
+            "x".repeat(1000)
+        );
+        let mut text = String::from("{\"type\":\"mode\"}\n");
+        text.push_str(
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-19T10:00:00.250Z\",\"message\":{\"content\":\"hi\"}}\n",
+        );
+        text.push_str(&format!("{}\n", BRIDGE_OLD));
+        text.push_str(&format!("{}\n", ANSWER));
+        text.push_str(&format!("{}\n", BRIDGE_NEW));
+        // far more than one chunk after the records, and a line still being written at the end
+        text.push_str(&filler.repeat(600));
+        text.push_str("{\"type\":\"assist");
+        std::fs::write(&path, &text).unwrap();
+        let meta = chat_meta(&path);
+        assert_eq!(meta.message_to.as_deref(), Some("bridge:session_01NewAbc"));
+        assert_eq!(meta.context_tokens, Some(1102));
+        assert_eq!(meta.started_at, Some(1_795_082_400_250));
+    }
+
+    #[test]
+    fn a_huge_transcript_is_read_only_as_far_back_as_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let filler = format!("{}\n", "y".repeat(1023));
+        let text = format!("{}\n{}\n{}", BRIDGE_NEW, ANSWER, filler.repeat(64));
+        std::fs::write(&path, &text).unwrap();
+        // the records are 64 KiB back: a 16 KiB cap does not reach them
+        let meta = chat_meta_with_cap(&path, 16 * 1024);
+        assert_eq!((meta.message_to, meta.context_tokens), (None, None));
+        let meta = chat_meta_with_cap(&path, 1024 * 1024);
+        assert_eq!(meta.message_to.as_deref(), Some("bridge:session_01NewAbc"));
+        // a single line longer than the cap ends the walk without reading the file whole
+        let long = format!("{}\n{}\n", BRIDGE_NEW, "z".repeat(200 * 1024));
+        std::fs::write(&path, &long).unwrap();
+        assert_eq!(chat_meta_with_cap(&path, 64 * 1024).message_to, None);
+        // a missing file is nothing known
+        assert_eq!(
+            chat_meta(&dir.path().join("gone.jsonl")),
+            ChatMeta::default()
+        );
+    }
+
+    #[test]
+    fn a_claude_transcript_is_found_from_the_cwd_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            claude_project_dir(Path::new("/home/u/.cache/my_app")),
+            "-home-u--cache-my-app"
+        );
+        let id = "0f3c1a2b-aaaa";
+        std::fs::create_dir_all(root.join("-srv-app")).unwrap();
+        std::fs::write(root.join(format!("-srv-app/{}.jsonl", id)), "").unwrap();
+        assert_eq!(
+            find_claude_transcript(root, id, Some(Path::new("/srv/app"))),
+            Some(root.join(format!("-srv-app/{}.jsonl", id)))
+        );
+        // a cwd that maps elsewhere falls back to the walk
+        assert_eq!(
+            find_claude_transcript(root, id, Some(Path::new("/elsewhere"))),
+            Some(root.join(format!("-srv-app/{}.jsonl", id)))
+        );
+        assert_eq!(find_claude_transcript(root, "../x", None), None);
     }
 }

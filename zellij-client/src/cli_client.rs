@@ -1663,9 +1663,94 @@ fn agents_of_sessions(
     (agents, answered)
 }
 
+/// One `list-agents --json` row: the agent, and how a caller reaches it to send it a message.
+///
+/// The keys after the agent's own are read from its transcript on this machine (see
+/// [`crate::agent_reply::ChatMeta`]), so they are a client-side addition like the rest of the row.
+/// They are JSON-only: the table keeps its columns, and `action watch` never sees them.
+#[derive(serde::Serialize)]
+struct AgentRow<'a> {
+    #[serde(flatten)]
+    agent: &'a zellij_utils::data::AgentListEntry,
+    /// The address a harness's messaging tool takes, from any machine: `bridge:session_<X>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_to: Option<String>,
+    /// `harness` when `message_to` is there; `pane` when the way in is typing into the pane.
+    message_route: &'static str,
+    /// When the chat began, in milliseconds since the epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_started_at: Option<u64>,
+    /// The tokens the last answer's prompt took. No percentage: the window is not recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_tokens: Option<u64>,
+}
+
+/// How long `list-agents --json` waits for transcripts, all agents together. A row whose
+/// transcript was not read in time goes out without its chat keys rather than holding the list.
+const CHAT_META_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The rows with their chat keys, the transcripts read on a thread of their own and given at most
+/// `budget`.
+fn agent_rows<'a>(
+    agents: &'a ListAgentsResponse,
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
+    budget: Duration,
+) -> Vec<AgentRow<'a>> {
+    let mut metas: Vec<crate::agent_reply::ChatMeta> = vec![Default::default(); agents.len()];
+    let wanted: Vec<(usize, String, Option<PathBuf>)> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.agent.kind == "claude")
+        .filter_map(|(at, agent)| {
+            let id = agent.agent.agent_id.clone()?;
+            Some((at, id, agent.cwd.clone()))
+        })
+        .collect();
+    let root = crate::agent_reply::transcript_root("claude", var, home);
+    if let (false, Some(root)) = (wanted.is_empty(), root) {
+        let (sender, receiver) = mpsc::channel();
+        // detached: a read that hangs is abandoned with the thread when the list is printed
+        std::thread::spawn(move || {
+            for (at, id, cwd) in wanted {
+                let meta = crate::agent_reply::find_claude_transcript(&root, &id, cwd.as_deref())
+                    .map(|path| crate::agent_reply::chat_meta(&path))
+                    .unwrap_or_default();
+                if sender.send((at, meta)).is_err() {
+                    return;
+                }
+            }
+        });
+        let deadline = Instant::now() + budget;
+        while let Ok((at, meta)) =
+            receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            metas[at] = meta;
+        }
+    }
+    agents
+        .iter()
+        .zip(metas)
+        .map(|(agent, meta)| AgentRow {
+            agent,
+            message_route: if meta.message_to.is_some() {
+                "harness"
+            } else {
+                "pane"
+            },
+            message_to: meta.message_to,
+            chat_started_at: meta.started_at,
+            context_tokens: meta.context_tokens,
+        })
+        .collect()
+}
+
 fn print_agents(agents: &ListAgentsResponse, output_json: bool, with_session: bool) -> i32 {
     if output_json {
-        match serde_json::to_string_pretty(agents) {
+        let var = |name: &str| std::env::var(name).ok();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let rows = agent_rows(agents, &var, home.as_deref(), CHAT_META_BUDGET);
+        match serde_json::to_string_pretty(&rows) {
             Ok(json) => println!("{}", json),
             Err(e) => {
                 eprintln!("Could not write the agent list as JSON: {}", e);
@@ -3488,6 +3573,46 @@ mod tests {
         assert!(why(3).contains("no claude session id"), "{}", why(3));
         assert!(why(4).contains("no transcript"), "{}", why(4));
         assert!(why(9).contains("not running a coding agent"), "{}", why(9));
+    }
+
+    #[test]
+    fn list_agents_rows_carry_the_message_address_from_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let project = home.join(".claude/projects/-src");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("s1.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-19T10:00:00Z\",\"message\":{\"content\":\"hi\"}}\n\
+             {\"type\":\"bridge-session\",\"bridgeSessionId\":\"cse_01Abc\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":10}}}\n",
+        )
+        .unwrap();
+        let agents = vec![
+            agent_row(1, "claude", Some("s1")),
+            agent_row(2, "codex", Some("s2")),
+            agent_row(3, "claude", Some("gone")),
+        ];
+        let none = |_: &str| None;
+        let rows = agent_rows(&agents, &none, Some(home), Duration::from_secs(10));
+        let json: serde_json::Value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["message_to"], "bridge:session_01Abc");
+        assert_eq!(json[0]["message_route"], "harness");
+        assert_eq!(json[0]["chat_started_at"], 1_795_082_400_000u64);
+        assert_eq!(json[0]["context_tokens"], 15);
+        // the agent's own keys are still there, unchanged
+        assert_eq!(json[0]["handle"], "pane-1");
+        assert_eq!(json[0]["kind"], "claude");
+        for row in [&json[1], &json[2]] {
+            assert_eq!(row["message_route"], "pane");
+            assert!(row.get("message_to").is_none());
+            assert!(row.get("context_tokens").is_none());
+        }
+        // no time for the transcripts: every row still goes out, without the chat keys
+        let rows = agent_rows(&agents, &none, Some(home), Duration::ZERO);
+        let json: serde_json::Value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json.as_array().map(Vec::len), Some(3));
+        assert_eq!(json[0]["handle"], "pane-1");
     }
 }
 

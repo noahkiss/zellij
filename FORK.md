@@ -8718,6 +8718,53 @@ bar, and every bar ran its own probe.
 `default-plugins/slim-keybinds/src/vitals.rs` (`ProbeGate`), `default-plugins/slim-keybinds/src/main.rs`.
 Tests in `vitals.rs`. The checked-in `slim-keybinds.wasm` is rebuilt. No contract change.
 
+### `list-agents --json` rows say how to message the agent
+
+```
+zellij action list-agents --json
+[{"handle": "brisk-heron", "kind": "claude", "name": "project-1", "agent_id": "…", ...,
+  "message_to": "bridge:session_01AbC", "message_route": "harness",
+  "chat_started_at": 1795082400000, "context_tokens": 118204},
+ {"handle": "calm-otter", "kind": "codex", ..., "message_route": "pane"}]
+```
+
+A supervisor told "send this to the agent in tab X on boxa" had a pane handle and no way to know
+whether the agent there could take a message from its harness. Four keys are appended to every
+JSON row. No key is renamed or removed, the table keeps its columns, and `action watch` never
+carries them.
+
+- **`message_to`**: the address a harness's messaging tool takes, from any machine. A claude
+  connected to Remote Control writes `{"type":"bridge-session","bridgeSessionId":"cse_<X>"}` into
+  its transcript, repeated through the file. The last one is current, and `cse_<X>` becomes
+  `bridge:session_<X>`. Absent when there is no such record, when the id is not a plain token, and
+  for every other harness: codex, opencode and pi have no bridge.
+- **`message_route`**: `harness` when `message_to` is there. Otherwise `pane`: type into the pane,
+  addressed by host/session and handle.
+- **`chat_started_at`**: milliseconds since the epoch. The first `timestamp` in the transcript's
+  first 64 KiB, or the file's birth time when that has none.
+- **`context_tokens`**: the last answer's prompt size, `input_tokens` + `cache_read_input_tokens` +
+  `cache_creation_input_tokens` from the newest main-chain assistant `usage`. A line with no tokens
+  (a synthetic error message) is skipped. No percentage: the transcript names the model but not its
+  context window, so a percentage would be a guess.
+
+All of it is undocumented harness output, read defensively: a missing, malformed or unreadable
+record is a missing key, never an error. The read is bounded. The transcript is found the way
+`last-reply` finds it, trying the project directory the agent's `cwd` maps to first. Its tail is
+walked backwards in 256 KiB reads, at most 4 MiB, stopping once both records are found. Lines are
+matched as text before any is parsed. All transcripts are read on one thread, given 1.5 seconds
+in total; a row not read by then goes out without its chat keys.
+
+The keys are read on the machine that runs `list-agents`, from that CLI's `CLAUDE_CONFIG_DIR` or
+`~/.claude`. `--all-sessions` and the MCP fleet, where each host runs its own `list-agents` over ssh,
+carry them per host. A host on an older build simply lacks them.
+
+`zellij-client/src/agent_reply.rs` (`ChatMeta`, `chat_meta`, `bridge_address`,
+`find_claude_transcript`), `zellij-client/src/cli_client.rs` (`AgentRow`, `agent_rows`, in
+`print_agents`). Tests: the address, the last of several records, a missing and a malformed record,
+a sidechain and a zero `usage`, the head timestamp, a tail longer than one read, the cap, a line
+longer than the cap, the cwd lookup, and rows with and without time to read. CLI-side only; no
+contract change.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships
