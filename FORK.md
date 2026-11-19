@@ -8723,12 +8723,12 @@ Tests in `vitals.rs`. The checked-in `slim-keybinds.wasm` is rebuilt. No contrac
 zellij action list-agents --json
 [{"handle": "brisk-heron", "kind": "claude", "name": "project-1", "agent_id": "…", ...,
   "message_to": "bridge:session_01AbC", "message_route": "harness",
-  "chat_started_at": 1795082400000, "context_tokens": 118204},
+  "chat_started_at": 1795082400000},
  {"handle": "calm-otter", "kind": "codex", ..., "message_route": "pane"}]
 ```
 
 A supervisor told "send this to the agent in tab X on boxa" had a pane handle and no way to know
-whether the agent there could take a message from its harness. Four keys are appended to every
+whether the agent there could take a message from its harness. Three keys are appended to every
 JSON row. No key is renamed or removed, the table keeps its columns, and `action watch` never
 carries them.
 
@@ -8741,15 +8741,14 @@ carries them.
   addressed by host/session and handle.
 - **`chat_started_at`**: milliseconds since the epoch. The first `timestamp` in the transcript's
   first 64 KiB, or the file's birth time when that has none.
-- **`context_tokens`**: the last answer's prompt size, `input_tokens` + `cache_read_input_tokens` +
-  `cache_creation_input_tokens` from the newest main-chain assistant `usage`. A line with no tokens
-  (a synthetic error message) is skipped. No percentage: the transcript names the model but not its
-  context window, so a percentage would be a guess.
+
+There is no context size. Every current harness has a large window, so a token count would mislead
+a reader more than it helps.
 
 All of it is undocumented harness output, read defensively: a missing, malformed or unreadable
 record is a missing key, never an error. The read is bounded. The transcript is found the way
 `last-reply` finds it, trying the project directory the agent's `cwd` maps to first. Its tail is
-walked backwards in 256 KiB reads, at most 4 MiB, stopping once both records are found. Lines are
+walked backwards in 256 KiB reads, at most 4 MiB, stopping once the address record is found. Lines are
 matched as text before any is parsed. All transcripts are read on one thread, given 1.5 seconds
 in total; a row not read by then goes out without its chat keys.
 
@@ -8760,7 +8759,7 @@ carry them per host. A host on an older build simply lacks them.
 `zellij-client/src/agent_reply.rs` (`ChatMeta`, `chat_meta`, `bridge_address`,
 `find_claude_transcript`), `zellij-client/src/cli_client.rs` (`AgentRow`, `agent_rows`, in
 `print_agents`). Tests: the address, the last of several records, a missing and a malformed record,
-a sidechain and a zero `usage`, the head timestamp, a tail longer than one read, the cap, a line
+the head timestamp, a tail longer than one read, the cap, a line
 longer than the cap, the cwd lookup, and rows with and without time to read. CLI-side only; no
 contract change.
 
@@ -8811,9 +8810,9 @@ zellij_overview {"scope": "fleet"}
 To message an agent, call zellij_send with to = host/tab, host/handle or the agent's name ...
 [{"host": "boxa", "host_alias": "a", "tabs": [
    {"session": "work", "tab": "develop", "panes": [
-     {"handle": "brisk-heron", "kind": "claude", "name": "develop-1", "title": "Fix the build",
-      "state": "idle", ..., "message_to": "bridge:session_01AbC", "message_route": "harness",
-      "display_title": "Fix the build", "chat_age_s": 5400,
+     {"handle": "brisk-heron", "kind": "claude", "name": "develop-1", "state": "idle", ...,
+      "message_to": "bridge:session_01AbC", "display_title": "Fix the build",
+      "last_activity_age_s": 240, "chat_age_s": 5400,
       "address": {"session": "boxa/work", "pane": "brisk-heron"}}]}]},
  {"host": "boxb", "error": "ssh could not reach boxb (exit 255): ...", "error_kind": "unreachable",
   "tabs": []}]
@@ -8827,20 +8826,44 @@ grouped the way a person names an agent: host, then tab (with its session), then
   instruction is static: message an agent with `zellij_send` (see "Agent messages wait until the
   agent is idle and nobody is typing"); "X on <machine>" is `to=<machine>/X`; `message_to`, when a
   pane has it, is a second route through the harness's own messaging tool.
-- **Each pane entry keeps every key of its row**, and gains `display_title` (the title, or `new
-  session` when it is empty or only the harness's name, like claude's `Claude Code`), `chat_age_s`
-  (from `chat_started_at`) and `address`, the `session` and `pane` `zellij_write_input` takes.
-  This machine's rows are addressed by their bare session, another host's as `host/session`.
-  `scope=agents` rows gain `host` (and `host_alias`) in the grouped view.
+- **Each pane entry keeps only the keys that help a decision** (table below). `display_title` is
+  the title, or `new session` when it is empty or only the harness's name, like claude's `Claude
+  Code`. `address` is the `session` and `pane` the tools take. This machine's rows are addressed by
+  their bare session, another host's as `host/session`. `scope=agents` rows gain `host` (and
+  `host_alias`) in the grouped view.
 - **The structure keeps its flat answer.** `result` is unchanged: the array for `agents` and
   `my_agents`, `{agents, hosts}` for `fleet`. It gains `grouped` and `how_to_message`. The flat
   rows stay for a program, and the prompt and resource `zellij://agents` still return them.
 - **`scope=fleet` loses its one-line-per-agent text.** A silent host is now a host entry with
   `error` and `error_kind` (`unreachable` or `error`), in the text and in `result.hosts`.
 
-`src/mcp/fleet.rs` (`HOW_TO_MESSAGE`, `grouped`, `display_title`, `with_grouped`, `merge`),
+| Pane key | The decision it helps |
+|---|---|
+| `handle` | Which pane to send to or type into. |
+| `address` | The `session` and `pane` a tool takes, ready to pass. |
+| `self` | Do not message yourself. |
+| `kind` | Which harness: whether it reports state, and which routes it has. |
+| `name` | The word a person uses for the agent; a `to` target. |
+| `cwd` | Which project it works in; its directory name is a `to` target. |
+| `display_title` | What it is working on now. |
+| `state`, `state_kind`, `state_msg` | Busy, idle, or blocked on what: will a message be held. |
+| `state_age_s` | Stuck in one state for too long. |
+| `output_age_s` | Stalled while it says it is working. |
+| `last_activity_age_s` | Idle long enough to hand it work, or to restart under it. The later of the end of its last turn and its last output. |
+| `chat_age_s` | A long-running chat or a fresh one. |
+| `queued` | Messages already wait for it; do not pile on. |
+| `message_to` | The harness's own messaging route, when it has one. |
+
+Every other row key stays in the flat `result` only. `pane_id`, `tab_id`, `tab_position`,
+`tab_name`, `session`, `host` and `host_alias` are the groups above the pane. `title` becomes
+`display_title`. `state_at`, `last_output_at` and `chat_started_at` become ages. `message_route`
+follows from `message_to`. `command`, `pid`, `source`, `session_source`, `agent_id`, `state_app`,
+`state_title`, `state_progress` and `state_working` decide nothing a reader of the grouped view
+does.
+
+`src/mcp/fleet.rs` (`HOW_TO_MESSAGE`, `GROUPED_PANE_KEYS`, `grouped`, `display_title`, `with_grouped`, `merge`),
 `src/mcp/mod.rs` (`group_agents`), `src/mcp/tools.rs` (the tip). Tests: the grouping order by
-host, session and tab, every row key kept, the titles, the chat age, local and remote addresses, a
+host, session and tab, the kept and dropped keys, the titles, the ages, local and remote addresses, a
 row with no session, and the fleet merge's text and structure. MCP-side only; no contract change.
 
 ### The `zellij_write_input` hint names the address that reaches the agent

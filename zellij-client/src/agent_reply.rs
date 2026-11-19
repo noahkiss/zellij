@@ -329,9 +329,6 @@ pub struct ChatMeta {
     /// When the chat began, in milliseconds since the epoch: the first record's `timestamp`, or
     /// the file's birth when the head of the file has none.
     pub started_at: Option<u64>,
-    /// The prompt the last answer was given, in tokens: input plus cache read plus cache
-    /// creation. The model's context window is not in the transcript, so no percentage is made.
-    pub context_tokens: Option<u64>,
 }
 
 /// How far back from a transcript's end the meta scan reads, at most.
@@ -357,12 +354,11 @@ pub fn bridge_address(bridge_session_id: &str) -> Option<String> {
 struct TailFacts {
     message_to: Option<String>,
     bridge_seen: bool,
-    context_tokens: Option<u64>,
 }
 
 impl TailFacts {
     fn done(&self) -> bool {
-        self.bridge_seen && self.context_tokens.is_some()
+        self.bridge_seen
     }
 
     /// One transcript line, newest first. Lines are matched as text before they are parsed, so a
@@ -379,32 +375,7 @@ impl TailFacts {
                 }
             }
         }
-        if self.context_tokens.is_none()
-            && line.contains("\"usage\"")
-            && line.contains("\"assistant\"")
-        {
-            if let Ok(value) = serde_json::from_str::<Value>(line) {
-                self.context_tokens = prompt_tokens(&value);
-            }
-        }
     }
-}
-
-/// The prompt size of one claude assistant line, or `None` for any other line. A subagent's line
-/// is another conversation's, and a line with no tokens at all (a synthetic error message) says
-/// nothing about the context.
-fn prompt_tokens(line: &Value) -> Option<u64> {
-    if line.get("type").and_then(Value::as_str) != Some("assistant")
-        || line.get("isSidechain").and_then(Value::as_bool) == Some(true)
-    {
-        return None;
-    }
-    let usage = line.get("message")?.get("usage")?;
-    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let total = count("input_tokens")
-        + count("cache_read_input_tokens")
-        + count("cache_creation_input_tokens");
-    (total > 0).then_some(total)
 }
 
 /// The facts in a transcript's text, as the backward scan would find them.
@@ -492,7 +463,6 @@ pub fn chat_meta_with_cap(path: &Path, cap: u64) -> ChatMeta {
     ChatMeta {
         message_to: facts.message_to,
         started_at,
-        context_tokens: facts.context_tokens,
     }
 }
 
@@ -702,14 +672,12 @@ not json at all
         );
         let facts = tail_facts_of(&text);
         assert_eq!(facts.message_to.as_deref(), Some("bridge:session_01NewAbc"));
-        assert_eq!(facts.context_tokens, Some(1102));
         let facts = tail_facts_of(&format!("{}\n", ANSWER));
         assert_eq!(facts.message_to, None);
-        assert_eq!(facts.context_tokens, Some(1102));
     }
 
     #[test]
-    fn a_malformed_bridge_record_or_usage_is_not_known_rather_than_an_error() {
+    fn a_malformed_bridge_record_is_not_known_rather_than_an_error() {
         let text = [
             r#"{"type":"bridge-session","bridgeSessionId":"cse_GOOD"}"#,
             // newer, and malformed: it is the current record, and it has no address
@@ -722,7 +690,6 @@ not json at all
         let facts = tail_facts_of(&text);
         assert_eq!(facts.message_to, None);
         assert!(facts.bridge_seen);
-        assert_eq!(facts.context_tokens, None);
     }
 
     #[test]
@@ -746,7 +713,6 @@ not json at all
         std::fs::write(&path, &text).unwrap();
         let meta = chat_meta(&path);
         assert_eq!(meta.message_to.as_deref(), Some("bridge:session_01NewAbc"));
-        assert_eq!(meta.context_tokens, Some(1102));
         assert_eq!(meta.started_at, Some(1_795_082_400_250));
     }
 
@@ -759,7 +725,7 @@ not json at all
         std::fs::write(&path, &text).unwrap();
         // the records are 64 KiB back: a 16 KiB cap does not reach them
         let meta = chat_meta_with_cap(&path, 16 * 1024);
-        assert_eq!((meta.message_to, meta.context_tokens), (None, None));
+        assert_eq!(meta.message_to, None);
         let meta = chat_meta_with_cap(&path, 1024 * 1024);
         assert_eq!(meta.message_to.as_deref(), Some("bridge:session_01NewAbc"));
         // a single line longer than the cap ends the walk without reading the file whole

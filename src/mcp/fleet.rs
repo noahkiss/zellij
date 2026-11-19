@@ -208,12 +208,29 @@ must match. It waits until that agent is idle and nobody is typing there, and sa
 queued or refused. A pane entry's address works as to = host/session/handle. message_to, when \
 present, is a second route: the harness's own messaging tool.";
 
+/// The keys a grouped pane entry keeps from its row. Each one helps an agent or a person decide
+/// something (FORK.md has the table); the host, session and tab are the groups above it, and the
+/// raw times become ages. The flat `result` keeps every key.
+pub const GROUPED_PANE_KEYS: &[&str] = &[
+    "handle",
+    "self",
+    "kind",
+    "name",
+    "cwd",
+    "state",
+    "state_kind",
+    "state_msg",
+    "queued",
+    "message_to",
+];
+
 /// The agent rows as a person refers to them: host, then tab, then pane.
 ///
 /// `hosts` are the host entries in order (`{host, host_alias?, error?}`); a row's `host` places it,
-/// and a row whose host is not among them adds one. Every key of a row stays in its pane entry,
-/// which gains `display_title` (the title, or "new session" when the harness has given none),
-/// `chat_age_s` and `address`, the `session` and `pane` that `zellij_write_input` takes. A row of
+/// and a row whose host is not among them adds one. A pane entry keeps the row's
+/// [`GROUPED_PANE_KEYS`] and gains `display_title` (the title, or "new session" when the harness has
+/// given none), the ages `state_age_s`, `output_age_s`, `last_activity_age_s` and `chat_age_s`,
+/// and `address`, the `session` and `pane` the tools take. A row of
 /// `local_host` is addressed by its bare session, any other as `host/session`. `session` is the
 /// session a row without its own `session` came from, when the call knows it.
 pub fn grouped(
@@ -260,7 +277,32 @@ pub fn grouped(
             .or(session)
             .map(str::to_owned);
         let tab_name = fields.get("tab_name").cloned().unwrap_or(Value::Null);
-        let mut pane = fields.clone();
+        // the keys that help decide something, and nothing the groups above already say: see
+        // GROUPED_PANE_KEYS. The flat rows keep every key
+        let mut pane: Map<String, Value> = fields
+            .iter()
+            .filter(|(key, _)| GROUPED_PANE_KEYS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let age = |at: u64| json!(now_ms.saturating_sub(at) / 1000);
+        let state_at = fields.get("state_at").and_then(Value::as_u64);
+        let output_at = fields.get("last_output_at").and_then(Value::as_u64);
+        if let Some(at) = state_at {
+            pane.insert("state_age_s".to_owned(), age(at));
+        }
+        if let Some(at) = output_at {
+            pane.insert("output_age_s".to_owned(), age(at));
+        }
+        // the later of the end of its last turn and its last output
+        let finished_at = state_at.filter(|_| {
+            matches!(
+                fields.get("state").and_then(Value::as_str),
+                Some("idle" | "done" | "error")
+            )
+        });
+        if let Some(at) = finished_at.max(output_at) {
+            pane.insert("last_activity_age_s".to_owned(), age(at));
+        }
         pane.insert(
             "display_title".to_owned(),
             json!(display_title(
@@ -459,12 +501,13 @@ mod tests {
     }
 
     #[test]
-    fn the_grouped_view_is_host_then_tab_then_pane_and_keeps_every_key() {
+    fn the_grouped_view_is_host_then_tab_then_pane_with_the_keys_that_decide() {
         let rows: Vec<Value> = serde_json::from_str(
             r#"[
             {"host": "here", "session": "work", "tab_name": "develop", "handle": "deep-fox",
              "kind": "claude", "name": "develop-1", "title": "✳ Claude Code", "state": "idle",
-             "chat_started_at": 1000000, "context_tokens": 5000,
+             "chat_started_at": 1000000, "state_at": 60000000, "last_output_at": 59000000,
+             "pane_id": 3, "pid": 77, "queued": 2,
              "message_to": "bridge:session_01A", "message_route": "harness"},
             {"host": "boxa", "host_alias": "a", "session": "work", "tab_name": "develop",
              "handle": "calm-otter", "kind": "codex", "title": "Fix the build",
@@ -495,17 +538,28 @@ mod tests {
             .collect();
         assert_eq!(tabs, vec![("work", "develop"), ("play", "develop")]);
         let first = &here["tabs"][0]["panes"][0];
+        for key in ["handle", "kind", "name", "state", "message_to", "queued"] {
+            assert_eq!(first[key], rows[0][key], "{}", key);
+        }
+        // what the groups above say, and the raw times, are not repeated in the pane
         for key in [
             "host",
             "session",
             "tab_name",
-            "kind",
-            "name",
-            "state",
-            "message_to",
+            "pane_id",
+            "pid",
+            "state_at",
+            "last_output_at",
+            "chat_started_at",
+            "context_tokens",
+            "message_route",
         ] {
-            assert_eq!(first[key], rows[0][key], "{}", key);
+            assert!(first.get(key).is_none(), "{}", key);
         }
+        assert_eq!(first["state_age_s"], 1_000);
+        assert_eq!(first["output_age_s"], 2_000);
+        // idle since 60 000 s, last drew at 59 000 s: the later one counts
+        assert_eq!(first["last_activity_age_s"], 1_000);
         assert_eq!(first["display_title"], "new session");
         assert_eq!(first["chat_age_s"], 60_000);
         // this machine's rows are addressed by their bare session

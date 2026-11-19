@@ -1680,9 +1680,6 @@ struct AgentRow<'a> {
     /// When the chat began, in milliseconds since the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_started_at: Option<u64>,
-    /// The tokens the last answer's prompt took. No percentage: the window is not recorded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context_tokens: Option<u64>,
     /// Messages from other agents the session holds for this one (`send-message`). Written only
     /// when there are some.
     #[serde(skip_serializing_if = "is_no_count")]
@@ -1748,7 +1745,6 @@ fn agent_rows<'a>(
             },
             message_to: meta.message_to,
             chat_started_at: meta.started_at,
-            context_tokens: meta.context_tokens,
             queued: agent.queued_messages,
         })
         .collect()
@@ -3886,7 +3882,8 @@ mod tests {
         assert_eq!(json[0]["message_to"], "bridge:session_01Abc");
         assert_eq!(json[0]["message_route"], "harness");
         assert_eq!(json[0]["chat_started_at"], 1_795_082_400_000u64);
-        assert_eq!(json[0]["context_tokens"], 15);
+        // no context size: every harness's window is large enough that the number misleads
+        assert!(json[0].get("context_tokens").is_none());
         // the agent's own keys are still there, unchanged
         assert_eq!(json[0]["handle"], "pane-1");
         assert_eq!(json[0]["kind"], "claude");
@@ -3896,7 +3893,6 @@ mod tests {
         for row in [&json[1], &json[2]] {
             assert_eq!(row["message_route"], "pane");
             assert!(row.get("message_to").is_none());
-            assert!(row.get("context_tokens").is_none());
         }
         // no time for the transcripts: every row still goes out, without the chat keys
         let rows = agent_rows(&agents, &none, Some(home), Duration::ZERO);
