@@ -8765,6 +8765,46 @@ a sidechain and a zero `usage`, the head timestamp, a tail longer than one read,
 longer than the cap, the cwd lookup, and rows with and without time to read. CLI-side only; no
 contract change.
 
+### `remote_hosts` takes a short alias for a host
+
+```kdl
+remote_hosts {
+    from "~/.config/fleet/machines.tsv" column="hostname" alias_column="short" where="zellij_peer=yes"
+    host "boxc.example.net" alias="boxc"
+}
+```
+
+```
+zellij_read_pane {"session": "boxc/work", "pane": "calm-otter"}   # reaches boxc.example.net
+```
+
+A host was reachable only by the name the block listed, so an agent that wrote the short name
+everyone uses for a machine was refused. Now a host can carry one alias:
+
+- **`alias="<name>"`** on a `host` line, and **`alias_column="<column>"`** on a `from` line. A table
+  alias is lower-cased like the host name, and an empty cell is no alias. An inline `host` line
+  that overrides a table row keeps the row's alias unless it gives its own.
+- **`session` = `<alias>/<name>`** resolves to the host, ignoring case. ssh is always given the full
+  name. An alias of this machine stays local, like its name.
+- **An alias names one host.** One that matches a host's name, or an earlier host's alias, is
+  dropped with a warning, and so is one ssh could not take as a host name. A missing alias column
+  warns and costs the aliases, not the hosts. The hosts themselves always load.
+- **Answers name the canonical host**, with `host_alias` beside it when there is one: on every
+  `scope=fleet` row and `hosts` entry, and on any result from a remote call. A refusal for an
+  unlisted host lists each host as `name (alias a)`.
+
+**An older build** warns about `alias` and `alias_column` as unknown properties and ignores them:
+`unknown remote_hosts host property "alias", ignored (expected bin)`. Its hosts still load; only the
+alias does not resolve there. Checked against nkmk.40: `setup --check` still reports the config well
+defined, since the main config parser does not read inside `remote_hosts`. A build from before the
+block ignores it as a whole.
+
+`src/mcp/remote.rs` (`RemoteHost.alias`, the two properties, `find`, `alias_of`, `route`, the
+clash check), `src/mcp/fleet.rs` (`merge`), `src/mcp/mod.rs` (`with_host`). Tests: an inline alias,
+a clash with a name and with another alias, a bad alias, routing by alias, a local alias, the
+refusal's list, a table's alias column, an inline override keeping the row's alias, and a missing
+alias column. MCP-side only; no contract change.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

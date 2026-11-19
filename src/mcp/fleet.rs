@@ -37,7 +37,7 @@ pub async fn overview(hosts: &RemoteHosts, local: &str) -> CallToolResult {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
-    merge(&answers, now_ms, &hosts.warnings)
+    merge(&answers, now_ms, hosts)
 }
 
 /// Ask every target at once, each bounded by `timeout`, and return the answers in target order.
@@ -118,8 +118,9 @@ async fn ask(target: &Target, argv: &[String]) -> Answer {
 }
 
 /// The answers as one result: a line per agent and per silent host for a reader, and the rows,
-/// each with its `host`, for a program.
-pub fn merge(answers: &[(String, Answer)], now_ms: u64, warnings: &[String]) -> CallToolResult {
+/// each with its `host` (and `host_alias`, when the list gives it one), for a program.
+pub fn merge(answers: &[(String, Answer)], now_ms: u64, listed: &RemoteHosts) -> CallToolResult {
+    let warnings = &listed.warnings;
     let view = AgentsView { only_tab: None };
     let mut agents = Vec::new();
     let mut hosts = Vec::new();
@@ -135,11 +136,18 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, warnings: &[String]) -> 
             Ok(outcome) => Err(("error", first_line(&outcome.stderr, &outcome.stdout))),
             Err(message) => Err(("unreachable", first_line(message, ""))),
         };
+        let alias = listed.alias_of(host);
+        let with_alias = |mut entry: Value| {
+            if let (Some(alias), Some(entry)) = (alias, entry.as_object_mut()) {
+                entry.insert("host_alias".to_owned(), json!(alias));
+            }
+            entry
+        };
         let outcome = match said {
             Ok(outcome) => outcome,
             Err((label, why)) => {
                 lines.push(format!("{}: {}: {}", host, label, why));
-                hosts.push(json!({"host": host, "error": why}));
+                hosts.push(with_alias(json!({"host": host, "error": why})));
                 continue;
             },
         };
@@ -151,18 +159,21 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, warnings: &[String]) -> 
             _ => {
                 let why = "its answer was not the JSON list-agents prints".to_owned();
                 lines.push(format!("{}: error: {}", host, why));
-                hosts.push(json!({"host": host, "error": why}));
+                hosts.push(with_alias(json!({"host": host, "error": why})));
                 continue;
             },
         };
         if rows.is_empty() {
             lines.push(format!("{}: no agents", host));
         }
-        hosts.push(json!({"host": host, "agents": rows.len()}));
+        hosts.push(with_alias(json!({"host": host, "agents": rows.len()})));
         for mut row in rows {
             if let Some(row) = row.as_object_mut() {
                 lines.push(row_line(host, row));
                 row.insert("host".to_owned(), json!(host));
+                if let Some(alias) = alias {
+                    row.insert("host_alias".to_owned(), json!(alias));
+                }
             }
             agents.push(row);
         }
@@ -271,7 +282,16 @@ mod tests {
                 Err("no answer within 10 seconds".to_owned()),
             ),
         ];
-        let result = merge(&answers, 1_042_000, &["a warning".to_owned()]);
+        let listed = RemoteHosts {
+            hosts: vec![remote::RemoteHost {
+                name: "boxa".into(),
+                bin: None,
+                alias: Some("a".into()),
+            }],
+            warnings: vec!["a warning".to_owned()],
+            path: None,
+        };
+        let result = merge(&answers, 1_042_000, &listed);
         assert_eq!(result.is_error, Some(false));
         let text = serde_json::to_string(&result.content).unwrap();
         let text: Vec<String> = serde_json::from_str::<Value>(&text).unwrap()[0]["text"]
@@ -293,11 +313,15 @@ mod tests {
         let agents = structured["result"]["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["host"], json!("boxa"));
+        assert_eq!(agents[0]["host_alias"], json!("a"));
         assert_eq!(agents[0]["name"], "project-1");
         assert_eq!(agents[0]["self"], false);
         assert_eq!(agents[0]["output_age_s"], json!(42));
         let hosts = &structured["result"]["hosts"];
-        assert_eq!(hosts[0], json!({"host": "boxa", "agents": 1}));
+        assert_eq!(
+            hosts[0],
+            json!({"host": "boxa", "host_alias": "a", "agents": 1})
+        );
         assert!(hosts[1]["error"].as_str().unwrap().contains("exit 255"));
         assert_eq!(hosts[2], json!({"host": "boxc", "agents": 0}));
         assert_eq!(structured["diagnostics"], json!("a warning"));
@@ -336,10 +360,12 @@ mod tests {
         let up = remote::RemoteHost {
             name: "boxa".into(),
             bin: Some(zellij.display().to_string()),
+            alias: None,
         };
         let down = remote::RemoteHost {
             name: "boxdown".into(),
             bin: None,
+            alias: None,
         };
         let answers = gather(
             vec![
@@ -349,7 +375,7 @@ mod tests {
             Duration::from_secs(20),
         )
         .await;
-        let result = merge(&answers, 1_042_000, &[]);
+        let result = merge(&answers, 1_042_000, &RemoteHosts::default());
         let structured = result.structured_content.unwrap();
         let hosts = &structured["result"]["hosts"];
         assert_eq!(hosts[0]["agents"], json!(1), "{}", structured);
@@ -381,13 +407,14 @@ mod tests {
         let behind = remote::RemoteHost {
             name: "boxold".into(),
             bin: Some(old.display().to_string()),
+            alias: None,
         };
         let answers = gather(
             vec![("boxold".into(), Target::Remote(behind))],
             Duration::from_secs(20),
         )
         .await;
-        let result = merge(&answers, 0, &[]);
+        let result = merge(&answers, 0, &RemoteHosts::default());
         let structured = result.structured_content.unwrap();
         let agents = &structured["result"]["agents"];
         assert_eq!(agents.as_array().map(Vec::len), Some(1), "{}", structured);
@@ -401,6 +428,7 @@ mod tests {
         let host = remote::RemoteHost {
             name: "boxslow".into(),
             bin: Some(slow.display().to_string()),
+            alias: None,
         };
         let started = std::time::Instant::now();
         let answers = gather(

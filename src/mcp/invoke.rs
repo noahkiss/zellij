@@ -2219,6 +2219,7 @@ mod tests {
         let host = remote::RemoteHost {
             name: "boxa".into(),
             bin: None,
+            alias: None,
         };
         for (placement, expected) in [
             (json!({"kind": "pane"}), "must be agent_tab, stacked or tab"),

@@ -10,8 +10,12 @@
 //!     from "~/.config/fleet/machines.tsv" column="hostname" where="zellij_peer=yes"
 //!     host "boxa"
 //!     host "boxb" bin="/opt/homebrew/bin/zellij"
+//!     host "boxc.example.net" alias="boxc"
 //! }
 //! ```
+//!
+//! An alias is a second, shorter name for a host: `boxc/work` reaches `boxc.example.net`. A `from`
+//! line takes its aliases from a column, `alias_column="short"`.
 //!
 //! `from` reads hosts out of a tab-separated table with a header line, so a fleet that already
 //! keeps one needs no second list. It is read on every call, like the rest of the block.
@@ -49,6 +53,9 @@ pub struct RemoteHost {
     /// The zellij binary on that machine. Without one, the remote shell's `PATH` and the usual
     /// install places are tried - see [`ZELLIJ_ON_REMOTE`].
     pub bin: Option<String>,
+    /// A second name a `session` may use for this host: `alias="boxc"`, or a `from` table's
+    /// `alias_column`. ssh is always given `name`.
+    pub alias: Option<String>,
 }
 
 /// The `remote_hosts` block, and what in it was passed over.
@@ -123,7 +130,7 @@ impl RemoteHosts {
                 },
                 "host" => {
                     if let Some(host) = hosts.host_from_kdl(node) {
-                        if hosts.find(&host.name).is_some() {
+                        if hosts.named(&host.name).is_some() {
                             hosts
                                 .warnings
                                 .push(format!("remote_hosts lists {:?} twice", host.name));
@@ -140,19 +147,51 @@ impl RemoteHosts {
         }
         let inline = std::mem::take(&mut hosts.hosts);
         for row in from_files {
-            let chosen = inline
+            let chosen = match inline
                 .iter()
                 .find(|host| host.name.eq_ignore_ascii_case(&row.name))
-                .cloned()
-                .unwrap_or(row);
+            {
+                // an inline line without an alias keeps the table's
+                Some(host) => RemoteHost {
+                    alias: host.alias.clone().or(row.alias),
+                    ..host.clone()
+                },
+                None => row,
+            };
             hosts.hosts.push(chosen);
         }
         for host in inline {
-            if hosts.find(&host.name).is_none() {
+            if hosts.named(&host.name).is_none() {
                 hosts.hosts.push(host);
             }
         }
+        hosts.drop_clashing_aliases();
         hosts
+    }
+
+    /// An alias must name one host: one that is also a host's name, or an earlier host's alias, is
+    /// dropped with a warning, and the hosts themselves stay.
+    fn drop_clashing_aliases(&mut self) {
+        for at in 0..self.hosts.len() {
+            let Some(alias) = self.hosts[at].alias.clone() else {
+                continue;
+            };
+            let clashes = self.hosts.iter().enumerate().any(|(other, host)| {
+                host.name.eq_ignore_ascii_case(&alias)
+                    || (other < at
+                        && host
+                            .alias
+                            .as_deref()
+                            .is_some_and(|theirs| theirs.eq_ignore_ascii_case(&alias)))
+            });
+            if clashes {
+                self.warnings.push(format!(
+                    "remote_hosts: alias {:?} of {:?} names another host too, ignored",
+                    alias, self.hosts[at].name
+                ));
+                self.hosts[at].alias = None;
+            }
+        }
     }
 
     /// The hosts a `from` line names: one per row of a tab-separated table with a header line,
@@ -164,11 +203,15 @@ impl RemoteHosts {
     fn hosts_from_file(&mut self, node: &KdlNode, home: Option<&str>) -> Vec<RemoteHost> {
         let mut path = None;
         let mut column = "hostname".to_owned();
+        let mut alias_column = None;
         let mut filter = None;
         for entry in node.entries() {
             match (entry.name().map(|name| name.value()), entry.value()) {
                 (None, KdlValue::String(value)) if path.is_none() => path = Some(value.clone()),
                 (Some("column"), KdlValue::String(value)) => column = value.clone(),
+                (Some("alias_column"), KdlValue::String(value)) => {
+                    alias_column = Some(value.clone())
+                },
                 (Some("where"), KdlValue::String(value)) => match value.split_once('=') {
                     Some((key, wanted)) if !key.trim().is_empty() => {
                         filter = Some((key.trim().to_owned(), wanted.trim().to_owned()))
@@ -183,7 +226,8 @@ impl RemoteHosts {
                     },
                 },
                 (Some(other), _) => self.warnings.push(format!(
-                    "unknown remote_hosts from property {:?}, ignored (expected column or where)",
+                    "unknown remote_hosts from property {:?}, ignored (expected column, alias_column or \
+                     where)",
                     other
                 )),
                 (None, value) => self.warnings.push(format!(
@@ -241,6 +285,20 @@ impl RemoteHosts {
             },
             None => None,
         };
+        // a missing alias column costs the aliases, not the hosts
+        let alias_at = match &alias_column {
+            Some(name) => {
+                let at = index_of(name);
+                if at.is_none() {
+                    self.warnings.push(format!(
+                        "remote_hosts: from {} has no column {:?} for alias_column",
+                        expanded, name
+                    ));
+                }
+                at
+            },
+            None => None,
+        };
         let mut hosts = Vec::new();
         for line in lines {
             let cells: Vec<&str> = line.split('\t').map(str::trim).collect();
@@ -265,9 +323,23 @@ impl RemoteHosts {
             // lower-cased: a table may record a hostname as the machine reports it (`BOXA`), and
             // ssh matches `Host` patterns in its config case-sensitively, so `BOXA` would miss
             // the `Host boxa` entry that carries the user and key
+            let alias = alias_at
+                .and_then(|at| cells.get(at))
+                .filter(|alias| !alias.is_empty() && !alias.eq_ignore_ascii_case(name))
+                .and_then(|alias| match host_name_error(alias) {
+                    Some(reason) => {
+                        self.warnings.push(format!(
+                            "remote_hosts: from {}: alias {:?} {}, ignored",
+                            expanded, alias, reason
+                        ));
+                        None
+                    },
+                    None => Some(alias.to_ascii_lowercase()),
+                });
             hosts.push(RemoteHost {
                 name: name.to_ascii_lowercase(),
                 bin: None,
+                alias,
             });
         }
         hosts
@@ -276,6 +348,7 @@ impl RemoteHosts {
     fn host_from_kdl(&mut self, node: &KdlNode) -> Option<RemoteHost> {
         let mut name = None;
         let mut bin = None;
+        let mut alias = None;
         for entry in node.entries() {
             match (entry.name().map(|name| name.value()), entry.value()) {
                 (None, KdlValue::String(value)) if name.is_none() => name = Some(value.clone()),
@@ -286,8 +359,15 @@ impl RemoteHosts {
                     "remote_hosts: bin={} is not an absolute path, ignored",
                     value
                 )),
+                (Some("alias"), KdlValue::String(value)) => match host_name_error(value) {
+                    Some(reason) => self.warnings.push(format!(
+                        "remote_hosts: alias {:?} {}, ignored",
+                        value, reason
+                    )),
+                    None => alias = Some(value.clone()),
+                },
                 (Some(other), _) => self.warnings.push(format!(
-                    "unknown remote_hosts host property {:?}, ignored (expected bin)",
+                    "unknown remote_hosts host property {:?}, ignored (expected bin or alias)",
                     other
                 )),
                 (None, value) => self.warnings.push(format!(
@@ -306,14 +386,31 @@ impl RemoteHosts {
                 .push(format!("remote_hosts: host {:?} {}, ignored", name, reason));
             return None;
         }
-        Some(RemoteHost { name, bin })
+        let alias = alias.filter(|alias| !alias.eq_ignore_ascii_case(&name));
+        Some(RemoteHost { name, bin, alias })
     }
 
-    /// The listed host by this name, ignoring case.
+    /// The listed host by this name or alias, ignoring case.
     pub fn find(&self, name: &str) -> Option<&RemoteHost> {
+        self.named(name).or_else(|| {
+            self.hosts.iter().find(|host| {
+                host.alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+            })
+        })
+    }
+
+    /// The listed host by its name alone, ignoring case.
+    fn named(&self, name: &str) -> Option<&RemoteHost> {
         self.hosts
             .iter()
             .find(|host| host.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The alias of the host a fleet answer calls `name`, if it has one.
+    pub fn alias_of(&self, name: &str) -> Option<&str> {
+        self.named(name)?.alias.as_deref()
     }
 
     /// Every listed host but this machine.
@@ -421,10 +518,12 @@ pub fn route(
             session
         ));
     }
-    let target = if is_local(host, local) {
+    // an alias names its host, and a host that is this machine stays local by either name
+    let listed = hosts.find(host);
+    let target = if is_local(host, local) || listed.is_some_and(|l| is_local(&l.name, local)) {
         Target::Local
     } else {
-        match hosts.find(host) {
+        match listed {
             Some(listed) => Target::Remote(listed.clone()),
             None => return Err(not_listed(host, hosts)),
         }
@@ -449,7 +548,14 @@ fn not_listed(host: &str, hosts: &RemoteHosts) -> String {
             host, file
         )
     } else {
-        let listed: Vec<&str> = hosts.hosts.iter().map(|host| host.name.as_str()).collect();
+        let listed: Vec<String> = hosts
+            .hosts
+            .iter()
+            .map(|host| match &host.alias {
+                Some(alias) => format!("{} (alias {})", host.name, alias),
+                None => host.name.clone(),
+            })
+            .collect();
         format!(
             "`{}` is not in remote_hosts in {}, so this server will not reach it. Listed: {}.",
             host,
@@ -649,15 +755,18 @@ mod tests {
             vec![
                 RemoteHost {
                     name: "boxa".into(),
-                    bin: None
+                    bin: None,
+                    alias: None
                 },
                 RemoteHost {
                     name: "boxb".into(),
-                    bin: Some("/opt/homebrew/bin/zellij".into())
+                    bin: Some("/opt/homebrew/bin/zellij".into()),
+                    alias: None
                 },
                 RemoteHost {
                     name: "Local-Box".into(),
-                    bin: None
+                    bin: None,
+                    alias: None
                 },
             ]
         );
@@ -747,7 +856,8 @@ mod tests {
             target.unwrap(),
             Target::Remote(RemoteHost {
                 name: "boxb".into(),
-                bin: Some("/opt/homebrew/bin/zellij".into())
+                bin: Some("/opt/homebrew/bin/zellij".into()),
+                alias: None
             })
         );
         assert_eq!(arguments["session"], json!("work"));
@@ -846,6 +956,7 @@ mod tests {
         let host = RemoteHost {
             name: "boxa".into(),
             bin: None,
+            alias: None,
         };
         let argv: Vec<String> = ["-s", "my work", "action", "write-chars", "--", "it's $x"]
             .iter()
@@ -867,6 +978,7 @@ mod tests {
         let with_bin = RemoteHost {
             name: "boxa".into(),
             bin: Some(fake.display().to_string()),
+            alias: None,
         };
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -906,6 +1018,7 @@ mod tests {
         let host = RemoteHost {
             name: "boxa".into(),
             bin: Some(fake.display().to_string()),
+            alias: None,
         };
         let argv = vec!["action".to_owned(), "list-panes".to_owned()];
         let run = |strict: bool| {
@@ -1076,5 +1189,101 @@ mod tests {
             route(&mut arguments, &hosts, "BOXB.local").unwrap(),
             Target::Local
         );
+    }
+
+    #[test]
+    fn an_alias_reaches_its_host_and_ssh_is_given_the_full_name() {
+        let hosts = RemoteHosts::parse(
+            r#"remote_hosts {
+                host "boxa.example.net" alias="a"
+                host "boxb"
+                host "boxc" alias="BOXB"
+                host "boxd" alias="-x"
+                host "boxe" alias="a"
+            }"#,
+        );
+        assert_eq!(hosts.hosts[0].alias.as_deref(), Some("a"));
+        assert_eq!(hosts.alias_of("boxa.example.net"), Some("a"));
+        // an alias that names another host, or one already taken, or not a host name, is dropped
+        assert_eq!(hosts.hosts[2].alias, None);
+        assert_eq!(hosts.hosts[3].alias, None);
+        assert_eq!(hosts.hosts[4].alias, None);
+        assert_eq!(
+            hosts.hosts[0].alias.as_deref(),
+            Some("a"),
+            "the first keeps it"
+        );
+        let said = hosts.warnings.join("\n");
+        assert!(
+            said.contains("\"BOXB\" of \"boxc\" names another host"),
+            "{}",
+            said
+        );
+        assert!(said.contains("alias \"-x\" begins with a dash"), "{}", said);
+        let mut arguments = json!({"session": "A/work"}).as_object().unwrap().clone();
+        let target = route(&mut arguments, &hosts, "here").unwrap();
+        assert_eq!(target.host(), Some("boxa.example.net"));
+        assert_eq!(arguments["session"], json!("work"));
+        // an alias of this machine stays local
+        let mut arguments = json!({"session": "a/work"}).as_object().unwrap().clone();
+        assert_eq!(
+            route(&mut arguments, &hosts, "boxa").unwrap(),
+            Target::Local
+        );
+        // a refusal lists the aliases beside the names
+        let mut arguments = json!({"session": "zz/work"}).as_object().unwrap().clone();
+        let refused = route(&mut arguments, &hosts, "here").unwrap_err();
+        assert!(
+            refused.contains("boxa.example.net (alias a)"),
+            "{}",
+            refused
+        );
+    }
+
+    #[test]
+    fn a_from_line_takes_its_aliases_from_a_column() {
+        let home = tempfile::tempdir().unwrap();
+        let table = home.path().join("m.tsv");
+        std::fs::write(
+            &table,
+            "hostname\tshort\tpeer\n\
+             boxa.example.net\tA\tyes\n\
+             boxb\t\tyes\n\
+             boxc.example.net\tbad name\tyes\n",
+        )
+        .unwrap();
+        let hosts = from_config(
+            &format!(
+                "from \"{}\" alias_column=\"short\" where=\"peer=yes\"\nhost \"boxa.example.net\" bin=\"/bin/zellij\"",
+                table.display()
+            ),
+            home.path(),
+        );
+        assert_eq!(
+            names(&hosts),
+            vec!["boxa.example.net", "boxb", "boxc.example.net"]
+        );
+        // lower-cased like the name, and kept when an inline line overrides the row
+        assert_eq!(hosts.hosts[0].alias.as_deref(), Some("a"));
+        assert_eq!(hosts.hosts[0].bin.as_deref(), Some("/bin/zellij"));
+        assert_eq!(hosts.hosts[1].alias, None);
+        assert_eq!(hosts.hosts[2].alias, None);
+        assert!(
+            hosts.warnings[0].contains("alias \"bad name\""),
+            "{:?}",
+            hosts.warnings
+        );
+        assert_eq!(
+            hosts.find("A").map(|h| h.name.as_str()),
+            Some("boxa.example.net")
+        );
+        // a column the header lacks costs the aliases, not the hosts
+        let hosts = from_config(
+            &format!("from \"{}\" alias_column=\"nick\"", table.display()),
+            home.path(),
+        );
+        assert_eq!(hosts.hosts.len(), 3);
+        assert!(hosts.hosts.iter().all(|host| host.alias.is_none()));
+        assert!(hosts.warnings[0].contains("no column \"nick\" for alias_column"));
     }
 }

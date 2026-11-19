@@ -628,6 +628,12 @@ fn with_host(mut result: CallToolResult, target: &remote::Target) -> CallToolRes
         (target.host(), result.structured_content.as_mut())
     {
         structured.insert("host".to_owned(), json!(host));
+        if let remote::Target::Remote(remote::RemoteHost {
+            alias: Some(alias), ..
+        }) = target
+        {
+            structured.insert("host_alias".to_owned(), json!(alias));
+        }
     }
     result
 }
@@ -1008,6 +1014,7 @@ mod tests {
         let remote = remote::Target::Remote(remote::RemoteHost {
             name: "boxa".into(),
             bin: None,
+            alias: None,
         });
         assert!(same_dir("/srv/app/", "/srv/app", &remote));
         assert!(!same_dir("/srv", "/srv/app", &remote));
