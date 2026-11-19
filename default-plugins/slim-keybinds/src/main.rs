@@ -32,7 +32,7 @@ mod vitals;
 use derive::{hints_for_mode, Hints};
 use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
-use vitals::Vitals;
+use vitals::{ProbeGate, Vitals};
 use zellij_tile::prelude::*;
 
 /// One column of bar background at each end, so nothing sits flush against the terminal edge.
@@ -93,6 +93,12 @@ struct SlimKeybinds {
     /// neither of which a hint bar should pay for unasked.
     show_vitals: bool,
     vitals: Vitals,
+    /// One probe at a time; see `ProbeGate`.
+    probe: ProbeGate,
+    /// `true` once zellij says this bar's tab has no client on it. Every tab has its own bar, and
+    /// only a bar someone can see needs fresh numbers. A bar never told is taken as seen, so a tab
+    /// made in the background still probes, as before.
+    hidden: bool,
 }
 
 /// `PaletteColor` as an SGR colour parameter. The enum has exactly two variants and both are
@@ -148,6 +154,13 @@ fn parse_list(v: Option<&String>) -> Vec<String> {
 }
 
 impl SlimKeybinds {
+    /// Start a probe if this bar is seen and none is in flight.
+    fn probe(&mut self) {
+        if self.show_vitals && !self.hidden && self.probe.start() {
+            vitals::request();
+        }
+    }
+
     /// Hints for the current mode, after `hide` and `rename` have been applied.
     fn visible_hints(&self) -> Hints {
         let mut hints = hints_for_mode(&self.mode_info, self.mode_info.mode);
@@ -280,6 +293,7 @@ impl ZellijPlugin for SlimKeybinds {
             EventType::Timer,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
+            EventType::Visible,
         ]);
 
         self.hide = parse_list(configuration.get("hide"))
@@ -359,22 +373,34 @@ impl ZellijPlugin for SlimKeybinds {
 
             // The ONLY place the timer is re-armed, so the chain can never fork. No warm-up any
             // more: the probe carries both CPU samples itself, so the first result is already a
-            // real reading and there is nothing to prime.
+            // real reading and there is nothing to prime. The timer stays armed while the bar is
+            // hidden or a probe is out; only the probe is skipped.
             Event::Timer(_) => {
                 if !self.show_vitals {
                     return false;
                 }
                 set_timeout(VITALS_INTERVAL);
-                vitals::request();
+                self.probe();
+                false
+            },
+
+            // A tab someone switches to shows fresh numbers at once, rather than the ones it had
+            // when it was last seen. A probe already out answers soon enough; a switch is not a
+            // tick, so it never counts that probe down.
+            Event::Visible(visible) => {
+                self.hidden = !visible;
+                if !self.probe.is_out() {
+                    self.probe();
+                }
                 false
             },
 
             // A grant can land after the first probe was already refused, so re-probe rather
-            // than waiting out an interval with an empty cluster.
+            // than waiting out an interval with an empty cluster. A refused probe never answers,
+            // so the gate is cleared first.
             Event::PermissionRequestResult(_) => {
-                if self.show_vitals {
-                    vitals::request();
-                }
+                self.probe.landed();
+                self.probe();
                 false
             },
 
@@ -382,6 +408,7 @@ impl ZellijPlugin for SlimKeybinds {
                 if context.get("source").map(|s| s.as_str()) != Some(vitals::CONTEXT_SOURCE) {
                     return false;
                 }
+                self.probe.landed();
                 // A non-zero exit means a partial or missing probe; keeping the previous
                 // numbers beats blanking the cluster on one bad tick.
                 exit_code == Some(0) && self.vitals.parse(&stdout)

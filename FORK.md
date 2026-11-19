@@ -8695,6 +8695,29 @@ before.
 `socket_dir_redirects`), `src/session_commands.rs` (`refuse_a_scratch_pin`). Tests in
 `session_lifecycle.rs`. No contract change.
 
+### The vitals probe never overlaps itself
+
+`slim-keybinds` draws its vitals cluster from a `/bin/sh` probe every ten seconds. On macOS the
+probe runs `top -l 2 -n 0 -s 1`, which takes a second when the machine is idle and far longer when it
+is not. The timer fired whether or not the last probe had answered, so under load the probes piled
+up, each `top` slowed the others, and one Mac reached a load average near 300. Every tab has its own
+bar, and every bar ran its own probe.
+
+- **One probe in flight per bar.** A tick that finds a probe still out is skipped. A probe
+  unanswered for three ticks counts as lost, and the next tick starts a new one, so a result that
+  never comes cannot stop the cluster.
+- **Only a bar someone can see probes.** The bar subscribes to `Visible`, which zellij sends when
+  a tab gains its first client or loses its last. A hidden bar keeps its last numbers and skips its
+  probes; a tab switched to probes at once, unless a probe is already out. A bar never told, such as one in a tab an agent made in
+  the background, probes as before. A fully detached session gets no `Visible` events, so each of its
+  bars still probes, one at a time.
+- The macOS probe still uses `top -l 2 -s 1`. A cheaper source of CPU ticks would need a
+  sample kept between probes; with one probe at a time and only visible bars probing, the cost is
+  bounded.
+
+`default-plugins/slim-keybinds/src/vitals.rs` (`ProbeGate`), `default-plugins/slim-keybinds/src/main.rs`.
+Tests in `vitals.rs`. The checked-in `slim-keybinds.wasm` is rebuilt. No contract change.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

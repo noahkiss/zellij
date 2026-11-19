@@ -1,4 +1,4 @@
-//! System vitals: one host probe per tick, parsed into a right-corner cluster.
+//! System vitals: at most one host probe in flight per bar, parsed into a right-corner cluster.
 //!
 //!     cpu 12% │ ram 7.0/23G │ disk 412/931G │ bat 87% │ fda ok
 //!
@@ -136,6 +136,50 @@ pub fn probe_command() -> String {
      esac; \
      echo \"DISK $(df -Pk \"$(eval echo ~\"$(id -un)\")\" | tail -1)\""
         .to_string()
+}
+
+/// How many timer ticks a probe may stay unanswered before it counts as lost. Three intervals, so a
+/// slow probe under load gets time to finish, and a result that never comes cannot stop the cluster
+/// for good.
+pub const LOST_AFTER_TICKS: u32 = 3;
+
+/// At most one probe in flight per bar.
+///
+/// The timer fires every interval whether or not the last probe has answered. Under load a probe
+/// outlived the interval, the next one started beside it, and they piled up: `top -l 2` runs at
+/// high CPU, so each new one made the others slower. This gate skips a tick while a probe is out.
+#[derive(Default, Debug, PartialEq)]
+pub struct ProbeGate {
+    /// `Some(ticks skipped)` while a probe is out.
+    in_flight: Option<u32>,
+}
+
+impl ProbeGate {
+    /// Whether to start a probe now. A started probe is marked in flight. A probe out for
+    /// [`LOST_AFTER_TICKS`] ticks is taken for lost, and a new one starts.
+    pub fn start(&mut self) -> bool {
+        match self.in_flight {
+            Some(skipped) if skipped + 1 < LOST_AFTER_TICKS => {
+                self.in_flight = Some(skipped + 1);
+                false
+            },
+            _ => {
+                self.in_flight = Some(0);
+                true
+            },
+        }
+    }
+
+    /// The probe answered, well or badly. The next tick may start another.
+    pub fn landed(&mut self) {
+        self.in_flight = None;
+    }
+
+    /// Whether a probe is out. A tab switched to probes only when none is, so switching tabs
+    /// cannot count down a slow probe's ticks.
+    pub fn is_out(&self) -> bool {
+        self.in_flight.is_some()
+    }
 }
 
 /// Fire the probe. Requires `RunCommands`.
@@ -362,5 +406,40 @@ impl Vitals {
             ));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_probe_in_flight_skips_the_tick() {
+        let mut gate = ProbeGate::default();
+        assert!(gate.start());
+        assert!(!gate.start());
+        gate.landed();
+        assert!(gate.start());
+    }
+
+    #[test]
+    fn a_lost_probe_is_given_up_after_a_few_ticks() {
+        let mut gate = ProbeGate::default();
+        assert!(gate.start());
+        for _ in 1..LOST_AFTER_TICKS {
+            assert!(!gate.start());
+        }
+        assert!(gate.start(), "taken for lost");
+        assert!(!gate.start(), "the new probe is in flight");
+    }
+
+    #[test]
+    fn a_probe_out_is_reported() {
+        let mut gate = ProbeGate::default();
+        assert!(!gate.is_out());
+        gate.start();
+        assert!(gate.is_out());
+        gate.landed();
+        assert!(!gate.is_out());
     }
 }
