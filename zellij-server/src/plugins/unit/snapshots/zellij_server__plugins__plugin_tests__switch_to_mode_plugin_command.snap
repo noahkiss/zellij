@@ -6,7 +6,6 @@ Some(
     ChangeMode(
         1,
         Tab,
-        false,
         Some(
             NotificationEnd {
                 channel: None,
