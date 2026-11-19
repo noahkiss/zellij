@@ -1066,20 +1066,6 @@ pub enum SnapshotCli {
         #[clap(long)]
         yes: bool,
     },
-    /// Adopt saved layouts left in the cache by other versions or contract versions
-    Import {
-        /// A session_info directory, or a single session folder, to import instead of the cache
-        #[clap(long, value_parser)]
-        from: Option<PathBuf>,
-
-        /// Report what would be imported without writing anything
-        #[clap(long)]
-        dry_run: bool,
-
-        /// Delete each source folder once it has been imported
-        #[clap(long)]
-        prune_source: bool,
-    },
     /// Delete all but the newest snapshots of each session
     Prune {
         /// How many snapshots to keep per session name, defaults to session_snapshot_limit

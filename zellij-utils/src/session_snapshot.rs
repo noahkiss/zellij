@@ -120,7 +120,8 @@ pub struct SnapshotMeta {
     pub reason: SnapshotReason,
     pub tabs: usize,
     pub panes: usize,
-    /// The directory this snapshot was imported from, for imported snapshots only.
+    /// The directory this snapshot was imported from, read back from a sidecar an earlier build's
+    /// `snapshot import` wrote. Nothing writes it now.
     pub imported_from: Option<String>,
 }
 
@@ -223,9 +224,8 @@ impl SnapshotMeta {
 
 /// What an archiving attempt actually did.
 ///
-/// The three no-snapshot cases are separate on purpose. A caller that deletes the source once it
-/// is safely archived - `snapshot import --prune-source` - must not act on `Disabled`, where
-/// nothing was read and nothing was written.
+/// The three no-snapshot cases are separate on purpose: `save-session --archive` reports
+/// `Disabled` as an error rather than as nothing new to archive.
 #[derive(Debug, Clone)]
 pub enum ArchiveOutcome {
     /// A new snapshot was written.
@@ -245,14 +245,6 @@ impl ArchiveOutcome {
             ArchiveOutcome::Archived(snapshot) => Some(snapshot),
             _ => None,
         }
-    }
-    /// Whether the source folder is now safely in the archive - either because this call put it
-    /// there, or because an earlier one did. The only condition under which pruning it is safe.
-    pub fn source_is_archived(&self) -> bool {
-        matches!(
-            self,
-            ArchiveOutcome::Archived(_) | ArchiveOutcome::AlreadyArchived
-        )
     }
 }
 
@@ -312,8 +304,8 @@ fn session_archive_dir(settings: &SnapshotSettings, session_name: &str) -> PathB
 /// timestamps that change on every write and would make every save look like a new shape, and not
 /// the server's version stamp, which changes with every server.
 ///
-/// Used to give a snapshot its short id, to keep the same shape from being archived twice in a row,
-/// and to make `snapshot import` idempotent.
+/// Used to give a snapshot its short id, and to keep the same shape from being archived twice in a
+/// row.
 fn hash_directory_contents(dir: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
@@ -416,17 +408,16 @@ pub fn archive_session_info(
     settings: &SnapshotSettings,
 ) -> Result<ArchiveOutcome, String> {
     let source = session_info_folder_for_session(session_name);
-    archive_session_info_folder(&source, session_name, reason, settings, None)
+    archive_session_info_folder(&source, session_name, reason, settings)
 }
 
-/// The general form of [`archive_session_info`], for folders that are not this machine's live
-/// `session_info` folder for that name (the legacy locations `snapshot import` walks).
+/// The general form of [`archive_session_info`], for a folder that is not this machine's live
+/// `session_info` folder for that name.
 pub fn archive_session_info_folder(
     source: &Path,
     session_name: &str,
     reason: SnapshotReason,
     settings: &SnapshotSettings,
-    imported_from: Option<String>,
 ) -> Result<ArchiveOutcome, String> {
     if !settings.enabled() {
         return Ok(ArchiveOutcome::Disabled);
@@ -436,16 +427,9 @@ pub fn archive_session_info_folder(
     }
     let hash = hash_directory_contents(source)
         .map_err(|e| format!("failed to read {}: {}", source.display(), e))?;
-    let existing = snapshots_for_session(settings, session_name);
-    let is_import = imported_from.is_some();
-    let already_archived = if is_import {
-        // import is idempotent against the whole archive, so re-running it adds nothing
-        existing.iter().any(|snapshot| snapshot.id.ends_with(&hash))
-    } else {
-        existing
-            .last()
-            .map_or(false, |newest| newest.id.ends_with(&hash))
-    };
+    let already_archived = snapshots_for_session(settings, session_name)
+        .last()
+        .map_or(false, |newest| newest.id.ends_with(&hash));
     if already_archived {
         return Ok(ArchiveOutcome::AlreadyArchived);
     }
@@ -459,7 +443,7 @@ pub fn archive_session_info_folder(
         reason,
         tabs,
         panes,
-        imported_from,
+        imported_from: None,
     };
     let id = format!("{}-{}", meta.saved_at, hash);
     let destination = session_archive_dir(settings, session_name).join(&id);
@@ -625,95 +609,6 @@ pub fn prune_session(
     removed
 }
 
-/// A `session_info` folder in the cache that this binary does not use, holding a saved layout.
-#[derive(Debug, Clone)]
-pub struct ImportableFolder {
-    pub path: PathBuf,
-    pub session_name: String,
-    /// The cache directory it came from, eg. `0.43.1` or `contract_version_1`, recorded in the
-    /// sidecar so an imported snapshot says where it was adopted from.
-    pub from: String,
-}
-
-/// The `session_info` directories of other versions and other client/server contracts.
-///
-/// Before 0.44.0 session state was scoped by version rather than by contract, so an upgrade left
-/// the old directory stranded. The same happens to the current directory the day upstream bumps the
-/// contract version. Both look identical from here.
-pub fn legacy_session_info_dirs() -> Vec<PathBuf> {
-    use crate::consts::{ZELLIJ_CACHE_DIR, ZELLIJ_SESSION_INFO_CACHE_DIR};
-    let Ok(entries) = std::fs::read_dir(&*ZELLIJ_CACHE_DIR) else {
-        return vec![];
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path().join("session_info"))
-        .filter(|dir| dir.is_dir() && dir != &*ZELLIJ_SESSION_INFO_CACHE_DIR)
-        .collect();
-    dirs.sort();
-    dirs
-}
-
-/// The session folders under one or more `session_info` directories.
-///
-/// A directory that holds a `session-layout.kdl` itself is taken as a single session folder, so
-/// `--from` accepts either shape.
-pub fn importable_folders(dirs: &[PathBuf]) -> Vec<ImportableFolder> {
-    let mut folders = vec![];
-    for dir in dirs {
-        let from = dir
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| dir.display().to_string());
-        if dir.join(SNAPSHOT_LAYOUT_FILE_NAME).exists() {
-            if let Some(session_name) = dir.file_name() {
-                folders.push(ImportableFolder {
-                    path: dir.clone(),
-                    session_name: session_name.to_string_lossy().to_string(),
-                    from,
-                });
-            }
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || !path.join(SNAPSHOT_LAYOUT_FILE_NAME).exists() {
-                continue;
-            }
-            folders.push(ImportableFolder {
-                session_name: entry.file_name().to_string_lossy().to_string(),
-                path,
-                from: from.clone(),
-            });
-        }
-    }
-    folders
-}
-
-/// Whether the archive already holds this exact shape for this session name.
-pub fn is_already_archived(settings: &SnapshotSettings, folder: &ImportableFolder) -> bool {
-    let Ok(hash) = hash_directory_contents(&folder.path) else {
-        return false;
-    };
-    snapshots_for_session(settings, &folder.session_name)
-        .iter()
-        .any(|snapshot| snapshot.id.ends_with(&hash))
-}
-
-/// How many legacy layouts are sitting outside the archive, for the one-line hint `snapshot list`
-/// prints. Deliberately only a hint: nothing is ever swept automatically, because silently
-/// relocating a user's files is indistinguishable from data loss when it goes wrong.
-pub fn unimported_legacy_layout_count(settings: &SnapshotSettings) -> usize {
-    importable_folders(&legacy_session_info_dirs())
-        .iter()
-        .filter(|folder| !is_already_archived(settings, folder))
-        .count()
-}
-
 /// Prune every session in the archive.
 pub fn prune_all(settings: &SnapshotSettings, keep: usize) -> Vec<Snapshot> {
     archived_session_names(settings)
@@ -799,16 +694,11 @@ mod tests {
         write_session_info_folder(&source, "layout {\n    tab\n}\n");
         std::fs::write(source.join("initial_contents_1"), "some pane content").unwrap();
 
-        let snapshot = archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Manual,
-            &settings,
-            None,
-        )
-        .unwrap()
-        .into_snapshot()
-        .expect("a snapshot should have been written");
+        let snapshot =
+            archive_session_info_folder(&source, "a-session", SnapshotReason::Manual, &settings)
+                .unwrap()
+                .into_snapshot()
+                .expect("a snapshot should have been written");
 
         assert!(snapshot.path.join(SNAPSHOT_LAYOUT_FILE_NAME).exists());
         assert!(snapshot.path.join("initial_contents_1").exists());
@@ -829,16 +719,11 @@ mod tests {
         // a new server is a new pid, and the same shape must still hash the same
         assert_eq!(hash_directory_contents(&source).unwrap(), unstamped);
 
-        let snapshot = archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Manual,
-            &settings,
-            None,
-        )
-        .unwrap()
-        .into_snapshot()
-        .expect("a snapshot should have been written");
+        let snapshot =
+            archive_session_info_folder(&source, "a-session", SnapshotReason::Manual, &settings)
+                .unwrap()
+                .into_snapshot()
+                .expect("a snapshot should have been written");
         assert!(!snapshot
             .path
             .join(crate::consts::SERVER_VERSION_STAMP_FILE_NAME)
@@ -853,19 +738,10 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join(SNAPSHOT_METADATA_FILE_NAME), "").unwrap();
 
-        let outcome = archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Manual,
-            &settings,
-            None,
-        )
-        .unwrap();
+        let outcome =
+            archive_session_info_folder(&source, "a-session", SnapshotReason::Manual, &settings)
+                .unwrap();
         assert!(matches!(outcome, ArchiveOutcome::NothingToArchive));
-        assert!(
-            !outcome.source_is_archived(),
-            "a folder that was not archived must never be pruned"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -876,54 +752,11 @@ mod tests {
         let source = root.join("session_info").join("a-session");
         write_session_info_folder(&source, "layout {\n    tab\n}\n");
 
-        let outcome = archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Manual,
-            &settings,
-            None,
-        )
-        .unwrap();
-        // The distinction that keeps `snapshot import --prune-source` from deleting every source
-        // folder when archiving is off: this is NOT the "already in the archive" answer.
+        let outcome =
+            archive_session_info_folder(&source, "a-session", SnapshotReason::Manual, &settings)
+                .unwrap();
+        // this is NOT the "already in the archive" answer
         assert!(matches!(outcome, ArchiveOutcome::Disabled));
-        assert!(
-            !outcome.source_is_archived(),
-            "nothing was archived, so the source must not be pruned"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn only_an_archived_source_may_be_pruned() {
-        let (settings, root) = temp_settings("prunable");
-        let source = root.join("session_info").join("a-session");
-        write_session_info_folder(&source, "layout {\n    tab\n}\n");
-
-        let first = archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Imported,
-            &settings,
-            Some("session_info".to_owned()),
-        )
-        .unwrap();
-        assert!(matches!(first, ArchiveOutcome::Archived(_)));
-        assert!(first.source_is_archived());
-
-        let second = archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Imported,
-            &settings,
-            Some("session_info".to_owned()),
-        )
-        .unwrap();
-        assert!(matches!(second, ArchiveOutcome::AlreadyArchived));
-        assert!(
-            second.source_is_archived(),
-            "a re-import is the one no-snapshot case where pruning is safe"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -937,39 +770,26 @@ mod tests {
             &source,
             "a-session",
             SnapshotReason::Shutdown,
-            &settings,
-            None
+            &settings
         )
         .unwrap()
         .into_snapshot()
         .is_some());
         assert!(
-            archive_session_info_folder(
-                &source,
-                "a-session",
-                SnapshotReason::Delete,
-                &settings,
-                None
-            )
-            .unwrap()
-            .into_snapshot()
-            .is_none(),
+            archive_session_info_folder(&source, "a-session", SnapshotReason::Delete, &settings)
+                .unwrap()
+                .into_snapshot()
+                .is_none(),
             "the teardown pair should leave one snapshot, not two"
         );
         assert_eq!(snapshots_for_session(&settings, "a-session").len(), 1);
 
         write_session_info_folder(&source, "layout {\n    tab\n    tab\n}\n");
         assert!(
-            archive_session_info_folder(
-                &source,
-                "a-session",
-                SnapshotReason::Delete,
-                &settings,
-                None
-            )
-            .unwrap()
-            .into_snapshot()
-            .is_some(),
+            archive_session_info_folder(&source, "a-session", SnapshotReason::Delete, &settings)
+                .unwrap()
+                .into_snapshot()
+                .is_some(),
             "a changed shape is a new snapshot"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -988,7 +808,6 @@ mod tests {
                 "a-session",
                 SnapshotReason::Manual,
                 &settings,
-                None,
             )
             .unwrap()
             .into_snapshot()
@@ -1006,61 +825,6 @@ mod tests {
     }
 
     #[test]
-    fn importable_folders_accept_a_session_info_dir_or_a_single_session_folder() {
-        let (_settings, root) = temp_settings("importable");
-        let session_info = root.join("0.43.1").join("session_info");
-        write_session_info_folder(&session_info.join("one"), "layout {\n    tab\n}\n");
-        write_session_info_folder(&session_info.join("two"), "layout {\n    tab\n}\n");
-        std::fs::create_dir_all(session_info.join("no-layout")).unwrap();
-
-        let mut from_parent: Vec<String> = importable_folders(&[session_info.clone()])
-            .into_iter()
-            .map(|folder| folder.session_name)
-            .collect();
-        from_parent.sort();
-        assert_eq!(from_parent, vec!["one".to_owned(), "two".to_owned()]);
-
-        let single = importable_folders(&[session_info.join("one")]);
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].session_name, "one");
-        assert_eq!(single[0].from, "session_info");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn importing_the_same_folder_twice_adds_one_snapshot() {
-        let (settings, root) = temp_settings("import-idempotent");
-        let source = root.join("0.43.1").join("session_info").join("a-session");
-        write_session_info_folder(&source, "layout {\n    tab\n}\n");
-        let folder = importable_folders(&[source.clone()]).pop().unwrap();
-
-        assert!(!is_already_archived(&settings, &folder));
-        assert!(archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Imported,
-            &settings,
-            Some(folder.from.clone())
-        )
-        .unwrap()
-        .into_snapshot()
-        .is_some());
-        assert!(is_already_archived(&settings, &folder));
-        assert!(archive_session_info_folder(
-            &source,
-            "a-session",
-            SnapshotReason::Imported,
-            &settings,
-            Some(folder.from.clone())
-        )
-        .unwrap()
-        .into_snapshot()
-        .is_none());
-        assert_eq!(snapshots_for_session(&settings, "a-session").len(), 1);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn snapshots_resolve_by_latest_exact_id_and_unique_prefix() {
         let (settings, root) = temp_settings("resolve");
         let source = root.join("session_info").join("a-session");
@@ -1073,7 +837,6 @@ mod tests {
                     "a-session",
                     SnapshotReason::Manual,
                     &settings,
-                    None,
                 )
                 .unwrap()
                 .into_snapshot()

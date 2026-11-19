@@ -23,9 +23,8 @@ use zellij_utils::sessions::{
 use zellij_utils::consts::session_layout_cache_file_name;
 use zellij_utils::consts::{CLIENT_SERVER_CONTRACT_VERSION, VERSION};
 use zellij_utils::session_snapshot::{
-    archive_session_info, archive_session_info_folder, importable_folders, is_already_archived,
-    legacy_session_info_dirs, list_snapshots, prune_all, remove_snapshot, resolve_snapshot,
-    unimported_legacy_layout_count, ArchiveOutcome, Snapshot, SnapshotReason, SnapshotSettings,
+    archive_session_info, list_snapshots, prune_all, remove_snapshot, resolve_snapshot,
+    ArchiveOutcome, Snapshot, SnapshotReason, SnapshotSettings,
 };
 
 #[cfg(feature = "web_server_capability")]
@@ -224,13 +223,6 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
                 },
             }
         },
-        SnapshotCli::Import {
-            from,
-            dry_run,
-            prune_source,
-        } => {
-            import_snapshots_command(&settings, from, dry_run, prune_source);
-        },
         SnapshotCli::Prune { keep, yes } => {
             let keep = keep.unwrap_or(settings.limit);
             confirm_or_exit("snapshot prune", destroys::SNAPSHOT_PRUNE, yes);
@@ -243,92 +235,6 @@ pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
         },
     }
     process::exit(0);
-}
-
-fn import_snapshots_command(
-    settings: &SnapshotSettings,
-    from: Option<PathBuf>,
-    dry_run: bool,
-    prune_source: bool,
-) {
-    // Refuse before the loop rather than per folder. With archiving off, every folder would be
-    // reported as already archived and --prune-source would then delete a source nothing kept.
-    if !settings.enabled() {
-        eprintln!(
-            "Archiving is off (`session_snapshot_limit 0`), so there is nowhere to import to.\n\
-             Set a non-zero `session_snapshot_limit` and run this again. Nothing was read, written\n\
-             or removed."
-        );
-        process::exit(2);
-    }
-    let dirs = match from {
-        Some(from) => vec![from],
-        None => legacy_session_info_dirs(),
-    };
-    let folders = importable_folders(&dirs);
-    if folders.is_empty() {
-        println!("Nothing to import.");
-        return;
-    }
-    let mut imported = 0;
-    let mut skipped = 0;
-    for folder in folders {
-        if dry_run {
-            if is_already_archived(settings, &folder) {
-                println!(
-                    "would skip  {} ({}) - already in the archive",
-                    folder.session_name, folder.from
-                );
-                skipped += 1;
-            } else {
-                println!("would import {} ({})", folder.session_name, folder.from);
-                imported += 1;
-            }
-            continue;
-        }
-        let outcome = match archive_session_info_folder(
-            &folder.path,
-            &folder.session_name,
-            SnapshotReason::Imported,
-            settings,
-            Some(folder.from.clone()),
-        ) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                eprintln!("failed to import {}: {}", folder.path.display(), e);
-                continue;
-            },
-        };
-        match &outcome {
-            ArchiveOutcome::Archived(snapshot) => {
-                println!(
-                    "imported {} ({}) as {}",
-                    folder.session_name, folder.from, snapshot.id
-                );
-                imported += 1;
-            },
-            ArchiveOutcome::AlreadyArchived => {
-                println!(
-                    "skipped  {} ({}) - already in the archive",
-                    folder.session_name, folder.from
-                );
-                skipped += 1;
-            },
-            // Unreachable through this command - the disabled case exits above, and
-            // importable_folders only yields folders that hold a layout. Said honestly anyway,
-            // because the source is NOT in the archive here and must not be pruned.
-            ArchiveOutcome::Disabled | ArchiveOutcome::NothingToArchive => eprintln!(
-                "skipped  {} ({}) - nothing was archived",
-                folder.session_name, folder.from
-            ),
-        }
-        if prune_source && outcome.source_is_archived() {
-            if let Err(e) = std::fs::remove_dir_all(&folder.path) {
-                eprintln!("failed to remove {}: {}", folder.path.display(), e);
-            }
-        }
-    }
-    println!("{} imported, {} already present.", imported, skipped);
 }
 
 fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, json: bool) {
@@ -364,7 +270,6 @@ fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, js
     }
     if snapshots.is_empty() {
         eprintln!("No snapshots in {}.", settings.dir.display());
-        print_legacy_layout_hint(settings);
         return;
     }
     println!(
@@ -386,19 +291,6 @@ fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, js
             snapshot.meta.tabs,
             snapshot.meta.panes,
             unparseable
-        );
-    }
-    print_legacy_layout_hint(settings);
-}
-
-/// Say that adoptable layouts exist; never adopt them. Silently relocating a user's files is the
-/// kind of helpfulness that is indistinguishable from data loss when it goes wrong.
-fn print_legacy_layout_hint(settings: &SnapshotSettings) {
-    let count = unimported_legacy_layout_count(settings);
-    if count > 0 {
-        eprintln!(
-            "\n{} saved layout(s) from another version or contract are not in the archive. Adopt them with:\n    zellij snapshot import",
-            count
         );
     }
 }

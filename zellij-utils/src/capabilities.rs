@@ -36,7 +36,6 @@ pub const CAPABILITIES: &[&str] = &[
     "build-mismatch-warning", // a client warns when the running server is another build
     // the snapshot archive
     "session-snapshots", // zellij snapshot list|show|restore|rm|prune, attach --restore
-    "snapshot-import",   // zellij snapshot import
     // pane and client identity, all of it in `list-panes --json` / `list-clients`
     "pane-uuid",                // PaneInfo.uuid
     "pane-restored-from",       // PaneInfo.restored_from

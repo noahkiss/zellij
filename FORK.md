@@ -1363,7 +1363,8 @@ their own — with it off (the default) a snapshot is two KDL files.
 
 Bare `save-session` keeps its in-place behaviour; `--archive` is handled by the CLI client after the
 existing action returns, so nothing here crosses the client/server contract and plugins see nothing
-new.
+new. With archiving off (`session_snapshot_limit 0`) `--archive` exits 2 and names the setting,
+rather than reporting `Nothing new to archive.`
 
 #### Reading and restoring the archive
 
@@ -1400,24 +1401,9 @@ A restored layout runs its recorded commands, exactly as resurrection does today
 weeks ago is a sharper edge than a session that died minutes ago, so `snapshot show` prints the
 layout before `restore` acts on it. There is deliberately no confirmation prompt.
 
-#### Adopting layouts the archive never saw
+#### A session under another contract
 
-```
-zellij snapshot import [--from <dir>] [--dry-run] [--prune-source]
-```
-
-Scans the `session_info` directories in the cache that this binary does not use — `$cache/<version>/`
-from before 0.44.0 moved session state to contract scoping, and `$cache/contract_version_*/` for the
-day upstream bumps the contract — and copies every folder holding a `session-layout.kdl` into the
-archive with reason `imported`, stamped with the directory it came from. `--from` takes either a
-`session_info` directory or a single session folder. Importing is idempotent: a folder whose shape is
-already archived under that session name is skipped, so re-running adds nothing.
-
-Nothing is ever swept automatically. Silently relocating a user's files is the kind of helpfulness
-that is indistinguishable from data loss when it goes wrong, so `snapshot list` prints one line when
-it sees adoptable layouts and leaves the decision to the user.
-
-The same contract bump that strands a `session_info` directory also makes a running session
+A contract bump makes a running session
 unreachable: the socket path is contract-scoped and the wire format genuinely differs, so a
 mismatched client attaching to a live server is a protocol violation rather than a path problem.
 Attaching to a name that only exists under another contract now says so, and names the way out:
@@ -5513,34 +5499,6 @@ unused global flag) and silently did nothing.
 `attach`'s own positional still wins when both are given - `zellij -s foo attach bar` means `bar`,
 the more specific of the two - but now falls back to `-s` when it is empty, the same way `action`
 and `subscribe` already do.
-
-### `snapshot import --prune-source` prunes only what it archived
-
-Archiving answered three different questions with the same word. `archive_session_info_folder`
-returned `Ok(None)` for "the archive already holds this exact shape", for "this folder has no
-layout", and for "archiving is switched off" — and one of those three is the only one where the
-source folder is safe to delete.
-
-`snapshot import --prune-source` read all three as the first. With `session_snapshot_limit 0` it
-printed `skipped <name> - already in the archive` for every legacy `session_info` folder it found,
-which was false, and then removed each one. Nothing had been archived, and nothing was left. The
-same conflation made `save-session --archive` report `Nothing new to archive.` on a machine where
-archiving was simply off.
-
-The return type now says which case it is. `ArchiveOutcome` has an `Archived` variant carrying the
-snapshot, `AlreadyArchived`, `Disabled` and `NothingToArchive`, and `source_is_archived()` answers
-the one question a pruning caller actually has — is this folder in the archive now, whether or not
-this call is what put it there. Only `Archived` and `AlreadyArchived` say yes, so the prune is
-guarded by the fact rather than by the absence of a snapshot.
-
-`snapshot import` also refuses up front when archiving is off, before it walks anything, rather
-than reporting per folder on work it was never going to do. It exits 2 and names the setting. The
-dry run refuses with it, which is the point: `--dry-run` used to promise imports that a real run
-would not have made either. `save-session --archive` grew the same distinction and exits 2 instead
-of claiming there was nothing new.
-
-The four fire-and-forget callers in the server and in `delete-session` are unchanged; they only
-ever looked at the `Err`.
 
 ### The recorded `XDG_STATE_HOME` is read back, not re-derived
 
