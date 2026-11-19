@@ -8512,6 +8512,22 @@ Files: `zellij-server/src/screen.rs` (`AddPlugin`, `ApplyLayout`), `zellij-serve
 plugin pane opening in a tab the client is not in, and a new tab that keeps the pane the plugin
 thread named. No client/server contract changes.
 
+### `zellij_create kind=tab` names the tab
+
+```
+zellij_create {"kind": "tab", "name": "build"}
+action new-tab --name=build --wait-ready --ready-timeout=10
+```
+
+Without `name`, a tab an agent makes is called `Tab #N`. `name` names the tab, and only the tab: it
+is accepted with `kind: tab` alone. Any other kind, and `reopen`, refuse it with one line before a
+session is asked anything. A pane still keeps its generated handle, and a command pane is still
+named after its command.
+
+`src/mcp/tools.rs` (the `name` parameter and the tool's tips) and `src/mcp/invoke.rs`
+(`create_kind_allowed`, the `tab` arm of `argv_in`). Tests: the tab's name on the command line, a
+name that starts with a dash, and the refusals. CLI-side only; no contract change.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

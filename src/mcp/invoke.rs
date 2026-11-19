@@ -618,7 +618,15 @@ fn create_kind_allowed(args: &Args) -> Result<(), String> {
     if args.values.contains_key("floating") {
         return Err("`floating` is unsupported; use stacked, agent_tab or tab.".to_owned());
     }
-    match args.enumerated("kind", CREATE_KIND_DEFAULT).as_str() {
+    let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
+    // `name` names a new tab. A pane keeps its generated handle and its command's name
+    if kind != "tab" && args.values.contains_key("name") {
+        return Err(format!(
+            "`name` names a new tab and needs kind: tab, not kind: {}.",
+            kind
+        ));
+    }
+    match kind.as_str() {
         "agent_tab" | "stacked" | "tab" => Ok(()),
         other => Err(format!(
             "`kind` must be agent_tab, stacked or tab, not `{}`.",
@@ -902,7 +910,7 @@ fn argv_in(
         "zellij_create" if args.string("reopen").is_some() => {
             let reopen = args.string("reopen").unwrap_or_default();
             // the pane comes back as it was: its tab, its directory, its handle, its line
-            if let Some(param) = ["kind", "command", "run_in", "cwd"]
+            if let Some(param) = ["kind", "command", "run_in", "cwd", "name"]
                 .into_iter()
                 .find(|param| args.values.contains_key(*param))
             {
@@ -993,6 +1001,9 @@ fn argv_in(
                     rest.push("new-tab".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
+                    }
+                    if let Some(name) = args.string("name") {
+                        rest.push(flag_value("--name", &name));
                     }
                     finish(&mut rest);
                 },
@@ -2042,6 +2053,51 @@ mod tests {
         )
         .expect_err("a cwd that is not there")
         .contains("/nonexistent-dir is not a directory"));
+    }
+
+    #[test]
+    fn a_tab_takes_a_name_and_a_pane_does_not() {
+        assert_eq!(
+            line(
+                "zellij_create",
+                json!({"kind": "tab", "name": "build"}),
+                Some("work")
+            ),
+            "-s work action new-tab --name=build --wait-ready --ready-timeout=10"
+        );
+        // a name that begins with a dash is a name, not a flag
+        assert!(
+            line("zellij_create", json!({"kind": "tab", "name": "-x"}), None).contains("--name=-x")
+        );
+        for kind in ["stacked", "agent_tab"] {
+            let refused = refusal("zellij_create", json!({"kind": kind, "name": "build"}));
+            assert_eq!(
+                refused,
+                format!(
+                    "`name` names a new tab and needs kind: tab, not kind: {}.",
+                    kind
+                )
+            );
+        }
+        // the default kind is agent_tab, and a pane in it keeps its generated handle
+        assert!(refusal("zellij_create", json!({"name": "build"})).contains("kind: agent_tab"));
+        assert!(
+            refusal("zellij_create", json!({"reopen": "last", "name": "build"}))
+                .contains("takes no `name`")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_tab_create_refuses_a_name_before_asking_the_session() {
+        let call = plan_in(
+            "zellij_create",
+            &args(json!({"name": "build"})),
+            Some("no-such-session-mcp-test"),
+            &a_shell_env(),
+            &Target::Local,
+        )
+        .await;
+        assert!(matches!(call, Err(reason) if reason.contains("needs kind: tab")));
     }
 
     #[test]

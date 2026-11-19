@@ -406,7 +406,8 @@ pub const TOOLS: &[ToolSpec] = &[
                The answer carries the pane's id and its generated handle. The handle is the \
                pane's address and survives a session restore: use it, not the integer id, for \
                every later call on the pane. You cannot choose a pane's name or handle; a pane \
-               running a command is named after the command. On another machine (session host/session) kind is \
+               running a command is named after the command. kind=tab takes `name` for the \
+               tab itself. On another machine (session host/session) kind is \
                agent_tab or tab, cwd is an absolute path there, and exec runs through /bin/sh.",
         params: &[
             SESSION,
@@ -465,6 +466,15 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "The directory the pane starts in. `~`, `$VAR` and a relative path are \
                            expanded against this server's own environment; a path that is not a \
                            directory fails the call rather than being ignored.",
+                default: None,
+            },
+            ParamSpec {
+                name: "name",
+                kind: ParamKind::Str,
+                required: false,
+                from: None,
+                describe: "With kind=tab only: the new tab's name. Without one zellij numbers \
+                           the tab. Any other kind refuses it; a pane keeps its generated handle.",
                 default: None,
             },
             ParamSpec {
