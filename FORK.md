@@ -8197,9 +8197,8 @@ remote_hosts {
 
 ```
 zellij_overview {"scope": "fleet"}
-boxa: work: brisk-heron claude blocked/permission tab=build out=42s /home/u/app
-boxb: work: calm-otter codex working tab=work-zj out=3s /Users/u/site
-boxc: unreachable: ssh could not reach boxc (exit 255): ...
+  # text: how_to_message, then the agents grouped by host, tab and pane (see "Agent listings are
+  # grouped by host, tab and pane"); structure: {agents, hosts}, one row per agent
 
 zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
 ```
@@ -8239,10 +8238,9 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
   `PATH`. `ZELLIJ_MCP_SSH` names a different ssh program, for tests. Exit 255 is ssh's own failure
   and is reported as "ssh could not reach <host>".
 - **`zellij_overview scope=fleet`** runs `list-agents --all-sessions --json` here
-  and on every remote host at once, each bounded by 10 seconds. Every row gains `host`. The text is
-  one line per agent, `host: session: handle kind state tab=… out=…s cwd`. A host that does not
-  answer is one `unreachable` row, and one that answers with an error is one `error` row, never a
-  failed call. A host on a build from before `--all-sessions` gets `ls --json` and one
+  and on every remote host at once, each bounded by 10 seconds. Every row gains `host`. A host that does not
+  answer is one host entry with its `error` and `error_kind` `unreachable`, and one that answers
+  with an error has `error_kind` `error`, never a failed call. A host on a build from before `--all-sessions` gets `ls --json` and one
   `list-agents` per session instead, so a fleet halfway through an upgrade still lists. The
   structured result is `{agents, hosts}`, where `hosts` says per host how many agents it has, or
   its error. It takes no `session`. State and output ages are computed against this machine's
@@ -8804,6 +8802,45 @@ clash check), `src/mcp/fleet.rs` (`merge`), `src/mcp/mod.rs` (`with_host`). Test
 a clash with a name and with another alias, a bad alias, routing by alias, a local alias, the
 refusal's list, a table's alias column, an inline override keeping the row's alias, and a missing
 alias column. MCP-side only; no contract change.
+
+### Agent listings are grouped by host, tab and pane, and say how to message a row
+
+```
+zellij_overview {"scope": "fleet"}
+To message an agent: when its pane entry has message_to, send the message to that address ...
+[{"host": "boxa", "host_alias": "a", "tabs": [
+   {"session": "work", "tab": "develop", "panes": [
+     {"handle": "brisk-heron", "kind": "claude", "name": "develop-1", "title": "Fix the build",
+      "state": "idle", ..., "message_to": "bridge:session_01AbC", "message_route": "harness",
+      "display_title": "Fix the build", "chat_age_s": 5400,
+      "address": {"session": "boxa/work", "pane": "brisk-heron"}}]}]},
+ {"host": "boxb", "error": "ssh could not reach boxb (exit 255): ...", "error_kind": "unreachable",
+  "tabs": []}]
+```
+
+An agent asked to "send this to develop on boxa" had a flat list to search and no rule for which
+way a message goes. `zellij_overview` with `scope=agents`, `my_agents` and `fleet` now answers
+grouped the way a person names an agent: host, then tab (with its session), then pane.
+
+- **The text** is one instruction, `how_to_message`, then the grouped view as JSON. The
+  instruction is static: use `message_to` with the harness's messaging tool when a pane has it;
+  otherwise type into the pane with `zellij_write_input` at the pane's `address`; "X on
+  <machine>" usually means the tab named X on that host.
+- **Each pane entry keeps every key of its row**, and gains `display_title` (the title, or `new
+  session` when it is empty or only the harness's name, like claude's `Claude Code`), `chat_age_s`
+  (from `chat_started_at`) and `address`, the `session` and `pane` `zellij_write_input` takes.
+  This machine's rows are addressed by their bare session, another host's as `host/session`.
+  `scope=agents` rows gain `host` (and `host_alias`) in the grouped view.
+- **The structure keeps its flat answer.** `result` is unchanged: the array for `agents` and
+  `my_agents`, `{agents, hosts}` for `fleet`. It gains `grouped` and `how_to_message`. The flat
+  rows stay for a program, and the prompt and resource `zellij://agents` still return them.
+- **`scope=fleet` loses its one-line-per-agent text.** A silent host is now a host entry with
+  `error` and `error_kind` (`unreachable` or `error`), in the text and in `result.hosts`.
+
+`src/mcp/fleet.rs` (`HOW_TO_MESSAGE`, `grouped`, `display_title`, `with_grouped`, `merge`),
+`src/mcp/mod.rs` (`group_agents`), `src/mcp/tools.rs` (the tip). Tests: the grouping order by
+host, session and tab, every row key kept, the titles, the chat age, local and remote addresses, a
+row with no session, and the fleet merge's text and structure. MCP-side only; no contract change.
 
 ## Assessed and deliberately not built
 

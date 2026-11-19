@@ -167,7 +167,11 @@ impl ZellijMcp {
         } else {
             None
         };
+        let listed_agents = plan.agents.is_some() && !outcome.is_error();
         let mut result = self.report(&argv, outcome, input_sent);
+        if listed_agents {
+            self.group_agents(&mut result, &arguments, &target, local);
+        }
         if let Some(note) = checked.get("note").and_then(Value::as_str) {
             result.content.push(ContentBlock::text(note));
         }
@@ -181,6 +185,69 @@ impl ZellijMcp {
             }
         }
         with_host(result, &target)
+    }
+
+    /// `scope=agents` and `my_agents`: the rows grouped by host, tab and pane, as `scope=fleet`
+    /// answers, with the one instruction on how to message a row.
+    fn group_agents(
+        &self,
+        result: &mut CallToolResult,
+        arguments: &Map<String, Value>,
+        target: &remote::Target,
+        local: &str,
+    ) {
+        let Some(rows) = result
+            .structured_content
+            .as_ref()
+            .and_then(|structured| structured.get("result"))
+            .and_then(Value::as_array)
+            .cloned()
+        else {
+            return;
+        };
+        let (host, alias, local_host) = match target {
+            remote::Target::Remote(host) => (host.name.clone(), host.alias.clone(), None),
+            remote::Target::Local => {
+                let hosts = self.remote_hosts();
+                let name = hosts.local_name(local);
+                let alias = hosts.alias_of(&name).map(str::to_owned);
+                (name.clone(), alias, Some(name))
+            },
+        };
+        let session = arguments
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                if target.is_remote() {
+                    None
+                } else {
+                    self.ambient_session.clone()
+                }
+            });
+        let rows: Vec<Value> = rows
+            .into_iter()
+            .map(|mut row| {
+                if let Some(fields) = row.as_object_mut() {
+                    fields.insert("host".to_owned(), json!(host));
+                    if let Some(alias) = &alias {
+                        fields.insert("host_alias".to_owned(), json!(alias));
+                    }
+                }
+                row
+            })
+            .collect();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let view = fleet::grouped(
+            &[],
+            &rows,
+            now_ms,
+            local_host.as_deref(),
+            session.as_deref(),
+        );
+        fleet::with_grouped(result, view);
     }
 
     async fn input_hint(

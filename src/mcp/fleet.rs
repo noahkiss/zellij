@@ -37,7 +37,7 @@ pub async fn overview(hosts: &RemoteHosts, local: &str) -> CallToolResult {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
-    merge(&answers, now_ms, hosts)
+    merge(&answers, now_ms, hosts, Some(&hosts.local_name(local)))
 }
 
 /// Ask every target at once, each bounded by `timeout`, and return the answers in target order.
@@ -117,14 +117,19 @@ async fn ask(target: &Target, argv: &[String]) -> Answer {
     })
 }
 
-/// The answers as one result: a line per agent and per silent host for a reader, and the rows,
-/// each with its `host` (and `host_alias`, when the list gives it one), for a program.
-pub fn merge(answers: &[(String, Answer)], now_ms: u64, listed: &RemoteHosts) -> CallToolResult {
+/// The answers as one result: [`HOW_TO_MESSAGE`] and the [`grouped`] view for a reader, and the
+/// flat rows, each with its `host` (and `host_alias`, when the list gives it one), for a program.
+/// A host that did not answer is a host entry with its `error`.
+pub fn merge(
+    answers: &[(String, Answer)],
+    now_ms: u64,
+    listed: &RemoteHosts,
+    local_host: Option<&str>,
+) -> CallToolResult {
     let warnings = &listed.warnings;
     let view = AgentsView { only_tab: None };
     let mut agents = Vec::new();
     let mut hosts = Vec::new();
-    let mut lines = Vec::new();
     for (host, answer) in answers {
         // `unreachable` is ssh's own failure, or no answer in time. `error` is a host that
         // answered and said no
@@ -146,8 +151,9 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, listed: &RemoteHosts) ->
         let outcome = match said {
             Ok(outcome) => outcome,
             Err((label, why)) => {
-                lines.push(format!("{}: {}: {}", host, label, why));
-                hosts.push(with_alias(json!({"host": host, "error": why})));
+                hosts.push(with_alias(
+                    json!({"host": host, "error": why, "error_kind": label}),
+                ));
                 continue;
             },
         };
@@ -158,18 +164,15 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, listed: &RemoteHosts) ->
             Some(Value::Array(rows)) => rows,
             _ => {
                 let why = "its answer was not the JSON list-agents prints".to_owned();
-                lines.push(format!("{}: error: {}", host, why));
-                hosts.push(with_alias(json!({"host": host, "error": why})));
+                hosts.push(with_alias(
+                    json!({"host": host, "error": why, "error_kind": "error"}),
+                ));
                 continue;
             },
         };
-        if rows.is_empty() {
-            lines.push(format!("{}: no agents", host));
-        }
         hosts.push(with_alias(json!({"host": host, "agents": rows.len()})));
         for mut row in rows {
             if let Some(row) = row.as_object_mut() {
-                lines.push(row_line(host, row));
                 row.insert("host".to_owned(), json!(host));
                 if let Some(alias) = alias {
                     row.insert("host_alias".to_owned(), json!(alias));
@@ -191,41 +194,162 @@ pub fn merge(answers: &[(String, Answer)], now_ms: u64, listed: &RemoteHosts) ->
     if !warnings.is_empty() {
         structured.insert("diagnostics".to_owned(), json!(warnings.join("\n")));
     }
-    let mut result = CallToolResult::success(vec![ContentBlock::text(lines.join("\n"))]);
+    let mut result = CallToolResult::success(Vec::new());
     result.structured_content = Some(Value::Object(structured));
+    let view = grouped(&hosts, &agents, now_ms, local_host, None);
+    with_grouped(&mut result, view);
     result
 }
 
-/// One agent on one line, with its live messaging name before its pane handle.
-fn row_line(host: &str, row: &Map<String, Value>) -> String {
-    let text = |key: &str| row.get(key).and_then(Value::as_str).unwrap_or("-");
-    let mut state = text("state").to_owned();
-    if let Some(kind) = row.get("state_kind").and_then(Value::as_str) {
-        state = format!("{}/{}", state, kind);
+/// The one instruction an agent listing carries: how to send a message to a row.
+pub const HOW_TO_MESSAGE: &str = "To message an agent: when its pane entry has message_to, send \
+the message to that address with your harness's messaging tool; it works from any machine. A \
+claude agent on this machine also takes its name there. Otherwise type into its pane: \
+zellij_write_input with the entry's address (session = host/session, pane = handle) and \
+submit=true. \"X on <machine>\" usually means the tab named X on that host; the target is the \
+agent in that tab.";
+
+/// The agent rows as a person refers to them: host, then tab, then pane.
+///
+/// `hosts` are the host entries in order (`{host, host_alias?, error?}`); a row's `host` places it,
+/// and a row whose host is not among them adds one. Every key of a row stays in its pane entry,
+/// which gains `display_title` (the title, or "new session" when the harness has given none),
+/// `chat_age_s` and `address`, the `session` and `pane` that `zellij_write_input` takes. A row of
+/// `local_host` is addressed by its bare session, any other as `host/session`. `session` is the
+/// session a row without its own `session` came from, when the call knows it.
+pub fn grouped(
+    hosts: &[Value],
+    rows: &[Value],
+    now_ms: u64,
+    local_host: Option<&str>,
+    session: Option<&str>,
+) -> Value {
+    let mut out: Vec<Map<String, Value>> = hosts
+        .iter()
+        .filter_map(|entry| entry.as_object())
+        .map(|entry| {
+            let mut host = entry.clone();
+            host.remove("agents");
+            host.insert("tabs".to_owned(), json!([]));
+            host
+        })
+        .collect();
+    for row in rows {
+        let Some(fields) = row.as_object() else {
+            continue;
+        };
+        let host_name = fields.get("host").and_then(Value::as_str).unwrap_or("");
+        let at = match out
+            .iter()
+            .position(|host| host.get("host").and_then(Value::as_str) == Some(host_name))
+        {
+            Some(at) => at,
+            None => {
+                let mut host = Map::new();
+                host.insert("host".to_owned(), json!(host_name));
+                if let Some(alias) = fields.get("host_alias") {
+                    host.insert("host_alias".to_owned(), alias.clone());
+                }
+                host.insert("tabs".to_owned(), json!([]));
+                out.push(host);
+                out.len() - 1
+            },
+        };
+        let row_session = fields
+            .get("session")
+            .and_then(Value::as_str)
+            .or(session)
+            .map(str::to_owned);
+        let tab_name = fields.get("tab_name").cloned().unwrap_or(Value::Null);
+        let mut pane = fields.clone();
+        pane.insert(
+            "display_title".to_owned(),
+            json!(display_title(
+                fields.get("title").and_then(Value::as_str).unwrap_or(""),
+                fields.get("kind").and_then(Value::as_str).unwrap_or(""),
+            )),
+        );
+        if let Some(started) = fields.get("chat_started_at").and_then(Value::as_u64) {
+            pane.insert(
+                "chat_age_s".to_owned(),
+                json!(now_ms.saturating_sub(started) / 1000),
+            );
+        }
+        let local = !host_name.is_empty() && local_host == Some(host_name);
+        let address_session = match (&row_session, local || host_name.is_empty()) {
+            (Some(session), true) => Some(session.clone()),
+            (Some(session), false) => Some(format!("{}/{}", host_name, session)),
+            (None, true) => None,
+            (None, false) => Some(format!("{}/", host_name)),
+        };
+        let mut address = Map::new();
+        if let Some(address_session) = address_session {
+            address.insert("session".to_owned(), json!(address_session));
+        }
+        address.insert(
+            "pane".to_owned(),
+            fields.get("handle").cloned().unwrap_or(Value::Null),
+        );
+        pane.insert("address".to_owned(), Value::Object(address));
+        let Some(Value::Array(tabs)) = out[at].get_mut("tabs") else {
+            continue;
+        };
+        let tab_at = tabs.iter().position(|tab| {
+            tab.get("tab") == Some(&tab_name)
+                && tab.get("session").and_then(Value::as_str) == row_session.as_deref()
+        });
+        let tab_at = match tab_at {
+            Some(tab_at) => tab_at,
+            None => {
+                let mut tab = Map::new();
+                if let Some(session) = &row_session {
+                    tab.insert("session".to_owned(), json!(session));
+                }
+                tab.insert("tab".to_owned(), tab_name.clone());
+                tab.insert("panes".to_owned(), json!([]));
+                tabs.push(Value::Object(tab));
+                tabs.len() - 1
+            },
+        };
+        if let Some(Value::Array(panes)) = tabs[tab_at].get_mut("panes") {
+            panes.push(Value::Object(pane));
+        }
     }
-    let name = if row.get("self").and_then(Value::as_bool) == Some(true) {
-        format!("{} (you)", text("name"))
+    Value::Array(out.into_iter().map(Value::Object).collect())
+}
+
+/// A pane title, or "new session" when it is empty or only the harness's own name: a claude that
+/// has not been given a task is titled "Claude Code", after a spinner glyph.
+pub fn display_title(title: &str, kind: &str) -> String {
+    let bare = title
+        .trim()
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    let generic = bare.is_empty()
+        || bare.eq_ignore_ascii_case(kind)
+        || ["claude code", "claude", "codex", "opencode", "pi"]
+            .iter()
+            .any(|name| bare.eq_ignore_ascii_case(name));
+    if generic {
+        "new session".to_owned()
     } else {
-        text("name").to_owned()
-    };
-    let mut line = format!(
-        "{}: {}: {} {} {} {} tab={}",
-        host,
-        text("session"),
-        name,
-        text("handle"),
-        text("kind"),
-        state,
-        text("tab_name"),
+        title.trim().to_owned()
+    }
+}
+
+/// The text and structure an agent listing answers with: [`HOW_TO_MESSAGE`], then the grouped
+/// view as JSON. The structure keeps its flat `result` and gains `grouped` and `how_to_message`.
+pub fn with_grouped(result: &mut CallToolResult, grouped: Value) {
+    let text = format!(
+        "{}\n{}",
+        HOW_TO_MESSAGE,
+        serde_json::to_string_pretty(&grouped).unwrap_or_default()
     );
-    if let Some(age) = row.get("output_age_s").and_then(Value::as_u64) {
-        line.push_str(&format!(" out={}s", age));
+    result.content = vec![ContentBlock::text(text)];
+    if let Some(Value::Object(structured)) = result.structured_content.as_mut() {
+        structured.insert("grouped".to_owned(), grouped);
+        structured.insert("how_to_message".to_owned(), json!(HOW_TO_MESSAGE));
     }
-    if let Some(cwd) = row.get("cwd").and_then(Value::as_str) {
-        line.push(' ');
-        line.push_str(cwd);
-    }
-    line
 }
 
 fn first_line(first: &str, then: &str) -> String {
@@ -248,13 +372,6 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: String::new(),
         })
-    }
-
-    #[test]
-    fn fleet_text_marks_the_named_caller() {
-        let row = json!({"session":"work","name":"project-1","self":true,"handle":"brisk-heron","kind":"claude"});
-        assert!(row_line("boxa", row.as_object().unwrap())
-            .contains("project-1 (you) brisk-heron claude"));
     }
 
     const BOXA: &str = r#"[
@@ -291,25 +408,37 @@ mod tests {
             warnings: vec!["a warning".to_owned()],
             path: None,
         };
-        let result = merge(&answers, 1_042_000, &listed);
+        let result = merge(&answers, 1_042_000, &listed, Some("boxz"));
         assert_eq!(result.is_error, Some(false));
         let text = serde_json::to_string(&result.content).unwrap();
-        let text: Vec<String> = serde_json::from_str::<Value>(&text).unwrap()[0]["text"]
+        let text = serde_json::from_str::<Value>(&text).unwrap()[0]["text"]
             .as_str()
             .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect();
+            .to_owned();
+        let (first, rest) = text.split_once('\n').unwrap();
+        assert_eq!(first, HOW_TO_MESSAGE);
+        let view: Value = serde_json::from_str(rest).unwrap();
+        let pane = &view[0]["tabs"][0]["panes"][0];
+        assert_eq!(view[0]["host"], "boxa");
+        assert_eq!(view[0]["host_alias"], "a");
+        assert_eq!(view[0]["tabs"][0]["tab"], "build");
+        assert_eq!(view[0]["tabs"][0]["session"], "work");
+        assert_eq!(pane["name"], "project-1");
+        assert_eq!(pane["output_age_s"], 42);
         assert_eq!(
-            text,
-            vec![
-                "boxa: work: project-1 brisk-heron claude blocked/permission tab=build out=42s /srv/app",
-                "boxb: unreachable: ssh could not reach boxb (exit 255): Connection timed out",
-                "boxc: no agents",
-                "boxd: unreachable: no answer within 10 seconds",
-            ]
+            pane["address"],
+            json!({"session": "boxa/work", "pane": "brisk-heron"})
         );
+        assert_eq!(
+            view[1],
+            json!({"host": "boxb", "error_kind": "unreachable", "tabs": [],
+                   "error": "ssh could not reach boxb (exit 255): Connection timed out"})
+        );
+        assert_eq!(view[2], json!({"host": "boxc", "tabs": []}));
+        assert_eq!(view[3]["error"], "no answer within 10 seconds");
         let structured = result.structured_content.unwrap();
+        assert_eq!(structured["grouped"], view);
+        assert_eq!(structured["how_to_message"], HOW_TO_MESSAGE);
         let agents = structured["result"]["agents"].as_array().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0]["host"], json!("boxa"));
@@ -322,9 +451,91 @@ mod tests {
             hosts[0],
             json!({"host": "boxa", "host_alias": "a", "agents": 1})
         );
-        assert!(hosts[1]["error"].as_str().unwrap().contains("exit 255"));
+        assert_eq!(
+            hosts[1]["error"],
+            "ssh could not reach boxb (exit 255): Connection timed out"
+        );
         assert_eq!(hosts[2], json!({"host": "boxc", "agents": 0}));
         assert_eq!(structured["diagnostics"], json!("a warning"));
+    }
+
+    #[test]
+    fn the_grouped_view_is_host_then_tab_then_pane_and_keeps_every_key() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[
+            {"host": "here", "session": "work", "tab_name": "develop", "handle": "deep-fox",
+             "kind": "claude", "name": "develop-1", "title": "✳ Claude Code", "state": "idle",
+             "chat_started_at": 1000000, "context_tokens": 5000,
+             "message_to": "bridge:session_01A", "message_route": "harness"},
+            {"host": "boxa", "host_alias": "a", "session": "work", "tab_name": "develop",
+             "handle": "calm-otter", "kind": "codex", "title": "Fix the build",
+             "message_route": "pane"},
+            {"host": "here", "session": "work", "tab_name": "develop", "handle": "warm-owl",
+             "kind": "pi", "title": "", "message_route": "pane"},
+            {"host": "here", "session": "play", "tab_name": "develop", "handle": "odd-elk",
+             "kind": "opencode", "title": "opencode"}
+        ]"#,
+        )
+        .unwrap();
+        let hosts = vec![json!({"host": "here", "agents": 3})];
+        let view = grouped(&hosts, &rows, 61_000_000, Some("here"), None);
+        assert_eq!(view.as_array().map(Vec::len), Some(2));
+        let here = &view[0];
+        assert!(here.get("agents").is_none(), "the count is not a pane key");
+        // one tab per session and name, in the order rows arrived
+        let tabs: Vec<(&str, &str)> = here["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tab| {
+                (
+                    tab["session"].as_str().unwrap(),
+                    tab["tab"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(tabs, vec![("work", "develop"), ("play", "develop")]);
+        let first = &here["tabs"][0]["panes"][0];
+        for key in [
+            "host",
+            "session",
+            "tab_name",
+            "kind",
+            "name",
+            "state",
+            "message_to",
+        ] {
+            assert_eq!(first[key], rows[0][key], "{}", key);
+        }
+        assert_eq!(first["display_title"], "new session");
+        assert_eq!(first["chat_age_s"], 60_000);
+        // this machine's rows are addressed by their bare session
+        assert_eq!(
+            first["address"],
+            json!({"session": "work", "pane": "deep-fox"})
+        );
+        assert_eq!(here["tabs"][0]["panes"][1]["display_title"], "new session");
+        assert_eq!(here["tabs"][1]["panes"][0]["display_title"], "new session");
+        // a host the entries did not name is added, with its alias, and addressed host/session
+        assert_eq!(view[1]["host"], "boxa");
+        assert_eq!(view[1]["host_alias"], "a");
+        let remote = &view[1]["tabs"][0]["panes"][0];
+        assert_eq!(remote["display_title"], "Fix the build");
+        assert_eq!(remote["address"]["session"], "boxa/work");
+        assert!(remote.get("chat_age_s").is_none());
+        // a row with no session of its own takes the call's, and a remote one with none names
+        // the host alone
+        let bare = vec![json!({"host": "boxa", "tab_name": "t", "handle": "h", "kind": "pi"})];
+        let view = grouped(&[], &bare, 0, None, Some("work"));
+        assert_eq!(
+            view[0]["tabs"][0]["panes"][0]["address"]["session"],
+            "boxa/work"
+        );
+        let view = grouped(&[], &bare, 0, None, None);
+        assert_eq!(
+            view[0]["tabs"][0]["panes"][0]["address"]["session"],
+            "boxa/"
+        );
     }
 
     /// The whole remote path with a stand-in ssh: it runs the remote line through `sh` as the
@@ -375,7 +586,7 @@ mod tests {
             Duration::from_secs(20),
         )
         .await;
-        let result = merge(&answers, 1_042_000, &RemoteHosts::default());
+        let result = merge(&answers, 1_042_000, &RemoteHosts::default(), None);
         let structured = result.structured_content.unwrap();
         let hosts = &structured["result"]["hosts"];
         assert_eq!(hosts[0]["agents"], json!(1), "{}", structured);
@@ -414,7 +625,7 @@ mod tests {
             Duration::from_secs(20),
         )
         .await;
-        let result = merge(&answers, 0, &RemoteHosts::default());
+        let result = merge(&answers, 0, &RemoteHosts::default(), None);
         let structured = result.structured_content.unwrap();
         let agents = &structured["result"]["agents"];
         assert_eq!(agents.as_array().map(Vec::len), Some(1), "{}", structured);

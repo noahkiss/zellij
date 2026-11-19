@@ -121,7 +121,9 @@ pub const TOOLS: &[ToolSpec] = &[
                session. scope=fleet lists every agent in every session on this machine and on \
                every host in remote_hosts, each row with its host and session; a host that does \
                not answer within 10 seconds is one `unreachable` row, and the rest still answer. \
-               To act on a fleet row, pass session as host/session.",
+               To act on a fleet row, pass session as host/session. scope=agents, my_agents and \
+               fleet also answer grouped by host, tab and pane: each pane carries its address \
+               and, when a harness can reach it, message_to; how_to_message says how to use them.",
         params: &[
             SESSION,
             ParamSpec {
