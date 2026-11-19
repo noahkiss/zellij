@@ -55,6 +55,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             fresh,
         } => {
             let name = resolve_session_name(session_name, &opts, false);
+            refuse_a_scratch_pin(&opts);
             process::exit(match up(&name, up_shape(fresh, restore), &opts) {
                 Ok(()) => 0,
                 Err(()) => 1,
@@ -81,6 +82,7 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             force,
         } => {
             let name = resolve_session_name(session_name, &opts, true);
+            refuse_a_scratch_pin(&opts);
             refuse_if_agents_are_working(
                 "restart",
                 &name,
@@ -101,6 +103,9 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             dry_run,
         } => {
             let name = resolve_session_name(session_name, &opts, false);
+            if !dry_run {
+                refuse_a_scratch_pin(&opts);
+            }
             let enabled = if dry_run {
                 enable_dry_run(&name, exe, force, &opts)
             } else {
@@ -142,6 +147,24 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
         ),
     }
 }
+
+/// Exit 2, having changed nothing, when this is a scratch environment whose config pins to the
+/// real pin. Asked before the verb does anything, so a scratch `session up` starts no server on a
+/// pin it was not allowed to refresh. The rule is
+/// [`scratch_pin_refusal`](zellij_utils::session_lifecycle::scratch_pin_refusal)'s.
+#[cfg(unix)]
+pub(crate) fn refuse_a_scratch_pin(opts: &CliArgs) {
+    let Some(pinned) = configured_pinned_exe(configured_extras(opts).as_ref()) else {
+        return;
+    };
+    if let Some(refusal) = zellij_utils::session_lifecycle::scratch_pin_refusal(&pinned) {
+        eprintln!("{}", refusal);
+        process::exit(2);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn refuse_a_scratch_pin(_opts: &CliArgs) {}
 
 /// The init system of this machine, or a refusal naming what it would have driven.
 fn native_service_kind() -> Result<ServiceKind, ()> {

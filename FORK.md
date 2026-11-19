@@ -8659,6 +8659,42 @@ resume onto this build without `--fresh`. A template cwd that differs from the g
 Test in `zellij-utils/src/input/unit/layout_test.rs`: the fresh and the stamped template take no
 cwd, a template's own cwd stays, and the tabs still hang from the global `cwd`. No contract change.
 
+### A scratch environment cannot rewrite the real pin
+
+```
+$ ZELLIJ_SOCKET_DIR=/tmp/zj-test/sock zellij session up scratch    # config has `pin_exe true`
+refusing to write the pin <home>/.local/share/zellij/bin/zellij: ZELLIJ_SOCKET_DIR points at a
+scratch socket directory, but the pin is the real one under this account's home; set XDG_DATA_HOME
+to a scratch directory too
+$ echo $?
+2
+```
+
+A test run moves its sockets with `ZELLIJ_SOCKET_DIR`. With the real config's `pin_exe`, the pin
+did not move with them: `session up` copied the dev build over the pin the real launcher runs.
+
+The rule: when `ZELLIJ_SOCKET_DIR` names a directory other than this user's default socket
+directory, no pin under the account's home is written. The home comes from the passwd database, as
+in the release-candidate guard, so a scratch `HOME` does not unlock it. A pin outside that home,
+such as `XDG_DATA_HOME=/tmp/zj-test/data` on Linux or a scratch `pin_exe` path, is written as
+before.
+
+- **It cannot refuse a real install.** A generated unit never sets `ZELLIJ_SOCKET_DIR`; the
+  generator refuses it (`FORBIDDEN_ENV_NAMES`). A shell that exports the default value is not a
+  scratch environment. A shell that exports another value already sees other sessions than its
+  launcher does.
+- **The verbs refuse first:** `session up`, `session restart`, `session enable` and
+  `session doctor --fix` print one line, exit 2 and start nothing.
+- **The writer refuses too.** `install_pinned_exe` returns the same line as an error before it reads
+  the pin or its stamp. An interactive launch then serves the session from the build it is, with
+  the warning it prints for any pin it cannot write.
+- On macOS the canonical pin stays under `~/Library/Application Support`; `XDG_DATA_HOME` does not
+  move it. The line says to drop `pin_exe` from the scratch config or name a scratch path.
+
+`zellij-utils/src/session_lifecycle.rs` (`scratch_pin_refusal`, `scratch_may_write_pin`,
+`socket_dir_redirects`), `src/session_commands.rs` (`refuse_a_scratch_pin`). Tests in
+`session_lifecycle.rs`. No contract change.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

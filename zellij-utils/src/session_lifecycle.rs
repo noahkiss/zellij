@@ -1874,6 +1874,12 @@ fn candidate_may_pin(allowed: bool, target: &Path, account_home: Option<&Path>) 
     if !allowed {
         return false;
     }
+    !path_is_under_home(target, home)
+}
+
+/// Whether `target` is under `home`, by any spelling of either.
+#[cfg(unix)]
+fn path_is_under_home(target: &Path, home: &Path) -> bool {
     // Both spellings of each, as typed and as the disk resolves them, and a pin is under the home
     // when ANY spelling is. A link outside the home that leads into it is the home; so is a link
     // inside the home that leads out of it, such as a `~/.cache` or `~/.local/share` that is a
@@ -1889,10 +1895,65 @@ fn candidate_may_pin(allowed: bool, target: &Path, account_home: Option<&Path>) 
             .unwrap_or_else(|_| target.to_path_buf()),
         _ => target.to_path_buf(),
     };
-    let under_home = [target.to_path_buf(), resolved]
+    [target.to_path_buf(), resolved]
         .iter()
-        .any(|spelling| homes.iter().any(|home| spelling.starts_with(home)));
-    !under_home
+        .any(|spelling| homes.iter().any(|home| spelling.starts_with(home)))
+}
+
+/// Whether a scratch environment must leave the pin at `target` alone, and the line that says so.
+///
+/// A scratch environment is one whose `ZELLIJ_SOCKET_DIR` moves the socket directory off this
+/// user's default. A generated unit never sets that variable (`FORBIDDEN_ENV_NAMES` in
+/// `session_service`), so the launcher that runs the real pin never counts as scratch. Its pin is
+/// still the real one when it lies under the account's home, read from the passwd database as the
+/// release-candidate guard does: a scratch run that moved its sockets and not its pin would copy a
+/// dev build over the build the real launcher runs. A pin outside that home is a scratch pin.
+#[cfg(unix)]
+pub fn scratch_pin_refusal(target: &Path) -> Option<String> {
+    let explicit = crate::envs::get_socket_dir().ok().map(PathBuf::from);
+    let default = crate::consts::ZELLIJ_PROJ_DIR
+        .runtime_dir()
+        .map_or_else(|| crate::consts::ZELLIJ_TMP_DIR.clone(), |p| p.to_owned());
+    let redirected = socket_dir_redirects(explicit.as_deref(), &default);
+    if scratch_may_write_pin(redirected, target, account_home().as_deref()) {
+        return None;
+    }
+    let fix = if cfg!(target_os = "macos") {
+        "on macOS XDG_DATA_HOME does not move it: give the scratch config no `pin_exe`, or \
+         `pin_exe \"<scratch path>\"`"
+    } else {
+        "set XDG_DATA_HOME to a scratch directory too"
+    };
+    Some(format!(
+        "refusing to write the pin {}: ZELLIJ_SOCKET_DIR points at a scratch socket directory, \
+         but the pin is the real one under this account's home; {}",
+        target.display(),
+        fix
+    ))
+}
+
+/// Whether an explicit socket directory moves the sockets off `default`, by any spelling.
+#[cfg(unix)]
+fn socket_dir_redirects(explicit: Option<&Path>, default: &Path) -> bool {
+    let Some(explicit) = explicit else {
+        return false;
+    };
+    let spell = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    explicit != default && spell(explicit) != spell(default)
+}
+
+/// The rule, apart from the environment. Outside a scratch environment the pin is always the
+/// pin's own business. Inside one, the pin may be written only when it is not under the account's
+/// home, and an account with no known home writes none.
+#[cfg(unix)]
+fn scratch_may_write_pin(redirected: bool, target: &Path, account_home: Option<&Path>) -> bool {
+    if !redirected {
+        return true;
+    }
+    match account_home {
+        Some(home) => !path_is_under_home(target, home),
+        None => false,
+    }
 }
 
 /// This account's home directory as the passwd database records it, whatever `HOME` says.
@@ -2007,6 +2068,12 @@ fn say_the_pin_was_not_refreshed(reason: &str) {
 pub fn install_pinned_exe(source: &Path, target: &Path) -> Result<PinOutcome, String> {
     if is_the_same_file(source, target) {
         return Ok(PinOutcome::UpToDate(target.to_path_buf()));
+    }
+    // A scratch environment touches nothing beside the real pin, not even its stamp. The verbs ask
+    // this first and exit; this is the backstop for every other caller, an interactive launch
+    // above all, which then serves the session from the build it already is.
+    if let Some(refusal) = scratch_pin_refusal(target) {
+        return Err(refusal);
     }
     let key = source_identity(source);
     // the pin's OWN identity, asked before anything below trusts the stamp beside it: a stamp
@@ -4437,6 +4504,58 @@ dev.zellij.session.mysession = {
         let outward = home.path().join("cache");
         std::os::unix::fs::symlink(scratch.path(), &outward).unwrap();
         assert!(!candidate_may_pin(true, &outward.join("zellij"), home_path));
+    }
+
+    /// A scratch environment (sockets moved by `ZELLIJ_SOCKET_DIR`) may not write a pin under the
+    /// account's home, by any spelling; a pin outside it is a scratch pin and may be written.
+    /// Outside a scratch environment the rule says nothing, so a real install is never refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_scratch_environment_may_not_write_the_real_pin() {
+        let home = tempfile::TempDir::new().unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let home_pin = home.path().join("data").join("zellij");
+        std::fs::create_dir_all(home_pin.parent().unwrap()).unwrap();
+        let scratch_pin = scratch.path().join("zellij");
+        let home_path = Some(home.path());
+
+        assert!(scratch_may_write_pin(false, &home_pin, home_path), "real");
+        assert!(
+            scratch_may_write_pin(false, &home_pin, None),
+            "real, no home"
+        );
+        assert!(
+            !scratch_may_write_pin(true, &home_pin, home_path),
+            "scratch"
+        );
+        assert!(scratch_may_write_pin(true, &scratch_pin, home_path));
+        assert!(!scratch_may_write_pin(true, &scratch_pin, None), "no home");
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(home_pin.parent().unwrap(), &link).unwrap();
+        assert!(!scratch_may_write_pin(
+            true,
+            &link.join("zellij"),
+            home_path
+        ));
+    }
+
+    /// Only a socket directory that differs from the default makes a scratch environment. A shell
+    /// that exports the default value is not one.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_moved_socket_dir_makes_a_scratch_environment() {
+        let default = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        assert!(!socket_dir_redirects(None, default.path()));
+        assert!(!socket_dir_redirects(Some(default.path()), default.path()));
+        let link = other.path().join("link");
+        std::os::unix::fs::symlink(default.path(), &link).unwrap();
+        assert!(!socket_dir_redirects(Some(&link), default.path()), "a link");
+        assert!(socket_dir_redirects(Some(other.path()), default.path()));
+        assert!(socket_dir_redirects(
+            Some(Path::new("/tmp/zj-test/sock")),
+            default.path()
+        ));
     }
 
     /// The other half of the rule, and the half that costs something to get wrong: the ordinary

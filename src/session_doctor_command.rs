@@ -43,6 +43,9 @@ pub(crate) fn session_doctor_command(
 ) -> ! {
     let name = resolve_session_name(session_name, &opts, false);
     let mode = DoctorMode::from_flags(dry_run, no_fix, no_sign);
+    if mode.fix {
+        crate::session_commands::refuse_a_scratch_pin(&opts);
+    }
     let report = examine(&name, exe, mode, regranted, &opts);
     print!("{}", report.render());
     std::process::exit(report.exit_code());

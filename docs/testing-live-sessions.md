@@ -34,6 +34,10 @@ comes from the `directories` crate (`canonical_pinned_exe` in `zellij-utils/src/
 - On macOS it is `~/Library/Application Support/zellij/bin/zellij`, and `XDG_DATA_HOME` does not
   move it. Use a scratch config with no `pin_exe`, or with `pin_exe "<scratch path>"`.
 
+A scratch run that would still write a pin under the account's home is refused: the session verbs
+exit 2 and change nothing, and an interactive launch serves the session from the running build.
+FORK.md, "A scratch environment cannot rewrite the real pin", has the rule.
+
 **So never run `delete-all-sessions` on macOS, scratch environment or not.** It does not read the
 session list you set up. `delete_all_sessions` (`src/commands.rs:410`) takes its targets from
 `scan_session_list_default_dirs` and `get_resurrectable_sessions`, both of which walk
