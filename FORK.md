@@ -8557,9 +8557,8 @@ Tests in `tab_tests.rs`, each with and without stack lists: the anchored and the
 keep the focused pane shown, a stack nobody is focused in shows the new pane, and a focused stack
 create takes both focus and the expanded slot. No contract change.
 
-Not changed: a tiled `new-pane --no-focus` in a tab with no room left joins a stack through
-`expand_pane_in_stack`, which moves every client focused in that stack to the new pane. Focus and
-expansion agree there, but the focus moves.
+A tiled pane made without focus in a tab with no room left takes a different path; see "A pane
+made without focus in a full tab leaves the focus alone".
 
 ### An agent's new pane or tab leaves the person's focus alone
 
@@ -8594,9 +8593,8 @@ the person's focused pane, as `--no-focus` always has. So an agent's bare `new-p
 stacks onto the agent's own pane in the background. With "A pane stacked in the background leaves
 the focused pane expanded", the person's focused pane stays expanded.
 
-One gap remains. A tiled no-focus pane in a tab with no room to split joins a stack, and that path
-still moves every client focused in the stack to the new pane (the "Not changed" note in the entry
-above). An agent's bare `new-pane` or `zellij run` from inside a stack hits it.
+An agent's bare `new-pane` or `zellij run` in a tab with no room to split joins a stack; "A pane
+made without focus in a full tab leaves the focus alone" keeps the person's focus there too.
 
 MCP `zellij_create kind=tab` passes `--no-focus` itself, so it does not depend on the environment
 the MCP server was started with.
@@ -8607,6 +8605,31 @@ The decision is made on the CLI side before the action is built (`leaves_focus_a
 action carries `no_focus` as before, so the client/server contract does not change. Tests: the
 decision table, the settled `new-pane` and `new-tab`, the clap conflicts, `zellij run --focus`, and
 agent detection from the environment.
+
+### A pane made without focus in a full tab leaves the focus alone
+
+```
+# the person is focused on terminal_12, in a tab with no room left to split
+AGENT_SESSION_ID=x zellij action new-pane      # or: zellij action new-pane --no-focus
+# before: the new pane joins the stack and the person's focus moves to it
+# after:  the new pane joins the stack collapsed; terminal_12 stays focused and expanded
+```
+
+A tiled pane that finds no room to split falls back into a stack. That fallback expanded the new
+pane with `expand_pane_in_stack`, which moves every client focused in the stack onto it. So
+`--no-focus` was not honoured there, and an agent's bare `new-pane` or `zellij run` took the
+person's typing focus.
+
+The fallback now keeps the pane a client is focused on expanded and moves nobody
+(`keep_focused_pane_expanded_in_stack_of`, from "A pane stacked in the background leaves the
+focused pane expanded"). A
+focusing create is unchanged: `Tab::add_tiled_pane` focuses the new pane afterwards, and focusing a
+stacked pane expands it and moves the clients in that stack with it.
+
+`zellij-server/src/panes/tiled_panes/mod.rs` (`add_pane_without_stacked_resize`). Tests in
+`tab_tests.rs`, each with and without stack lists: background panes in a full tab leave the focus and
+the focused pane's expansion alone, and a focused create in a full tab takes both. No contract
+change.
 
 ## Assessed and deliberately not built
 

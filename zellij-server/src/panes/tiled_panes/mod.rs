@@ -354,7 +354,11 @@ impl TiledPanes {
                     Ok(new_pane_geom) => {
                         pane.set_geom(new_pane_geom);
                         self.panes.insert(pane_id, pane); // TODO: is set_geom the right one?
-                        self.expand_pane_in_stack(pane_id);
+                                                          // fork change: expanding the newcomer here moved every client focused in
+                                                          // the stack onto it, so a pane made without focus took it anyway. A
+                                                          // focusing caller focuses the pane itself afterwards.
+                        self.keep_focused_pane_expanded_in_stack_of(pane_id);
+                        self.set_force_render();
                     },
                     Err(e) => {
                         log::error!("Failed to add pane to stack: {:?}", e);
