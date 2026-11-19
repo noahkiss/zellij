@@ -268,8 +268,13 @@ impl ProgramStatusRecords {
             },
             Message::Report(report) => {
                 self.input_since_report = false;
-                // a program that starts working took up whatever its prompt held
-                if report.state == State::Working {
+                // a program that starts working took up whatever its prompt held. Only the start
+                // counts: a harness that reports `working` again mid-turn (codex after every
+                // tool call) took nothing up, and text typed meanwhile still waits in its prompt
+                let was_working = self
+                    .summary()
+                    .is_some_and(|summary| summary.state == State::Working.as_str());
+                if report.state == State::Working && !was_working {
                     self.draft.taken_up();
                 }
                 self.seq += 1;
@@ -719,5 +724,24 @@ mod tests {
         records.note_input();
         records.apply(Message::Clear { id: String::new() }, 3);
         assert!(!records.input_since_report());
+    }
+
+    #[test]
+    fn a_draft_typed_mid_turn_outlives_a_repeated_working_report() {
+        let now = std::time::Instant::now();
+        let mut records = ProgramStatusRecords::default();
+        records.apply(Message::Report(report("state=idle")), 1);
+        records.note_typed(b"run it\r", now);
+        assert!(records.draft_pending(now));
+        // the start of the turn takes the submitted line up
+        records.apply(Message::Report(report("state=working")), 2);
+        assert!(!records.draft_pending(now));
+        // the person types while the agent works; the harness reports `working` again
+        records.note_typed(b"next", now);
+        records.apply(Message::Report(report("state=working")), 3);
+        assert!(records.draft_pending(now), "a repeat took nothing up");
+        // the turn ends with the text still in the prompt
+        records.apply(Message::Report(report("state=done")), 4);
+        assert!(records.draft_pending(now));
     }
 }

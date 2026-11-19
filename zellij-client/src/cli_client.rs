@@ -2825,7 +2825,15 @@ pub fn start_send_message_client(
     for session in &scope {
         match panes_of_session(make_os_input(), session) {
             Ok(panes) => {
-                let agents = active_agents(panes.clone());
+                let mut agents = active_agents(panes.clone());
+                // the caller is never the agent a word names; see `agent_send::resolve`
+                agent_detect::mark_self(
+                    &mut agents,
+                    std::env::var("ZELLIJ_PANE_ID")
+                        .ok()
+                        .and_then(|id| id.parse().ok()),
+                    std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session.as_str()),
+                );
                 listed.push((session.clone(), panes, agents));
             },
             Err(message) if scope.len() > 1 => eprintln!("session '{}': {}", session, message),

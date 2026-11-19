@@ -8903,7 +8903,8 @@ when that cannot mix with a person's typing, and otherwise holds it.
 - **The target** is one word matched against `list-agents`: a pane handle or pane id, a tab name,
   an agent name, or the name of the agent's project directory, compared without case.
   `session/word` keeps the search to one session; `--all-sessions` searches every session on the
-  machine. A handle or id wins outright. Otherwise exactly one agent must answer: none or several
+  machine. A handle or id wins outright. Otherwise the sender's own agent never answers, and
+  exactly one other agent must: none or several
   is a miss, exit 2, with the candidates on stderr. A pane with no agent is refused: type into it
   with `zellij_write_input`.
 - **The guard** runs on the server, and the message goes in only when all three hold:
@@ -8922,7 +8923,9 @@ when that cannot mix with a person's typing, and otherwise holds it.
   `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
   Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc
   on an idle agent, an Alt chord) makes the draft unknown, which holds until the agent next
-  reports `working`. Enter on text holds for up to 10 s until the agent says it took the line.
+  starts working. Enter on text holds for up to 10 s until the agent says it took the line.
+  Only the start of a turn takes a draft up: a harness that reports `working` again mid-turn
+  (codex after every tool call) leaves text typed meanwhile pending.
   Both keyboard encodings are read, legacy and the kitty protocol.
 - **Atomic.** The check, the paste and the Enter are one step on the screen thread, where every
   key a client sends is also handled. The paste goes out as one write, and the Enter 150 ms later

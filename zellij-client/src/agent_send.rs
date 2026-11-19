@@ -35,7 +35,8 @@ pub enum Resolved {
 /// A handle or a pane id names one pane and wins outright. Otherwise a tab name, an agent name
 /// and a project directory name all count, compared without case, and every agent that answers to
 /// any of them is a match: "develop" names the agent in the tab `develop` and the agent working in
-/// `~/src/develop` alike, and two such agents are two candidates rather than a pick.
+/// `~/src/develop` alike, and two such agents are two candidates rather than a pick. The caller's
+/// own agent (`is_self`) never answers to a word: "the other agent in my tab" is the one meant.
 pub fn resolve(target: &str, candidates: &[Candidate]) -> Resolved {
     let (session_filter, word) = match target.split_once('/') {
         Some((session, word)) if !session.is_empty() && !word.is_empty() => (Some(session), word),
@@ -88,7 +89,7 @@ pub fn resolve(target: &str, candidates: &[Candidate]) -> Resolved {
 
 fn answers_to(candidate: &Candidate, word: &str) -> bool {
     let same = |value: &str| !value.is_empty() && value.eq_ignore_ascii_case(word);
-    let Some(agent) = candidate.agent else {
+    let Some(agent) = candidate.agent.filter(|agent| !agent.is_self) else {
         return false;
     };
     same(&agent.tab_name)
@@ -296,6 +297,17 @@ mod tests {
             resolve_in("play/builder", &fleet),
             Resolved::Nothing(_)
         ));
+    }
+
+    #[test]
+    fn the_caller_never_answers_to_a_word() {
+        // the sender shares the tab `notes` with one other agent: that one is meant
+        let mut fleet = fleet();
+        fleet[3].agent.as_mut().unwrap().is_self = true;
+        assert_eq!(resolve_in("notes", &fleet), one("play", 5));
+        assert!(matches!(resolve_in("scribe", &fleet), Resolved::Nothing(_)));
+        // its own handle still names it
+        assert_eq!(resolve_in("calm-lynx", &fleet), one("play", 4));
     }
 
     #[test]
