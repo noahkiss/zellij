@@ -26,8 +26,6 @@ pub enum ParamKind {
     Int,
     /// A closed set, written out here because the tool's own values need not be the CLI's.
     Enum(&'static [&'static str]),
-    /// A list of strings with at least one in it - one argv word each, so a value may hold spaces.
-    StrList,
 }
 
 /// One parameter of one tool.
@@ -321,7 +319,7 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "zellij_write_input",
         summary: "Type into a named pane, as if at its keyboard, or send a coding agent in it a \
-                  message, an interrupt or an answer to its approval prompt.",
+                  message.",
         best_for: "driving a program that is already running in a pane - answering a prompt, \
                    sending a line to a shell, talking to an agent in another pane.",
         not_for: "starting something in a NEW pane, and not for a pane you have not named. There \
@@ -331,19 +329,12 @@ pub const TOOLS: &[ToolSpec] = &[
         // flag: a tool that multiplexes says what each of its commands returns
         reports: &["action send-keys", "action write-chars"],
         tips: "keys goes through the key parser, so `Enter`, `Ctrl c` and `Esc` mean those keys; \
-               text is written literally and presses nothing. Pass one of keys, text or \
-               agent_action. This is the cheap way to do more work in a pane you already made: \
-               reach for it before zellij_create. Prefer your harness's messaging tool for a named agent. \
+               text is written literally and presses nothing. Pass one of keys or text. This \
+               is the cheap way to do more work in a pane you already made: reach for it before \
+               zellij_create. Prefer your harness's messaging tool for a named agent. \
                Successful input to a named agent adds a messaging hint. To send pane input, pass text with \
                submit=true: the text goes in as one bracketed paste, so its newlines do not send \
-               it early, and then Enter sends it. Follow with zellij_wait_for until=agent_idle. \
-               agent_action works on a pane running claude, codex, opencode or pi, and checks \
-               the state the agent reports before it presses anything: interrupt stops a \
-               working agent; approve accepts the permission prompt a blocked agent shows, on \
-               its first option (allow once); deny refuses it. A call that does not fit the \
-               state - approve when nothing is asked, interrupt when the agent is idle - is \
-               refused and presses nothing. A question the agent asks (blocked, kind question) \
-               is answered with keys or text, not with approve.",
+               it early, and then Enter sends it. Follow with zellij_wait_for until=agent_idle.",
         params: &[
             SESSION,
             ParamSpec {
@@ -385,16 +376,6 @@ pub const TOOLS: &[ToolSpec] = &[
                            send a message to a coding agent, or several lines to a shell at once.",
                 default: None,
             },
-            ParamSpec {
-                name: "agent_action",
-                kind: ParamKind::Enum(&["interrupt", "approve", "deny"]),
-                required: false,
-                from: None,
-                describe: "Act on the coding agent in the pane: interrupt its work, approve its \
-                           permission prompt, or deny it. The key is the one that agent expects, \
-                           and nothing is pressed unless the agent's state fits.",
-                default: None,
-            },
         ],
         read_only: false,
         destructive: false,
@@ -426,9 +407,7 @@ pub const TOOLS: &[ToolSpec] = &[
                pane's address and survives a session restore: use it, not the integer id, for \
                every later call on the pane. You cannot choose a pane's name or handle; a pane \
                running a command is named after the command. On another machine (session host/session) kind is \
-               agent_tab or tab, cwd is an absolute path there, and exec runs through /bin/sh. \
-               run_in=plugin loads a plugin instead, configured by \
-               plugin_config; read what it draws with zellij_read_pane.",
+               agent_tab or tab, cwd is an absolute path there, and exec runs through /bin/sh.",
         params: &[
             SESSION,
             ParamSpec {
@@ -455,7 +434,7 @@ pub const TOOLS: &[ToolSpec] = &[
             },
             ParamSpec {
                 name: "run_in",
-                kind: ParamKind::Enum(&["shell", "exec", "plugin"]),
+                kind: ParamKind::Enum(&["shell", "exec"]),
                 required: false,
                 from: None,
                 describe: "How `command` runs. shell, the default, types it into your interactive \
@@ -463,9 +442,7 @@ pub const TOOLS: &[ToolSpec] = &[
                            apply, and the pane stays a shell afterwards. exec runs it as \
                            `$SHELL -c`, which reads no interactive rc file, ends the pane's \
                            command when it ends, and keeps its exit status for zellij_wait_for \
-                           until=exit. plugin opens `command` as a plugin pane instead of a terminal: \
-                           `file:/path/to.wasm`, `zellij:<name>` or an alias. It takes kind \
-                           agent_tab or tab, not stacked.",
+                           until=exit.",
                 default: Some(invoke::RUN_IN_DEFAULT),
             },
             ParamSpec {
@@ -488,15 +465,6 @@ pub const TOOLS: &[ToolSpec] = &[
                 describe: "The directory the pane starts in. `~`, `$VAR` and a relative path are \
                            expanded against this server's own environment; a path that is not a \
                            directory fails the call rather than being ignored.",
-                default: None,
-            },
-            ParamSpec {
-                name: "plugin_config",
-                kind: ParamKind::StrList,
-                required: false,
-                from: Some(("action new-pane", "--configuration")),
-                describe: "With run_in=plugin: the plugin's configuration, one `key=value` per \
-                           entry. A value cannot hold a comma.",
                 default: None,
             },
             ParamSpec {
@@ -770,11 +738,6 @@ fn property(param: &ParamSpec) -> Value {
         ParamKind::Enum(values) => {
             property.insert("type".to_owned(), json!("string"));
             property.insert("enum".to_owned(), json!(values));
-        },
-        ParamKind::StrList => {
-            property.insert("type".to_owned(), json!("array"));
-            property.insert("items".to_owned(), json!({"type": "string"}));
-            property.insert("minItems".to_owned(), json!(1));
         },
     }
     property.insert("description".to_owned(), json!(param_description(param)));
@@ -1065,10 +1028,9 @@ mod tests {
                 "{} is not namespaced by its service",
                 tool.name
             );
-            // Keep each tool's argument list small enough to use reliably. Ten since
-            // `zellij_create` took `plugin_config`; a plugin pane reuses `command` and `run_in`
+            // Keep each tool's argument list small enough to use reliably
             assert!(
-                tool.params.len() <= 10,
+                tool.params.len() <= 9,
                 "{} asks for more parameters than an agent can be expected to get right",
                 tool.name
             );

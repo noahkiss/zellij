@@ -138,25 +138,6 @@ impl<'a> Args<'a> {
     fn enumerated(&self, name: &str, default: &str) -> String {
         self.string(name).unwrap_or_else(|| default.to_owned())
     }
-    /// A required list of non-empty strings. A lone string is taken as a list of one, which is the
-    /// mistake a caller is most likely to make and has only one meaning.
-    fn strings(&self, name: &str) -> Result<Vec<String>, String> {
-        let values = match self.values.get(name) {
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(|item| match item {
-                    Value::String(text) if !text.is_empty() => Ok(text.clone()),
-                    _ => Err(format!("`{}` must hold only non-empty strings.", name)),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(Value::String(text)) if !text.is_empty() => vec![text.clone()],
-            _ => Vec::new(),
-        };
-        if values.is_empty() {
-            return Err(format!("`{}` is required and was not given.", name));
-        }
-        Ok(values)
-    }
 }
 
 /// Where `zellij_create` puts a pane when the caller does not say.
@@ -568,7 +549,7 @@ async fn plan_in(
         .string("session")
         .or_else(|| ambient_session.map(String::from));
     if tool == "zellij_write_input" {
-        if let Some(call) = write_input_call(&read, ambient_session, target).await? {
+        if let Some(call) = write_input_call(&read, ambient_session)? {
             return Ok(call.into());
         }
     }
@@ -597,7 +578,6 @@ async fn plan_in(
         return Ok(Call::One(argv_in(tool, args, ambient_session, env, None)?).into());
     }
     create_kind_allowed(&read)?;
-    plugin_pane(&read)?;
     let session = target_session.clone();
     let then_type = typed_command(&read)?.map(|command| TypeAfter {
         session: session.clone(),
@@ -659,17 +639,13 @@ fn remote_kind_allowed(args: &Args) -> Result<(), String> {
     }
 }
 
-/// `zellij_write_input` when it is more than one keystroke or one write: a message to submit, or
-/// an action on the coding agent in the pane. `None` for a plain `keys` or `text` call, which
-/// [`argv_in`] builds.
-async fn write_input_call(
+/// `zellij_write_input` when it is more than one keystroke or one write: a message to submit.
+/// `None` for a plain `keys` or `text` call, which [`argv_in`] builds.
+fn write_input_call(
     args: &Args<'_>,
     ambient_session: Option<&str>,
-    target: &Target,
 ) -> Result<Option<Call>, String> {
-    let submit = args.flag("submit");
-    let action = args.string("agent_action");
-    if !submit && action.is_none() {
+    if !args.flag("submit") {
         return Ok(None);
     }
     let pane = args.required("pane")?;
@@ -694,52 +670,6 @@ async fn write_input_call(
             key.to_owned(),
         ])
     };
-    if let Some(action) = action {
-        if submit || args.string("keys").is_some() || args.string("text").is_some() {
-            return Err(
-                "`agent_action` presses its own key: pass it alone, without keys, text or \
-                 submit."
-                    .to_owned(),
-            );
-        }
-        if !["interrupt", "approve", "deny"].contains(&action.as_str()) {
-            return Err(format!(
-                "`agent_action` must be interrupt, approve or deny, not `{}`.",
-                action
-            ));
-        }
-        let agents = run_on(
-            target,
-            &scoped(vec![
-                "action".to_owned(),
-                "list-agents".to_owned(),
-                "--json".to_owned(),
-            ]),
-        )
-        .await?;
-        if agents.is_error() {
-            return Err(format!(
-                "Could not ask the session which agent is in `{}`: {}",
-                pane,
-                agents.stderr.trim()
-            ));
-        }
-        let row = agent_row(&agents.stdout, &pane).ok_or_else(|| {
-            format!(
-                "`{}` is not running a coding agent this server can see. Pass the handle \
-                 zellij_overview with scope=agents prints.",
-                pane
-            )
-        })?;
-        let field = |name: &str| row.get(name).and_then(Value::as_str);
-        let key = agent_key(
-            field("kind").unwrap_or_default(),
-            field("state"),
-            field("state_kind"),
-            &action,
-        )?;
-        return Ok(Some(Call::One(press(key))));
-    }
     if args.string("keys").is_some() {
         return Err("`submit` sends text: pass text, not keys.".to_owned());
     }
@@ -758,124 +688,13 @@ async fn write_input_call(
     ])))
 }
 
-/// The `list-agents --json` row of the pane a caller named: by handle, bare id or `terminal_N`.
-pub fn agent_row(json: &str, pane: &str) -> Option<Map<String, Value>> {
-    let rows: Vec<Map<String, Value>> = serde_json::from_str(json.trim()).ok()?;
-    rows.into_iter().find(|row| {
-        let id = row.get("pane_id").and_then(Value::as_u64);
-        row.get("handle").and_then(Value::as_str) == Some(pane)
-            || id.map_or(false, |id| {
-                pane == id.to_string() || pane == format!("terminal_{}", id)
-            })
-    })
-}
-
-/// The key an agent action presses, or why it presses none.
-///
-/// The keys are the ones the harnesses share. A permission prompt opens on its "allow once"
-/// option in claude, codex and opencode, so Enter takes it; Esc refuses it, and interrupts a
-/// working turn. pi asks for no approval at all. The agent's own `state` is the guard: an Enter
-/// sent to an agent that is not asking anything would send whatever it holds in its input box.
-/// An agent that reports no state cannot be checked, and gets the key.
-pub fn agent_key(
-    kind: &str,
-    state: Option<&str>,
-    state_kind: Option<&str>,
-    action: &str,
-) -> Result<&'static str, String> {
-    let nothing = |what: &str| {
-        Err(format!(
-            "Nothing to {}: the agent's state is {}. Nothing was pressed.",
-            what,
-            state.unwrap_or("-")
-        ))
-    };
-    match action {
-        "interrupt" => match state {
-            None | Some("working") => Ok("Esc"),
-            Some("blocked") => Err(
-                "The agent is blocked on a person, not working: approve or deny it instead. \
-                 Nothing was pressed."
-                    .to_owned(),
-            ),
-            Some(_) => nothing("interrupt"),
-        },
-        "approve" if kind == "pi" => {
-            Err("pi asks for no approvals, so there is nothing to approve.".to_owned())
-        },
-        "approve" => match (state, state_kind) {
-            (Some("blocked"), Some("question")) => Err(
-                "The agent is asking a question, not for permission: answer it with keys (the \
-                 option's number) or text. Nothing was pressed."
-                    .to_owned(),
-            ),
-            (None, _) | (Some("blocked"), _) => Ok("Enter"),
-            _ => nothing("approve"),
-        },
-        "deny" => match state {
-            None | Some("blocked") => Ok("Esc"),
-            Some(_) => nothing("deny"),
-        },
-        other => Err(format!(
-            "`agent_action` must be interrupt, approve or deny, not `{}`.",
-            other
-        )),
-    }
-}
-
-/// How a create runs its `command`: `shell`, `exec` or `plugin`, refused when it is none of them.
+/// How a create runs its `command`: `shell` or `exec`, refused when it is neither.
 fn run_in(args: &Args) -> Result<String, String> {
     let run_in = args.enumerated("run_in", RUN_IN_DEFAULT);
     match run_in.as_str() {
-        "shell" | "exec" | "plugin" => Ok(run_in),
-        other => Err(format!(
-            "`run_in` must be shell, exec or plugin, not `{}`.",
-            other
-        )),
+        "shell" | "exec" => Ok(run_in),
+        other => Err(format!("`run_in` must be shell or exec, not `{}`.", other)),
     }
-}
-
-/// The plugin a `run_in: plugin` create loads instead of a terminal - its `command` - with its
-/// configuration in the form `--configuration` takes. `None` for a terminal create. Refused with
-/// what only a terminal pane has, and with `kind: stacked`: the CLI drops `--stacked` for a
-/// plugin and opens it tiled in the focused tab, which is the person's.
-fn plugin_pane(args: &Args) -> Result<Option<(String, Option<String>)>, String> {
-    if run_in(args)? != "plugin" {
-        if args.values.contains_key("plugin_config") {
-            return Err(
-                "`plugin_config` configures a plugin: pass it with run_in=plugin.".to_owned(),
-            );
-        }
-        return Ok(None);
-    }
-    let plugin = args.required("command").map_err(|_| {
-        "run_in=plugin needs `command`: the plugin, like `file:/path/to.wasm`.".to_owned()
-    })?;
-    if args.values.contains_key("wait_ready") {
-        return Err("A plugin pane has no shell, and takes no `wait_ready`.".to_owned());
-    }
-    if args.enumerated("kind", CREATE_KIND_DEFAULT) == "stacked" {
-        return Err(
-            "A plugin pane cannot be stacked: use agent_tab, the default, or tab.".to_owned(),
-        );
-    }
-    let config = match args.values.contains_key("plugin_config") {
-        false => None,
-        true => {
-            let entries = args.strings("plugin_config")?;
-            if let Some(entry) = entries
-                .iter()
-                .find(|entry| !entry.contains('=') || entry.contains(','))
-            {
-                return Err(format!(
-                    "`plugin_config` takes one `key=value` per entry, with no comma: not `{}`.",
-                    entry
-                ));
-            }
-            Some(entries.join(","))
-        },
-    };
-    Ok(Some((plugin, config)))
 }
 
 /// The command a create types into its pane once the pane is ready: the `command` of a
@@ -889,10 +708,6 @@ fn typed_command(args: &Args) -> Result<Option<String>, String> {
 
 /// The name a created pane is given: the command it runs. The caller does not choose it.
 fn pane_name(args: &Args) -> Option<String> {
-    // a plugin pane is titled by its plugin already
-    if args.enumerated("run_in", RUN_IN_DEFAULT) == "plugin" {
-        return None;
-    }
     args.string("command").as_deref().map(default_pane_name)
 }
 
@@ -1087,7 +902,7 @@ fn argv_in(
         "zellij_create" if args.string("reopen").is_some() => {
             let reopen = args.string("reopen").unwrap_or_default();
             // the pane comes back as it was: its tab, its directory, its handle, its line
-            if let Some(param) = ["kind", "command", "run_in", "cwd", "plugin_config"]
+            if let Some(param) = ["kind", "command", "run_in", "cwd"]
                 .into_iter()
                 .find(|param| args.values.contains_key(*param))
             {
@@ -1108,20 +923,10 @@ fn argv_in(
             create_kind_allowed(&args)?;
             let kind = args.enumerated("kind", CREATE_KIND_DEFAULT);
             let command = args.string("command");
-            // a plugin pane has no shell to wait for, and no command to hand over
-            let plugin = plugin_pane(&args)?;
-            let with_plugin = |rest: &mut Vec<String>| {
-                if let Some((plugin, config)) = &plugin {
-                    rest.push(flag_value("--plugin", plugin));
-                    if let Some(config) = config {
-                        rest.push(flag_value("--configuration", config));
-                    }
-                }
-            };
             // `shell` makes a plain shell pane and leaves `command` to be typed into it once it is
             // ready - see `TypeAfter`. `exec` hands `command` to the server as `$SHELL -c`, as
             // every create did before, and waits for nothing
-            let shell_mode = !matches!(run_in(&args)?.as_str(), "exec" | "plugin");
+            let shell_mode = run_in(&args)? != "exec";
             let wait_ready = shell_mode && args.flag_or("wait_ready", true);
             // the end of every create's command line: the readiness wait, or the command after
             // `--`, which has to come last because everything after it is the command's own argv
@@ -1130,7 +935,7 @@ fn argv_in(
                     rest.push("--wait-ready".to_owned());
                     rest.push(flag_value("--ready-timeout", READY_TIMEOUT_DEFAULT_S));
                 }
-                if let (false, None, Some(command)) = (shell_mode, &plugin, &command) {
+                if let (false, Some(command)) = (shell_mode, &command) {
                     rest.push("--".to_owned());
                     // this machine's `$SHELL` names a path on this machine
                     let shell = if env.remote { None } else { env.shell.clone() };
@@ -1169,7 +974,6 @@ fn argv_in(
                             rest.push(flag_value("--name", &name));
                         }
                     }
-                    with_plugin(&mut rest);
                     finish(&mut rest);
                 },
                 "stacked" => {
@@ -1184,15 +988,6 @@ fn argv_in(
                         rest.push(flag_value("--name", &name));
                     }
                     finish(&mut rest);
-                },
-                "tab" if plugin.is_some() => {
-                    // `new-tab` takes no plugin configuration; `new-pane --new-tab` does
-                    rest.push("new-pane".to_owned());
-                    rest.push("--new-tab".to_owned());
-                    if let Some(cwd) = args.string("cwd") {
-                        rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
-                    }
-                    with_plugin(&mut rest);
                 },
                 "tab" => {
                     rest.push("new-tab".to_owned());
@@ -1616,53 +1411,6 @@ mod tests {
         .contains("without full or ansi"));
     }
 
-    #[test]
-    fn an_agent_action_presses_the_key_the_state_calls_for_or_nothing() {
-        // approve takes the prompt's first option, allow once, in every harness that asks
-        for kind in ["claude", "codex", "opencode"] {
-            assert_eq!(
-                agent_key(kind, Some("blocked"), Some("permission"), "approve"),
-                Ok("Enter")
-            );
-        }
-        assert_eq!(
-            agent_key("claude", Some("blocked"), Some("permission"), "deny"),
-            Ok("Esc")
-        );
-        assert_eq!(
-            agent_key("claude", Some("working"), None, "interrupt"),
-            Ok("Esc")
-        );
-        // an agent that reports no state cannot be checked, and gets the key
-        assert_eq!(agent_key("opencode", None, None, "approve"), Ok("Enter"));
-        // the guard: an Enter to an idle agent would send its draft
-        for (state, action) in [
-            ("done", "approve"),
-            ("idle", "interrupt"),
-            ("working", "deny"),
-        ] {
-            let refused = agent_key("claude", Some(state), None, action).unwrap_err();
-            assert!(refused.contains("Nothing was pressed"), "{}", refused);
-        }
-        assert!(
-            agent_key("claude", Some("blocked"), Some("question"), "approve")
-                .unwrap_err()
-                .contains("asking a question")
-        );
-        assert!(agent_key("claude", Some("blocked"), Some("permission"), "interrupt").is_err());
-        assert!(agent_key("pi", Some("blocked"), None, "approve").is_err());
-    }
-
-    #[test]
-    fn an_agent_is_found_by_any_name_its_pane_answers_to() {
-        let rows = r#"[{"handle":"sunny-otter","pane_id":3,"kind":"claude"}]"#;
-        for name in ["sunny-otter", "3", "terminal_3"] {
-            assert!(agent_row(rows, name).is_some(), "{}", name);
-        }
-        assert!(agent_row(rows, "4").is_none());
-        assert!(agent_row("not json", "3").is_none());
-    }
-
     #[tokio::test]
     async fn a_submitted_message_is_a_paste_then_enter() {
         let plan = plan_in(
@@ -1704,8 +1452,6 @@ mod tests {
         for refused in [
             json!({"pane": "3", "submit": true}),
             json!({"pane": "3", "keys": "Enter", "submit": true}),
-            json!({"pane": "3", "agent_action": "approve", "text": "x"}),
-            json!({"pane": "3", "agent_action": "maybe"}),
         ] {
             assert!(
                 plan_in(
@@ -1885,7 +1631,7 @@ mod tests {
             "zellij_create",
             json!({"kind": "stacked", "command": "make", "run_in": "login"})
         )
-        .contains("shell, exec or plugin"));
+        .contains("shell or exec"));
     }
 
     #[tokio::test]
@@ -1949,59 +1695,6 @@ mod tests {
             assert!(refusal("zellij_create", json!({"kind": kind}))
                 .contains("must be agent_tab, stacked or tab"));
         }
-    }
-
-    #[test]
-    fn a_plugin_create_loads_the_plugin_in_the_agents_tab_and_waits_for_no_shell() {
-        let plugin = json!({"run_in": "plugin", "command": "file:/tmp/bar.wasm",
-                            "plugin_config": ["data_file=/tmp/d", "mode=a=b"]});
-        assert_eq!(
-            in_agent_tab(
-                plugin.clone(),
-                Some("work"),
-                "work-zj",
-                TabPlacement::Existing
-            ),
-            "-s work action new-pane --in-tab=work-zj --no-focus \
-             --plugin=file:/tmp/bar.wasm --configuration=data_file=/tmp/d,mode=a=b"
-        );
-        assert_eq!(
-            in_agent_tab(plugin, Some("work"), "work-zj", TabPlacement::Made),
-            "-s work action new-pane --new-tab=work-zj --no-focus \
-             --plugin=file:/tmp/bar.wasm --configuration=data_file=/tmp/d,mode=a=b"
-        );
-        assert_eq!(
-            line(
-                "zellij_create",
-                json!({"kind": "tab", "run_in": "plugin", "command": "zellij:strider"}),
-                None
-            ),
-            "action new-pane --new-tab --plugin=zellij:strider"
-        );
-    }
-
-    #[test]
-    fn a_plugin_create_refuses_what_only_a_terminal_has() {
-        for (extra, said) in [
-            (json!({"wait_ready": false}), "no `wait_ready`"),
-            (json!({"kind": "stacked"}), "cannot be stacked"),
-            (json!({"plugin_config": ["a=1,b=2"]}), "no comma"),
-            (json!({"plugin_config": ["flag"]}), "one `key=value`"),
-        ] {
-            let mut value = extra.clone();
-            value["run_in"] = json!("plugin");
-            value["command"] = json!("zellij:strider");
-            let refused = refusal("zellij_create", value);
-            assert!(refused.contains(said), "{}: {}", extra, refused);
-        }
-        assert!(refusal("zellij_create", json!({"run_in": "plugin"})).contains("needs `command`"));
-        assert!(refusal("zellij_create", json!({"plugin_config": ["a=1"]}))
-            .contains("with run_in=plugin"));
-        assert!(refusal(
-            "zellij_create",
-            json!({"reopen": "last", "plugin_config": ["a=1"]})
-        )
-        .contains("no `plugin_config`"));
     }
 
     #[test]

@@ -8157,11 +8157,11 @@ parameters. Files: `zellij-server/src/program_status.rs` (the flag), `panes/grid
 judge on scripted looks (stale, working, each stop, the silence fallback, the `agent-waiting`
 misses), the row reading, the report lines, the clap defaults and the MCP command lines.
 
-### Checking in on an agent: `last-reply`, `submit` and `agent_action`
+### Checking in on an agent: `last-reply` and `submit`
 
 From nkmk.34, from the agent-orchestration plan. A session that drives agents in other panes read
-their whole screen to learn what they said, typed a message as keystrokes whose newlines sent it
-early, and had to know which key each harness wants for an approval.
+their whole screen to learn what they said, and typed a message as keystrokes whose newlines sent
+it early.
 
 ```
 zellij_write_input {"pane": "sunny-otter", "text": "Fix the failing test.\nThen run it.", "submit": true}
@@ -8171,7 +8171,6 @@ zellij_read_pane   {"pane": "sunny-otter", "last_reply": true}
 {"pane_id": "terminal_3", "handle": "sunny-otter", "kind": "claude", "agent_id": "…",
  "transcript": "/home/u/.claude/projects/-home-u-src/….jsonl", "state": "done",
  "reply": "Fixed: the fixture path was relative. The test passes."}
-zellij_write_input {"pane": "sunny-otter", "agent_action": "approve"}
 ```
 
 **`zellij action last-reply --pane-id <pane> [--json]`** prints the agent's last reply, read from
@@ -8204,37 +8203,19 @@ the model wrote it.
 **`zellij_read_pane` gains `last_reply`**, which runs `last-reply --json`. It refuses `full` and
 `ansi` beside it.
 
-**`zellij_write_input` gains `submit` and `agent_action`.**
-
-- `submit` with `text` runs `action paste` (one bracketed paste, so a newline in the message does
-  not send it early) and then `send-keys Enter`, 150 ms apart. A TUI that reads a paste as it
-  arrives can take an Enter right behind it as part of the paste.
-- `agent_action` is `interrupt`, `approve` or `deny`. It reads the pane's `list-agents` row first
-  and presses a key only when the agent's reported state fits:
-
-  | action | presses | only when the state is |
-  |---|---|---|
-  | `interrupt` | `Esc` | `working`, or none reported |
-  | `approve` | `Enter`: the prompt's first option, allow once, in claude, codex and opencode | `blocked` (not `question`), or none reported |
-  | `deny` | `Esc` | `blocked`, or none reported |
-
-  An Enter sent to an agent that is not asking would send whatever it holds in its input box, which
-  is why the state is the guard. A question (`blocked`, `question`) is answered with keys or text.
-  pi asks for no approvals. An agent that reports no state (opencode) cannot be checked and gets
-  the key. The pane is matched by handle, bare id or `terminal_N`; a uuid is refused with a pointer
-  to `zellij_overview`. Verified live on claude only; the codex and opencode keys come from their
-  prompts' default option and their own Esc bindings.
+**`zellij_write_input` gains `submit`.** With `text` it runs `action paste` (one bracketed paste,
+so a newline in the message does not send it early) and then `send-keys Enter`, 150 ms apart. A
+TUI that reads a paste as it arrives can take an Enter right behind it as part of the paste.
 
 Capability: `last-reply`. Both MCP tools stay within the parameter cap: `zellij_read_pane` has
-five, `zellij_write_input` six. Files: `zellij-client/src/agent_reply.rs` (new: the transcript
+five, `zellij_write_input` five. Files: `zellij-client/src/agent_reply.rs` (new: the transcript
 roots, the find, the tail read and the per-harness walk), `cli_client.rs`
 (`start_last_reply_client`, `last_reply_of`), `zellij-utils/src/cli.rs` (`LastReply`),
 `input/actions.rs` (the refusal arm), `cli_surface.rs` (the `read` band, the payload row),
-`capabilities.rs`; `src/commands.rs`; `src/mcp/` (`Call::Sequence`, `write_input_call`,
-`agent_row`, `agent_key`, the two tools). Tests: the walk on claude, codex and pi transcripts
+`capabilities.rs`; `src/commands.rs`; `src/mcp/` (`Call::Sequence`, `write_input_call`, the two
+tools). Tests: the walk on claude, codex and pi transcripts
 (narration, tool steps, mid-tool, sidechain, meta), the roots and their variables, the find at each
-harness's depth, the tail read, every miss of `last_reply_of`, the key table and its refusals, the
-row match, and the paste-then-Enter sequence.
+harness's depth, the tail read, every miss of `last_reply_of`, and the paste-then-Enter sequence.
 
 ### `zellij_overview scope=my_agents`: the supervision view
 
@@ -8579,34 +8560,19 @@ description now tells the caller to stay at least 5 seconds under the client's d
 again. The 300-second default is unchanged: lowering it would cut short a long wait in a client
 whose deadline is long, such as Claude Code.
 
-### `zellij_create run_in=plugin`: a plugin pane in the agent's own tab
+### `new-pane --plugin` opens in the tab it was asked for
 
-An agent testing a plugin had no way to load it next to its own work. `zellij_create` ran shells,
-commands and agents only. The CLI route, `new-pane --plugin`, opened the plugin in the focused tab,
-which is the person's. So agents started a throwaway background session for every look.
+`new-pane --plugin` with `--tab-id`, `--in-tab` or `--new-tab` put the plugin somewhere else. An
+agent testing a plugin could not load it in its own tab, away from the person's.
 
 ```
-zellij_create {"run_in": "plugin", "command": "file:/tmp/bar.wasm",
-               "plugin_config": ["data_file=/tmp/d.json"]}
-  # action new-pane --in-tab=work-zj --no-focus --plugin=file:/tmp/bar.wasm
-  #   --configuration=data_file=/tmp/d.json
+zellij action new-pane --in-tab=work-zj --no-focus --plugin=file:/tmp/bar.wasm \
+  --configuration=data_file=/tmp/d.json
 pane_id: plugin_12
 handle: brave-lynx
 ```
 
-- **`run_in` takes `plugin`.** `command` is then the plugin: a `file:` path, a `zellij:` plugin
-  or an alias. **`plugin_config` is its configuration**, one `key=value` per entry, joined into
-  `--configuration`. An entry with a comma, or with no `=`, is refused, because
-  `--configuration` cannot carry it. `plugin_config` with any other `run_in` is refused.
-- **`kind` is `agent_tab` (the default) or `tab`.** `stacked` is refused: the CLI drops
-  `--stacked` for a plugin pane, and the pane would open tiled in the focused tab. `tab` runs
-  `new-pane --new-tab`, because `new-tab --initial-plugin` takes no configuration.
-- **`wait_ready` is refused** with a plugin, which has no shell. The pane keeps the title zellij
-  gives a plugin.
-- The answer carries the pane's handle, so `zellij_read_pane` reads what the plugin draws.
-- The tool takes eight parameters.
-
-Two server fixes make the placement true. Both changed what the CLI does, not only the MCP:
+Two server fixes:
 
 - **A plugin pane asked for in another tab opens there.** `new-pane --plugin --tab-id` and
   `--in-tab` were ignored. `AddPlugin` took the client's active tab whenever a client was named,
@@ -8617,12 +8583,10 @@ Two server fixes make the placement true. Both changed what the CLI does, not on
   `HashMap`, so it could name the tab template's tab bar or status bar. The plugin thread now names the pane it put into the template's empty slot, and
   `ApplyLayout` keeps that name instead of picking one.
 
-Files: `src/mcp/invoke.rs` (`run_in`, `plugin_pane`, the create arms), `src/mcp/tools.rs`,
-`zellij-server/src/screen.rs` (`AddPlugin`, `ApplyLayout`), `zellij-server/src/plugins/mod.rs`
-(`NewTab`), `zellij-server/src/route.rs` (`NotificationEnd::has_affected_pane_id`). Tests: the
-argv for an existing and a new agent tab and for `kind: tab`, each refusal, a plugin pane opening
-in a tab the client is not in, and a new tab that keeps the pane the plugin thread named. No
-client/server contract changes.
+Files: `zellij-server/src/screen.rs` (`AddPlugin`, `ApplyLayout`), `zellij-server/src/plugins/mod.rs`
+(`NewTab`), `zellij-server/src/route.rs` (`NotificationEnd::has_affected_pane_id`). Tests: a
+plugin pane opening in a tab the client is not in, and a new tab that keeps the pane the plugin
+thread named. No client/server contract changes.
 
 ## Assessed and deliberately not built
 
