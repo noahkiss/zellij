@@ -8633,6 +8633,32 @@ stacked pane expands it and moves the clients in that stack with it.
 the focused pane's expansion alone, and a focused create in a full tab takes both. No contract
 change.
 
+### A resumed session's new tabs open where they are asked to
+
+```
+# a session that came back from its serialized layout (`session up`, `session restart`)
+zellij action new-pane --new-tab=work --cwd=<default_cwd>/project
+zellij action new-tab --cwd=<default_cwd>/project
+# before: the tab's shell starts in <default_cwd>
+# after:  it starts in <default_cwd>/project
+```
+
+A serialized session layout names a global `cwd` for its tabs and carries a `new_tab_template`.
+The parser stamped that global `cwd` onto the template's panes as an absolute path. A new tab
+joins its own cwd onto the template's, and joining onto an absolute path leaves the absolute path,
+so the session's directory beat `--cwd`, and beat the caller's own directory for a plain
+`new-tab`. A fresh session did not do it; only a resumed one did. The next serialization wrote the
+stamp back as `pane cwd="..."`, so every later resume kept it.
+
+The parser no longer applies the global `cwd` to `new_tab_template`: it says where the written
+tabs hang from, not where a new tab opens. A template pane whose cwd equals the global `cwd` is
+taken for that stamp, as an older build wrote it, and dropped too, so a session heals on its first
+resume onto this build without `--fresh`. A template cwd that differs from the global one is kept.
+
+`zellij-utils/src/kdl/kdl_layout_parser.rs` (`populate_new_tab_template`, `drop_cwd_equal_to`).
+Test in `zellij-utils/src/input/unit/layout_test.rs`: the fresh and the stamped template take no
+cwd, a template's own cwd stays, and the tabs still hang from the global `cwd`. No contract change.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

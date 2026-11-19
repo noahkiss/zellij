@@ -857,6 +857,87 @@ fn layout_with_new_tab_template() {
     assert_snapshot!(normalize_layout_debug(format!("{:#?}", layout)));
 }
 
+// fork addition: a resumed session's layout carries a global `cwd` for its tabs. Stamped onto
+// `new_tab_template`, it beat the cwd a new tab was opened with, so `new-tab --cwd` and
+// `new-pane --new-tab --cwd` opened in the session's directory.
+#[test]
+fn new_tab_template_does_not_take_the_global_cwd() {
+    let template_runs = |kdl_layout: &str| -> Vec<Option<Run>> {
+        let layout =
+            Layout::from_kdl(kdl_layout, Some("layout_file_name".into()), None, None).unwrap();
+        let (template, _floating) = layout.new_tab();
+        template.extract_run_instructions()
+    };
+    // the shape a fresh session serializes
+    let runs = template_runs(
+        r#"
+        layout {
+            cwd "/home/user/develop"
+            tab name="first" {
+                pane cwd="project"
+            }
+            new_tab_template {
+                pane
+            }
+        }
+    "#,
+    );
+    assert_eq!(runs, vec![None]);
+    // the stamp as an older build wrote it back on the next serialization
+    let runs = template_runs(
+        r#"
+        layout {
+            cwd "/home/user/develop"
+            tab name="first" {
+                pane cwd="project"
+            }
+            new_tab_template {
+                pane cwd="/home/user/develop"
+            }
+        }
+    "#,
+    );
+    assert_eq!(runs, vec![None]);
+    // a cwd the template names for itself stays
+    let runs = template_runs(
+        r#"
+        layout {
+            cwd "/home/user/develop"
+            tab name="first" {
+                pane
+            }
+            new_tab_template {
+                pane cwd="/srv/elsewhere"
+            }
+        }
+    "#,
+    );
+    assert_eq!(runs, vec![Some(Run::Cwd("/srv/elsewhere".into()))]);
+    // the tabs still hang from the global cwd
+    let layout = Layout::from_kdl(
+        r#"
+        layout {
+            cwd "/home/user/develop"
+            tab name="first" {
+                pane cwd="project"
+            }
+            new_tab_template {
+                pane
+            }
+        }
+    "#,
+        Some("layout_file_name".into()),
+        None,
+        None,
+    )
+    .unwrap();
+    let tab_runs = layout.tabs()[0].1.extract_run_instructions();
+    assert_eq!(
+        tab_runs,
+        vec![Some(Run::Cwd("/home/user/develop/project".into()))]
+    );
+}
+
 #[test]
 fn layout_with_pane_templates() {
     let kdl_layout = r#"

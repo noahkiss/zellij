@@ -1730,8 +1730,23 @@ impl<'a> KdlLayoutParser<'a> {
         Ok(())
     }
     fn populate_new_tab_template(&mut self, kdl_node: &KdlNode) -> Result<(), ConfigError> {
-        let (_is_focused, _tab_name, tab_template, tab_template_floating_panes) =
-            self.parse_tab_node(kdl_node)?;
+        // fork change: the layout's global `cwd` is where the tabs written here hang from, not
+        // where a new tab opens. Stamped onto this template, it beat the cwd every new tab asks
+        // for (`new-tab --cwd`, `new-pane --new-tab --cwd`, or the caller's own directory), and a
+        // resumed session wrote it back, so it stuck. A pane cwd equal to the global one is that
+        // stamp as an older build serialized it, and is dropped too.
+        let global_cwd = self.global_cwd.take();
+        let parsed = self.parse_tab_node(kdl_node);
+        self.global_cwd = global_cwd;
+        let (_is_focused, _tab_name, mut tab_template, mut tab_template_floating_panes) = parsed?;
+        if let Some(global_cwd) = &self.global_cwd {
+            drop_cwd_equal_to(&mut tab_template, global_cwd);
+            for floating_pane in tab_template_floating_panes.iter_mut() {
+                if matches!(&floating_pane.run, Some(Run::Cwd(cwd)) if cwd == global_cwd) {
+                    floating_pane.run = None;
+                }
+            }
+        }
         self.new_tab_template = Some((tab_template, tab_template_floating_panes));
         Ok(())
     }
@@ -2655,5 +2670,16 @@ impl<'a> KdlLayoutParser<'a> {
                 tab_cwd,
             )
         }
+    }
+}
+
+/// Clears every bare `cwd` in `layout` that names `cwd`, so the pane takes the cwd its tab is
+/// opened with. See `populate_new_tab_template`.
+fn drop_cwd_equal_to(layout: &mut TiledPaneLayout, cwd: &PathBuf) {
+    if matches!(&layout.run, Some(Run::Cwd(pane_cwd)) if pane_cwd == cwd) {
+        layout.run = None;
+    }
+    for child in layout.children.iter_mut() {
+        drop_cwd_equal_to(child, cwd);
     }
 }
