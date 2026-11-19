@@ -1,4 +1,4 @@
-//! The nine tools, and the half of each one that is generated rather than written.
+//! The six tools, and the half of each one that is generated rather than written.
 //!
 //! A tool's description is routing logic: it decides whether the tool is called at all, so the
 //! part that says what the tool is FOR is written by hand and kept blunt. The part that says what
@@ -7,7 +7,7 @@
 //! real CLI flag. A flag renamed in `cli.rs` therefore cannot leave a stale description behind:
 //! `every_parameter_names_a_real_argument` fails the build instead.
 //!
-//! Nine, not one per verb. `zellij action` has eighty-seven of those, and a surface nobody can
+//! Six, not one per verb. `zellij action` has eighty-seven of those, and a surface nobody can
 //! route through is worse than a small one that names its own follow-ups.
 
 use std::borrow::Cow;
@@ -517,87 +517,11 @@ pub const TOOLS: &[ToolSpec] = &[
         idempotent: false,
     },
     ToolSpec {
-        name: "zellij_arrange",
-        summary: "Move or stack a pane or a tab, always by explicit target.",
-        best_for: "reshaping a session you already have an overview of. Nothing here loses \
-                   anything: every operation can be moved back.",
-        not_for: "closing anything - that is zellij_close. Not for anything you cannot name a \
-                  target for, either: every operation here takes one.",
-        follow_up: Some("zellij_overview to see the shape the session ended up in"),
-        reports: &[
-            "action move-pane",
-            "action move-tab",
-            "action stack-panes",
-        ],
-        tips: "",
-        params: &[
-            SESSION,
-            ParamSpec {
-                name: "operation",
-                kind: ParamKind::Enum(&["move_pane", "move_tab", "stack_panes"]),
-                required: true,
-                from: None,
-                describe: "What to do. move_pane takes pane; move_tab takes tab; stack_panes \
-                           takes panes.",
-                default: None,
-            },
-            ParamSpec {
-                name: "pane",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("action move-pane", "--pane-id")),
-                describe: "The pane to move: its handle, like sunny-otter, or \
-                           terminal_1, plugin_2, a bare integer or a pane uuid.",
-                default: None,
-            },
-            ParamSpec {
-                name: "panes",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("action stack-panes", "pane_ids")),
-                describe: "The panes to stack, space separated: handles, terminal_1, plugin_2, \
-                           bare integers or pane uuids.",
-                default: None,
-            },
-            ParamSpec {
-                name: "tab",
-                kind: ParamKind::Int,
-                required: false,
-                from: Some(("action move-tab", "--tab-id")),
-                describe: "The tab to move, by the stable id zellij_overview prints - not its \
-                           1-based display position.",
-                default: None,
-            },
-            ParamSpec {
-                name: "direction",
-                kind: ParamKind::Enum(&["left", "right", "up", "down"]),
-                required: false,
-                from: Some(("action move-pane", "direction")),
-                describe: "",
-                default: None,
-            },
-            ParamSpec {
-                name: "to_index",
-                kind: ParamKind::Int,
-                required: false,
-                from: Some(("action move-tab", "--to-index")),
-                describe: "",
-                default: None,
-            },
-        ],
-        read_only: false,
-        // every operation here is reversible; the two that are not moved out to `zellij_close`, so
-        // that a client can allow a pane to be moved without allowing a tab to be closed
-        destructive: false,
-        idempotent: false,
-    },
-    ToolSpec {
         name: "zellij_close",
         summary: "Close a pane or a tab. This cannot be undone.",
         best_for: "clearing away a pane you are done with, or one whose command failed - close it \
                    rather than leaving it and making another.",
-        not_for: "moving or restacking anything, which is zellij_arrange, and not for a pane \
-                  somebody else made. Closing a tab closes every pane in it.",
+        not_for: "a pane somebody else made. Closing a tab closes every pane in it.",
         follow_up: Some("zellij_overview to see what the session has left"),
         reports: &["action close-pane", "action close-tab-by-id"],
         tips: "close_pane passes the `--yes` a person at a terminal would have to type. close_tab \
@@ -637,51 +561,6 @@ pub const TOOLS: &[ToolSpec] = &[
         destructive: true,
         idempotent: false,
     },
-    ToolSpec {
-        name: "zellij_snapshot",
-        summary: "List, show or restore an archived session snapshot.",
-        best_for: "bringing a session back after it was shut down, and for finding out what \
-                   snapshots exist to bring back.",
-        not_for: "saving one. A snapshot is written when a session is taken down, by the CLI, and \
-                  session lifecycle is deliberately not reachable from here.",
-        follow_up: Some("zellij_overview once a restore has rebuilt the session"),
-        reports: &["snapshot list", "snapshot show", "snapshot restore"],
-        tips: "An id may be given as a unique prefix, and `latest` is a valid id for a restore. \
-               list and show only read; restore rebuilds a whole session, which is why this tool \
-               is marked destructive.",
-        params: &[
-            ParamSpec {
-                name: "operation",
-                kind: ParamKind::Enum(&["list", "show", "restore"]),
-                required: true,
-                from: None,
-                describe: "Whether to list the archive, print one snapshot's layout, or rebuild a \
-                           session from one.",
-                default: None,
-            },
-            ParamSpec {
-                name: "id",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("snapshot show", "id")),
-                describe: "",
-                default: None,
-            },
-            ParamSpec {
-                name: "of_session",
-                kind: ParamKind::Str,
-                required: false,
-                from: Some(("snapshot list", "--session")),
-                describe: "Which session's snapshots: the name they were taken of, and the name a \
-                           restore brings back under. Unlike `session` on the other tools, it does \
-                           not choose which session to talk to.",
-                default: None,
-            },
-        ],
-        read_only: false,
-        destructive: true,
-        idempotent: false,
-    },
 ];
 
 /// The tool by that name, or `None`.
@@ -694,9 +573,9 @@ pub fn tool_list() -> Vec<Tool> {
     TOOLS.iter().map(describe).collect()
 }
 
-/// The shape of every tool's `structuredContent`, which is the same for all seven.
+/// The shape of every tool's `structuredContent`, which is the same for all six.
 ///
-/// One schema rather than seven, because every tool is the same child process reported the same
+/// One schema rather than six, because every tool is the same child process reported the same
 /// way: how the CLI exited, what it printed - parsed when it printed JSON, carried as lines when
 /// it did not - and, on a failure, whether it was a miss or an error. The per-tool part is the
 /// `result` payload, whose shape the `Returns:` line already describes in the words the surface
@@ -1008,7 +887,6 @@ mod tests {
             ("zellij_write_input", "text"),
             ("zellij_read_pane", "pane"),
             ("zellij_create", "command"),
-            ("zellij_arrange", "panes"),
         ] {
             let spec = tool_spec(tool).expect("a tool");
             let param = spec
@@ -1071,17 +949,18 @@ mod tests {
 
     #[test]
     fn a_tool_that_multiplexes_says_what_each_operation_returns() {
-        // `snapshot list` prints a table and `snapshot show` prints a payload; promising the
-        // table for both is the kind of lie a client cannot detect
-        let snapshot = tool_spec("zellij_snapshot").expect("a tool");
-        let line = returns_for(snapshot);
+        // `list-panes` and `list-agents` print tables of different columns and `list-sessions`
+        // prints its own; promising one shape for all three is the kind of lie a client cannot
+        // detect
+        let overview = tool_spec("zellij_overview").expect("a tool");
+        let line = returns_for(overview);
         assert!(line.starts_with("it depends on the operation"), "{}", line);
-        assert!(line.contains("snapshot list"), "{}", line);
-        assert!(line.contains("the payload itself"), "{}", line);
+        assert!(line.contains("action list-panes"), "{}", line);
+        assert!(line.contains("action list-agents"), "{}", line);
     }
 
     #[test]
-    fn a_read_only_tool_is_idempotent_and_a_multiplexed_one_owns_its_worst_operation() {
+    fn a_read_only_tool_is_idempotent() {
         for tool in TOOLS {
             if tool.read_only {
                 assert!(
@@ -1091,23 +970,15 @@ mod tests {
                 );
             }
         }
-        // restore rebuilds a whole session, so the tool that offers it is destructive whatever its
-        // other two operations do
-        assert!(tool_spec("zellij_snapshot").expect("a tool").destructive);
     }
 
     #[test]
     fn what_can_be_undone_is_gated_apart_from_what_cannot() {
-        // the reason this server exists is that a client gates verbs one by one. Six operations
-        // under one destructive name meant allowing `move_pane` allowed `close_tab` with it
-        let arrange = tool_spec("zellij_arrange").expect("a tool");
-        assert!(
-            !arrange.destructive,
-            "every arrange operation is reversible"
-        );
+        // the reason this server exists is that a client gates verbs one by one, so the closes
+        // live in one destructive tool and no other tool offers one
         let close = tool_spec("zellij_close").expect("a tool");
         assert!(close.destructive, "closing cannot be undone");
-        for spec in [arrange, close] {
+        for spec in TOOLS {
             for param in spec.params {
                 let ParamKind::Enum(operations) = param.kind else {
                     continue;
@@ -1180,7 +1051,7 @@ mod tests {
     #[test]
     fn the_surface_stays_small_and_the_names_do_not_collide() {
         assert!(
-            TOOLS.len() <= 8,
+            TOOLS.len() <= 6,
             "the point of this server is a surface an agent can route through"
         );
         let mut names: Vec<&str> = TOOLS.iter().map(|tool| tool.name).collect();

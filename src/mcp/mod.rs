@@ -7,8 +7,8 @@
 //!
 //! Three things keep it honest, and each is enforced somewhere rather than promised here:
 //!
-//! * **Eight tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
-//!   fails if it grows past eight or if a tool asks for more than ten parameters.
+//! * **Six tools, not eighty-seven.** The table in [`tools`] is the whole surface, and a test
+//!   fails if it grows past six or if a tool asks for more than ten parameters.
 //! * **The descriptions are generated.** What a tool returns, and what each of its parameters
 //!   means, come out of the same map `--dump-surface` reads. A renamed flag fails the build.
 //! * **The tools run the CLI.** Every call is a child process of the binary at this one's path, so
@@ -43,7 +43,7 @@ Start the child, then wait for agent-change in the background; never poll the sc
 Use zellij_wait_for until=agent_change.
 
 Drive a running zellij session: read what is on a pane, wait for something to happen in one, type
-into one, and make or rearrange panes and tabs.
+into one, and make or close panes and tabs.
 
 Start with zellij_overview. Panes are addressed by their two-word handle - `sunny-otter` - which is
 the pane's address, survives a session restore, and is what every other tool wants. An integer id

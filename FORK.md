@@ -5007,12 +5007,12 @@ gated per verb - an MCP client allows or denies each tool by name, which on a ma
 pane" and "close a tab" want different answers is the whole point. Hence a server, in the binary, so
 it is version-synced and there is nothing to install.
 
-**Eight tools, not eighty-seven.** `zellij_overview` (panes, agents, or the sessions on this
+**Six tools, not eighty-seven.** `zellij_overview` (panes, agents, or the sessions on this
 machine), `zellij_read_pane`, `zellij_wait_for`, `zellij_write_input`, `zellij_create`,
-`zellij_arrange`, `zellij_close`, `zellij_snapshot`. `zellij_close` is the one that cannot be
-undone, kept apart from the moves so a client can allow one without the other. Session lifecycle -
+`zellij_close`. `zellij_close` is the one that cannot be undone, kept apart so a client can allow
+the others without it. Session lifecycle -
 `up`, `down`, `restart`, `enable` - is deliberately not among them: those start and stop the thing
-the server is talking to. A test fails if the surface grows past eight tools, or a tool past nine
+the server is talking to. A test fails if the surface grows past six tools, or a tool past nine
 parameters (eight until nkmk.32, when `zellij_create` took `run_in` and `wait_ready`).
 
 **The descriptions are generated from the surface map.** A tool's `Returns:` line is built from the
@@ -5043,7 +5043,7 @@ pane, which is the default its own schema has always advertised. That bound is t
 the client's: a client whose request deadline is shorter (often 60 seconds) gives up first, so
 `timeout_s` tells the caller to stay under that deadline and wait again.
 
-**Every tool declares the shape of what it returns**, and it is the same shape for all eight: the
+**Every tool declares the shape of what it returns**, and it is the same shape for all six: the
 CLI's exit code, what it printed - parsed when that was JSON - what it wrote to stderr, and on a
 failure whether it was a miss or an error. The per-operation part stays in the `Returns:` line,
 which is generated. A tool that multiplexes several operations says what each of them returns
@@ -7408,13 +7408,10 @@ the tab bar.
 pane's title was `/path/to/zsh -c cargo test`. The command is now the name, whitespace collapsed
 and cut to 48 characters with an ellipsis. The caller does not choose a pane's name.
 
-**`close_pane` and `close_tab` moved to their own tool.** Per-verb gating is the reason this
+**`close_pane` and `close_tab` have their own tool.** Per-verb gating is the reason this
 server exists at all - this file's own words, "an MCP client allows or denies each tool by name" -
-and one `zellij_arrange` bundling four reversible moves with two irreversible closes meant a client
-that wanted to allow a pane to be moved had to allow a tab to be closed. `zellij_arrange` keeps
-`move_pane`, `move_tab` and `stack_panes` and is no longer flagged destructive; the new
-`zellij_close` takes the two closes and is. That spends the eighth and last tool slot, and the cap
-test now pins the surface shut.
+so the two irreversible closes live in `zellij_close`, the one tool flagged destructive, and no
+other tool offers a close. The cap test pins the surface shut.
 
 **`close_tab` never worked.** It built `action close-tab-by-id --tab-id <n> --yes`, and that
 command takes a positional `<ID>` and has no `--yes` - a clap error on every call since the tool
@@ -7445,10 +7442,6 @@ person and that the tool passes the confirmation; only `close_pane` has a `--yes
 no confirmation at all and takes every pane in the tab with it, which is what the tip now says.
 And `zellij_create` claimed a session with no client attached cannot lay out a new tab - creating
 is not focus-dependent, and a detached session makes a real tab.
-
-`zellij_snapshot`'s `session` is renamed **`of_session`**: everywhere else on this surface `session`
-means the session to talk to, and here it meant which snapshots to look at and what name to restore
-under.
 
 CLI-side only: `src/mcp/`, and one row of `zellij-utils/src/cli_surface.rs`. No protobuf, no
 contract change, and no CLI flag added - every flag this uses (`--in-tab`, `--new-tab`,
@@ -8325,7 +8318,7 @@ zellij_read_pane {"session": "boxb/work", "pane": "calm-otter"}
 - **Addressing is the `session` argument, `host/session`.** No tool gained a parameter.
   `boxa/work` is session `work` on `boxa`. `boxa/` names no session, and the remote CLI resolves
   one the way a terminal there would, which works when one session runs there. `scope=sessions`
-  and `zellij_snapshot` take `boxa/` to ask that machine. A session name cannot contain `/`
+  takes `boxa/` to ask that machine. A session name cannot contain `/`
   (`validate_session_name`), so the split is never ambiguous. A pane handle alone is always
   local: name its host through `session`.
 - **The transport.** `ssh -T -o BatchMode=yes -o ConnectTimeout=5 -o ForwardAgent=no -o

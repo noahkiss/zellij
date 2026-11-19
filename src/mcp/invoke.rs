@@ -932,8 +932,7 @@ fn argv_in(
     let args = Args::new(args);
     let session = args.string("session");
     // the session is named on the command line where the CLI takes it there, and passed as the
-    // global `-s` everywhere else. `snapshot` is the exception: its `--session` means the name to
-    // restore UNDER, not the session to ask, so the global flag would say something else
+    // global `-s` everywhere else
     let scoped = |rest: Vec<String>| -> Vec<String> {
         let mut argv = Vec::new();
         if let Some(session) = session
@@ -1211,69 +1210,7 @@ fn argv_in(
             }
             Ok(scoped(rest))
         },
-        "zellij_arrange" => {
-            let operation = args.required("operation")?;
-            let rest = match operation.as_str() {
-                "move_pane" => {
-                    let mut rest = vec![
-                        "action".to_owned(),
-                        "move-pane".to_owned(),
-                        "--pane-id".to_owned(),
-                        args.required("pane")?,
-                    ];
-                    if let Some(direction) = args.string("direction") {
-                        rest.push(direction);
-                    }
-                    rest
-                },
-                "move_tab" => {
-                    let mut rest = vec![
-                        "action".to_owned(),
-                        "move-tab".to_owned(),
-                        "--tab-id".to_owned(),
-                        args.required("tab")?,
-                    ];
-                    match (args.string("to_index"), args.string("direction")) {
-                        (Some(to_index), _) => {
-                            rest.push("--to-index".to_owned());
-                            rest.push(to_index);
-                        },
-                        (None, Some(direction)) => rest.push(direction),
-                        (None, None) => {
-                            return Err(
-                                "`move_tab` needs somewhere to move to: pass `to_index` or \
-                                 `direction`."
-                                    .to_owned(),
-                            )
-                        },
-                    }
-                    rest
-                },
-                "stack_panes" => {
-                    let panes = args.required("panes").map_err(|_| {
-                        "`stack_panes` needs `panes`: the panes to stack, space separated."
-                            .to_owned()
-                    })?;
-                    let mut rest = vec![
-                        "action".to_owned(),
-                        "stack-panes".to_owned(),
-                        "--".to_owned(),
-                    ];
-                    rest.extend(panes.split_whitespace().map(|pane| pane.to_owned()));
-                    rest
-                },
-                "close_pane" | "close_tab" => {
-                    return Err(format!(
-                        "`{}` closes something, which is `zellij_close`'s job rather than this \
-                         tool's.",
-                        operation
-                    ))
-                },
-                other => return Err(format!("`{}` is not an operation of this tool.", other)),
-            };
-            Ok(scoped(rest))
-        },
-        // the two that cannot be undone, kept apart from the three that can. The CLI confirms them
+        // the two that cannot be undone, in their own tool. The CLI confirms them
         // for a person and refuses off a terminal; a tool call has already been approved by
         // whatever gates tool calls, so it answers the confirmation here rather than hanging on a
         // prompt nobody can see
@@ -1303,47 +1240,6 @@ fn argv_in(
                 },
             };
             Ok(scoped(rest))
-        },
-        "zellij_snapshot" => {
-            let operation = args.required("operation")?;
-            // `of_session` rather than the `session` every other tool takes, because it says which
-            // snapshots to look at and which name to restore under - never which session to talk to
-            let of_session = args.string("of_session");
-            match operation.as_str() {
-                "list" => {
-                    let mut argv = vec![
-                        "snapshot".to_owned(),
-                        "list".to_owned(),
-                        "--json".to_owned(),
-                    ];
-                    if let Some(session) = of_session {
-                        argv.push("--session".to_owned());
-                        argv.push(session);
-                    }
-                    Ok(argv)
-                },
-                "show" => Ok(vec![
-                    "snapshot".to_owned(),
-                    "show".to_owned(),
-                    args.required("id")?,
-                ]),
-                "restore" => {
-                    let mut argv = vec![
-                        "snapshot".to_owned(),
-                        "restore".to_owned(),
-                        args.required("id")?,
-                    ];
-                    if let Some(session) = of_session {
-                        argv.push("--session".to_owned());
-                        argv.push(session);
-                    }
-                    Ok(argv)
-                },
-                other => Err(format!(
-                    "`operation` must be list, show or restore, not `{}`.",
-                    other
-                )),
-            }
         },
         other => Err(format!("`{}` is not a tool of this server.", other)),
     }
@@ -2484,83 +2380,11 @@ mod tests {
     }
 
     #[test]
-    fn closing_is_its_own_tool_so_a_client_can_allow_the_moves_without_it() {
-        // one name for six operations meant a client that wanted `move_pane` had to allow
-        // `close_tab` with it
-        for operation in ["close_pane", "close_tab"] {
-            let said = refusal("zellij_arrange", json!({ "operation": operation }));
-            assert!(said.contains("zellij_close"), "{}", said);
-        }
+    fn closing_takes_only_the_two_closes() {
         for operation in ["move_pane", "stack_panes"] {
             let said = refusal("zellij_close", json!({ "operation": operation }));
             assert!(said.contains("close_pane or close_tab"), "{}", said);
         }
-    }
-
-    #[test]
-    fn a_structural_move_names_its_target_and_where_it_is_going() {
-        assert_eq!(
-            line(
-                "zellij_arrange",
-                json!({"operation": "move_tab", "tab": 1, "to_index": 3}),
-                None
-            ),
-            "action move-tab --tab-id 1 --to-index 3"
-        );
-        assert!(
-            refusal("zellij_arrange", json!({"operation": "move_tab", "tab": 1}))
-                .contains("needs somewhere to move to")
-        );
-    }
-
-    #[test]
-    fn stacking_takes_the_panes_after_the_double_dash() {
-        assert_eq!(
-            line(
-                "zellij_arrange",
-                json!({"operation": "stack_panes", "panes": "3 4 5"}),
-                None
-            ),
-            "action stack-panes -- 3 4 5"
-        );
-    }
-
-    #[test]
-    fn a_snapshot_call_is_not_scoped_to_a_session_the_way_the_others_are() {
-        // `snapshot --session` names what to restore UNDER, so the global `-s` would say something
-        // else entirely
-        assert_eq!(
-            line(
-                "zellij_snapshot",
-                json!({"operation": "list"}),
-                Some("work")
-            ),
-            "snapshot list --json"
-        );
-        assert_eq!(
-            line(
-                "zellij_snapshot",
-                json!({"operation": "restore", "id": "latest", "of_session": "revived"}),
-                Some("work")
-            ),
-            "snapshot restore latest --session revived"
-        );
-        // and `session`, which means the session to talk to everywhere else, is not read here at
-        // all: the parameter is called `of_session` so that the two cannot be confused
-        assert_eq!(
-            line(
-                "zellij_snapshot",
-                json!({"operation": "list", "session": "work"}),
-                None
-            ),
-            "snapshot list --json"
-        );
-    }
-
-    #[test]
-    fn saving_a_snapshot_is_not_offered_because_the_cli_does_not_offer_it() {
-        assert!(refusal("zellij_snapshot", json!({"operation": "save"}))
-            .contains("must be list, show or restore"));
     }
 
     #[test]
