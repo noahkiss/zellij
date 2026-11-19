@@ -746,6 +746,11 @@ pub enum Sessions {
             help = "if set, will open the plugin pane without changing the focus of any client, placing it relative to the pane the command was issued from"
         )]
         no_focus: bool,
+        /// Take the focus even when an agent runs this. An agent's new pane leaves the person's
+        /// focus alone by default: the caller is an agent when AGENT_SESSION_ID, AGENT_KIND or a
+        /// harness's own session variable is set
+        #[clap(long, conflicts_with("no_focus"))]
+        focus: bool,
         /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
@@ -3765,6 +3770,17 @@ mod tests {
         assert!(matches!(
             run(&["--focus"]).unwrap().command,
             Some(Command::Sessions(Sessions::Run { focus: true, .. }))
+        ));
+        let plugin = |extra: &[&str]| {
+            let mut args = vec!["zellij".to_owned(), "plugin".to_owned()];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            args.extend(["--".to_owned(), "zellij:strider".to_owned()]);
+            parse_cli(args)
+        };
+        assert!(plugin(&["--focus", "--no-focus"]).is_err());
+        assert!(matches!(
+            plugin(&["--focus"]).unwrap().command,
+            Some(Command::Sessions(Sessions::Plugin { focus: true, .. }))
         ));
     }
 

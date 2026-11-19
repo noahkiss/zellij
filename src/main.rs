@@ -160,6 +160,7 @@ fn main() {
             height,
             pinned,
             no_focus,
+            focus,
             borderless,
             tab_id,
         })) = opts.command
@@ -198,7 +199,7 @@ fn main() {
                 near: None,
                 near_current_pane: false,
                 no_focus,
-                focus: false,
+                focus,
                 ready: Default::default(),
                 borderless,
                 tab_id,

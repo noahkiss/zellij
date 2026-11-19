@@ -8584,9 +8584,11 @@ The caller is an agent when any variable from `agent_identity_env_names` is set 
 a person's shell in a session an agent started is not taken for an agent.
 
 `--focus` and `--no-focus` together are a clap error, and so are `--focus` and `--in-tab`, which
-never moves anybody. The `zellij plugin` shorthand and `zellij --layout` inside a session reach the
-same `new-pane` / `new-tab` path, so an agent's call there leaves the focus alone too; they take no
-`--focus`. `zellij edit` and `action edit` are unchanged.
+never moves anybody. The `zellij plugin` shorthand reaches the same `new-pane` path and takes the
+same `--focus`. `zellij --layout` inside a session reaches the `new-tab` path, so an agent's call
+there leaves the focus alone too; it has no `--focus`, because it is a top-level option, not a
+subcommand. An agent that wants the person taken to the tab runs `zellij action new-tab --layout
+<layout> --focus`. `zellij edit` and `action edit` are unchanged.
 
 A no-focus `new-pane` run from inside a pane opens beside that pane (`ZELLIJ_PANE_ID`), not beside
 the person's focused pane, as `--no-focus` always has. So an agent's bare `new-pane --stacked` now
@@ -8603,7 +8605,7 @@ The decision is made on the CLI side before the action is built (`leaves_focus_a
 `CliAction::settle_focus_for_caller` in `zellij-utils/src/cli.rs`, `caller_is_agent` in
 `zellij-utils/src/agent_detect.rs`, called from `send_action_to_session` in `src/commands.rs`). The
 action carries `no_focus` as before, so the client/server contract does not change. Tests: the
-decision table, the settled `new-pane` and `new-tab`, the clap conflicts, `zellij run --focus`, and
+decision table, the settled `new-pane` and `new-tab`, the clap conflicts, `zellij run --focus` and `zellij plugin --focus`, and
 agent detection from the environment.
 
 ### A pane made without focus in a full tab leaves the focus alone
