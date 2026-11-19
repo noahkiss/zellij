@@ -208,7 +208,7 @@ pub enum StreamEvent {
 }
 
 impl StreamEvent {
-    /// Whether `list-agents --watch` prints this line.
+    /// Whether an `agents_only` stream writes this line.
     pub fn is_agent_line(&self) -> bool {
         matches!(self, StreamEvent::Agent(_) | StreamEvent::Gone { .. })
     }
@@ -252,8 +252,8 @@ pub struct EventStream {
 impl EventStream {
     /// A new stream, and its first lines: `hello`, the snapshot, `synced`.
     ///
-    /// `agents_only` is `list-agents --watch`: the stream still counts every line it writes, but
-    /// writes only `hello`, the agent lines and `synced`.
+    /// `agents_only` is the mode an older client's `list-agents --watch` asks for: the stream
+    /// still counts every line it writes, but writes only `hello`, the agent lines and `synced`.
     pub fn start(
         epoch: &str,
         hello: StreamEvent,
@@ -535,42 +535,6 @@ pub fn with_server_build(line: &str, own_build_id: Option<&str>) -> String {
         Some(body) => format!("{},\"server_build\":\"{}\"}}", body, word),
         None => line.to_owned(),
     }
-}
-
-/// An `agent` line with `self` set when it is the caller's own pane, as `list-agents` marks it.
-/// The server cannot tell which pane asked, so the client does.
-pub fn with_self_marked(line: &str, own_pane: Option<u32>) -> String {
-    const UNMARKED: &str = "{\"event\":\"agent\",\"self\":false,";
-    let Some(own_pane) = own_pane else {
-        return line.to_owned();
-    };
-    if !line.starts_with(UNMARKED) {
-        return line.to_owned();
-    }
-    let is_own = serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|value| value.get("pane_id").and_then(|id| id.as_u64()))
-        == Some(own_pane as u64);
-    if !is_own {
-        return line.to_owned();
-    }
-    format!(
-        "{{\"event\":\"agent\",\"self\":true,{}",
-        &line[UNMARKED.len()..]
-    )
-}
-
-/// The `event` of a line, or an empty string for a line that is not one.
-pub fn event_of(line: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("event")
-                .and_then(|event| event.as_str())
-                .map(str::to_owned)
-        })
-        .unwrap_or_default()
 }
 
 /// Whether nobody reads this process's stdout any more: the far end of its pipe closed.
@@ -998,7 +962,7 @@ mod tests {
         assert!(stream.advance(&look(&entry), 500).is_empty());
         let lines = stream.advance(&look(&entry), 1010);
         assert_eq!(parse(&lines)[0]["title"], "prompt");
-        // `list-agents --watch` never sees one
+        // an `agents_only` stream never sees one
         let (mut agents, _) = EventStream::start("ep", hello(), &model, true, 0);
         assert!(agents.advance(&look(&entry), 10).is_empty());
     }
@@ -1014,12 +978,12 @@ mod tests {
         let lines = stream.advance(&StreamModel::new(vec![tab(0, "t"), tab(1, "u")], vec![]), 1);
         assert_eq!(events(&lines), vec!["gone"]);
         assert_eq!(parse(&lines)[0]["seq"], 3);
-        // the existing `list-agents --watch` gone shape
+        // the `gone` shape carries no session
         assert!(parse(&lines)[0].get("session").is_none());
     }
 
     #[test]
-    fn the_client_adds_server_build_to_hello_and_marks_its_own_agent() {
+    fn the_client_adds_server_build_to_hello() {
         let model = StreamModel::new(vec![tab(0, "t")], vec![pane(7, "a-b", 0, Some("claude"))]);
         let (_, lines) = EventStream::start("ep", hello(), &model, false, 0);
         let hello_line = with_server_build(&lines[0], Some("abcd"));
@@ -1031,13 +995,6 @@ mod tests {
         assert_eq!(other["server_build"], "different");
         // only hello gains it
         assert_eq!(with_server_build(&lines[1], Some("abcd")), lines[1]);
-        let mine: Value = serde_json::from_str(&with_self_marked(&lines[1], Some(7))).unwrap();
-        assert_eq!(mine["self"], true);
-        assert_eq!(mine["seq"], 1);
-        assert_eq!(with_self_marked(&lines[1], Some(8)), lines[1]);
-        assert_eq!(with_self_marked(&lines[1], None), lines[1]);
-        assert_eq!(event_of(&lines[1]), "agent");
-        assert_eq!(event_of("not json"), "");
     }
 
     #[test]

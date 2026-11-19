@@ -384,17 +384,6 @@ pub enum Sessions {
         /// List agents in every live session
         #[clap(long)]
         all_sessions: bool,
-        /// Print agent changes as JSON lines
-        #[clap(long)]
-        watch: bool,
-        /// With --watch, omit the initial agents and print changes as NDJSON.
-        /// Fields: event, session, pane_id, handle, tab_id, tab_name, kind, name,
-        /// old_state, new_state, and last_reply.
-        #[clap(long, requires = "watch")]
-        changes_only: bool,
-        /// Poll interval with --watch, in milliseconds
-        #[clap(long, default_value = "1000")]
-        interval_ms: u64,
     },
     /// List existing plugin aliases
     #[clap(visible_alias = "la")]
@@ -2500,23 +2489,6 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         /// A session that does not answer is named on stderr and skipped
         #[clap(long, value_parser)]
         all_sessions: bool,
-
-        /// Keep running, and print one JSON line whenever an agent appears, changes state or
-        /// identity, or goes: {"event": "agent", ...row} or {"event": "gone", ...}. The first
-        /// lines are every agent there is now. One session is pushed by its server, each line
-        /// with seq, epoch and ts; --all-sessions, --changes-only and an older server are asked
-        /// again every --interval-ms
-        #[clap(long, value_parser)]
-        watch: bool,
-        /// With --watch, omit the initial agents and print changes as NDJSON.
-        /// Fields: event, session, pane_id, handle, tab_id, tab_name, kind, name,
-        /// old_state, new_state, and last_reply.
-        #[clap(long, requires = "watch")]
-        changes_only: bool,
-
-        /// With --watch: how often to ask, in milliseconds (at least 100)
-        #[clap(long, value_parser, default_value = "1000")]
-        interval_ms: u64,
     },
     /// Print the last reply of the coding agent in a pane, from its harness's transcript
     ///
@@ -3293,9 +3265,6 @@ mod tests {
                 "--json",
                 "--all-sessions",
                 "--report-withheld",
-                "--watch",
-                "--interval-ms",
-                "250",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -3308,9 +3277,6 @@ mod tests {
                 json: true,
                 all_sessions: true,
                 report_withheld: true,
-                watch: true,
-                interval_ms: 250,
-                changes_only: false
             }))
         ));
     }

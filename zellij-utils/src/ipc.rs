@@ -250,7 +250,7 @@ pub enum ClientToServerMsg {
         focused: bool,
     },
     /// fork addition: `zellij action watch`. The server answers with `SessionEvent` lines on this
-    /// connection until it goes away. `agents_only` is `list-agents --watch`.
+    /// connection until it goes away. `agents_only` is what an older client's `list-agents --watch` asks for.
     SubscribeToSessionEvents {
         agents_only: bool,
     },

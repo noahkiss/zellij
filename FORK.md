@@ -57,7 +57,6 @@ Start the child, then wait for agent-change in the background; never poll the sc
 
 ```sh
 zellij action --json wait --for agent-change --pane sunny-otter --pane quiet-fox --timeout 300
-zellij list-agents --watch --changes-only
 ```
 
 Omit `--pane` to watch every agent in the session except the caller.
@@ -65,7 +64,6 @@ The wait records state, name, identity, appearance, and exit changes.
 Exit 0 reports a change; exit 2 reports a timeout or session failure.
 The JSON record includes pane handle, tab, kind, name, old/new states, and one last reply line.
 The reply comes from the harness transcript when a turn ends, when available.
-`--changes-only` streams those records as NDJSON and omits the initial agent list.
 The client samples internally; the supervising agent runs one blocking command.
 Without OSC 7501, a small screen detector recognizes trust gates, rate-limit gates, and question menus.
 The harness-map evaluator will replace this fallback.
@@ -4842,21 +4840,16 @@ the host keeps one set of records per window, and a client shows many panes.
 
 Capability: `program-status-osc`.
 
-### `list-agents --all-sessions` and `list-agents --watch`
+### `list-agents --all-sessions`
 
-From nkmk.33. `list-agents` answered for one session, once. A controller that drives agents across
-sessions had to run `ls --json`, ask each session in turn, and poll the lot to see a state change.
+From nkmk.33. `list-agents` answered for one session. A controller that drives agents across
+sessions had to run `ls --json` and ask each session in turn.
 
 ```
 $ zellij action list-agents --all-sessions
 TAB_ID  TAB_NAME  PANE_ID  HANDLE       KIND    ...  STATE               SESSION
 1       develop   3        sunny-otter  claude  ...  blocked:permission  work
 0       Tab #1    1        brisk-heron  codex   ...  working             notes
-
-$ zellij action list-agents --watch
-{"event":"agent","handle":"sunny-otter","pane_id":3,...,"state":"working","state_at":1760000000000}
-{"event":"agent","handle":"sunny-otter","pane_id":3,...,"state":"blocked","state_kind":"permission",...}
-{"event":"gone","pane_id":3,"handle":"sunny-otter"}
 ```
 
 **`--all-sessions`** asks every live session in the socket directory, in name order, and each row
@@ -4866,40 +4859,13 @@ prints the header alone and exits 0. A session that does not answer is named on 
 out: one wedged server should not hide every other agent on the machine. It exits 1 only when there
 were sessions and none answered.
 
-**`--watch`** keeps running and prints one JSON line whenever an agent appears, changes, or goes:
+To follow agents as they change, read [`zellij action watch`](#zellij-action-watch-the-session-pushes-its-changes)
+or block on `action wait --for agent-change`.
 
-- `{"event": "agent", ...}` carries the whole `list-agents --json` row. A reader keeps one map keyed
-  by `session` and `pane_id` and replaces the entry.
-- `{"event": "gone", "pane_id": ..., "handle": ...}` names the row to drop. Its `session` is there
-  when the watch spans sessions. An agent is gone once it is missing from **two** looks in a row: a
-  pane list taken while a pane is being made can miss it once, which the live proof caught, and a
-  `gone` followed by the same `agent` is noise a reader would have to filter.
-- The first lines are every agent there is now, so a reader needs no separate first call.
-- A change is a change of identity or state: `handle`, `kind`, `agent_id`, or any `state` key. The
-  title is not one. Several harnesses animate their title, and a line per spinner frame would bury
-  the change a reader waits for.
+`AgentListEntry` gains `session`, absent outside this mode. Still CLI-only: no protobuf tag, no
+plugin API.
 
-It combines with `--all-sessions`, which re-reads the live sessions on every look: a session that
-starts or ends shows up as its agents coming or going. A one-session watch ends with exit 2 when its
-session stops answering. Any watch ends with exit 0 when its reader closes the pipe.
-
-**Where the push is.** A one-session watch without `--changes-only` rides the server's event
-stream (see [`zellij action watch`](#zellij-action-watch-the-session-pushes-its-changes)): the
-server sends each `agent` and `gone` line as the change happens, and every line gains `seq`,
-`epoch` and `ts`. `seq` counts the stream's own `hello` and `synced` lines, which `list-agents`
-does not print, so the printed numbers skip `0` and the one after the snapshot. A reader that needs gap-free numbering reads `action watch`. Against a server that predates the
-stream, the watch says so on stderr and falls back to the poll below.
-
-`--all-sessions` and `--changes-only` stay a poll in the client: the watch asks the same
-`list-panes --json` every `--interval-ms` (default 1000, at least 100) and prints the difference.
-An all-sessions watch has to notice sessions starting and ending, which only a scan of the socket
-directory tells it, and `--changes-only` enriches each change from the screen and the transcript,
-which the server does not do.
-
-`AgentListEntry` gains `session`, absent outside these two modes. Still CLI-only: no protobuf tag,
-no plugin API.
-
-Capabilities: `list-agents-all-sessions`, `list-agents-watch`.
+Capability: `list-agents-all-sessions`.
 
 ### `zellij action watch`: the session pushes its changes
 
@@ -4927,7 +4893,7 @@ long-lived command the server writes to as things change, one JSON object per li
   line per agent, one `pane_opened` line per pane, one `tab_opened` line per tab, then `synced`. A
   reader needs no separate first call.
 - **`agent`** carries the whole `list-agents --json` row; **`gone`** (`pane_id`, `handle`) drops
-  it. The change filter is `list-agents --watch`'s: identity (`handle`, `kind`, `agent_id`, `name`)
+  it. The change filter: identity (`handle`, `kind`, `agent_id`, `name`)
   or any `state` key. A title change is not a change. A handle renamed under a live agent is a
   `gone` for the old handle and an `agent` for the new one.
 - **Pane lines are ids only**: `pane_opened` (`pane_id`, `handle`, `tab_id`), `pane_exited`
@@ -4963,7 +4929,6 @@ long-lived command the server writes to as things change, one JSON object per li
 - **Order inside one change**: a tab opens before its panes, a pane opens before its agent, an
   agent's `gone` comes before its pane closes, a pane closes before its tab. `pane_changed` and
   then `pane_output` lines come last.
-- **`list-agents --watch`** writes no `pane_changed` line, and its `seq` does not count one.
 - **Exit 0** when the reader closes the pipe, noticed even on a quiet session (the client asks its
   stdout every half second). **Exit 2** when the session goes away. **Exit 2 at once**, within five
   seconds and with the reason on stderr, against a server that predates the command.
@@ -4985,7 +4950,8 @@ render path: the per-pane output stamp already existed for `last_output_at`.
 | server to client | `SessionEventMsg session_event` | 20 | `string line = 1` |
 
 The server writes each line's JSON itself, so the contract carries one string per line and a new
-event or field changes no message. `agents_only` is `list-agents --watch`. A stock server, or a fork
+event or field changes no message. `agents_only` asks for the `hello`, agent and `synced` lines alone: this build's client never
+sets it, and the server honours it for an older client's `list-agents --watch`. A stock server, or a fork
 server from before this, reads tag 28 as an unknown message, logs it and ignores it, so the client
 times out waiting for `hello` rather than hanging. The verb is not an `Action`: it opens its own
 connection, as `subscribe` does.
@@ -5746,7 +5712,7 @@ still run reports `done` (or `idle`). Claude Code already reports each running b
 its summary shows only the most urgent one, and `done` outranks `working`. So the summary now also
 carries `state_working`: how many of the pane's records say `working`, the reported one included.
 It is on `list-panes --json` and `list-agents --json`, and absent when zero. The table is
-unchanged, and `list-agents --watch` does not compare it.
+unchanged, and `action watch` does not compare it.
 
 No hook was needed and none was added. The count is server-side and rides the existing JSON:
 no new `OSC` key, no protobuf tag, no client/server contract. Against an older server the field

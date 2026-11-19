@@ -1390,7 +1390,6 @@ pub enum SessionEventStreamEnd {
 fn run_session_event_stream(
     os_input: Box<dyn ClientOsApi>,
     session_name: &str,
-    agents_only: bool,
     print: &mut dyn FnMut(&str) -> bool,
 ) -> SessionEventStreamEnd {
     let socket = match socket_for(session_name) {
@@ -1400,7 +1399,7 @@ fn run_session_event_stream(
     if let Err(message) = os_input.connect_to_server(&socket) {
         return SessionEventStreamEnd::ServerGone(message);
     }
-    os_input.send_to_server(ClientToServerMsg::SubscribeToSessionEvents { agents_only });
+    os_input.send_to_server(ClientToServerMsg::SubscribeToSessionEvents { agents_only: false });
     let (sender, messages) = mpsc::channel();
     let reader = os_input.box_clone();
     std::thread::spawn(move || {
@@ -1482,143 +1481,12 @@ fn print_stream_line(line: &str) -> bool {
 /// `zellij action watch`: every line of the session's event stream, until the reader stops
 /// reading (exit 0) or the session goes (exit 2).
 pub fn start_watch_client(os_input: Box<dyn ClientOsApi>, session_name: &str) -> i32 {
-    match run_session_event_stream(os_input, session_name, false, &mut print_stream_line) {
+    match run_session_event_stream(os_input, session_name, &mut print_stream_line) {
         SessionEventStreamEnd::ReaderGone => 0,
         SessionEventStreamEnd::ServerGone(message) | SessionEventStreamEnd::NoStream(message) => {
             eprintln!("{}", message);
             2
         },
-    }
-}
-
-/// `list-agents --watch` for one session, on the session event stream: the `agent` and `gone`
-/// lines, each with its `seq`, `epoch` and `ts`. `None` when the server predates the stream, so
-/// the caller falls back to asking the pane list.
-fn list_agents_watch_on_stream(os_input: Box<dyn ClientOsApi>, session_name: &str) -> Option<i32> {
-    let own_pane = std::env::var("ZELLIJ_PANE_ID")
-        .ok()
-        .and_then(|id| id.parse().ok())
-        .filter(|_| std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session_name));
-    let mut print = |line: &str| match zellij_utils::event_stream::event_of(line).as_str() {
-        "agent" | "gone" => print_stream_line(&zellij_utils::event_stream::with_self_marked(
-            line, own_pane,
-        )),
-        _ => true,
-    };
-    match run_session_event_stream(os_input, session_name, true, &mut print) {
-        SessionEventStreamEnd::ReaderGone => Some(0),
-        SessionEventStreamEnd::ServerGone(message) => {
-            eprintln!("{}", message);
-            Some(2)
-        },
-        SessionEventStreamEnd::NoStream(_) => None,
-    }
-}
-
-/// `zellij action list-agents --watch`: one JSON line whenever an agent appears, changes, or
-/// goes, until the reader stops reading.
-///
-/// One session, without `--changes-only`, rides the session event stream the server pushes; a
-/// server that predates the stream, and every other mode, is asked the pane list every interval.
-///
-/// It asks the same `list-panes --json` every `interval` and prints the difference, so it adds
-/// nothing to the server or the contract: the push is in the client. `sessions` is `None` for one
-/// session, which ends the watch with exit 2 when it stops answering; `Some` re-reads the live
-/// sessions on every look, so a session that starts or ends shows up as its agents coming or
-/// going.
-pub fn start_list_agents_watch_client(
-    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
-    session_name: &str,
-    all_sessions: Option<&dyn Fn() -> Vec<String>>,
-    interval: Duration,
-    changes_only: bool,
-) -> i32 {
-    if all_sessions.is_none() && !changes_only {
-        match list_agents_watch_on_stream(make_os_input(), session_name) {
-            Some(exit_status) => return exit_status,
-            None => eprintln!(
-                "Session '{}' predates the event stream; asking it every {}ms instead.",
-                session_name,
-                interval.as_millis()
-            ),
-        }
-    }
-    let mut previous: Option<ListAgentsResponse> = None;
-    let mut seen = BTreeMap::new();
-    let stdout = io::stdout();
-    loop {
-        let agents = match all_sessions {
-            Some(live_sessions) if changes_only => {
-                let mut agents = Vec::new();
-                for session in live_sessions() {
-                    match agent_change_snapshot(make_os_input, &session, None) {
-                        Ok(mut found) => {
-                            for agent in &mut found {
-                                agent.session = Some(session.clone());
-                            }
-                            agents.extend(found);
-                        },
-                        Err(message) => eprintln!("{}", message),
-                    }
-                }
-                agents
-            },
-            Some(live_sessions) => agents_of_sessions(make_os_input, &live_sessions()).0,
-            None if !changes_only => match agents_of_session(make_os_input(), session_name) {
-                Ok(agents) => agents,
-                Err(message) => {
-                    eprintln!("{}", message);
-                    return 2;
-                },
-            },
-            None => match agent_change_snapshot(make_os_input, session_name, None) {
-                Ok(agents) => agents,
-                Err(message) => {
-                    eprintln!("{}", message);
-                    return 2;
-                },
-            },
-        };
-        if changes_only {
-            if let Some(old) = &previous {
-                for mut change in agent_detect::agent_changes(old, &agents) {
-                    let source = if change.event == "gone" { old } else { &agents };
-                    enrich_agent_change(&mut change, source);
-                    if writeln!(stdout.lock(), "{}", serde_json::to_string(&change).unwrap())
-                        .is_err()
-                    {
-                        return 0;
-                    }
-                }
-                if stdout.lock().flush().is_err() {
-                    return 0;
-                }
-            }
-            previous = Some(agents);
-            std::thread::sleep(interval);
-            continue;
-        }
-        let (events, next) = agent_detect::agent_watch_events(&seen, agents);
-        seen = next;
-        let mut out = stdout.lock();
-        for event in events {
-            let line = match serde_json::to_string(&event) {
-                Ok(line) => line,
-                Err(e) => {
-                    eprintln!("Could not write a watch line as JSON: {}", e);
-                    return 1;
-                },
-            };
-            // a reader that has gone away is how a watch is meant to end
-            if writeln!(out, "{}", line).is_err() {
-                return 0;
-            }
-        }
-        if out.flush().is_err() {
-            return 0;
-        }
-        drop(out);
-        std::thread::sleep(interval);
     }
 }
 

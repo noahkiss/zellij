@@ -73,8 +73,7 @@ pub const CAPABILITIES: &[&str] = &[
     "harness-map",              // setup --harness-map [--json]: facts and pure screen detector data
     "program-status-osc", // OSC 7501 answered and kept per pane; state, state_* on list-panes/list-agents --json
     "list-agents-all-sessions", // list-agents --all-sessions, a session key on each row
-    "list-agents-watch",  // list-agents --watch, one JSON line per agent change
-    "wait-agent-change",  // blocking agent transitions and changes-only watch
+    "wait-agent-change",  // action wait --for agent-change: blocking agent transitions
     "wait-agent-state", // action wait --for agent-idle|agent-waiting, input_since_state on list-panes --json
     "last-reply",       // action last-reply: an agent's last reply, from its transcript
     "session-drop-env", // session_restart_drop_env
@@ -87,7 +86,7 @@ pub const CAPABILITIES: &[&str] = &[
     "mcp-agent-surfaces", // agents prompt and zellij://agents resource
     "mcp-agent-input-hint", // named agent guidance after zellij_write_input
     "mcp-remote-hosts", // zellij mcp: remote_hosts in config.kdl, host/session, scope=fleet
-    "action-watch", // action watch --json: the server-pushed event stream; list-agents --watch rides it
+    "action-watch",     // action watch --json: the server-pushed event stream
     // state_working on list-panes/list-agents --json: working records, background subagents included
     "program-status-working-count",
     // session down|restart refuse with exit 4 while an agent is working; --force overrides

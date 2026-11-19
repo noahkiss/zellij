@@ -41,9 +41,6 @@ fn main() {
             json,
             report_withheld: _,
             all_sessions,
-            watch,
-            changes_only,
-            interval_ms,
         })) = opts.command
         {
             commands::send_action_to_session(
@@ -51,9 +48,6 @@ fn main() {
                     json,
                     report_withheld: false,
                     all_sessions,
-                    watch,
-                    changes_only,
-                    interval_ms,
                 },
                 opts.session,
                 config,

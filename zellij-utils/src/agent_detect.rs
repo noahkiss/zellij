@@ -497,26 +497,7 @@ pub fn screen_agent_blocked(screen: &str) -> bool {
             && (selected_number || (text.contains("1)") && text.contains("enter to select"))))
 }
 
-/// One line of `list-agents --watch`.
-///
-/// `agent` carries the whole row, so a reader keeps one map keyed by session and pane and
-/// replaces the entry; `gone` names the row to drop.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum AgentWatchEvent {
-    Agent(AgentListEntry),
-    Gone {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session: Option<String>,
-        pane_id: u32,
-        handle: String,
-    },
-}
-
-/// Where a watched agent lives: its session, when the watch spans several, and its pane.
-pub type AgentWatchKey = (Option<String>, u32);
-
-/// What `--watch` remembers of one agent: the parts whose change is worth a line.
+/// What `action watch` compares of one agent: the parts whose change is worth an `agent` line.
 ///
 /// The identity and the state, not the whole row. The title is left out on purpose: several
 /// harnesses animate it, and a watch that printed every spinner frame would bury the change a
@@ -539,66 +520,6 @@ pub(crate) fn watched_part(agent: &AgentListEntry) -> String {
         }),
     ))
     .unwrap_or_default()
-}
-
-/// What a watch remembers of one agent between looks.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchedAgent {
-    part: String,
-    handle: String,
-    /// Looks in a row this agent was missing from. One miss is not enough to call it gone.
-    misses: u8,
-}
-
-/// The lines one more look at the agents is worth, and what to remember for the next look.
-///
-/// An agent that is new, or whose identity or state changed, is an `agent` line. One that is
-/// missing from two looks in a row is a `gone` line: a pane list taken while a pane is being made
-/// or moved can miss it once, and a `gone` followed by the same `agent` is noise a reader would
-/// have to filter. Nothing else prints: an unchanged agent says nothing.
-pub fn agent_watch_events(
-    previous: &BTreeMap<AgentWatchKey, WatchedAgent>,
-    current: ListAgentsResponse,
-) -> (Vec<AgentWatchEvent>, BTreeMap<AgentWatchKey, WatchedAgent>) {
-    let mut events = Vec::new();
-    let mut seen: BTreeMap<AgentWatchKey, WatchedAgent> = BTreeMap::new();
-    for agent in current {
-        let key = (agent.session.clone(), agent.pane_id);
-        let part = watched_part(&agent);
-        let changed = previous.get(&key).map(|old| &old.part) != Some(&part);
-        seen.insert(
-            key,
-            WatchedAgent {
-                part,
-                handle: agent.handle.clone(),
-                misses: 0,
-            },
-        );
-        if changed {
-            events.push(AgentWatchEvent::Agent(agent));
-        }
-    }
-    for (key, old) in previous {
-        if seen.contains_key(key) {
-            continue;
-        }
-        if old.misses == 0 {
-            seen.insert(
-                key.clone(),
-                WatchedAgent {
-                    misses: 1,
-                    ..old.clone()
-                },
-            );
-        } else {
-            events.push(AgentWatchEvent::Gone {
-                session: key.0.clone(),
-                pane_id: key.1,
-                handle: old.handle.clone(),
-            });
-        }
-    }
-    (events, seen)
 }
 
 /// The `STATE` cell: the state, and a blocked program's reason after a colon.
@@ -986,93 +907,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_change_legacy_watch_ignores_timestamps_and_reports_names() {
+    fn the_watched_part_ignores_timestamps_and_titles_and_sees_names() {
         let mut quiet = watched(1, None, Some("working"));
-        let (_, seen) = agent_watch_events(&BTreeMap::new(), vec![quiet.clone()]);
-        assert!(serde_json::to_string(&quiet)
-            .unwrap()
-            .contains("\"last_output_at\":1"));
-        // a spinner frame moves last_output_at; it is not a change worth a line
+        let before = watched_part(&quiet);
+        // a spinner frame moves last_output_at and the title; it is not a change worth a line
         quiet.last_output_at = Some(99);
         quiet.program_status.as_mut().unwrap().at = 99;
-        let (events, _) = agent_watch_events(&seen, vec![quiet.clone()]);
-        assert!(events.is_empty(), "{:?}", events);
+        quiet.title = "spinner 2".to_owned();
+        assert_eq!(watched_part(&quiet), before);
         quiet.agent.name = Some("child".into());
-        let (events, _) = agent_watch_events(&seen, vec![quiet]);
-        assert_eq!(events.len(), 1);
-    }
-
-    #[test]
-    fn a_watch_prints_what_changed_and_nothing_else() {
-        let (events, seen) = agent_watch_events(
-            &BTreeMap::new(),
-            vec![
-                watched(1, Some("a"), Some("working")),
-                watched(1, Some("b"), None),
-            ],
-        );
-        assert_eq!(events.len(), 2, "the first look reports every agent");
-        // same pane id in two sessions is two agents
-        assert_eq!(seen.len(), 2);
-
-        // a new title alone is not a change; a new state is
-        let mut retitled = watched(1, Some("a"), Some("working"));
-        retitled.title = "spinner 2".to_owned();
-        let (events, seen) = agent_watch_events(
-            &seen,
-            vec![retitled, watched(1, Some("b"), Some("blocked"))],
-        );
-        assert_eq!(
-            events,
-            vec![AgentWatchEvent::Agent(watched(
-                1,
-                Some("b"),
-                Some("blocked")
-            ))]
-        );
-
-        // missing once is not gone: a pane list can miss a pane that is being made
-        let (events, seen) =
-            agent_watch_events(&seen, vec![watched(1, Some("b"), Some("blocked"))]);
-        assert!(events.is_empty());
-        // and coming back after one miss, unchanged, says nothing either
-        let (events, _) = agent_watch_events(
-            &seen,
-            vec![
-                watched(1, Some("a"), Some("working")),
-                watched(1, Some("b"), Some("blocked")),
-            ],
-        );
-        assert!(events.is_empty());
-        let (events, seen) =
-            agent_watch_events(&seen, vec![watched(1, Some("b"), Some("blocked"))]);
-        assert_eq!(
-            events,
-            vec![AgentWatchEvent::Gone {
-                session: Some("a".to_owned()),
-                pane_id: 1,
-                handle: "pane-1".to_owned(),
-            }]
-        );
-        assert_eq!(seen.len(), 1);
-    }
-
-    #[test]
-    fn a_watch_line_is_tagged_and_carries_the_row_flat() {
-        let line =
-            serde_json::to_value(AgentWatchEvent::Agent(watched(3, None, Some("done")))).unwrap();
-        assert_eq!(line["event"], "agent");
-        assert_eq!(line["pane_id"], 3);
-        assert_eq!(line["state"], "done");
-        assert!(line.get("session").is_none());
-        let gone = serde_json::to_value(AgentWatchEvent::Gone {
-            session: Some("work".to_owned()),
-            pane_id: 3,
-            handle: "pane-3".to_owned(),
-        })
-        .unwrap();
-        assert_eq!(gone["event"], "gone");
-        assert_eq!(gone["session"], "work");
+        assert_ne!(watched_part(&quiet), before);
     }
 
     #[test]

@@ -751,12 +751,6 @@ fn no_session_answers_to(sentence: String) -> ! {
     process::exit(2);
 }
 
-/// `list-agents --interval-ms`, held to at least 100ms: a watch that asks the session in a tight
-/// loop would cost the server more than the answer is worth.
-fn watch_interval(interval_ms: u64) -> Duration {
-    Duration::from_millis(interval_ms.max(100))
-}
-
 /// Client entrypoint for all [`zellij_utils::cli::CliAction`]
 ///
 /// Checks session to send the action to and attaches with client
@@ -772,9 +766,6 @@ pub(crate) fn send_action_to_session(
     if let zellij_utils::cli::CliAction::ListAgents {
         json,
         all_sessions: true,
-        changes_only,
-        watch,
-        interval_ms,
         ..
     } = &cli_action
     {
@@ -797,21 +788,11 @@ pub(crate) fn send_action_to_session(
         for name in live_sessions() {
             zellij_utils::session_lifecycle::check_server_build(&name);
         }
-        let exit_status = if *watch {
-            zellij_client::cli_client::start_list_agents_watch_client(
-                &make_os_input,
-                "",
-                Some(&live_sessions),
-                watch_interval(*interval_ms),
-                *changes_only,
-            )
-        } else {
-            zellij_client::cli_client::start_list_agents_all_sessions_client(
-                &make_os_input,
-                &live_sessions(),
-                *json || output_json,
-            )
-        };
+        let exit_status = zellij_client::cli_client::start_list_agents_all_sessions_client(
+            &make_os_input,
+            &live_sessions(),
+            *json || output_json,
+        );
         process::exit(exit_status);
     }
     match get_active_session() {
@@ -1226,26 +1207,6 @@ fn attach_with_cli_client(
     // `list-agents` never becomes an action either. It is `list-panes` with a filter and a
     // different table, and doing that in the client is what keeps a whole verb off the
     // client/server contract
-    if let zellij_utils::cli::CliAction::ListAgents {
-        watch: true,
-        changes_only,
-        interval_ms,
-        ..
-    } = &cli_action
-    {
-        let exit_status = zellij_client::cli_client::start_list_agents_watch_client(
-            &|| {
-                Box::new(get_os_input(
-                    zellij_client::os_input_output::get_cli_client_os_input,
-                ))
-            },
-            session_name,
-            None,
-            watch_interval(*interval_ms),
-            *changes_only,
-        );
-        std::process::exit(exit_status);
-    }
     if let zellij_utils::cli::CliAction::ListAgents { json, .. } = &cli_action {
         let exit_status = zellij_client::cli_client::start_list_agents_client(
             Box::new(get_os_input(

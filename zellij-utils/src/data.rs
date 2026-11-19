@@ -2739,14 +2739,14 @@ pub struct AgentListEntry {
     pub pid: Option<u32>,
     /// When the pane last produced output, in milliseconds since the epoch: the pane's
     /// `last_output_at`. With `state_at`, how long the agent has gone without progress. Not part
-    /// of what `--watch` compares, because it moves with every frame an agent draws.
+    /// of what `action watch` compares, because it moves with every frame an agent draws.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at: Option<u64>,
     /// What the agent last said it is doing over `OSC 7501`, flattened: `state`, `state_msg`,
     /// `state_at` and the rest of [`PaneProgramStatus`]. Absent when it has said nothing.
     #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<PaneProgramStatus>,
-    /// The session the agent runs in. Only `list-agents --all-sessions` and `--watch` fill it:
+    /// The session the agent runs in. Only `list-agents --all-sessions` fills it:
     /// a one-session list is about the session it was asked of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
