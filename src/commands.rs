@@ -1153,6 +1153,10 @@ fn attach_with_cli_client(
         }
     }
     let mut cli_action = cli_action;
+    // an agent's new pane or tab leaves the person's focus alone unless it passed `--focus`
+    cli_action.settle_focus_for_caller(zellij_utils::agent_detect::caller_is_agent(|name| {
+        std::env::var(name).ok()
+    }));
     // `pipe --timeout` is the client's to hold: the session has nothing to time out, and keeping it
     // here is what keeps the flag off `Action::CliPipe` and off the client/server contract
     let pipe_timeout = cli_action.take_pipe_timeout();

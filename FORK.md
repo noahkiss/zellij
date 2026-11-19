@@ -491,7 +491,9 @@ than dropped. Rename the pane once it is there.
 
 `--new-tab` is the one placement flag that **does** move the focus: whoever is attached is taken to
 the new tab, the way `new-tab` itself takes them. That is what a caller opening a tab usually means,
-and `--no-focus` is how to say otherwise. `--near` and `--in-tab` never move anybody.
+and `--no-focus` is how to say otherwise. An agent's `--new-tab` leaves the focus alone unless it
+passes `--focus` (see "An agent's new pane or tab leaves the person's focus alone"). `--near` and
+`--in-tab` never move anybody.
 
 The flags that say where a pane goes in an existing tab - `--direction`,
 `--stacked`, `--floating`, `--in-place`, `--tab-id`, `--near-current-pane` - are refused, because
@@ -8516,7 +8518,7 @@ thread named. No client/server contract changes.
 
 ```
 zellij_create {"kind": "tab", "name": "build"}
-action new-tab --name=build --wait-ready --ready-timeout=10
+action new-tab --no-focus --name=build --wait-ready --ready-timeout=10
 ```
 
 Without `name`, a tab an agent makes is called `Tab #N`. `name` names the tab, and only the tab: it
@@ -8558,6 +8560,53 @@ create takes both focus and the expanded slot. No contract change.
 Not changed: a tiled `new-pane --no-focus` in a tab with no room left joins a stack through
 `expand_pane_in_stack`, which moves every client focused in that stack to the new pane. Focus and
 expansion agree there, but the focus moves.
+
+### An agent's new pane or tab leaves the person's focus alone
+
+```
+# from an agent's shell (AGENT_SESSION_ID is set)
+zellij action new-tab                 # before: the person is taken to the new tab
+                                      # after:  the tab is made in the background
+zellij action new-tab --focus         # the agent asked: the person is taken there
+```
+
+`zellij action new-pane`, `zellij action new-tab` and `zellij run` took the focus unless the caller
+passed `--no-focus`. An agent that made a pane moved the person's cursor, and the person's next
+keystrokes went to the agent's pane. Now the caller decides the default:
+
+| Caller | No flag | `--no-focus` | `--focus` |
+|---|---|---|---|
+| a person | takes the focus (upstream) | leaves it | takes it |
+| an agent | **leaves it** | leaves it | takes it |
+
+The caller is an agent when any variable from `agent_identity_env_names` is set and not empty:
+`AGENT_SESSION_ID`, `AGENT_KIND`, or a harness's own session variable such as
+`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`. A session this binary creates drops all of them, so
+a person's shell in a session an agent started is not taken for an agent.
+
+`--focus` and `--no-focus` together are a clap error, and so are `--focus` and `--in-tab`, which
+never moves anybody. The `zellij plugin` shorthand and `zellij --layout` inside a session reach the
+same `new-pane` / `new-tab` path, so an agent's call there leaves the focus alone too; they take no
+`--focus`. `zellij edit` and `action edit` are unchanged.
+
+A no-focus `new-pane` run from inside a pane opens beside that pane (`ZELLIJ_PANE_ID`), not beside
+the person's focused pane, as `--no-focus` always has. So an agent's bare `new-pane --stacked` now
+stacks onto the agent's own pane in the background. With "A pane stacked in the background leaves
+the focused pane expanded", the person's focused pane stays expanded.
+
+One gap remains. A tiled no-focus pane in a tab with no room to split joins a stack, and that path
+still moves every client focused in the stack to the new pane (the "Not changed" note in the entry
+above). An agent's bare `new-pane` or `zellij run` from inside a stack hits it.
+
+MCP `zellij_create kind=tab` passes `--no-focus` itself, so it does not depend on the environment
+the MCP server was started with.
+
+The decision is made on the CLI side before the action is built (`leaves_focus_alone` and
+`CliAction::settle_focus_for_caller` in `zellij-utils/src/cli.rs`, `caller_is_agent` in
+`zellij-utils/src/agent_detect.rs`, called from `send_action_to_session` in `src/commands.rs`). The
+action carries `no_focus` as before, so the client/server contract does not change. Tests: the
+decision table, the settled `new-pane` and `new-tab`, the clap conflicts, `zellij run --focus`, and
+agent detection from the environment.
 
 ## Assessed and deliberately not built
 

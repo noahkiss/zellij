@@ -112,6 +112,18 @@ pub fn agent_identity_env_names() -> Vec<&'static str> {
     names
 }
 
+/// Whether the process asking is a coding agent, read from its own environment by `var`.
+///
+/// The names are [`agent_identity_env_names`]: the shared `AGENT_SESSION_ID` and `AGENT_KIND`, and
+/// each harness's own session variable. An empty value does not count. A session this binary
+/// creates drops every one of them, so a person's shell in a session an agent started is not taken
+/// for the agent.
+pub fn caller_is_agent(var: impl Fn(&str) -> Option<String>) -> bool {
+    agent_identity_env_names()
+        .into_iter()
+        .any(|name| var(name).map_or(false, |value| !value.is_empty()))
+}
+
 /// What was found running in a pane.
 ///
 /// Carried on the CLI-only [`crate::data::PaneListEntry`], never on `PaneInfo`: the consumer is the
@@ -1090,6 +1102,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found.agent_id.as_deref(), Some("own"));
+    }
+
+    #[test]
+    fn a_caller_is_an_agent_by_its_identity_variables() {
+        let caller = |pairs: &[(&str, &str)]| {
+            let vars = env(pairs);
+            caller_is_agent(|name| vars.get(name).cloned())
+        };
+        assert!(!caller(&[]));
+        assert!(!caller(&[("HOME", "/home/user"), ("TERM", "xterm")]));
+        assert!(caller(&[(AGENT_SESSION_ID, "abc")]));
+        assert!(caller(&[(AGENT_KIND, "codex")]));
+        // a harness with no start hook still names itself
+        assert!(caller(&[("CLAUDE_CODE_SESSION_ID", "abc")]));
+        assert!(caller(&[("CODEX_THREAD_ID", "abc")]));
+        // an exported but empty variable proves nothing
+        assert!(!caller(&[(AGENT_SESSION_ID, "")]));
     }
 
     /// opencode's bash tool passes on its parent claude's variables when nested. A pane detected

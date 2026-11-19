@@ -1193,6 +1193,7 @@ impl Action {
                 new_tab,
                 near_current_pane,
                 no_focus,
+                focus: _,
                 borderless,
                 tab_id,
                 in_tab,
@@ -1636,6 +1637,7 @@ impl Action {
                 block_until_exit_failure,
                 block_until_exit,
                 no_focus,
+                focus: _,
             } => {
                 let current_dir = get_current_dir();
                 let cwd = cwd
@@ -4268,6 +4270,7 @@ mod tests {
             block_until_exit_success: false,
             block_until_exit_failure: false,
             no_focus: false,
+            focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -4311,6 +4314,7 @@ mod tests {
             block_until_exit_success: false,
             block_until_exit_failure: false,
             no_focus: false,
+            focus: false,
         };
         let result = Action::actions_from_cli(
             cli_action,
@@ -4434,6 +4438,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: Some(3),
         };
@@ -4496,6 +4501,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: None,
         };
@@ -4551,6 +4557,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: None,
         };
@@ -4635,6 +4642,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: None,
         };
@@ -4695,6 +4703,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: None,
         };
@@ -4742,6 +4751,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: Some(5),
         };
@@ -4798,6 +4808,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: Some(1),
         };
@@ -4851,6 +4862,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: Some(2),
         };
@@ -4980,6 +4992,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: Some(2),
         };
@@ -5033,6 +5046,7 @@ mod tests {
             near: None,
             near_current_pane: false,
             no_focus: false,
+            focus: false,
             borderless: None,
             tab_id: Some(1),
         };

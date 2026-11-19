@@ -999,6 +999,9 @@ fn argv_in(
                 },
                 "tab" => {
                     rest.push("new-tab".to_owned());
+                    // an agent's tab leaves the person's focus alone, whatever the CLI would
+                    // conclude from this server's own environment
+                    rest.push("--no-focus".to_owned());
                     if let Some(cwd) = args.string("cwd") {
                         rest.push(flag_value("--cwd", &create_cwd(&cwd, env)?));
                     }
@@ -1574,7 +1577,7 @@ mod tests {
                 json!({"kind": "tab", "command": "make"}),
                 None
             ),
-            "action new-tab --wait-ready --ready-timeout=10"
+            "action new-tab --no-focus --wait-ready --ready-timeout=10"
         );
         assert_eq!(
             in_agent_tab(
@@ -1951,7 +1954,15 @@ mod tests {
         );
         assert_eq!(
             argv,
-            vec!["action", "new-tab", "--", "/bin/zsh", "-c", command]
+            vec![
+                "action",
+                "new-tab",
+                "--no-focus",
+                "--",
+                "/bin/zsh",
+                "-c",
+                command
+            ]
         );
     }
 
@@ -1990,7 +2001,7 @@ mod tests {
                     &env
                 )
                 .join(" "),
-                format!("action new-tab --cwd={}", expected)
+                format!("action new-tab --no-focus --cwd={}", expected)
             );
         }
     }
@@ -2063,7 +2074,7 @@ mod tests {
                 json!({"kind": "tab", "name": "build"}),
                 Some("work")
             ),
-            "-s work action new-tab --name=build --wait-ready --ready-timeout=10"
+            "-s work action new-tab --no-focus --name=build --wait-ready --ready-timeout=10"
         );
         // a name that begins with a dash is a name, not a flag
         assert!(
@@ -2174,7 +2185,7 @@ mod tests {
         )
         .join(" ");
         assert_eq!(
-            line, "-s work action new-tab --cwd=/srv/app -- /bin/sh -c make",
+            line, "-s work action new-tab --no-focus --cwd=/srv/app -- /bin/sh -c make",
             "this machine's $SHELL is not a path there"
         );
         for cwd in ["~/app", "$HOME/app", "app"] {

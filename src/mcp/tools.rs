@@ -421,7 +421,8 @@ pub const TOOLS: &[ToolSpec] = &[
                            not take the person's focus. It is named after the tab this server's \
                            own pane is in, even when `session` names a different session. Use it \
                            unless you have a reason not to. stacked stacks onto your own pane. \
-                           tab makes a fresh tab. This tool never splits or floats.",
+                           tab makes a fresh tab, without going there. This tool never splits \
+                           or floats.",
                 default: Some(invoke::CREATE_KIND_DEFAULT),
             },
             ParamSpec {

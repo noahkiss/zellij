@@ -322,6 +322,7 @@ fn new_pane_cli_action(
         near: None,
         near_current_pane: false,
         no_focus: false,
+        focus: false,
         borderless: None,
         tab_id: None,
     }

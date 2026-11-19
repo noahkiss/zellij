@@ -89,6 +89,7 @@ fn main() {
             block_until_exit,
             near_current_pane,
             no_focus,
+            focus,
             borderless,
             tab_id,
             ready,
@@ -139,6 +140,7 @@ fn main() {
                 ready,
                 near_current_pane,
                 no_focus,
+                focus,
                 borderless,
                 tab_id,
             };
@@ -196,6 +198,7 @@ fn main() {
                 near: None,
                 near_current_pane: false,
                 no_focus,
+                focus: false,
                 ready: Default::default(),
                 borderless,
                 tab_id,
@@ -370,6 +373,7 @@ fn main() {
                 block_until_exit_failure: false,
                 block_until_exit: false,
                 no_focus: false,
+                focus: false,
                 ready: Default::default(),
             };
             commands::send_action_to_session(
