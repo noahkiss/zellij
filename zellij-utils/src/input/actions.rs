@@ -4559,14 +4559,32 @@ mod tests {
     }
 
     #[test]
-    fn test_dump_screen_with_pane_id_and_ansi() {
-        let cli_action = CliAction::DumpScreen {
-            path: None,
-            full: false,
-            pane_id: Some("terminal_5".to_string()),
-            ansi: true,
-        };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+    fn dump_screen_of_several_panes_is_not_one_action() {
+        for pane_id in [
+            vec!["terminal_5".to_string(), "terminal_6".to_string()],
+            vec![],
+        ] {
+            let all = pane_id.is_empty();
+            let cli_action = CliAction::DumpScreen {
+                file: None,
+                path: None,
+                full: false,
+                pane_id,
+                all,
+                ansi: false,
+            };
+            let result = Action::actions_from_cli(
+                cli_action,
+                Box::new(|| PathBuf::from("/tmp")),
+                None,
+                &pane_ids_only,
+            );
+            // the client runs a sweep a pane at a time; nothing here may quietly answer with the
+            // first pane of several
+            assert!(result.is_err(), "a sweep is not an action");
+        }
+    }
+
     #[test]
     fn test_dump_screen_with_pane_id_and_ansi() {
         let cli_action = CliAction::DumpScreen {

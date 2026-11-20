@@ -1430,6 +1430,396 @@ pub fn start_wait_client(
     }
 }
 
+/// `zellij action last-reply`: the agent's last reply, from its harness's transcript.
+///
+/// The pane is resolved the way every addressed verb resolves one. Its row in the agent list
+/// names the harness and the session id, and [`crate::agent_reply`] finds and reads the transcript on this machine.
+///
+/// Exit 0 printed a reply. Exit 2 is a miss with the reason on stderr: not an agent, no session
+/// id yet, a harness whose transcript this build does not read, no transcript file, or nothing
+/// written since the last prompt. Exit 1 is a session that could not be asked.
+pub fn start_last_reply_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    target: &str,
+    output_json: bool,
+) -> i32 {
+    let pane = match resolve_pane_target(make_os_input(), session_name, target) {
+        Ok(pane) => pane,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 2;
+        },
+    };
+    let agents = match agents_of_session(make_os_input(), session_name) {
+        Ok(agents) => agents,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let var = |name: &str| std::env::var(name).ok();
+    match last_reply_of(&agents, pane, &var, home.as_deref()) {
+        Ok(found) => {
+            if output_json {
+                println!("{}", serde_json::to_string(&found).unwrap_or_default());
+            } else {
+                println!("{}", found.reply);
+            }
+            0
+        },
+        Err(message) => {
+            eprintln!("{}: {}", target, message);
+            2
+        },
+    }
+}
+
+/// What `last-reply --json` prints.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LastReplyReport {
+    pub pane_id: String,
+    pub handle: String,
+    pub kind: String,
+    pub agent_id: String,
+    /// The transcript the reply was read from.
+    pub transcript: PathBuf,
+    /// The agent's `OSC 7501` state, when it reports one: `done` or `idle` means the turn ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    pub reply: String,
+}
+
+/// The last reply of the agent in `pane`, or why there is none. Pure but for the file reads.
+fn last_reply_of(
+    agents: &ListAgentsResponse,
+    pane: PaneId,
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
+) -> Result<LastReplyReport, String> {
+    let PaneId::Terminal(id) = pane else {
+        return Err("a plugin pane runs no coding agent.".to_owned());
+    };
+    let agent = agents
+        .iter()
+        .find(|agent| agent.pane_id == id)
+        .ok_or_else(|| {
+            "it is not running a coding agent (`list-agents` does not list it).".to_owned()
+        })?;
+    let kind = agent.agent.kind.as_str();
+    if !crate::agent_reply::reads_transcript_of(kind) {
+        return Err(format!(
+            "{} keeps its sessions where this build does not read them. Read the pane's screen \
+             with dump-screen instead.",
+            kind
+        ));
+    }
+    let agent_id = agent.agent.agent_id.clone().ok_or_else(|| {
+        format!(
+            "no {} session id is known for it yet, so its transcript cannot be found. A {} that \
+             has not been sent a message has none.",
+            kind, kind
+        )
+    })?;
+    let root = crate::agent_reply::transcript_root(kind, var, home)
+        .ok_or_else(|| "no home directory to look for the transcript in.".to_owned())?;
+    let transcript =
+        crate::agent_reply::find_transcript(kind, &root, &agent_id).ok_or_else(|| {
+            format!(
+                "no transcript of {} session {} under {}.",
+                kind,
+                agent_id,
+                root.display()
+            )
+        })?;
+    let text = crate::agent_reply::read_tail(&transcript)
+        .map_err(|e| format!("could not read {}: {}", transcript.display(), e))?;
+    let found = crate::agent_reply::last_reply(kind, &text);
+    let state = agent
+        .program_status
+        .as_ref()
+        .map(|status| status.state.clone());
+    if found.reply.is_empty() {
+        return Err(format!(
+            "the agent has written no reply since its last prompt{}.",
+            match (&state, found.mid_tool) {
+                (Some(state), _) => format!(" (state: {})", state),
+                (None, true) => " (it is running a tool)".to_owned(),
+                (None, false) => String::new(),
+            }
+        ));
+    }
+    Ok(LastReplyReport {
+        pane_id: pane.to_string(),
+        handle: agent.handle.clone(),
+        kind: kind.to_owned(),
+        agent_id,
+        transcript,
+        state,
+        reply: found.reply,
+    })
+}
+
+/// What one question got, on a connection that is about to be asked another.
+///
+/// The session answers a CLI message with its report and then, from the bottom of its route loop,
+/// an `UnblockInputThread` addressed to whoever holds the input. A client that asks one question and
+/// exits can ignore that second message; a client that asks several cannot, because the unblock it
+/// left behind is the first thing the NEXT question reads, and every answer after that is one
+/// question late.
+enum Answer {
+    /// The report, which is empty for a verb that had nothing to say.
+    Reported(Vec<String>),
+    /// The session refused or missed, in its own words. Already printed.
+    Failed,
+    /// The connection ended. Nothing more will come down it, whatever is still to ask.
+    Ended(i32),
+}
+
+/// Asks one question down a connection that stays open, and reads to the end of its answer.
+///
+/// Returns with the connection at a message boundary: the report, then the unblock that closes it,
+/// are both consumed. That is the whole difference from [`individual_messages_client`], which stops
+/// at the report because the client it serves is about to exit.
+fn ask_in_sequence(os_input: &mut Box<dyn ClientOsApi>, action: Action) -> Answer {
+    os_input.send_to_server(ClientToServerMsg::Action {
+        action,
+        terminal_id: None,
+        client_id: None,
+        is_cli_client: true,
+    });
+    let mut answer = Answer::Reported(Vec::new());
+    loop {
+        match os_input.recv_from_server() {
+            Some((ServerToClientMsg::Log { lines }, _)) => answer = Answer::Reported(lines),
+            Some((ServerToClientMsg::LogError { lines }, _)) => {
+                lines.iter().for_each(|line| eprintln!("{line}"));
+                answer = Answer::Failed;
+            },
+            Some((ServerToClientMsg::UnblockInputThread, _)) => return answer,
+            Some((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                let (outcome, diagnostic) = outcome_of_exit(exit_reason);
+                if let Some(diagnostic) = diagnostic {
+                    eprintln!("{}", diagnostic);
+                }
+                return match outcome {
+                    ActionOutcome::Done(exit_status) => Answer::Ended(exit_status),
+                    ActionOutcome::Reported(_) => Answer::Ended(0),
+                };
+            },
+            Some(_) => {},
+            // the socket went. Unlike a one-question client there is a loop above this one, so
+            // saying so is what stops it rather than spinning on a connection that is gone
+            None => return Answer::Ended(1),
+        }
+    }
+}
+
+/// `zellij action dump-screen` for more than one pane, or for `--all`.
+///
+/// The sweep is the point: a caller reaching a session over ssh pays for the round trip, not for the
+/// dump, so N panes asked for in one invocation cost one connection and N local messages instead of
+/// N of everything. Nothing about the request changes - it is the same per-pane `DumpScreen` the
+/// session has always answered, asked N times - so this crosses no contract.
+///
+/// One JSON object per line, [`PaneDump`]. A single `--pane-id` never comes here: it keeps printing
+/// the bare content it always did.
+///
+/// Exit 0 when every pane asked for answered, 2 when one did not - the miss every `--pane-id` verb
+/// reports, said once per pane that missed and counted at the end. `--all` on a session with no
+/// panes prints nothing and exits 0: nothing was asked for by name, so nothing is missing.
+pub fn start_dump_screen_client(
+    mut os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    targets: Vec<String>,
+    all: bool,
+    full: bool,
+    ansi: bool,
+    file_path: Option<PathBuf>,
+) -> i32 {
+    // the targets are read before anything is asked. A string that names no pane in ANY form is
+    // malformed input rather than a miss, and half-way through a sweep that has already printed
+    // panes is the wrong place to discover it
+    let mut wanted: Vec<(String, Option<PaneId>)> = Vec::with_capacity(targets.len());
+    for target in targets {
+        match target.parse::<PaneTarget>() {
+            Ok(parsed) => {
+                let known = parsed.as_pane_id();
+                wanted.push((target, known));
+            },
+            Err(malformed) => {
+                eprintln!("{}", malformed);
+                return 1;
+            },
+        }
+    }
+    let zellij_ipc_pipe: PathBuf = {
+        let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+        if let Err(e) = fs::create_dir_all(&sock_dir) {
+            eprintln!("{}", e);
+            return 1;
+        }
+        if let Err(e) = zellij_utils::shared::set_permissions(&sock_dir, 0o700) {
+            eprintln!("{}", e);
+            return 1;
+        }
+        sock_dir.push(zellij_utils::sessions::session_id_for(session_name));
+        sock_dir
+    };
+    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", e);
+        return 1;
+    }
+    // one listing, whatever was asked for: it is what `--all` sweeps, and it is where a named pane's
+    // handle comes from. A dump says which pane it is, and the handle is the address a reader of the
+    // sweep will use to talk to that pane
+    let listed = match ask_in_sequence(
+        &mut os_input,
+        Action::ListPanes {
+            show_tab: true,
+            show_command: true,
+            show_state: false,
+            show_geometry: false,
+            show_all: false,
+            output_json: true,
+        },
+    ) {
+        Answer::Reported(lines) => lines,
+        Answer::Failed => return 1,
+        Answer::Ended(exit_status) => return exit_status,
+    };
+    let listed: Vec<PaneListEntry> = match serde_json::from_str(&listed.join("\n")) {
+        Ok(listed) => listed,
+        Err(e) => {
+            eprintln!(
+                "Could not read the pane list this session answered with: {}",
+                e
+            );
+            return 1;
+        },
+    };
+    let handles: BTreeMap<PaneId, String> = listed
+        .iter()
+        .map(|entry| (pane_id_of(entry), entry.pane_info.handle.clone()))
+        .collect();
+    // a miss is per pane and does not end the sweep: one name nobody answers to should cost that
+    // one pane, not the nine beside it that are there. The exit code carries it to the end
+    let mut missed = false;
+    let mut sweep: Vec<PaneId> = Vec::new();
+    if all {
+        sweep.extend(listed.iter().map(pane_id_of));
+    } else {
+        for (target, known) in wanted {
+            match known {
+                // an id form needs no lookup to be UNDERSTOOD, and whether a pane answers to it is
+                // the dump's own question - the same one the single-pane form asks
+                Some(pane_id) => sweep.push(pane_id),
+                None => match ask_in_sequence(
+                    &mut os_input,
+                    Action::ResolvePaneTarget {
+                        target: target.clone(),
+                    },
+                ) {
+                    Answer::Reported(lines) => {
+                        match lines
+                            .first()
+                            .and_then(|line| line.strip_prefix("pane_id: "))
+                            .and_then(|id| PaneId::from_str(id).ok())
+                        {
+                            Some(pane_id) => sweep.push(pane_id),
+                            None => {
+                                eprintln!("Could not read the resolved pane for '{}'", target);
+                                missed = true;
+                            },
+                        }
+                    },
+                    Answer::Failed => missed = true,
+                    Answer::Ended(exit_status) => return exit_status,
+                },
+            }
+        }
+    }
+    let mut out: Box<dyn Write> = match &file_path {
+        Some(path) => match fs::File::create(path) {
+            Ok(file) => Box::new(io::BufWriter::new(file)),
+            Err(e) => {
+                eprintln!("Could not write to '{}': {}", path.display(), e);
+                return 1;
+            },
+        },
+        None => Box::new(io::stdout()),
+    };
+    for pane_id in sweep {
+        match ask_in_sequence(
+            &mut os_input,
+            Action::DumpScreen {
+                file_path: None,
+                include_scrollback: full,
+                pane_id: Some(pane_id),
+                ansi,
+            },
+        ) {
+            Answer::Reported(lines) => {
+                let dump = PaneDump {
+                    pane_id: pane_id.to_string(),
+                    handle: handles.get(&pane_id).cloned().unwrap_or_default(),
+                    // the session answers with the dump as one string, so this is the same content
+                    // the single-pane form prints, escaped into one line
+                    content: lines.join("\n"),
+                };
+                let line = match serde_json::to_string(&dump) {
+                    Ok(line) => line,
+                    Err(e) => {
+                        eprintln!("Could not write the dump of {} as JSON: {}", pane_id, e);
+                        return 1;
+                    },
+                };
+                if let Err(e) = writeln!(out, "{}", line) {
+                    return end_of_writing(e);
+                }
+            },
+            Answer::Failed => missed = true,
+            Answer::Ended(exit_status) => return exit_status,
+        }
+    }
+    if let Err(e) = out.flush() {
+        return end_of_writing(e);
+    }
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    if missed {
+        2
+    } else {
+        0
+    }
+}
+
+/// The pane a `list-panes` row is about.
+///
+/// The row carries the id and the kind separately, which is what the JSON says; a `PaneId` is the
+/// two of them together, and is what everything else here holds a pane by.
+fn pane_id_of(entry: &PaneListEntry) -> PaneId {
+    if entry.pane_info.is_plugin {
+        PaneId::Plugin(entry.pane_info.id)
+    } else {
+        PaneId::Terminal(entry.pane_info.id)
+    }
+}
+
+/// A sweep that could not finish writing, and what that is worth as an exit code.
+///
+/// A reader that stopped reading - `| head -1` on a sweep of thirty panes - is not this command's
+/// failure, and exits 0 saying nothing. Any other write error is one, and says so. The same answer
+/// `session status` gives, for the same reason.
+fn end_of_writing(e: io::Error) -> i32 {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        return 0;
+    }
+    eprintln!("Could not write the dump: {}", e);
+    1
+}
+
 /// A wait that ended without its condition: the sentence to print, and which exit code it is.
 enum WaitMiss {
     Missed(String),

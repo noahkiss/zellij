@@ -4989,6 +4989,73 @@ mod tests {
     }
 
     #[test]
+    fn dump_screen_takes_one_pane_as_it_always_did() {
+        match parse_action(&["dump-screen", "--pane-id", "sunny-otter"]) {
+            CliAction::DumpScreen { pane_id, all, .. } => {
+                assert_eq!(pane_id, vec!["sunny-otter".to_owned()]);
+                assert!(!all);
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_takes_a_pane_at_a_time_and_keeps_the_order() {
+        match parse_action(&[
+            "dump-screen",
+            "--pane-id",
+            "sunny-otter",
+            "--pane-id",
+            "terminal_3",
+            "-p",
+            "4",
+        ]) {
+            CliAction::DumpScreen { pane_id, all, .. } => {
+                assert_eq!(
+                    pane_id,
+                    vec![
+                        "sunny-otter".to_owned(),
+                        "terminal_3".to_owned(),
+                        "4".to_owned()
+                    ]
+                );
+                assert!(!all);
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_all_is_the_whole_session() {
+        match parse_action(&["dump-screen", "--all", "--full", "--ansi"]) {
+            CliAction::DumpScreen {
+                pane_id,
+                all,
+                full,
+                ansi,
+                ..
+            } => {
+                assert!(pane_id.is_empty());
+                assert!(all);
+                // the two flags that shape a dump shape every dump in the sweep
+                assert!(full);
+                assert!(ansi);
+            },
+            other => panic!("Expected DumpScreen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dump_screen_refuses_all_beside_a_named_pane() {
+        assert!(action_parse_fails(&[
+            "dump-screen",
+            "--all",
+            "--pane-id",
+            "sunny-otter"
+        ]));
+    }
+
+    #[test]
     fn go_to_tab_name_focuses_by_default() {
         let action = parse_action(&["go-to-tab-name", "build"]);
         match action {
