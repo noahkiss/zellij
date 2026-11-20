@@ -864,9 +864,9 @@ so it moved the deterministic output every one of those `ZELLIJ_SEQUENTIAL_PANE_
 was pinned to. 275 `zellij-server` snapshots refreshed with the new sequence — the local
 `tab_integration_tests` and `screen_tests` unit-test golden frames, mostly. The 150 `#[ignore]`d
 plugin-system snapshots did not need it: none of them render a pane frame or otherwise embed handle
-text. The `quit_and_resurrect_session` and `resize_terminal_window` e2e snapshots almost certainly do
-need it too, since they cross a real frame render, but this box has no `musl-gcc` to build the e2e
-binary that would prove it — confirm and refresh them in CI before relying on that pair.
+text. The `resize_terminal_window` e2e snapshot does: it splits a pane, so its frames carry the
+handles `apt-anteater` and `dry-backyard`. Upstream's copy of that snapshot has no handles, so a
+merge that takes it fails the End to End workflow; keep the fork's frame line.
 
 ### Making a tab does not need somebody attached
 
