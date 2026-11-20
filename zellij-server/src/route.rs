@@ -3721,6 +3721,18 @@ pub(crate) fn route_thread_main(
                                         log::error!("{}", e);
                                     },
                                 }
+                            } else if let Some(retry_queue) = retry_queue.as_mut() {
+                                // fork addition: the session is not set up yet - an action sent
+                                // the moment `attach --create-background` returns. Dropped here, it
+                                // made nothing and its caller exited 0 with no word; parked, it runs
+                                // once the session is ready, as the other early messages do
+                                log::warn!("Server not ready, parking the action until it is");
+                                retry_queue.push_back(ClientToServerMsg::Action {
+                                    action,
+                                    terminal_id: maybe_pane_id,
+                                    client_id: maybe_client_id,
+                                    is_cli_client,
+                                });
                             }
                         },
                         ClientToServerMsg::TerminalResize { new_size } => {

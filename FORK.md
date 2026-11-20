@@ -1432,6 +1432,16 @@ The last two lines appear only when a snapshot for that name exists. Nothing is 
 contract's server would not understand the question — so this is a socket-file check, not a
 connection.
 
+### An action sent while the session is still starting waits for it
+
+`zellij attach --create-background S` returns once the server is spawned, before the session is
+set up. An action sent in that moment - `zellij -s S action new-tab` right after it - reached a
+server with nothing to route it to, and upstream dropped it without a word: nothing was made, and
+the CLI printed nothing and exited 0. The server now parks such an action and runs it once the
+session is ready, the way it already holds a resize or a key that arrives early (up to the same
+ten seconds). The caller gets the usual answer, `tab_id:` and all
+(`zellij-server/src/route.rs`, the `ClientToServerMsg::Action` arm).
+
 ### A pane is reported only once a tab has taken it
 
 Upstream v0.45 reported a new pane **as soon as its pty spawned**, which was before any tab had
