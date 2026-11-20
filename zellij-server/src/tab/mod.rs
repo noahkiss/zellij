@@ -1219,6 +1219,42 @@ pub trait Pane {
     ) -> PaneContents {
         Default::default()
     }
+    /// What the pane's shell says it is doing, from its OSC 133 markers.
+    ///
+    /// Only a terminal pane can answer: a plugin pane has no shell, and a terminal pane whose
+    /// shell writes no markers says `None` rather than guessing at idle.
+    fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
+        None
+    }
+    /// fork addition: the most urgent `OSC 7501` record a program in the pane reported. Only a
+    /// terminal pane holds any.
+    fn program_status(&self) -> Option<zellij_utils::data::PaneProgramStatus> {
+        None
+    }
+    /// Whether input was typed into the pane after its shell last drew a prompt. Only a terminal
+    /// pane can say; see `Grid::input_since_prompt`.
+    fn input_since_prompt(&self) -> bool {
+        false
+    }
+    /// fork addition: the command line a `resurrect_commands "prefill"` restore typed at this
+    /// pane's prompt, until anything touches it. Only a terminal pane holds one; see
+    /// `Grid::prefilled_command`.
+    fn prefilled_command(&self) -> Option<String> {
+        None
+    }
+    fn set_prefilled_command(&mut self, _command: Option<String>) {}
+    /// Whether input was typed into the pane after a program in it last reported over `OSC
+    /// 7501`. Only a terminal pane can say; see `ProgramStatusRecords::input_since_report`.
+    fn input_since_state(&self) -> bool {
+        false
+    }
+    /// fork addition: what `send-message`'s guard reads about the prompt of the program in this
+    /// pane. Only a terminal pane has one.
+    fn agent_prompt(&self, _now: std::time::Instant) -> Option<AgentPrompt> {
+        None
+    }
+    /// fork addition: the session typed a message into this pane and submitted it.
+    fn note_message_delivered(&mut self, _now: std::time::Instant) {}
     fn update_exit_status(&mut self, _exit_status: i32) {}
     fn set_plugin_regex_highlights(
         &mut self,
@@ -1250,10 +1286,10 @@ pub trait Pane {
         None
     }
     fn program_columns(&self) -> usize {
-        self.get_content_columns()
+        self.get_terminal_columns()
     }
     fn program_rows(&self) -> usize {
-        self.get_content_rows()
+        self.get_terminal_rows()
     }
     fn mirror_pinned_size(&self) -> Option<Size> {
         None

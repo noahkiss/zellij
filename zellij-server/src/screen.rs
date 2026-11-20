@@ -16005,16 +16005,23 @@ pub(crate) fn screen_thread_main(
                 });
                 let run_plugin = Run::Plugin(run_plugin_or_alias);
 
-                // Set affected pane ID for CLI client output
-                if let Some(ref mut completion) = completion_tx {
-                    completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
-                }
-
                 // Set affected pane ID for CLI client output; `finish_pane_creation` clears it
                 // again if no tab takes the pane
                 if let Some(ref mut completion) = completion_tx {
                     completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
                 }
+
+                // fork addition: a tab the client branch below would not open the pane in. That
+                // branch always wins, because a plugin is loaded on a client's behalf, so a pane
+                // asked for in another tab (`--tab-id`, `--in-tab`) landed in the focused one -
+                // or, with no client attached, nowhere.
+                let client_tab = client_id
+                    .and_then(|client_id| screen.active_tab_ids.get(&client_id))
+                    .or_else(|| screen.active_tab_ids.values().next())
+                    .copied();
+                let other_tab = tab_index
+                    .filter(|index| Some(*index) != client_tab)
+                    .filter(|index| screen.tabs.contains_key(index));
 
                 if should_be_in_place {
                     if let Some(pane_id_to_replace) = pane_id_to_replace {
@@ -16047,6 +16054,17 @@ pub(crate) fn screen_thread_main(
                             PaneNotCreatedReason::NoClientOrTargetPane,
                         );
                     }
+                } else if let Some(tab) = other_tab.and_then(|index| screen.tabs.get_mut(&index)) {
+                    tab.new_pane(
+                        PaneId::Plugin(plugin_id),
+                        Some(pane_title),
+                        Some(run_plugin),
+                        start_suppressed,
+                        should_focus_plugin.unwrap_or(true),
+                        new_pane_placement,
+                        None,
+                        None,
+                    )?;
                 } else if let Some(client_id) = client_id {
                     let mut found_tab = false;
                     active_tab_and_connected_client_id!(screen, client_id, |active_tab: &mut Tab, _client_id: ClientId| {

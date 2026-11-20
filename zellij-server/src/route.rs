@@ -202,6 +202,19 @@ impl NotificationEnd {
     pub fn clear_affected_pane_id(&mut self) {
         self.affected_pane_id = None;
     }
+    /// fork addition: whether a pane was already named as the one this action made.
+    pub fn has_affected_pane_id(&self) -> bool {
+        self.affected_pane_id.is_some()
+    }
+
+    pub fn set_affected_tab_id(&mut self, tab_id: usize) {
+        self.affected_tab_id = Some(tab_id);
+    }
+
+    pub fn set_error_message(&mut self, message: String) {
+        self.error_message = Some(message);
+    }
+
     /// The one report this action prints. Calling it again replaces the report rather than adding
     /// to it, because a command answers once.
     pub fn set_stdout_message(&mut self, message: String) {

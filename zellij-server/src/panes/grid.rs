@@ -1092,6 +1092,19 @@ pub struct Grid {
     pub cached_hover_tooltip: Option<String>,
     osc133_markers_seen: bool,
     style_cache: StyleCache,
+    /// Whether input was typed into the pane after its shell last wrote an OSC 133 prompt marker.
+    /// See [`Grid::input_since_prompt`].
+    input_since_prompt: bool,
+    /// See [`Grid::prefilled_command`].
+    prefilled_command: Option<String>,
+    osc133_command_selection: bool,
+    command_output_flash: Option<Selection>,
+    word_separators: String,
+    pub osc7_payload: Option<String>,
+    pub shell_reports: crate::attention::signals::ShellReportState,
+    unseen_output_mark: Option<(usize, usize)>,
+}
+
 impl Grid {
     /// fork addition: records an `OSC 9;4` report. Every report counts, a repeat included.
     pub fn set_progress(&mut self, report: ProgressReport) {
@@ -1487,6 +1500,8 @@ impl Grid {
             hover_position: None,
             cached_hover_tooltip: None,
             osc133_markers_seen: false,
+            input_since_prompt: false,
+            prefilled_command: None,
             style_cache: StyleCache::default(),
             osc133_command_selection: true,
             command_output_flash: None,
@@ -4259,6 +4274,21 @@ impl Grid {
         if self.shell_reports.is_duplicate(&mark) {
             return;
         }
+        // fork addition: a new prompt ends the work a program reported over OSC 7501, and a
+        // command start drops the results from before that prompt
+        match &mark.kind {
+            MarkKind::PromptStart { .. } => {
+                self.program_status.prompt();
+                // a prompt drawn now is drawn after everything typed so far
+                self.input_since_prompt = false;
+            },
+            MarkKind::CommandStart { .. } => {
+                self.program_status.command_started();
+                // the line at the prompt ran, whatever put it there
+                self.prefilled_command = None;
+            },
+            _ => {},
+        }
         let marker = match &mark.kind {
             MarkKind::PromptStart { .. } => Some(Osc133MarkerKind::Prompt),
             MarkKind::InputStart => Some(Osc133MarkerKind::Input),
@@ -4366,6 +4396,13 @@ impl Grid {
             .note_typed(bytes, std::time::Instant::now());
     }
 
+    /// Record that input was typed into this pane: a key, a paste, `write-chars`.
+    pub fn note_typed_input(&mut self) {
+        self.input_since_prompt = true;
+        self.program_status.note_input();
+        self.prefilled_command = None;
+    }
+
     /// fork addition: the command line `resurrect_commands "prefill"` typed at this restored
     /// shell's prompt, for as long as nobody has touched it since.
     ///
@@ -4378,6 +4415,16 @@ impl Grid {
 
     pub fn set_prefilled_command(&mut self, command: Option<String>) {
         self.prefilled_command = command;
+    }
+
+    /// Whether input was typed into this pane after its shell last wrote an OSC 133 prompt marker.
+    ///
+    /// This is what tells a fresh prompt from a stale one. Right after a command is typed, the
+    /// shell's last marker is still the prompt it drew before the typing, and `command_state` reads
+    /// `prompt` until the shell's preexec hook writes the output marker. With this, a prompt counts
+    /// only once it was drawn after the last input - which is "the command I typed has finished".
+    pub fn input_since_prompt(&self) -> bool {
+        self.input_since_prompt
     }
 
     #[cfg(test)]
