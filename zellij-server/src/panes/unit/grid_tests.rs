@@ -11577,3 +11577,66 @@ fn oversized_xtgettcap_request_is_dropped() {
     vte_parser.feed(&mut grid, &sequence);
     assert!(grid.pending_messages_to_pty.is_empty());
 }
+
+// fork additions: OSC 9;4 progress and the OSC 7501 records, fed from upstream's parser
+
+#[test]
+fn osc_9_4_progress_is_kept_on_the_grid_and_is_not_a_notification() {
+    use crate::terminal_progress::TerminalProgress;
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vt_parser::Parser::new();
+    vte_parser.feed(&mut grid, b"\x1b]9;4;1;42\x07");
+    assert_eq!(
+        grid.progress,
+        Some(TerminalProgress {
+            state: 1,
+            value: Some(42)
+        })
+    );
+    assert_eq!(grid.progress_seq, 1);
+    assert!(grid.pending_desktop_notifications.is_empty());
+    vte_parser.feed(&mut grid, b"\x1b]9;4;3\x1b\\");
+    assert_eq!(
+        grid.progress,
+        Some(TerminalProgress {
+            state: 3,
+            value: None
+        })
+    );
+    assert_eq!(grid.progress_seq, 2);
+}
+
+#[test]
+fn osc_9_4_repeated_report_still_counts_and_a_clear_drops_the_state() {
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vt_parser::Parser::new();
+    vte_parser.feed(&mut grid, b"\x1b]9;4;3\x07\x1b]9;4;3\x07");
+    assert_eq!(grid.progress_seq, 2);
+    vte_parser.feed(&mut grid, b"\x1b]9;4;0\x07");
+    assert_eq!(grid.progress, None);
+    assert_eq!(grid.progress_seq, 3);
+    assert!(grid.pending_desktop_notifications.is_empty());
+}
+
+#[test]
+fn osc_9_4_with_an_unknown_state_is_ignored() {
+    let mut grid = new_grid_for_forwarding_test();
+    let mut vte_parser = vt_parser::Parser::new();
+    vte_parser.feed(&mut grid, b"\x1b]9;4;9;10\x07");
+    assert_eq!(grid.progress, None);
+    assert_eq!(grid.progress_seq, 0);
+    assert!(grid.pending_desktop_notifications.is_empty());
+}
+
+#[test]
+fn clear_progress_counts_only_when_there_was_progress() {
+    let mut grid = new_grid_for_forwarding_test();
+    grid.clear_progress();
+    assert_eq!(grid.progress_seq, 0);
+    let mut vte_parser = vt_parser::Parser::new();
+    vte_parser.feed(&mut grid, b"\x1b]9;4;3\x07");
+    grid.clear_progress();
+    assert_eq!(grid.progress, None);
+    assert_eq!(grid.progress_seq, 2);
+}
+

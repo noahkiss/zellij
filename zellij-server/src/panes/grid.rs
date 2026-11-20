@@ -270,6 +270,7 @@ use crate::panes::terminal_character::{
     TerminalCharacter, EMPTY_TERMINAL_CHARACTER,
 };
 use crate::panes::Selection;
+use crate::terminal_progress::{ProgressReport, TerminalProgress};
 use crate::ui::components::UiComponentParser;
 use zellij_utils::data::PaneContents;
 
@@ -1021,7 +1022,18 @@ pub struct Grid {
     pub pending_clipboard_update: Option<String>,
     pub pending_osc7_cwd: Option<std::path::PathBuf>,
     pub pending_prompt_return: bool,
+    /// The session id an agent reported for itself with `OSC 1337 SetUserVar=agent_session=`,
+    /// waiting for the tab to hand it to the pty thread. `Some("")` is an explicit clear.
+    pub pending_agent_session: Option<String>,
     pub pending_desktop_notifications: Vec<PendingNotification>,
+    /// fork addition: the last `OSC 9;4` progress this pane reported, `None` once cleared.
+    pub progress: Option<TerminalProgress>,
+    /// fork addition: counts the `OSC 9;4` reports, so a refresh of an unchanged state is still
+    /// forwarded. See `terminal_progress`.
+    pub progress_seq: u64,
+    /// fork addition: the `OSC 7501` program status records this pane holds, fed from upstream's
+    /// parser in `osc_end` and its shell marks in `handle_shell_mark`. See `program_status`.
+    pub program_status: crate::program_status::ProgramStatusRecords,
     notification_tracker: NotificationTracker,
     /// Whitelisted host-terminal queries intercepted from the app running
     /// in this pane (CSI 14t / 16t pixel-dim queries, OSC 10;? / 11;? /
@@ -1058,15 +1070,21 @@ pub struct Grid {
     pub cached_hover_tooltip: Option<String>,
     osc133_markers_seen: bool,
     style_cache: StyleCache,
-    osc133_command_selection: bool,
-    command_output_flash: Option<Selection>,
-    word_separators: String,
-    pub osc7_payload: Option<String>,
-    pub shell_reports: crate::attention::signals::ShellReportState,
-    unseen_output_mark: Option<(usize, usize)>,
-}
-
 impl Grid {
+    /// fork addition: records an `OSC 9;4` report. Every report counts, a repeat included.
+    pub fn set_progress(&mut self, report: ProgressReport) {
+        self.progress = match report {
+            ProgressReport::Set(progress) => Some(progress),
+            ProgressReport::Clear => None,
+        };
+        self.progress_seq = self.progress_seq.wrapping_add(1);
+    }
+    /// fork addition: drops the pane's progress, as when its program exits.
+    pub fn clear_progress(&mut self) {
+        if self.progress.is_some() {
+            self.set_progress(ProgressReport::Clear);
+        }
+    }
     pub fn set_pane_default_colors(&mut self, fg: Option<String>, bg: Option<String>) {
         // Parse inputs; anything that isn't literal RGB (palette
         // index / named colour / parse failure) is silently dropped so
@@ -1418,6 +1436,10 @@ impl Grid {
             sixel_host_support: true,
             pending_clipboard_update: None,
             pending_osc7_cwd: None,
+            pending_agent_session: None,
+            progress: None,
+            progress_seq: 0,
+            program_status: Default::default(),
             pending_prompt_return: false,
             pending_desktop_notifications: Vec::new(),
             notification_tracker: NotificationTracker::default(),
@@ -5853,6 +5875,13 @@ impl Handler for Grid {
                                 display,
                             });
                     }
+                }
+            },
+
+            // fork addition: ConEmu progress, kept for the client of whoever focuses this pane
+            b"9" if params.get(1) == Some(&&b"4"[..]) => {
+                if let Some(report) = TerminalProgress::parse(params) {
+                    self.set_progress(report);
                 }
             },
 

@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use super::LinkAnchor;
 
-const TERMINATOR: &str = "\u{1b}\\";
+// BEL, not the 7-bit ST: mosh-server (<= 1.4.0) reads a bare `ESC \` as an unknown escape and
+// clears its pending-wrap flag, which destroys the cell in the last column (mobile-shell/mosh#687).
+// Every terminal this fork targets accepts BEL as an OSC terminator.
+const TERMINATOR: &str = "\u{07}";
 
 #[derive(Debug, Clone)]
 pub struct LinkHandler {

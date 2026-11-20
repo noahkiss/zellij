@@ -13,14 +13,17 @@ use crate::panes::{
 use crate::pty::VteBytes;
 use crate::route::NotificationEnd;
 use crate::tab::{AdjustedInput, GuestChoiceIndicator, Pane};
+use crate::terminal_progress::TerminalProgress;
 use crate::vt_parser;
 use crate::ClientId;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{self, Instant};
-use zellij_utils::data::PaneContents;
+use uuid::Uuid;
+use zellij_utils::data::{NoteColor, PaneCommandState, PaneContents};
 use zellij_utils::input::command::RunCommand;
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::pane_size::Offset;
@@ -1017,6 +1020,10 @@ impl Pane for TerminalPane {
 
     fn drain_desktop_notifications(&mut self) -> Vec<PendingNotification> {
         self.grid.pending_desktop_notifications.drain(..).collect()
+    }
+
+    fn progress(&self) -> (Option<TerminalProgress>, u64) {
+        (self.grid.progress, self.grid.progress_seq)
     }
 
     fn drain_osc7_cwd(&mut self) -> Option<std::path::PathBuf> {

@@ -6510,6 +6510,39 @@ impl Screen {
             })
     }
 
+    /// fork addition: sends each client the `OSC 9;4` progress of the pane it has focused, when
+    /// that pane reported, or when the client's focus moved to another pane or tab. Returns
+    /// whether anything was added to `output`.
+    fn sync_progress_to_clients(&mut self, output: &mut Output) -> bool {
+        let mut sent = false;
+        for (client_id, tab_index) in &self.active_tab_ids {
+            if self.watcher_clients.contains_key(client_id) {
+                continue;
+            }
+            let focused = self
+                .tabs
+                .get(tab_index)
+                .and_then(|tab| tab.get_active_pane_id(*client_id));
+            let (progress, seq) = focused
+                .and_then(|pane_id| {
+                    self.tabs
+                        .get(tab_index)
+                        .and_then(|tab| tab.get_pane_with_id(pane_id))
+                })
+                .map(|pane| pane.progress())
+                .unwrap_or((None, 0));
+            let client_progress = self.client_progress.entry(*client_id).or_default();
+            if let Some(raw) = client_progress.update(focused, progress, seq) {
+                output.add_post_vte_instruction_to_multiple_clients(
+                    std::iter::once(*client_id),
+                    &raw,
+                );
+                sent = true;
+            }
+        }
+        sent
+    }
+
     fn forward_desktop_notifications(
         &mut self,
         notifications: Vec<PendingNotification>,

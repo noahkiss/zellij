@@ -66,6 +66,7 @@ use crate::{
     },
     plugins::PluginInstruction,
     pty::{ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
+    terminal_progress::TerminalProgress,
     thread_bus::ThreadSenders,
     ClientId,
 };
@@ -863,6 +864,14 @@ pub trait Pane {
         false
     }
     fn reset_input_modes_left_by_lost_guest(&mut self) {}
+    /// fork addition: the pane's last `OSC 9;4` progress and its report counter.
+    fn progress(&self) -> (Option<TerminalProgress>, u64) {
+        (None, 0)
+    }
+    /// The session id the pane's agent reported with `OSC 1337 SetUserVar=agent_session=`.
+    fn drain_agent_session(&mut self) -> Option<String> {
+        None
+    }
     fn render_full_viewport(&mut self) {}
     fn relative_position(&self, position_on_screen: &Position) -> Position {
         position_on_screen.relative_to(self.get_content_y(), self.get_content_x())
