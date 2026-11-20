@@ -42,6 +42,9 @@ message ClientToServerMsg {
     ClientPaneMirrorMsg pane_mirror = 35;
     AdoptSessionHistoryMsg adopt_session_history = 36;
     ClipboardPasteSupportMsg clipboard_paste_support = 37;
+    // fork addition: `zellij action watch`, the session's changes pushed as JSON lines. Fork
+    // messages live in a block from 900
+    ForkSubscribeToSessionEventsMsg fork_subscribe_to_session_events = 900;
   }
 }
 

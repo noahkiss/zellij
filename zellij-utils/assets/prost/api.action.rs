@@ -309,7 +309,7 @@ pub struct OverrideLayoutPayload {
 pub struct Action {
     #[prost(enumeration="ActionName", tag="1")]
     pub name: i32,
-    #[prost(oneof="action::OptionalPayload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71")]
+    #[prost(oneof="action::OptionalPayload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 900")]
     pub optional_payload: ::core::option::Option<action::OptionalPayload>,
 }
 /// Nested message and enum types in `Action`.
@@ -451,6 +451,10 @@ pub mod action {
         SessionNameInputPayload(::prost::alloc::vec::Vec<u8>),
         #[prost(message, tag="71")]
         BarNamesPayload(super::BarNamesPayload),
+        /// fork additions live in a block from 900, well clear of upstream's numbering
+        /// the handle of the closed pane to reopen; absent for the newest
+        #[prost(string, tag="900")]
+        ReopenPanePayload(::prost::alloc::string::String),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -1278,6 +1282,7 @@ pub enum ActionName {
     PasteFromClipboardByPaneId = 154,
     ToggleStackListOrientation = 155,
     ToggleStackListOrientationByPaneId = 156,
+    ReopenPane = 900,
 }
 impl ActionName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1440,6 +1445,7 @@ impl ActionName {
             ActionName::PasteFromClipboardByPaneId => "PasteFromClipboardByPaneId",
             ActionName::ToggleStackListOrientation => "ToggleStackListOrientation",
             ActionName::ToggleStackListOrientationByPaneId => "ToggleStackListOrientationByPaneId",
+            ActionName::ReopenPane => "ReopenPane",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1599,6 +1605,7 @@ impl ActionName {
             "PasteFromClipboardByPaneId" => Some(Self::PasteFromClipboardByPaneId),
             "ToggleStackListOrientation" => Some(Self::ToggleStackListOrientation),
             "ToggleStackListOrientationByPaneId" => Some(Self::ToggleStackListOrientationByPaneId),
+            "ReopenPane" => Some(Self::ReopenPane),
             _ => None,
         }
     }

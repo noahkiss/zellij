@@ -154,7 +154,7 @@ pub struct RgbColor {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Action {
-    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 156, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 157, 158, 159, 160, 161, 162, 163, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195")]
+    #[prost(oneof="action::ActionType", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 156, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 157, 158, 159, 160, 161, 162, 163, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 902, 903, 905, 906, 900, 901")]
     pub action_type: ::core::option::Option<action::ActionType>,
 }
 /// Nested message and enum types in `Action`.
@@ -296,6 +296,9 @@ pub mod action {
         PreviousSwapLayout(super::PreviousSwapLayoutAction),
         #[prost(message, tag="67")]
         NextSwapLayout(super::NextSwapLayoutAction),
+        /// retired: the `query-tab-names` CLI verb is gone (list-tabs answers it, and answers more).
+        /// The tag stays assigned and the message stays defined - a client of an older build still
+        /// sends it, and the wire contract is append-only
         #[prost(message, tag="68")]
         QueryTabNames(super::QueryTabNamesAction),
         #[prost(message, tag="69")]
@@ -550,6 +553,21 @@ pub mod action {
         ToggleStackListOrientation(super::ToggleStackListOrientationAction),
         #[prost(message, tag="195")]
         ToggleStackListOrientationByPaneId(super::ToggleStackListOrientationByPaneIdAction),
+        /// fork additions live in a reserved block from 900, well clear of upstream's numbering, so
+        /// a rebase never renumbers them. Declaration order is kept; the numbers are not contiguous
+        /// with it
+        #[prost(message, tag="902")]
+        ResolvePaneTarget(super::ResolvePaneTargetAction),
+        #[prost(message, tag="903")]
+        ListTree(super::ListTreeAction),
+        #[prost(message, tag="905")]
+        NewShellPane(super::NewShellPaneAction),
+        #[prost(message, tag="906")]
+        ReopenPane(super::ReopenPaneAction),
+        #[prost(message, tag="900")]
+        SendMessage(super::SendMessageAction),
+        #[prost(message, tag="901")]
+        MessageStatus(super::MessageStatusAction),
     }
 }
 // Action message definitions (all 92 variants)
@@ -844,6 +862,53 @@ pub struct BreakPaneLeftAction {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListClientsAction {
+    #[prost(bool, tag="900")]
+    pub output_json: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolvePaneTargetAction {
+    #[prost(string, tag="1")]
+    pub target: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListTreeAction {
+    #[prost(bool, tag="1")]
+    pub output_json: bool,
+}
+/// fork addition: bring back a pane that was closed lately, or list the ones the session remembers
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReopenPaneAction {
+    #[prost(string, optional, tag="1")]
+    pub handle: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="2")]
+    pub list: bool,
+    #[prost(bool, tag="3")]
+    pub output_json: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SendMessageAction {
+    #[prost(uint32, tag="1")]
+    pub terminal_id: u32,
+    #[prost(string, tag="2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(string, tag="3")]
+    pub from: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="4")]
+    pub from_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="5")]
+    pub reply_to: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag="6")]
+    pub expire_s: u64,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MessageStatusAction {
+    #[prost(string, optional, tag="1")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1122,6 +1187,24 @@ pub struct NewBlockingPaneAction {
     #[prost(bool, tag="7")]
     pub no_focus: bool,
 }
+/// fork addition: a pane with no command, opened in a cwd the caller named. The four New*Pane
+/// actions carry their cwd inside RunCommandAction, so a command-less pane had nowhere to put one.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NewShellPaneAction {
+    #[prost(message, optional, tag="1")]
+    pub placement: ::core::option::Option<NewPanePlacement>,
+    #[prost(string, optional, tag="2")]
+    pub pane_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub cwd: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="4")]
+    pub near_current_pane: bool,
+    #[prost(bool, tag="5")]
+    pub no_focus: bool,
+    #[prost(uint32, optional, tag="6")]
+    pub tab_id: ::core::option::Option<u32>,
+}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PaneNameInputAction {
@@ -1163,6 +1246,8 @@ pub struct GoToTabNameAction {
     pub name: ::prost::alloc::string::String,
     #[prost(bool, tag="2")]
     pub create: bool,
+    #[prost(bool, tag="900")]
+    pub no_focus: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1595,6 +1680,8 @@ pub struct CliAssets {
     pub initial_panes: ::prost::alloc::vec::Vec<CommandOrPlugin>,
     #[prost(message, optional, tag="14")]
     pub switch_context: ::core::option::Option<SwitchContext>,
+    #[prost(string, optional, tag="900")]
+    pub tty: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1872,9 +1959,15 @@ pub struct TiledPaneLayout {
     pub attention_muted: ::core::option::Option<bool>,
     #[prost(bool, optional, tag="18")]
     pub ignore_output: ::core::option::Option<bool>,
-    /// NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
     #[prost(string, optional, tag="19")]
     pub stack_orientation: ::core::option::Option<::prost::alloc::string::String>,
+    /// fork addition: the handle a layout chose for this pane. `restored_from` is still absent on
+    /// purpose - that is provenance the server assigns - but a handle IS something a layout declares.
+    /// Fork block from 900
+    ///
+    /// NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
+    #[prost(string, optional, tag="900")]
+    pub pane_handle: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1913,6 +2006,9 @@ pub struct FloatingPaneLayout {
     pub attention_muted: ::core::option::Option<bool>,
     #[prost(bool, optional, tag="17")]
     pub ignore_output: ::core::option::Option<bool>,
+    /// fork addition: see TiledPaneLayout.pane_handle
+    #[prost(string, optional, tag="900")]
+    pub pane_handle: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2481,6 +2577,9 @@ pub struct TogglePanePinnedByPaneIdAction {
 pub struct FocusPaneByPaneIdAction {
     #[prost(message, optional, tag="1")]
     pub pane_id: ::core::option::Option<PaneId>,
+    /// fork: the existence probe: resolve the pane and report it, but leave focus where it is
+    #[prost(bool, tag="900")]
+    pub no_focus: bool,
 }
 /// Tab-targeting action messages
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -4241,7 +4340,7 @@ impl AppStartupMode {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientToServerMsg {
-    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37")]
+    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 900")]
     pub message: ::core::option::Option<client_to_server_msg::Message>,
 }
 /// Nested message and enum types in `ClientToServerMsg`.
@@ -4323,6 +4422,10 @@ pub mod client_to_server_msg {
         AdoptSessionHistory(super::AdoptSessionHistoryMsg),
         #[prost(message, tag="37")]
         ClipboardPasteSupport(super::ClipboardPasteSupportMsg),
+        /// fork addition: `zellij action watch`, the session's changes pushed as JSON lines. Fork
+        /// messages live in a block from 900
+        #[prost(message, tag="900")]
+        ForkSubscribeToSessionEvents(super::ForkSubscribeToSessionEventsMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -4536,6 +4639,16 @@ pub struct PeerAttentionChangedMsg {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RequestSessionListMsg {
+}
+/// fork addition: start a session event stream on this connection. The server answers with
+/// ForkSessionEventMsg lines; a server that predates it ignores the message, so the client times
+/// out.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForkSubscribeToSessionEventsMsg {
+    /// only the hello, agent, gone and synced lines: `list-agents --watch`
+    #[prost(bool, tag="1")]
+    pub agents_only: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -4792,7 +4905,7 @@ impl MirrorCloseReason {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ServerToClientMsg {
-    #[prost(oneof="server_to_client_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27")]
+    #[prost(oneof="server_to_client_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 900")]
     pub message: ::core::option::Option<server_to_client_msg::Message>,
 }
 /// Nested message and enum types in `ServerToClientMsg`.
@@ -4854,6 +4967,9 @@ pub mod server_to_client_msg {
         PaneMirror(super::ServerPaneMirrorMsg),
         #[prost(message, tag="27")]
         PasteFromClipboard(super::PasteFromClipboardMsg),
+        /// fork addition: one line of `zellij action watch`. Fork messages live in a block from 900
+        #[prost(message, tag="900")]
+        ForkSessionEvent(super::ForkSessionEventMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -5100,6 +5216,13 @@ pub struct MobileRenderPrefsMsg {
     pub fit: bool,
     #[prost(bool, tag="3")]
     pub active_pane_is_fullscreen: bool,
+}
+/// fork addition: one JSON object, written by the server, carrying seq, epoch and ts.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ForkSessionEventMsg {
+    #[prost(string, tag="1")]
+    pub line: ::prost::alloc::string::String,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

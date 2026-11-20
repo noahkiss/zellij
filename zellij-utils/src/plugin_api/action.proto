@@ -192,6 +192,8 @@ message OverrideLayoutPayload {
 }
 
 message Action {
+  // fork: 200 was reopen_pane_payload before the 900 block
+  reserved 200;
   ActionName name = 1;
   oneof optional_payload {
     SwitchToModePayload switch_to_mode_payload = 2;
@@ -261,6 +263,9 @@ message Action {
     SessionPanePayload session_pane_payload = 69;
     bytes session_name_input_payload = 70;
     BarNamesPayload bar_names_payload = 71;
+    // fork additions live in a block from 900, well clear of upstream's numbering
+    // the handle of the closed pane to reopen; absent for the newest
+    string reopen_pane_payload = 900;
   }
 }
 
@@ -600,6 +605,9 @@ enum ActionName {
     PasteFromClipboardByPaneId = 154;
     ToggleStackListOrientation = 155;
     ToggleStackListOrientationByPaneId = 156;
+    // fork additions live in a block from 900; 200 was ReopenPane before
+    reserved 200;
+    ReopenPane = 900;
 }
 
 message Position {

@@ -95,6 +95,7 @@ enum EventType {
     DesktopIntegration = 69;
     LiveViewStateChanged = 71;
     PluginSettingsEntries = 72;
+    // fork event types, if any, go in a block from 900, well clear of upstream's numbering
 }
 
 message EventNameList {
@@ -166,6 +167,7 @@ message Event {
     string desktop_integration_payload = 61;
     LiveViewStateChangedPayload live_view_state_changed_payload = 63;
     PluginSettingsEntriesPayload plugin_settings_entries_payload = 64;
+    // fork payloads, if any, go in a block from 900, well clear of upstream's numbering
   }
 }
 
@@ -565,6 +567,11 @@ message ClientInfo {
   PaneId pane_id = 2;
   string running_command = 3;
   bool is_current_client = 4;
+  // fork-only fields live in a block from 900, well clear of upstream's numbering.
+  // 100 and 101 were terminal_rows and terminal_cols, retired; 102 was tty before the 900 block
+  reserved 100, 101, 102;
+  // the terminal device the client is attached to, absent when it has none
+  optional string tty = 900;
 }
 
 message FailedToWriteConfigToDiskPayload {
@@ -805,6 +812,9 @@ message ResurrectableSession {
 
 message PaneInfo {
     reserved 31;
+    // fork: 32-48 were fork fields before the 900 block (26-30 are upstream's now). Drop a number
+    // from this line when upstream takes it at a rebase
+    reserved 32 to 48;
     uint32 id = 1;
     bool is_plugin = 2;
     bool is_focused = 3;
@@ -835,6 +845,21 @@ message PaneInfo {
     PaneAttention attention = 28;
     CommandState command_state = 29;
     repeated ProgramStatusRecord program_status = 30;
+    // fork fields live in a block from 900, well clear of upstream's numbering, so a rebase
+    // never renumbers them
+    optional string program_title = 900;
+    optional uint32 stack_id = 901;
+    optional uint32 index_in_stack = 902;
+    bool is_expanded_in_stack = 903;
+    string uuid = 904;
+    string restored_from = 905;
+    optional string pane_cwd = 906;
+    optional uint32 pane_pid = 907;
+    optional string pane_command = 908;
+    optional uint64 last_output_at = 909;
+    bool has_pending_bell = 910;
+    string handle = 911;
+    uint32 tab_id = 912;
 }
 
 message IndexInPaneGroup {
@@ -911,6 +936,9 @@ enum PaneFrameStyle {
     Full = 0;
     Titles = 1;
     None = 2;
+    // fork addition, in the block from 900; 100 was its value before
+    reserved 100;
+    TopOnly = 900;
 }
 
 message InputModeKeybinds {

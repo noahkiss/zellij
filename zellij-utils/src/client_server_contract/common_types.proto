@@ -365,6 +365,15 @@ message Action {
     PasteFromClipboardByPaneIdAction paste_from_clipboard_by_pane_id = 193;
     ToggleStackListOrientationAction toggle_stack_list_orientation = 194;
     ToggleStackListOrientationByPaneIdAction toggle_stack_list_orientation_by_pane_id = 195;
+    // fork additions live in a reserved block from 900, well clear of upstream's numbering, so
+    // a rebase never renumbers them. Declaration order is kept; the numbers are not contiguous
+    // with it
+    ResolvePaneTargetAction resolve_pane_target = 902;
+    ListTreeAction list_tree = 903;
+    NewShellPaneAction new_shell_pane = 905;
+    ReopenPaneAction reopen_pane = 906;
+    SendMessageAction send_message = 900;
+    MessageStatusAction message_status = 901;
   }
 }
 
@@ -679,6 +688,9 @@ message GoToTabAction {
 message GoToTabNameAction {
   string name = 1;
   bool create = 2;
+  // fork: 3 was no_focus before the 900 block; drop a number from this line when upstream takes it at a rebase
+  reserved 3;
+  bool no_focus = 900;
 }
 
 message TabNameInputAction {
@@ -977,6 +989,10 @@ message CliAssets {
   map<string, string> host_terminal_env = 12;
   repeated CommandOrPlugin initial_panes = 13;
   optional SwitchContext switch_context = 14;
+  // fork: the terminal device this client is attached to, when it has one. The fork block
+  // starts at 900; 100 was its tag before
+  reserved 100;
+  optional string tty = 900;
 }
 
 message LayoutInfo {
@@ -1140,6 +1156,10 @@ message TiledPaneLayout {
   optional bool attention_muted = 17;
   optional bool ignore_output = 18;
   optional string stack_orientation = 19;
+  // fork addition: the handle a layout chose for this pane. `restored_from` is still absent on
+  // purpose - that is provenance the server assigns - but a handle IS something a layout declares.
+  // Fork block from 900
+  optional string pane_handle = 900;
   // NOTE: run_instructions_to_ignore is not represented here because it's a field used only inside the server itself and not part of the server/client contract
 }
 
@@ -1161,6 +1181,8 @@ message FloatingPaneLayout {
   optional BorderStyleOverride border_style = 15;
   optional bool attention_muted = 16;
   optional bool ignore_output = 17;
+  // fork addition: see TiledPaneLayout.pane_handle
+  optional string pane_handle = 900;
 }
 
 message SwapTiledLayout {
@@ -1493,7 +1515,13 @@ message CloseFocusByPaneIdAction { PaneId pane_id = 1; }
 message RenamePaneByPaneIdAction { PaneId pane_id = 1; bytes name = 2; }
 message UndoRenamePaneByPaneIdAction { PaneId pane_id = 1; }
 message TogglePanePinnedByPaneIdAction { PaneId pane_id = 1; }
-message FocusPaneByPaneIdAction { PaneId pane_id = 1; }
+message FocusPaneByPaneIdAction {
+  PaneId pane_id = 1;
+  // fork: 2 was no_focus before the 900 block; drop a number from this line when upstream takes it at a rebase
+  reserved 2;
+  // fork: the existence probe: resolve the pane and report it, but leave focus where it is
+  bool no_focus = 900;
+}
 
 // Tab-targeting action messages
 message UndoRenameTabByTabIdAction { uint64 id = 1; }

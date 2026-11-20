@@ -6,4 +6,7 @@ enum PaneFrameStyle {
     Full = 0;
     Titles = 1;
     None = 2;
+    // fork addition, in the block from 900; 100 was its value before
+    reserved 100;
+    TopOnly = 900;
 }

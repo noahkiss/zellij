@@ -5,6 +5,7 @@ pub enum PaneFrameStyle {
     Full = 0,
     Titles = 1,
     None = 2,
+    TopOnly = 900,
 }
 impl PaneFrameStyle {
     /// String value of the enum field names used in the ProtoBuf definition.

@@ -138,6 +138,7 @@ pub mod event {
         DesktopIntegrationPayload(::prost::alloc::string::String),
         #[prost(message, tag="63")]
         LiveViewStateChangedPayload(super::LiveViewStateChangedPayload),
+        /// fork payloads, if any, go in a block from 900, well clear of upstream's numbering
         #[prost(message, tag="64")]
         PluginSettingsEntriesPayload(super::PluginSettingsEntriesPayload),
     }
@@ -736,6 +737,9 @@ pub struct ClientInfo {
     pub running_command: ::prost::alloc::string::String,
     #[prost(bool, tag="4")]
     pub is_current_client: bool,
+    /// the terminal device the client is attached to, absent when it has none
+    #[prost(string, optional, tag="900")]
+    pub tty: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1157,6 +1161,34 @@ pub struct PaneInfo {
     pub command_state: ::core::option::Option<CommandState>,
     #[prost(message, repeated, tag="30")]
     pub program_status: ::prost::alloc::vec::Vec<ProgramStatusRecord>,
+    /// fork fields live in a block from 900, well clear of upstream's numbering, so a rebase
+    /// never renumbers them
+    #[prost(string, optional, tag="900")]
+    pub program_title: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag="901")]
+    pub stack_id: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag="902")]
+    pub index_in_stack: ::core::option::Option<u32>,
+    #[prost(bool, tag="903")]
+    pub is_expanded_in_stack: bool,
+    #[prost(string, tag="904")]
+    pub uuid: ::prost::alloc::string::String,
+    #[prost(string, tag="905")]
+    pub restored_from: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="906")]
+    pub pane_cwd: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag="907")]
+    pub pane_pid: ::core::option::Option<u32>,
+    #[prost(string, optional, tag="908")]
+    pub pane_command: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, optional, tag="909")]
+    pub last_output_at: ::core::option::Option<u64>,
+    #[prost(bool, tag="910")]
+    pub has_pending_bell: bool,
+    #[prost(string, tag="911")]
+    pub handle: ::prost::alloc::string::String,
+    #[prost(uint32, tag="912")]
+    pub tab_id: u32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1263,6 +1295,9 @@ pub struct ModeUpdatePayload {
     pub remote_client: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, repeated, tag="24")]
     pub hidden_bars: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// fork: in the block from 900
+    #[prost(enumeration="SessionWarning", repeated, tag="900")]
+    pub session_warnings: ::prost::alloc::vec::Vec<i32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1682,6 +1717,7 @@ pub enum EventType {
     SessionHistoryUpdate = 68,
     DesktopIntegration = 69,
     LiveViewStateChanged = 71,
+    /// fork event types, if any, go in a block from 900, well clear of upstream's numbering
     PluginSettingsEntries = 72,
 }
 impl EventType {
@@ -2217,6 +2253,33 @@ impl MouseEventName {
         }
     }
 }
+/// Session-wide conditions worth badging in a status bar. Ordered as they are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SessionWarning {
+    SupersededBuild = 0,
+    MissingFullDiskAccess = 1,
+}
+impl SessionWarning {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            SessionWarning::SupersededBuild => "SupersededBuild",
+            SessionWarning::MissingFullDiskAccess => "MissingFullDiskAccess",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SupersededBuild" => Some(Self::SupersededBuild),
+            "MissingFullDiskAccess" => Some(Self::MissingFullDiskAccess),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WebSharing {
@@ -2252,6 +2315,7 @@ pub enum PaneFrameStyle {
     Full = 0,
     Titles = 1,
     None = 2,
+    TopOnly = 900,
 }
 impl PaneFrameStyle {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2263,6 +2327,7 @@ impl PaneFrameStyle {
             PaneFrameStyle::Full => "Full",
             PaneFrameStyle::Titles => "Titles",
             PaneFrameStyle::None => "None",
+            PaneFrameStyle::TopOnly => "TopOnly",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2271,6 +2336,7 @@ impl PaneFrameStyle {
             "Full" => Some(Self::Full),
             "Titles" => Some(Self::Titles),
             "None" => Some(Self::None),
+            "TopOnly" => Some(Self::TopOnly),
             _ => None,
         }
     }

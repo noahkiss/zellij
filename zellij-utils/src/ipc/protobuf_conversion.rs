@@ -946,6 +946,9 @@ impl TryFrom<ProtoServerToClientMsg> for ServerToClientMsg {
                     payload: msg.payload,
                 })
             },
+            Some(server_to_client_msg::Message::ForkSessionEvent(msg)) => {
+                Ok(ServerToClientMsg::SessionEvent { line: msg.line })
+            },
             None => Err(anyhow!("Empty ServerToClientMsg message")),
         }
     }
