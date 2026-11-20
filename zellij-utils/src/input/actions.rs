@@ -4414,15 +4414,66 @@ mod tests {
         }
     }
 
-    // 28. ANSI flag tests
+    #[test]
+    fn test_move_tab_to_index_with_tab_id() {
+        let cli_action = CliAction::MoveTab {
+            direction: None,
+            to_index: Some(2),
+            tab_id: Some(10),
+        };
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
+        assert!(result.is_ok());
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::MoveTabToPosition { id, position } => {
+                assert_eq!(*id, 10u64);
+                assert_eq!(*position, 2u64);
+            },
+            _ => panic!("Expected MoveTabToPosition action"),
+        }
+    }
 
     #[test]
-    fn test_edit_scrollback_with_ansi_flag() {
-        let cli_action = CliAction::EditScrollback {
-            pane_id: None,
-            ansi: true,
+    fn test_move_tab_to_index_without_tab_id() {
+        let cli_action = CliAction::MoveTab {
+            direction: None,
+            to_index: Some(0),
+            tab_id: None,
         };
-        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
+        // the client resolves the focused tab first; unresolved, the action is refused
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_move_tab_without_direction_or_index() {
+        let cli_action = CliAction::MoveTab {
+            direction: None,
+            to_index: None,
+            tab_id: None,
+        };
+        let result = Action::actions_from_cli(
+            cli_action,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        );
+        assert!(result.is_err());
+    }
+
+    // 28. ANSI flag tests
+
     #[test]
     fn test_edit_scrollback_with_ansi_flag() {
         let cli_action = CliAction::EditScrollback {

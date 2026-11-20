@@ -1264,12 +1264,15 @@ pub enum ScreenInstruction {
     MuteSession(ClientId, Option<NotificationEnd>),
     AttentionCommandPaneStarted(PaneId, Option<String>),
     SetAttentionConfig(zellij_utils::input::attention::AttentionConfig),
+    ClearBellAfterDwell(PaneId),
 }
 
 impl From<&ScreenInstruction> for ScreenContext {
     fn from(screen_instruction: &ScreenInstruction) -> Self {
         match *screen_instruction {
             ScreenInstruction::PtyBytes(..) => ScreenContext::HandlePtyBytes,
+            ScreenInstruction::PrefillPane(..) => ScreenContext::PrefillPane,
+            ScreenInstruction::UpdatePaneProcessInfo { .. } => ScreenContext::UpdatePaneProcessInfo,
             ScreenInstruction::PluginBytes(..) => ScreenContext::PluginBytes,
             ScreenInstruction::Render => ScreenContext::Render,
             ScreenInstruction::RenderToClients => ScreenContext::RenderToClients,
@@ -1798,6 +1801,7 @@ impl From<&ScreenInstruction> for ScreenContext {
                 ScreenContext::AttentionCommandPaneStarted
             },
             ScreenInstruction::SetAttentionConfig(..) => ScreenContext::SetAttentionConfig,
+            ScreenInstruction::ClearBellAfterDwell(..) => ScreenContext::ClearBellAfterDwell,
         }
     }
 }
@@ -17608,6 +17612,16 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::SetAttentionConfig(config) => {
                 screen.reconfigure_attention(config);
             },
+            ScreenInstruction::ClearBellAfterDwell(pane_id) => {
+                screen.clear_bell_after_dwell(pane_id);
+                screen.render(None)?;
+            },
+        }
+        screen.process_attention();
+    }
+    Ok(())
+}
+
 #[path = "./unit/screen_tests.rs"]
 #[cfg(test)]
 mod screen_tests;

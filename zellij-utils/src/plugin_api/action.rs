@@ -1560,7 +1560,8 @@ impl TryFrom<Action> for ProtobufAction {
             | Action::PreviousSwapLayoutByTabId { .. }
             | Action::NextSwapLayoutByTabId { .. }
             | Action::ApplyTiledSwapLayoutByTabId { .. }
-            | Action::ApplyFloatingSwapLayoutByTabId { .. } => {
+            | Action::ApplyFloatingSwapLayoutByTabId { .. }
+            | Action::NewShellPane { .. } => {
                 Err("These are CLI-only actions, not available in keybindings")
             },
             Action::CloseFocusByPaneId { pane_id } => Ok(ProtobufAction {
