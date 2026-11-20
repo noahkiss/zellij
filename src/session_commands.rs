@@ -154,15 +154,23 @@ pub(crate) fn session_lifecycle_command(cli: SessionLifecycleCli, opts: CliArgs)
             no_sign,
             regranted,
             exe,
-        } => crate::session_doctor_command::session_doctor_command(
-            session_name,
-            dry_run,
-            no_fix,
-            no_sign,
-            regranted,
-            exe,
-            opts,
-        ),
+            grant_probe,
+        } => {
+            // asked from inside a pane, before the name, the config or the pin: the answer is
+            // about the process that runs it and nothing else
+            if let Some(what) = grant_probe {
+                process::exit(crate::session_doctor_grants::run_grant_probe(&what));
+            }
+            crate::session_doctor_command::session_doctor_command(
+                session_name,
+                dry_run,
+                no_fix,
+                no_sign,
+                regranted,
+                exe,
+                opts,
+            )
+        },
     }
 }
 

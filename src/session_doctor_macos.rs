@@ -25,8 +25,10 @@ use zellij_utils::session_signing::{
     refresh_belongs_to_signing, sign_pin, signing_context, NO_HOME,
 };
 
+use crate::session_doctor_grants::{fix_notes, grant_to_fix, Grant, GrantState};
 use crate::session_doctor_probe::{
-    parse_pane_answer, probe_step, FullDiskAccess, PaneAnswer, ProbeStep, PROBE_POLL,
+    finished_line, parse_pane_answer, probe_step, FullDiskAccess, PaneAnswer, ProbeStep,
+    PROBE_POLL, PROBE_TIMEOUT,
 };
 
 pub(crate) fn checks(
@@ -39,7 +41,7 @@ pub(crate) fn checks(
     let commander = SystemCommander;
     check_tmpdir(report, &commander);
     check_launch_agent(report, name);
-    check_from_inside_a_pane(report, name, session_is_up);
+    check_from_inside_a_pane(report, name, mode, session_is_up);
     check_signature(report, &commander, pinned, mode);
 }
 
@@ -138,20 +140,27 @@ fn check_launch_agent(report: &mut Report, name: &str) {
     );
 }
 
-/// The two questions only the server can answer, asked from inside one of its panes.
+/// The questions only the server can answer, asked from inside one of its panes.
 ///
 /// A pane inherits the server's session domain and macOS attributes a pane's file access to the
-/// server's executable, so a pane is where both answers actually live. Skipped rather than guessed
-/// when the session is down: an answer about a server that does not exist would be an answer about
-/// this terminal.
-fn check_from_inside_a_pane(report: &mut Report, name: &str, session_is_up: bool) {
+/// server's executable, so a pane is where both answers actually live. The privacy grants are
+/// asked there too, by this binary run in the pane; see
+/// [`session_doctor_grants`](crate::session_doctor_grants). Skipped rather than guessed when the
+/// session is down: an answer about a server that does not exist would be an answer about this
+/// terminal.
+fn check_from_inside_a_pane(
+    report: &mut Report,
+    name: &str,
+    mode: DoctorMode,
+    session_is_up: bool,
+) {
     if !session_is_up {
         report.push(
             Finding::ok(
                 "probe",
                 format!("'{}' is not up, so there is no server to ask", name),
             )
-            .note("the session domain and Full Disk Access are properties of the server,")
+            .note("the session domain and the privacy grants are properties of the server,")
             .note("and this terminal's answers would not be its answers"),
         );
         return;
@@ -185,31 +194,214 @@ fn check_from_inside_a_pane(report: &mut Report, name: &str, session_is_up: bool
         )),
     }
 
-    match answer.full_disk_access {
-        FullDiskAccess::Granted => report.push(Finding::ok(
-            "fda",
-            "the server has Full Disk Access, so every pane does",
-        )),
-        FullDiskAccess::Denied => report.push(
+    // fork addition: which missing grant this run acts on, one per run, and what it did
+    let fda_state = match answer.full_disk_access {
+        FullDiskAccess::Granted => GrantState::Granted,
+        FullDiskAccess::Denied | FullDiskAccess::Unanswered => GrantState::Missing,
+        FullDiskAccess::Undetermined => GrantState::Unknown,
+    };
+    let states = [
+        (Grant::FullDiskAccess, fda_state),
+        (Grant::Accessibility, answer.accessibility),
+        (Grant::ScreenRecording, answer.screen_recording),
+    ];
+    let chosen = grant_to_fix(&states);
+    let interactive = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
+    };
+    let acted = match chosen {
+        Some(grant) if mode.fix && interactive => fix_grant(name, grant),
+        _ => vec![],
+    };
+    let notes_for = |grant: Grant| fix_notes(grant, chosen, mode, interactive, acted.clone());
+
+    let fda_finding = match answer.full_disk_access {
+        FullDiskAccess::Granted => {
+            Finding::ok("fda", "the server has Full Disk Access, so every pane does")
+        },
+        FullDiskAccess::Denied => {
             Finding::needs_you("fda", "the server does NOT have Full Disk Access")
                 .note("every pane sees \"Operation not permitted\" in a protected directory,")
                 .note("whatever it runs. No program can grant this - Apple offers no API for it.")
-                .note("System Settings > Privacy & Security > Full Disk Access, and add the")
-                .note("EXACT path the server runs; the grant is keyed to it and to its signature."),
-        ),
-        FullDiskAccess::Unanswered => report.push(
+        },
+        FullDiskAccess::Unanswered => {
             Finding::needs_you("fda", "the Full Disk Access check did not finish in time")
                 .note("the pane answered, so the server is serving - it is this one check that")
                 .note("hung, and on macOS that is what a REFUSAL looks like: a machine holding")
                 .note("the grant is let in at once, a machine without it waits to be told no.")
-                .note("Read it as not granted until it answers. System Settings > Privacy &")
-                .note("Security > Full Disk Access, and add the EXACT path the server runs."),
-        ),
-        FullDiskAccess::Undetermined => report.push(Finding::ok(
+                .note("Read it as not granted until it answers.")
+        },
+        FullDiskAccess::Undetermined => Finding::ok(
             "fda",
             "the probe could not tell whether Full Disk Access is granted",
-        )),
+        ),
+    };
+    report.push(with_fix_notes(
+        fda_finding,
+        fda_state,
+        notes_for(Grant::FullDiskAccess),
+    ));
+    report.push(with_fix_notes(
+        grant_finding(
+            Grant::Accessibility,
+            answer.accessibility,
+            "a pane cannot drive other apps (System Events, automation tools)",
+        ),
+        answer.accessibility,
+        notes_for(Grant::Accessibility),
+    ));
+    report.push(with_fix_notes(
+        grant_finding(
+            Grant::ScreenRecording,
+            answer.screen_recording,
+            "a pane cannot capture the screen or read other apps' windows",
+        ),
+        answer.screen_recording,
+        notes_for(Grant::ScreenRecording),
+    ));
+    report.push(app_management_finding());
+    // Automation (Apple Events) is asked per target app, by macOS's own dialog at first use, and
+    // no target is configured anywhere, so there is nothing to check.
+}
+
+/// A missing grant's finding with the fix notes under it; any other finding as it is.
+fn with_fix_notes(finding: Finding, state: GrantState, notes: Vec<String>) -> Finding {
+    if state != GrantState::Missing {
+        return finding;
     }
+    notes.into_iter().fold(finding, Finding::note)
+}
+
+/// The finding for a grant the probe checks with a framework call.
+fn grant_finding(grant: Grant, state: GrantState, without: &str) -> Finding {
+    match state {
+        GrantState::Granted => {
+            Finding::ok(grant.check(), format!("the server has {}", grant.title()))
+        },
+        GrantState::Missing => Finding::needs_you(
+            grant.check(),
+            format!("the server does NOT have {}", grant.title()),
+        )
+        .note(format!("without it {}", without)),
+        GrantState::Unknown => Finding::ok(
+            grant.check(),
+            format!(
+                "the probe could not tell whether {} is granted",
+                grant.title()
+            ),
+        )
+        .note("the call did not return in time, or this binary could not run in the pane"),
+    }
+}
+
+/// App Management, which macOS gives no way to ask about.
+///
+/// The only probe would be a write into another app's bundle, which is the very thing the grant
+/// guards, so it is never tried. The pane is named so a person can look.
+fn app_management_finding() -> Finding {
+    let grant = Grant::AppManagement;
+    Finding::ok(
+        grant.check(),
+        "macOS offers no way to ask whether the server has App Management",
+    )
+    .note("it lets a pane update or delete another app, as a cask upgrade does. The only")
+    .note("probe is a write into another app's bundle, so doctor never tries one. Look:")
+    .note(grant.settings_url())
+}
+
+/// Act on one missing grant: ask macOS for it from inside a pane, where macOS has a request call,
+/// then open its pane in System Settings. Returns what happened, as notes.
+///
+/// The request is made in the server's pane for the same reason the check is: the dialog and the
+/// new row in the list belong to the responsible process, and that is the server.
+fn fix_grant(name: &str, grant: Grant) -> Vec<String> {
+    let mut notes = vec![];
+    if let Some(request) = grant.request_arg() {
+        match run_grant_request(name, request) {
+            Ok(()) => notes.push(format!(
+                "asked macOS to list the server under {}",
+                grant.title()
+            )),
+            Err(failure) => notes.push(format!(
+                "the request for {} did not finish: {}",
+                grant.title(),
+                failure
+            )),
+        }
+    }
+    match SystemCommander.run("open", &[grant.settings_url()], None) {
+        Ok(output) if output.success => notes.push(format!(
+            "opened System Settings at {}: turn the server on there",
+            grant.settings_name()
+        )),
+        Ok(output) => notes.push(format!(
+            "could not open System Settings: {}",
+            output.combined().trim()
+        )),
+        Err(error) => notes.push(format!("could not open System Settings: {}", error)),
+    }
+    notes
+}
+
+/// Run `--grant-probe <request>` in a pane of the server, and wait for it to say it is done.
+fn run_grant_request(name: &str, request: &str) -> Result<(), String> {
+    let answer_file = ZELLIJ_TMP_DIR.join(format!("doctor-grant-{}", std::process::id()));
+    let _ = std::fs::remove_file(&answer_file);
+    let zellij = std::env::current_exe().map_err(|e| format!("cannot find this binary: {}", e))?;
+    let script = format!(
+        "{} session doctor --grant-probe {} > {} 2>/dev/null",
+        shell_quote(&zellij.display().to_string()),
+        shell_quote(request),
+        shell_quote(&answer_file.display().to_string())
+    );
+    let mut client = spawn_probe_pane(&zellij, name, &script).map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    let outcome = loop {
+        let written = std::fs::read_to_string(&answer_file).unwrap_or_default();
+        if finished_line(&written, "requested=").is_some() {
+            break Ok(());
+        }
+        if let Ok(Some(status)) = client.try_wait() {
+            if !status.success() {
+                break Err(format!("the pane could not be opened ({})", status));
+            }
+        }
+        if started.elapsed() >= PROBE_TIMEOUT {
+            break Err(String::from("the pane did not answer in time"));
+        }
+        std::thread::sleep(PROBE_POLL);
+    };
+    let _ = std::fs::remove_file(&answer_file);
+    reap(&mut client);
+    outcome
+}
+
+/// Start the client that opens a floating, self-closing pane running `script` in session `name`.
+fn spawn_probe_pane(
+    zellij: &Path,
+    name: &str,
+    script: &str,
+) -> std::io::Result<std::process::Child> {
+    std::process::Command::new(zellij)
+        .args([
+            "--session",
+            name,
+            "run",
+            "--floating",
+            "--close-on-exit",
+            "--name",
+            "zellij session doctor",
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        // kept rather than nulled: on the failing path it is the only account of why
+        .stderr(std::process::Stdio::piped())
+        .spawn()
 }
 
 /// How many lines of the client's stderr to quote. Enough for a message and its context, few
@@ -218,11 +410,11 @@ const PROBE_STDERR_LINES: usize = 6;
 
 /// The one finding a failed probe produces, in the words of the failure that happened.
 ///
-/// All three end the same way - the domain and Full Disk Access went unchecked - because that is
+/// All three end the same way - the domain and the grants went unchecked - because that is
 /// the consequence for the reader whatever the cause. What differs is whether they are told to look
 /// at a stuck session or at a client that refused.
 fn probe_failure_finding(failure: ProbeFailure) -> Finding {
-    let unchecked = "the session domain and Full Disk Access could not be checked";
+    let unchecked = "the session domain and the privacy grants could not be checked";
     match failure {
         ProbeFailure::TimedOut => {
             Finding::needs_you("probe", "the pane probe did not answer in time")
@@ -302,36 +494,25 @@ fn run_pane_probe(name: &str) -> Result<PaneAnswer, ProbeFailure> {
     //
     // A directory that is not there is not a refusal, and the two are reported apart rather than
     // guessed at. `[ -d ]` is safe to ask: TCC gates the open, not the stat.
+    //
+    // fork addition: between the two, this binary asks the server's Accessibility and Screen
+    // Recording grants (`a11y=`, `screen=`). It runs in the pane, so its answers are the server's.
+    // Each call is bounded well inside the Full Disk Access deadline.
+    let zellij = std::env::current_exe()
+        .map_err(|e| ProbeFailure::CouldNotSpawn(format!("cannot find this binary: {}", e)))?;
     let script = format!(
         "{{ printf 'manager=%s\\n' \"$(launchctl managername 2>/dev/null)\"; \
+         {} session doctor --grant-probe {} 2>/dev/null; \
          tcc=\"/Library/Application Support/com.apple.TCC\"; \
          if [ ! -d \"$tcc\" ]; then echo fda=unknown; \
          elif ls \"$tcc\" >/dev/null 2>&1; then echo fda=yes; \
          else echo fda=no; fi; }} > {} 2>/dev/null",
+        shell_quote(&zellij.display().to_string()),
+        crate::session_doctor_grants::CHECK,
         shell_quote(&answer_path)
     );
 
-    let zellij = std::env::current_exe()
-        .map_err(|e| ProbeFailure::CouldNotSpawn(format!("cannot find this binary: {}", e)))?;
-    let mut client = std::process::Command::new(&zellij)
-        .args([
-            "--session",
-            name,
-            "run",
-            "--floating",
-            "--close-on-exit",
-            "--name",
-            "zellij session doctor",
-            "--",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        // kept rather than nulled: on the failing path it is the only account of why
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    let mut client = spawn_probe_pane(&zellij, name, &script)
         .map_err(|e| ProbeFailure::CouldNotSpawn(e.to_string()))?;
 
     let started = std::time::Instant::now();

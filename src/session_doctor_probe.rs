@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 
+use crate::session_doctor_grants::{parse_grant, Grant, GrantState};
+
 /// How long to wait for the pane to prove it is alive.
 ///
 /// A pane that is going to answer at all writes its first line as fast as a shell starts. Waiting
@@ -37,6 +39,9 @@ pub(crate) const PROBE_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct PaneAnswer {
     pub(crate) manager: Option<String>,
     pub(crate) full_disk_access: FullDiskAccess,
+    /// fork addition: the `a11y=` and `screen=` lines the grant probe writes between the two above.
+    pub(crate) accessibility: GrantState,
+    pub(crate) screen_recording: GrantState,
 }
 
 /// What the probe was able to say about Full Disk Access.
@@ -101,7 +106,7 @@ pub(crate) fn probe_step(written: &str, elapsed: Duration) -> ProbeStep {
 /// The trailing newline is what says the line is finished. The pane writes its two answers with
 /// two calls, so a read can land between them - and half of `fda=yes` is an answer that would
 /// parse to "could not tell" on a machine that could have told.
-fn finished_line<'a>(written: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn finished_line<'a>(written: &'a str, key: &str) -> Option<&'a str> {
     written
         .split_inclusive('\n')
         .find_map(|line| line.strip_suffix('\n')?.trim().strip_prefix(key))
@@ -123,6 +128,8 @@ pub(crate) fn parse_pane_answer(written: &str) -> PaneAnswer {
             Some(_) => FullDiskAccess::Undetermined,
             None => FullDiskAccess::Unanswered,
         },
+        accessibility: parse_grant(written, Grant::Accessibility),
+        screen_recording: parse_grant(written, Grant::ScreenRecording),
     }
 }
 

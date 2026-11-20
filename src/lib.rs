@@ -7,6 +7,7 @@ mod new_pane_default;
 mod pane_default;
 mod session_commands;
 mod session_doctor_command;
+mod session_doctor_grants;
 #[cfg(target_os = "linux")]
 mod session_doctor_linux;
 #[cfg(target_os = "macos")]

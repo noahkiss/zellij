@@ -3067,7 +3067,8 @@ success. Signing and TCC report `n/a on Linux` rather than being left out: an ab
 **macOS** adds `TMPDIR` against `getconf DARWIN_USER_TEMP_DIR` — reported, never fixed, because the
 value came from whatever started this shell — the launch agent's label, and two questions asked from
 inside a floating pane that closes itself: which session domain the server is in, and whether it has
-Full Disk Access. Both are asked in a pane because neither is about doctor's own process: macOS
+Full Disk Access (and, from nkmk.41, the other privacy grants: see [The privacy
+grants](#the-privacy-grants-macos)). Both are asked in a pane because neither is about doctor's own process: macOS
 judges a terminal-launched process against the terminal's grants, while a pane inherits the server's
 domain and is attributed to the server's executable. They are skipped when the session is down,
 where the answers would be this terminal's.
@@ -3083,6 +3084,52 @@ probe's five-second deadline: a client talking to a wedged server never returns 
 question, not a repair, and the answer cannot be had any other way. Expect a floating pane to
 appear and close itself on a `-n` run against a live session. Nothing else on that path writes —
 the pin is compared and not copied, and nothing is signed.
+
+#### The privacy grants (macOS)
+
+From nkmk.41 the pane probe also asks the server's other privacy grants. A grant belongs to the
+responsible process, the server, and a program started in a pane is judged against the server's
+grants. So the probe runs doctor's own binary in the pane as `zellij session doctor --grant-probe
+check` (a hidden flag), between the `manager=` and `fda=` lines. It writes `a11y=` and `screen=`,
+each `yes`, `no` or `unknown`. Each framework call gets two seconds, so a stalled call never
+reads as a Full Disk Access refusal.
+
+| Line | Grant | Check | Request |
+|---|---|---|---|
+| `fda` | Full Disk Access | open the system TCC directory | none |
+| `a11y` | Accessibility | `AXIsProcessTrusted` | `AXIsProcessTrustedWithOptions`, prompt on |
+| `screen` | Screen Recording | `CGPreflightScreenCaptureAccess` | `CGRequestScreenCaptureAccess` |
+| `appmgmt` | App Management | none | none |
+
+- **A missing grant is `Needs you`**, with the Settings path and its
+  `x-apple.systempreferences:com.apple.preference.security?Privacy_*` link. A request never turns
+  a grant on, so the line stays `Needs you` after one.
+- **An unknown grant is `Already correct`** with the reason, as an undetermined Full Disk Access
+  is. App Management is always unknown: macOS has no check for it, and the only probe is a write
+  into another app's bundle, which doctor never tries. Its line names the pane to look at.
+- **Automation (Apple Events) is not checked.** macOS asks for it per target app at first use,
+  and no target is configured anywhere.
+- **`--fix` acts on one grant per run**: the first missing one in the order of the table. Where
+  macOS has a request call, doctor runs `--grant-probe request-accessibility` (or
+  `request-screen-recording`) in a second floating pane, which lists the server in that pane and
+  shows macOS's dialog. Then it runs `open` on the grant's Settings link. The other missing grants
+  say they come after it.
+- **A run with no terminal on stdin opens nothing**, as the setup script never did: nobody may be
+  there to answer the dialog. Its note says to run `--fix` from a terminal. `--dry-run` and
+  `--no-fix` say what the fix would do.
+- **The fix is the default**, like every doctor fix: a plain `zellij session doctor` from a
+  terminal opens a missing grant's pane.
+- **Newer macOS renamed two panes.** macOS 27 shows Accessibility as Device Control & Data Access,
+  and Screen Recording as Screen & System Audio Recording. The Settings line names both, and each
+  link opens the pane on either version. All four links were checked on macOS 27.
+- **What was proved live, and what was not.** On a macOS 27 Mac, each check answered as the TCC
+  database says for three responsible processes: an ssh session, Terminal, and a scratch server
+  through `doctor --dry-run`. `--grant-probe request-screen-recording`, run in Terminal there,
+  showed macOS's dialog, so `CGRequestScreenCaptureAccess` works on macOS 27. The Accessibility
+  request and a full `--fix` run in a server pane were not fired live. Unit tests cover which grant
+  a run acts on and what it says.
+- A call that does not return in time prints `unknown`. A binary that cannot run in the pane prints
+  no grant lines, and both grants read as unknown.
 
 #### Signing the pinned copy (macOS)
 

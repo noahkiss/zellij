@@ -1572,6 +1572,11 @@ pub enum SessionLifecycleCli {
         /// The binary path to compare the installed unit against, as `status` takes it
         #[clap(long, value_name = "PATH", value_parser)]
         exe: Option<PathBuf>,
+
+        /// Internal: the macOS privacy grant probe doctor runs in one of the server's panes.
+        /// `check` prints the grants' states; a `request-*` value asks macOS for one grant
+        #[clap(long, value_name = "WHAT", hide = true)]
+        grant_probe: Option<String>,
     },
 }
 

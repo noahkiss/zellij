@@ -719,6 +719,21 @@ fn session_doctor_takes_its_negations_and_the_short_dry_run() {
     }
 }
 
+/// The grant probe doctor runs in a pane is a hidden flag, absent unless passed.
+#[test]
+fn session_doctor_takes_the_hidden_grant_probe() {
+    match session_lifecycle_from(&["zellij", "session", "doctor", "work"]) {
+        SessionLifecycleCli::Doctor { grant_probe, .. } => assert_eq!(grant_probe, None),
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+    match session_lifecycle_from(&["zellij", "session", "doctor", "--grant-probe", "check"]) {
+        SessionLifecycleCli::Doctor { grant_probe, .. } => {
+            assert_eq!(grant_probe.as_deref(), Some("check"))
+        },
+        other => panic!("Expected `doctor`, got {:?}", other),
+    }
+}
+
 /// `enable` installs unless `--dry-run` or `-n` is typed.
 #[test]
 fn session_enable_installs_unless_told_to_dry_run() {
