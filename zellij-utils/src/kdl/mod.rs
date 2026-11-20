@@ -14548,3 +14548,29 @@ fn path_options_are_expanded() {
     );
 }
 
+#[test]
+fn pane_frame_agent_name_config_roundtrips_and_defaults_off() {
+    assert_eq!(
+        Options::default().pane_frame_agent_name.unwrap_or(false),
+        false
+    );
+    let config = Config::from_kdl("pane_frame_agent_name true", None).unwrap();
+    assert_eq!(config.options.pane_frame_agent_name, Some(true));
+    let serialized = config
+        .options
+        .to_kdl(false)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let restored = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(restored.options.pane_frame_agent_name, Some(true));
+    let disabled = Options {
+        pane_frame_agent_name: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        config.options.merge(disabled).pane_frame_agent_name,
+        Some(false)
+    );
+}

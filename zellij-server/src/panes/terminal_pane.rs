@@ -543,7 +543,17 @@ impl Pane for TerminalPane {
                     raw_input_bytes,
                     raw_input_bytes_are_kitty,
                 )
+            };
+            // fork addition: what reaches the shell here was typed, so its last prompt is no longer
+            // a fresh one, and a prefilled line is no longer untouched. Every route that writes
+            // user bytes - a key, a paste, `write`/`write-chars`, a plugin - arrives through here.
+            // See `Grid::input_since_prompt` and `Grid::prefilled_command`.
+            if let Some(AdjustedInput::WriteBytesToTerminal(bytes)) = &adjusted {
+                if !bytes.is_empty() {
+                    self.grid.note_typed_bytes(bytes);
+                }
             }
+            adjusted
         }
     }
     fn position_and_size(&self) -> PaneGeom {
@@ -628,6 +638,13 @@ impl Pane for TerminalPane {
             Ok(None)
         }
     }
+    fn set_frame_agent_name(&mut self, name: Option<String>) {
+        if self.frame_agent_name != name {
+            self.frame_agent_name = name;
+            self.frame.clear();
+        }
+    }
+
     fn render_frame(
         &mut self,
         client_id: ClientId,
@@ -692,6 +709,12 @@ impl Pane for TerminalPane {
             text_color_override.into()
         } else {
             self.title_with_bell_indicator(normal_title)
+        };
+
+        let pane_title = if frame_params.blank_title {
+            pane_title
+        } else {
+            prefix_agent_name(pane_title, self.frame_agent_name.as_deref())
         };
 
         let frame_geom = frame_params
@@ -1104,6 +1127,10 @@ impl Pane for TerminalPane {
     }
     fn reset_input_modes_left_by_lost_guest(&mut self) {
         self.grid.reset_input_modes_left_by_lost_guest();
+    }
+
+    fn drain_agent_session(&mut self) -> Option<String> {
+        self.grid.pending_agent_session.take()
     }
 
     fn set_selection_options(&mut self, osc133_command_selection: bool, word_separators: &str) {
@@ -1606,6 +1633,36 @@ impl Pane for TerminalPane {
         self.grid
             .pane_contents_with_ansi(get_full_scrollback, max_scrollback_lines)
     }
+    fn osc133_command_state(&self) -> Option<(PaneCommandState, Option<i32>)> {
+        self.grid.osc133_command_state()
+    }
+    fn program_status(&self) -> Option<zellij_utils::data::PaneProgramStatus> {
+        self.grid.program_status.summary()
+    }
+    fn input_since_prompt(&self) -> bool {
+        self.grid.input_since_prompt()
+    }
+    fn prefilled_command(&self) -> Option<String> {
+        self.grid.prefilled_command().map(str::to_owned)
+    }
+    fn set_prefilled_command(&mut self, command: Option<String>) {
+        self.grid.set_prefilled_command(command);
+    }
+    fn input_since_state(&self) -> bool {
+        self.grid.program_status.input_since_report()
+    }
+    fn agent_prompt(&self, now: std::time::Instant) -> Option<crate::tab::AgentPrompt> {
+        Some(crate::tab::AgentPrompt {
+            program_status: self.grid.program_status.summary(),
+            draft_pending: self.grid.program_status.draft_pending(now)
+                && !self.grid.program_status.message_pending(now),
+            message_pending: self.grid.program_status.message_pending(now),
+            since_input: self.grid.program_status.since_input(now),
+        })
+    }
+    fn note_message_delivered(&mut self, now: std::time::Instant) {
+        self.grid.program_status.note_delivered(now);
+    }
     fn update_exit_status(&mut self, exit_status: i32) {
         if let Some(notification_end) = self.notification_end.as_mut() {
             notification_end.set_exit_status(exit_status);
@@ -1664,14 +1721,16 @@ impl Pane for TerminalPane {
         self.grid.mouse_event_signal(event)
     }
     fn program_columns(&self) -> usize {
+        // fork: a collapsed stack member keeps its expanded size; see `get_terminal_columns`
         self.mirror_pinned_size
             .map(|size| size.cols)
-            .unwrap_or_else(|| self.get_content_columns())
+            .unwrap_or_else(|| self.get_terminal_columns())
     }
     fn program_rows(&self) -> usize {
+        // fork: a collapsed stack member keeps its expanded size; see `get_terminal_rows`
         self.mirror_pinned_size
             .map(|size| size.rows)
-            .unwrap_or_else(|| self.get_content_rows())
+            .unwrap_or_else(|| self.get_terminal_rows())
     }
     fn mirror_pinned_size(&self) -> Option<zellij_utils::pane_size::Size> {
         self.mirror_pinned_size
@@ -2113,3 +2172,24 @@ mod grid_tests;
 #[cfg(test)]
 #[path = "./unit/search_in_pane_tests.rs"]
 mod search_tests;
+
+fn prefix_agent_name(title: String, name: Option<&str>) -> String {
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => format!("{name} · {title}"),
+        None => title,
+    }
+}
+
+#[test]
+fn frame_agent_name_prefix_tracks_changes() {
+    assert_eq!(prefix_agent_name("title".into(), None), "title");
+    assert_eq!(prefix_agent_name("title".into(), Some("")), "title");
+    assert_eq!(
+        prefix_agent_name("title".into(), Some("agent-1")),
+        "agent-1 · title"
+    );
+    assert_eq!(
+        prefix_agent_name("title".into(), Some("agent-2")),
+        "agent-2 · title"
+    );
+}

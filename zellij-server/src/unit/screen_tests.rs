@@ -22671,6 +22671,72 @@ pub fn an_osc_title_change_reports_a_pane_update() {
     );
 }
 
+/// `list-panes` as Screen builds it, for a session whose pane 1 runs `claude`.
+///
+/// The whole point of the pair below is the `detect_agents` argument, so the setup is shared and
+/// only that value differs between them.
+fn pane_list_for_a_claude_pane(detect_agents: bool) -> ListPanesResponse {
+    pane_list_for_an_agent_pane(
+        detect_agents,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: None,
+            command: Some(vec!["claude".to_owned()]),
+            agent_env: Default::default(),
+            agent_name: None,
+            agent_session_source: None,
+            osc_agent_session: None,
+        },
+    )
+}
+
+fn pane_list_for_an_agent_pane(
+    detect_agents: bool,
+    pane_process_info: crate::pty::PaneProcessInfo,
+) -> ListPanesResponse {
+    let size = Size { cols: 80, rows: 10 };
+    let mut mock_screen = MockScreen::new(size);
+    let screen_thread = mock_screen.run(Some(two_pane_layout()), vec![]);
+
+    let mut process_info = HashMap::new();
+    process_info.insert(1, pane_process_info);
+    let _ = mock_screen
+        .to_screen
+        .send(ScreenInstruction::UpdatePaneProcessInfo {
+            process_info,
+            detect_agents,
+            pane_frame_agent_name: false,
+        });
+    let (response_channel, panes) = crossbeam::channel::unbounded();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::ListPanes {
+        show_all: true,
+        response_channel,
+    });
+    let pane_list = panes
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("screen should answer ListPanes");
+    mock_screen.teardown(vec![screen_thread]);
+    pane_list
+}
+
+#[test]
+pub fn a_pane_running_a_harness_is_reported_as_an_agent() {
+    let pane_list = pane_list_for_a_claude_pane(true);
+    let reported = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .expect("terminal pane 1 should be in the pane list");
+    let agent = reported
+        .agent
+        .as_ref()
+        .expect("a pane running claude is an agent");
+    assert_eq!(agent.kind, "claude");
+    assert_eq!(agent.source, "command");
+    // nothing named its session, so a restore would offer claude's picker, and the row says so
+    assert_eq!(agent.agent_id, None);
+    assert_eq!(agent.session_source.as_deref(), Some("picker-fallback"));
+}
+
 /// `list-agents --json` names the session a codex holds open, and says where that came from.
 #[test]
 pub fn an_agent_row_says_where_its_session_id_came_from() {
@@ -22706,6 +22772,20 @@ pub fn an_agent_row_says_where_its_session_id_came_from() {
         Some("01a112dd-5b0e-7db3-964b-68a8a71304b1")
     );
     assert_eq!(agent.session_source.as_deref(), Some("open-file"));
+}
+
+#[test]
+pub fn detect_agents_off_reports_no_agent_at_all() {
+    // the negative control for the test above: the same pane, the same command, the option off.
+    // Gating only the environment read would leave `kind: claude` here, which is the bug this
+    // pair exists to catch
+    let pane_list = pane_list_for_a_claude_pane(false);
+    let reported = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .expect("terminal pane 1 should be in the pane list");
+    assert_eq!(reported.agent, None);
+    assert!(pane_list.iter().all(|entry| entry.agent.is_none()));
 }
 
 #[test]
@@ -23655,6 +23735,133 @@ pub fn closing_a_pane_id_that_is_not_there_is_a_miss() {
 }
 
 #[test]
+pub fn renaming_a_tab_id_that_is_not_there_is_a_miss() {
+    // `close-tab --tab-id` and `undo-rename-tab --tab-id` both refuse an id no tab answers to.
+    // This one used to log and exit 0, which reads as a rename that happened.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::RenameTabById {
+            id: 99,
+            name: "nowhere".to_string(),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab with id 99"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss reports nothing on stdout: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn editing_the_scrollback_of_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::EditScrollbackByPaneId {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+            ansi: false,
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss opens no editor and says so: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn toggling_the_borderlessness_of_a_pane_that_is_not_there_is_a_miss() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 10;
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let session_metadata = mock_screen.clone_session_metadata();
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let result = route_arbitrary_action_and_get_result(
+        &session_metadata,
+        Action::TogglePaneBorderless {
+            pane_id: ZellijUtilsPaneId::Terminal(9),
+        },
+        client_id,
+    );
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No pane answers to 'terminal_9'"),
+        "{:?}",
+        result.error_message
+    );
+    assert!(
+        result.stdout_lines.is_empty(),
+        "a miss toggles nothing and says so: {:?}",
+        result.stdout_lines
+    );
+}
+
+#[test]
+pub fn going_to_a_tab_position_that_is_not_there_is_a_miss_with_nobody_attached() {
+    // the detached half of the same gap: with no client to move, the switch used to be queued for
+    // a tab that is never coming and the CLI exited 0. `go-to-tab-name` refuses in this state
+    // already. The check is asked before the client is looked for, so it answers either way.
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let (mut mock_screen, initial_layout) = two_pane_mock_screen(size);
+    let screen_thread = mock_screen.run(Some(initial_layout), vec![]);
+    let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel();
+    let _ = mock_screen.to_screen.send(ScreenInstruction::GoToTab(
+        99,
+        None, // nobody is attached
+        Some(crate::route::NotificationEnd::new(completion_tx)),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let result = completion_rx
+        .try_recv()
+        .expect("a tab position nothing sits at never answered at all");
+    mock_screen.teardown(vec![screen_thread]);
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("No tab at position 99"),
+        "{:?}",
+        result.error_message
+    );
+}
+
+#[test]
 pub fn going_to_a_tab_by_an_id_nothing_answers_to_is_a_miss_with_nobody_attached() {
     // the same gap `go-to-tab` had, in the verb that takes an id: the miss used to be reported
     // from inside the branch that had found a client, so a detached session answered nothing at
@@ -24290,6 +24497,36 @@ pub fn a_prefill_is_pasted_once_when_the_line_editor_turns_bracketed_paste_on() 
     );
 }
 
+/// The agent's own `OSC 1337` report on its pane beats what the walk found, and the pane is
+/// matched from the line it was started with even when its live argv is something else.
+#[test]
+pub fn an_agents_own_osc_report_wins_in_the_agent_row() {
+    let pane_list = pane_list_for_an_agent_pane(
+        true,
+        crate::pty::PaneProcessInfo {
+            pid: Some(90210),
+            cwd: None,
+            command: Some(vec!["claude".to_owned(), "--continue".to_owned()]),
+            agent_env: [(
+                "CLAUDE_CODE_SESSION_ID".to_owned(),
+                "from-record".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            agent_name: None,
+            agent_session_source: Some("record".to_owned()),
+            osc_agent_session: Some("from-osc".to_owned()),
+        },
+    );
+    let agent = pane_list
+        .iter()
+        .find(|entry| !entry.pane_info.is_plugin && entry.pane_info.id == 1)
+        .and_then(|entry| entry.agent.as_ref())
+        .expect("a pane running claude is an agent");
+    assert_eq!(agent.agent_id.as_deref(), Some("from-osc"));
+    assert_eq!(agent.session_source.as_deref(), Some("osc"));
+}
+
 /// Two restored panes, a prefill pending on pane 0, and `steps` sent after it. Returns each
 /// terminal pane's id, `prefilled_command` and `restored_from`, read from `ListPanes`.
 fn prefilled_commands_after(steps: Vec<ScreenInstruction>) -> Vec<(u32, Option<String>, String)> {
@@ -24856,3 +25093,224 @@ pub fn reopening_a_handle_the_ring_lacks_changes_nothing() {
         .any(|i| matches!(i, PtyInstruction::SpawnReopenedTerminal { .. })));
 }
 
+// fork addition: `send-message`'s guard and write, on a screen with a fake claude in pane 1.
+
+type PtyWriterReceiver = Receiver<(PtyWriteInstruction, ErrorContext)>;
+
+fn screen_with_claude(quiet_ms: u64) -> (Screen, PtyWriterReceiver) {
+    let mut screen = create_new_screen(
+        Size {
+            cols: 121,
+            rows: 20,
+        },
+        true,
+        true,
+    );
+    let (to_pty_writer, pty_writer_receiver): ChannelWithContext<PtyWriteInstruction> =
+        channels::unbounded();
+    screen.bus.senders.to_pty_writer = Some(SenderWithContext::new(to_pty_writer));
+    new_tab(&mut screen, 1, 0);
+    screen.pane_process_info.insert(
+        1,
+        crate::pty::PaneProcessInfo {
+            pid: Some(4242),
+            cwd: Some(PathBuf::from("/src/app")),
+            command: Some(vec!["claude".to_owned()]),
+            agent_env: Default::default(),
+            agent_name: None,
+            agent_session_source: None,
+            osc_agent_session: None,
+        },
+    );
+    screen.agent_mail_quiet_ms = quiet_ms;
+    (screen, pty_writer_receiver)
+}
+
+fn agent_reports(screen: &mut Screen, state: &str) {
+    let report = format!("\x1b]7501;state={}:app=claude-code\x07", state);
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .handle_pty_bytes(1, report.into_bytes())
+        .unwrap();
+}
+
+fn person_types(screen: &mut Screen, bytes: &[u8]) {
+    screen
+        .get_active_tab_mut(1)
+        .unwrap()
+        .write_to_pane_id(
+            &None,
+            bytes.to_vec(),
+            false,
+            PaneId::Terminal(1),
+            Some(1),
+            None,
+        )
+        .unwrap();
+}
+
+fn send(screen: &mut Screen, text: &str) -> zellij_utils::agent_mail::MessageRecord {
+    screen.send_agent_message(
+        1,
+        text.to_owned(),
+        "boxa/work/brisk-heron".to_owned(),
+        Some("builder".to_owned()),
+        None,
+        60,
+    )
+}
+
+/// What reached the pty writer for pane 1, in order: `w:` for a write, `at:` for one held to
+/// an instant.
+fn pty_writes(receiver: &PtyWriterReceiver) -> Vec<String> {
+    receiver
+        .try_iter()
+        .filter_map(|(instruction, _)| match instruction {
+            PtyWriteInstruction::Write(bytes, 1, _) => {
+                Some(format!("w:{}", String::from_utf8_lossy(&bytes)))
+            },
+            PtyWriteInstruction::WriteNotBefore(bytes, 1, _) => {
+                Some(format!("at:{}", String::from_utf8_lossy(&bytes)))
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_message_to_an_idle_agent_goes_in_as_one_paste_and_a_held_enter() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Delivered, "{record:?}");
+    assert_eq!(record.agent.as_deref(), Some("claude"));
+    let sent = pty_writes(&writes);
+    assert_eq!(
+        sent,
+        vec![
+            format!(
+                "w:\x1b[200~[message {} from agent builder at boxa/work/brisk-heron; not from \
+                 the person; reply with zellij_send reply_to={}]\nRun the tests.\x1b[201~",
+                record.id, record.id
+            ),
+            "at:\r".to_owned(),
+        ]
+    );
+    // the agent's `idle` is from before the message: the next one waits for its turn
+    let second = send(&mut screen, "And then the lint.");
+    assert_eq!(second.status, Status::Queued);
+    assert_eq!(
+        second.reason,
+        Some(zellij_utils::agent_mail::Reason::Working)
+    );
+    // a key pressed right after queues behind the Enter, in the one channel the writer drains in
+    // order (see pty_writer's held-write test for the hold itself)
+    person_types(&mut screen, b"x");
+    assert_eq!(pty_writes(&writes), vec!["w:x".to_owned()]);
+}
+
+#[test]
+fn a_message_against_a_persons_draft_is_held_and_the_draft_left_alone() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    // the original bug: a message typed into a prompt that held half a sentence went out with it
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "done");
+    person_types(&mut screen, b"half a tho");
+    let record = send(&mut screen, "Run the tests.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(record.reason, Some(Reason::Draft));
+    assert_eq!(pty_writes(&writes), vec!["w:half a tho".to_owned()]);
+    assert_eq!(
+        screen.collect_pane_list(false).unwrap()[0].queued_messages,
+        1
+    );
+
+    // still held on the next round, while the draft stays
+    screen.drain_agent_messages();
+    assert!(pty_writes(&writes).is_empty());
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Queued
+    );
+
+    // the person submits it; the agent works on it, then finishes
+    person_types(&mut screen, b"\r");
+    agent_reports(&mut screen, "working");
+    screen.drain_agent_messages();
+    assert_eq!(pty_writes(&writes), vec!["w:\r".to_owned()]);
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.reason,
+        Some(Reason::Working)
+    );
+    agent_reports(&mut screen, "done");
+    screen.drain_agent_messages();
+    let sent = pty_writes(&writes);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(
+        sent[0].starts_with("w:\x1b[200~[message ") && sent[0].ends_with("Run the tests.\x1b[201~")
+    );
+    assert_eq!(sent[1], "at:\r");
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+    assert_eq!(
+        screen.collect_pane_list(false).unwrap()[0].queued_messages,
+        0
+    );
+}
+
+#[test]
+fn a_cleared_draft_lets_a_held_message_in() {
+    use zellij_utils::agent_mail::Status;
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "idle");
+    person_types(&mut screen, b"nev");
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(pty_writes(&writes), vec!["w:nev".to_owned()]);
+    person_types(&mut screen, b"\x7f\x7f\x7f");
+    screen.drain_agent_messages();
+    let sent = pty_writes(&writes);
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[0], "w:\x7f\x7f\x7f");
+    assert_eq!(
+        screen.agent_mail.get(&record.id).unwrap().record.status,
+        Status::Delivered
+    );
+}
+
+#[test]
+fn a_key_just_before_the_send_holds_it_for_the_quiet_window() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    let (mut screen, writes) = screen_with_claude(zellij_utils::agent_mail::QUIET_MS);
+    agent_reports(&mut screen, "idle");
+    // a key that changes nothing in the prompt: the cursor moves
+    person_types(&mut screen, b"\x1b[D");
+    let record = send(&mut screen, "Ping.");
+    assert_eq!(record.status, Status::Queued);
+    assert_eq!(record.reason, Some(Reason::Typing));
+    assert_eq!(pty_writes(&writes), vec!["w:\x1b[D".to_owned()]);
+}
+
+#[test]
+fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    let (mut screen, writes) = screen_with_claude(0);
+    agent_reports(&mut screen, "working");
+    assert_eq!(send(&mut screen, "a").reason, Some(Reason::Working));
+    agent_reports(&mut screen, "blocked");
+    assert_eq!(send(&mut screen, "b").reason, Some(Reason::Blocked));
+    // expire_s 0: deliver now or not at all
+    let now_only = screen.send_agent_message(1, "c".into(), "x/y/z".into(), None, None, 0);
+    assert_eq!(now_only.status, Status::Refused);
+    assert_eq!(now_only.reason, Some(Reason::Blocked));
+    assert!(pty_writes(&writes).is_empty());
+    // the same pane without an agent in it
+    screen.pane_process_info.clear();
+    let shell = send(&mut screen, "d");
+    assert_eq!(shell.status, Status::Refused);
+    assert_eq!(shell.reason, Some(Reason::NotAgent));
+}

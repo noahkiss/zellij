@@ -70,7 +70,12 @@ fn main() {
     if let Some(problem) = login_environment_problem {
         log::warn!("{}", problem);
     }
-    let opts = double_click::reroute(CliArgs::parse_for_distribution());
+    let opts = double_click::reroute(parse_cli_args());
+    // the flag is the variable for this process, so one check reads both, and every zellij this
+    // process runs - `zellij mcp`'s children, local or over ssh - inherits it
+    if opts.strict_version {
+        std::env::set_var(zellij_utils::session_lifecycle::STRICT_VERSION_ENV, "1");
+    }
     if let Some(socket_dir) = socket_dir_override(&opts) {
         std::env::set_var(zellij_utils::envs::SOCKET_DIR_ENV_KEY, socket_dir);
     }
@@ -89,8 +94,30 @@ fn main() {
 
     {
         let config = Config::try_from(&opts).ok();
-        if let Some(Command::Action(cli_action)) = opts.command {
-            commands::send_action_to_session(*cli_action, opts.session, config);
+        if let Some(Command::Sessions(Sessions::ListAgents {
+            json,
+            report_withheld: _,
+            all_sessions,
+        })) = opts.command
+        {
+            commands::send_action_to_session(
+                CliAction::ListAgents {
+                    json,
+                    report_withheld: false,
+                    all_sessions,
+                },
+                opts.session,
+                config,
+                json,
+            );
+            std::process::exit(0);
+        }
+        if let Some(Command::Action {
+            json,
+            action: cli_action,
+        }) = opts.command
+        {
+            commands::send_action_to_session(*cli_action, opts.session, config, json);
             std::process::exit(0);
         }
         if let Some(Command::Subscribe(subscribe_cli)) = opts.command {
@@ -123,9 +150,11 @@ fn main() {
             block_until_exit,
             near_current_pane,
             no_focus,
+            focus,
             borderless,
             border_style,
             tab_id,
+            ready,
         })) = opts.command
         {
             let cwd = cwd.or_else(|| std::env::current_dir().ok());

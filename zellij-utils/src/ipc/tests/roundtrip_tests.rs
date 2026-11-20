@@ -1284,6 +1284,43 @@ fn test_client_messages() {
         is_cli_client: true,
     });
     test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::SendMessage {
+            terminal_id: 7,
+            text: "Run the tests.\nThen say what failed.".to_owned(),
+            from: "boxa/work/brisk-heron".to_owned(),
+            from_name: Some("builder".to_owned()),
+            reply_to: Some("m1a2b3c".to_owned()),
+            expire_s: 1800,
+        },
+        terminal_id: None,
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    for id in [None, Some("m1a2b3c".to_owned())] {
+        test_client_roundtrip!(ClientToServerMsg::Action {
+            action: Action::MessageStatus { id },
+            terminal_id: None,
+            client_id: Some(100),
+            is_cli_client: true,
+        });
+    }
+    for (handle, list, output_json) in [
+        (None, false, false),
+        (Some("sunny-otter".to_owned()), false, false),
+        (None, true, true),
+    ] {
+        test_client_roundtrip!(ClientToServerMsg::Action {
+            action: Action::ReopenPane {
+                handle,
+                list,
+                output_json,
+            },
+            terminal_id: None,
+            client_id: Some(100),
+            is_cli_client: true,
+        });
+    }
+    test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::EditFile {
             payload: OpenFilePayload {
                 path: PathBuf::from("/file/path"),

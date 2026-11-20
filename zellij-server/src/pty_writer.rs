@@ -14,6 +14,10 @@ use crate::thread_bus::Bus;
 #[derive(Debug, Clone)]
 pub enum PtyWriteInstruction {
     Write(Vec<u8>, u32, Option<NotificationEnd>),
+    /// fork addition: bytes that go out no earlier than the instant given, with every later write
+    /// to the same terminal held behind them. `send-message` queues its Enter this way, right
+    /// behind its paste, so a key a person presses meanwhile cannot land between the two.
+    WriteNotBefore(Vec<u8>, u32, std::time::Instant),
     ResizePty(u32, u16, u16, Option<u16>, Option<u16>),
     StartCachingResizes,
     ApplyCachedResizes,
@@ -23,7 +27,9 @@ pub enum PtyWriteInstruction {
 impl From<&PtyWriteInstruction> for PtyWriteContext {
     fn from(tty_write_instruction: &PtyWriteInstruction) -> Self {
         match *tty_write_instruction {
-            PtyWriteInstruction::Write(..) => PtyWriteContext::Write,
+            PtyWriteInstruction::Write(..) | PtyWriteInstruction::WriteNotBefore(..) => {
+                PtyWriteContext::Write
+            },
             PtyWriteInstruction::ResizePty(..) => PtyWriteContext::ResizePty,
             PtyWriteInstruction::ApplyCachedResizes => PtyWriteContext::ApplyCachedResizes,
             PtyWriteInstruction::StartCachingResizes => PtyWriteContext::StartCachingResizes,
@@ -48,6 +54,8 @@ struct PendingWrite {
     bytes: Vec<u8>,
     offset: usize,
     _completion: Option<NotificationEnd>,
+    /// fork addition: not before this instant. The writes behind it in the queue wait with it.
+    not_before: Option<std::time::Instant>,
 }
 
 pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
@@ -99,8 +107,20 @@ pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
                             bytes,
                             offset: 0,
                             _completion: completion,
+                            not_before: None,
                         });
                     }
+                },
+                PtyWriteInstruction::WriteNotBefore(bytes, terminal_id, not_before) => {
+                    pending
+                        .entry(terminal_id)
+                        .or_default()
+                        .push_back(PendingWrite {
+                            bytes,
+                            offset: 0,
+                            _completion: None,
+                            not_before: Some(not_before),
+                        });
                 },
                 PtyWriteInstruction::ResizePty(
                     terminal_id,
@@ -151,6 +171,12 @@ pub(crate) fn pty_writer_main(bus: Bus<PtyWriteInstruction>) -> Result<()> {
             };
 
             while let Some(front) = queue.front_mut() {
+                if front
+                    .not_before
+                    .is_some_and(|not_before| std::time::Instant::now() < not_before)
+                {
+                    break; // not yet: this terminal waits, the others go on
+                }
                 let remaining = front.bytes.get(front.offset..).unwrap_or_default();
                 if remaining.is_empty() {
                     queue.pop_front();

@@ -690,6 +690,24 @@ pub(crate) fn toggle_tray_icon_at(socket: &std::path::Path) -> Result<(), String
     }
 }
 
+/// A session nothing answers to, said the way every other miss is said.
+///
+/// The sentence and the names of the sessions that DO exist go to stderr, and the exit is 2. Both
+/// halves matter and neither was true before: these paths called `list_sessions`, which prints the
+/// `ls` table to **stdout** and ends in `process::exit(0)` - so the `exit(1)` written after it was
+/// unreachable, and `zellij -s no-such-session action list-panes --json` answered a caller parsing
+/// stdout with a session table and a success. A miss changed nothing the caller can address, which
+/// is exit 2; see the CLI output convention in FORK.md.
+///
+/// This never returns.
+fn no_session_answers_to(sentence: String) -> ! {
+    eprintln!("{}", sentence);
+    for (name, _) in get_sessions().unwrap_or_default() {
+        eprintln!("{}", name);
+    }
+    process::exit(2);
+}
+
 /// Client entrypoint for all [`zellij_utils::cli::CliAction`]
 ///
 /// Checks session to send the action to and attaches with client
@@ -697,6 +715,7 @@ pub(crate) fn send_action_to_session(
     cli_action: zellij_utils::cli::CliAction,
     requested_session_name: Option<String>,
     config: Option<Config>,
+    output_json: bool,
 ) {
     if matches!(cli_action, zellij_utils::cli::CliAction::ToggleTrayIcon) {
         match toggle_tray_icon_at(&zellij_utils::consts::app_control_socket()) {
@@ -707,23 +726,73 @@ pub(crate) fn send_action_to_session(
             },
         }
     }
+    // `list-agents --all-sessions` is a question about the machine rather than about one session,
+    // so it is answered before a session is chosen - and with none running, it is an empty list
+    // rather than a miss
+    // `send-message --all-sessions` looks for its target on the whole machine, so it too is
+    // answered before a session is chosen
+    if let zellij_utils::cli::CliAction::SendMessage {
+        all_sessions: true, ..
+    } = &cli_action
+    {
+        let mut names: Vec<String> = get_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        let own = requested_session_name
+            .clone()
+            .or_else(|| envs::get_session_name().ok());
+        let exit_status = send_message(&cli_action, own.as_deref(), &names, output_json);
+        process::exit(exit_status);
+    }
+    if let zellij_utils::cli::CliAction::ListAgents {
+        json,
+        all_sessions: true,
+        ..
+    } = &cli_action
+    {
+        let live_sessions = || {
+            let mut names: Vec<String> = get_sessions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            names.sort();
+            names
+        };
+        let make_os_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            ))
+        };
+        // every session it asks is a server it reaches. Strict mode refuses on the first one
+        // proven to be another build; without it, at most one warning for the whole call.
+        for name in live_sessions() {
+            zellij_utils::session_lifecycle::check_server_build(&name);
+        }
+        let exit_status = zellij_client::cli_client::start_list_agents_all_sessions_client(
+            &make_os_input,
+            &live_sessions(),
+            *json || output_json,
+        );
+        process::exit(exit_status);
+    }
     match get_active_session() {
         ActiveSession::None => {
-            eprintln!("There is no active session!");
-            std::process::exit(1);
+            no_session_answers_to("There is no active session!".to_owned());
         },
         ActiveSession::One(session_name) => {
             if let Some(requested_session_name) = requested_session_name {
                 if requested_session_name != session_name {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         requested_session_name
-                    );
-                    eprintln!("{}", session_name);
-                    std::process::exit(1);
+                    ));
                 }
             }
-            attach_with_cli_client(cli_action, &session_name, config);
+            attach_with_cli_client(cli_action, &session_name, config, output_json);
         },
         ActiveSession::Many => {
             let existing_sessions: Vec<String> = get_sessions()
@@ -733,21 +802,21 @@ pub(crate) fn send_action_to_session(
                 .collect();
             if let Some(session_name) = requested_session_name {
                 if existing_sessions.contains(&session_name) {
-                    attach_with_cli_client(cli_action, &session_name, config);
+                    attach_with_cli_client(cli_action, &session_name, config, output_json);
                 } else {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         session_name
-                    );
-                    list_sessions(false, false, true);
-                    std::process::exit(1);
+                    ));
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
-                attach_with_cli_client(cli_action, &session_name, config);
+                attach_with_cli_client(cli_action, &session_name, config, output_json);
             } else {
-                eprintln!("Please specify the session name to send actions to. The following sessions are active:");
-                list_sessions(false, false, true);
-                std::process::exit(1);
+                no_session_answers_to(
+                    "Please specify the session name to send actions to. The following sessions \
+                     are active:"
+                        .to_owned(),
+                );
             }
         },
     };
@@ -759,18 +828,15 @@ pub(crate) fn subscribe_to_session(
 ) {
     let session_name = match get_active_session() {
         ActiveSession::None => {
-            eprintln!("There is no active session!");
-            std::process::exit(1);
+            no_session_answers_to("There is no active session!".to_owned());
         },
         ActiveSession::One(session_name) => {
             if let Some(ref requested) = requested_session_name {
                 if *requested != session_name {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         requested
-                    );
-                    eprintln!("{}", session_name);
-                    std::process::exit(1);
+                    ));
                 }
             }
             session_name
@@ -1830,4 +1896,46 @@ pub fn get_config_options_from_cli_args(opts: &CliArgs) -> Result<Options, Strin
     Setup::from_cli_args(&opts)
         .map(|(_, _, config_options, _, _)| config_options)
         .map_err(|e| e.to_string())
+}
+
+/// fork addition: `zellij action send-message`, run by the client.
+fn send_message(
+    cli_action: &zellij_utils::cli::CliAction,
+    own_session: Option<&str>,
+    sessions: &[String],
+    output_json: bool,
+) -> i32 {
+    let zellij_utils::cli::CliAction::SendMessage {
+        to,
+        reply_to,
+        text,
+        expire_s,
+        wait,
+        from,
+        from_name,
+        json,
+        ..
+    } = cli_action
+    else {
+        return 1;
+    };
+    zellij_client::cli_client::start_send_message_client(
+        &|| {
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            ))
+        },
+        own_session,
+        sessions,
+        zellij_client::cli_client::SendMessageRequest {
+            to: to.clone(),
+            reply_to: reply_to.clone(),
+            text: text.clone(),
+            expire_s: *expire_s,
+            wait_s: *wait,
+            from: from.clone(),
+            from_name: from_name.clone(),
+            json: *json || output_json,
+        },
+    )
 }

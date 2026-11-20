@@ -2474,7 +2474,7 @@ fn route_action_with_origin(
                 log::error!("Message must have a name");
             }
         },
-        Action::ListClients => {
+        Action::ListClients { output_json } => {
             let default_shell = match default_shell {
                 Some(TerminalAction::RunCommand(run_command)) => Some(run_command.command),
                 _ => None,
@@ -2485,37 +2485,61 @@ fn route_action_with_origin(
                     cli_client_id.unwrap_or(client_id), // we prefer the cli client here because
                     // this is a cli query and we want to print
                     // it there
+                    output_json,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
         },
+        Action::ResolvePaneTarget { target } => {
+            match target.parse::<PaneTarget>() {
+                Ok(parsed) => match request_pane_target_resolution(&senders, parsed)
+                    .with_context(err_context)?
+                {
+                    Some(Some(pane_id)) => {
+                        let pane_id: ZellijUtilsPaneId = pane_id.into();
+                        send_output_to_client(
+                            cli_client_id,
+                            os_input.as_ref(),
+                            vec![format!("pane_id: {}", pane_id)],
+                        );
+                    },
+                    // a target that names no live pane is a miss, not an error: exit 2, per the
+                    // convention the rest of the query surface already follows
+                    Some(None) => send_error_to_client(
+                        cli_client_id,
+                        os_input.as_ref(),
+                        &format!("No pane answers to '{}'", target),
+                    ),
+                    None => send_error_to_client(
+                        cli_client_id,
+                        os_input.as_ref(),
+                        "Timeout resolving pane target",
+                    ),
+                },
+                Err(e) => send_error_to_client(cli_client_id, os_input.as_ref(), &e),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
         Action::ListPanes {
-            show_tab,
-            show_command,
-            show_state,
-            show_geometry,
+            show_tab: _,
+            show_command: _,
+            show_state: _,
+            show_geometry: _,
             show_all,
             output_json,
         } => {
             let maybe_panes =
                 request_panes_from_screen(&senders, show_all).with_context(err_context)?;
 
-            if let Some(mut pane_entries) = maybe_panes {
-                if show_command || show_all || output_json {
-                    enrich_panes_with_pty_data(&mut pane_entries, &senders)
-                        .with_context(err_context)?;
-                }
-
+            if let Some(pane_entries) = maybe_panes {
                 let output_lines = if output_json {
                     format_panes_as_json(&pane_entries)
                 } else {
-                    format_panes_table(
-                        &pane_entries,
-                        show_tab || show_all,
-                        show_command || show_all,
-                        show_state || show_all,
-                        show_geometry || show_all,
-                    )
+                    // every column, every time: the flags that used to gate them stay accepted so
+                    // that a script asking for one is not an error, but asking is now a no-op.
+                    // `--all` keeps the one meaning the columns never shared with it - which ROWS
+                    // the table has, non-selectable panes included
+                    format_panes_table(&pane_entries, true, true, true, true)
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -2525,11 +2549,11 @@ fn route_action_with_origin(
             drop(NotificationEnd::new(completion_tx));
         },
         Action::ListTabs {
-            show_state,
-            show_dimensions,
-            show_panes,
-            show_layout,
-            show_all,
+            show_state: _,
+            show_dimensions: _,
+            show_panes: _,
+            show_layout: _,
+            show_all: _,
             output_json,
         } => {
             let maybe_tabs =
@@ -2539,13 +2563,9 @@ fn route_action_with_origin(
                 let output_lines = if output_json {
                     format_tabs_as_json(&tab_infos)
                 } else {
-                    format_tabs_table(
-                        &tab_infos,
-                        show_state || show_all,
-                        show_dimensions || show_all,
-                        show_panes || show_all,
-                        show_layout || show_all,
-                    )
+                    // every column, every time - see `list-panes` above. A tab has no row-set
+                    // question, so `--all` here means nothing at all beyond staying accepted
+                    format_tabs_table(&tab_infos, true, true, true, true)
                 };
 
                 send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
@@ -2553,6 +2573,137 @@ fn route_action_with_origin(
                 send_error_to_client(cli_client_id, os_input.as_ref(), "Timeout listing tabs");
             }
             drop(NotificationEnd::new(completion_tx));
+        },
+        Action::ListTree { output_json } => {
+            // the tree is the join of the two queries that already exist, asked in one command:
+            // the tabs give the nesting and which one is in view, the panes give what is in them
+            let maybe_tabs =
+                request_tabs_from_screen(&senders, client_id).with_context(err_context)?;
+            let maybe_panes =
+                request_panes_from_screen(&senders, false).with_context(err_context)?;
+
+            match (maybe_tabs, maybe_panes) {
+                (Some(tab_infos), Some(pane_entries)) => {
+                    let output_lines = if output_json {
+                        format_tree_as_json(&tab_infos, &pane_entries)
+                    } else {
+                        format_tree(&tab_infos, &pane_entries)
+                    };
+                    send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
+                },
+                _ => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout listing the session tree",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        Action::ReopenPane {
+            handle,
+            list: true,
+            output_json,
+        } => {
+            // a list names no pane, so a handle beside it would be ignored; clap refuses the pair
+            let _ = handle;
+            match request_closed_panes_from_screen(&senders).with_context(err_context)? {
+                Some(closed) => {
+                    let output_lines = if output_json {
+                        vec![serde_json::to_string_pretty(&closed)
+                            .unwrap_or_else(|_| "[]".to_string())]
+                    } else {
+                        crate::closed_panes::format_closed_panes_table(&closed)
+                    };
+                    send_output_to_client(cli_client_id, os_input.as_ref(), output_lines);
+                },
+                None => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout listing the session's closed panes",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        Action::SendMessage {
+            terminal_id,
+            text,
+            from,
+            from_name,
+            reply_to,
+            expire_s,
+        } => {
+            use crossbeam::channel::unbounded;
+            let (response_sender, response_receiver) = unbounded();
+            senders
+                .send_to_screen(ScreenInstruction::SendAgentMessage {
+                    terminal_id,
+                    text,
+                    from,
+                    from_name,
+                    reply_to,
+                    expire_s,
+                    response_channel: response_sender,
+                })
+                .with_context(err_context)?;
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(record) => send_output_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    vec![serde_json::to_string(&record).unwrap_or_default()],
+                ),
+                Err(_) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout sending the message",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        Action::MessageStatus { id } => {
+            use crossbeam::channel::unbounded;
+            let (response_sender, response_receiver) = unbounded();
+            senders
+                .send_to_screen(ScreenInstruction::AgentMessageStatus {
+                    id: id.clone(),
+                    response_channel: response_sender,
+                })
+                .with_context(err_context)?;
+            match response_receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(Some(records)) => send_output_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    vec![serde_json::to_string(&records).unwrap_or_default()],
+                ),
+                // an id this session does not know is a miss, exit 2, like a pane nothing holds
+                Ok(None) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    &format!(
+                        "No message '{}' in this session. `zellij action message-status` lists the ones it holds or delivered lately.",
+                        id.unwrap_or_default()
+                    ),
+                ),
+                Err(_) => send_error_to_client(
+                    cli_client_id,
+                    os_input.as_ref(),
+                    "Timeout reading the session's messages",
+                ),
+            }
+            drop(NotificationEnd::new(completion_tx));
+        },
+        Action::ReopenPane {
+            handle,
+            list: false,
+            ..
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::ReopenPane {
+                    handle,
+                    default_shell: default_shell.clone(),
+                    client_id,
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
         },
         Action::CurrentTabInfo { output_json } => {
             let maybe_tab_info = request_current_tab_info_from_screen(&senders, client_id)
@@ -2976,11 +3127,9 @@ fn route_action_with_origin(
     if submits_terminal_input {
         let _ = senders.send_to_screen(ScreenInstruction::TerminalInputSubmitted(client_id));
     }
-    let result = if is_cli_client && !wait_forever {
-        wait_for_cli_action_completion(completion_rx, &action_name)
-    } else {
-        wait_for_action_completion(completion_rx, &action_name, wait_forever)
-    };
+    // fork: `wait_for_action_completion` already bounds a CLI client's wait, which upstream's
+    // `wait_for_cli_action_completion` added for the same reason
+    let result = wait_for_action_completion(completion_rx, &action_name, wait_forever);
     if let Some(error_message) = &result.error_message {
         if let Some(cli_client_id) = cli_client_id {
             if let Some(ref os_input) = os_input {
@@ -4358,15 +4507,6 @@ fn build_table_header(
         header.push("FOCUSED");
         header.push("FLOATING");
         header.push("EXITED");
-    }
-
-    if show_geometry {
-        header.push("X");
-        header.push("Y");
-        header.push("ROWS");
-        header.push("COLS");
-    }
-
         header.push("NOTE");
     }
 
@@ -4376,6 +4516,10 @@ fn build_table_header(
         header.push("ROWS");
         header.push("COLS");
     }
+
+    // last, and outside every group: the columns are append-only, so a new one goes on the end
+    // rather than between two a reader is already counting past
+    header.push("AGENT");
 
     header.join("  ")
 }
@@ -4429,6 +4573,16 @@ fn build_table_row(
         .join("  ")
 }
 
+/// The harness running in a pane, for the table's `AGENT` column, or `-` for a pane with none.
+///
+/// The kind alone: the session id and what the detection rested on are `list-agents`' business,
+/// and a column nobody can read at a glance is not worth the width here.
+fn format_agent(entry: &PaneListEntry) -> String {
+    entry
+        .agent
+        .as_ref()
+        .map(|agent| agent.kind.clone())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_pane_id(pane_info: &zellij_utils::data::PaneInfo) -> String {
@@ -5121,6 +5275,21 @@ mod tests {
         let header = &table[0];
         assert!(header.contains("HANDLE"), "{}", header);
         assert!(table[1].contains("sunny-otter"), "{}", table[1]);
+    }
+
+    #[test]
+    fn the_pane_table_prints_all_four_column_groups() {
+        let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
+        let header = &table[0];
+        // pinned to the dump rather than transcribed, the way the event table's test is: a column
+        // added to one and not the other is what this catches
+        assert_eq!(
+            zellij_utils::cli_surface::promised_output_keys("action list-panes")
+                .expect("list-panes promises columns in the dump")
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            header.split_whitespace().collect::<Vec<_>>()
+        );
     }
 
     #[test]

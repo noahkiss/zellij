@@ -1033,6 +1033,48 @@ fn a_serialized_attribute_that_changes_back_writes_both_times() {
     );
 }
 
+#[test]
+fn a_pane_whose_identity_is_known_is_never_walked_again() {
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 10_000,
+        live_session: None,
+    };
+    assert!(!probe.needs_another_walk(42));
+}
+
+#[test]
+fn a_new_process_in_the_pane_is_a_new_question() {
+    // the identity belongs to the program, so replacing the program invalidates it even when the
+    // last walk answered
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: None,
+    };
+    assert!(probe.needs_another_walk(43));
+}
+
+#[test]
+fn a_pane_with_no_identity_yet_is_retried_but_not_every_tick() {
+    let mut probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: false,
+        ticks_since_probe: 0,
+        live_session: None,
+    };
+    assert!(!probe.needs_another_walk(42));
+    probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS - 1;
+    assert!(!probe.needs_another_walk(42));
+    probe.ticks_since_probe = AGENT_ENV_RETRY_TICKS;
+    assert!(probe.needs_another_walk(42));
+}
+
 fn pane_running(terminal_id: u32, run: Option<Run>) -> PaneLayoutMetadata {
     PaneLayoutMetadata::new(
         PaneId::Terminal(terminal_id),
@@ -1184,6 +1226,117 @@ fn a_held_command_pane_stays_a_command_pane_until_it_closes() {
     pty.close_pane(PaneId::Terminal(terminal_id))
         .expect("the mock closes the pane");
     assert!(!pty.command_terminal_ids.contains(&terminal_id));
+}
+
+fn write_claude_record(dir: &std::path::Path, pid: u32, session_id: &str) {
+    std::fs::write(
+        dir.join(format!("{}.json", pid)),
+        format!(r#"{{"pid":{},"sessionId":"{}"}}"#, pid, session_id),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_known_claude_follows_its_session_without_another_walk() {
+    // `/clear` moves claude to another session in the same process: the pid the walk was keyed
+    // on does not change, so only re-reading claude's own record can see it
+    let dir = tempfile::tempdir().unwrap();
+    write_claude_record(dir.path(), 77, "first-session");
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: Some(LiveSession::ClaudeRecord {
+            pid: 77,
+            dir: dir.path().to_path_buf(),
+        }),
+    };
+    assert!(!probe.needs_another_walk(42));
+    assert_eq!(
+        probe.live_session_id_with(|pid| pid == 77).as_deref(),
+        Some("first-session")
+    );
+    assert_eq!(probe.live_session_id_with(|_| false), None);
+    write_claude_record(dir.path(), 77, "second-session");
+    assert_eq!(
+        probe.live_session_id_with(|pid| pid == 77).as_deref(),
+        Some("second-session")
+    );
+    std::fs::remove_file(dir.path().join("77.json")).unwrap();
+    assert_eq!(probe.live_session_id_with(|pid| pid == 77), None);
+}
+
+#[test]
+fn a_pane_with_no_live_session_reads_none() {
+    let dir = tempfile::tempdir().unwrap();
+    write_claude_record(dir.path(), 77, "first-session");
+    let probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: None,
+    };
+    assert_eq!(probe.live_session_id(), None);
+}
+
+fn agent_pane_meta(terminal_id: u32, command: &str, args: &[&str]) -> SessionLayoutMetadata {
+    let mut run_command = RunCommand::new(PathBuf::from(command));
+    run_command.args = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let mut meta = SessionLayoutMetadata::default();
+    meta.add_tab(
+        "tab1".to_owned(),
+        true,
+        false,
+        vec![pane_running(terminal_id, Some(Run::Command(run_command)))],
+        vec![],
+    );
+    meta
+}
+
+/// The agent's own `OSC 1337` report is the first thing serialization believes: a claude pane
+/// is recorded with the id it reported, in place of its `--continue`.
+#[test]
+fn an_osc_reported_session_is_what_a_pane_is_recorded_with() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_mode = ResurrectCommands::Agents;
+    pty.id_to_child_pid.insert(1, 100);
+    pty.note_agent_session_from_osc(1, "osc-session".to_owned());
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(
+        run_command.args,
+        vec!["--resume".to_owned(), "osc-session".to_owned()]
+    );
+}
+
+/// With no report, no record and no open file, a `--continue` the operator typed is recorded as
+/// the picker: never the newest session.
+#[test]
+fn with_nothing_found_a_typed_latest_flag_is_recorded_as_the_picker() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    pty.resurrect_mode = ResurrectCommands::Agents;
+    // a pid no process has: the walk finds nothing under it
+    pty.id_to_child_pid.insert(1, u32::MAX - 7);
+    let mut meta = agent_pane_meta(1, "claude", &["--continue"]);
+
+    pty.populate_session_layout_metadata(&mut meta);
+
+    let Some(Run::Command(run_command)) = meta.terminal_run(1) else {
+        panic!("expected a command, got {:?}", meta.terminal_run(1));
+    };
+    assert_eq!(run_command.args, vec!["--resume".to_owned()]);
+    assert!(pty.resume_misses.contains_key(&1));
 }
 
 /// The flightdeck pane: launch flags and a positional launch prompt, then a session the agent
@@ -1351,6 +1504,79 @@ fn a_prefill_types_only_the_bare_resume_of_an_old_snapshot() {
             .and_then(|(_, line)| line),
         Some("aider --model opus --restore-chat-history".to_owned())
     );
+}
+
+#[test]
+fn an_empty_osc_report_clears_the_pane_and_a_closed_pane_loses_its_report() {
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(MockOsApi::new());
+    pty.id_to_child_pid.insert(1, 100);
+    pty.id_to_child_pid.insert(2, 200);
+    pty.note_agent_session_from_osc(1, "one".to_owned());
+    pty.note_agent_session_from_osc(2, "two".to_owned());
+    assert_eq!(pty.osc_agent_session(1), Some("one"));
+    pty.note_agent_session_from_osc(1, String::new());
+    assert_eq!(pty.osc_agent_session(1), None);
+    pty.id_to_child_pid.remove(&2);
+    pty.expire_osc_agent_sessions();
+    assert_eq!(pty.osc_agent_session(2), None);
+}
+
+/// A report outlives a tick on which the agent is not yet the pane's command - the hook fires at
+/// start-up - but not the agent: once the pane has run an agent and is back at its shell, the
+/// report is gone. A respawned pane is a new program and loses it too.
+#[test]
+fn an_osc_report_lasts_as_long_as_the_agent_that_made_it() {
+    let mut report = OscAgentSession {
+        session_id: "s".to_owned(),
+        child_pid: Some(100),
+        seen_agent: false,
+    };
+    assert!(
+        report.still_holds(Some(100), false),
+        "before the tick sees the agent"
+    );
+    assert!(report.still_holds(Some(100), true));
+    assert!(report.seen_agent);
+    assert!(!report.still_holds(Some(100), false), "the agent exited");
+    let mut report = OscAgentSession {
+        session_id: "s".to_owned(),
+        child_pid: Some(100),
+        seen_agent: true,
+    };
+    assert!(
+        !report.still_holds(Some(101), true),
+        "the pane was respawned"
+    );
+    assert!(
+        !report.still_holds(None, true),
+        "the pane's process is gone"
+    );
+}
+
+/// The live list believes the agent's own report too, and says so: `session_source: osc`. Once
+/// the agent exits and the pane is back at its shell, the report is gone.
+#[test]
+fn the_live_list_reports_an_osc_session_while_its_agent_runs() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cmd(child_pid, vec!["claude".into(), "--continue".into()]);
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    set_active_terminal(&mut pty, 1, child_pid);
+    pty.note_agent_session_from_osc(1, "osc-session".to_owned());
+
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("a report")[&1];
+    assert_eq!(info.osc_agent_session.as_deref(), Some("osc-session"));
+
+    // claude exits; the pane's process is its shell again
+    mock.set_cmd(child_pid, vec!["/bin/bash".into()]);
+    pty.pane_activity_flags
+        .get(&1)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    assert_eq!(pty.osc_agent_session(1), None);
 }
 
 /// A real server's pty thread can hear from the thread that reaped a held pane's child. Its bus
@@ -1574,3 +1800,279 @@ fn a_held_pane_is_listed_with_no_pid_and_no_command() {
     assert!(!reports.last().expect("a report").contains_key(&1));
 }
 
+#[test]
+fn claude_retries_a_late_record_without_delaying_other_harnesses() {
+    let mut probe = AgentEnvProbe {
+        child_pid: 42,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: None,
+    };
+    assert!(probe.needs_identity_walk(42, "claude"));
+    probe.kind = "codex".into();
+    assert!(!probe.needs_identity_walk(42, "codex"));
+    probe.kind = "claude".into();
+    probe.live_session = Some(LiveSession::ClaudeRecord {
+        pid: 77,
+        dir: "/tmp/agent-test".into(),
+    });
+    assert!(!probe.needs_identity_walk(42, "claude"));
+    assert!(probe.needs_identity_walk(43, "claude"));
+}
+
+#[test]
+fn agent_identity_uses_the_foreground_job_and_invalidates_changed_harnesses() {
+    assert_eq!(agent_identity_root(10, Some(20)), 20);
+    assert_eq!(agent_identity_root(10, Some(30)), 30);
+    assert_eq!(agent_identity_root(10, Some(10)), 10);
+    assert_eq!(agent_identity_root(10, Some(0)), 10);
+    assert_eq!(agent_identity_root(10, None), 10);
+    let probe = AgentEnvProbe {
+        child_pid: 10,
+        kind: "claude".into(),
+        found: true,
+        ticks_since_probe: 0,
+        live_session: Some(LiveSession::ClaudeRecord {
+            pid: 20,
+            dir: "/tmp/agent-test".into(),
+        }),
+    };
+    assert!(probe.needs_identity_walk(10, "codex"));
+    assert!(probe.needs_identity_walk(30, "claude"));
+    assert!(!probe.needs_identity_walk(10, "claude"));
+}
+
+#[test]
+fn a_configured_default_shell_is_listed_as_its_agent_job() {
+    let mock = MockOsApi::new();
+    mock.set_cmd(100, vec!["/bin/bash".into()]);
+    mock.set_foreground_cmd(100, vec!["claude".into()]);
+    let (mut pty, _rx) = make_pty_with_plugin_receiver(mock);
+    let command = RunCommand {
+        command: "/bin/bash".into(),
+        use_terminal_title: true,
+        ..Default::default()
+    };
+    let (terminal_id, _) = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+            None,
+        )
+        .unwrap();
+    assert!(!pty.command_terminal_ids.contains(&terminal_id));
+    pty.pane_activity_flags
+        .get(&terminal_id)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    assert_eq!(
+        pty.reported_command_for(terminal_id),
+        Some(&vec!["claude".to_owned()])
+    );
+}
+
+#[test]
+fn shell_commands_with_scripts_remain_command_panes() {
+    let mut command = RunCommand::new("/bin/bash".into());
+    assert!(!command_runs_interactive_shell(&command));
+    command.use_terminal_title = true;
+    assert!(command_runs_interactive_shell(&command));
+    command.args = vec!["-c".into(), "sleep 1".into()];
+    assert!(!command_runs_interactive_shell(&command));
+    command.command = "claude".into();
+    command.args.clear();
+    assert!(!command_runs_interactive_shell(&command));
+}
+
+/// The detection tick discovers and refreshes a foreground agent without PTY output.
+#[test]
+#[cfg(unix)]
+fn a_silent_fake_claude_refreshes_its_record_on_the_detection_tick() {
+    struct SilentAgent(std::process::Child);
+    impl Drop for SilentAgent {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let config = tempfile::tempdir().unwrap();
+    let records = config.path().join("sessions");
+    std::fs::create_dir(&records).unwrap();
+    let agent = SilentAgent(
+        std::process::Command::new("bash")
+            .args(["-c", "exec -a claude sleep 60"])
+            .env("CLAUDE_CONFIG_DIR", config.path())
+            .env(agent_detect::AGENT_SESSION_ID, "env-session")
+            .env(AGENT_KIND, "claude")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = agent.0.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !crate::resurrect_hints::live_claude_process(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake Claude must start"
+        );
+        std::thread::yield_now();
+    }
+    let write_record = |id: &str, name: &str| {
+        std::fs::write(
+            records.join(format!("{}.json", pid)),
+            serde_json::to_vec(&serde_json::json!({"pid": pid, "sessionId": id, "name": name}))
+                .unwrap(),
+        )
+        .unwrap();
+    };
+    let mock = MockOsApi::new();
+    mock.set_foreground_cmd(pid, vec!["claude".into()]);
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    // No activity flag or command cache: the agent has never written pane output.
+    pty.id_to_child_pid.insert(1, pid);
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports
+        .last()
+        .expect("silent pending agent must be reported")[&1];
+    assert_eq!(info.agent_name, None);
+    assert_eq!(info.agent_session_source, None);
+    assert_eq!(
+        info.agent_env
+            .get(agent_detect::AGENT_SESSION_ID)
+            .map(String::as_str),
+        Some("env-session")
+    );
+    assert!(matches!(
+        pty.agent_env_probes[&1].live_session,
+        Some(LiveSession::ClaudeRecord { .. })
+    ));
+    for _ in 0..=AGENT_ENV_RETRY_TICKS {
+        pty.update_and_report_cwds();
+    }
+    assert!(pty.agent_env_probes[&1].ticks_since_probe > AGENT_ENV_RETRY_TICKS);
+    assert!(collect_process_info_reports(&screen_rx).is_empty());
+    write_record("late-session", "late-name");
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        reports.last().unwrap()[&1].agent_name.as_deref(),
+        Some("late-name")
+    );
+
+    // A malformed startup record keeps a pending handle and avoids repeated identity walks.
+    let record = records.join(format!("{}.json", pid));
+    std::fs::write(&record, b"invalid json").unwrap();
+    let malformed_mtime = std::fs::metadata(&record).unwrap().modified().unwrap();
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    pty.id_to_child_pid.insert(1, pid);
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        reports.last().unwrap()[&1]
+            .agent_env
+            .get(agent_detect::AGENT_SESSION_ID)
+            .map(String::as_str),
+        Some("env-session")
+    );
+    write_record("first-session", "first-name");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(malformed_mtime))
+        .unwrap();
+    for _ in 0..=AGENT_ENV_RETRY_TICKS {
+        pty.update_and_report_cwds();
+    }
+    assert!(collect_process_info_reports(&screen_rx).is_empty());
+    assert!(pty.agent_record_cache[&1].session_id.is_none());
+    assert_eq!(
+        pty.terminal_agent_envs[&1]
+            .get(agent_detect::AGENT_SESSION_ID)
+            .map(String::as_str),
+        Some("env-session")
+    );
+    assert!(pty.agent_env_probes[&1].ticks_since_probe > AGENT_ENV_RETRY_TICKS);
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(malformed_mtime + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("silent agent must be reported")[&1];
+    let harness = agent_detect::harness_for_command("claude").unwrap();
+    let key = claude_identity_key(harness);
+    assert_eq!(
+        info.agent_env.get(&key).map(String::as_str),
+        Some("first-session")
+    );
+    assert_eq!(info.agent_name.as_deref(), Some("first-name"));
+    assert_eq!(info.agent_session_source.as_deref(), Some("record"));
+
+    // A same-mtime rewrite stays cached, proving the tick does not reread unchanged files.
+    let record = records.join(format!("{}.json", pid));
+    let modified = std::fs::metadata(&record).unwrap().modified().unwrap();
+    write_record("second-session", "second-name");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&record)
+        .unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    pty.update_and_report_cwds();
+    assert!(collect_process_info_reports(&screen_rx).is_empty());
+    assert_eq!(
+        pty.agent_record_cache[&1].name.as_deref(),
+        Some("first-name")
+    );
+    let live = pty.agent_env_probes[&1].live_session.clone().unwrap();
+    assert_eq!(
+        pty.agent_record_cache
+            .get_mut(&1)
+            .unwrap()
+            .refresh(pid + 1, &live)
+            .as_deref(),
+        Some("second-session")
+    );
+    assert_eq!(
+        pty.agent_record_cache[&1].name.as_deref(),
+        Some("second-name")
+    );
+
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("record changes must be reported")[&1];
+    assert_eq!(
+        info.agent_env.get(&key).map(String::as_str),
+        Some("second-session")
+    );
+    assert_eq!(info.agent_name.as_deref(), Some("second-name"));
+    let mut switched = AgentRecordCache::default();
+    switched.refresh(pid, &live);
+    assert_eq!(switched.name.as_deref(), Some("second-name"));
+    switched.refresh(pid, &LiveSession::CodexRollout { pid });
+    assert_eq!(switched.name, None);
+    std::fs::remove_file(record).unwrap();
+    pty.update_and_report_cwds();
+    let reports = collect_process_info_reports(&screen_rx);
+    let info = &reports.last().expect("record removal must be reported")[&1];
+    assert_eq!(info.agent_name, None);
+    assert_eq!(
+        info.agent_env.get(&key).map(String::as_str),
+        Some("env-session")
+    );
+    assert_eq!(info.agent_session_source, None);
+
+    mock.clear_foreground_cmd(pid);
+    pty.update_and_report_cwds();
+    assert!(!pty.agent_record_cache.contains_key(&1));
+}

@@ -2070,6 +2070,53 @@ mod open_files_and_accept_tests {
     }
 }
 
+#[cfg(test)]
+mod session_state_tests {
+    use super::*;
+
+    fn with_client(id: ClientId) -> SessionState {
+        let mut s = SessionState::new();
+        s.clients.insert(id, None);
+        s
+    }
+
+    #[test]
+    fn a_client_that_never_attached_is_not_one_to_unblock() {
+        // this is what keeps a `close-pane` report from being outrun: the pty thread broadcasts an
+        // unblock as a pane is torn down, and a `zellij action` client reads the first message it
+        // gets as the answer to its command. It is registered like any other client but never
+        // attaches, so it is not in `attached_client_ids` and the broadcast passes it by
+        let mut session_state = SessionState::new();
+        let cli_client = session_state.new_client();
+        let attached_client = session_state.new_client();
+        session_state.set_client_data(attached_client, Size { rows: 20, cols: 80 }, false);
+
+        assert_eq!(session_state.attached_client_ids(), vec![attached_client]);
+        let mut all = session_state.client_ids();
+        all.sort_unstable();
+        assert_eq!(
+            all,
+            vec![cli_client, attached_client],
+            "both are still clients: only the unblock treats them differently"
+        );
+    }
+
+    #[test]
+    fn a_removed_client_id_is_not_handed_out_again() {
+        // fork: the route thread's removal announcement used to free an id the next connection
+        // was given at once, so a second announcement tore down that new connection. Upstream
+        // now retires ids, which is what makes a stray announcement harmless; if ids are ever
+        // reused again, read the comment at the end of `route_thread_main` first
+        let mut session_state = SessionState::new();
+        let first = session_state.new_client();
+        session_state.remove_client(first);
+        assert_ne!(
+            session_state.new_client(),
+            first,
+            "a removed client's id is retired, not given to the next connection"
+        );
+    }
+
     #[test]
     fn pick_forward_target_prefers_last_active_when_still_connected() {
         let mut s = SessionState::new();
@@ -6139,6 +6186,8 @@ fn init_session(
                 config_options.detect_agents,
             );
 
+            let session_id = session_id.clone();
+            pty.pane_frame_agent_name = config_options.pane_frame_agent_name.unwrap_or(false);
             move || pty_thread_main(pty, layout.clone(), session_id).fatal()
         })
         .unwrap();

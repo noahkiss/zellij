@@ -219,20 +219,12 @@ pub enum PtyInstruction {
         resurrect: Option<ResurrectCommand>,
         completion_tx: Option<NotificationEnd>,
     },
+    /// An agent in this terminal reported its own session with `OSC 1337
+    /// SetUserVar=agent_session=`. An empty id clears it.
+    AgentSessionFromOsc(u32, String),
     Exit,
 }
 
-impl From<&PtyInstruction> for PtyContext {
-    fn from(pty_instruction: &PtyInstruction) -> Self {
-        match *pty_instruction {
-            PtyInstruction::SpawnTerminal(..) => PtyContext::SpawnTerminal,
-            PtyInstruction::OpenInPlaceEditor(..) => PtyContext::OpenInPlaceEditor,
-            PtyInstruction::UpdateActivePane(..) => PtyContext::UpdateActivePane,
-            PtyInstruction::GoToTab(..) => PtyContext::GoToTab,
-            PtyInstruction::ClosePane(..) => PtyContext::ClosePane,
-            PtyInstruction::ClosePaneThatWasNotCreated(..) => {
-                PtyContext::ClosePaneThatWasNotCreated
-            },
 impl From<&PtyInstruction> for PtyContext {
     fn from(pty_instruction: &PtyInstruction) -> Self {
         match *pty_instruction {
@@ -271,6 +263,7 @@ impl From<&PtyInstruction> for PtyContext {
             PtyInstruction::RunInBackground { .. } => PtyContext::RunInBackground,
             PtyInstruction::SetResurrectCommand { .. } => PtyContext::SetResurrectCommand,
             PtyInstruction::PromptReturned(..) => PtyContext::PromptReturned,
+            PtyInstruction::AgentSessionFromOsc(..) => PtyContext::AgentSessionFromOsc,
             PtyInstruction::Exit => PtyContext::Exit,
         }
     }
@@ -281,6 +274,62 @@ impl From<&PtyInstruction> for PtyContext {
 /// On, because the check that decides whether to do any work at all is a string compare, and a
 /// session with no agent pane in it reads nothing.
 pub const DETECT_AGENTS_DEFAULT: bool = true;
+
+/// How many ticks a matched pane that has shown no identity yet waits before it is walked again.
+///
+/// A harness exports its session id when it starts, so the answer for a pane whose process has not
+/// changed is almost always the answer from last time. Re-walking it once a second buys nothing and
+/// costs a full process-table read. Thirty seconds is late enough to be free and early enough that
+/// a harness which exports its id after a slow start-up is still picked up while the pane is young.
+const AGENT_ENV_RETRY_TICKS: u32 = 30;
+
+/// The harness whose live session is read from its own record rather than its environment.
+const CLAUDE: &str = "claude";
+
+use zellij_utils::agent_detect::AGENT_KIND;
+
+/// The key a harness's own live session is filed under among a pane's identity variables: the
+/// first one `agent_detect` asks for, so detection takes it over anything the environment said.
+fn claude_identity_key(harness: &AgentHarness) -> String {
+    harness
+        .identity_env
+        .first()
+        .copied()
+        .unwrap_or("CLAUDE_CODE_SESSION_ID")
+        .to_owned()
+}
+
+/// The session an agent reported for itself on its own pane, with `OSC 1337
+/// SetUserVar=agent_session=<base64 id>`: the first thing serialization and `list-agents` believe.
+///
+/// The report is pane-scoped by construction - it arrived on that pane's pty - but it outlives
+/// the agent that printed it unless something clears it. It is cleared when the pane's process is
+/// replaced or the pane closes, and when the pane stops running an agent after having been seen
+/// running one: the agent exited and the shell came back. "Seen running one" matters because the
+/// hook fires at the agent's start-up, usually before the once-a-second tick has noticed the agent
+/// is the pane's command; clearing on "not an agent right now" would drop every fresh report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OscAgentSession {
+    session_id: String,
+    /// The pane's child pid when the report arrived. A different one is a different program.
+    child_pid: Option<u32>,
+    /// Whether the pane has been seen running an agent since the report.
+    seen_agent: bool,
+}
+
+impl OscAgentSession {
+    /// Whether this report still describes the pane, given what the pane is now.
+    fn still_holds(&mut self, child_pid: Option<u32>, runs_an_agent: bool) -> bool {
+        if child_pid.is_none() || child_pid != self.child_pid {
+            return false;
+        }
+        if runs_an_agent {
+            self.seen_agent = true;
+            return true;
+        }
+        !self.seen_agent
+    }
+}
 
 /// What a held pane keeps of the agent it ran, once its process has exited.
 ///
@@ -306,6 +355,141 @@ impl HeldPane {
         } else {
             self.agent_session_source.as_deref().unwrap_or("env")
         }
+    }
+}
+
+/// What the last identity walk of a pane found, and what would make another one worth doing.
+///
+/// The walk is the expensive half of agent detection, and its answer is stable: a pane is one
+/// program, and that program's environment does not change under it. So a pane is walked when it is
+/// new, when its process is replaced, and - if nothing was found - once every
+/// [`AGENT_ENV_RETRY_TICKS`]. A verified Claude record handle checks metadata each tick,
+/// including while its record is missing. It avoids another walk until its process changes.
+#[derive(Debug)]
+struct AgentEnvProbe {
+    /// The identity walk’s root PID: the foreground job, or the pane’s own child.
+    child_pid: u32,
+    /// The harness matched when this probe ran.
+    kind: String,
+    /// Whether the walk found an identity. Once it has, the question is answered for this pid.
+    found: bool,
+    /// Ticks since the walk, counted only while `found` is false.
+    ticks_since_probe: u32,
+    /// Where the walk found the pane's own session, if it did: claude's record, or the rollout
+    /// file a codex holds open.
+    ///
+    /// An agent moves to another session on `/clear` or `/new` without becoming another process,
+    /// so the walk's answer can change while the pid stays the same.
+    /// Claude record metadata gates cached reads; Codex refreshes its open-file list.
+    /// A process that exits sends the pane back to the walk.
+    live_session: Option<LiveSession>,
+}
+
+/// A Claude record changes only when its file changes or its foreground process changes.
+#[derive(Default)]
+struct AgentRecordCache {
+    key: Option<(
+        u32,
+        LiveSession,
+        Option<std::time::SystemTime>,
+        Option<String>,
+    )>,
+    session_id: Option<String>,
+    name: Option<String>,
+    env_fallback: BTreeMap<String, String>,
+}
+
+impl AgentRecordCache {
+    fn refresh(&mut self, child_pid: u32, live: &LiveSession) -> Option<String> {
+        let LiveSession::ClaudeRecord { pid, dir } = live else {
+            *self = Self::default();
+            return live.reread_live(open_files_of, crate::resurrect_hints::live_claude_process);
+        };
+        if !crate::resurrect_hints::live_claude_process(*pid) {
+            *self = Self::default();
+            return None;
+        }
+        let modified = std::fs::metadata(dir.join(format!("{}.json", pid)))
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        // PID reuse must invalidate a record validated for the earlier process.
+        let started = crate::resurrect_hints::process_start_ticks(*pid);
+        if self
+            .key
+            .as_ref()
+            .map_or(false, |(root, previous, _, start)| {
+                *root == child_pid && previous == live && start != &started
+            })
+        {
+            // Rebuild the environment fallback for the process that reused this PID.
+            *self = Self::default();
+            return None;
+        }
+        let key = (child_pid, live.clone(), modified, started);
+        if self.key.as_ref() != Some(&key) {
+            (self.session_id, self.name) = if modified.is_some() {
+                crate::resurrect_hints::claude_record_identity(dir, *pid)
+            } else {
+                (None, None)
+            };
+            self.key = Some(key);
+        }
+        self.session_id.clone()
+    }
+}
+
+/// An interactive shell remains a shell pane even when config supplies it as an explicit command.
+fn command_runs_interactive_shell(command: &RunCommand) -> bool {
+    command.use_terminal_title
+        && command.args.is_empty()
+        && command
+            .command
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or(false, |name| {
+                matches!(
+                    name,
+                    "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "nu" | "nushell"
+                )
+            })
+}
+
+/// Match the identity walk to the foreground job instead of older background jobs.
+fn agent_identity_root(child_pid: u32, foreground_pid: Option<u32>) -> u32 {
+    foreground_pid
+        .filter(|pid| *pid > 0 && *pid != child_pid)
+        .unwrap_or(child_pid)
+}
+
+impl AgentEnvProbe {
+    /// Whether this record is worth replacing with another walk.
+    ///
+    /// The whole cost policy, in one place so it can be read and tested without a process table.
+    fn needs_another_walk(&self, child_pid: u32) -> bool {
+        self.child_pid != child_pid
+            || (!self.found && self.ticks_since_probe >= AGENT_ENV_RETRY_TICKS)
+    }
+
+    /// Rewalk changed processes and missing identities without a verified record handle.
+    fn needs_identity_walk(&self, child_pid: u32, kind: &str) -> bool {
+        self.kind != kind
+            || self.child_pid != child_pid
+            || (self.live_session.is_none()
+                && (kind == CLAUDE || self.needs_another_walk(child_pid)))
+    }
+
+    /// The session the agent this walk found holds now, re-read from where the walk found it.
+    /// `None` when the walk found none, or that agent has since exited or moved on.
+    #[cfg(test)]
+    fn live_session_id(&self) -> Option<String> {
+        self.live_session_id_with(crate::resurrect_hints::live_claude_process)
+    }
+
+    #[cfg(test)]
+    fn live_session_id_with<C: Fn(u32) -> bool>(&self, live_claude: C) -> Option<String> {
+        self.live_session
+            .as_ref()?
+            .reread_live(open_files_of, live_claude)
     }
 }
 
@@ -1225,6 +1409,9 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                     pty.report_session_context(ContextTrigger::PromptReturned);
                 }
             },
+            PtyInstruction::AgentSessionFromOsc(terminal_id, session_id) => {
+                pty.note_agent_session_from_osc(terminal_id, session_id);
+            },
             PtyInstruction::Exit => break,
         }
     }
@@ -1447,6 +1634,12 @@ impl Pty {
         // bool is starts_held
         let err_context = || format!("failed to spawn terminal for {:?}", client_or_tab_index);
 
+        // Configured default shells arrive as explicit actions, but their children are still jobs.
+        let runs_its_own_command = match terminal_action.as_ref() {
+            Some(TerminalAction::RunCommand(command)) => !command_runs_interactive_shell(command),
+            Some(TerminalAction::OpenFile(_)) => true,
+            None => false,
+        };
         // returns the terminal id
         let terminal_action = match client_or_tab_index {
             ClientTabIndexOrPaneId::ClientId(client_id)
@@ -2162,6 +2355,9 @@ impl Pty {
                         .with_context(err_context)
                     {
                         Ok((terminal_id, reader, child_pid)) => {
+                            if !command_runs_interactive_shell(&command) {
+                                self.command_terminal_ids.insert(terminal_id);
+                            }
                             if let Some(child_pid) = child_pid {
                                 self.id_to_child_pid.insert(terminal_id, child_pid);
                                 self.capture_initial_cwd(terminal_id, child_pid);
@@ -2870,13 +3066,210 @@ impl Pty {
         }
     }
 
-    pub fn update_and_report_cwds(&mut self) {
     /// The once-a-second tick: refresh what the active panes are doing, then tell Screen.
     pub fn update_and_report_cwds(&mut self) {
         self.refresh_cwds_and_commands();
         self.expire_osc_agent_sessions();
         self.refresh_agent_identities();
         self.report_pane_process_info();
+    }
+
+    /// Read any coding agent's session id out of the panes' processes.
+    ///
+    /// Agent detection asks only about panes whose OWN command already matched a harness - which
+    /// is a string compare against a cache this tick already filled, not a probe - and then only
+    /// for the session-id variable names of the harness that matched. A session with no agent
+    /// pane in it therefore reads nothing, and the process table is not touched at all.
+    ///
+    /// A known live record avoids another walk until its process exits.
+    /// Claude checks cached record metadata each tick; other missing identities retry every
+    /// [`AGENT_ENV_RETRY_TICKS`]. Record changes refresh names without another process walk.
+    ///
+    /// The variable lives on a process the shell started, not on the shell, so this walks down
+    /// from the pane's own child - the same problem `resurrect_command_hints` solves, and the same
+    /// code solving it.
+    fn refresh_agent_identities(&mut self) {
+        let mut agent_panes: Vec<(u32, u32, &'static AgentHarness)> = if self.detect_agents {
+            self.id_to_child_pid
+                .iter()
+                .filter_map(|(terminal_id, child_pid)| {
+                    let harness = self
+                        .reported_command_for(*terminal_id)
+                        .and_then(|command| command.first())
+                        .and_then(|argv0| agent_detect::harness_for_command(argv0))?;
+                    Some((*terminal_id, *child_pid, harness))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let panes: Vec<(u32, u32, bool)> = agent_panes
+            .iter()
+            .map(|(id, pid, _)| (*id, *pid, self.command_terminal_ids.contains(id)))
+            .collect();
+        let roots = self
+            .bus
+            .os_input
+            .as_ref()
+            .map(|input| input.get_foreground_pids(&panes))
+            .unwrap_or_default();
+        for (terminal_id, child_pid, _) in &mut agent_panes {
+            *child_pid = agent_identity_root(*child_pid, roots.get(terminal_id).copied());
+        }
+        // a pane that closed, or stopped running a harness, keeps neither an answer nor a record of
+        // having been asked - and detection being turned off empties both, which is the same thing
+        let is_agent_pane =
+            |terminal_id: &u32| agent_panes.iter().any(|(id, _, _)| id == terminal_id);
+        self.terminal_agent_envs
+            .retain(|terminal_id, _| is_agent_pane(terminal_id));
+        self.agent_env_probes
+            .retain(|terminal_id, _| is_agent_pane(terminal_id));
+
+        self.agent_record_cache
+            .retain(|terminal_id, _| is_agent_pane(terminal_id));
+
+        let sessions_dir = agent_panes
+            .iter()
+            .any(|(_, _, harness)| harness.kind == CLAUDE)
+            .then(claude_sessions_dir)
+            .flatten();
+
+        // the panes worth a walk this tick, and a tick counted against the ones that are not
+        let mut to_probe: Vec<(u32, u32, &'static AgentHarness)> = Vec::new();
+        for (terminal_id, child_pid, harness) in &agent_panes {
+            if let Some(probe) = self.agent_env_probes.get_mut(terminal_id) {
+                if !probe.needs_identity_walk(*child_pid, harness.kind) {
+                    probe.ticks_since_probe = probe.ticks_since_probe.saturating_add(1);
+                    if probe.live_session.is_none() {
+                        continue;
+                    }
+                    let session_id = self
+                        .agent_record_cache
+                        .entry(*terminal_id)
+                        .or_default()
+                        .refresh(*child_pid, probe.live_session.as_ref().unwrap());
+                    if let Some(session_id) = session_id {
+                        let envs = self.terminal_agent_envs.entry(*terminal_id).or_default();
+                        envs.insert(claude_identity_key(harness), session_id);
+                        envs.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
+                        continue;
+                    }
+                    if harness.kind == CLAUDE
+                        && self
+                            .agent_record_cache
+                            .get(terminal_id)
+                            .map_or(false, |cache| cache.key.is_some())
+                    {
+                        // Keep the verified process handle while a missing record waits for a rewrite.
+                        let fallback = self.agent_record_cache[terminal_id].env_fallback.clone();
+                        if fallback.is_empty() {
+                            self.terminal_agent_envs.remove(terminal_id);
+                        } else {
+                            self.terminal_agent_envs.insert(*terminal_id, fallback);
+                        }
+                        continue;
+                    }
+                    // that agent has exited or moved on: what the pane runs now is a new question
+                }
+            }
+            to_probe.push((*terminal_id, *child_pid, *harness));
+        }
+
+        if to_probe.is_empty() {
+            return;
+        }
+        let process_tree = ProcessTree::read();
+        for (terminal_id, child_pid, harness) in to_probe {
+            let identity_vars = agent_detect::identity_env_names_for(harness);
+            let mut found = process_tree.find_all_envs(child_pid, &identity_vars);
+            let env_fallback = found.clone();
+            // an identity variable is frozen in each child at its spawn, so after a `/clear` it
+            // names the first session; the agent's own record or open session file names the one
+            // it holds now, and wins
+            let live_session = match process_tree.own_session_checked(
+                child_pid,
+                harness.kind,
+                sessions_dir.as_deref(),
+                open_files_of,
+                process_env,
+                crate::resurrect_hints::live_claude_process,
+            ) {
+                Ok(own) => {
+                    found.insert(claude_identity_key(harness), own.id);
+                    // the id is this harness's: a nested agent's AGENT_KIND must not disown it
+                    found.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
+                    Some(own.live)
+                },
+                Err(miss) => {
+                    log::debug!(
+                        "agents: no {} session for terminal {} (pid {}): {}",
+                        harness.kind,
+                        terminal_id,
+                        child_pid,
+                        miss
+                    );
+                    if harness.kind == CLAUDE
+                        && crate::resurrect_hints::live_claude_process(child_pid)
+                    {
+                        // Track a verified foreground Claude before its SessionStart record appears.
+                        let process_dir = crate::resurrect_hints::claude_sessions_dir_for(
+                            process_env(child_pid, "CLAUDE_CONFIG_DIR").map(Into::into),
+                            process_env(child_pid, "HOME").map(Into::into),
+                        );
+                        let dir = sessions_dir
+                            .as_ref()
+                            .filter(|_| {
+                                std::env::var_os("ZELLIJ_CLAUDE_SESSIONS_DIR")
+                                    .map_or(false, |override_dir| !override_dir.is_empty())
+                            })
+                            .cloned()
+                            .or(process_dir)
+                            .or_else(|| sessions_dir.clone());
+                        dir.map(|dir| LiveSession::ClaudeRecord {
+                            pid: child_pid,
+                            dir,
+                        })
+                    } else {
+                        None
+                    }
+                },
+            };
+            if let Some(live) = live_session.as_ref() {
+                let cached_id = self
+                    .agent_record_cache
+                    .entry(terminal_id)
+                    .or_default()
+                    .refresh(child_pid, live);
+                if matches!(live, LiveSession::ClaudeRecord { .. }) {
+                    self.agent_record_cache
+                        .get_mut(&terminal_id)
+                        .unwrap()
+                        .env_fallback = env_fallback.clone();
+                    found = env_fallback;
+                    if let Some(id) = cached_id {
+                        found.insert(claude_identity_key(harness), id);
+                        found.insert(AGENT_KIND.to_owned(), harness.kind.to_owned());
+                    }
+                }
+            } else {
+                self.agent_record_cache.remove(&terminal_id);
+            }
+            self.agent_env_probes.insert(
+                terminal_id,
+                AgentEnvProbe {
+                    child_pid,
+                    kind: harness.kind.to_owned(),
+                    found: !found.is_empty() && (harness.kind != CLAUDE || live_session.is_some()),
+                    ticks_since_probe: 0,
+                    live_session,
+                },
+            );
+            if found.is_empty() {
+                self.terminal_agent_envs.remove(&terminal_id);
+            } else {
+                self.terminal_agent_envs.insert(terminal_id, found);
+            }
+        }
     }
 
     /// The command this tick would report for a pane: its foreground process, or its shell.
@@ -2889,6 +3282,96 @@ impl Pty {
             .filter(|cmd| !cmd.is_empty())
             .or_else(|| self.terminal_cmds.get(&terminal_id))
             .filter(|cmd| !cmd.is_empty())
+    }
+
+    /// Screen holds no pid, cwd or command of its own - it is told, from these caches, every tick.
+    ///
+    /// The whole map goes every time rather than only the panes that were active, because Screen
+    /// stamps every `PaneInfo` it builds and a pane that has been quiet for an hour still has a
+    /// pid. Claude names also read their live process records on this tick.
+    ///
+    /// A map equal to the last one sent is dropped instead: an idle session would otherwise wake
+    /// the screen thread once a second forever to tell it nothing. `detect_agents` is compared
+    /// alongside it, because a config reload that flips the option changes nothing in the map and
+    /// would otherwise never reach Screen on an idle session.
+    fn report_pane_process_info(&mut self) {
+        let mut process_info: HashMap<u32, PaneProcessInfo> = self
+            .id_to_child_pid
+            .keys()
+            .copied()
+            .map(|terminal_id| {
+                let command = self.reported_command_for(terminal_id).cloned();
+                let agent_env = self
+                    .terminal_agent_envs
+                    .get(&terminal_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let agent_session_source = self
+                    .agent_env_probes
+                    .get(&terminal_id)
+                    .and_then(|probe| probe.live_session.as_ref())
+                    .filter(|live| {
+                        !matches!(live, LiveSession::ClaudeRecord { .. })
+                            || self
+                                .agent_record_cache
+                                .get(&terminal_id)
+                                .and_then(|cache| cache.session_id.as_ref())
+                                .is_some()
+                    })
+                    .map(|live| live.source().as_str().to_owned());
+                let osc_agent_session = self.osc_agent_session(terminal_id).map(str::to_owned);
+                (
+                    terminal_id,
+                    PaneProcessInfo {
+                        pid: self.id_to_child_pid.get(&terminal_id).copied(),
+                        cwd: self.terminal_cwds.get(&terminal_id).cloned(),
+                        command,
+                        agent_env,
+                        agent_name: self
+                            .agent_record_cache
+                            .get(&terminal_id)
+                            .and_then(|cache| cache.name.clone()),
+                        agent_session_source,
+                        osc_agent_session,
+                    },
+                )
+            })
+            .collect();
+        // a held pane has no process: no pid and no command, but its cwd and its agent's session
+        for (terminal_id, held) in &self.held_panes {
+            if self.id_to_child_pid.contains_key(terminal_id) {
+                continue;
+            }
+            process_info.insert(
+                *terminal_id,
+                PaneProcessInfo {
+                    pid: None,
+                    cwd: self.terminal_cwds.get(terminal_id).cloned(),
+                    command: None,
+                    agent_env: held.agent_env.clone(),
+                    agent_name: None,
+                    agent_session_source: held.agent_session_source.clone(),
+                    osc_agent_session: held.osc_agent_session.clone(),
+                },
+            );
+        }
+        if process_info == self.last_reported_process_info
+            && self.last_reported_detect_agents == Some(self.detect_agents)
+            && self.last_reported_pane_frame_agent_name == Some(self.pane_frame_agent_name)
+        {
+            return;
+        }
+        self.last_reported_process_info = process_info.clone();
+        self.last_reported_detect_agents = Some(self.detect_agents);
+        self.last_reported_pane_frame_agent_name = Some(self.pane_frame_agent_name);
+        let _ = self
+            .bus
+            .senders
+            .send_to_screen(ScreenInstruction::UpdatePaneProcessInfo {
+                process_info,
+                detect_agents: self.detect_agents,
+                pane_frame_agent_name: self.pane_frame_agent_name,
+            });
     }
 
     fn refresh_cwds_and_commands(&mut self) {
@@ -2906,7 +3389,7 @@ impl Pty {
             })
             .collect();
 
-        if active_terminal_ids.is_empty() {
+        if active_terminal_ids.is_empty() && !self.detect_agents {
             return;
         }
 
@@ -2986,6 +3469,25 @@ impl Pty {
             })
             .unwrap_or_default();
 
+        for terminal_id in &command_terminal_ids {
+            let foreground_cmd: Vec<String> = foreground_cmds
+                .get(terminal_id)
+                .cloned()
+                .unwrap_or_default();
+            if !active_terminal_ids.contains(terminal_id) {
+                let is_agent = |command: Option<&Vec<String>>| {
+                    command
+                        .and_then(|argv| argv.first())
+                        .and_then(|argv0| agent_detect::harness_for_command(argv0))
+                        .is_some()
+                };
+                // Preserve output-driven updates for quiet non-agent commands.
+                if !is_agent(Some(&foreground_cmd))
+                    && !is_agent(self.reported_command_for(*terminal_id))
+                {
+                    continue;
+                }
+            }
 
             if self.terminal_foreground_cmds.get(terminal_id) != Some(&foreground_cmd) {
                 let pane_id = PaneId::Terminal(*terminal_id);
@@ -3046,15 +3548,6 @@ impl Pty {
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         pane_env: PaneEnv,
-    ) {
-        self.default_editor = default_editor;
-        self.post_command_discovery_hook = post_command_discovery_hook;
-        self.pane_env = pane_env;
-    }
-
-    pub fn notify_cwd_from_osc7(&mut self, terminal_id: u32, path: PathBuf) {
-        use std::sync::atomic::Ordering;
-
         resurrect_command_hints: Option<ResurrectCommandHints>,
         resurrect_commands: Option<ResurrectCommands>,
         detect_agents: Option<bool>,
@@ -3065,6 +3558,61 @@ impl Pty {
         self.resurrect_command_hints = resurrect_command_hints;
         self.resurrect_mode = resurrect_commands.unwrap_or(ResurrectCommands::All);
         self.detect_agents = detect_agents.unwrap_or(DETECT_AGENTS_DEFAULT);
+    }
+
+    /// An agent told us its session directly, on its own pane. An empty id clears the report.
+    pub fn note_agent_session_from_osc(&mut self, terminal_id: u32, session_id: String) {
+        if session_id.is_empty() {
+            self.osc_agent_sessions.remove(&terminal_id);
+            return;
+        }
+        log::debug!(
+            "agents: terminal {} reported its agent session {} (session_source: osc)",
+            terminal_id,
+            session_id
+        );
+        self.osc_agent_sessions.insert(
+            terminal_id,
+            OscAgentSession {
+                session_id,
+                child_pid: self.id_to_child_pid.get(&terminal_id).copied(),
+                seen_agent: false,
+            },
+        );
+    }
+
+    /// Drops every `OSC 1337` report whose pane closed, was respawned, or went back to its shell
+    /// after running an agent. See [`OscAgentSession`].
+    fn expire_osc_agent_sessions(&mut self) {
+        let mut sessions = std::mem::take(&mut self.osc_agent_sessions);
+        sessions.retain(|terminal_id, report| {
+            let runs_an_agent = self
+                .reported_command_for(*terminal_id)
+                .and_then(|command| command.first())
+                .map_or(false, |argv0| {
+                    agent_detect::harness_for_command(argv0).is_some()
+                });
+            let holds = report.still_holds(
+                self.id_to_child_pid.get(terminal_id).copied(),
+                runs_an_agent,
+            );
+            if !holds {
+                log::debug!(
+                    "agents: terminal {} no longer runs the agent that reported session {}",
+                    terminal_id,
+                    report.session_id
+                );
+            }
+            holds
+        });
+        self.osc_agent_sessions = sessions;
+    }
+
+    /// The session the pane's agent reported over `OSC 1337`, if that report still holds.
+    fn osc_agent_session(&self, terminal_id: u32) -> Option<&str> {
+        self.osc_agent_sessions
+            .get(&terminal_id)
+            .map(|report| report.session_id.as_str())
     }
 
     /// A shell told us its cwd directly, so we do not have to read it off the process.
@@ -3097,9 +3645,6 @@ impl Pty {
             if self.session_context_pane == Some(pane_id) {
                 self.report_session_context(ContextTrigger::FolderChanged);
             }
-        }
-        if let Some(flag) = self.pane_activity_flags.get(&terminal_id) {
-            flag.store(false, Ordering::Relaxed);
         }
     }
 

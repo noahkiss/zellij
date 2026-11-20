@@ -1,0 +1,99 @@
+schema_version = 1
+harness = "opencode"
+
+[[facts]]
+key = "process_names"
+value = "opencode"
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = false
+notes = "Executable/argv0 name used by the fork hook. Complete process aliases remain unverified."
+
+[[facts]]
+key = "human_title_source"
+value = "Native session.title from session metadata during import."
+source = "https://github.com/getpaseo/paseo/blob/e135e9c101700b31671fc374325d17b608467a91/packages/server/src/server/agent/providers/opencode-agent.ts"
+revision = "e135e9c101700b31671fc374325d17b608467a91"
+verified = true
+
+[[facts]]
+key = "transcript_path"
+value = "~/.local/share/opencode/storage/session/<project-id>/<session-id>.json; message/<session-id>/<message-id>.json; part/<message-id>/<part-id>.json"
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/opencode.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = false
+notes = "Observed JSON installation only. Current database/storage migrations require installed-version verification."
+
+[[facts]]
+key = "transcript_format"
+value = "Observed JSON session/message/part files; opencode export <session-id> produces JSON."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/opencode.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = false
+notes = "Prefer native server/export APIs over assuming this disk schema."
+
+[[facts]]
+key = "resume_command"
+value = "opencode --session <session-id>"
+source = "https://opencode.ai/docs/cli/"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "approve_keys"
+value = "Enter for once; Right, Enter, Enter for always."
+source = "https://github.com/agent-of-empires/agent-of-empires/blob/43dfdd13e1e53b55138becff173d0e7fcf17d2bf/src/agents.rs"
+revision = "43dfdd13e1e53b55138becff173d0e7fcf17d2bf"
+verified = false
+notes = "Manager mapping; verify installed prompt layout."
+
+[[facts]]
+key = "deny_keys"
+value = "Right, Right, Enter."
+source = "https://github.com/agent-of-empires/agent-of-empires/blob/43dfdd13e1e53b55138becff173d0e7fcf17d2bf/src/agents.rs"
+revision = "43dfdd13e1e53b55138becff173d0e7fcf17d2bf"
+verified = false
+notes = "Manager mapping; verify installed prompt layout."
+
+[[facts]]
+key = "interrupt_keys"
+value = "Escape (default session_interrupt)."
+source = "https://opencode.ai/docs/keybinds/"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "question_keys"
+value = "Visible footer advertises enter confirm/submit/toggle, arrows select, tab navigate, escape dismiss."
+source = "https://github.com/herdrdev/herdr/blob/87e5c13c6028df72405f63388dde585212ad3019/src/detect/manifests/opencode.toml"
+revision = "87e5c13c6028df72405f63388dde585212ad3019"
+verified = false
+notes = "No complete question answer sequence verified."
+
+[[facts]]
+key = "folder_trust"
+value = "First-run folder-trust gates unknown."
+source = "https://opencode.ai/docs/permissions/"
+revision = "retrieved-2026-10-13"
+verified = false
+
+[[facts]]
+key = "hook_trust"
+value = "Plugin trust gates unknown."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = false
+
+[[facts]]
+key = "osc7501"
+value = "The fork TUI plugin synthesizes state OSC 7501 for v1/v2; OpenCode does not report it natively in this integration."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true
+
+[[facts]]
+key = "hooks"
+value = "Server plugin exports agent identity to shell commands. TUI plugin registers current session and reports permission/question/status lifecycle."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true

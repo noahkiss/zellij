@@ -591,6 +591,21 @@ pub struct Options {
     #[serde(default)]
     pub resurrect_commands: Option<ResurrectCommands>,
 
+    /// Whether to work out which panes are running a coding agent, so that `list-agents` and
+    /// `list-panes` can say so. Default: true. Detection is by the pane's own command first, which
+    /// costs nothing; only a pane that already matched has its processes read, and then only for
+    /// the fixed list of session-id variables the harnesses export. Set it false on a machine
+    /// where reading a process's environment is not wanted at all.
+    /// config.kdl only - it is read by the server when it reports pane state.
+    #[clap(skip)]
+    #[serde(default)]
+    pub detect_agents: Option<bool>,
+
+    /// Show the live agent name before the pane frame title. Defaults to false.
+    #[clap(skip)]
+    #[serde(default)]
+    pub pane_frame_agent_name: Option<bool>,
+
     /// Whether a plain `zellij session up` comes back with the shape the session had. Default:
     /// true. `up` already resurrects from the in-place cache that a crash leaves behind; this is
     /// what makes it reach the archived snapshot as well, which is the only copy left after a

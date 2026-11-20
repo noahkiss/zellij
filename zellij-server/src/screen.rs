@@ -106,6 +106,7 @@ use crate::panes::terminal_pane::{BRACKETED_PASTE_BEGIN, BRACKETED_PASTE_END};
 use crate::session_layout_metadata::{PaneLayoutMetadata, SessionLayoutMetadata};
 use zellij_utils::data::SessionWarning;
 
+use crate::terminal_progress::ClientProgress;
 use crate::{
     nested_guest::NestedGuestTracker,
     output::{
@@ -117,7 +118,10 @@ use crate::{
     plugins::{
         DumpSessionLayoutResponse, PluginId, PluginInstruction, PluginRenderAsset, PromptCaller,
     },
-    pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction, VteBytes},
+    pty::{
+        get_default_shell, ClientTabIndexOrPaneId, PaneProcessInfo, PtyInstruction, VteBytes,
+        DETECT_AGENTS_DEFAULT,
+    },
     pty_writer::PtyWriteInstruction,
     tab::{GuestChoiceIndicator, Pane, PaneLocation, PaneNotCreatedReason, SuppressedPanes, Tab},
     thread_bus::Bus,
@@ -378,6 +382,21 @@ pub struct TabOverrideResult {
 #[derive(Debug, Clone)]
 pub enum ScreenInstruction {
     PtyBytes(u32, VteBytes),
+    /// `resurrect_commands "prefill"`: put this command line at the restored pane's prompt, once
+    /// its shell is at one, as a bracketed paste. Never run - no newline is sent.
+    PrefillPane(u32, String),
+    /// The pty thread's once-a-second report of what each terminal pane is running, keyed by
+    /// terminal id. Screen keeps it only to stamp `PaneInfo`.
+    ///
+    /// `detect_agents` rides along because the pty thread owns that option and Screen answers the
+    /// question it governs. Sending it with the data it gates is what stops the two halves from
+    /// disagreeing: there is no tick on which Screen has process info and a stale opinion about
+    /// whether it may look at it.
+    UpdatePaneProcessInfo {
+        process_info: HashMap<u32, PaneProcessInfo>,
+        detect_agents: bool,
+        pane_frame_agent_name: bool,
+    },
     PluginBytes(Vec<PluginRenderAsset>),
     Render,
     RenderToClients,
@@ -865,10 +884,53 @@ pub enum ScreenInstruction {
     RenameSession(String, ClientId, Option<NotificationEnd>), // String -> new name
     UpdateSessionNameDraft(Vec<u8>, ClientId, Option<NotificationEnd>),
     UndoRenameSession(ClientId, Option<NotificationEnd>),
-    ListClientsMetadata(Option<PathBuf>, ClientId, Option<NotificationEnd>), // Option<PathBuf> - default shell
+    ListClientsMetadata(Option<PathBuf>, ClientId, bool, Option<NotificationEnd>), // Option<PathBuf> - default shell, bool - render as JSON
     ListPanes {
         show_all: bool,
         response_channel: crossbeam::channel::Sender<ListPanesResponse>,
+    },
+    ResolvePaneTarget {
+        target: PaneTarget,
+        response_channel: crossbeam::channel::Sender<Option<PaneId>>,
+    },
+    /// fork addition: brings back the newest closed terminal pane, or the newest one that had
+    /// `handle`. See `crate::closed_panes`.
+    ReopenPane {
+        handle: Option<String>,
+        default_shell: Option<TerminalAction>,
+        client_id: ClientId,
+        completion_tx: Option<NotificationEnd>,
+    },
+    /// fork addition: the closed panes a reopen can bring back, newest first.
+    ListClosedPanes {
+        response_channel: crossbeam::channel::Sender<Vec<ClosedPane>>,
+    },
+    /// fork addition: `send-message`. Deliver a message to the agent in this terminal pane now,
+    /// or hold it; the record says which. See `crate::agent_mail`.
+    SendAgentMessage {
+        terminal_id: u32,
+        text: String,
+        from: String,
+        from_name: Option<String>,
+        reply_to: Option<String>,
+        expire_s: u64,
+        response_channel: crossbeam::channel::Sender<zellij_utils::agent_mail::MessageRecord>,
+    },
+    /// fork addition: `message-status`: one message's record, or every record. `None` answers an
+    /// id this session does not know.
+    AgentMessageStatus {
+        id: Option<String>,
+        response_channel:
+            crossbeam::channel::Sender<Option<Vec<zellij_utils::agent_mail::MessageRecord>>>,
+    },
+    /// fork addition: try the held messages again, and expire the overdue ones. Sent once a
+    /// second while any are held.
+    DrainAgentMessages,
+    /// fork addition: the pty is about to hand over a reopened pane, which takes back this
+    /// handle the moment a tab takes it - before the creation is reported.
+    ExpectReopenedPane {
+        terminal_id: u32,
+        handle: String,
     },
     ListTabs {
         client_id: ClientId,
@@ -6668,6 +6730,7 @@ impl Screen {
             .unwrap_or(true)
     }
 
+    /// The fork's `list-clients --json` reads `rootshell_pane` from here; see `rootshell_pane_of`.
     pub fn set_client_host_terminal_env(
         &mut self,
         client_id: ClientId,
@@ -7865,14 +7928,70 @@ impl Screen {
             pane_info.is_selectable || show_all
         }
 
-        fn create_pane_list_entry(pane_info: PaneInfo, tab: &crate::tab::Tab) -> PaneListEntry {
+        fn create_pane_list_entry(
+            mut pane_info: PaneInfo,
+            tab: &crate::tab::Tab,
+            agent: Option<PaneAgent>,
+            mailbox: &crate::agent_mail::Mailbox,
+        ) -> PaneListEntry {
+            // fork: a CLI row reports focus only for a client that is still connected. A
+            // detached client's remembered focus is not somebody looking at the pane
+            if pane_info.is_focused {
+                let pane_id = if pane_info.is_plugin {
+                    PaneId::Plugin(pane_info.id)
+                } else {
+                    PaneId::Terminal(pane_info.id)
+                };
+                pane_info.is_focused = tab.pane_is_focused_by_connected_client(pane_id);
+            }
+            // the markers are on the pane's own grid, so this is a lookup by id rather than
+            // something `pane_infos_for_tab` could have carried out
+            let (command_state, last_command_exit_code, input_since_prompt) = if pane_info.is_plugin
+            {
+                (None, None, false)
+            } else {
+                tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .and_then(|pane| {
+                        pane.osc133_command_state().map(|(state, exit_code)| {
+                            (Some(state), exit_code, pane.input_since_prompt())
+                        })
+                    })
+                    .unwrap_or((None, None, false))
+            };
+            let program_status = if pane_info.is_plugin {
+                None
+            } else {
+                tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .and_then(|pane| pane.program_status())
+            };
+            // only beside a state: a shell pane somebody typed into has no state to call stale
+            let input_since_state = program_status.is_some()
+                && tab
+                    .get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .map_or(false, |pane| pane.input_since_state());
+            let queued_messages = if pane_info.is_plugin {
+                0
+            } else {
+                mailbox.held_for(&pane_info.handle)
+            };
+            let prefilled_command = if pane_info.is_plugin {
+                None
+            } else {
+                tab.get_pane_with_id(PaneId::Terminal(pane_info.id))
+                    .and_then(|pane| pane.prefilled_command())
+            };
             PaneListEntry {
                 pane_info,
-                tab_id: tab.id,
                 tab_position: tab.position,
                 tab_name: tab.name.clone(),
-                pane_command: None,
-                pane_cwd: None,
+                agent,
+                command_state,
+                last_command_exit_code,
+                program_status,
+                input_since_prompt,
+                input_since_state,
+                prefilled_command,
+                queued_messages,
             }
         }
 
@@ -7883,18 +8002,76 @@ impl Screen {
         let mut pane_entries = Vec::new();
 
         for tab in self.tabs.values() {
-            let mut pane_infos = tab.pane_infos();
+            let mut pane_infos = self.pane_infos_for_tab(tab);
             self.decorate_pane_infos(&mut pane_infos);
 
             for pane_info in pane_infos {
                 if should_include_pane(&pane_info, show_all) {
-                    pane_entries.push(create_pane_list_entry(pane_info, tab));
+                    let agent = self.agent_in_pane(&pane_info);
+                    pane_entries.push(create_pane_list_entry(
+                        pane_info,
+                        tab,
+                        agent,
+                        &self.agent_mail,
+                    ));
                 }
             }
         }
 
         sort_panes_by_tab_and_type(&mut pane_entries);
         Ok(pane_entries)
+    }
+
+    /// The coding agent running in a pane, if one is.
+    ///
+    /// Both halves of the answer are already here: the pane's command arrived with the rest of its
+    /// process info, and the harness session-id variables were read by the pty tick - but only for
+    /// a pane whose command had already matched, so a pane running a shell costs one string
+    /// compare and nothing else. A plugin pane has no process and is never an agent.
+    fn agent_in_pane(&self, pane_info: &PaneInfo) -> Option<PaneAgent> {
+        // `detect_agents false` means the question is not asked, not that half of it is skipped.
+        // The pty tick stops reading identity variables; this stops the match that would report a
+        // harness without one, so `list-agents` prints nothing and no pane carries an `agent`
+        if !self.detect_agents {
+            return None;
+        }
+        if pane_info.is_plugin {
+            return None;
+        }
+        let process_info = self.pane_process_info.get(&pane_info.id);
+        let agent_env = process_info
+            .map(|process_info| &process_info.agent_env)
+            .cloned()
+            .unwrap_or_default();
+        // the live argv first, then the command the pane was STARTED with - the second for a pane
+        // the process table has not been asked about yet, since a command pane is only probed once
+        // it produces output and a harness that has printed nothing has no live argv to match.
+        // `list-agents` re-asks which of the two answered, to fill its COMMAND column, so the rule
+        // lives in one place rather than in two that could disagree
+        // and where its session id came from - the pty's own find, the environment, the argv - or
+        // that nothing named it and a restore would offer the agent's picker
+        let live_source = process_info.and_then(|info| info.agent_session_source.as_deref());
+        // the agent's own `OSC 1337` report on this pane beats anything the walk found
+        let osc_session = process_info.and_then(|info| info.osc_agent_session.clone());
+        agent_detect::detect_in_pane(
+            pane_info.pane_command.as_deref(),
+            pane_info.terminal_command.as_deref(),
+            &agent_env,
+        )
+        .map(|(mut agent, command)| {
+            agent.name = if agent.kind == "claude" {
+                process_info.and_then(|info| info.agent_name.clone())
+            } else {
+                None
+            };
+            match osc_session {
+                Some(session_id) => {
+                    agent.agent_id = Some(session_id);
+                    agent_detect::with_session_source(agent, Some("osc"), command)
+                },
+                None => agent_detect::with_session_source(agent, live_source, command),
+            }
+        })
     }
 
     /// fork addition: what a reopen needs of each of `pane_ids` that is a live terminal pane,
@@ -8026,6 +8203,231 @@ impl Screen {
         }
         pane.set_pane_handle(handle);
         Ok(())
+    }
+
+    /// fork addition: `send-message`. The message goes in now if the guard passes, is held if the
+    /// agent is busy or a person is typing, and is refused if the pane runs no agent that could
+    /// take it. An `expire_s` of 0 asks for no holding: what would be held is refused instead.
+    pub fn send_agent_message(
+        &mut self,
+        terminal_id: u32,
+        text: String,
+        from: String,
+        from_name: Option<String>,
+        reply_to: Option<String>,
+        expire_s: u64,
+    ) -> zellij_utils::agent_mail::MessageRecord {
+        use zellij_utils::agent_mail::{Decision, MessageRecord, Reason, Status};
+        let now_ms = crate::program_status::now_ms();
+        let pane = self.agent_mail_pane(|info| !info.is_plugin && info.id == terminal_id);
+        let mut stored = crate::agent_mail::Stored {
+            record: MessageRecord {
+                id: self.agent_mail.new_id(),
+                status: Status::Queued,
+                reason: None,
+                pane_id: format!("terminal_{}", terminal_id),
+                handle: pane
+                    .as_ref()
+                    .map(|(info, _)| info.handle.clone())
+                    .unwrap_or_default(),
+                session: self.session_name.clone(),
+                agent: pane
+                    .as_ref()
+                    .and_then(|(_, agent)| agent.as_ref().map(|a| a.kind.clone())),
+                from,
+                from_name,
+                reply_to,
+                queued_at: now_ms,
+                expires_at: now_ms.saturating_add(expire_s.saturating_mul(1000)),
+                delivered_at: None,
+            },
+            text,
+        };
+        let decision = match pane {
+            Some((_, agent)) => self.try_deliver_agent_message(terminal_id, agent, &stored),
+            None => Decision::Refuse(Reason::PaneGone),
+        };
+        match decision {
+            Decision::Deliver => {
+                stored.record.status = Status::Delivered;
+                stored.record.delivered_at = Some(now_ms);
+                let record = stored.record.clone();
+                self.agent_mail.remember(stored);
+                record
+            },
+            Decision::Hold(reason) if expire_s > 0 => {
+                stored.record.reason = Some(reason);
+                let record = stored.record.clone();
+                self.agent_mail.hold(stored);
+                self.start_agent_mail_ticker();
+                record
+            },
+            Decision::Hold(reason) | Decision::Refuse(reason) => {
+                stored.record.status = Status::Refused;
+                stored.record.reason = Some(reason);
+                stored.record.expires_at = now_ms;
+                stored.record
+            },
+        }
+    }
+
+    /// fork addition: the held messages, tried again in the order they came; the overdue ones
+    /// expire. One message per pane per round: a delivered one leaves the agent's prompt
+    /// submitted, and the next waits for the turn it starts to end.
+    pub fn drain_agent_messages(&mut self) {
+        use zellij_utils::agent_mail::{Decision, Reason};
+        let now_ms = crate::program_status::now_ms();
+        self.agent_mail.expire(now_ms);
+        let held: Vec<crate::agent_mail::Stored> = self.agent_mail.held().to_vec();
+        let mut tried = HashSet::new();
+        for stored in held {
+            if !tried.insert(stored.record.handle.clone()) {
+                continue;
+            }
+            let handle = stored.record.handle.clone();
+            let pane = self.agent_mail_pane(|info| !info.is_plugin && info.handle == handle);
+            let Some((info, agent)) = pane else {
+                // a pane a restore is bringing back gets its handle again: wait for it
+                self.agent_mail
+                    .set_reason(&stored.record.id, Reason::PaneGone, None);
+                continue;
+            };
+            let pane_id = format!("terminal_{}", info.id);
+            match self.try_deliver_agent_message(info.id, agent, &stored) {
+                Decision::Deliver => {
+                    self.agent_mail
+                        .delivered(&stored.record.id, pane_id, now_ms);
+                },
+                Decision::Hold(reason) | Decision::Refuse(reason) => {
+                    // a pane whose agent went away keeps the message until it expires: the agent
+                    // may be started again under the same handle
+                    self.agent_mail
+                        .set_reason(&stored.record.id, reason, Some(pane_id));
+                },
+            }
+        }
+        if self.agent_mail.is_empty() {
+            self.agent_mail_ticking
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// fork addition: the guard and the write, in one step on this thread. A key a person presses
+    /// is handled on this same thread, so none can be read between the look and the paste; one
+    /// pressed after it is queued behind the Enter by the pty writer.
+    fn try_deliver_agent_message(
+        &mut self,
+        terminal_id: u32,
+        agent: Option<PaneAgent>,
+        stored: &crate::agent_mail::Stored,
+    ) -> zellij_utils::agent_mail::Decision {
+        use zellij_utils::agent_mail::{self, Decision, GuardFacts};
+        let now = std::time::Instant::now();
+        let prompt = self
+            .tabs
+            .values()
+            .find_map(|tab| tab.get_pane_with_id(PaneId::Terminal(terminal_id)))
+            .and_then(|pane| pane.agent_prompt(now));
+        // a message this session just typed in is the agent's turn, until it reports one
+        let state = if prompt.as_ref().is_some_and(|prompt| prompt.message_pending) {
+            Some("working".to_owned())
+        } else {
+            prompt
+                .as_ref()
+                .and_then(|prompt| prompt.program_status.as_ref())
+                .map(|status| status.state.clone())
+        };
+        let facts = GuardFacts {
+            agent_kind: agent.as_ref().map(|agent| agent.kind.as_str()),
+            state: state.as_deref(),
+            draft_pending: prompt.as_ref().is_some_and(|prompt| prompt.draft_pending),
+            since_input_ms: prompt
+                .as_ref()
+                .and_then(|prompt| prompt.since_input)
+                .map(|since| since.as_millis() as u64),
+            quiet_ms: self.agent_mail_quiet_ms,
+        };
+        let decision = agent_mail::guard(&facts);
+        if decision != Decision::Deliver {
+            return decision;
+        }
+        let envelope = agent_mail::envelope(
+            &stored.record.id,
+            &stored.record.from,
+            stored.record.from_name.as_deref(),
+            stored.record.reply_to.as_deref(),
+        );
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.extend_from_slice(agent_mail::wrapped(&envelope, &stored.text).as_bytes());
+        paste.extend_from_slice(b"\x1b[201~");
+        let sent = self
+            .bus
+            .senders
+            .send_to_pty_writer(PtyWriteInstruction::Write(paste, terminal_id, None))
+            .and_then(|_| {
+                self.bus
+                    .senders
+                    .send_to_pty_writer(PtyWriteInstruction::WriteNotBefore(
+                        b"\r".to_vec(),
+                        terminal_id,
+                        now + crate::agent_mail::ENTER_DELAY,
+                    ))
+            });
+        if let Err(e) = sent {
+            log::error!("could not type message {}: {}", stored.record.id, e);
+            return Decision::Hold(agent_mail::Reason::Working);
+        }
+        if let Some(pane) = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(PaneId::Terminal(terminal_id)))
+        {
+            pane.note_message_delivered(now);
+        }
+        Decision::Deliver
+    }
+
+    /// fork addition: the first pane `matches` picks, and the agent in it.
+    fn agent_mail_pane(
+        &self,
+        matches: impl Fn(&PaneInfo) -> bool,
+    ) -> Option<(PaneInfo, Option<PaneAgent>)> {
+        self.tabs
+            .values()
+            .flat_map(|tab| self.pane_infos_for_tab(tab))
+            .find(|info| matches(info))
+            .map(|info| {
+                let agent = self.agent_in_pane(&info);
+                (info, agent)
+            })
+    }
+
+    /// fork addition: a thread that asks for `DrainAgentMessages` once a second, for as long as
+    /// any message is held. Started again by the next held message once it stops.
+    fn start_agent_mail_ticker(&self) {
+        use std::sync::atomic::Ordering;
+        if self.agent_mail_ticking.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ticking = self.agent_mail_ticking.clone();
+        let senders = self.bus.senders.clone();
+        let started = std::thread::Builder::new()
+            .name("agent_mail".to_owned())
+            .spawn(move || {
+                while ticking.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if senders
+                        .send_to_screen(ScreenInstruction::DrainAgentMessages)
+                        .is_err()
+                    {
+                        ticking.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
+        if started.is_err() {
+            self.agent_mail_ticking.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Which pane, if any, a CLI target names.
@@ -12123,6 +12525,9 @@ pub(crate) fn screen_thread_main(
         stacked_pane_list,
         stacked_pane_list_orientation,
         default_editor,
+        default_floating_size,
+        input_while_scrolled,
+        command_pane_on_clean_exit,
         web_clients_allowed,
         web_sharing,
         advanced_mouse_actions,
@@ -12133,6 +12538,7 @@ pub(crate) fn screen_thread_main(
         mouse_hover_effects,
         mouse_hover_tips,
         visual_bell,
+        bell_clear_delay_ms,
         focus_follows_mouse,
         mouse_click_through,
         web_server_ip,
@@ -12146,6 +12552,16 @@ pub(crate) fn screen_thread_main(
     screen.default_mousebinds = config.mousebinds.clone();
     screen.configured_default_shell = configured_default_shell;
     screen.update_context_menu_enabled(config_options.context_menu_enabled.unwrap_or(true));
+    // fork addition: the messages an earlier server held for this session's agents
+    screen.agent_mail = crate::agent_mail::Mailbox::open(
+        zellij_utils::consts::ZELLIJ_STATE_DIR
+            .join("messages")
+            .join(&screen.session_name),
+        crate::program_status::now_ms(),
+    );
+    if !screen.agent_mail.is_empty() {
+        screen.start_agent_mail_ticker();
+    }
     screen.host_theme_dark_styling = host_theme_dark_styling;
     screen.host_theme_light_styling = host_theme_light_styling;
     screen.paste_buffer_read_enabled = dangerously_enable_paste_buffer_read;
@@ -14398,12 +14814,24 @@ pub(crate) fn screen_thread_main(
 
                 screen.render(None)?;
             },
-            ScreenInstruction::GoToTab(
-                tab_index,
-                client_id,
-                _completion_tx, // the action ends here, dropping this will release anything
-                                // waiting for it
-            ) => {
+            ScreenInstruction::GoToTab(tab_index, client_id, mut completion_tx) => {
+                // fork: a position nothing sits at is a miss, not a silent no-op: the report below
+                // would otherwise name the tab the client never left, and with nobody attached the
+                // switch would be queued for a tab that is never coming. `go-to-tab-name` refuses
+                // in both states already.
+                //
+                // Only asked once the tab list has settled - a pending tab may still be about to
+                // take that position, which is the same reason the switch itself waits for it
+                if pending_tab_ids.is_empty()
+                    && screen
+                        .get_tab_id_at_position(tab_index.saturating_sub(1) as usize)
+                        .is_none()
+                {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!("No tab at position {}", tab_index));
+                    }
+                    continue;
+                }
                 let client_id_to_switch = match client_id {
                     None => None,
                     Some(client_id) if screen.active_tab_ids.contains_key(&client_id) => {
@@ -16955,7 +17383,22 @@ pub(crate) fn screen_thread_main(
                 let _ = screen.render(None);
                 screen.log_and_report_session_state().non_fatal();
             },
-            ScreenInstruction::TogglePaneBorderless(pane_id, _completion_tx) => {
+            ScreenInstruction::TogglePaneBorderless(pane_id, mut completion_tx) => {
+                // an id no live pane answers to is a miss, not a silent no-op - the same answer
+                // `toggle-pane-pinned` and `toggle-pane-embed-or-floating` give
+                if !screen
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_pane_with_pid(&pane_id))
+                {
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!(
+                            "No pane answers to '{}'",
+                            screen.pane_summary(pane_id)
+                        ));
+                    }
+                    continue;
+                }
                 screen.toggle_pane_borderless(pane_id);
                 let _ = screen.render(None);
             },
@@ -17879,9 +18322,25 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.render(None)?;
             },
-            ScreenInstruction::EditScrollbackWithPaneId(pane_id, ansi, completion_tx) => {
+            ScreenInstruction::EditScrollbackWithPaneId(pane_id, ansi, mut completion_tx) => {
+                // asked before the loop, because the loop hands the notification to the tab that
+                // takes the pane. An id no live pane answers to is the same miss every other pane
+                // target reports; silence here reads as a scrollback editor that opened
+                if !screen
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_pane_with_pid(&pane_id))
+                {
+                    log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!(
+                            "No pane answers to '{}'",
+                            screen.pane_summary(pane_id)
+                        ));
+                    }
+                    continue;
+                }
                 let all_tabs = screen.get_tabs_mut();
-                let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
                         if ansi {
@@ -17891,12 +18350,8 @@ pub(crate) fn screen_thread_main(
                             tab.edit_scrollback_for_pane_with_id(pane_id, completion_tx)
                                 .non_fatal();
                         }
-                        found = true;
                         break;
                     }
-                }
-                if !found {
-                    log::error!("Pane with id {:?} not found", pane_id);
                 }
                 screen.render(None)?;
             },

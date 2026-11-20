@@ -648,7 +648,17 @@ pub enum Action {
         cwd: Option<PathBuf>,
         pane_title: Option<String>,
     },
-    ListClients,
+    ListClients {
+        output_json: bool,
+    },
+    /// Asks the session which pane a CLI target names.
+    ///
+    /// A handle or a uuid only means something against the live panes, which live in the server -
+    /// so the client asks before it builds the action that will act on the pane. The reply is the
+    /// pane's id, or a miss on stderr with exit 2.
+    ResolvePaneTarget {
+        target: String,
+    },
     ListPanes {
         show_tab: bool,
         show_command: bool,
@@ -656,6 +666,41 @@ pub enum Action {
         show_geometry: bool,
         show_all: bool,
         output_json: bool,
+    },
+    /// Every tab with its panes nested beneath it - the shape of the session in one answer.
+    ListTree {
+        output_json: bool,
+    },
+    /// fork addition: brings back a terminal pane that was closed lately, or lists the ones the
+    /// session remembers.
+    ///
+    /// The server keeps the last few closed terminal panes in memory. `handle: None` with
+    /// `list: false` reopens the newest; a handle reopens that one. `list` changes nothing.
+    ReopenPane {
+        handle: Option<String>,
+        list: bool,
+        output_json: bool,
+    },
+    /// fork addition: a message for the coding agent in a terminal pane, typed in only when the
+    /// agent is idle and nobody is typing there, and otherwise held by the session until then.
+    ///
+    /// The server answers with one JSON record: `delivered`, `queued` or `refused`. See
+    /// `zellij-server/src/agent_mail.rs`.
+    SendMessage {
+        terminal_id: u32,
+        text: String,
+        /// The sender's address, `host/session/handle`, as the envelope names it.
+        from: String,
+        from_name: Option<String>,
+        /// The message this one answers.
+        reply_to: Option<String>,
+        /// How long a held message waits before it expires.
+        expire_s: u64,
+    },
+    /// fork addition: the record of one message this session holds or delivered, or of all of
+    /// them. JSON.
+    MessageStatus {
+        id: Option<String>,
     },
     ListTabs {
         show_state: bool,

@@ -1642,6 +1642,7 @@ impl From<crate::input::actions::Action>
             SearchInputAction,
             SearchToggleOptionAction,
             SelectCommandAtScrollPositionAction,
+            SendMessageAction,
             SessionNameInputAction,
             SetDarkThemeAction,
             SetLightThemeAction,
@@ -2553,8 +2554,41 @@ impl From<crate::input::actions::Action>
                 cwd: cwd.map(|p| p.to_string_lossy().to_string()),
                 pane_title,
             }),
-            crate::input::actions::Action::ListClients => {
-                ActionType::ListClients(ListClientsAction {})
+            crate::input::actions::Action::ListClients { output_json } => {
+                ActionType::ListClients(ListClientsAction { output_json })
+            },
+            crate::input::actions::Action::ResolvePaneTarget { target } => {
+                ActionType::ResolvePaneTarget(ResolvePaneTargetAction { target })
+            },
+            crate::input::actions::Action::ListTree { output_json } => {
+                ActionType::ListTree(ListTreeAction { output_json })
+            },
+            crate::input::actions::Action::ReopenPane {
+                handle,
+                list,
+                output_json,
+            } => ActionType::ReopenPane(ReopenPaneAction {
+                handle,
+                list,
+                output_json,
+            }),
+            crate::input::actions::Action::SendMessage {
+                terminal_id,
+                text,
+                from,
+                from_name,
+                reply_to,
+                expire_s,
+            } => ActionType::SendMessage(SendMessageAction {
+                terminal_id,
+                text,
+                from,
+                from_name,
+                reply_to,
+                expire_s,
+            }),
+            crate::input::actions::Action::MessageStatus { id } => {
+                ActionType::MessageStatus(MessageStatusAction { id })
             },
             crate::input::actions::Action::ListPanes {
                 show_tab,
@@ -3672,7 +3706,31 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Action>
                     pane_title: keybind_pipe_action.pane_title,
                 })
             },
-            ActionType::ListClients(_) => Ok(crate::input::actions::Action::ListClients),
+            ActionType::ListClients(a) => Ok(crate::input::actions::Action::ListClients {
+                output_json: a.output_json,
+            }),
+            ActionType::ResolvePaneTarget(a) => {
+                Ok(crate::input::actions::Action::ResolvePaneTarget { target: a.target })
+            },
+            ActionType::ListTree(a) => Ok(crate::input::actions::Action::ListTree {
+                output_json: a.output_json,
+            }),
+            ActionType::ReopenPane(a) => Ok(crate::input::actions::Action::ReopenPane {
+                handle: a.handle,
+                list: a.list,
+                output_json: a.output_json,
+            }),
+            ActionType::SendMessage(a) => Ok(crate::input::actions::Action::SendMessage {
+                terminal_id: a.terminal_id,
+                text: a.text,
+                from: a.from,
+                from_name: a.from_name,
+                reply_to: a.reply_to,
+                expire_s: a.expire_s,
+            }),
+            ActionType::MessageStatus(a) => {
+                Ok(crate::input::actions::Action::MessageStatus { id: a.id })
+            },
             ActionType::ListPanes(list_panes_action) => {
                 Ok(crate::input::actions::Action::ListPanes {
                     show_tab: list_panes_action.show_tab,

@@ -1,30 +1,5 @@
 use crate::panes::PaneId;
 use crate::ClientId;
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
-use zellij_utils::common_path::common_path_all;
-use zellij_utils::pane_size::PaneGeom;
-use zellij_utils::{
-    data::{BorderStyleOverride, LayoutMetadata, PaneMetadata, TabMetadata},
-    input::command::RunCommand,
-    input::layout::{Layout, Run, RunPlugin, RunPluginOrAlias},
-    input::options::StackListOrientation,
-    input::plugins::PluginAliases,
-    session_serialization::{
-        extract_command_and_args, extract_edit_and_line_number, extract_plugin_and_config,
-        GlobalLayoutManifest, PaneLayoutManifest, TabLayoutManifest,
-    },
-};
-
-#[derive(Default, Debug, Clone)]
-pub struct SessionLayoutMetadata {
-    default_layout: Box<Layout>,
-    global_cwd: Option<PathBuf>,
-    pub default_shell: Option<PathBuf>,
-    pub default_editor: Option<PathBuf>,
-    tabs: Vec<TabLayoutMetadata>,
-    session_attention_muted: bool,
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -49,6 +24,21 @@ use zellij_utils::{
         GlobalLayoutManifest, PaneLayoutManifest, TabLayoutManifest,
     },
 };
+
+/// The rootshell tab a client's host terminal map names (`LC_ROOTSHELL_PANE`), if it names a
+/// usable one.
+///
+/// The value is whatever the client's environment held, so it is checked before it is repeated
+/// to every reader of `list-clients --json`: trimmed, at most 128 characters, and no control
+/// characters. rootshell's own value is a UUID, which passes.
+pub fn rootshell_pane_of(host_terminal_env: &BTreeMap<String, String>) -> Option<String> {
+    let value = host_terminal_env
+        .get(zellij_utils::input::cli_assets::ROOTSHELL_PANE_VAR)?
+        .trim();
+    let usable =
+        !value.is_empty() && value.chars().count() <= 128 && !value.chars().any(|c| c.is_control());
+    usable.then(|| value.to_owned())
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct SessionLayoutMetadata {
@@ -1885,6 +1875,44 @@ mod tests {
     }
 
     #[test]
+    fn json_client_list_names_the_rootshell_tab_where_a_client_had_one() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![1, 2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![]);
+        meta.set_client_rootshell_panes([(2, "a-tab-uuid".to_owned())].into_iter().collect());
+        let rendered = meta.list_clients_metadata_json(1);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["client_id"], 1);
+        assert!(
+            parsed[0].get("rootshell_pane").is_none(),
+            "absent, not null"
+        );
+        assert_eq!(parsed[1]["client_id"], 2);
+        assert_eq!(parsed[1]["rootshell_pane"], "a-tab-uuid");
+        // every ClientInfo key is still there, flat
+        let as_info: Vec<ClientInfo> = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(as_info[1].client_id, 2);
+    }
+
+    #[test]
+    fn only_a_usable_rootshell_tab_is_repeated() {
+        let env = |value: &str| -> BTreeMap<String, String> {
+            [("LC_ROOTSHELL_PANE".to_owned(), value.to_owned())]
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(
+            super::rootshell_pane_of(&env(" 00000000-0000-4000-8000-000000000001\n")).as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
+        assert_eq!(super::rootshell_pane_of(&env("")), None);
+        assert_eq!(super::rootshell_pane_of(&env("a\u{1b}]52;c;x")), None);
+        assert_eq!(super::rootshell_pane_of(&env(&"x".repeat(129))), None);
+        assert_eq!(super::rootshell_pane_of(&BTreeMap::new()), None);
+    }
+
+    #[test]
     fn json_client_list_is_empty_when_nobody_is_attached() {
         let meta = SessionLayoutMetadata::default();
         assert_eq!(meta.list_clients_metadata_json(1), "[]");
@@ -2422,6 +2450,26 @@ mod tests {
         assert_eq!(
             command_line(&meta, 0),
             Some(("claude".to_owned(), owned(&["-c"])))
+        );
+    }
+
+    /// `resurrect_commands "all"` with the documented `claude` hint: the hint appends
+    /// `--continue`, nothing names the session, and the pane still comes back with the picker.
+    #[test]
+    fn a_hint_that_adds_a_latest_flag_still_ends_at_the_picker() {
+        let mut meta = session_with_panes(vec![make_command_pane(
+            1,
+            "claude",
+            vec!["--dangerously-skip-permissions"],
+        )]);
+        meta.apply_resurrect_command_hints(
+            &hints(&[("claude", "CLAUDE_CODE_SESSION_ID", "--continue")]),
+            env_always(Some("x")),
+        );
+        meta.pin_live_agent_sessions(|_, _, _| Some(None));
+        assert_eq!(
+            command_line(&meta, 0),
+            Some(("claude".to_owned(), owned(&["--resume"])))
         );
     }
 

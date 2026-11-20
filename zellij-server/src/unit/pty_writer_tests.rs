@@ -355,3 +355,47 @@ fn write_error_clears_terminal_queue() {
     let written_2 = mock_clone.get_written_bytes(2);
     assert_eq!(written_2, b"should work");
 }
+
+#[test]
+fn a_write_held_until_an_instant_holds_the_writes_behind_it_and_no_other_terminal() {
+    let mock = MockServerOsApi::new();
+    mock.set_behavior(1, WriteBehavior::AcceptAll);
+    mock.set_behavior(2, WriteBehavior::AcceptAll);
+    let log = mock.clone();
+
+    let (bus, sender) = make_test_bus(mock);
+    let writer = std::thread::spawn(move || pty_writer_main(bus).unwrap());
+    let enter_at = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    sender
+        .send(PtyWriteInstruction::Write(b"<paste>".to_vec(), 1, None))
+        .unwrap();
+    sender
+        .send(PtyWriteInstruction::WriteNotBefore(
+            b"\r".to_vec(),
+            1,
+            enter_at,
+        ))
+        .unwrap();
+    // a key a person pressed right after: it must not land between the paste and its Enter
+    sender
+        .send(PtyWriteInstruction::Write(b"x".to_vec(), 1, None))
+        .unwrap();
+    sender
+        .send(PtyWriteInstruction::Write(b"other".to_vec(), 2, None))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        log.get_written_bytes(1),
+        b"<paste>",
+        "the Enter and the key wait"
+    );
+    assert_eq!(
+        log.get_written_bytes(2),
+        b"other",
+        "another terminal does not"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(log.get_written_bytes(1), b"<paste>\rx");
+    sender.send(PtyWriteInstruction::Exit).unwrap();
+    writer.join().unwrap();
+}

@@ -1,5 +1,10 @@
+pub mod agent_detect;
+pub mod agent_hooks;
+pub mod agent_mail;
 pub mod attention;
+pub mod capabilities;
 pub mod cli;
+pub mod cli_surface;
 pub mod client_server_contract;
 pub mod consts;
 pub mod data;
@@ -8,6 +13,7 @@ pub mod distribution;
 pub mod envs;
 pub mod errors;
 pub mod graphemes;
+pub mod harness_map;
 pub mod home;
 #[cfg(not(windows))]
 mod home_unix;
@@ -16,6 +22,7 @@ mod home_windows;
 pub mod input;
 pub mod kdl;
 pub mod nested_session_contract;
+pub mod pane_handle;
 pub mod pane_size;
 pub mod plugin_api;
 pub mod position;
@@ -26,16 +33,6 @@ pub mod setup;
 pub mod shared;
 pub mod structured_render;
 
-// The following modules can't be used when targeting wasm
-#[cfg(not(target_family = "wasm"))]
-pub mod app_control;
-#[cfg(not(target_family = "wasm"))]
-pub mod channels; // Requires tokio
-#[cfg(not(target_family = "wasm"))]
-pub mod common_path;
-#[cfg(not(target_family = "wasm"))]
-pub mod downloader; // Requires tokio
-#[cfg(not(target_family = "wasm"))]
 // The following modules can't be used when targeting wasm
 #[cfg(not(target_family = "wasm"))]
 pub mod app_control;

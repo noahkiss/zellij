@@ -927,19 +927,38 @@ pub enum SessionCommand {
 #[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
 pub enum Sessions {
     /// List active sessions
+    ///
+    /// Returns: one row per session - NAME, STATUS (live or exited), CURRENT, CLIENTS, CREATED.
+    /// CREATED is last because it is the only column that holds spaces.
     #[clap(visible_alias = "ls")]
     ListSessions {
-        /// Do not add colors and formatting to the list (useful for parsing)
+        /// Do not add colors to the table
         #[clap(short, long)]
         no_formatting: bool,
 
-        /// Print just the session name
+        /// Print just the session name, with ` (EXITED)` after a resurrectable one
         #[clap(short, long)]
         short: bool,
 
         /// List the sessions in reverse order (default is ascending order)
         #[clap(short, long)]
         reverse: bool,
+
+        /// Output as JSON (overrides --short and --no-formatting)
+        #[clap(short, long)]
+        json: bool,
+    },
+    /// List live coding agents with names and pane handles
+    ListAgents {
+        /// Output as JSON
+        #[clap(short, long)]
+        json: bool,
+        /// Accepted and ignored: a retired flag that older callers still pass
+        #[clap(long, hide = true)]
+        report_withheld: bool,
+        /// List agents in every live session
+        #[clap(long)]
+        all_sessions: bool,
     },
     /// List existing plugin aliases
     #[clap(visible_alias = "la")]
@@ -1014,6 +1033,20 @@ pub enum Sessions {
     /// Create, tear down and restart a named session, asserting the result
     #[clap(subcommand)]
     Session(SessionLifecycleCli),
+
+    /// Serve this CLI to an agent over the Model Context Protocol, on stdin and stdout
+    ///
+    /// A few tools shaped around jobs rather than one per verb, each running the zellij binary at
+    /// this one's path, so a tool behaves exactly as the command line does. The client reads the
+    /// list from the server itself. Session lifecycle is deliberately not among them.
+    ///
+    /// Speaks the protocol on stdout, so nothing else may be printed there. Run it from an MCP
+    /// client's server configuration, not from a terminal.
+    Mcp {
+        /// The session an unqualified tool call is about. Defaults to ZELLIJ_SESSION_NAME
+        #[clap(short, long, value_parser)]
+        session: Option<String>,
+    },
 
     /// Stop every session's server, keeping the sessions resurrectable
     ///
@@ -2973,29 +3006,77 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
             help = "What a click outside the --popup does: block (ignore it) or close (close the popup) (e.g. --popup mouse --popup-outside-click close)"
         )]
         popup_outside_click: Option<crate::data::OutsideClick>,
+        /// Seconds the session may say NOTHING before this gives up and exits 2. The window is
+        /// idle time, not a budget for the call: every answer restarts it, and time spent
+        /// waiting on STDIN is outside it, so a `tail -f | zellij pipe` is unaffected. `0` waits
+        /// forever, which only a plugin that received the message can end
+        #[clap(long, value_parser, default_value = "30", display_order(11))]
+        timeout: u64,
     },
-    ListClients,
+    /// List the clients attached to this session
+    ///
+    /// Returns: one row per client - id, focused pane, running command, tty, terminal size, and
+    /// whether the row is the client asking - or the ClientInfo array with --json
+    ListClients {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
     /// List all panes in the current session
     ///
-    /// Returns: Formatted list of panes (table or JSON) to stdout
+    /// Returns: one row per pane, every column - tab, handle, command, state, geometry - or the
+    /// same information as JSON with --json
     ListPanes {
-        /// Include tab information (name, position, ID)
+        /// Accepted and ignored: tab columns are always printed
         #[clap(short, long, value_parser)]
         tab: bool,
 
-        /// Include running command information
+        /// Accepted and ignored: command columns are always printed
         #[clap(short, long, value_parser)]
         command: bool,
 
-        /// Include pane state (focused, floating, exited, etc.)
+        /// Accepted and ignored: state columns are always printed
         #[clap(short, long, value_parser)]
         state: bool,
 
-        /// Include geometry (position, size)
+        /// Accepted and ignored: geometry columns are always printed
         #[clap(short, long, value_parser)]
         geometry: bool,
 
-        /// Include all available fields
+        /// Also list the panes you cannot select - plugin panes the UI hides, suppressed panes
+        #[clap(short, long, value_parser)]
+        all: bool,
+
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+
+        /// Accepted and ignored: a retired flag that older callers still pass
+        #[clap(long, value_parser, hide = true)]
+        report_withheld: bool,
+    },
+    /// List all tabs with their information
+    ///
+    /// Returns: one row per tab, every column - state, dimensions, pane counts, layout - or the
+    /// same information as JSON with --json
+    ListTabs {
+        /// Accepted and ignored: state columns are always printed
+        #[clap(short, long, value_parser)]
+        state: bool,
+
+        /// Accepted and ignored: dimension columns are always printed
+        #[clap(short, long, value_parser)]
+        dimensions: bool,
+
+        /// Accepted and ignored: pane-count columns are always printed
+        #[clap(short, long, value_parser)]
+        panes: bool,
+
+        /// Accepted and ignored: layout columns are always printed
+        #[clap(short, long, value_parser)]
+        layout: bool,
+
+        /// Accepted and ignored: every column is always printed
         #[clap(short, long, value_parser)]
         all: bool,
 
@@ -3003,29 +3084,138 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(short, long, value_parser)]
         json: bool,
     },
-    /// List all tabs with their information
+    /// List every tab with its panes nested beneath it
     ///
-    /// Returns: Tab information in table or JSON format
-    ListTabs {
-        /// Include state information (active, fullscreen, sync, floating visibility)
+    /// Returns: one line per tab, then its panes indented below it, each line `key: value` pairs
+    /// two spaces apart - or the same tree structured with --json
+    ListTree {
+        /// Output as JSON
         #[clap(short, long, value_parser)]
-        state: bool,
+        json: bool,
+    },
+    /// Show this pane and the agents in its session
+    Whoami {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
+    /// List the panes running a coding agent, and which agent each one is
+    ///
+    /// A filtered `list-panes`: the panes whose command is a harness this build recognises -
+    /// claude, opencode, codex, pi - with the harness's own session id where it exports one.
+    /// `SOURCE` says what the row rests on: `command` when only the pane's command matched,
+    /// `command+env` when an identity variable was found in the pane's processes as well.
+    /// `STATE` is what the agent last reported over OSC 7501 (`state`, `state_msg`, `state_at`
+    /// and the other `state_*` keys in --json): working, blocked, done, idle or error.
+    ///
+    /// Returns: a table, or the same rows with --json. No agents prints the header alone.
+    ListAgents {
+        /// Output as JSON
+        #[clap(short, long, value_parser)]
+        json: bool,
 
-        /// Include dimension information (viewport, display area)
-        #[clap(short, long, value_parser)]
-        dimensions: bool,
+        /// Accepted and ignored: a retired flag that older callers still pass
+        #[clap(long, value_parser, hide = true)]
+        report_withheld: bool,
 
-        /// Include pane counts
+        /// Ask every live session, not one. Each row gains `session` (a SESSION column, last).
+        /// A session that does not answer is named on stderr and skipped
+        #[clap(long, value_parser)]
+        all_sessions: bool,
+    },
+    /// Print the last reply of the coding agent in a pane, from its harness's transcript
+    ///
+    /// The text the agent wrote after the last prompt, tool call or tool result - the answer at
+    /// the end of a turn, without the narration between tool calls and without thinking. It is
+    /// read from the transcript file the harness writes, found by the session id `list-agents`
+    /// shows: claude (`~/.claude/projects`), codex (`~/.codex/sessions`) and pi
+    /// (`~/.pi/agent/sessions`), honouring CLAUDE_CONFIG_DIR, CODEX_HOME and PI_CODING_AGENT_DIR
+    /// in this command's environment. opencode is not read.
+    ///
+    ///   zellij action last-reply --pane-id sunny-otter
+    ///
+    /// Returns: the reply text alone, or with --json a record of pane_id, handle, kind,
+    /// agent_id, transcript, state and reply. Exit 2, with the reason on stderr, when the pane
+    /// runs no agent, its session id is not known yet, its harness is not read, no transcript is
+    /// found, or the agent has written nothing since its last prompt.
+    LastReply {
+        /// The pane: terminal_1, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-agents` prints the handles of the
+        /// panes running an agent
         #[clap(short, long, value_parser)]
-        panes: bool,
+        pane_id: String,
 
-        /// Include layout information (swap layout name and dirty state)
+        /// Output as JSON
         #[clap(short, long, value_parser)]
-        layout: bool,
+        json: bool,
+    },
+    /// Send the coding agent in another pane a message, typed in only when it is safe
+    ///
+    /// The target is one word, matched against `list-agents`: a pane handle, a tab name, an
+    /// agent name, or the name of the agent's project directory. Exactly one agent must match;
+    /// none or several is a miss, exit 2, with the candidates on stderr.
+    ///
+    /// The session types the message in - one bracketed paste, then Enter - only when the agent
+    /// reported `idle`, `done` or `error`, nothing typed into its prompt is waiting there, and no
+    /// key reached the pane in the last 5 seconds. The check and the typing happen in one step on
+    /// the server, and a key that arrives meanwhile waits behind the Enter. Otherwise the session
+    /// holds the message, tries again every second, and drops it when it expires. A held message
+    /// survives a restart of the session. The message goes in under a one-line envelope that names
+    /// the sender and says how to reply.
+    ///
+    ///   zellij action send-message --to develop -- 'The build is green; go ahead.'
+    ///   zellij action send-message --reply-to m3k9x2q -- 'Done.'
+    ///
+    /// Returns: one record of id, status (delivered, queued, refused or expired), reason, pane,
+    /// handle, session, agent and the times; with --wait, the record once the message went in or
+    /// the wait ran out. Exit 0 for delivered and queued, 2 for refused, expired or a target that
+    /// matched no agent or several.
+    SendMessage {
+        /// Who gets it: a pane handle, a tab name, an agent name or a project directory name
+        #[clap(long, value_parser, required_unless_present = "reply-to")]
+        to: Option<String>,
 
-        /// Include all available fields
+        /// Answer a message this session delivered: its sender is the target. With --to, the
+        /// target is --to's and this only names the message answered
+        #[clap(long, value_parser)]
+        reply_to: Option<String>,
+
+        /// The message. `-` reads it from stdin
+        #[clap(value_parser)]
+        text: String,
+
+        /// Seconds a held message waits before it expires
+        #[clap(long, value_parser, default_value = "1800")]
+        expire_s: u64,
+
+        /// Block until the message is delivered, for at most this many seconds
+        #[clap(long, value_parser)]
+        wait: Option<u64>,
+
+        /// The sender, as host/session/handle. Defaults to this pane on this machine
+        #[clap(long, value_parser)]
+        from: Option<String>,
+
+        /// The sender's agent name, for the envelope
+        #[clap(long, value_parser)]
+        from_name: Option<String>,
+
+        /// Look for the target in every live session on this machine, not one
+        #[clap(long, value_parser)]
+        all_sessions: bool,
+
+        /// Output as JSON
         #[clap(short, long, value_parser)]
-        all: bool,
+        json: bool,
+    },
+    /// Show the messages this session holds for its agents, or one message by id
+    ///
+    /// Returns: the records `send-message` prints, held ones first, then the ones delivered lately.
+    /// Exit 2 when an id names no message this session knows.
+    MessageStatus {
+        /// One message id
+        #[clap(value_parser)]
+        id: Option<String>,
 
         /// Output as JSON
         #[clap(short, long, value_parser)]
@@ -3033,14 +3223,17 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
     /// Get information about the currently active tab
     ///
-    /// Returns: Tab name and ID by default, or full info in JSON
+    /// Returns: `name:`, `id:` and `position:` lines, or the full TabInfo with --json
     CurrentTabInfo {
         /// Output as JSON with full TabInfo
         #[clap(short, long, value_parser)]
         json: bool,
     },
+    /// Toggle whether a floating pane stays on top of the other floating panes
     TogglePanePinned {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
@@ -3120,52 +3313,63 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(long, help = "Only mark the panes of the current session")]
         this_session: bool,
     },
-    /// Stack pane ids
-    /// Ids are a space separated list of pane ids.
-    /// They should either be in the form of `terminal_<int>` (eg. terminal_1), `plugin_<int>` (eg.
-    /// plugin_1) or bare integers in which case they'll be considered terminals (eg. 1 is
-    /// the equivalent of terminal_1)
+    /// Gather panes into one stack, in the order given
     ///
     /// Example: zellij action stack-panes -- terminal_1 plugin_2 3
     StackPanes {
+        /// The panes, after a `--`: terminal_1, plugin_2, a bare integer (3 means terminal_3), a
+        /// handle like sunny-otter, or a pane uuid
         #[clap(last(true), required(true))]
         pane_ids: Vec<String>,
     },
+    /// Move, resize or re-dress a floating pane
+    ///
+    /// Every field is optional and the ones you leave out are left alone.
     ChangeFloatingPaneCoordinates {
-        /// The pane_id of the floating pane, eg.  terminal_1, plugin_2 or 3 (equivalent to
-        /// terminal_3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. It must be floating already -
+        /// `toggle-pane-embed-or-floating --pane-id` makes it so
         #[clap(short, long, value_parser)]
         pane_id: String,
-        /// The x coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Distance from the left edge, in columns (eg. 1) or percent of the screen (eg. 10%)
         #[clap(short, long)]
         x: Option<String>,
-        /// The y coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Distance from the top edge, in rows (eg. 1) or percent of the screen (eg. 10%)
         #[clap(short, long)]
         y: Option<String>,
-        /// The width if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Width in columns (eg. 80) or percent of the screen (eg. 50%)
         #[clap(long)]
         width: Option<String>,
-        /// The height if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
+        /// Height in rows (eg. 24) or percent of the screen (eg. 50%)
         #[clap(long)]
         height: Option<String>,
-        /// Whether to pin a floating pane so that it is always on top
+        /// Whether the pane stays on top of the other floating panes
         #[clap(long)]
         pinned: Option<bool>,
-        /// change this pane to be with/without a border (warning: will make it impossible to move with the
-        /// mouse if without a border)
+        /// Whether the pane is drawn with a frame (warning: a borderless pane cannot be moved with
+        /// the mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
     },
+    /// Toggle whether a pane is drawn with a frame
+    ///
+    /// Use `set-pane-borderless` to say which state you want rather than flipping whichever one
+    /// the pane is in.
     TogglePaneBorderless {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
         #[clap(short, long, value_parser)]
         pane_id: String,
     },
+    /// Set whether a pane is drawn with a frame, rather than toggling it
     SetPaneBorderless {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
         #[clap(short, long, value_parser)]
         pane_id: String,
         /// Whether the pane should be borderless (flag present) or bordered (flag absent)
@@ -3181,38 +3385,41 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         #[clap(long, value_parser)]
         border_style: Option<String>,
     },
-    /// Detach from the current session
+    /// Detach every client from this session, leaving the session running
     Detach,
-    /// Switch the theme to dark (uses configured `theme_dark`).
+    /// Switch every client to the configured `theme_dark`
     SetDarkTheme,
-    /// Switch the theme to light (uses configured `theme_light`).
+    /// Switch every client to the configured `theme_light`
     SetLightTheme,
-    /// Toggle between dark and light themes (used configured `theme_dark` and `theme_light`)
+    /// Switch every client between the configured `theme_dark` and `theme_light`
     ToggleTheme,
     #[clap(about = "Close the information popups (such as `zellij prompt notify`) shown to you")]
     DismissInfoPopups,
     #[clap(about = "Open the right-click menu for the focused pane, at that pane's position")]
     OpenContextMenu,
-    /// Switch to a different session
+    /// Move the clients of this session to another session, creating it if it is not running
     SwitchSession {
-        /// Name of the session to switch to
+        /// The session to switch to, as `zellij ls` names it
         name: String,
-        /// Optional tab position to focus
+        /// A 1-based tab position to focus in the session being switched to
         #[clap(long)]
         tab_position: Option<usize>,
-        /// Optional pane ID to focus (eg. "terminal_1" for terminal pane with id 1, or "plugin_2" for plugin pane with id 2)
+        /// A pane to focus in the session being switched to: terminal_1, plugin_2, or a bare
+        /// integer. A handle or a uuid is refused here - it names a pane against this session, not
+        /// that one, and there is no way to ask that one
         #[clap(long)]
         pane_id: Option<String>,
-        /// Layout to apply when switching to the session (relative paths start at layout-dir)
+        /// A layout to build the session from, if it is not already running: a name in the layout
+        /// directory, or a path to a file
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]
         layout: Option<PathBuf>,
-        /// Raw KDL layout string to use directly
+        /// A KDL layout as a string, instead of a file to read it from
         #[clap(long, value_parser, conflicts_with = "layout")]
         layout_string: Option<String>,
-        /// Default folder to look for layouts
+        /// Where to look for the --layout name, overriding the configured layout directory
         #[clap(long, value_parser, requires("layout"))]
         layout_dir: Option<PathBuf>,
-        /// Change the working directory when switching
+        /// The working directory the session's panes start in, if it is not already running
         #[clap(short, long, value_parser)]
         cwd: Option<PathBuf>,
         #[clap(
@@ -3221,19 +3428,22 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
         )]
         close_current: bool,
     },
-    /// Set the default foreground/background color of a pane
+    /// Set a pane's default foreground and background colour
+    ///
+    /// The colours a program in the pane sets for itself still win; this is the ground it draws on.
     SetPaneColor {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3).
-        /// Defaults to $ZELLIJ_PANE_ID if not provided.
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. Without this, the pane named by $ZELLIJ_PANE_ID - which
+        /// is the pane the command runs in, and unset outside a pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
-        /// Foreground color (e.g. "#00e000", "rgb:00/e0/00")
+        /// Foreground colour (e.g. "#00e000", "rgb:00/e0/00")
         #[clap(long, value_parser)]
         fg: Option<String>,
-        /// Background color (e.g. "#001a3a", "rgb:00/1a/3a")
+        /// Background colour (e.g. "#001a3a", "rgb:00/1a/3a")
         #[clap(long, value_parser)]
         bg: Option<String>,
-        /// Reset pane colors to terminal defaults
+        /// Drop both colours, so the pane draws on the terminal's own defaults
         #[clap(long, value_parser, conflicts_with_all(&["fg", "bg"]))]
         reset: bool,
     },
@@ -4817,6 +5027,16 @@ mod tests {
         // the negative control: no other verb has a pipe deadline to give up
         let mut other = parse_action(&["new-pane"]);
         assert_eq!(other.take_pipe_timeout(), None);
+    }
+
+    #[test]
+    fn agent_change_wait_accepts_no_target_and_repeated_targets() {
+        assert!(
+            matches!(parse_action(&["wait", "--for", "agent-change"]), CliAction::Wait { wait_for: WaitFor::AgentChange, panes, pane_id, .. } if panes.is_empty() && pane_id.is_empty())
+        );
+        assert!(
+            matches!(parse_action(&["wait", "--for", "agent-change", "--pane", "sunny-otter", "--pane", "quiet-fox"]), CliAction::Wait { panes, .. } if panes == ["sunny-otter", "quiet-fox"])
+        );
     }
 
     fn wait_bounds(args: &[&str]) -> (WaitFor, u64, u64) {

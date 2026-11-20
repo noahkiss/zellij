@@ -546,24 +546,6 @@ pub(crate) struct Tab {
     pub panes_with_pending_bell: HashSet<PaneId>,
     pub pending_pane_signals: Vec<(PaneId, Vec<crate::attention::PaneSignal>)>,
     initial_attention_muted: Option<bool>,
-    pub tab_has_pending_bell: bool,
-    pub tab_bell_flash: bool, // currently in mid-notification-flash
-    pub tab_bell_ring: bool,  // need to send ANSI BEL to the controlling terminal
-    tab_visible: bool,
-    popups: HashMap<ClientId, Vec<popup::Popup>>,
-    live_views: crate::pane_mirror::SharedLiveViews,
-}
-
-// FIXME: Use a struct that has a pane_type enum, to reduce all of the duplication
-pub trait Pane {
-    fn x(&self) -> usize;
-    fn y(&self) -> usize;
-    fn rows(&self) -> usize;
-    fn cols(&self) -> usize;
-    fn get_content_x(&self) -> usize;
-    fn get_content_y(&self) -> usize;
-    fn get_content_columns(&self) -> usize;
-    fn get_content_rows(&self) -> usize;
     /// Panes that rang again while they were focused and already showing a bell. Drained by
     /// `Screen` to restart the `bell_clear_delay_ms` dwell.
     panes_that_rang_while_focused: Vec<PaneId>,
@@ -573,6 +555,19 @@ pub trait Pane {
     tab_visible: bool,
     popups: HashMap<ClientId, Vec<popup::Popup>>,
     live_views: crate::pane_mirror::SharedLiveViews,
+}
+
+// FIXME: Use a struct that has a pane_type enum, to reduce all of the duplication
+/// fork addition: a terminal pane's prompt, as `send-message`'s guard reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPrompt {
+    pub program_status: Option<zellij_utils::data::PaneProgramStatus>,
+    /// Text a person typed is waiting in the prompt unsent.
+    pub draft_pending: bool,
+    /// A message the session typed in waits for the program to report it took it up.
+    pub message_pending: bool,
+    /// How long since a key last reached the pane.
+    pub since_input: Option<std::time::Duration>,
 }
 
 pub trait Pane {
@@ -5601,6 +5596,7 @@ impl Tab {
                 self.pending_pane_signals
                     .push((PaneId::Terminal(pid), pane_signals));
             }
+            let agent_session = terminal_output.drain_agent_session();
             for message in messages_to_pty {
                 self.write_to_pane_id_without_preprocessing(message, PaneId::Terminal(pid))
                     .with_context(err_context)?;
@@ -5647,6 +5643,11 @@ impl Tab {
                     .send_to_screen(ScreenInstruction::PromptReturnedInPane {
                         pane_id: PaneId::Terminal(pid),
                     });
+            }
+            if let Some(session_id) = agent_session {
+                let _ = self
+                    .senders
+                    .send_to_pty(PtyInstruction::AgentSessionFromOsc(pid, session_id));
             }
         }
         Ok(())

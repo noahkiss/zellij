@@ -1,3 +1,4 @@
+use crate::agent_detect::PaneAgent;
 use crate::home::default_layout_dir;
 use crate::input::actions::{Action, RunCommandAction};
 use crate::input::config::{ConversionError, KdlError};
@@ -6,7 +7,7 @@ use crate::input::layout::{
     Layout, PercentOrFixed, Run, RunPlugin, RunPluginLocation, RunPluginOrAlias,
 };
 pub use crate::input::options::PaneFrameStyle;
-use crate::pane_size::PaneGeom;
+use crate::pane_size::{PaneGeom, Size};
 use crate::position::Position;
 use crate::shared::{
     colors as ansi_colors, default_theme_colors as default_colors, eightbit_to_rgb,
@@ -3617,39 +3618,6 @@ pub struct PaneInfo {
     pub is_selectable: bool,
     /// Grouped panes (usually through an explicit user action) that are staged for a bulk action
     /// the index is kept track of in order to preserve the pane group order
-    pub index_in_pane_group: BTreeMap<ClientId, usize>,
-    /// The default foreground color of this pane, if set (e.g. "#00e000")
-    pub default_fg: Option<String>,
-    /// The default background color of this pane, if set (e.g. "#001a3a")
-    pub default_bg: Option<String>,
-    pub nested_session_name: Option<String>,
-    pub attention: crate::attention::PaneAttention,
-    pub command_state: crate::attention::CommandState,
-    pub program_status: Vec<crate::attention::ProgramStatusRecord>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct PaneListEntry {
-    #[serde(flatten)]
-    pub pane_info: PaneInfo,
-    pub tab_id: usize,
-    pub tab_position: usize,
-    pub tab_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_command: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pane_cwd: Option<String>,
-}
-
-pub type ListPanesResponse = Vec<PaneListEntry>;
-pub type ListTabsResponse = Vec<TabInfo>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct ClientInfo {
-    pub client_id: ClientId,
-    pub pane_id: PaneId,
-    pub running_command: String,
-    pub is_current_client: bool,
     ///
     /// NOTE: this is the multi-select grouping feature (eg. `TogglePaneInGroup`), it is per-client
     /// and empty unless the user explicitly marked panes for a bulk action. It has nothing to do
@@ -3791,6 +3759,65 @@ pub enum PaneCommandState {
     Done,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PaneListEntry {
+    #[serde(flatten)]
+    pub pane_info: PaneInfo,
+    /// The tab's 0-indexed position. Its stable id is `pane_info.tab_id`, which this row used to
+    /// carry itself - two `tab_id` keys in one flattened object is one too many.
+    pub tab_position: usize,
+    pub tab_name: String,
+    /// The coding agent running in this pane, if one is.
+    ///
+    /// Absent for every pane that is not running a harness this build recognises, and absent
+    /// entirely when `detect_agents` is off. It lives here rather than on `PaneInfo` on purpose:
+    /// the readers are `list-panes`, `list-agents` and the MCP server, all of them on this side of
+    /// the plugin contract, and a field on `PaneInfo` would cost a protobuf tag to tell them
+    /// something they can already be told for free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<PaneAgent>,
+    /// What the pane's shell says it is doing, from its OSC 133 markers.
+    ///
+    /// Absent for a plugin pane, and for a terminal pane whose shell emits no markers - which is
+    /// the honest answer rather than a guess. Like `agent`, it lives on this CLI-only row rather
+    /// than on `PaneInfo`, whose readers would each cost a protobuf tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_state: Option<PaneCommandState>,
+    /// The exit code the last command reported, when `command_state` is `done` and the shell put
+    /// one in its end marker. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_command_exit_code: Option<i32>,
+    /// Input was typed into the pane after its shell last drew a prompt, so a `command_state` of
+    /// `prompt` is the prompt from BEFORE that input: the typed command has not started, or its
+    /// shell has not drawn the next prompt yet. Written only when `true`, and only for a pane whose
+    /// shell writes OSC 133 markers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_since_prompt: bool,
+    /// Input was typed into the pane after the program in it last reported its `state`, so that
+    /// state is from BEFORE the input: an agent told something new has not said yet that it took
+    /// it up. Written only when `true`, and only beside a `state`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_since_state: bool,
+    /// The command line the server typed at this restored shell's prompt under
+    /// `resurrect_commands "prefill"`, which nobody has touched since: pressing Enter runs it.
+    ///
+    /// Present only once the line is written, not while it waits for the shell's line editor.
+    /// Gone at the first input that reaches the pane by any route, and when the shell reports a
+    /// command start. `restored_from` marks every restored pane; this marks only the ones a
+    /// prefill is still waiting in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefilled_command: Option<String>,
+    /// fork addition: messages from other agents the session holds for this pane, waiting for the
+    /// agent to be idle and its prompt clear (`zellij action send-message`). Written only when
+    /// there are some.
+    #[serde(default, skip_serializing_if = "is_no_messages")]
+    pub queued_messages: usize,
+    /// What a program in the pane last said it is doing, over `OSC 7501`: the `state`, `state_*`
+    /// keys of [`PaneProgramStatus`], flattened onto the row. Absent when no program has reported.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<PaneProgramStatus>,
+}
+
 /// What a program in a pane last reported about itself with the Program Status Protocol, `OSC
 /// 7501`: one record, the most urgent the pane holds.
 ///
@@ -3847,9 +3874,15 @@ pub struct PaneProgramStatus {
     pub working: u32,
 }
 
+fn is_no_messages(count: &usize) -> bool {
+    *count == 0
+}
+
 fn is_zero_count(count: &u32) -> bool {
     *count == 0
 }
+
+pub type ListPanesResponse = Vec<PaneListEntry>;
 
 /// One pane's screen, in a `dump-screen` sweep of several: one JSON object per line.
 ///
@@ -3871,6 +3904,64 @@ pub struct PaneDump {
     /// What the pane is showing, exactly what a single-pane `dump-screen` would have printed.
     pub content: String,
 }
+
+/// One pane that is running a coding agent: `zellij action list-agents`.
+///
+/// A projection of [`PaneListEntry`] rather than a second walk of the session - the same pane
+/// list, filtered to the panes with an `agent`, carrying the fields a reader needs to address the
+/// pane and nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentListEntry {
+    /// Whether this row names the caller’s pane.
+    #[serde(default, rename = "self")]
+    pub is_self: bool,
+    /// The pane's two-word handle: its address, and what a reader should use to talk to it.
+    pub handle: String,
+    /// The pane's integer id, for a caller that already speaks in them.
+    pub pane_id: u32,
+    pub tab_id: usize,
+    pub tab_position: usize,
+    pub tab_name: String,
+    /// The pane's title, which several harnesses set to what they are working on.
+    pub title: String,
+    /// The harness, its session id if it exports one, and what the answer rests on.
+    #[serde(flatten)]
+    pub agent: PaneAgent,
+    /// The command line this row was decided on, so a wrong row is obvious rather than mysterious.
+    ///
+    /// Which of a pane's two lines that is depends on which one matched: the live argv for a pane
+    /// the process table has answered for, the line the pane was STARTED with otherwise. It is the
+    /// line detection used, not whichever one was handy - a column that exists to expose a wrong
+    /// row is no use if it can contradict the row it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// When the pane last produced output, in milliseconds since the epoch: the pane's
+    /// `last_output_at`. With `state_at`, how long the agent has gone without progress. Not part
+    /// of what `action watch` compares, because it moves with every frame an agent draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
+    /// What the agent last said it is doing over `OSC 7501`, flattened: `state`, `state_msg`,
+    /// `state_at` and the rest of [`PaneProgramStatus`]. Absent when it has said nothing.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<PaneProgramStatus>,
+    /// The session the agent runs in. Only `list-agents --all-sessions` fills it:
+    /// a one-session list is about the session it was asked of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// fork addition: messages the session holds for this agent, from the pane's
+    /// `queued_messages`. Never serialized here: `list-agents --json` writes it as `queued` on its
+    /// own row, and `action watch` keeps the keys it had.
+    #[serde(skip)]
+    pub queued_messages: usize,
+}
+
+pub type ListAgentsResponse = Vec<AgentListEntry>;
+
+pub type ListTabsResponse = Vec<TabInfo>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ClientInfo {
@@ -3896,6 +3987,19 @@ pub struct ClientInfo {
     pub tty: Option<String>,
 }
 
+/// One row of `zellij action list-clients --json`: the [`ClientInfo`] plugins receive, flattened,
+/// and what only the command line is told.
+///
+/// CLI-only, like [`PaneListEntry`]: a field here costs no protobuf tag and changes nothing a
+/// plugin sees, which a field on `ClientInfo` would.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClientListEntry {
+    #[serde(flatten)]
+    pub client: ClientInfo,
+    /// The rootshell tab this client is attached from: the `LC_ROOTSHELL_PANE` the client had in
+    /// its environment. Absent for a client that had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootshell_pane: Option<String>,
 }
 
 impl ClientInfo {

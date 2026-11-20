@@ -1,0 +1,37 @@
+# Fork additions; herdr's pinned manifest remains unchanged.
+# Question footer source: herdr codex.toml @ 87e5c13c6028df72405f63388dde585212ad3019.
+# Trust and rate-limit wording: operator brief, 2026-10-13; unverified live capture.
+id = "codex"
+version = "2026.10.13.1"
+min_engine_version = 3
+
+[[rules]]
+id = "question_submit_footer"
+state = "question"
+priority = 900
+region = "after_last_prompt_marker"
+visible_blocker = true
+any = [
+  { contains = ["enter to submit answer"] },
+  { contains = ["enter to submit all"] },
+]
+
+[[rules]]
+id = "rate_limit_model_switch"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+contains = ["approaching rate limits"]
+regex = ['(?mi)^\s*(?:›\s*)?1\.\s+[^\n]*switch', '(?mi)^\s*(?:›\s*)?2\.\s+[^\n]*keep', '(?mi)^\s*(?:›\s*)?3\.\s+[^\n]*(?:never|don.t show)', '(?i)enter[^\n]*(?:confirm|continue|select)[^\n]*\s*\z']
+not = [{ line_regex = ['^\s*›\s*(?:$|[^0-9\s])'] }]
+
+[[rules]]
+id = "hook_trust_review"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+contains = ["hooks", "trust"]
+regex = ['(?mi)^\s*(?:›\s*)?[1-9]\.\s+[^\n]+', '(?i)enter[^\n]*(?:confirm|continue)[^\n]*\s*\z']
+not = [{ line_regex = ['^\s*›\s*(?:$|[^0-9\s])'] }]

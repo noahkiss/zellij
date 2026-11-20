@@ -8,6 +8,22 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
+use crate::os_input_output::ClientOsApi;
+use regex::Regex;
+use uuid::Uuid;
+use zellij_utils::{
+    agent_detect,
+    cli::{PromptCli, PromptElementCli, SubscribeCli, SubscribeFormat},
+    data::{
+        ListAgentsResponse, OutsideClick, PaneCommandState, PaneDump, PaneId, PaneListEntry,
+        PaneProgramStatus, PaneTarget, PipePopupPlacement,
+    },
+    errors::prelude::*,
+    input::actions::Action,
+    ipc::{ClientToServerMsg, ExitReason, IpcReceiveError, ServerToClientMsg},
+    prompt::{self, ChoiceItem, PromptElement},
+};
+
 /// `--wait-ready` on a verb that makes a pane: how long to wait for the pane's shell, and how to
 /// open the connections the wait asks the session on.
 pub struct WaitReady<'a> {
@@ -1277,6 +1293,12 @@ enum ActionOutcome {
     Done(i32),
 }
 
+fn individual_messages_client(
+    os_input: &mut Box<dyn ClientOsApi>,
+    action: Action,
+    pane_id: Option<u32>,
+) -> ActionOutcome {
+    let is_blocking = action_answers_with_its_own_report(&action);
     let msg = ClientToServerMsg::Action {
         action,
         terminal_id: pane_id,
@@ -1290,52 +1312,65 @@ enum ActionOutcome {
             .map_err(|e| matches!(e, IpcReceiveError::Disconnected))
         {
             Ok((ServerToClientMsg::UnblockInputThread, _)) if !is_blocking => {
-                return None;
+                return ActionOutcome::Reported(Vec::new());
             },
             Ok((ServerToClientMsg::Log { lines: log_lines }, _)) => {
-                log_lines.iter().for_each(|line| println!("{line}"));
-                return None;
+                return ActionOutcome::Reported(log_lines);
             },
             Ok((ServerToClientMsg::LogError { lines: log_lines }, _)) => {
                 log_lines.iter().for_each(|line| eprintln!("{line}"));
-                return Some(2);
+                return ActionOutcome::Done(2);
             },
-            Ok((ServerToClientMsg::Exit { exit_reason }, _)) => match exit_reason {
-                ExitReason::Error(e) => {
-                    eprintln!("{}", e);
-                    return Some(2);
-                },
-                ExitReason::CustomExitStatus(exit_status) => {
-                    return Some(exit_status);
-                },
-                _ => {
-                    return None;
-                },
+            Ok((ServerToClientMsg::Exit { exit_reason }, _)) => {
+                let (outcome, diagnostic) = outcome_of_exit(exit_reason);
+                if let Some(diagnostic) = diagnostic {
+                    eprintln!("{}", diagnostic);
+                }
+                return outcome;
             },
+            // fork: a dropped connection is the same unknown as a `Disconnect` - the command may
+            // have run - so it gets that answer and exit 1, not a miss a caller would resend on
             Err(true) => {
-                eprintln!("The session closed the connection before the action finished.");
-                return Some(2);
+                let (outcome, diagnostic) = outcome_of_exit(ExitReason::Disconnect);
+                if let Some(diagnostic) = diagnostic {
+                    eprintln!("{}", diagnostic);
+                }
+                return outcome;
             },
             _ => {},
         }
     }
 }
 
-pub fn start_subscribe_client(
-    os_input: Box<dyn ClientOsApi>,
-    session_name: &str,
-    subscribe_cli: SubscribeCli,
-) {
-    let zellij_ipc_pipe: PathBuf = {
-        let sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
-        fs::create_dir_all(&sock_dir).unwrap();
-        zellij_utils::shared::set_permissions(&sock_dir, 0o700).unwrap();
-        zellij_utils::sessions::resolve_session_socket_path(session_name)
-            .unwrap_or_else(|| sock_dir.join(session_name))
-    };
-    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
-        eprintln!("{}", crate::connect_error_message(e));
+/// What an `Exit` from the session means for the command that is waiting for its report, and the
+/// sentence to print on stderr before returning it.
+///
+/// A **disconnect is not an answer**. The session hands one to a client whose sender it dropped,
+/// which happens to a `zellij action` client that has done nothing wrong: client ids are reused as
+/// soon as they are freed, so a connection can be torn down by the departure of the one before it.
+/// Reading that as "the session reported nothing" is what made `new-pane` print `No pane
+/// was created` for a pane the session had made and confirmed. The command may well have run, so
+/// the honest answer is to say the connection went and let the caller ask.
+///
+/// The rest keep their meanings: an error is the server's own words and the one exit code the
+/// client has for them, a custom status is the status, and an ordinary end of the session is a
+/// command that reported nothing.
+fn outcome_of_exit(exit_reason: ExitReason) -> (ActionOutcome, Option<String>) {
+    match exit_reason {
+        ExitReason::Error(e) => (ActionOutcome::Done(2), Some(e)),
+        ExitReason::CustomExitStatus(exit_status) => (ActionOutcome::Done(exit_status), None),
+        ExitReason::Disconnect => (
+            ActionOutcome::Done(1),
+            Some(
+                "The session dropped this connection before it answered. Whether the command ran \
+                 is unknown; ask the session before sending it again."
+                    .to_owned(),
+            ),
+        ),
+        _ => (ActionOutcome::Reported(Vec::new()), None),
+    }
+}
+
 /// The pane a creating command's report says it made.
 /// A creation report with `--wait-ready`'s two lines added: which signal said the pane was ready,
 /// and how long after it was made.
@@ -1545,6 +1580,29 @@ pub fn start_wait_client(
     }
 }
 
+/// `zellij action list-agents`: the panes running a coding agent.
+///
+/// Answered by the client, from one `list-panes --json`. The pane list already carries the
+/// detection on every entry, so this is a filter and a printer - which is what keeps `list-agents`
+/// off the client/server contract entirely.
+///
+/// Returns the process exit status: 0 answered - an empty list is still an answer - and 1 for a
+/// call the session could not carry out.
+pub fn start_list_agents_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    output_json: bool,
+) -> i32 {
+    let agents = match agents_of_session(os_input, session_name) {
+        Ok(answer) => answer,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    print_agents(&agents, output_json, false)
+}
+
 /// `zellij action last-reply`: the agent's last reply, from its harness's transcript.
 ///
 /// The pane is resolved the way every addressed verb resolves one. Its row in the agent list
@@ -1676,6 +1734,42 @@ fn last_reply_of(
     })
 }
 
+/// `zellij action list-agents --all-sessions`: the same rows, from every live session, each
+/// carrying the session it came from.
+///
+/// One `list-panes --json` per session, each on its own connection. A session that does not
+/// answer is named on stderr and left out rather than failing the rest: the question is about
+/// the machine, and one wedged server should not hide every other agent on it. Exit 1 only when
+/// there were sessions and none of them answered.
+pub fn start_list_agents_all_sessions_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_names: &[String],
+    output_json: bool,
+) -> i32 {
+    let (agents, answered) = agents_of_sessions(make_os_input, session_names);
+    if answered == 0 && !session_names.is_empty() {
+        return 1;
+    }
+    print_agents(&agents, output_json, true)
+}
+
+fn active_agents(panes: Vec<PaneListEntry>) -> ListAgentsResponse {
+    agent_detect::agents_from_pane_list(
+        panes
+            .into_iter()
+            .filter(|pane| !pane.pane_info.exited && !pane.pane_info.is_held)
+            .collect(),
+    )
+}
+
+fn agent_change_snapshot(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    filter: Option<&[u32]>,
+) -> Result<ListAgentsResponse, String> {
+    agent_snapshot(make_os_input, session_name, filter)
+}
+
 /// The agents of one session as a teardown sees them. `zellij session restart` and `session down` ask this before they
 /// kill anything: the rows of `list-agents`, the caller's own pane marked, and the screen
 /// detector's `blocked` where an agent reported no state.
@@ -1684,6 +1778,190 @@ pub fn agents_before_teardown(
     session_name: &str,
 ) -> Result<ListAgentsResponse, String> {
     agent_snapshot(make_os_input, session_name, None)
+}
+
+fn agent_snapshot(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    filter: Option<&[u32]>,
+) -> Result<ListAgentsResponse, String> {
+    let panes = panes_of_session(make_os_input(), session_name)?;
+    let mut agents = active_agents(panes);
+    agent_detect::mark_self(
+        &mut agents,
+        std::env::var("ZELLIJ_PANE_ID")
+            .ok()
+            .and_then(|id| id.parse().ok()),
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session_name),
+    );
+    if let Some(panes) = filter {
+        agents.retain(|agent| {
+            if panes.is_empty() {
+                !agent.is_self
+            } else {
+                panes.contains(&agent.pane_id)
+            }
+        });
+    }
+    for agent in &mut agents {
+        if agent.program_status.is_none() {
+            if let Ok(lines) = ask(
+                make_os_input(),
+                session_name,
+                Action::DumpScreen {
+                    file_path: None,
+                    include_scrollback: false,
+                    pane_id: Some(PaneId::Terminal(agent.pane_id)),
+                    ansi: false,
+                },
+                "the agent screen",
+            ) {
+                if agent_detect::screen_agent_blocked(&lines.join("\n")) {
+                    agent.program_status = Some(zellij_utils::data::PaneProgramStatus {
+                        state: "blocked".into(),
+                        kind: Some("question".into()),
+                        app: None,
+                        title: None,
+                        msg: None,
+                        progress: None,
+                        at: 0,
+                        working: 0,
+                    });
+                }
+            }
+        }
+    }
+    Ok(agents)
+}
+
+fn enrich_agent_change(change: &mut agent_detect::AgentChange, agents: &ListAgentsResponse) {
+    let var = |key: &str| std::env::var(key).ok();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    enrich_agent_change_from(change, agents, &var, home.as_deref());
+}
+
+fn enrich_agent_change_from(
+    change: &mut agent_detect::AgentChange,
+    agents: &ListAgentsResponse,
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
+) {
+    if (change.old_state != change.new_state
+        && matches!(
+            change.new_state.as_deref(),
+            Some("idle" | "done" | "error" | "blocked")
+        ))
+        || change.event == "gone"
+    {
+        let scoped = agents
+            .iter()
+            .filter(|agent| agent.session == change.session)
+            .cloned()
+            .collect();
+        change.last_reply = last_reply_of(&scoped, PaneId::Terminal(change.pane_id), var, home)
+            .ok()
+            .and_then(|reply| {
+                reply
+                    .reply
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::to_owned)
+            });
+    }
+}
+
+fn agent_snapshot_answer<T>(
+    receiver: std::sync::mpsc::Receiver<T>,
+    deadline: Option<Instant>,
+) -> Result<T, String> {
+    match deadline {
+        Some(end) => receiver
+            .recv_timeout(end.saturating_duration_since(Instant::now()))
+            .map_err(|_| "Agent-change wait timed out".to_owned()),
+        None => receiver
+            .recv()
+            .map_err(|_| "Agent-change snapshot ended".to_owned()),
+    }
+}
+
+/// Block until a watched agent changes. The caller is excluded only for an unscoped wait.
+pub fn start_agent_change_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    panes: &[u32],
+    timeout: Option<Duration>,
+    output_json: bool,
+) -> i32 {
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let snapshot = || {
+        let input = make_os_input();
+        let session = session_name.to_owned();
+        let panes = panes.to_vec();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(agent_change_snapshot(
+                &|| input.box_clone(),
+                &session,
+                Some(&panes),
+            ));
+        });
+        agent_snapshot_answer(receiver, deadline)?
+    };
+    let mut previous = match snapshot() {
+        Ok(agents) => agents,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 2;
+        },
+    };
+    loop {
+        if deadline.map(|end| Instant::now() >= end).unwrap_or(false) {
+            eprintln!("Agent-change wait timed out");
+            return 2;
+        }
+        std::thread::sleep(
+            Duration::from_millis(100).min(
+                deadline
+                    .map(|end| end.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::from_millis(100)),
+            ),
+        );
+        let current = match snapshot() {
+            Ok(agents) => agents,
+            Err(message) => {
+                eprintln!("{}", message);
+                return 2;
+            },
+        };
+        if deadline.map(|end| Instant::now() >= end).unwrap_or(false) {
+            eprintln!("Agent-change wait timed out");
+            return 2;
+        }
+        if let Some(mut change) = agent_detect::agent_changes(&previous, &current)
+            .into_iter()
+            .next()
+        {
+            let source = if change.event == "gone" {
+                &previous
+            } else {
+                &current
+            };
+            enrich_agent_change(&mut change, source);
+            if output_json {
+                println!("{}", serde_json::to_string(&change).unwrap());
+            } else {
+                println!(
+                    "handle: {}\npane_id: {}\ntab_id: {}\ntab_name: {}\nkind: {}\nname: {}\nold_state: {}\nnew_state: {}\nevent: {}\nsession: {}\nlast_reply: {}",
+                    change.handle, change.pane_id, change.tab_id, change.tab_name, change.kind,
+                    change.name.as_deref().unwrap_or("-"), change.old_state.as_deref().unwrap_or("-"),
+                    change.new_state.as_deref().unwrap_or("-"), change.event,
+                    change.session.as_deref().unwrap_or("-"), change.last_reply.as_deref().unwrap_or("-")
+                );
+            }
+            return 0;
+        }
+        previous = current;
+    }
 }
 
 /// How long a session event stream waits for its `hello` before calling the server too old. A
@@ -1804,6 +2082,291 @@ pub fn start_watch_client(os_input: Box<dyn ClientOsApi>, session_name: &str) ->
             2
         },
     }
+}
+
+/// Show the caller's pane and its session's live agents.
+pub fn start_whoami_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    output_json: bool,
+) -> i32 {
+    if std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .as_deref()
+        .is_some_and(|own_session| own_session != session_name)
+    {
+        eprintln!("whoami must target the caller's own session");
+        return 2;
+    }
+    let caller = match std::env::var("ZELLIJ_PANE_ID").ok().and_then(|id| {
+        id.strip_prefix("terminal_")
+            .unwrap_or(&id)
+            .parse::<u32>()
+            .ok()
+    }) {
+        Some(id) => id,
+        None => {
+            eprintln!("whoami needs ZELLIJ_PANE_ID from a terminal pane");
+            return 2;
+        },
+    };
+    let panes = match panes_of_session(os_input, session_name) {
+        Ok(panes) => panes,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    let pane = match panes
+        .iter()
+        .find(|p| !p.pane_info.is_plugin && p.pane_info.id == caller)
+    {
+        Some(pane) => pane,
+        None => {
+            eprintln!("whoami could not find the caller's pane in this session");
+            return 2;
+        },
+    };
+    let report = whoami_report(
+        session_name,
+        zellij_utils::shared::short_hostname(),
+        pane,
+        &panes,
+    );
+    if output_json {
+        println!("{}", serde_json::to_string(&report).unwrap_or_default());
+    } else {
+        println!("{}", whoami_text(&report));
+    }
+    0
+}
+
+fn whoami_report(
+    session: &str,
+    host: &str,
+    pane: &PaneListEntry,
+    panes: &[PaneListEntry],
+) -> serde_json::Value {
+    let others = agent_detect::agents_from_pane_list(panes.to_vec())
+        .into_iter()
+        .filter(|agent| agent.pane_id != pane.pane_info.id)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "session": session, "host": host,
+        "pane_id": format!("terminal_{}", pane.pane_info.id),
+        "handle": pane.pane_info.handle,
+        "tab_id": pane.pane_info.tab_id, "tab_name": pane.tab_name,
+        "tab_position": pane.tab_position,
+        "name": pane.agent.as_ref().and_then(|agent| agent.name.as_deref()),
+        "agents": others,
+    })
+}
+
+fn whoami_text(report: &serde_json::Value) -> String {
+    let string = |key: &str| report[key].as_str().unwrap_or("unnamed");
+    let mut lines = vec![format!(
+        "You are {} in session {} on {}, tab {} (position {}), pane {} ({}).",
+        string("name"),
+        string("session"),
+        string("host"),
+        string("tab_name"),
+        report["tab_position"],
+        string("handle"),
+        string("pane_id")
+    )];
+    if let Some(agents) = report["agents"].as_array() {
+        for agent in agents {
+            lines.push(format!(
+                "Agent {}: {}, tab {}, pane {}, state {}.",
+                agent["name"].as_str().unwrap_or("unnamed"),
+                agent["kind"].as_str().unwrap_or("unknown"),
+                agent["tab_name"].as_str().unwrap_or(""),
+                agent["handle"].as_str().unwrap_or(""),
+                agent["state"].as_str().unwrap_or("unknown")
+            ));
+        }
+    }
+    lines.push("Agent list changes; run `zellij list-agents` before addressing another agent. To talk to an agent that has a name, message it by that name with your harness's messaging tool; type into its pane only when it has no messaging.".into());
+    lines.join("\n")
+}
+
+/// The agents of one session.
+fn agents_of_session(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<ListAgentsResponse, String> {
+    let panes = panes_of_session(os_input, session_name)?;
+    let mut agents = agent_detect::agents_from_pane_list(panes);
+    agent_detect::mark_self(
+        &mut agents,
+        std::env::var("ZELLIJ_PANE_ID")
+            .ok()
+            .and_then(|id| id.parse().ok()),
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session_name),
+    );
+    Ok(agents)
+}
+
+fn panes_of_session(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<Vec<PaneListEntry>, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ListPanes {
+            show_tab: true,
+            show_command: true,
+            show_state: false,
+            show_geometry: false,
+            show_all: false,
+            output_json: true,
+        },
+        "the panes of this session",
+    )?;
+    // a session that answered with something other than a pane list is a bug rather than a
+    // miss, so it is an error and says what it could not read
+    serde_json::from_str(&lines.join("\n")).map_err(|e| {
+        format!(
+            "Could not read the pane list session '{}' answered with: {}",
+            session_name, e
+        )
+    })
+}
+
+/// The agents of several sessions, each row naming its session, and how many sessions
+/// answered. A session that did not answer is named on stderr.
+fn agents_of_sessions(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_names: &[String],
+) -> (ListAgentsResponse, usize) {
+    let mut agents = Vec::new();
+    let mut answered = 0;
+    for session_name in session_names {
+        match agents_of_session(make_os_input(), session_name) {
+            Ok(session_agents) => {
+                answered += 1;
+                agents.extend(session_agents.into_iter().map(|mut agent| {
+                    agent.session = Some(session_name.clone());
+                    agent
+                }));
+            },
+            Err(message) => eprintln!("session '{}': {}", session_name, message),
+        }
+    }
+    (agents, answered)
+}
+
+/// One `list-agents --json` row: the agent, and how a caller reaches it to send it a message.
+///
+/// The keys after the agent's own are read from its transcript on this machine (see
+/// [`crate::agent_reply::ChatMeta`]), so they are a client-side addition like the rest of the row.
+/// They are JSON-only: the table keeps its columns, and `action watch` never sees them.
+#[derive(serde::Serialize)]
+struct AgentRow<'a> {
+    #[serde(flatten)]
+    agent: &'a zellij_utils::data::AgentListEntry,
+    /// The address a harness's messaging tool takes, from any machine: `bridge:session_<X>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_to: Option<String>,
+    /// `harness` when `message_to` is there; `pane` when the way in is typing into the pane.
+    message_route: &'static str,
+    /// When the chat began, in milliseconds since the epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_started_at: Option<u64>,
+    /// Messages from other agents the session holds for this one (`send-message`). Written only
+    /// when there are some.
+    #[serde(skip_serializing_if = "is_no_count")]
+    queued: usize,
+}
+
+fn is_no_count(count: &usize) -> bool {
+    *count == 0
+}
+
+/// How long `list-agents --json` waits for transcripts, all agents together. A row whose
+/// transcript was not read in time goes out without its chat keys rather than holding the list.
+const CHAT_META_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The rows with their chat keys, the transcripts read on a thread of their own and given at most
+/// `budget`.
+fn agent_rows<'a>(
+    agents: &'a ListAgentsResponse,
+    var: &dyn Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
+    budget: Duration,
+) -> Vec<AgentRow<'a>> {
+    let mut metas: Vec<crate::agent_reply::ChatMeta> = vec![Default::default(); agents.len()];
+    let wanted: Vec<(usize, String, Option<PathBuf>)> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| agent.agent.kind == "claude")
+        .filter_map(|(at, agent)| {
+            let id = agent.agent.agent_id.clone()?;
+            Some((at, id, agent.cwd.clone()))
+        })
+        .collect();
+    let root = crate::agent_reply::transcript_root("claude", var, home);
+    if let (false, Some(root)) = (wanted.is_empty(), root) {
+        let (sender, receiver) = mpsc::channel();
+        // detached: a read that hangs is abandoned with the thread when the list is printed
+        std::thread::spawn(move || {
+            for (at, id, cwd) in wanted {
+                let meta = crate::agent_reply::find_claude_transcript(&root, &id, cwd.as_deref())
+                    .map(|path| crate::agent_reply::chat_meta(&path))
+                    .unwrap_or_default();
+                if sender.send((at, meta)).is_err() {
+                    return;
+                }
+            }
+        });
+        let deadline = Instant::now() + budget;
+        while let Ok((at, meta)) =
+            receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            metas[at] = meta;
+        }
+    }
+    agents
+        .iter()
+        .zip(metas)
+        .map(|(agent, meta)| AgentRow {
+            agent,
+            message_route: if meta.message_to.is_some() {
+                "harness"
+            } else {
+                "pane"
+            },
+            message_to: meta.message_to,
+            chat_started_at: meta.started_at,
+            queued: agent.queued_messages,
+        })
+        .collect()
+}
+
+fn print_agents(agents: &ListAgentsResponse, output_json: bool, with_session: bool) -> i32 {
+    if output_json {
+        let var = |name: &str| std::env::var(name).ok();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let rows = agent_rows(agents, &var, home.as_deref(), CHAT_META_BUDGET);
+        match serde_json::to_string_pretty(&rows) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Could not write the agent list as JSON: {}", e);
+                return 1;
+            },
+        }
+    } else {
+        let table = if with_session {
+            agent_detect::agent_table_with_sessions(agents)
+        } else {
+            agent_detect::agent_table(agents)
+        };
+        for line in table {
+            println!("{}", line);
+        }
+    }
+    0
 }
 
 /// What one question got, on a connection that is about to be asked another.
@@ -2535,6 +3098,289 @@ pub fn start_subscribe_client(
     }
 
     os_input.send_to_server(ClientToServerMsg::ClientExited);
+}
+
+/// fork addition: what `zellij action send-message` was asked to do.
+pub struct SendMessageRequest {
+    pub to: Option<String>,
+    pub reply_to: Option<String>,
+    pub text: String,
+    pub expire_s: u64,
+    pub wait_s: Option<u64>,
+    pub from: Option<String>,
+    pub from_name: Option<String>,
+    pub json: bool,
+}
+
+/// fork addition: `zellij action send-message`.
+///
+/// Resolves the target against the agents of `sessions` (or, for a reply, against the session the
+/// answered message came from), then hands the message to that session's server, which types it in
+/// or holds it. See `zellij_utils::agent_mail`.
+///
+/// Exit 0 for `delivered` and `queued`. Exit 2 for `refused`, `expired`, and a target that names no
+/// agent, several, or a pane without one. Exit 1 for a session that could not be asked.
+pub fn start_send_message_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    own_session: Option<&str>,
+    sessions: &[String],
+    request: SendMessageRequest,
+) -> i32 {
+    use zellij_utils::agent_mail::{Address, Status};
+    let text = if request.text == "-" {
+        let mut text = String::new();
+        if let Err(e) = io::Read::read_to_string(&mut io::stdin(), &mut text) {
+            eprintln!("Could not read the message from stdin: {}", e);
+            return 1;
+        }
+        text
+    } else {
+        request.text.clone()
+    };
+    if text.trim().is_empty() {
+        eprintln!("The message is empty.");
+        return 2;
+    }
+    let (target, scope): (String, Vec<String>) = match (&request.reply_to, &request.to) {
+        (_, Some(to)) => (to.clone(), sessions.to_vec()),
+        (Some(id), None) => {
+            let Some(own) = own_session else {
+                eprintln!(
+                    "--reply-to looks the message up in the session that delivered it: run it inside that session, or pass --session."
+                );
+                return 2;
+            };
+            let record = match message_records(make_os_input(), own, Some(id)) {
+                Ok(mut records) if !records.is_empty() => records.remove(0),
+                Ok(_) => {
+                    eprintln!("No message '{}' in session '{}'.", id, own);
+                    return 2;
+                },
+                Err(message) => {
+                    eprintln!("{}", message);
+                    return 2;
+                },
+            };
+            let Some(address) = Address::parse(&record.from) else {
+                eprintln!(
+                    "Message {} carries no address to reply to: '{}'.",
+                    id, record.from
+                );
+                return 2;
+            };
+            if !address.host.is_empty() && !is_this_host(&address.host) {
+                eprintln!(
+                    "Message {} came from {}, which is another machine. Reply with zellij_send reply_to={}, or on that machine: zellij --session {} action send-message --to {} -- <text>",
+                    id, address.host, id, address.session, address.handle
+                );
+                return 2;
+            }
+            (address.handle, vec![address.session])
+        },
+        (None, None) => {
+            eprintln!("Pass --to <agent> or --reply-to <message id>.");
+            return 2;
+        },
+    };
+
+    // every pane of every session in scope, and the agents among them
+    let mut listed: Vec<(String, Vec<PaneListEntry>, ListAgentsResponse)> = Vec::new();
+    for session in &scope {
+        match panes_of_session(make_os_input(), session) {
+            Ok(panes) => {
+                let mut agents = active_agents(panes.clone());
+                // the caller is never the agent a word names; see `agent_send::resolve`
+                agent_detect::mark_self(
+                    &mut agents,
+                    std::env::var("ZELLIJ_PANE_ID")
+                        .ok()
+                        .and_then(|id| id.parse().ok()),
+                    std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref() == Some(session.as_str()),
+                );
+                listed.push((session.clone(), panes, agents));
+            },
+            Err(message) if scope.len() > 1 => eprintln!("session '{}': {}", session, message),
+            Err(message) => {
+                eprintln!("{}", message);
+                return 1;
+            },
+        }
+    }
+    let candidates: Vec<crate::agent_send::Candidate> = listed
+        .iter()
+        .flat_map(|(session, panes, agents)| {
+            panes
+                .iter()
+                .filter(|pane| !pane.pane_info.exited && !pane.pane_info.is_held)
+                .map(move |pane| crate::agent_send::Candidate {
+                    session: session.as_str(),
+                    pane,
+                    agent: agents.iter().find(|a| a.pane_id == pane.pane_info.id),
+                })
+        })
+        .collect();
+    let (session, terminal_id) = match crate::agent_send::resolve(&target, &candidates) {
+        crate::agent_send::Resolved::One {
+            session,
+            terminal_id,
+        } => (session, terminal_id),
+        crate::agent_send::Resolved::NotAgent { session, handle } => {
+            eprintln!(
+                "{}/{} runs no coding agent, so there is nobody to message. Type into it with zellij_write_input, or zellij action paste.",
+                session, handle
+            );
+            return 2;
+        },
+        crate::agent_send::Resolved::Nothing(lines) if lines.is_empty() => {
+            eprintln!(
+                "No agent answers to '{}': no coding agent runs in {}.",
+                target,
+                if scope.len() == 1 {
+                    format!("session '{}'", scope[0])
+                } else {
+                    "any session on this machine".to_owned()
+                }
+            );
+            return 2;
+        },
+        crate::agent_send::Resolved::Nothing(lines) => {
+            eprintln!("No agent answers to '{}'. The agents:", target);
+            lines.iter().for_each(|line| eprintln!("  {}", line));
+            return 2;
+        },
+        crate::agent_send::Resolved::Several(lines) => {
+            eprintln!(
+                "'{}' names {} agents; pass a handle, or session/handle:",
+                target,
+                lines.len()
+            );
+            lines.iter().for_each(|line| eprintln!("  {}", line));
+            return 2;
+        },
+    };
+
+    let (from, own_name) = match &request.from {
+        Some(from) => (from.clone(), None),
+        None => sender_address(make_os_input),
+    };
+    let action = Action::SendMessage {
+        terminal_id,
+        text,
+        from,
+        from_name: request.from_name.clone().or(own_name),
+        reply_to: request.reply_to.clone(),
+        expire_s: request.expire_s,
+    };
+    let mut record = match ask(make_os_input(), &session, action, "the message").and_then(|lines| {
+        serde_json::from_str::<zellij_utils::agent_mail::MessageRecord>(
+            lines.first().map(String::as_str).unwrap_or(""),
+        )
+        .map_err(|e| format!("Could not read the session's answer: {}", e))
+    }) {
+        Ok(record) => record,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 1;
+        },
+    };
+    if let (Some(wait_s), Status::Queued) = (request.wait_s, record.status) {
+        let deadline = Instant::now() + Duration::from_secs(wait_s);
+        while record.status == Status::Queued && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(500));
+            match message_records(make_os_input(), &session, Some(&record.id)) {
+                Ok(mut records) if !records.is_empty() => record = records.remove(0),
+                _ => break,
+            }
+        }
+    }
+    if request.json {
+        println!("{}", serde_json::to_string(&record).unwrap_or_default());
+    } else {
+        println!("{}", record.line());
+    }
+    match record.status {
+        Status::Delivered | Status::Queued => 0,
+        Status::Refused | Status::Expired => 2,
+    }
+}
+
+/// fork addition: `zellij action message-status`.
+pub fn start_message_status_client(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    id: Option<&str>,
+    output_json: bool,
+) -> i32 {
+    match message_records(os_input, session_name, id) {
+        Ok(records) => {
+            if output_json {
+                let json = match (id, records.first()) {
+                    (Some(_), Some(record)) => serde_json::to_string(record),
+                    _ => serde_json::to_string(&records),
+                };
+                println!("{}", json.unwrap_or_default());
+            } else {
+                records
+                    .iter()
+                    .for_each(|record| println!("{}", record.line()));
+            }
+            0
+        },
+        Err(message) => {
+            eprintln!("{}", message);
+            2
+        },
+    }
+}
+
+fn message_records(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    id: Option<&str>,
+) -> Result<Vec<zellij_utils::agent_mail::MessageRecord>, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::MessageStatus {
+            id: id.map(str::to_owned),
+        },
+        id.unwrap_or("the messages"),
+    )?;
+    serde_json::from_str(lines.first().map(String::as_str).unwrap_or("[]"))
+        .map_err(|e| format!("Could not read the session's messages: {}", e))
+}
+
+/// This pane's address, `host/session/handle`, and the name of the agent in it, from the
+/// environment zellij gives every pane. Outside a pane, `host/-/cli`.
+fn sender_address(make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>) -> (String, Option<String>) {
+    let host = zellij_utils::shared::short_hostname();
+    let session = std::env::var("ZELLIJ_SESSION_NAME").ok();
+    let pane_id: Option<u32> = std::env::var("ZELLIJ_PANE_ID")
+        .ok()
+        .and_then(|id| id.parse().ok());
+    let (Some(session), Some(pane_id)) = (session, pane_id) else {
+        return (format!("{}/-/cli", host), None);
+    };
+    let Ok(panes) = panes_of_session(make_os_input(), &session) else {
+        return (format!("{}/{}/terminal_{}", host, session, pane_id), None);
+    };
+    let pane = panes
+        .iter()
+        .find(|pane| !pane.pane_info.is_plugin && pane.pane_info.id == pane_id);
+    let handle = pane
+        .map(|pane| pane.pane_info.handle.clone())
+        .filter(|handle| !handle.is_empty())
+        .unwrap_or_else(|| format!("terminal_{}", pane_id));
+    let name = pane
+        .and_then(|pane| pane.agent.as_ref())
+        .and_then(|agent| agent.name.clone());
+    (format!("{}/{}/{}", host, session, handle), name)
+}
+
+/// Whether `host` names this machine: its short name, or a longer name that starts with it.
+fn is_this_host(host: &str) -> bool {
+    let local = zellij_utils::shared::short_hostname();
+    host == local || host.split('.').next() == Some(local)
 }
 
 #[cfg(test)]
@@ -3428,3 +4274,48 @@ mod tests {
     }
 }
 
+/// Attach the caller marker to JSON pane rows without changing the wire contract.
+fn pane_list_with_self(
+    lines: Vec<String>,
+    pane_id: Option<u32>,
+    same_session: bool,
+) -> Vec<String> {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&lines.join("\n")) else {
+        return lines;
+    };
+    let Some(rows) = value.as_array_mut() else {
+        return lines;
+    };
+    for row in rows {
+        let is_self = same_session
+            && pane_id.is_some()
+            && row.get("is_plugin").and_then(serde_json::Value::as_bool) != Some(true)
+            && pane_id.map(u64::from) == row.get("id").and_then(|id| id.as_u64());
+        if let Some(row) = row.as_object_mut() {
+            row.insert("self".into(), serde_json::Value::Bool(is_self));
+        }
+    }
+    serde_json::to_string_pretty(&value)
+        .map(|value| vec![value])
+        .unwrap_or(lines)
+}
+
+#[cfg(test)]
+mod pane_self_tests {
+    use super::*;
+    #[test]
+    fn json_panes_mark_only_the_callers_session_and_pane() {
+        let json = r#"[{"id":7},{"id":8},{"id":7,"is_plugin":true}]"#;
+        let rows: serde_json::Value =
+            serde_json::from_str(&pane_list_with_self(vec![json.into()], Some(7), true).join("\n"))
+                .unwrap();
+        assert_eq!(rows[0]["self"], true);
+        assert_eq!(rows[1]["self"], false);
+        assert_eq!(rows[2]["self"], false);
+        let rows: serde_json::Value = serde_json::from_str(
+            &pane_list_with_self(vec![json.into()], Some(7), false).join("\n"),
+        )
+        .unwrap();
+        assert_eq!(rows[0]["self"], false);
+    }
+}

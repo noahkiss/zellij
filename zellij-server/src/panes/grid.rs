@@ -651,6 +651,28 @@ pub fn create_horizontal_tabstops(columns: usize) -> BTreeSet<usize> {
     horizontal_tabstops
 }
 
+/// The id in `SetUserVar=agent_session=<base64>`, the payload of an `OSC 1337` an agent hook
+/// prints. `Some("")` for an empty value, which clears the pane's reported session.
+///
+/// `None` for any other user variable, a value that is not base64, or an id that is not a plain
+/// token: the id ends up as a word of a recorded command line, so only letters, digits and
+/// `-_.:` are accepted, at most 128 of them.
+pub fn parse_agent_session_user_var(raw: &[u8]) -> Option<String> {
+    use base64::Engine;
+    let s = std::str::from_utf8(raw).ok()?;
+    let value = s.strip_prefix("SetUserVar=agent_session=")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .ok()?;
+    let id = String::from_utf8(decoded).ok()?;
+    let id = id.trim();
+    let is_token = id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+    is_token.then(|| id.to_owned())
+}
+
 pub fn parse_osc7_path(raw: &[u8]) -> Option<std::path::PathBuf> {
     let s = std::str::from_utf8(raw).ok()?;
     let rest = s.strip_prefix("file://")?;
@@ -4336,6 +4358,14 @@ impl Grid {
         None
     }
 
+    /// fork addition: [`Grid::note_typed_input`], with the bytes, which the agent prompt's draft
+    /// follows for `send-message`'s guard.
+    pub fn note_typed_bytes(&mut self, bytes: &[u8]) {
+        self.note_typed_input();
+        self.program_status
+            .note_typed(bytes, std::time::Instant::now());
+    }
+
     /// fork addition: the command line `resurrect_commands "prefill"` typed at this restored
     /// shell's prompt, for as long as nobody has touched it since.
     ///
@@ -5619,19 +5649,30 @@ impl Handler for Grid {
                 }
             },
 
-            b"7501" => match crate::attention::program_status::parse(params, bell_terminated) {
-                Some(crate::attention::program_status::ProgramStatusMessage::Query) => {
-                    self.pending_messages_to_pty.push(
-                        crate::attention::program_status::query_reply(bell_terminated),
-                    );
-                },
-                Some(message) => {
-                    self.shell_reports
-                        .push(crate::attention::signals::PaneSignal::ProgramStatus(
-                            message,
-                        ));
-                },
-                None => {},
+            b"7501" => {
+                // fork: `read` is upstream's parser, plus a query with pairs after the `?`
+                match crate::program_status::read(params, bell_terminated) {
+                    Some(crate::attention::program_status::ProgramStatusMessage::Query) => {
+                        // fork addition: a program asks as it starts, so what the pane holds
+                        // came before it
+                        self.program_status.program_started();
+                        self.pending_messages_to_pty.push(
+                            crate::attention::program_status::query_reply(bell_terminated),
+                        );
+                    },
+                    Some(message) => {
+                        // fork addition: the same parsed report feeds the pane's own records,
+                        // which carry the flat `state*` keys and the guarded send's draft
+                        if let Some(fork_message) = crate::program_status::from_upstream(&message) {
+                            self.program_status
+                                .apply(fork_message, crate::program_status::now_ms());
+                        }
+                        self.shell_reports.push(
+                            crate::attention::signals::PaneSignal::ProgramStatus(message),
+                        );
+                    },
+                    None => {},
+                }
             },
 
             b"633" => {
@@ -5641,6 +5682,15 @@ impl Handler for Grid {
             },
 
             b"1337" => {
+                // fork addition: a coding agent's own hook reports the session it holds with
+                // `SetUserVar=agent_session=`, so a restore can resume exactly that one
+                if let Some(id) = params
+                    .get(1)
+                    .and_then(|raw| parse_agent_session_user_var(raw))
+                {
+                    self.pending_agent_session = Some(id);
+                    return;
+                }
                 if let Some(raw) = params.get(1).and_then(|p| str::from_utf8(p).ok()) {
                     if let Some(host) = raw.strip_prefix("RemoteHost=") {
                         self.shell_reports.iterm_remote_host = Some(host.to_owned());
@@ -7628,6 +7678,44 @@ fn is_selection_boundary_character(character: char, word_separators: &str) -> bo
 #[cfg(test)]
 #[path = "./unit/grid_tests.rs"]
 mod grid_tests;
+
+#[cfg(test)]
+mod agent_session_osc_tests {
+    use super::parse_agent_session_user_var;
+
+    #[test]
+    fn reads_the_agent_session_user_var() {
+        // base64("01a112dd-5b0e-7db3-964b-68a8a71304b1")
+        let raw = b"SetUserVar=agent_session=MDFhMTEyZGQtNWIwZS03ZGIzLTk2NGItNjhhOGE3MTMwNGIx";
+        assert_eq!(
+            parse_agent_session_user_var(raw).as_deref(),
+            Some("01a112dd-5b0e-7db3-964b-68a8a71304b1")
+        );
+    }
+
+    #[test]
+    fn an_empty_value_is_a_clear() {
+        assert_eq!(
+            parse_agent_session_user_var(b"SetUserVar=agent_session=").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn other_user_vars_and_bad_values_are_ignored() {
+        assert_eq!(parse_agent_session_user_var(b"SetUserVar=other=YWJj"), None);
+        assert_eq!(parse_agent_session_user_var(b"File=inline=1:AAAA"), None);
+        assert_eq!(
+            parse_agent_session_user_var(b"SetUserVar=agent_session=not base64!"),
+            None
+        );
+        // base64("a b;rm -rf") - not a plain token
+        assert_eq!(
+            parse_agent_session_user_var(b"SetUserVar=agent_session=YSBiO3JtIC1yZg=="),
+            None
+        );
+    }
+}
 
 #[cfg(test)]
 #[path = "./unit/grapheme_perf_tests.rs"]

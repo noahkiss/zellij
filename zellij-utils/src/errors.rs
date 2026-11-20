@@ -417,6 +417,12 @@ pub enum ScreenContext {
     GetTabInfo,
     ListClientsMetadata,
     ListPanes,
+    ResolvePaneTarget,
+    ReopenPane,
+    ListClosedPanes,
+    SendAgentMessage,
+    AgentMessageStatus,
+    DrainAgentMessages,
     ListTabs,
     GetCurrentTabInfo,
     Reconfigure,
@@ -607,6 +613,8 @@ pub enum PtyContext {
     RunInBackground,
     SetResurrectCommand,
     PromptReturned,
+    AgentSessionFromOsc,
+    ChildProcessExited,
     Exit,
 }
 

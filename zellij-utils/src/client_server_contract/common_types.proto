@@ -457,7 +457,34 @@ message QueryTabNamesAction {}
 message BreakPaneAction {}
 message BreakPaneRightAction {}
 message BreakPaneLeftAction {}
-message ListClientsAction {}
+message ListClientsAction {
+  // fork: 1 was output_json before the 900 block; drop a number from this line when upstream takes it at a rebase
+  reserved 1;
+  bool output_json = 900;
+}
+message ResolvePaneTargetAction {
+  string target = 1;
+}
+message ListTreeAction {
+  bool output_json = 1;
+}
+// fork addition: bring back a pane that was closed lately, or list the ones the session remembers
+message ReopenPaneAction {
+  optional string handle = 1;
+  bool list = 2;
+  bool output_json = 3;
+}
+message SendMessageAction {
+  uint32 terminal_id = 1;
+  string text = 2;
+  string from = 3;
+  optional string from_name = 4;
+  optional string reply_to = 5;
+  uint64 expire_s = 6;
+}
+message MessageStatusAction {
+  optional string id = 1;
+}
 message ListPanesAction {
   bool show_tab = 1;
   bool show_command = 2;
@@ -465,6 +492,8 @@ message ListPanesAction {
   bool show_geometry = 4;
   bool show_all = 5;
   bool output_json = 6;
+  // 7 was report_withheld, a retired fork field
+  reserved 7;
 }
 message ListTabsAction {
   bool show_state = 1;

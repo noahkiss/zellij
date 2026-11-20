@@ -1,0 +1,97 @@
+schema_version = 1
+harness = "pi"
+
+[[facts]]
+key = "process_names"
+value = "pi"
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = false
+notes = "Executable/argv0 name used by the fork hook. Complete process aliases remain unverified."
+
+[[facts]]
+key = "human_title_source"
+value = "Last session_info.name; first user-message fallback."
+source = "https://github.com/getpaseo/paseo/blob/e135e9c101700b31671fc374325d17b608467a91/packages/server/src/server/agent/providers/pi/session-descriptor.ts"
+revision = "e135e9c101700b31671fc374325d17b608467a91"
+verified = true
+
+[[facts]]
+key = "transcript_path"
+value = "~/.pi/agent/sessions/--<encoded-path>--/<timestamp>_<session-id>.jsonl"
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/pi.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "transcript_format"
+value = "Version-3 JSONL; entries form an id/parentId tree; session header stores UUID."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/pi.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "resume_command"
+value = "pi --session <native-session-file>"
+source = "https://github.com/getpaseo/paseo/blob/e135e9c101700b31671fc374325d17b608467a91/packages/server/src/server/agent/providers/pi/runtime.ts"
+revision = "e135e9c101700b31671fc374325d17b608467a91"
+verified = true
+
+[[facts]]
+key = "approve_keys"
+value = "Enter confirms selection. Core tools have no universal approval dialog."
+source = "https://pi.dev/docs/latest/keybindings"
+revision = "retrieved-2026-10-13"
+verified = false
+notes = "Extensions own confirmation behavior; verify each extension."
+
+[[facts]]
+key = "deny_keys"
+value = "Escape or Ctrl+C cancels selection."
+source = "https://pi.dev/docs/latest/keybindings"
+revision = "retrieved-2026-10-13"
+verified = false
+notes = "Selection cancellation is not a universal tool-denial contract."
+
+[[facts]]
+key = "interrupt_keys"
+value = "Escape"
+source = "https://pi.dev/docs/latest/keybindings"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "question_keys"
+value = "Enter submits/confirms; Escape or Ctrl+C cancels selection. Extensions define select, confirm, input, and editor dialogs."
+source = "https://pi.dev/docs/latest/keybindings"
+revision = "retrieved-2026-10-13"
+verified = false
+notes = "Exact extension navigation remains unverified."
+
+[[facts]]
+key = "folder_trust"
+value = "Project trust gates local resources; --approve trusts for one process; --no-approve ignores gated resources."
+source = "https://pi.dev/docs/latest/security"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "hook_trust"
+value = "Project resource trust gates extensions; extension-specific trust dialog keys remain unknown."
+source = "https://pi.dev/docs/latest/security"
+revision = "retrieved-2026-10-13"
+verified = false
+
+[[facts]]
+key = "osc7501"
+value = "Native state reporting after zellij answers the query; extension reports session identity."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true
+
+[[facts]]
+key = "hooks"
+value = "Extension session_start exports AGENT_SESSION_ID/AGENT_KIND and registers; session_shutdown unregisters."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true

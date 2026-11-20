@@ -1,0 +1,111 @@
+schema_version = 1
+harness = "codex"
+
+[[facts]]
+key = "process_names"
+value = "codex"
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = false
+notes = "Executable/argv0 name used by the fork hook. Complete process aliases remain unverified."
+
+[[facts]]
+key = "human_title_source"
+value = "App-server thread.name; nonempty thread.preview fallback."
+source = "https://github.com/getpaseo/paseo/blob/e135e9c101700b31671fc374325d17b608467a91/packages/server/src/server/agent/providers/codex-app-server-agent.ts"
+revision = "e135e9c101700b31671fc374325d17b608467a91"
+verified = true
+
+[[facts]]
+key = "transcript_path"
+value = "${CODEX_HOME:-~/.codex}/sessions/YYYY/MM/DD/rollout-*.jsonl; archived_sessions/*.jsonl"
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/codex.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "transcript_format"
+value = "JSONL: session metadata, response items, event messages, tool calls, and assistant text."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/codex.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "resume_command"
+value = "codex resume <thread-id>"
+source = "https://learn.chatgpt.com/docs/developer-commands?surface=cli"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "approve_keys"
+value = "Match displayed numbered choices, require selected row plus affirmative/negative options, recheck prompt, send affirmative digit without Enter, verify overlay disappears."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/send/codex_approval.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "deny_keys"
+value = "Apply the same choice check, then send the displayed negative digit without Enter."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/send/codex_approval.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true
+
+[[facts]]
+key = "interrupt_keys"
+value = "Escape when the visible interruption hint advertises it; prefer app-server turn/interrupt."
+source = "https://github.com/herdrdev/herdr/blob/87e5c13c6028df72405f63388dde585212ad3019/src/detect/manifests/codex.toml"
+revision = "87e5c13c6028df72405f63388dde585212ad3019"
+verified = false
+notes = "Interactive interruption keys can be remapped. Ctrl+C can close the session."
+
+[[facts]]
+key = "question_keys"
+value = "Enter to submit answer/all; full multi-question and free-text navigation unknown."
+source = "https://github.com/herdrdev/herdr/blob/87e5c13c6028df72405f63388dde585212ad3019/src/detect/manifests/codex.toml"
+revision = "87e5c13c6028df72405f63388dde585212ad3019"
+verified = false
+
+[[facts]]
+key = "folder_trust"
+value = "Do you trust the contents of this directory? or Trust this folder? / Trust and continue."
+source = "https://github.com/herdrdev/herdr/blob/87e5c13c6028df72405f63388dde585212ad3019/src/detect/manifests/codex.toml"
+revision = "87e5c13c6028df72405f63388dde585212ad3019"
+verified = true
+
+[[facts]]
+key = "hook_trust"
+value = "Project hooks require project trust. Non-managed hooks require exact-definition-hash trust; changed hooks require review. /hooks manages trust."
+source = "https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks"
+revision = "retrieved-2026-10-13"
+verified = true
+
+[[facts]]
+key = "rate_limit_choices"
+value = "Approaching rate limits: 1 switch model; 2 keep model; 3 keep model and never show again."
+source = "https://github.com/openai/codex"
+revision = "operator-brief-2026-10-13"
+verified = false
+notes = "Operator supplied these choices. They need a captured installed-version fixture; the pinned herdr manifest does not establish them."
+
+[[facts]]
+key = "osc7501"
+value = "The fork synthesizes working, blocked permission, and done through hooks; Codex does not natively report OSC 7501 in this integration."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true
+
+[[facts]]
+key = "hooks"
+value = "SessionStart/SessionEnd register identity; UserPromptSubmit, PermissionRequest, PostToolUse, Stop report state. No hook environment export in Codex 0.160."
+source = "zellij-utils/src/agent_hooks.rs"
+revision = "954a93c6ad6d971bea019e496d0ae59a898799b8"
+verified = true
+notes = "Interactive hook terminal attribution remains unproven when hooks run in an app-server daemon."
+
+[[facts]]
+key = "human_title_storage"
+value = "${CODEX_HOME:-~/.codex}/session_index.jsonl stores id and thread_name; app-server exposes thread.name."
+source = "https://github.com/asheshgoplani/agent-deck/blob/8d0f1fe1506dec1405d774c42c178291d1b20f40/internal/recall/reader/codex.go"
+revision = "8d0f1fe1506dec1405d774c42c178291d1b20f40"
+verified = true

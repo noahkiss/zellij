@@ -92,6 +92,31 @@ fn server_exe() -> io::Result<PathBuf> {
     }
 }
 
+/// The command that starts a server for a new session.
+///
+/// The server hands its own environment to every pane, so this is where a new session's
+/// environment is decided. The agent identity variables are removed here, whatever the config says:
+/// each names the one agent whose pane created the session, and in a new session it would name that
+/// agent for every pane. See [`agent_identity_env_names`](zellij_utils::agent_detect::agent_identity_env_names).
+pub(crate) fn server_command(launch: &ServerLaunch) -> Command {
+    let mut cmd = launch.command();
+    for name in zellij_utils::agent_detect::agent_identity_env_names() {
+        cmd.env_remove(name);
+    }
+    // strict version mode describes the caller that asked, not the session: a pane that inherited
+    // it would refuse the operator's own commands through the next upgrade
+    cmd.env_remove(zellij_utils::session_lifecycle::STRICT_VERSION_ENV);
+    cmd
+}
+
+pub fn spawn_server(socket_path: &Path, debug: bool) -> io::Result<()> {
+    let mut launch = ServerLaunch::new(server_exe()?.into_os_string(), socket_path);
+    launch.debug = debug;
+    spawn_server_with(&launch)
+}
+
+pub fn spawn_server_with(launch: &ServerLaunch) -> io::Result<()> {
+    let mut cmd = server_command(launch);
     match launch_style(cfg!(windows)) {
         LaunchStyle::WaitForDaemon => {
             let status = cmd.status()?;
