@@ -655,6 +655,13 @@ impl WasmBridge {
     }
     pub fn unload_plugin(&mut self, pid: PluginId) -> Result<()> {
         info!("Bye from plugin {}", &pid);
+        // a background plugin has no pane whose closing would tell Screen it is gone, so its
+        // subscription entry would otherwise outlive it and have a PaneManifest and a tab list
+        // built for it on every state change, forever
+        let _ = self
+            .senders
+            .send_to_screen(ScreenInstruction::RemoveBackgroundPluginSubscriptions(pid));
+
         let _ = self
             .senders
             .send_to_screen(ScreenInstruction::ClearLiveViewsOfPlugin(pid));
@@ -3741,6 +3748,11 @@ pub fn handle_plugin_crash(plugin_id: PluginId, message: String, senders: Thread
         loading_indication,
     ));
     let _ = senders.send_to_plugin(PluginInstruction::UnregisterSettingsEntry(plugin_id));
+    // a dead plugin receives nothing, so stop building payloads for it - a crashed background
+    // plugin has no pane whose closing would otherwise tell Screen it is gone
+    let _ = senders.send_to_screen(ScreenInstruction::RemoveBackgroundPluginSubscriptions(
+        plugin_id,
+    ));
 }
 
 pub fn apply_before_close_event_to_plugin(

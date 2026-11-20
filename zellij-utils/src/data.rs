@@ -4465,6 +4465,43 @@ pub enum LiveViewRelease {
     NotAllowed,
 }
 
+/// What a pane note means, which is also what colour it is drawn in.
+///
+/// A small closed set rather than a colour string: the note is drawn inside somebody else's theme,
+/// and a caller picking `#ff00ff` would be picking against a background it cannot see. These four
+/// are the meanings the theme already has colours for, so a note is legible in every theme.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteColor {
+    /// Something went wrong here. What the server marks a failed command pane with.
+    Error,
+    /// Something needs attention here, but nothing is broken.
+    Warn,
+    /// This pane is finished, and finished well.
+    Ok,
+    /// Neither good nor bad: the default, and what a note carries when nobody said.
+    #[default]
+    Info,
+}
+
+impl NoteColor {
+    /// The name the CLI takes and prints, which is the one this was parsed from.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NoteColor::Error => "error",
+            NoteColor::Warn => "warn",
+            NoteColor::Ok => "ok",
+            NoteColor::Info => "info",
+        }
+    }
+}
+
+impl std::fmt::Display for NoteColor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 impl Default for PaneId {
     fn default() -> Self {
         PaneId::Terminal(0)

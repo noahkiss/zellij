@@ -82,6 +82,14 @@ macro_rules! get_or_create_grid {
 
 pub(crate) struct PluginPane {
     pub pid: u32,
+    /// Given at creation, never reused - see `Pane::pane_uuid`
+    uuid: Uuid,
+    /// Set when this pane was built from a serialized session - see `Pane::restored_from`
+    restored_from: Option<String>,
+    /// Given at creation and kept across a snapshot restore - see `Pane::pane_handle`
+    handle: HeldHandle,
+    /// A short note about what is happening here - see `Pane::pane_note`
+    note: Option<(String, NoteColor)>,
     pub should_render: HashMap<ClientId, bool>,
     pub selectable: bool,
     pub geom: PaneGeom,
@@ -144,6 +152,10 @@ impl PluginPane {
         let initial_loading_message = loading_indication.to_string();
         let mut plugin = PluginPane {
             pid,
+            uuid: Uuid::new_v4(),
+            restored_from: None,
+            handle: HeldHandle::claim_new(),
+            note: None,
             should_render: HashMap::new(),
             selectable: true,
             geom: position_and_size,
@@ -529,6 +541,28 @@ impl Pane for PluginPane {
     }
     fn pid(&self) -> PaneId {
         PaneId::Plugin(self.pid)
+    }
+    fn pane_uuid(&self) -> Uuid {
+        self.uuid
+    }
+    fn restored_from(&self) -> Option<String> {
+        self.restored_from.clone()
+    }
+    fn set_restored_from(&mut self, restored_from: Option<String>) {
+        self.restored_from = restored_from;
+    }
+    fn pane_handle(&self) -> String {
+        self.handle.as_str().to_owned()
+    }
+    fn set_pane_handle(&mut self, handle: &str) {
+        self.handle = HeldHandle::claim(handle);
+    }
+    fn pane_note(&self) -> Option<(String, NoteColor)> {
+        self.note.clone()
+    }
+    fn set_pane_note(&mut self, note: Option<(String, NoteColor)>) {
+        self.note = note;
+        self.set_should_render(true);
     }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {

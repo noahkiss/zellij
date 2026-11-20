@@ -67,7 +67,10 @@ impl Desktop {
         }
         crate::window::activate_app();
         if let Some(pane_id) = pane {
-            app.send_action(Action::FocusPaneByPaneId { pane_id });
+            app.send_action(Action::FocusPaneByPaneId {
+                pane_id,
+                no_focus: false,
+            });
         } else if let Some(position) = tab {
             app.send_action(Action::GoToTab {
                 index: position as u32,

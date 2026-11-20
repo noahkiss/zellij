@@ -418,8 +418,12 @@ fn new_pane_cli_action(
         block_until_exit_failure: false,
         block_until_exit,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
         near_current_pane: false,
         no_focus: false,
+        focus: false,
         borderless: None,
         tab_id: None,
         border_style: None,
@@ -939,6 +943,13 @@ impl TestSession {
                     Box::new(fake_client_os_api),
                     &session_name,
                     actions,
+                    // no `--near`: the anchor is whatever the client's environment says
+                    None,
+                    pipe_timeout,
+                    // no `action --json`: the harness reads the report's own lines
+                    false,
+                    // no `--wait-ready`: it opens connections of its own, which this fake has not
+                    None,
                 )
             })
             .unwrap()

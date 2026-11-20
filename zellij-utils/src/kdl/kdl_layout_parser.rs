@@ -122,6 +122,9 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "attention_muted"
             || property_name == "ignore_output"
             || self.is_a_border_style_property(property_name)
+            || property_name == "pane_uuid"
+            || property_name == "pane_handle"
+            || property_name == "handle"
     }
     fn is_a_border_style_property(&self, property_name: &str) -> bool {
         property_name == "border_style"
@@ -182,6 +185,9 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "attention_muted"
             || property_name == "ignore_output"
             || self.is_a_border_style_property(property_name)
+            || property_name == "pane_uuid"
+            || property_name == "pane_handle"
+            || property_name == "handle"
     }
     fn is_a_valid_tab_property(&self, property_name: &str) -> bool {
         property_name == "focus"
@@ -651,6 +657,29 @@ impl<'a> KdlLayoutParser<'a> {
             .map(|s| s.to_string());
         let default_bg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_bg")
             .map(|s| s.to_string());
+        // Written by session serialization, not by hand: the uuid the pane had when the session
+        // was saved. It becomes the restored pane's `restored_from`, never its own uuid.
+        let restored_from =
+            kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_uuid")
+                .map(|s| s.to_string());
+        // The handle the pane answers to. Unlike `pane_uuid` this one stays the pane's own - the
+        // restored pane comes back at this address. `handle` is the spelling a person writes;
+        // `pane_handle` is what serialization writes, and every saved layout already carries it.
+        let pane_handle =
+            match kdl_get_string_property_or_child_value_with_error!(kdl_node, "handle") {
+                Some(handle) => Some(handle.to_string()),
+                None => kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_handle")
+                    .map(|s| s.to_string()),
+            };
+        if let Some(handle) = pane_handle.as_deref() {
+            if let Some(reason) = crate::pane_handle::chosen_handle_error(handle) {
+                return Err(ConfigError::new_layout_kdl_error(
+                    reason,
+                    kdl_node.span().offset(),
+                    kdl_node.span().len(),
+                ));
+            }
+        }
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -684,6 +713,8 @@ impl<'a> KdlLayoutParser<'a> {
             pane_initial_contents,
             default_fg,
             default_bg,
+            restored_from,
+            pane_handle,
             ..Default::default()
         })
     }
@@ -708,6 +739,29 @@ impl<'a> KdlLayoutParser<'a> {
             .map(|s| s.to_string());
         let default_bg = kdl_get_string_property_or_child_value_with_error!(kdl_node, "default_bg")
             .map(|s| s.to_string());
+        // Written by session serialization, not by hand: the uuid the pane had when the session
+        // was saved. It becomes the restored pane's `restored_from`, never its own uuid.
+        let restored_from =
+            kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_uuid")
+                .map(|s| s.to_string());
+        // The handle the pane answers to. Unlike `pane_uuid` this one stays the pane's own - the
+        // restored pane comes back at this address. `handle` is the spelling a person writes;
+        // `pane_handle` is what serialization writes, and every saved layout already carries it.
+        let pane_handle =
+            match kdl_get_string_property_or_child_value_with_error!(kdl_node, "handle") {
+                Some(handle) => Some(handle.to_string()),
+                None => kdl_get_string_property_or_child_value_with_error!(kdl_node, "pane_handle")
+                    .map(|s| s.to_string()),
+            };
+        if let Some(handle) = pane_handle.as_deref() {
+            if let Some(reason) = crate::pane_handle::chosen_handle_error(handle) {
+                return Err(ConfigError::new_layout_kdl_error(
+                    reason,
+                    kdl_node.span().offset(),
+                    kdl_node.span().len(),
+                ));
+            }
+        }
         self.assert_no_mixed_children_and_properties(kdl_node)?;
         let pane_initial_contents = contents_file.and_then(|contents_file| {
             self.file_name
@@ -738,6 +792,8 @@ impl<'a> KdlLayoutParser<'a> {
             pane_initial_contents,
             default_fg,
             default_bg,
+            restored_from,
+            pane_handle,
             ..Default::default()
         })
     }

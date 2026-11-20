@@ -2522,6 +2522,10 @@ impl TryFrom<ProtobufPaneInfo> for PaneInfo {
     type Error = &'static str;
     fn try_from(protobuf_pane_info: ProtobufPaneInfo) -> Result<Self, &'static str> {
         Ok(PaneInfo {
+            // the plugin PaneInfo protobuf does not carry the note: a plugin reads it through the
+            // same `PaneManifest` the server builds in process, not across this boundary
+            note: String::new(),
+            note_color: Default::default(),
             id: protobuf_pane_info.id,
             is_plugin: protobuf_pane_info.is_plugin,
             is_focused: protobuf_pane_info.is_focused,
@@ -3754,6 +3758,9 @@ fn serialize_session_update_event_with_non_default_values() {
     index_in_pane_group_2.insert(3, 1);
     let panes_list = vec![
         PaneInfo {
+            note: String::new(),
+            note_color: Default::default(),
+            tab_id: 7,
             id: 1,
             is_plugin: false,
             is_focused: true,

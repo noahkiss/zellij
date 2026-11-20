@@ -107,6 +107,8 @@ pub enum PtyInstruction {
     ),
     ClosePane(PaneId, Option<NotificationEnd>),
     ClosePaneThatWasNotCreated(PaneId, Option<NotificationEnd>),
+    /// The child of a held pane was reaped, but the pane itself stays.
+    ChildProcessExited(u32), // u32 - terminal id
     CloseTab(Vec<PaneId>),
     ReRunCommandInPane(PaneId, RunCommand, Option<NotificationEnd>),
     DropToShellInPane {
@@ -152,12 +154,21 @@ pub enum PtyInstruction {
         Option<FloatingPaneCoordinates>,
         Option<NotificationEnd>,
     ),
-    ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
+    ListClientsMetadata(
+        SessionLayoutMetadata,
+        ClientId,
+        bool,
+        Option<NotificationEnd>,
+    ),
     Reconfigure {
         client_id: ClientId,
         default_editor: Option<PathBuf>,
         post_command_discovery_hook: Option<String>,
         pane_env: PaneEnv,
+        resurrect_command_hints: Option<ResurrectCommandHints>,
+        resurrect_commands: Option<ResurrectCommands>,
+        detect_agents: Option<bool>,
+        pane_frame_agent_name: Option<bool>,
     },
     ListClientsToPlugin(SessionLayoutMetadata, PluginId, ClientId),
     ReportPluginCwd(PluginId, PathBuf),
@@ -657,6 +668,9 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
                     ))
                     .with_context(err_context)?;
             },
+            PtyInstruction::ChildProcessExited(terminal_id) => {
+                pty.forget_child_pid(terminal_id);
+            },
             PtyInstruction::ClosePane(id, completion_tx) => {
                 let close_result = pty.close_pane(id);
                 let action_unblocks_its_own_client = completion_tx.is_some();
@@ -809,17 +823,20 @@ pub(crate) fn pty_thread_main(mut pty: Pty, layout: Box<Layout>, session_id: Str
             PtyInstruction::ListClientsMetadata(
                 mut session_layout_metadata,
                 client_id,
+                output_json,
                 completion_tx,
             ) => {
                 let err_context = || format!("Failed to dump layout");
                 pty.populate_session_layout_metadata(&mut session_layout_metadata);
+                let rendered = if output_json {
+                    session_layout_metadata.list_clients_metadata_json(client_id)
+                } else {
+                    session_layout_metadata.list_clients_metadata(client_id)
+                };
                 pty.bus
                     .senders
                     .send_to_server(ServerInstruction::Log(
-                        vec![format!(
-                            "{}",
-                            session_layout_metadata.list_clients_metadata(),
-                        )],
+                        vec![rendered],
                         client_id,
                         completion_tx,
                     ))
@@ -1287,6 +1304,7 @@ impl Pty {
                 }
 
                 if hold_on_close {
+                    forget_reaped_child(&senders, pane_id);
                     let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                         pane_id,
                         exit_status,
@@ -1832,6 +1850,7 @@ impl Pty {
                         }
 
                         if hold_on_close {
+                            forget_reaped_child(&senders, pane_id);
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -2128,6 +2147,7 @@ impl Pty {
                             }
                         }
                         if hold_on_close {
+                            forget_reaped_child(&senders, pane_id);
                             let _ = senders.send_to_screen(ScreenInstruction::HoldPane(
                                 pane_id,
                                 exit_status,
@@ -2694,6 +2714,13 @@ impl Drop for Pty {
                 .with_context(|| format!("failed to close pane for pid {id}"))
                 .fatal();
         }
+/// Tell the pty thread that a held pane's child was reaped, so it stops holding the pid.
+///
+/// This runs on the thread that reaped the child, which owns none of the pty thread's state, so
+/// it goes back as an instruction. See `Pty::forget_child_pid` for why it matters.
+fn forget_reaped_child(senders: &ThreadSenders, pane_id: PaneId) {
+    if let PaneId::Terminal(terminal_id) = pane_id {
+        let _ = senders.send_to_pty(PtyInstruction::ChildProcessExited(terminal_id));
     }
 }
 

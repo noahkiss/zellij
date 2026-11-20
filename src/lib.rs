@@ -156,13 +156,18 @@ fn main() {
                 block_until_exit_failure: false,
                 block_until_exit: false,
                 unblock_condition,
+                new_tab: None,
+                in_tab: None,
+                near: None,
+                ready,
                 near_current_pane,
                 no_focus,
+                focus,
                 borderless,
                 border_style,
                 tab_id,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
         if let Some(Command::Sessions(Sessions::Plugin {
@@ -178,6 +183,7 @@ fn main() {
             height,
             pinned,
             no_focus,
+            focus,
             borderless,
             border_style,
             tab_id,
@@ -213,13 +219,18 @@ fn main() {
                 block_until_exit_failure: false,
                 block_until_exit: false,
                 unblock_condition,
+                new_tab: None,
+                in_tab: None,
+                near: None,
                 near_current_pane: false,
                 no_focus,
+                focus,
+                ready: Default::default(),
                 borderless,
                 border_style,
                 tab_id,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
         if let Some(Command::Sessions(Sessions::Edit {
@@ -240,6 +251,7 @@ fn main() {
             borderless,
             border_style,
             tab_id,
+            ready,
         })) = opts.command
         {
             let mut file = file;
@@ -267,8 +279,9 @@ fn main() {
                 borderless,
                 border_style,
                 tab_id,
+                ready,
             };
-            commands::send_action_to_session(command_cli_action, opts.session, config);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
             std::process::exit(0);
         }
         if let Some(Command::Sessions(Sessions::Pipe {
@@ -277,6 +290,7 @@ fn main() {
             args,
             plugin,
             plugin_configuration,
+            timeout,
         })) = opts.command
         {
             let command_cli_action = CliAction::Pipe {
@@ -285,6 +299,7 @@ fn main() {
                 args,
                 plugin,
                 plugin_configuration,
+                timeout,
 
                 force_launch_plugin: false,
                 skip_plugin_cache: false,
@@ -328,6 +343,11 @@ fn main() {
     })) = opts.command
     {
         commands::delete_session(target_session, force);
+            commands::send_action_to_session(command_cli_action, opts.session, config, false);
+            std::process::exit(0);
+        }
+    }
+
     } else if let Some(path) = opts.server {
         commands::start_server(path, opts.debug);
     } else if opts.layout.is_some() || opts.layout_string.is_some() {
@@ -353,8 +373,15 @@ fn main() {
                 block_until_exit_failure: false,
                 block_until_exit: false,
                 no_focus: false,
+                focus: false,
+                ready: Default::default(),
             };
-            commands::send_action_to_session(new_layout_cli_action, Some(session_name), config);
+            commands::send_action_to_session(
+                new_layout_cli_action,
+                Some(session_name),
+                config,
+                false,
+            );
         } else {
             commands::start_client(opts);
         }

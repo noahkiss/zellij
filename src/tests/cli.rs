@@ -1,7 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use clap::{CommandFactory, Parser, Subcommand};
-use zellij_utils::cli::{AttachArgs, CliArgs, Command, Sessions, TerminalArgs};
+use zellij_utils::cli::{
+    on_big_stack, AttachArgs, CliArgs, Command, SessionLifecycleCli, Sessions, TerminalArgs,
+};
 
 const CLI_PARSE_TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
 
@@ -17,6 +19,15 @@ fn on_large_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 fn try_parse(args: &[&str]) -> Result<CliArgs, clap::Error> {
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
     on_large_stack(move || CliArgs::try_parse_from(args))
+}
+
+/// Parse a command line on a thread with a real stack (fork tests).
+///
+/// Building the clap tree overflows the stack a test thread gets, so every fork test in this module
+/// goes through [`on_big_stack`]. See its doc comment in `zellij-utils/src/cli.rs`.
+fn parse_cli(args: &[&str]) -> Result<CliArgs, clap::Error> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    on_big_stack(move || CliArgs::try_parse_from(args))
 }
 
 #[test]
@@ -457,7 +468,7 @@ fn parse_action(args: &[&str]) -> zellij_utils::cli::CliAction {
     line.extend_from_slice(args);
     match try_parse(&line) {
         Ok(CliArgs {
-            command: Some(Command::Action(action)),
+            command: Some(Command::Action { action, .. }),
             ..
         }) => *action,
         other => panic!("{:?} did not parse as an action: {:?}", args, other),
@@ -600,4 +611,34 @@ fn setup_actions_refuse_the_other_setup_flags_and_replace_needs_a_copy() {
     .is_err());
     assert!(try_parse(&["zellij", "setup", "--make-default-terminal", "--check"]).is_err());
     assert!(try_parse(&["zellij", "setup", "--replace-existing"]).is_err());
+}
+/// The session lifecycle verbs that cannot be undone each take `--yes`, and none of them assumes
+/// it. The `action` verbs are covered where the table that drives them lives, in `zellij-utils`.
+#[test]
+fn the_session_verbs_that_destroy_something_take_yes_and_default_to_asking() {
+    let yes_for = |args: &[&str]| match parse_cli(args).unwrap().command {
+        Some(Command::Sessions(Sessions::KillSession { yes, .. })) => yes,
+        Some(Command::Sessions(Sessions::DeleteSession { yes, .. })) => yes,
+        Some(Command::Sessions(Sessions::KillAllSessions { yes, .. })) => yes,
+        Some(Command::Sessions(Sessions::DeleteAllSessions { yes, .. })) => yes,
+        other => panic!("Expected a session verb, got {:?}", other),
+    };
+    for verb in [
+        "kill-session",
+        "delete-session",
+        "kill-all-sessions",
+        "delete-all-sessions",
+    ] {
+        // the named-session verbs want their target; the all-variants ignore the extra argument
+        let named: &[&str] = &["zellij", verb, "work"];
+        let bare: &[&str] = &["zellij", verb];
+        let args = if parse_cli(named).is_ok() {
+            named
+        } else {
+            bare
+        };
+        assert!(!yes_for(args), "{verb} assumed yes without being told");
+        let with_yes: Vec<&str> = args.iter().copied().chain(["--yes"]).collect();
+        assert!(yes_for(&with_yes), "{verb} did not take --yes");
+    }
 }

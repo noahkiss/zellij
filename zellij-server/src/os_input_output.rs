@@ -283,6 +283,19 @@ struct ClientSender {
     client_buffer_sender: ClientBuffer,
 }
 
+/// Why a message could not be handed to a client.
+///
+/// The two are not the same failure: a busy client is still there and will drain its buffer,
+/// while a gone client never will. A push feed that treats the first as the second drops a live
+/// consumer and leaves it holding an open socket that never emits again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendToClientError {
+    /// The client's buffer is full - it is connected, but behind
+    ClientBusy,
+    /// There is no such client, or its channel is closed
+    ClientGone,
+}
+
 impl ClientSender {
     pub fn new(client_id: ClientId, mut sender: IpcSenderWithContext<ServerToClientMsg>) -> Self {
         // FIXME(hartan): This queue is responsible for buffering messages between server and
@@ -312,6 +325,24 @@ impl ClientSender {
             client_id,
             client_buffer_sender,
         }
+    }
+    /// Like `send_or_buffer`, but says which of the two failures happened: a full buffer means
+    /// the client is alive and behind, and the caller may keep it and try again.
+    pub fn try_send_or_buffer(
+        &self,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        self.client_buffer_sender.try_send(msg).map_err(|err| {
+            if let TrySendError::Full(_) = err {
+                log::warn!(
+                    "client {} is processing server messages too slow",
+                    self.client_id
+                );
+                SendToClientError::ClientBusy
+            } else {
+                SendToClientError::ClientGone
+            }
+        })
     }
     pub fn send_or_buffer(&self, msg: ServerToClientMsg) -> Result<()> {
         let err_context = || {
@@ -528,6 +559,22 @@ impl ServerOsApi for ServerOsInputOutput {
         }
     }
 
+    fn try_send_to_client(
+        &self,
+        client_id: ClientId,
+        msg: ServerToClientMsg,
+    ) -> std::result::Result<(), SendToClientError> {
+        match self.client_senders.lock() {
+            Ok(mut client_senders) => match client_senders.get_mut(&client_id) {
+                Some(sender) => sender.try_send_or_buffer(msg),
+                // send_to_client answers Ok() here for historical reasons; a caller asking this
+                // question needs to hear that the client is not there
+                None => Err(SendToClientError::ClientGone),
+            },
+            Err(_) => Err(SendToClientError::ClientGone),
+        }
+    }
+
     fn register_client(
         &mut self,
         client_id: ClientId,
@@ -698,6 +745,31 @@ impl ServerOsApi for ServerOsInputOutput {
         cmds
     }
 
+    #[cfg(unix)]
+    fn get_foreground_cmds(
+        &self,
+        panes: &[(u32, u32)],
+        post_hook: &Option<String>,
+    ) -> HashMap<u32, Vec<String>> {
+        let mut terminal_to_fg_pid: HashMap<u32, u32> = HashMap::new();
+        // panes the foreground process group cannot answer for. It equals the shell's own group
+        // both when the shell sits idle and when the shell runs jobs inside its own group, which
+        // is what a shell with job control off does - so these are asked about their children
+        // instead, and an idle shell answers that question with nothing.
+        let mut panes_to_scan: Vec<(u32, u32)> = Vec::new();
+        for &(terminal_id, shell_pid) in panes {
+            match self.pty_backend.tcgetpgrp(terminal_id) {
+                Some(fpgid) if fpgid > 0 && fpgid as u32 != shell_pid => {
+                    terminal_to_fg_pid.insert(terminal_id, fpgid as u32);
+                },
+                _ => panes_to_scan.push((terminal_id, shell_pid)),
+            }
+        }
+        let mut cmds = foreground_cmds_by_pid(&terminal_to_fg_pid, post_hook);
+        cmds.extend(foreground_cmds_by_child(&panes_to_scan, post_hook));
+        cmds
+    }
+
     #[cfg(not(unix))]
     fn get_foreground_cmds(
         &self,
@@ -805,6 +877,117 @@ impl Drop for ResizeCache {
                 log::error!("Failed to apply cached resizes: {}", e);
             });
     }
+}
+
+/// The command of each pane's foreground process, looked up by pid.
+///
+/// The precise half: a shell with job control moves a foreground job into its own process group,
+/// and the terminal names that group, so there is exactly one process to ask about.
+#[cfg(unix)]
+fn foreground_cmds_by_pid(
+    terminal_to_fg_pid: &HashMap<u32, u32>,
+    post_hook: &Option<String>,
+) -> HashMap<u32, Vec<String>> {
+    if terminal_to_fg_pid.is_empty() {
+        return HashMap::new();
+    }
+
+    let sysinfo_pids: Vec<sysinfo::Pid> = terminal_to_fg_pid
+        .values()
+        .map(|&p| sysinfo::Pid::from_u32(p))
+        .collect();
+    let mut system_info = System::new();
+    let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    system_info.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&sysinfo_pids),
+        false,
+        refresh_kind,
+    );
+
+    let mut cmds = HashMap::new();
+    for (&terminal_id, &fg_pid) in terminal_to_fg_pid {
+        let Some(process) = system_info.process(sysinfo::Pid::from_u32(fg_pid)) else {
+            continue;
+        };
+        let command: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        if command.is_empty() {
+            continue;
+        }
+        let command = apply_post_command_hook(command, post_hook);
+        cmds.insert(terminal_id, command);
+    }
+    cmds
+}
+
+/// The command of each pane's newest child process, for the panes the foreground process group
+/// could not answer for.
+///
+/// A shell running with job control off (`setopt no_monitor`, `set +m`) keeps its jobs in its
+/// own process group, so the terminal reports the shell's group whether or not anything is
+/// running - and the precise lookup above discards it as "just the shell". What still
+/// distinguishes the two is children: an idle shell has none, so it records nothing, which is
+/// the same answer it gave before. The newest child wins, because the one a user is looking at
+/// is the one they started last.
+#[cfg(unix)]
+fn foreground_cmds_by_child(
+    panes: &[(u32, u32)],
+    post_hook: &Option<String>,
+) -> HashMap<u32, Vec<String>> {
+    if panes.is_empty() {
+        return HashMap::new();
+    }
+
+    // the whole table, because a child is found by its parent and only the table knows who
+    // that is - one read for every pane that needs one, as ProcessTree does for hints
+    let mut system_info = System::new();
+    let refresh_kind = ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always);
+    system_info.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
+
+    let mut children_by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
+    for (pid, process) in system_info.processes() {
+        if let Some(parent) = process.parent() {
+            children_by_parent
+                .entry(parent.as_u32())
+                .or_default()
+                .push((pid.as_u32(), process.start_time()));
+        }
+    }
+
+    let mut cmds = HashMap::new();
+    for &(terminal_id, shell_pid) in panes {
+        let Some(children) = children_by_parent.get(&shell_pid) else {
+            continue;
+        };
+        let Some(child_pid) = newest_child(children) else {
+            continue;
+        };
+        let Some(process) = system_info.process(sysinfo::Pid::from_u32(child_pid)) else {
+            continue;
+        };
+        let command: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        if command.is_empty() {
+            continue;
+        }
+        cmds.insert(terminal_id, apply_post_command_hook(command, post_hook));
+    }
+    cmds
+}
+
+/// The newest child, ordered by start time and then PID.
+#[cfg(unix)]
+fn newest_child(children: &[(u32, u64)]) -> Option<u32> {
+    children
+        .iter()
+        .max_by_key(|(pid, start_time)| (*start_time, *pid))
+        .map(|(pid, _)| *pid)
 }
 
 fn apply_post_command_hook(command: Vec<String>, post_hook: &Option<String>) -> Vec<String> {

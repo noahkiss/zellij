@@ -32,8 +32,12 @@ fn no_focus_new_pane_action(command: &[&str]) -> CliAction {
         block_until_exit_failure: false,
         block_until_exit: false,
         unblock_condition: None,
+        new_tab: None,
+        in_tab: None,
+        near: None,
         near_current_pane: false,
         no_focus: true,
+        focus: false,
         borderless: None,
         tab_id: None,
         border_style: None,
@@ -41,8 +45,6 @@ fn no_focus_new_pane_action(command: &[&str]) -> CliAction {
     }
 }
 
-fn no_focus_new_tab_action() -> CliAction {
-    CliAction::NewTab {
 fn no_focus_new_tab_action() -> CliAction {
     CliAction::NewTab {
         ready: Default::default(),

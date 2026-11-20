@@ -4445,6 +4445,7 @@ fn go_to_tab_name(env: &PluginEnv, tab_name: String) {
     let action = Action::GoToTabName {
         name: tab_name,
         create,
+        no_focus: false,
     };
     apply_action!(action, error_msg, env);
 }
@@ -4455,6 +4456,7 @@ fn focus_or_create_tab(env: &PluginEnv, tab_name: String) {
     let action = Action::GoToTabName {
         name: tab_name,
         create,
+        no_focus: false,
     };
     let result = apply_action!(action, error_msg, env);
 

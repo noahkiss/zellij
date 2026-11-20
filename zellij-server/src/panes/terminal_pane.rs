@@ -137,6 +137,14 @@ pub struct TerminalPane {
     pub grid: Grid,
     program_resized_at: Option<Instant>,
     pub pid: u32,
+    /// Given at creation, never reused - see `Pane::pane_uuid`
+    uuid: Uuid,
+    /// Set when this pane was built from a serialized session - see `Pane::restored_from`
+    restored_from: Option<String>,
+    /// Given at creation and kept across a snapshot restore - see `Pane::pane_handle`
+    handle: HeldHandle,
+    /// A short note about what is happening here - see `Pane::pane_note`
+    note: Option<(String, NoteColor)>,
     pub selectable: bool,
     pub geom: PaneGeom,
     pub geom_override: Option<PaneGeom>,
@@ -145,7 +153,9 @@ pub struct TerminalPane {
     vte_parser: vt_parser::Parser,
     selection_scrolled_at: time::Instant,
     content_offset: Offset,
+    stack_terminal_size: Option<(usize, usize)>,
     pane_title: String,
+    frame_agent_name: Option<String>,
     pane_name: String,
     prev_pane_name: String,
     frame: HashMap<ClientId, PaneFrame>,
@@ -790,6 +800,28 @@ impl Pane for TerminalPane {
     fn pid(&self) -> PaneId {
         PaneId::Terminal(self.pid)
     }
+    fn pane_uuid(&self) -> Uuid {
+        self.uuid
+    }
+    fn restored_from(&self) -> Option<String> {
+        self.restored_from.clone()
+    }
+    fn set_restored_from(&mut self, restored_from: Option<String>) {
+        self.restored_from = restored_from;
+    }
+    fn pane_handle(&self) -> String {
+        self.handle.as_str().to_owned()
+    }
+    fn set_pane_handle(&mut self, handle: &str) {
+        self.handle = HeldHandle::claim(handle);
+    }
+    fn pane_note(&self) -> Option<(String, NoteColor)> {
+        self.note.clone()
+    }
+    fn set_pane_note(&mut self, note: Option<(String, NoteColor)>) {
+        self.note = note;
+        self.set_should_render(true);
+    }
     fn reduce_height(&mut self, percent: f64) {
         if let Some(p) = self.geom.rows.as_percent() {
             self.geom.rows.set_percent(p - percent);
@@ -1269,7 +1301,20 @@ impl Pane for TerminalPane {
     }
     fn hold(&mut self, exit_status: Option<i32>, is_first_run: bool, run_command: RunCommand) {
         self.invoked_with = Some(Run::Command(run_command.clone()));
+        // fork addition: a command that failed and is being held leaves its own note. The frame
+        // says "EXIT CODE: 7" while the pane is held, but that line goes when the pane is re-run
+        // or scrolled past, and nothing outside the server could read it at all - the note is the
+        // durable mark, and `list-panes` prints it
+        if let Some(status) = exit_status.filter(|status| *status != 0) {
+            if !is_first_run {
+                self.set_pane_note(Some((format!("exit {}", status), NoteColor::Error)));
+            }
+        }
         self.is_held = Some((exit_status, is_first_run, run_command));
+        // fork addition: a program that exits mid-task never sends its own clear
+        self.grid.clear_progress();
+        // and the same for its OSC 7501 records: the work is over, a done or error result stays
+        self.grid.program_status.drop_unfinished();
         if let Some(notification_end) = self.notification_end.as_mut() {
             if let Some(exit_status) = exit_status {
                 notification_end.set_exit_status(exit_status);
@@ -1722,8 +1767,13 @@ impl TerminalPane {
             notification_end.set_affected_pane_id(PaneId::Terminal(pid));
         }
         TerminalPane {
+            uuid: Uuid::new_v4(),
+            restored_from: None,
+            handle: HeldHandle::claim_new(),
+            note: None,
             frame: HashMap::new(),
             content_offset: Offset::default(),
+            stack_terminal_size: None,
             pid,
             grid,
             selectable: true,
@@ -1734,6 +1784,7 @@ impl TerminalPane {
             style,
             selection_scrolled_at: time::Instant::now(),
             pane_title: initial_pane_title,
+            frame_agent_name: None,
             pane_name: pane_name.clone(),
             prev_pane_name: pane_name,
             borderless: false,
@@ -1971,6 +2022,8 @@ impl TerminalPane {
     fn handle_held_run(&mut self) -> Option<AdjustedInput> {
         self.is_held.take().map(|(_, _, run_command)| {
             self.is_held = None;
+            // see `rerun`: the mark belongs to the run that ended, not to this one
+            self.note = None;
             self.grid.reset_terminal_state();
             self.set_should_render(true);
             self.remove_banner();
@@ -1978,15 +2031,8 @@ impl TerminalPane {
         })
     }
     fn handle_held_drop_to_shell(&mut self) -> Option<AdjustedInput> {
-        self.is_held.take().map(|(_, _, run_command)| {
-            // Drop to shell in the same working directory as the command was run
-            let working_dir = run_command.cwd.clone();
-            self.is_held = None;
-            self.grid.reset_terminal_state();
-            self.set_should_render(true);
-            self.remove_banner();
-            AdjustedInput::DropToShellInThisPane { working_dir }
-        })
+        self.drop_held_to_shell()
+            .map(|working_dir| AdjustedInput::DropToShellInThisPane { working_dir })
     }
 }
 

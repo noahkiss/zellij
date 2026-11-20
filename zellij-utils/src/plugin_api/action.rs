@@ -656,6 +656,9 @@ impl TryFrom<ProtobufAction> for Action {
                     Ok(Action::GoToTabName {
                         name: tab_name,
                         create,
+                        // the plugin/keybinding payload has no such field; only the CLI
+                        // asks for a tab without taking focus to it
+                        no_focus: false,
                     })
                 },
                 _ => Err("Wrong payload for Action::GoToTabName"),
@@ -2079,6 +2082,7 @@ impl TryFrom<Action> for ProtobufAction {
             Action::GoToTabName {
                 name: tab_name,
                 create,
+                no_focus: _, // CLI-only, the plugin payload cannot carry it
             } => Ok(ProtobufAction {
                 name: ProtobufActionName::GoToTabName as i32,
                 optional_payload: Some(OptionalPayload::GoToTabNamePayload(GoToTabNamePayload {
@@ -3748,6 +3752,12 @@ impl TryFrom<ProtobufTiledPaneLayout> for TiledPaneLayout {
         });
         let run_instructions_to_ignore = vec![]; // Not serialized in protobuf
         Ok(TiledPaneLayout {
+            // Not carried across this contract: `restored_from` is provenance the SERVER assigns
+            // when it rebuilds a pane from a serialized session, never something a sender declares.
+            restored_from: None,
+            // Not carried across this contract for the same reason as `restored_from`: a pane's
+            // handle is the server's to assign, never something a sender declares.
+            pane_handle: None,
             children_split_direction,
             name: protobuf.name,
             children,
@@ -3817,6 +3827,12 @@ impl TryFrom<ProtobufFloatingPaneLayout> for FloatingPaneLayout {
         let y = protobuf.y.map(|y| y.try_into()).transpose()?;
         let run = protobuf.run.map(|r| r.try_into()).transpose()?;
         Ok(FloatingPaneLayout {
+            // Not carried across this contract: `restored_from` is provenance the SERVER assigns
+            // when it rebuilds a pane from a serialized session, never something a sender declares.
+            restored_from: None,
+            // Not carried across this contract for the same reason as `restored_from`: a pane's
+            // handle is the server's to assign, never something a sender declares.
+            pane_handle: None,
             name: protobuf.name,
             height,
             width,

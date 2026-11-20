@@ -589,6 +589,8 @@ impl Into<PaneLayoutManifest> for PaneLayoutMetadata {
             border_style: self.border_style.none_if_empty(),
             attention_muted: self.attention_muted,
             ignore_output: self.ignore_output,
+            pane_uuid: self.pane_uuid,
+            pane_handle: self.pane_handle,
         }
     }
 }
@@ -620,6 +622,10 @@ pub struct PaneLayoutMetadata {
     border_style: BorderStyleOverride,
     attention_muted: bool,
     ignore_output: bool,
+    /// This pane's uuid, so a pane restored from the serialized layout can name what it continues.
+    pane_uuid: Option<String>,
+    /// This pane's handle, so a pane restored from the serialized layout comes back at it.
+    pane_handle: Option<String>,
 }
 
 impl PaneLayoutMetadata {
@@ -635,6 +641,8 @@ impl PaneLayoutMetadata {
         default_fg: Option<String>,
         default_bg: Option<String>,
         border_style: BorderStyleOverride,
+        pane_uuid: Option<String>,
+        pane_handle: Option<String>,
     ) -> Self {
         PaneLayoutMetadata {
             id,
@@ -743,25 +751,41 @@ impl ClientMetadata {
     pub fn get_pane_id(&self) -> PaneId {
         self.pane_id
     }
+    /// The terminal this client is attached through, or `-` for one that reports none.
+    pub fn stringify_tty(&self) -> String {
+        self.tty.clone().unwrap_or_else(|| "-".to_owned())
+    }
+    /// The client's terminal size as `COLSxROWS`, or `-` for one that reports none.
+    pub fn stringify_size(&self) -> String {
+        self.terminal_size
+            .map(|size| format!("{}x{}", size.cols, size.rows))
+            .unwrap_or_else(|| "-".to_owned())
+    }
     pub fn render_many(
         clients_metadata: BTreeMap<ClientId, ClientMetadata>,
         default_editor: &Option<PathBuf>,
+        requesting_client_id: ClientId,
     ) -> String {
         let mut lines = vec![];
-        lines.push(format!(
-            "{0: <10} {1: <14} {2}",
-            "CLIENT_ID", "ZELLIJ_PANE_ID", "RUNNING_COMMAND"
+        // the first three columns are what this table has always printed, in the order it printed
+        // them; the rest are the fields that used to be reachable only through --json
+        lines.push(String::from(
+            "CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND TTY             SIZE      CURRENT",
         ));
 
         for (client_id, client_metadata) in clients_metadata.iter() {
+            // 9 - CLIENT_ID, 14 - ZELLIJ_PANE_ID, 15 - RUNNING_COMMAND, 15 - TTY, 9 - SIZE
             lines.push(format!(
-                "{} {} {}",
-                format!("{0: <10}", client_id),
+                "{} {} {} {} {} {}",
+                format!("{0: <9}", client_id),
                 format!("{0: <14}", client_metadata.stringify_pane_id()),
                 format!(
                     "{0: <15}",
                     client_metadata.stringify_command(default_editor)
-                )
+                ),
+                format!("{0: <15}", client_metadata.stringify_tty()),
+                format!("{0: <9}", client_metadata.stringify_size()),
+                *client_id == requesting_client_id,
             ));
         }
         lines.join("\n")
@@ -771,6 +795,8 @@ impl ClientMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zellij_utils::data::PaneId as ZellijPaneId;
+    use zellij_utils::input::layout::TiledPaneLayout;
     use zellij_utils::pane_size::PaneGeom;
 
     fn make_command_pane(terminal_id: u32, command: &str, args: Vec<&str>) -> PaneLayoutMetadata {
@@ -808,6 +834,18 @@ mod tests {
             None,
             None,
             Default::default(),
+        )
+    }
+
+    fn session_with_editor(editor: &str, panes: Vec<PaneLayoutMetadata>) -> SessionLayoutMetadata {
+        let mut meta = SessionLayoutMetadata::default();
+        meta.default_editor = Some(PathBuf::from(editor));
+        meta.add_tab("tab1".to_string(), true, false, panes, vec![]);
+        meta
+    }
+
+            None,
+            None,
         )
     }
 
@@ -1013,6 +1051,80 @@ mod tests {
         );
         let manifest: PaneLayoutManifest = pane.into();
         assert_eq!(manifest.pane_handle.as_deref(), Some("sunny-otter"));
+    }
+
+    #[test]
+    fn rendered_client_list_carries_the_columns_json_used_to_keep() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+
+        let rendered = meta.list_clients_metadata(2);
+        let header = rendered.lines().next().unwrap();
+        for column in ["CLIENT_ID", "ZELLIJ_PANE_ID", "RUNNING_COMMAND"] {
+            assert!(header.contains(column), "{}", header);
+        }
+        for column in ["TTY", "SIZE", "CURRENT"] {
+            assert!(header.contains(column), "{}", header);
+        }
+        // the requesting client is the one marked, and only it
+        let marked: Vec<&str> = rendered
+            .lines()
+            .skip(1)
+            .filter(|line| line.ends_with("true"))
+            .collect();
+        assert_eq!(marked.len(), 1, "{}", rendered);
+        assert!(marked[0].starts_with('2'), "{}", marked[0]);
+    }
+
+    #[test]
+    fn a_cli_query_marks_no_client_as_current() {
+        // `zellij action list-clients` runs as its own short-lived client, which is in no row
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![]);
+
+        let rendered = meta.list_clients_metadata(99);
+        assert!(
+            !rendered.lines().skip(1).any(|line| line.ends_with("true")),
+            "{}",
+            rendered
+        );
+    }
+
+    #[test]
+    fn json_client_list_carries_every_client() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let floating = make_focused_pane(PaneId::Plugin(3), vec![1]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![floating]);
+
+        let clients = meta.client_infos(2);
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].client_id, 1);
+        assert_eq!(clients[0].pane_id, ZellijPaneId::Plugin(3));
+        assert!(!clients[0].is_current_client);
+        assert_eq!(clients[1].client_id, 2);
+        assert_eq!(clients[1].pane_id, ZellijPaneId::Terminal(1));
+        assert!(clients[1].is_current_client, "the requesting client");
+    }
+
+    #[test]
+    fn json_client_list_is_an_array_and_nothing_else() {
+        let tiled = make_focused_pane(PaneId::Terminal(1), vec![2]);
+        let mut meta = SessionLayoutMetadata::default();
+        meta.add_tab("tab1".to_string(), true, false, vec![tiled], vec![]);
+        let rendered = meta.list_clients_metadata_json(2);
+        let parsed: Vec<ClientInfo> = serde_json::from_str(&rendered).expect("valid JSON array");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].client_id, 2);
+    }
+
+    #[test]
+    fn json_client_list_is_empty_when_nobody_is_attached() {
+        let meta = SessionLayoutMetadata::default();
+        assert_eq!(meta.list_clients_metadata_json(1), "[]");
     }
 
     fn pane_focused_by(terminal_id: u32, focused_clients: Vec<ClientId>) -> PaneLayoutMetadata {

@@ -1312,7 +1312,7 @@ impl Desktop {
     fn clients_of(&self, session: &str) -> Option<Vec<(u32, String)>> {
         let mut link = SessionLink::open_path(&self.socket_of(session)).ok()?;
         link.send(ClientToServerMsg::Action {
-            action: Action::ListClients,
+            action: Action::ListClients { output_json: false },
             terminal_id: None,
             client_id: None,
             is_cli_client: true,

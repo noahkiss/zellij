@@ -30,8 +30,8 @@ use zellij_utils::web_authentication_tokens::{
 use miette::{Report, Result};
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
-    cli::{AttachArgs, CliArgs, Command, Sessions},
-    data::ConnectToSession,
+    cli::{destroys, AttachArgs, CliArgs, Command, Sessions, SnapshotCli},
+    data::{ConnectToSession, PaneId, PaneTarget},
     envs,
     input::{
         actions::{initial_panes_from_cli, Action},
@@ -138,6 +138,51 @@ pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
             assert_dead_session(target_session, force);
             delete_session_impl(target_session, force);
             process::exit(0);
+/// Asks before something that cannot be undone, or refuses when nothing can answer.
+///
+/// One implementation for every such verb, so the wording and the behaviour on a pipe are the same
+/// wherever you meet them. `what` completes the sentence "`<verb>` <what>, and cannot be undone".
+///
+/// A refusal and a declined prompt both exit 2: each is a well-formed request that changed
+/// nothing, which is what a 2 means - the same code the targetless guard and a miss use.
+pub(crate) fn confirm_or_exit(verb: &str, what: &str, yes: bool) {
+    use std::io::IsTerminal;
+    match zellij_utils::cli::confirmation_for(verb, what, yes, std::io::stdin().is_terminal()) {
+        zellij_utils::cli::Confirmation::Proceed => {},
+        zellij_utils::cli::Confirmation::Refuse(message) => {
+            eprintln!("{}", message);
+            process::exit(2);
+        },
+        zellij_utils::cli::Confirmation::Ask(prompt) => {
+            // a prompt that cannot be read is a no, not a panic: the default is no either way
+            let answered_yes = Confirm::new()
+                .with_prompt(prompt)
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !answered_yes {
+                eprintln!("Abort.");
+                process::exit(2);
+            }
+        },
+    }
+}
+
+pub(crate) fn kill_session(target_session: &Option<String>, wait: KillWait, yes: bool) {
+    match target_session {
+        Some(target_session) => {
+            assert_session(target_session);
+            confirm_or_exit("kill-session", destroys::KILL_SESSION, yes);
+            let gone = kill_session_impl(target_session, wait);
+            process::exit(if gone { 0 } else { 1 });
+        },
+        None => {
+            println!("Please specify the session name to kill.");
+            process::exit(1);
+        },
+    }
+}
+
         },
         None => {
             println!("Please specify the session name to delete.");
@@ -613,22 +658,54 @@ pub(crate) fn subscribe_to_session(
                 if existing_sessions.contains(&session_name) {
                     session_name
                 } else {
-                    eprintln!(
+                    no_session_answers_to(format!(
                         "Session '{}' not found. The following sessions are active:",
                         session_name
-                    );
-                    list_sessions(false, false, true);
-                    std::process::exit(1);
+                    ));
                 }
             } else if let Ok(session_name) = envs::get_session_name() {
                 session_name
             } else {
-                eprintln!("Please specify the session name to subscribe to. The following sessions are active:");
-                list_sessions(false, false, true);
-                std::process::exit(1);
+                no_session_answers_to(
+                    "Please specify the session name to subscribe to. The following sessions are \
+                     active:"
+                        .to_owned(),
+                );
             }
         },
     };
+    // `--pane-id` takes every form a pane answers to, here as everywhere else. The two id forms
+    // mean the same thing without asking anyone; a handle or a uuid names a pane only against the
+    // session's live panes, so it is resolved before the subscription goes out and the stream is
+    // opened on a pane id like it always was.
+    let mut subscribe_cli = subscribe_cli;
+    for target in subscribe_cli.pane_id.iter_mut() {
+        match target.parse::<PaneTarget>() {
+            // a string that names no pane in any form is malformed input: an error, exit 1
+            Err(malformed) => {
+                eprintln!("{}", malformed);
+                std::process::exit(1);
+            },
+            // an id form is the same pane in any session, so nothing is asked
+            Ok(PaneTarget::Id(_)) => continue,
+            Ok(_) => match zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                &session_name,
+                target,
+            ) {
+                Ok(pane_id) => *target = pane_id.to_string(),
+                // a well-formed target no live pane answers to is a miss, exit 2
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(2);
+                },
+            },
+        }
+    }
+    // a subscription reads a session for as long as it runs, so a stale server is said here too
+    zellij_utils::session_lifecycle::check_server_build(&session_name);
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     zellij_client::cli_client::start_subscribe_client(
         Box::new(os_input),
@@ -679,20 +756,532 @@ pub(crate) fn prompt_in_session(
     process::exit(exit_status);
 }
 
+/// The text for a `write-chars` or a `paste` that was not given any on the command line.
+///
+/// Piping is the way multi-line text gets into a pane without being escaped twice - once for this
+/// shell and once for the pane's. So no positional means stdin, and an explicit `-` means stdin
+/// even from a terminal, where reading it would otherwise be a hang nobody asked for.
+///
+/// Every exit here is the command's own: 1 for text that cannot be sent, 2 for a stdin that carried
+/// nothing, which is a request that would change nothing.
+fn text_for(chars: Option<String>, verb: &str) -> String {
+    use std::io::IsTerminal;
+    match chars {
+        Some(chars) if chars != "-" => chars,
+        given => {
+            if given.is_none() && std::io::stdin().is_terminal() {
+                eprintln!(
+                    "`{}` needs text: pass it as an argument, or pipe it in. \
+                     `{} -` reads this terminal.",
+                    verb, verb
+                );
+                std::process::exit(1);
+            }
+            match zellij_utils::cli::text_from_stdin(std::io::stdin().lock(), verb) {
+                Ok(text) if text.is_empty() => {
+                    eprintln!("Nothing arrived on stdin, so `{}` wrote nothing.", verb);
+                    std::process::exit(2);
+                },
+                Ok(text) => text,
+                Err(message) => {
+                    eprintln!("{}", message);
+                    std::process::exit(1);
+                },
+            }
+        },
+    }
+}
+
 fn attach_with_cli_client(
     cli_action: zellij_utils::cli::CliAction,
     session_name: &str,
     config: Option<Config>,
+    output_json: bool,
 ) {
+    // `action --json` is answered in one of two places, and which one is a question about the verb.
+    // A verb that already prints JSON owns the flag, so it is simply turned on and nothing else
+    // changes; every other reporting verb prints a record, which the client structures. A payload
+    // has no keys to structure, so it is refused here rather than answered with something wrong.
+    let mut cli_action = cli_action;
+    let default_anchor = crate::pane_default::caller_anchor(
+        session_name,
+        std::env::var("ZELLIJ_SESSION_NAME").ok().as_deref(),
+        std::env::var("ZELLIJ_PANE_ID").ok().as_deref(),
+    );
+    let stacked_edit = crate::pane_default::apply(
+        &mut cli_action,
+        config.as_ref().and_then(|config| config.new_pane_default),
+        default_anchor,
+        &mut std::io::stderr(),
+    );
+    let mut structure_report = false;
+    if output_json && !cli_action.set_output_json() {
+        let verb = cli_action.verb();
+        match zellij_utils::cli_surface::output_shape(&format!("action {}", verb)) {
+            Some(shape) if shape != "record" => {
+                eprintln!(
+                    "`{}` prints a {}, which has no keys to answer with. `--json` is for the \
+                     verbs that report a record.",
+                    verb, shape
+                );
+                std::process::exit(2);
+            },
+            _ => structure_report = true,
+        }
+    }
+    let cli_action = cli_action;
+    // an action is the usual way a script meets a session, so it is where a stale server is usually
+    // met too - the warning costs one process scan and changes nothing about the action. In
+    // strict mode a proven mismatch refuses here instead, before anything is sent.
+    zellij_utils::session_lifecycle::check_server_build(session_name);
     let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
     let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
+    // `save-session --archive` is a client-side addition to the existing action: the action itself
+    // is unchanged and synchronous, so the archive copy is taken once it has returned. Nothing
+    // about it crosses the client/server contract.
+    let should_archive = matches!(
+        cli_action,
+        zellij_utils::cli::CliAction::SaveSession { archive: true }
+    );
+    let snapshot_settings =
+        SnapshotSettings::from_options(config.as_ref().map(|config| &config.options));
+    // A handle or a uuid names a pane only against the session's live panes, so those forms are
+    // resolved by asking the running server before the action is built. An id form needs no
+    // lookup, and pays for nothing: the connection is only opened when there is a question.
+    let resolve_pane_target = |target: &str| -> Result<PaneId, String> {
+        match target.parse::<PaneTarget>() {
+            // a string that names no pane in any form is malformed input, which is an error and
+            // exits 1. Only a well-formed target that no live pane answers to is a miss, and the
+            // miss is what the caller below turns into exit 2
+            Err(malformed) => {
+                eprintln!("{}", malformed);
+                std::process::exit(1);
+            },
+            Ok(PaneTarget::Id(pane_id)) => Ok(pane_id),
+            Ok(_) => zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                target,
+            ),
+        }
+    };
+    // a command that acts on "the focused thing" is only meaningful from inside the session that
+    // has the focus. From a script it resolves to a pane the caller has never seen
+    let inside_the_session = envs::get_session_name()
+        .map(|ambient| ambient == session_name)
+        .unwrap_or(false);
+    // a refusal exits 2 like the confirm layer beside it: a well-formed request that changed
+    // nothing is what this fork's exit codes call a miss, and a guard that stops a call before it
+    // is sent has changed nothing
+    if let Some(message) = zellij_utils::cli::missing_target(&cli_action, inside_the_session) {
+        eprintln!("{}", message);
+        std::process::exit(2);
+    }
+    // a pane in another session cannot be named by a handle or a uuid from here, and guessing is
+    // worse than refusing: the id it would resolve to belongs to a pane in this session
+    if let Some(message) = zellij_utils::cli::cross_session_pane_target_needs_an_id(&cli_action) {
+        eprintln!("{}", message);
+        std::process::exit(1);
+    }
+    // what cannot be undone is confirmed last of the guards and before anything is sent: a call
+    // that was never going to reach a pane should not ask about closing one
+    if let Some((verb, what, yes)) = zellij_utils::cli::confirmation_needed(&cli_action) {
+        // and the target is looked up FIRST, which is the whole of that sentence. The prompt is
+        // ours and the pane list is the server's, so without this `close-pane --pane-id
+        // terminal_99` asked whether to close a pane that does not exist and reported the miss
+        // after the answer. An id form is asked about like any other here - it needs no lookup to
+        // be UNDERSTOOD, which is a different question from whether a pane answers to it
+        if let Some(target) = zellij_utils::cli::pane_target_to_confirm(&cli_action) {
+            if let Err(message) = zellij_client::cli_client::resolve_pane_target(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                target,
+            ) {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            }
+        }
+        confirm_or_exit(verb, what, yes);
+    }
+    // `wait` never becomes an action the server runs. It is a question asked over and over, or a
+    // subscription read until something happens, and both of those are the client's to hold: the
+    // server would have to keep a caller alive across an unbounded stretch of time to do it here
+    if let zellij_utils::cli::CliAction::Wait {
+        pane_id,
+        panes,
+        wait_for,
+        pattern,
+        quiet_ms,
+        timeout,
+    } = &cli_action
+    {
+        if *wait_for == zellij_utils::cli::WaitFor::AgentChange {
+            let mut targets = panes.clone();
+            if !pane_id.is_empty() {
+                targets.push(pane_id.clone());
+            }
+            let make_input = || -> Box<dyn zellij_client::os_input_output::ClientOsApi> {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            };
+            let mut ids = Vec::new();
+            for target in targets {
+                match zellij_client::cli_client::resolve_pane_target(
+                    make_input(),
+                    session_name,
+                    &target,
+                ) {
+                    Ok(PaneId::Terminal(id)) => ids.push(id),
+                    Ok(_) => {
+                        eprintln!("Agent-change requires terminal panes");
+                        std::process::exit(2);
+                    },
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        std::process::exit(2);
+                    },
+                }
+            }
+            std::process::exit(zellij_client::cli_client::start_agent_change_client(
+                &make_input,
+                session_name,
+                &ids,
+                (*timeout > 0).then(|| Duration::from_secs(*timeout)),
+                structure_report,
+            ));
+        }
+        if pane_id.is_empty() || !panes.is_empty() {
+            eprintln!("This wait requires one positional pane; --pane requires --for agent-change");
+            std::process::exit(2);
+        }
+        // an id form is asked about too: a wait on an id no pane holds would poll a list the pane
+        // is not in and call that an exit
+        let pane = match zellij_client::cli_client::resolve_pane_target(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            pane_id,
+        ) {
+            Ok(pane) => pane,
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            },
+        };
+        let condition = match wait_for {
+            zellij_utils::cli::WaitFor::AgentChange => unreachable!(),
+            zellij_utils::cli::WaitFor::Exit => zellij_client::cli_client::WaitCondition::Exit,
+            zellij_utils::cli::WaitFor::Quiet => {
+                zellij_client::cli_client::WaitCondition::Quiet(Duration::from_millis(*quiet_ms))
+            },
+            // clap requires `--match` for this mode, so an absent pattern here is unreachable
+            // rather than a case with a sensible answer. The wait compiles it and refuses one that
+            // is not a regex
+            zellij_utils::cli::WaitFor::Match => {
+                zellij_client::cli_client::WaitCondition::Match(pattern.clone().unwrap_or_default())
+            },
+            zellij_utils::cli::WaitFor::Ready => {
+                zellij_client::cli_client::WaitCondition::Ready(Duration::from_millis(*quiet_ms))
+            },
+            zellij_utils::cli::WaitFor::AgentIdle => {
+                zellij_client::cli_client::WaitCondition::Agent {
+                    waiting: false,
+                    quiet: Duration::from_millis(*quiet_ms),
+                }
+            },
+            zellij_utils::cli::WaitFor::AgentWaiting => {
+                zellij_client::cli_client::WaitCondition::Agent {
+                    waiting: true,
+                    quiet: Duration::from_millis(*quiet_ms),
+                }
+            },
+        };
+        let exit_status = zellij_client::cli_client::start_wait_client(
+            &|| {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            },
+            session_name,
+            pane,
+            condition,
+            // `--timeout 0` is the caller asking, by name, for a wait that can hang
+            (*timeout > 0).then(|| Duration::from_secs(*timeout)),
+            structure_report,
+        );
+        std::process::exit(exit_status);
+    }
+    // `watch` never becomes an action: it is a stream the server pushes down its own connection
+    if let zellij_utils::cli::CliAction::Watch { .. } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_watch_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+        );
+        std::process::exit(exit_status);
+    }
+    if let zellij_utils::cli::CliAction::Whoami { json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_whoami_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
+    // `list-agents` never becomes an action either. It is `list-panes` with a filter and a
+    // different table, and doing that in the client is what keeps a whole verb off the
+    // client/server contract
+    if let zellij_utils::cli::CliAction::ListAgents { json, .. } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_list_agents_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            *json,
+        );
+        std::process::exit(exit_status);
+    }
+    // `send-message` resolves its target from the agent list first, then sends the action itself;
+    // `message-status` is one question, printed by the client
+    if let zellij_utils::cli::CliAction::SendMessage { .. } = &cli_action {
+        let exit_status = send_message(
+            &cli_action,
+            Some(session_name),
+            &[session_name.to_owned()],
+            output_json,
+        );
+        std::process::exit(exit_status);
+    }
+    if let zellij_utils::cli::CliAction::MessageStatus { id, json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_message_status_client(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            id.as_deref(),
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
+    // `last-reply` never becomes an action: it reads the agent's transcript on this machine,
+    // found from the pane list
+    if let zellij_utils::cli::CliAction::LastReply { pane_id, json } = &cli_action {
+        let exit_status = zellij_client::cli_client::start_last_reply_client(
+            &|| {
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                ))
+            },
+            session_name,
+            pane_id,
+            *json || output_json,
+        );
+        std::process::exit(exit_status);
+    }
+    // a `dump-screen` of several panes never becomes several actions either. It is the same per-pane
+    // request, asked N times down one connection, and holding that in the client is what keeps a
+    // sweep off the client/server contract. One `--pane-id` is not a sweep and does not come here:
+    // it keeps printing the bare content it always did
+    if let zellij_utils::cli::CliAction::DumpScreen {
+        file,
+        path,
+        full,
+        pane_id,
+        all,
+        ansi,
+    } = &cli_action
+    {
+        if *all || pane_id.len() > 1 {
+            let exit_status = zellij_client::cli_client::start_dump_screen_client(
+                Box::new(get_os_input(
+                    zellij_client::os_input_output::get_cli_client_os_input,
+                )),
+                session_name,
+                pane_id.clone(),
+                *all,
+                *full,
+                *ansi,
+                path.clone().or_else(|| file.clone()),
+            );
+            std::process::exit(exit_status);
+        }
+    }
+    let mut cli_action = cli_action;
+    // an agent's new pane or tab leaves the person's focus alone unless it passed `--focus`
+    cli_action.settle_focus_for_caller(zellij_utils::agent_detect::caller_is_agent(|name| {
+        std::env::var(name).ok()
+    }));
+    // `pipe --timeout` is the client's to hold: the session has nothing to time out, and keeping it
+    // here is what keeps the flag off `Action::CliPipe` and off the client/server contract
+    let pipe_timeout = cli_action.take_pipe_timeout();
+    // `--wait-ready` is the client's to hold too: it waits once the report names the pane
+    let ready_timeout = match cli_action.take_wait_ready() {
+        Ok(ready_timeout) => ready_timeout,
+        Err(message) => {
+            eprintln!("{}", message);
+            std::process::exit(2);
+        },
+    };
+    // `--near` names the pane the new one opens beside. It is resolved here, like every other pane
+    // target, and travels as the pane this command came from - the channel `--near-current-pane`
+    // reads out of the environment
+    let mut anchor_pane: Option<u32> = None;
+    if let Some(wanted) = cli_action.near_target().map(|t| t.to_owned()) {
+        match resolve_pane_target(&wanted) {
+            Ok(PaneId::Terminal(id)) => {
+                anchor_pane = Some(id);
+                cli_action.anchor_near();
+            },
+            Ok(PaneId::Plugin(_)) => {
+                eprintln!(
+                    "'{}' is a plugin pane, and `--near` anchors a new pane to a terminal one. \
+                     Name a terminal pane, or use `--in-tab` to put the pane in the same tab.",
+                    wanted
+                );
+                std::process::exit(1);
+            },
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(2);
+            },
+        }
+    }
+    // `--in-tab` names a tab the way a person does, and the action carries a stable id. The session
+    // is the only thing that knows which is which, so it is asked before the pane is made: a tab
+    // nothing answers to is a miss, and nothing is created
+    if let Some(wanted) = cli_action.in_tab_target().map(|t| t.to_owned()) {
+        let found = zellij_client::cli_client::resolve_tab_target(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+            &wanted,
+        );
+        match found {
+            Ok(Some(tab_id)) => cli_action.place_in_tab(tab_id),
+            Ok(None) => {
+                eprintln!(
+                    "No tab answers to '{}'. `zellij action list-tabs` lists them by TAB_ID and \
+                     NAME.",
+                    wanted
+                );
+                std::process::exit(2);
+            },
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            },
+        }
+    }
+    // `move-tab --to-index` is upstream's `MoveTabToPosition`, which names its tab. Without
+    // `--tab-id` it moves the focused tab, as it always has, so that tab is asked for here
+    if let zellij_utils::cli::CliAction::MoveTab {
+        to_index: Some(_),
+        tab_id: tab_id @ None,
+        ..
+    } = &mut cli_action
+    {
+        match zellij_client::cli_client::resolve_focused_tab(
+            Box::new(get_os_input(
+                zellij_client::os_input_output::get_cli_client_os_input,
+            )),
+            session_name,
+        ) {
+            Ok(Some(focused)) => *tab_id = Some(focused),
+            Ok(None) => {
+                eprintln!("The session has no tab to move.");
+                std::process::exit(2);
+            },
+            Err(message) => {
+                eprintln!("{}", message);
+                std::process::exit(1);
+            },
+        }
+    }
+    // the text these two write can come from stdin. It is read here, after the refusals above, so a
+    // call that was never going to reach a pane does not drain the pipe on its way out
+    let cli_action = match cli_action {
+        zellij_utils::cli::CliAction::WriteChars {
+            chars,
+            pane_id,
+            focused,
+        } => zellij_utils::cli::CliAction::WriteChars {
+            chars: Some(text_for(chars, "write-chars")),
+            pane_id,
+            focused,
+        },
+        zellij_utils::cli::CliAction::Paste {
+            chars,
+            pane_id,
+            focused,
+        } => zellij_utils::cli::CliAction::Paste {
+            chars: Some(text_for(chars, "paste")),
+            pane_id,
+            focused,
+        },
+        other => other,
+    };
+    let actions = if stacked_edit {
+        crate::new_pane_default::stacked_edit(cli_action, config.as_ref(), get_current_dir())
+            .map(|action| vec![action])
+    } else {
+        Action::actions_from_cli(
+            cli_action,
+            Box::new(get_current_dir),
+            config,
+            &resolve_pane_target,
+        )
+    };
+    match actions {
         Ok(actions) => {
             let exit_status = zellij_client::cli_client::start_cli_client(
                 Box::new(os_input),
                 session_name,
                 actions,
+                anchor_pane,
+                pipe_timeout,
+                structure_report,
+                ready_timeout.map(|timeout| zellij_client::cli_client::WaitReady {
+                    timeout,
+                    make_os_input: &|| {
+                        Box::new(get_os_input(
+                            zellij_client::os_input_output::get_cli_client_os_input,
+                        ))
+                    },
+                }),
             );
+            if should_archive {
+                match archive_session_info(session_name, SnapshotReason::Manual, &snapshot_settings)
+                {
+                    Ok(ArchiveOutcome::Archived(snapshot)) => {
+                        println!("Archived snapshot {}", snapshot.id)
+                    },
+                    Ok(ArchiveOutcome::AlreadyArchived) => println!("Nothing new to archive."),
+                    Ok(ArchiveOutcome::Disabled) => {
+                        eprintln!(
+                            "Archiving is off (`session_snapshot_limit 0`); nothing was archived."
+                        );
+                        std::process::exit(2);
+                    },
+                    Ok(ArchiveOutcome::NothingToArchive) => {
+                        eprintln!("There is no serialized layout for this session to archive.");
+                        std::process::exit(2);
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to archive the session: {}", e);
+                        std::process::exit(2);
+                    },
+                }
+            }
             std::process::exit(exit_status);
         },
         Err(e) => {
@@ -722,6 +1311,18 @@ pub(crate) fn start_client(opts: CliArgs) {
             process::exit(1);
         },
     };
+
+    // `pin_exe` covered only the generated service unit until now, so a session started by typing
+    // `zellij` ran a server from the package manager's versioned path - a new TCC subject after
+    // every upgrade, which is exactly what the pin exists to prevent. Decided once here, where the
+    // config is, and only for the server: the client stays the binary the user typed.
+    #[cfg(unix)]
+    zellij_client::record_pinned_server_exe(
+        zellij_utils::session_service::server_exe_for_interactive_launch(
+            config_options.session_service.as_ref(),
+            session_name_in_opts(&opts).as_deref(),
+        ),
+    );
 
     let mut reconnect_to_session: Option<ConnectToSession> = None;
     let os_input = get_os_input(get_client_os_input);

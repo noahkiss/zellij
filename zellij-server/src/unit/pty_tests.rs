@@ -177,6 +177,32 @@ fn make_pty_with_plugin_receiver(
     (pty, plugin_rx)
 }
 
+/// A pty whose screen channel a test can read, to see what each tick told Screen.
+fn make_pty_with_screen_receiver(
+    mock: MockOsApi,
+) -> (Pty, channels::Receiver<(ScreenInstruction, ErrorContext)>) {
+    let (plugin_tx, _plugin_rx) = channels::unbounded();
+    let (screen_tx, screen_rx) = channels::unbounded();
+    let mut bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    bus.os_input = Some(Box::new(mock));
+    bus.senders.to_plugin = Some(SenderWithContext::new(plugin_tx));
+    bus.senders.to_screen = Some(SenderWithContext::new(screen_tx));
+    let pty = Pty::new(bus, false, None, None, Default::default(), None, None, None);
+    (pty, screen_rx)
+}
+
+fn collect_process_info_reports(
+    rx: &channels::Receiver<(ScreenInstruction, ErrorContext)>,
+) -> Vec<HashMap<u32, PaneProcessInfo>> {
+    let mut reports = Vec::new();
+    while let Ok((instruction, _)) = rx.try_recv() {
+        if let ScreenInstruction::UpdatePaneProcessInfo { process_info, .. } = instruction {
+            reports.push(process_info);
+        }
+    }
+    reports
+}
+
 fn set_active_terminal(pty: &mut Pty, terminal_id: u32, child_pid: u32) {
     let flag = Arc::new(AtomicBool::new(true));
     pty.id_to_child_pid.insert(terminal_id, child_pid);
@@ -661,3 +687,168 @@ fn resurrect_command_for_unknown_terminal_is_rejected() {
     assert!(result.is_err());
     assert!(pty.resurrect_commands.is_empty());
 }
+/// The pid of a reaped child is the OS's to hand out again, so a pane that outlives its command
+/// must not keep it: signalling it would hit whatever process holds that number now.
+#[test]
+fn a_held_pane_forgets_the_pid_of_its_reaped_child() {
+    let mock = MockOsApi::new();
+    let recorder = mock.clone();
+    let (mut pty, pty_rx) = make_pty_with_pty_receiver(mock.clone());
+    let held_command = RunCommand {
+        command: PathBuf::from("/bin/does-not-matter"),
+        hold_on_close: true,
+        ..Default::default()
+    };
+    let _ = pty
+        .spawn_terminal(
+            Some(TerminalAction::RunCommand(held_command)),
+            ClientTabIndexOrPaneId::TabIndex(0),
+            None,
+        )
+        .expect("the mock spawns a terminal");
+    assert_eq!(
+        pty.id_to_child_pid.get(&1).copied(),
+        Some(100),
+        "the running pane has a pid"
+    );
+
+    mock.exit_last_spawned_pane(PaneId::Terminal(1), Some(0));
+
+    // the reaping thread owns none of the pty thread's state, so it asks the pty thread to forget
+    let mut forgotten = vec![];
+    while let Ok((instruction, _)) = pty_rx.try_recv() {
+        if let PtyInstruction::ChildProcessExited(terminal_id) = instruction {
+            forgotten.push(terminal_id);
+        }
+    }
+    assert_eq!(
+        forgotten,
+        vec![1],
+        "a held pane's exit should tell the pty thread to forget the child pid"
+    );
+    for terminal_id in forgotten {
+        pty.forget_child_pid(terminal_id);
+    }
+
+    assert!(
+        pty.id_to_child_pid.get(&1).is_none(),
+        "a held pane holds no pid"
+    );
+    match pty.get_pane_pid(PaneId::Terminal(1)) {
+        GetPanePidResponse::Err(_) => {},
+        other => panic!("a held pane should report no pid, got {:?}", other),
+    }
+    assert!(
+        recorder.signals_sent().is_empty(),
+        "nothing should have been signalled"
+    );
+}
+
+/// An idle session should not wake the screen thread once a second to tell it nothing.
+#[test]
+fn an_unchanged_process_info_map_is_not_reported_again() {
+    let mock = MockOsApi::new();
+    let child_pid = 100;
+    mock.set_cmd(child_pid, vec!["/bin/bash".into()]);
+    mock.set_cwd(child_pid, PathBuf::from("/tmp"));
+    let (mut pty, screen_rx) = make_pty_with_screen_receiver(mock.clone());
+    set_active_terminal(&mut pty, 1, child_pid);
+
+    pty.update_and_report_cwds();
+    let first = collect_process_info_reports(&screen_rx);
+    assert_eq!(first.len(), 1, "the first tick tells Screen what it found");
+
+    // nothing changed, and the pane produced no output
+    pty.update_and_report_cwds();
+    pty.update_and_report_cwds();
+    assert!(
+        collect_process_info_reports(&screen_rx).is_empty(),
+        "an unchanged map should not be sent again"
+    );
+
+    // the pane runs something new
+    mock.set_foreground_cmd(child_pid, vec!["vim".into()]);
+    pty.pane_activity_flags
+        .get(&1)
+        .unwrap()
+        .store(true, Ordering::Relaxed);
+    pty.update_and_report_cwds();
+    let after_change = collect_process_info_reports(&screen_rx);
+    assert_eq!(
+        after_change.len(),
+        1,
+        "a changed map should reach Screen: {:?}",
+        after_change
+    );
+    assert_eq!(
+        after_change[0]
+            .get(&1)
+            .and_then(|info| info.command.clone()),
+        Some(vec!["vim".to_owned()])
+    );
+}
+
+/// A pty with nothing wired up, for testing state it keeps for itself.
+fn make_bare_pty() -> Pty {
+    let bus: Bus<PtyInstruction> = Bus::empty().should_silently_fail();
+    Pty::new(bus, false, None, None, Default::default(), None, None, None)
+}
+
+#[test]
+fn the_first_tick_writes_the_cache_even_though_the_session_is_clean() {
+    // a session that never diverges from its layout would otherwise never write a resurrection
+    // cache at all, and could not be resurrected
+    let mut pty = make_bare_pty();
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED),
+        "the base shape has to reach disk once"
+    );
+}
+
+#[test]
+fn a_clean_session_stops_writing_the_cache() {
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED); // the first tick, which always writes
+    for tick in 0..5 {
+        assert!(
+            !pty.should_serialize_layout(false, UNCHANGED),
+            "nothing changed on tick {}, so there is nothing to write",
+            tick
+        );
+    }
+}
+
+#[test]
+fn a_dirty_session_writes_the_cache_every_tick() {
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED);
+    for tick in 0..5 {
+        assert!(
+            pty.should_serialize_layout(true, UNCHANGED),
+            "the session is still diverged on tick {}",
+            tick
+        );
+    }
+}
+
+#[test]
+fn returning_to_the_base_shape_rewrites_the_cache_once() {
+    // the trap the latch exists for: a session that opens a pane and closes it again is clean, and
+    // the cache on disk still describes the pane that is gone. Without the transition write, the
+    // next resurrection hands that pane back.
+    let mut pty = make_bare_pty();
+    pty.should_serialize_layout(false, UNCHANGED); // the first tick
+    assert!(
+        pty.should_serialize_layout(true, UNCHANGED),
+        "a pane was opened"
+    );
+    assert!(
+        pty.should_serialize_layout(false, UNCHANGED),
+        "the pane was closed - the diverged cache has to be overwritten"
+    );
+    assert!(
+        !pty.should_serialize_layout(false, UNCHANGED),
+        "and only once: the cache already matches"
+    );
+}
+

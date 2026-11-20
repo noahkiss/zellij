@@ -1,5 +1,6 @@
 ---
 source: zellij-server/src/./unit/screen_tests.rs
+assertion_line: 4864
 expression: output
 ---
 NewTab(
@@ -35,6 +36,8 @@ NewTab(
                     default_bg: None,
                     attention_muted: None,
                     ignore_output: None,
+                    restored_from: None,
+                    pane_handle: None,
                 },
                 TiledPaneLayout {
                     children_split_direction: Horizontal,
@@ -61,6 +64,8 @@ NewTab(
                     default_bg: None,
                     attention_muted: None,
                     ignore_output: None,
+                    restored_from: None,
+                    pane_handle: None,
                 },
                 TiledPaneLayout {
                     children_split_direction: Horizontal,
@@ -87,6 +92,8 @@ NewTab(
                     default_bg: None,
                     attention_muted: None,
                     ignore_output: None,
+                    restored_from: None,
+                    pane_handle: None,
                 },
             ],
             split_size: None,
@@ -110,6 +117,8 @@ NewTab(
             default_bg: None,
             attention_muted: None,
             ignore_output: None,
+            restored_from: None,
+            pane_handle: None,
         },
     ),
     [],
@@ -129,7 +138,7 @@ NewTab(
             affected_pane_id: None,
             affected_tab_id: None,
             error_message: None,
-            stdout_message: None,
+            stdout_lines: [],
         },
     ),
 )

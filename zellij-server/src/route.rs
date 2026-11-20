@@ -1,7 +1,4 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
-use tokio::sync::oneshot;
-
 use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::thread_bus::ThreadSenders;
@@ -9,7 +6,7 @@ use crate::{
     os_input_output::ServerOsApi,
     panes::PaneId,
     plugins::PluginInstruction,
-    pty::{ClientTabIndexOrPaneId, PtyInstruction},
+    pty::{get_default_shell, ClientTabIndexOrPaneId, PtyInstruction},
     screen::ScreenInstruction,
     ServerInstruction, SessionMetaData, SessionState,
 };
@@ -20,14 +17,15 @@ use zellij_utils::{
     channels::SenderWithContext,
     data::{
         BareKey, ConnectToSession, Direction, Event, GetFocusedPaneInfoResponse, InputMode,
-        KeyModifier, ListPanesResponse, ListTabsResponse, NewPanePlacement, PaneListEntry,
-        ResizeStrategy, TabInfo, UnblockCondition,
+        KeyModifier, ListPanesResponse, ListTabsResponse, NewPanePlacement,
+        PaneId as ZellijUtilsPaneId, PaneListEntry, PaneTarget, ResizeStrategy, TabInfo,
+        UnblockCondition,
     },
     envs,
     errors::{prelude::*, ErrorContext},
     input::{
         actions::{Action, SearchDirection, SearchOption},
-        command::TerminalAction,
+        command::{RunCommand, TerminalAction},
     },
     ipc::{
         ClientToServerMsg, ExitReason, IpcReceiveError, IpcReceiverWithContext, ServerToClientMsg,
@@ -39,6 +37,13 @@ use crate::ClientId;
 mod popup_keys;
 pub(crate) use popup_keys::PopupKeyAction;
 pub use popup_keys::PopupScroll;
+
+/// How long a CLI action waits for the server to report that it finished.
+///
+/// The budget is for the answer, not for the work: an action that takes longer than this is not
+/// cancelled and usually still completes. It is generous because the slow cases are legitimate -
+/// a new tab from a heavy layout, or the first plugin load of a session, which compiles wasm.
+const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ActionCompletionResult {
@@ -574,16 +579,30 @@ fn route_action_with_origin(
                 ))
                 .with_context(err_context)?;
         },
-        Action::FocusPaneByPaneId { pane_id } => {
-            senders
-                .send_to_screen(ScreenInstruction::FocusPaneWithId(
-                    pane_id.into(),
-                    true,  // should_float_if_hidden
-                    false, // should_be_in_place_if_hidden
-                    client_id,
-                    Some(NotificationEnd::new(completion_tx)),
-                ))
-                .with_context(err_context)?;
+        Action::FocusPaneByPaneId { pane_id, no_focus } => {
+            if no_focus {
+                // the probe: nothing moves, and the answer is whether a live pane answers to this
+                // target and what it is called. A pane that is not there is not a miss here - the
+                // question was whether it exists, and an empty answer is the answer
+                let mut notification_end = NotificationEnd::new(completion_tx);
+                if let Some(handle) = handle_of_pane(&senders, pane_id.into()) {
+                    notification_end.set_stdout_lines(vec![
+                        format!("id: {}", pane_id),
+                        format!("handle: {}", handle),
+                    ]);
+                }
+                drop(notification_end);
+            } else {
+                senders
+                    .send_to_screen(ScreenInstruction::FocusPaneWithId(
+                        pane_id.into(),
+                        true,  // should_float_if_hidden
+                        false, // should_be_in_place_if_hidden
+                        client_id,
+                        Some(NotificationEnd::new(completion_tx)),
+                    ))
+                    .with_context(err_context)?;
+            }
         },
         Action::FocusLastPane => {
             senders
@@ -1404,13 +1423,18 @@ fn route_action_with_origin(
                 ))
                 .with_context(err_context)?;
         },
-        Action::GoToTabName { name, create } => {
+        Action::GoToTabName {
+            name,
+            create,
+            no_focus,
+        } => {
             let shell = default_shell.clone();
             senders
                 .send_to_screen(ScreenInstruction::GoToTabName(
                     name,
                     shell,
                     create,
+                    no_focus,
                     Some(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                 ))
@@ -4253,6 +4277,16 @@ fn build_table_header(
         header.push("COLS");
     }
 
+        header.push("NOTE");
+    }
+
+    if show_geometry {
+        header.push("X");
+        header.push("Y");
+        header.push("ROWS");
+        header.push("COLS");
+    }
+
     header.join("  ")
 }
 
@@ -4323,6 +4357,17 @@ fn extract_command(entry: &PaneListEntry) -> String {
         .map(|s| s.as_str())
         .unwrap_or("-")
         .to_string()
+}
+
+/// The pane's note as one table cell: `error:exit 7`, or `-` for a pane with none.
+///
+/// The colour rides with the text because it is what the note MEANS, and a table that printed only
+/// the words would lose the difference between a pane that finished and one that failed.
+fn format_note(pane_info: &zellij_utils::data::PaneInfo) -> String {
+    if pane_info.note.is_empty() {
+        return "-".to_string();
+    }
+    format!("{}:{}", pane_info.note_color, pane_info.note)
 }
 
 fn extract_cwd(entry: &PaneListEntry) -> String {
@@ -4924,6 +4969,53 @@ mod tests {
     }
 
     #[test]
+    fn the_surface_dump_promises_the_columns_these_tables_print() {
+        // `zellij setup --dump-surface` is the map an agent reads instead of running every
+        // `--help`, and its column lists are hand-written - the one thing clap cannot introspect.
+        // They have drifted from the printer before, so the printer is the authority: a column
+        // added here and not there fails the build rather than teaching an agent a short table.
+        for (command, header) in [
+            (
+                "action list-panes",
+                format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true)
+                    .remove(0),
+            ),
+            (
+                "action list-tabs",
+                format_tabs_table(&[TabInfo::default()], true, true, true, true).remove(0),
+            ),
+        ] {
+            let promised = zellij_utils::cli_surface::promised_output_keys(command)
+                .unwrap_or_else(|| panic!("`{}` promises columns in the dump", command));
+            assert_eq!(
+                promised.split_whitespace().collect::<Vec<_>>(),
+                header.split_whitespace().collect::<Vec<_>>(),
+                "`{}`: the dump and the table disagree",
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_table_and_the_tree_both_carry_a_pane_note() {
+        let mut noted = pane_entry(7, "sunny-otter");
+        noted.pane_info.note = "exit 7".to_owned();
+        noted.pane_info.note_color = zellij_utils::data::NoteColor::Error;
+        let table = format_panes_table(&[noted.clone()], true, true, true, true);
+        assert!(table[0].contains("NOTE"), "{}", table[0]);
+        // the colour rides with the words: it is what the note means, and a table without it
+        // could not tell a pane that finished from one that failed
+        assert!(table[1].contains("error:exit 7"), "{}", table[1]);
+        let tree = format_tree(&[tab_info(1, "tab1", true)], &[noted]);
+        assert!(tree[1].contains("note: error:exit 7"), "{}", tree[1]);
+        // the negative control: a pane with no note prints the `-` this fork prints for an empty
+        // field everywhere else, rather than a blank column nobody can parse. The trailing `-` is
+        // AGENT, which the same rule covers for a pane running no coding agent
+        let plain = format_panes_table(&[pane_entry(8, "tender-orca")], true, true, true, true);
+        assert!(plain[1].ends_with("  -  0  0  0  0  -"), "{}", plain[1]);
+    }
+
+    #[test]
     fn the_pane_table_names_every_pane_by_its_handle() {
         let table = format_panes_table(&[pane_entry(7, "sunny-otter")], true, true, true, true);
         let header = &table[0];
@@ -5011,6 +5103,27 @@ mod tests {
         assert!(id_report_lines(&result, &keys).is_empty());
     }
 
+    #[test]
+    fn an_exit_status_is_not_displaced_by_the_id_report() {
+        // `new-pane --block-until-exit -- sh -c 'exit 7'` carries both a pane id, set when the
+        // pane was built, and the status the caller asked to wait for. Only one message reaches
+        // the CLI, so reporting the id here would answer 0 for every command
+        let mut result = completion_with(None, Some(PaneId::Terminal(7)), vec![]);
+        result.exit_status = Some(7);
+        let keys = IdReportKeys::for_action(&Action::CloseFocus);
+        assert!(id_report_lines(&result, &keys).is_empty());
+    }
+
+    #[test]
+    fn a_report_the_action_wrote_still_outranks_an_exit_status() {
+        // the negative control for the rule above: an action that said something meant to say it
+        let mut result = completion_with(None, None, vec!["closed: terminal_7".to_string()]);
+        result.exit_status = Some(1);
+        let keys = IdReportKeys::for_action(&Action::CloseFocus);
+        assert_eq!(
+            id_report_lines(&result, &keys),
+            vec!["closed: terminal_7".to_string()]
+        );
     }
 
     #[test]

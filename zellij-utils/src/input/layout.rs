@@ -865,6 +865,20 @@ pub struct FloatingPaneLayout {
     pub attention_muted: Option<bool>,
     #[serde(default)]
     pub ignore_output: Option<bool>,
+    /// The uuid of the pane this one continues, when it was built from a serialized session.
+    ///
+    /// A restored pane is a NEW pane - new process, new state - and gets its own new uuid, which is
+    /// what stops a consumer's pre-restart state from silently reattaching to it. This field is the
+    /// other half of that: it says WHICH pane it continues, so a consumer that wants the link can
+    /// make it deliberately. Empty for a pane that was never restored.
+    pub restored_from: Option<String>,
+    /// The handle this pane answers to, when it was built from a serialized session.
+    ///
+    /// Unlike `restored_from`, this one CARRIES: the restored pane keeps the handle, because a
+    /// handle is an address and an address that changed when the session came back would not be
+    /// one. `None` for a hand-written layout and for a snapshot saved before handles existed - the
+    /// pane then gets a fresh handle at restore, never an empty one.
+    pub pane_handle: Option<String>,
 }
 
 impl FloatingPaneLayout {
@@ -887,6 +901,8 @@ impl FloatingPaneLayout {
             default_bg: None,
             attention_muted: None,
             ignore_output: None,
+            restored_from: None,
+            pane_handle: None,
         }
     }
     pub fn add_cwd_to_layout(&mut self, cwd: &PathBuf) {
@@ -943,9 +959,22 @@ pub struct TiledPaneLayout {
     pub attention_muted: Option<bool>,
     #[serde(default)]
     pub ignore_output: Option<bool>,
+    /// The uuid of the pane this one continues, when it was built from a serialized session.
+    ///
+    /// A restored pane is a NEW pane - new process, new state - and gets its own new uuid, which is
+    /// what stops a consumer's pre-restart state from silently reattaching to it. This field is the
+    /// other half of that: it says WHICH pane it continues, so a consumer that wants the link can
+    /// make it deliberately. Empty for a pane that was never restored.
+    pub restored_from: Option<String>,
+    /// The handle this pane answers to, when it was built from a serialized session.
+    ///
+    /// Unlike `restored_from`, this one CARRIES: the restored pane keeps the handle, because a
+    /// handle is an address and an address that changed when the session came back would not be
+    /// one. `None` for a hand-written layout and for a snapshot saved before handles existed - the
+    /// pane then gets a fresh handle at restore, never an empty one.
+    pub pane_handle: Option<String>,
 }
 
-impl TiledPaneLayout {
 impl TiledPaneLayout {
     /// Every handle this layout and its descendants carry.
     ///
@@ -1918,19 +1947,31 @@ impl Layout {
             }
         }
     }
+    /// The number of panes this layout produces when it is applied.
+    ///
+    /// The template is an ALTERNATIVE to the tabs, not an addition to them. Applying a layout
+    /// branches on `has_tabs` exactly once (`zellij-server/src/lib.rs`, and `apply_layout` in
+    /// `zellij-server/src/plugins/zellij_exports.rs`): a layout with tabs spawns one tab per
+    /// entry and never spawns the template, a layout without tabs spawns a single tab from the
+    /// template. This branches the same way, so the count is the count of panes that actually
+    /// appear.
+    ///
+    /// It used to add the template's panes on top of the tabs. The parser fills `template` even
+    /// for a layout that declares its own tabs, so every KDL layout with tabs over-counted, and
+    /// `is_dirty` therefore called every such session dirty forever.
+    ///
+    /// Swap layouts are alternative ARRANGEMENTS of the panes that are already counted here, so
+    /// they contribute nothing and must keep contributing nothing.
     pub fn pane_count(&self) -> usize {
         let mut pane_count = 0;
-        if let Some((tiled_pane_layout, floating_panes)) = self.template.as_ref() {
-            pane_count += tiled_pane_layout.pane_count();
-            for _ in floating_panes {
-                pane_count += 1;
+        if self.has_tabs() {
+            for (_, tiled_pane_layout, floating_panes) in &self.tabs {
+                pane_count += tiled_pane_layout.pane_count();
+                pane_count += floating_panes.len();
             }
-        }
-        for (_, tiled_pane_layout, floating_panes) in &self.tabs {
+        } else if let Some((tiled_pane_layout, floating_panes)) = self.template.as_ref() {
             pane_count += tiled_pane_layout.pane_count();
-            for _ in floating_panes {
-                pane_count += 1;
-            }
+            pane_count += floating_panes.len();
         }
         pane_count
     }

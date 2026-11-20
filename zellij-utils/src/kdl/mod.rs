@@ -12424,6 +12424,23 @@ fn terminal_title_is_unset_by_default() {
     assert_eq!(config.options.session_aliases, None);
 }
 
+/// `pane_privacy` was a fork block that this build no longer reads. An old config that still
+/// carries one loads, with the block reported as an unknown key.
+#[test]
+fn a_retired_pane_privacy_block_warns_and_loads() {
+    let config = Config::from_kdl(
+        "pane_privacy {\n    pattern \"pretend-private\"\n}\nsimplified_ui true",
+        None,
+    )
+    .unwrap();
+    assert_eq!(config.options.simplified_ui, Some(true));
+    assert!(
+        config.warnings.iter().any(|w| w.contains("pane_privacy")),
+        "{:?}",
+        config.warnings
+    );
+}
+
 /// `builtin_plugin_dir` was a fork key that this build no longer reads. An old config that still
 /// carries it loads, with the key reported as unknown.
 #[test]

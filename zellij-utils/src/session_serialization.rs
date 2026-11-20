@@ -45,6 +45,12 @@ pub struct PaneLayoutManifest {
     pub border_style: Option<BorderStyleOverride>,
     pub attention_muted: bool,
     pub ignore_output: bool,
+    /// The uuid this pane had when the session was serialized. A pane restored from this manifest
+    /// gets a NEW uuid and reports this one as `restored_from`.
+    pub pane_uuid: Option<String>,
+    /// The handle this pane answers to. A pane restored from this manifest comes back at the same
+    /// handle - that is the difference between an address and a lineage.
+    pub pane_handle: Option<String>,
 }
 
 pub fn serialize_session_layout(
@@ -236,6 +242,22 @@ fn serialize_tiled_pane(
     );
 
     serialize_tiled_layout_attributes(&layout, is_in_stack, &mut tiled_pane_node);
+    // The pane's CURRENT uuid, written so the pane restored from this layout can report what it
+    // continues. One hop only: a pane that was itself restored records the uuid it is living under
+    // now, not the whole chain back to the first incarnation.
+    if let Some(ref uuid) = layout.restored_from {
+        tiled_pane_node
+            .entries_mut()
+            .push(KdlEntry::new_prop("pane_uuid", uuid.to_owned()));
+    }
+    // The pane's handle, written so the pane restored from this layout comes back at the same
+    // address. Unlike the uuid above, this one is not provenance - it IS the restored pane's
+    // handle.
+    if let Some(ref handle) = layout.pane_handle {
+        tiled_pane_node
+            .entries_mut()
+            .push(KdlEntry::new_prop("pane_handle", handle.to_owned()));
+    }
     if let Some(ref fg) = layout.default_fg {
         tiled_pane_node
             .entries_mut()
@@ -767,6 +789,22 @@ fn serialize_floating_pane(
         has_children,
         &mut floating_pane_node,
     );
+    // The pane's CURRENT uuid, written so the pane restored from this layout can report what it
+    // continues. One hop only: a pane that was itself restored records the uuid it is living under
+    // now, not the whole chain back to the first incarnation.
+    if let Some(ref uuid) = layout.restored_from {
+        floating_pane_node
+            .entries_mut()
+            .push(KdlEntry::new_prop("pane_uuid", uuid.to_owned()));
+    }
+    // The pane's handle, written so the pane restored from this layout comes back at the same
+    // address. Unlike the uuid above, this one is not provenance - it IS the restored pane's
+    // handle.
+    if let Some(ref handle) = layout.pane_handle {
+        floating_pane_node
+            .entries_mut()
+            .push(KdlEntry::new_prop("pane_handle", handle.to_owned()));
+    }
     if let Some(ref fg) = layout.default_fg {
         floating_pane_node
             .entries_mut()
@@ -901,6 +939,8 @@ fn tiled_pane_layout_from_manifest(
         border_style,
         attention_muted,
         ignore_output,
+        restored_from: manifest.and_then(|m| m.pane_uuid.clone()),
+        pane_handle: manifest.and_then(|m| m.pane_handle.clone()),
         ..Default::default()
     }
 }
@@ -1019,6 +1059,8 @@ fn get_floating_panes_layout_from_panegeoms(
                 border_style: m.border_style,
                 attention_muted: m.attention_muted.then_some(true),
                 ignore_output: m.ignore_output.then_some(true),
+                restored_from: m.pane_uuid.clone(),
+                pane_handle: m.pane_handle.clone(),
             }
         })
         .collect()
@@ -2883,6 +2925,95 @@ mod tests {
         dim
     }
 }
+
+#[cfg(test)]
+mod restored_from_tests {
+    use super::*;
+    use crate::input::layout::{Layout, TiledPaneLayout};
+
+    pub(super) fn manifest_with_handle(handle: Option<&str>) -> PaneLayoutManifest {
+        PaneLayoutManifest {
+            pane_handle: handle.map(|h| h.to_owned()),
+            ..manifest_with_uuid(None)
+        }
+    }
+
+    pub(super) fn manifest_with_uuid(uuid: Option<&str>) -> PaneLayoutManifest {
+        PaneLayoutManifest {
+            geom: Default::default(),
+            run: None,
+            cwd: None,
+            is_borderless: false,
+            title: Some("shell".to_owned()),
+            is_focused: false,
+            pane_contents: None,
+            default_fg: None,
+            default_bg: None,
+            pane_uuid: uuid.map(|u| u.to_owned()),
+            pane_handle: None,
+            border_style: None,
+            attention_muted: false,
+            ignore_output: false,
+            stack_orientation: None,
+        }
+    }
+
+    pub(super) fn parse_single_pane(kdl: &str) -> TiledPaneLayout {
+        let layout = Layout::from_kdl(kdl, None, None, None).expect("layout parses");
+        layout
+            .template
+            .expect("template")
+            .0
+            .children
+            .into_iter()
+            .next()
+            .expect("one pane")
+    }
+
+    #[test]
+    fn a_serialized_pane_records_the_uuid_it_had() {
+        let manifest = manifest_with_uuid(Some("f1e5dce9-a073-4594-b270-41f002924a9b"));
+        let layout = tiled_pane_layout_from_manifest(Some(&manifest), None);
+        assert_eq!(
+            layout.restored_from.as_deref(),
+            Some("f1e5dce9-a073-4594-b270-41f002924a9b")
+        );
+    }
+
+    #[test]
+    fn the_uuid_survives_the_kdl_round_trip_as_restored_from() {
+        // the whole point: serialize a live session, restore it, and the new pane can still say
+        // which pane it continues
+        let uuid = "f1e5dce9-a073-4594-b270-41f002924a9b";
+        let manifest = manifest_with_uuid(Some(uuid));
+        let layout = tiled_pane_layout_from_manifest(Some(&manifest), None);
+        let kdl = serialize_tiled_pane(&layout, false, &mut BTreeMap::new()).to_string();
+        assert!(
+            kdl.contains(&format!("pane_uuid=\"{}\"", uuid)),
+            "expected the uuid in the serialized layout, got: {}",
+            kdl
+        );
+        let parsed = parse_single_pane(&format!("layout {{\n{}\n}}", kdl));
+        assert_eq!(parsed.restored_from.as_deref(), Some(uuid));
+    }
+
+    #[test]
+    fn a_pane_that_was_never_restored_carries_nothing() {
+        // an absent uuid must not become an empty-string lineage, which would read as "restored"
+        let layout = tiled_pane_layout_from_manifest(Some(&manifest_with_uuid(None)), None);
+        assert_eq!(layout.restored_from, None);
+        let kdl = serialize_tiled_pane(&layout, false, &mut BTreeMap::new()).to_string();
+        assert!(!kdl.contains("pane_uuid"), "got: {}", kdl);
+    }
+
+    #[test]
+    fn a_hand_written_layout_needs_no_uuid() {
+        // `pane_uuid` is written by serialization, never by a user - its absence is the normal case
+        let parsed = parse_single_pane("layout {\n    pane name=\"shell\"\n}");
+        assert_eq!(parsed.restored_from, None);
+    }
+}
+
 #[cfg(test)]
 mod pane_handle_tests {
     use super::restored_from_tests::{manifest_with_handle, parse_single_pane};

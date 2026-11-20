@@ -54,6 +54,14 @@ use zellij_utils::data::{
     ListPanesResponse, ListTabsResponse, NestedSessionEndReason, NestedSessionKeybinds,
     NestedSessionKeybindsError, NestedSessionKeybindsResponse, NewPanePlacement, PaneContents,
     PaneInfo, PaneListEntry, PaneManifest, PaneRenderReport, PaneScrollbackResponse,
+use crate::closed_panes::{ClosedPane, ClosedPaneKind, ClosedPanes, ClosingPane};
+use zellij_utils::data::{
+    BorderStyle, BorderStyleOverride, CommandOrPlugin, ContextMenuContext, ContextMenuEntry,
+    ContextMenuTarget, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
+    HiddenBars, HostTerminalThemeMode, KeyWithModifier, KeybindsVec, LayoutInfo, LayoutWithError,
+    ListPanesResponse, ListTabsResponse, NestedSessionEndReason, NestedSessionKeybinds,
+    NestedSessionKeybindsError, NestedSessionKeybindsResponse, NewPanePlacement, PaneContents,
+    PaneInfo, PaneListEntry, PaneManifest, PaneRenderReport, PaneScrollbackResponse, PaneTarget,
     PluginPermission, RegexHighlight, Resize, ResizeStrategy, SessionInfo, Styling, TabInfo,
     ThemeHue, WebSharing,
 };
@@ -66,14 +74,16 @@ use zellij_utils::input::keybinds::{shortcut_for_action, Keybinds};
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::input::mousebinds::Mousebinds;
 use zellij_utils::input::options::{
-    Clipboard, HostNotificationProtocol, NestedSessionHandling, PaneFrameStyle,
-    StackListOrientation, DEFAULT_WORD_SEPARATORS,
+    Clipboard, CommandPaneOnCleanExit, DefaultFloatingSize, HostNotificationProtocol,
+    InputWhileScrolled, NestedSessionHandling, PaneFrameStyle, StackListOrientation,
+    DEFAULT_WORD_SEPARATORS,
 };
 use zellij_utils::ipc::{
     ExitReason, MobileActivePanePayload, MobilePanePayload, MobileSessionPayload,
     MobileSizePayload, MobileStatePayload, MobileTabPayload, ServerToClientMsg,
 };
 use zellij_utils::pane_size::{PaneGeom, Size, SizeInPixels};
+use zellij_utils::resurrect_command_hints::prefill_as_paste;
 use zellij_utils::shared::{clean_string_from_control_and_linebreak, detect_theme_hue};
 use zellij_utils::structured_render;
 use zellij_utils::{
@@ -551,7 +561,8 @@ pub enum ScreenInstruction {
     GoToTabName(
         String,
         Option<TerminalAction>, // default_shell
-        bool,
+        bool,                   // create the tab if it does not exist
+        bool,                   // leave focus where it is
         Option<ClientId>,
         Option<NotificationEnd>,
     ),
@@ -2446,6 +2457,17 @@ mod typed_input_tests {
         assert!(!typed_input.output_answers_input(7, typed_at));
     }
 }
+/// What `close-pane` answers when it is asked to close the focused pane and nothing is focused.
+///
+/// A detached session has no client holding the focus, so the request is well formed and its
+/// subject is not there - a miss, not an error, and certainly not a success. The CLI guard
+/// (`missing_target_from_outside_a_pane`) catches this from outside the session; from inside it,
+/// with `$ZELLIJ_SESSION_NAME` naming a session nobody is attached to, this is the only place that
+/// can tell.
+pub const NO_FOCUSED_PANE_TO_CLOSE: &str =
+    "`close-pane` has no focused pane to close: nothing is attached to this session. \
+     Pass --pane-id. `zellij action list-panes` lists them.";
+
 /// What `go-to-tab-name` says when it has only a focus move left to do and nothing is attached.
 ///
 /// Making the tab no longer needs a client - a detached session sizes one against itself - so
@@ -2454,6 +2476,10 @@ mod typed_input_tests {
 pub const NO_CLIENT_TO_MOVE_TO_A_TAB: &str =
     "`go-to-tab-name` has no client to move: nothing is attached to this session.";
 
+/// The same, for the verb that takes an id. It has no `--create` half to answer, so with nothing
+/// attached there is nothing left of it at all.
+pub const NO_CLIENT_TO_MOVE_TO_A_TAB_BY_ID: &str =
+    "`go-to-tab-by-id` has no client to move: nothing is attached to this session.";
 
 impl Screen {
     /// Creates and returns a new [`Screen`].
@@ -6806,14 +6832,11 @@ impl Screen {
                 }
             },
             Some(tab) => {
-                if tab.are_floating_panes_visible() {
-                    if let Some(c) = completion.as_mut() {
-                        c.set_stdout_message("true".to_string());
-                    }
-                } else {
-                    if let Some(c) = completion.as_mut() {
-                        c.set_error_message("false".to_string());
-                    }
+                // a question answers on stdout whichever way it comes out: `false` is the answer,
+                // not a failure to answer, so it does not travel as an error message and does not
+                // become the exit code an error message turns into
+                if let Some(c) = completion.as_mut() {
+                    c.set_stdout_message(format!("visible: {}", tab.are_floating_panes_visible()));
                 }
             },
         }
@@ -7713,6 +7736,34 @@ impl Screen {
 
         sort_panes_by_tab_and_type(&mut pane_entries);
         Ok(pane_entries)
+    }
+
+    /// Gives a live pane back a handle it held before: a reopened pane's old name.
+    ///
+    /// The name has to be free among the session's live panes: a handle is an address, and an
+    /// address that reached two panes would be no address at all. A taken one is refused here,
+    /// and the reopened pane keeps the handle it generated.
+    ///
+    /// The pane's own handle counts as free for it: setting the name a pane already answers to
+    /// changes nothing.
+    pub fn set_pane_handle(&mut self, pane_id: PaneId, handle: &str) -> Result<(), String> {
+        let pane = self
+            .tabs
+            .values_mut()
+            .find_map(|tab| tab.get_pane_with_id_mut(pane_id))
+            .ok_or_else(|| format!("No pane answers to '{}'", pane_id))?;
+        if pane.pane_handle() == handle {
+            return Ok(());
+        }
+        if crate::pane_handles::is_live(handle) {
+            return Err(format!(
+                "The handle '{}' is taken by another pane in this session. \
+                 Handles name one pane at a time; `zellij action list-panes` prints them.",
+                handle
+            ));
+        }
+        pane.set_pane_handle(handle);
+        Ok(())
     }
 
     /// Which pane, if any, a CLI target names.
@@ -8775,11 +8826,11 @@ impl Screen {
         }
         // Notify background plugins subscribed to ModeUpdate
         let mut bg_updates = vec![];
-        for ((bg_pid, bg_cid), subs) in &self.background_plugin_subscriptions {
-            if subs.contains(&EventType::ModeUpdate) && *bg_cid == client_id {
+        for (bg_pid, bg_cid) in self.background_plugin_ids_subscribed_to(EventType::ModeUpdate) {
+            if bg_cid == client_id {
                 bg_updates.push((
-                    Some(*bg_pid),
-                    Some(*bg_cid),
+                    Some(bg_pid),
+                    Some(bg_cid),
                     Event::ModeUpdate(mode_info.clone()),
                 ));
             }
@@ -9223,6 +9274,19 @@ impl Screen {
         }
     }
 
+    /// Whether a pane the session was asked to make is actually in a tab.
+    ///
+    /// A pane is asked for by an id that exists before the pane does: the pty is spawned first and
+    /// the tab is offered it afterwards. A tab may decline - it has no size until a client has
+    /// attached to it once, and some placements need a focused pane there is none of - and it
+    /// declines by dropping the pty, silently. So this is the only thing that separates "made" from
+    /// "asked for", and a report that names a pane has to pass through it first.
+    ///
+    /// Suppressed panes count: a pane opened in place of another is real and addressable, and the
+    /// pane it replaced is still there behind it.
+    pub fn pane_exists(&self, pane_id: &PaneId) -> bool {
+        self.tabs.values().any(|tab| tab.has_pane_with_pid(pane_id))
+    }
     pub fn focus_pane_with_id(
         &mut self,
         pane_id: PaneId,
@@ -9366,6 +9430,24 @@ impl Screen {
         }
         Ok(())
     }
+    /// The requested panes no tab owns, in the order they were asked for.
+    ///
+    /// `break_multiple_panes_*` skips a pane it cannot find, so without this check a request naming
+    /// only stale ids moves nothing and reports success - and, for a new tab, leaves an empty tab
+    /// behind.
+    pub fn panes_not_found(&self, pane_ids: &[PaneId]) -> Vec<PaneId> {
+        pane_ids
+            .iter()
+            .copied()
+            .filter(|pane_id| {
+                !self
+                    .tabs
+                    .values()
+                    .any(|tab| tab.has_non_suppressed_pane_with_pid(pane_id))
+            })
+            .collect()
+    }
+
     pub fn break_multiple_panes_to_new_tab(
         &mut self,
         pane_ids: Vec<PaneId>,
@@ -9810,11 +9892,11 @@ impl Screen {
             .unwrap_or(PaneNotCreatedReason::Unknown)
     }
     fn apply_pty_bytes(&mut self, pid: u32, vte_bytes: VteBytes) -> Result<Option<VteBytes>> {
-        self.pane_output_activity
-            .insert(PaneId::Terminal(pid), Instant::now());
+        self.record_pane_output(PaneId::Terminal(pid));
         let mut vte_bytes = Some(vte_bytes);
         let mut title_changed = false;
         let mut answers_typed_input = false;
+        let mut at_a_prompt = false;
         for tab in self.get_tabs_mut().values_mut() {
             if tab.has_terminal_pid(pid) {
                 if let Some(bytes) = vte_bytes.take() {
@@ -9826,10 +9908,38 @@ impl Screen {
                     let title_after = tab
                         .get_pane_with_id(PaneId::Terminal(pid))
                         .map(|pane| pane.current_title());
-                    title_changed = title_before != title_after;
+                    // fork: a title the program set for itself is a pane state change too, and
+                    // reaches `program_title` even when a user-given name hides it from the title
+                    let program_title_changed = tab.take_program_title_changed(pid);
+                    title_changed = title_before != title_after || program_title_changed;
                     answers_typed_input = tab.output_answers_typed_input(pid, Instant::now());
+                    at_a_prompt = tab.bracketed_paste_enabled(pid);
                 }
                 break;
+            }
+        }
+        // fork addition: a prefill is typed only once the line editor is reading. Bytes written
+        // before it starts sit in a cooked-mode tty, where the kernel echoes them above the
+        // prompt and a shell that flushes input on start drops them
+        if at_a_prompt {
+            if let Some(prefill) = self.pending_prefills.remove(&pid) {
+                self.bus
+                    .senders
+                    .send_to_pty_writer(PtyWriteInstruction::Write(
+                        prefill_as_paste(&prefill),
+                        pid,
+                        None,
+                    ))
+                    .context("failed to type a prefill")?;
+                // written straight to the pty, not through the pane's input, so this does not
+                // count as the input that clears it again
+                if let Some(pane) = self
+                    .tabs
+                    .values_mut()
+                    .find_map(|tab| tab.get_pane_with_id_mut(PaneId::Terminal(pid)))
+                {
+                    pane.set_prefilled_command(Some(prefill));
+                }
             }
         }
         if title_changed {
@@ -11873,6 +11983,14 @@ pub(crate) fn screen_thread_main(
                         }
                     },
                 };
+                // fork addition: a reopened pane answers to its old name before it is reported
+                if let PaneId::Terminal(terminal_id) = pid {
+                    if let Some(handle) = screen.pending_reopen_handles.remove(&terminal_id) {
+                        if let Err(e) = screen.set_pane_handle(pid, &handle) {
+                            log::info!("reopen-pane: kept a new handle: {}", e);
+                        }
+                    }
+                }
                 screen.finish_pane_creation(
                     pid,
                     &mut completion_tx,
@@ -12458,10 +12576,28 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 full,
                 pane_id,
-                completion_tx,
+                mut completion_tx,
                 cli_client_id,
                 ansi,
             ) => {
+                // a target no live pane answers to is a miss - the same one `close-pane` reports -
+                // rather than an empty dump, which reads as "this pane's screen is blank" and
+                // exits 0. Asked once here so that the file form and the stdout form agree
+                if let Some(pane_id) = pane_id {
+                    if !screen
+                        .tabs
+                        .values()
+                        .any(|tab| tab.has_pane_with_pid(&pane_id))
+                    {
+                        if let Some(c) = completion_tx.as_mut() {
+                            c.set_error_message(format!(
+                                "No pane answers to '{}'",
+                                screen.pane_summary(pane_id)
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 match file {
                     Some(file_path) => {
                         // Write dump to file (existing behavior)
@@ -12587,7 +12723,12 @@ pub(crate) fn screen_thread_main(
                     ))
                     .with_context(err_context)?;
             },
-            ScreenInstruction::ListClientsMetadata(default_shell, client_id, completion_tx) => {
+            ScreenInstruction::ListClientsMetadata(
+                default_shell,
+                client_id,
+                output_json,
+                completion_tx,
+            ) => {
                 let err_context = || format!("Failed to dump layout");
                 let session_layout_metadata = screen.get_layout_metadata(default_shell, None);
                 screen
@@ -12596,6 +12737,7 @@ pub(crate) fn screen_thread_main(
                     .send_to_plugin(PluginInstruction::ListClientsMetadata(
                         session_layout_metadata,
                         client_id,
+                        output_json,
                         completion_tx,
                     ))
                     .with_context(err_context)?;
@@ -13034,13 +13176,31 @@ pub(crate) fn screen_thread_main(
                 screen.sync_scroll_mode_if_scroll_changed(client_id, was_scrolled)?;
                 screen.render(None)?;
             },
-            ScreenInstruction::CloseFocusedPane(client_id, completion_tx) => {
+            ScreenInstruction::CloseFocusedPane(client_id, mut completion_tx) => {
                 let old_pane_id = screen.get_active_pane_id(&client_id);
-                active_tab_and_connected_client_id!(
-                    screen,
-                    client_id,
-                    |tab: &mut Tab, client_id: ClientId| tab.close_focused_pane(client_id, completion_tx), ?
-                );
+                let closing = old_pane_id
+                    .map(|pane_id| screen.closing_pane_snapshots(&[pane_id], false))
+                    .unwrap_or_default();
+                if let Some(old_pane_id) = old_pane_id {
+                    // the report is written before the close because the close consumes the
+                    // channel. A close that refuses sets an error message, and an error outranks a
+                    // report, so saying it early cannot make a failure look like a success
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_stdout_message(format!("closed: {}", old_pane_id));
+                    }
+                    active_tab_and_connected_client_id!(
+                        screen,
+                        client_id,
+                        |tab: &mut Tab, client_id: ClientId| tab.close_focused_pane(client_id, completion_tx), ?
+                    );
+                } else if let Some(c) = completion_tx.as_mut() {
+                    // nothing holds the focus, so there is nothing this command names. Saying so is
+                    // the whole job here: falling through would let the fallback close some other
+                    // client's pane, and saying nothing at all exits 0 on a session that still has
+                    // every pane it started with
+                    c.set_error_message(NO_FOCUSED_PANE_TO_CLOSE.to_owned());
+                }
+                screen.remember_closed_panes(closing);
                 let new_pane_id = screen.get_active_pane_id(&client_id);
                 if let (Some(old), Some(new)) = (old_pane_id, new_pane_id) {
                     screen.report_key_passthrough_state(client_id, old, new);
@@ -14729,6 +14889,12 @@ pub(crate) fn screen_thread_main(
                     completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
                 }
 
+                // Set affected pane ID for CLI client output; `finish_pane_creation` clears it
+                // again if no tab takes the pane
+                if let Some(ref mut completion) = completion_tx {
+                    completion.set_affected_pane_id(PaneId::Plugin(plugin_id));
+                }
+
                 if should_be_in_place {
                     if let Some(pane_id_to_replace) = pane_id_to_replace {
                         let client_tab_index_or_pane_id =
@@ -15206,7 +15372,21 @@ pub(crate) fn screen_thread_main(
                 }
                 screen.log_and_report_session_state()?;
             },
-            ScreenInstruction::GoToTabWithId(tab_id, client_id, _completion_tx) => {
+            ScreenInstruction::GoToTabWithId(tab_id, client_id, mut completion_tx) => {
+                // fork addition: the miss is answered before a client is looked for, the way
+                // `go-to-tab` answers one. Asking about the client first left an id nothing answers
+                // to reported only while somebody was attached, so a script driving a detached
+                // session got a silent success for a tab that was never there.
+                //
+                // Only asked once the tab list has settled - a pending tab already holds its id and
+                // is about to answer to it, which is the same reason `go-to-tab` waits for it
+                if pending_tab_ids.is_empty() && screen.get_tab_position_by_id(tab_id).is_none() {
+                    log::error!("Tab with ID {} not found", tab_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_error_message(format!("No tab with id {}", tab_id));
+                    }
+                    continue;
+                }
                 let client_id_to_switch = client_id
                     .and_then(|cid| {
                         if screen.active_tab_ids.contains_key(&cid) {
@@ -15939,6 +16119,19 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
+                if !missing_panes.is_empty() {
+                    // fork: no new tab, an empty one is worse than nothing
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
+                    continue;
+                }
                 match screen.break_multiple_panes_to_new_tab(
                     pane_ids,
                     default_shell,
@@ -15979,6 +16172,19 @@ pub(crate) fn screen_thread_main(
                 client_id,
                 mut completion_tx,
             } => {
+                let missing_panes = screen.panes_not_found(&pane_ids);
+                if !missing_panes.is_empty() {
+                    // no move: a partial break is worse than nothing
+                    log::error!("Pane with id {:?} not found", missing_panes[0]);
+                    if let Some(c) = completion_tx.as_mut() {
+                        c.set_exit_status(1);
+                        c.set_error_message(format!(
+                            "Pane with id {:?} not found",
+                            missing_panes[0]
+                        ));
+                    }
+                    continue;
+                }
                 // tab_index is the target tab ID
                 screen.break_multiple_panes_to_tab_with_index(
                     pane_ids,
@@ -16711,6 +16917,13 @@ pub(crate) fn screen_thread_main(
                     screen.report_pane_and_tab_state_to_plugin(plugin_id, client_id)?;
                 }
             },
+            ScreenInstruction::RemoveBackgroundPluginSubscriptions(plugin_id) => {
+                // a plugin that is gone must stop having payloads built for it - every client id
+                // it was ever loaded with goes, since the plugin id is what died
+                screen
+                    .background_plugin_subscriptions
+                    .retain(|(bg_pid, _bg_cid), _| *bg_pid != plugin_id);
+            },
             ScreenInstruction::ClearHintTextCache => {
                 for tab in screen.tabs.values_mut() {
                     tab.clear_hint_text_cache();
@@ -17045,20 +17258,38 @@ pub(crate) fn screen_thread_main(
                 screen.log_and_report_session_state()?;
                 screen.render(None)?;
             },
-            ScreenInstruction::CloseFocusWithPaneId(pane_id, completion_tx) => {
+            ScreenInstruction::CloseFocusWithPaneId(pane_id, mut completion_tx) => {
+                let printed_id = screen.pane_summary(pane_id);
+                let closing = screen.closing_pane_snapshots(&[pane_id], false);
                 let all_tabs = screen.get_tabs_mut();
                 let mut found = false;
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
-                        tab.close_pane_by_pane_id(pane_id, completion_tx)
-                            .non_fatal();
+                        // the report is written here and the channel is NOT handed on to the pane
+                        // being torn down. It used to ride along into the pty thread and drop
+                        // there, after that thread had already broadcast its unblock - so the
+                        // answer was assembled behind the message that ended the command
+                        if let Some(c) = completion_tx.as_mut() {
+                            // the id and not the handle: the pane is gone, and its handle is back
+                            // in circulation for the next pane to be given
+                            c.set_stdout_message(format!("closed: {}", pane_id));
+                        }
+                        drop(completion_tx.take());
+                        tab.close_pane_by_pane_id(pane_id, None).non_fatal();
                         found = true;
                         break;
                     }
                 }
                 if !found {
                     log::error!("Pane with id {:?} not found", pane_id);
+                    if let Some(c) = completion_tx.as_mut() {
+                        // the miss sentence every pane target answers with, not a debug-formatted
+                        // id: `No pane answers to 'terminal_9'` is the same answer the resolver
+                        // gives for a handle nothing holds
+                        c.set_error_message(format!("No pane answers to '{}'", printed_id));
+                    }
                 }
+                screen.remember_closed_panes(closing);
                 screen.render(None)?;
                 screen.log_and_report_session_state()?;
             },
@@ -17377,6 +17608,10 @@ pub(crate) fn screen_thread_main(
             ScreenInstruction::SetAttentionConfig(config) => {
                 screen.reconfigure_attention(config);
             },
+#[path = "./unit/screen_tests.rs"]
+#[cfg(test)]
+mod screen_tests;
+
 /// Report a focus switch as what it left and what it landed on.
 ///
 /// Serves tabs (`<id> <name>`) and panes (`<pane_id> <handle>`) alike: id first, so that a script

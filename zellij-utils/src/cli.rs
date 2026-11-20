@@ -36,9 +36,14 @@ fn validate_session(name: &str) -> Result<String, String> {
 
 #[derive(Parser, Default, Debug, Clone, Serialize, Deserialize)]
 #[clap(
-    version,
+    version = crate::consts::version_long(),
     name = "zellij",
     about = "A terminal workspace with batteries included",
+    long_about = "A terminal workspace with batteries included.
+
+`zellij action <verb>` drives a session that is already running - reading it, moving around it, changing it - and `zellij action --help` states the conventions all of those verbs share.
+
+`zellij setup --dump-surface` prints the whole command tree in one call: every command, its flags with their types and defaults, and what it puts on stdout.",
     styles = CLI_STYLES,
     args_override_self = true
 )]
@@ -152,10 +157,23 @@ pub enum Command {
     #[clap(name = "web", value_parser)]
     Web(WebCli),
 
-    /// Send actions to a specific session
+    /// Drive a running session: read it, move around it, change it
+    ///
+    /// `zellij action --help` states the conventions every one of these verbs follows.
     #[clap(visible_alias = "ac")]
-    #[clap(subcommand)]
-    Action(Box<CliAction>),
+    Action {
+        /// Answer in JSON instead of the shape this verb prints. It goes BEFORE the verb, because
+        /// the seven verbs that were already answering in JSON own the trailing `--json`
+        /// themselves - and for those `zellij action --json list-panes` and `zellij action
+        /// list-panes --json` are the same call. A verb that reports a record answers one object; one
+        /// that reports nothing answers `{}`; a verb that prints a payload refuses, because a
+        /// payload has nothing to structure
+        #[clap(long)]
+        json: bool,
+
+        #[clap(subcommand)]
+        action: Box<CliAction>,
+    },
 
     /// Explore existing zellij sessions
     #[clap(flatten)]
@@ -537,6 +555,23 @@ pub struct AttachArgs {
     #[clap(short, long)]
     pub force_run_commands: bool,
 
+    /// Ignore any resurrection snapshot for this session and build it fresh from the layout
+    #[clap(long)]
+    pub no_resurrect: bool,
+
+    /// Rebuild the session from an archived snapshot instead of resurrecting it in place.
+    /// Takes a snapshot id (a unique prefix is enough) and defaults to the newest snapshot
+    /// for this session name
+    #[clap(
+        long,
+        value_name = "ID",
+        value_parser,
+        num_args(0..=1),
+        require_equals(false),
+        default_missing_value("latest")
+    )]
+    pub restore: Option<String>,
+
     /// Authentication token for remote sessions
     #[clap(short('t'), long, value_parser)]
     pub token: Option<String>,
@@ -716,7 +751,9 @@ impl TerminalArgs {
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]
 pub struct SubscribeCli {
-    /// Pane ID(s) to subscribe to (e.g. terminal_1, plugin_2, or bare number like 1)
+    /// The pane(s) to subscribe to: terminal_1, plugin_2, a bare integer (3 means terminal_3), a
+    /// handle like sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of
+    /// them in its PANE_ID and HANDLE columns
     #[clap(
         short,
         long,
@@ -742,6 +779,25 @@ pub struct SubscribeCli {
     /// Preserve ANSI styling in the output
     #[clap(long)]
     pub ansi: bool,
+
+    /// Stamp every line with the UTC time it was printed: `2026-08-14T18:03:12.345Z ` before each
+    /// raw line, a `ts` key in each json object. It is when this client printed the line, not when
+    /// the pane produced it
+    #[clap(long)]
+    pub timestamps: bool,
+}
+
+/// The stamp `subscribe --timestamps` puts on a line: RFC3339, UTC, to the millisecond.
+///
+/// It is taken once per update, so every line of one render shares it - the lines were printed in
+/// one go and a stamp that drifted across them would say otherwise. It is a *print* time: the
+/// client's clock when the line left it, which is later than the pane's output by however long the
+/// render and the socket took, and is the only time this side of the connection can honestly claim.
+// `humantime` is a native-only dependency; plugins compile this crate for wasm and never
+// stamp events, so the helper does not exist there
+#[cfg(not(target_family = "wasm"))]
+pub fn event_timestamp(at: std::time::SystemTime) -> String {
+    humantime::format_rfc3339_millis(at).to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ValueEnum)]
@@ -892,7 +948,7 @@ pub enum Sessions {
         create_background: bool,
     },
 
-    /// Watch a session (read-only)
+    /// Attach to a session read-only, seeing what it shows without being able to type into it
     #[clap(visible_alias = "w")]
     Watch {
         /// Name of the session to watch
@@ -900,15 +956,30 @@ pub enum Sessions {
         session_name: Option<String>,
     },
 
-    /// Kill a specific session
+    /// Stop a session's server, keeping the session resurrectable
+    ///
+    /// Returns once the server process is gone, so a caller that rebuilds the session next gets a
+    /// true answer. `delete-session` is what removes it for good.
     #[clap(visible_alias = "k")]
     KillSession {
         /// Name of target session
         #[clap(value_parser)]
         target_session: Option<String>,
+        /// Return as soon as the kill has been acknowledged, without waiting for the server to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
 
-    /// Delete a specific session
+    /// Delete a session's saved state, so it can no longer be resurrected
+    ///
+    /// A running session has to be killed first; --force does both.
     #[clap(visible_alias = "d")]
     DeleteSession {
         /// Name of target session
@@ -917,29 +988,21 @@ pub enum Sessions {
         /// Kill the session if it's running before deleting it
         #[clap(short, long)]
         force: bool,
-    },
-
-    /// Kill all sessions
-    #[clap(visible_alias = "ka")]
-    KillAllSessions {
-        /// Automatic yes to prompts
-        #[clap(short, long, value_parser)]
+        /// Return as soon as the kill has been acknowledged, without waiting for the server to exit
+        #[clap(long)]
+        no_wait: bool,
+        /// Seconds to wait for the server to exit before giving up (exits 1 on timeout)
+        #[clap(long, value_parser, default_value("10"))]
+        wait_timeout: u64,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
         yes: bool,
-    },
-
-    /// Delete all sessions
-    #[clap(visible_alias = "da")]
-    DeleteAllSessions {
-        /// Automatic yes to prompts
-        #[clap(short, long, value_parser)]
-        yes: bool,
-        /// Kill the sessions if they're running before deleting them
-        #[clap(short, long)]
-        force: bool,
     },
 
     /// Run a command in a new pane
-    /// Returns: Created pane ID (format: terminal_<id>)
+    ///
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "r")]
     Run {
         /// Command to run
@@ -999,13 +1062,17 @@ pub enum Sessions {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
+        /// Open the pane into a stack with the pane it opens beside. Fails if that pane cannot be
+        /// stacked, rather than opening the pane somewhere else
         #[clap(long, conflicts_with("floating"), conflicts_with("direction"))]
         stacked: bool,
-        /// Block until the command has finished and its pane has been closed
+        /// Wait until the pane closes, then exit with the command's exit status. Waiting replaces
+        /// the report: a blocking run prints no `pane_id:`, because the status is the answer
         #[clap(long)]
         blocking: bool,
 
-        /// Block until the command exits successfully (exit status 0) OR its pane has been closed
+        /// Wait until the command exits 0 or its pane closes, then exit with its status. Prints no
+        /// `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1014,8 +1081,8 @@ pub enum Sessions {
         )]
         block_until_exit_success: bool,
 
-        /// Block until the command exits with failure (non-zero exit status) OR its pane has been
-        /// closed
+        /// Wait until the command exits non-zero or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1024,7 +1091,8 @@ pub enum Sessions {
         )]
         block_until_exit_failure: bool,
 
-        /// Block until the command exits (regardless of exit status) OR its pane has been closed
+        /// Wait until the command exits either way or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1032,19 +1100,25 @@ pub enum Sessions {
             conflicts_with("block_until_exit_failure")
         )]
         block_until_exit: bool,
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is. The default when an agent runs this
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Take the focus even when an agent runs this. An agent's new pane leaves the person's
+        /// focus alone by default: the caller is an agent when AGENT_SESSION_ID, AGENT_KIND or a
+        /// harness's own session variable is set
+        #[clap(long, conflicts_with("no_focus"))]
+        focus: bool,
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -1055,9 +1129,13 @@ pub enum Sessions {
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
-    /// Load a plugin
-    /// Returns: Created pane ID (format: plugin_<id>)
+    /// Load a plugin in a new pane
+    ///
+    /// Returns: `pane_id: plugin_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "p")]
     Plugin {
         /// Plugin URL, can either start with http(s), file: or zellij:
@@ -1158,19 +1236,20 @@ pub enum Sessions {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -1181,6 +1260,7 @@ pub enum Sessions {
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
+
         #[clap(flatten)]
         ready: ReadyFlags,
     },
@@ -1220,189 +1300,36 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// considered a different plugin for the purposes of determining the pipe destination)
         #[clap(short('c'), long, value_parser, display_order(4))]
         plugin_configuration: Option<PluginUserConfiguration>,
-    },
+/// The condition a `zellij action wait` blocks on.
+#[derive(ValueEnum, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WaitFor {
+    /// The pane's command ends, or the pane goes away.
+    Exit,
+    /// The pane stops producing output for `--quiet-ms`.
+    Quiet,
+    /// A line the pane delivers matches `--match`.
+    Match,
+    /// The pane's shell is ready for input: it drew a prompt (OSC 133), or it drew something and
+    /// then fell quiet for `--quiet-ms`.
+    Ready,
+    /// The coding agent in the pane stopped working: it reported `idle`, `done`, `error` or
+    /// `blocked` over `OSC 7501` after the last input typed into the pane. A pane whose program
+    /// reports no state is judged by `--quiet-ms` of silence instead.
+    AgentIdle,
+    /// The coding agent in the pane is blocked on a person: it reported `blocked` (a permission,
+    /// a question, a sign-in) after the last input typed into the pane.
+    AgentWaiting,
+    /// Start the child, then wait for agent-change in the background; never poll the screen.
+    AgentChange,
 }
 
-#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
-pub enum CliAction {
-    /// Write bytes to the terminal.
-    Write {
-        bytes: Vec<u8>,
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Write characters to the terminal.
-    WriteChars {
-        chars: String,
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Paste text to the terminal (using bracketed paste mode).
-    Paste {
-        chars: String,
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Send one or more keys to the terminal (e.g., "Ctrl a", "F1", "Alt Shift b")
-    SendKeys {
-        /// Keys to send as space-separated strings
-        #[clap(value_parser, required = true)]
-        keys: Vec<String>,
+impl Default for WaitFor {
+    fn default() -> Self {
+        WaitFor::Exit
+    }
+}
 
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// [increase|decrease] the focused panes area at the [left|down|up|right] border.
-    Resize {
-        resize: Resize,
-        direction: Option<Direction>,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Change focus to the next pane
-    FocusNextPane,
-    /// Change focus to the previous pane
-    FocusPreviousPane,
-    /// Focus a specific pane by its ID
-    FocusPaneId {
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3
-        pane_id: String,
-    },
-    /// Change focus to the last focused frame
-    FocusLastPane,
-    /// Move the focused pane in the specified direction. [right|left|up|down]
-    MoveFocus {
-        direction: Direction,
-    },
-    /// Move focus to the pane or tab (if on screen edge) in the specified direction
-    /// [right|left|up|down]
-    MoveFocusOrTab {
-        direction: Direction,
-    },
-    /// Change the location of the focused pane in the specified direction or rotate forwrads
-    /// [right|left|up|down]
-    MovePane {
-        direction: Option<Direction>,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Rotate the location of the previous pane backwards
-    MovePaneBackwards {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Clear all buffers for a focused pane
-    Clear {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Dumps the viewport and optionally scrollback of a pane to a file or STDOUT
-    DumpScreen {
-        /// File path to dump the pane content to. If omitted, prints to STDOUT.
-        #[clap(long, value_parser)]
-        path: Option<PathBuf>,
-
-        /// Dump the pane with full scrollback
-        #[clap(short, long)]
-        full: bool,
-
-        /// The pane_id of the pane, eg. terminal_1, plugin_2 or 3 (equivalent to terminal_3). If not specified, dumps the focused pane.
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-
-        /// Preserve ANSI styling in the dump output
-        #[clap(short, long)]
-        ansi: bool,
-    },
-    /// Dump current layout to stdout
-    DumpLayout,
-    /// Save the current session state to disk immediately
-    SaveSession,
-    /// Open the pane scrollback in your default editor
-    EditScrollback {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-
-        /// Preserve ANSI styling in the scrollback dump
-        #[clap(short, long)]
-        ansi: bool,
-    },
-    /// Scroll up in the focused pane
-    ScrollUp {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll down in focus pane.
-    ScrollDown {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll down to bottom in focus pane.
-    ScrollToBottom {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll up to top in focus pane.
-    ScrollToTop {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll up one page in focus pane.
-    PageScrollUp {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll down one page in focus pane.
-    PageScrollDown {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll up half page in focus pane.
-    HalfPageScrollUp {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Scroll down half page in focus pane.
-    HalfPageScrollDown {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    /// Toggle between fullscreen focus pane and normal layout.
-    ToggleFullscreen {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
-        #[clap(short, long, value_parser)]
-        pane_id: Option<String>,
-    },
-    #[clap(
-        about = "Toggle between fullscreen over the entire display (including the UI bars) and normal layout"
-    )]
-    ToggleNoUiFullscreen {
-        #[clap(
-            short,
-            long,
-            value_parser,
-            help = "Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)"
-        )]
-        pane_id: Option<String>,
-    },
-    /// Toggle frames around panes in the UI
 /// `--wait-ready` and `--ready-timeout`, on every verb that makes a pane for a caller to type into.
 ///
 /// Held by the client: it waits once the report names the pane, so nothing about it reaches the
@@ -1434,6 +1361,465 @@ impl Default for ReadyFlags {
     }
 }
 
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize, strum_macros::Display)]
+pub enum CliAction {
+    /// Block until a pane does something, then say what it did
+    ///
+    /// Start the child, then wait for agent-change in the background; never poll the screen.
+    /// Use --for agent-change with repeated --pane targets, or omit them to watch other agents.
+    /// The record carries the pane handle, tab, kind, name, old/new states and last reply line.
+    ///
+    /// This is the one command that replaces a poll loop. Instead of `send-keys`, `sleep 2`,
+    /// `dump-screen`, look, `sleep 2` again, a script says what it is waiting for and gets woken
+    /// when it happens.
+    ///
+    ///   zellij action wait build --for exit
+    ///
+    ///   zellij action wait build --for quiet --quiet-ms 2000
+    ///
+    ///   zellij action wait build --for match --match 'test result:'
+    ///
+    ///   zellij action wait build --for ready
+    ///
+    ///   zellij action wait sunny-otter --for agent-idle
+    ///
+    /// `--for ready` is met when the pane's shell says it drew a prompt - an OSC 133 prompt
+    /// marker, read as `command_state: prompt` in `list-panes` - or, for a shell that writes no
+    /// markers, when the pane has drawn something and then produced nothing for `--quiet-ms`
+    /// (300 by default here). The report's `ready_by:` line names which: `prompt` or `quiet`. A
+    /// pane whose shell says a command is running is not ready, however long it is silent. Only a
+    /// prompt drawn after the last input typed into the pane counts, so a wait started right after
+    /// typing a command answers once that command has finished. Its timeout defaults to 10
+    /// seconds.
+    ///
+    /// `--for agent-idle` and `--for agent-waiting` read the state the agent in the pane reports
+    /// over `OSC 7501` - the `state` key of `list-agents --json`. `agent-idle` is met when the
+    /// agent stops working: `idle`, `done`, `error`, or `blocked` on a person. `agent-waiting` is
+    /// met only by `blocked`, and misses when the agent ends its turn without asking anything.
+    /// Only a state reported after the last input typed into the pane counts, so a wait started
+    /// right after sending a message does not answer with the turn before it. Both print
+    /// `state:`, with `state_kind:` and `state_msg:` when the agent gave them. A pane whose
+    /// program reports no state (opencode; codex without the hooks `zellij setup --agent-hooks`
+    /// prints) is judged by silence for `agent-idle` - `--quiet-ms`, 3000 by default here - and
+    /// says `idle_by: quiet`; `agent-waiting` cannot be judged there, and misses.
+    ///
+    /// Exit 0 means the condition was met, and the report says how long it took. Exit 2 means it
+    /// was not - the timeout ran out, or the pane closed while waiting for something else - and
+    /// nothing is printed on stdout. Exit 1 is a malformed call, such as a regex that does not
+    /// compile.
+    ///
+    /// `--for exit` prints `exit_status:`, and the wait's OWN exit code stays 0 whatever that
+    /// status is. This is deliberately unlike `new-pane --block-until-exit`, which exits with the
+    /// command's status: that one owns the pane it made, while `wait` is a question about someone
+    /// else's pane, and a script has to be able to tell "the test failed" from "I never saw it
+    /// finish".
+    ///
+    /// What `--for match` sees is the rendered viewport, line by line, as the pane draws it - not
+    /// the byte stream. A line the terminal wrapped arrives as two lines, so a pattern spanning
+    /// the wrap never matches; anchor on a short distinctive string. Lines already on screen when
+    /// the wait began are the baseline and do not match: only a line the pane delivers afterwards
+    /// does. A line identical to one already on screen is not new, and is not matched either - so
+    /// wait for output that differs from what the pane has already shown. A timed-out match says
+    /// so, and names the pattern.
+    Wait {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Optional only for agent-change.
+        #[clap(value_parser)]
+        #[clap(default_value = "")]
+        pane_id: String,
+
+        /// Watch these panes for agent-change. Omit to watch every agent except the caller.
+        #[clap(long = "pane", requires = "wait_for")]
+        panes: Vec<String>,
+
+        /// What to wait for: the pane's command to end, the pane to fall quiet, a line to
+        /// match, the pane's shell to be ready for input, or the coding agent in the pane to
+        /// stop working, be blocked on a person, or change state, identity or name
+        #[clap(long = "for", value_enum, value_parser, default_value = "exit")]
+        wait_for: WaitFor,
+
+        /// The regex a new line must match, for `--for match`. Rust regex syntax, unanchored, tested
+        /// one screen line at a time, so `^` and `$` anchor to that line. Text already on screen
+        /// when the wait begins never matches
+        #[clap(long = "match", value_parser, required_if_eq("wait_for", "match"))]
+        pattern: Option<String>,
+
+        /// How long a pane must produce nothing to count as quiet, for `--for quiet` (default
+        /// 500), for the fallback of `--for ready` (default 300), and for `--for agent-idle` on
+        /// a pane that reports no state (default 3000)
+        #[clap(
+            long,
+            value_parser,
+            default_value = "500",
+            default_value_if("wait_for", "ready", "300"),
+            default_value_if("wait_for", "agent-idle", "3000"),
+            default_value_if("wait_for", "agent-waiting", "3000")
+        )]
+        quiet_ms: u64,
+
+        /// Seconds to wait before giving up and exiting 2. `0` waits forever, which is a hang a
+        /// script has to ask for by name. 300 by default, and 10 for `--for ready`
+        #[clap(
+            short,
+            long,
+            value_parser,
+            default_value = "300",
+            default_value_if("wait_for", "ready", "10")
+        )]
+        timeout: u64,
+    },
+    /// Keep running, and print one JSON line for every change the session makes
+    ///
+    /// The server pushes the lines as the changes happen. Every line carries `event`, `seq`
+    /// (counted from 0 with no gaps), `epoch` (new for every server start) and `ts` (ms since the
+    /// Unix epoch). The first line is `hello` (server_version, server_build, session), then one
+    /// `agent` line per agent, one `pane_opened` per pane and one `tab_opened` per tab, then
+    /// `synced`. After that: agent, gone, pane_opened, pane_exited, pane_closed, pane_output,
+    /// tab_opened, tab_closed and tab_renamed. Every pane line carries `pane_id` and `handle`.
+    ///
+    /// Returns: JSON lines until the reader closes the pipe (exit 0) or the session goes away
+    /// (exit 2). Exit 2 at once, with the reason on stderr, when the session's server predates
+    /// this command.
+    Watch {
+        /// Output as JSON. The only format: accepted so that `--json` is never an error
+        #[clap(short, long, value_parser)]
+        json: bool,
+    },
+    /// Bring back a pane that was closed lately
+    ///
+    /// The session remembers its last 10 closed terminal panes, in memory only - a restart
+    /// forgets them. A pane comes back stacked in the tab it left, or in a new tab when that tab
+    /// is gone, in the same directory and under its old handle when that handle is free.
+    ///
+    /// What comes back is a shell. A pane that ran a coding agent gets the agent's bare resume
+    /// typed at the prompt - `claude --resume <id>` for the session it held when it closed - and
+    /// a pane that ran a command gets that command typed. Nothing runs until Enter. A plain shell
+    /// gets nothing typed.
+    ///
+    /// A pane leaves the list once it is reopened. A shell or a plugin pane whose own process
+    /// exited is not remembered; an agent or a command pane that exited is.
+    ///
+    /// No flag means `--last`. `--handle` and `--last` need no focused pane, so they work in a
+    /// session nobody is attached to.
+    ReopenPane {
+        /// Reopen the pane that closed most recently (the default)
+        #[clap(long, conflicts_with_all = &["handle", "list"])]
+        last: bool,
+        /// Reopen the closed pane that had this handle
+        #[clap(long, value_parser, conflicts_with = "list")]
+        handle: Option<String>,
+        /// List the closed panes the session remembers, newest first, and reopen nothing
+        #[clap(long)]
+        list: bool,
+        /// With --list, output as JSON
+        #[clap(long, requires = "list")]
+        json: bool,
+    },
+    /// Write raw bytes into a pane, as if they had been typed
+    Write {
+        /// The bytes, as space-separated decimal values (27 91 65 is Escape [ A)
+        bytes: Vec<u8>,
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
+    },
+    /// Write text into a pane, as if it had been typed
+    ///
+    /// No newline is added: `send-keys Enter` is how you submit what you wrote.
+    ///
+    /// With no text and something piped in, the text is read from stdin to EOF - so a multi-line
+    /// prompt goes in without shell escaping. Exits 2 if what arrives is empty.
+    WriteChars {
+        /// The text to write. Leave it out, or pass `-`, to read it from stdin instead (1 MiB max)
+        chars: Option<String>,
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
+    },
+    /// Paste text into a pane in bracketed paste mode
+    ///
+    /// The pane's program is told the text was pasted rather than typed, which is what keeps an
+    /// editor from auto-indenting it and a shell from running each line as it arrives.
+    ///
+    /// With no text and something piped in, the text is read from stdin to EOF - so a file goes in
+    /// without shell escaping. Exits 2 if what arrives is empty.
+    Paste {
+        /// The text to paste. Leave it out, or pass `-`, to read it from stdin instead (1 MiB max)
+        chars: Option<String>,
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
+    },
+    /// Send named keys to a pane
+    ///
+    /// Keys by name, not by character: `Enter`, `Esc`, `Tab`, `F1`, `Ctrl a`, `Alt Shift b`. Use
+    /// `write-chars` for literal text.
+    SendKeys {
+        /// One key per argument, each a space-separated modifier chain ("Ctrl a", "F1")
+        #[clap(value_parser, required = true)]
+        keys: Vec<String>,
+
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
+    },
+    /// Grow or shrink a pane at one of its borders
+    Resize {
+        /// increase or decrease
+        resize: Resize,
+        /// The border to move: left, down, up or right. Without it, the pane grows or shrinks on
+        /// every side that can move
+        direction: Option<Direction>,
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Move focus to the next pane in the tab, wrapping at the end
+    FocusNextPane,
+    /// Move focus to the previous pane in the tab, wrapping at the start
+    FocusPreviousPane,
+    /// Focus a pane, and the tab it lives in
+    ///
+    /// Returns: `from:` and `to:` lines, each `<pane_id> <handle>`. A jump that landed where it
+    /// started prints only `to:`. A target no live pane answers to exits 2
+    ///
+    /// With --no-focus this is an existence probe instead, the same one `go-to-tab-name` has: the
+    /// exit code is 0 either way, and stdout is the answer - `id:` and `handle:` if the pane is
+    /// there, nothing at all if it is not
+    #[clap(visible_alias = "go-to-pane")]
+    FocusPaneId {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns
+        pane_id: String,
+        /// Leave focus where it is and only report what the target names. Read stdout for the
+        /// answer: `id:` and `handle:` mean the pane is there, empty means it is not. The exit
+        /// code stays 0 for both
+        #[clap(long, value_parser)]
+        no_focus: bool,
+    },
+    /// Move focus back to the pane it was on before the current one
+    FocusLastPane,
+    /// Move focus to the neighbouring pane in a direction, stopping at the edge of the tab
+    MoveFocus {
+        /// right, left, up or down
+        direction: Direction,
+    },
+    /// Move focus to the neighbouring pane in a direction, or to the neighbouring tab at the edge
+    MoveFocusOrTab {
+        /// right, left, up or down
+        direction: Direction,
+    },
+    /// Move a pane to a different place in its tab's layout
+    MovePane {
+        /// right, left, up or down. Without it, the pane rotates forwards through the layout
+        direction: Option<Direction>,
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Rotate a pane backwards through its tab's layout
+    MovePaneBackwards {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Clear a pane's screen and its scrollback
+    Clear {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
+    },
+    /// Print what a pane is showing
+    ///
+    /// The pane is not optional: without --pane-id this prints the panes you could have asked for,
+    /// grouped by tab, on stderr and exits 2. "The focused pane" is not a thing a command run from
+    /// outside a pane can mean.
+    ///
+    /// One pane prints its content and nothing else - no header, no trailing summary. Several
+    /// panes, or --all, print one JSON object per line instead: {"pane_id","handle","content"}.
+    /// The shape follows what was asked for, so a sweep of one pane is still the bare content.
+    DumpScreen {
+        /// Write the content to this file instead of stdout. An existing file is overwritten,
+        /// like any other command that takes an output path
+        #[clap(value_parser, conflicts_with = "path")]
+        file: Option<PathBuf>,
+
+        /// The same file, spelled as a flag. Give it one way or the other, not both
+        #[clap(long, value_parser)]
+        path: Option<PathBuf>,
+
+        /// Include the whole scrollback, not just the visible screen. A long-lived pane's
+        /// scrollback can be megabytes
+        #[clap(short, long)]
+        full: bool,
+
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: see above. Repeat it to dump several
+        /// panes in one call, which is one JSON line each and one connection rather than N
+        #[clap(short, long, value_parser)]
+        pane_id: Vec<String>,
+
+        /// Every pane in the session, in list-panes order, as the same JSON lines. A session with
+        /// no panes to dump prints nothing and exits 0
+        #[clap(long, conflicts_with = "pane_id")]
+        all: bool,
+
+        /// Keep the ANSI escape sequences, so colour and styling survive the dump
+        #[clap(short, long)]
+        ansi: bool,
+    },
+    /// Print the session's current layout, as the KDL a `--layout` would take
+    ///
+    /// Prints the layout and nothing else.
+    DumpLayout,
+    /// Write the session's resurrection state to disk now, rather than waiting for the next tick
+    SaveSession {
+        /// Also copy the saved state into the snapshot archive, as a manual snapshot
+        #[clap(long)]
+        archive: bool,
+    },
+    /// Open a pane's scrollback in a new pane running your $EDITOR
+    EditScrollback {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+
+        /// Preserve ANSI styling in the scrollback dump
+        #[clap(short, long)]
+        ansi: bool,
+    },
+    /// Scroll a pane up one line
+    ScrollUp {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane down one line
+    ScrollDown {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane to the bottom of its scrollback, where new output arrives
+    ScrollToBottom {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane to the top of its scrollback
+    ScrollToTop {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane up one screenful
+    PageScrollUp {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane down one screenful
+    PageScrollDown {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane up half a screenful
+    HalfPageScrollUp {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Scroll a pane down half a screenful
+    HalfPageScrollDown {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Toggle a pane between filling its tab and the tab's normal layout
+    ToggleFullscreen {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Toggle a pane between filling the whole terminal - status and tab bars included - and the
+    /// tab's normal layout
+    ToggleNoUiFullscreen {
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
+        #[clap(short, long, value_parser)]
+        pane_id: Option<String>,
+    },
+    /// Toggle every pane frame in the session between the configured style and none
     TogglePaneFrames,
     /// Switch the focused stack between showing its titles in a column (vertical) and in a row
     /// (horizontal)
@@ -1446,7 +1832,12 @@ impl Default for ReadyFlags {
         )]
         pane_id: Option<String>,
     },
+    /// Set the frame style for the whole session, rather than toggling it
+    ///
+    /// Lasts for the life of the session; `pane_frame_style` in the config is the persistent form.
     SetPaneFrameStyle {
+        /// full (a box around each pane), titles (a title row only), top_only (a title row with a
+        /// rule and no separators between panes), or none
         #[clap(value_enum, value_parser)]
         style: PaneFrameStyle,
     },
@@ -1470,23 +1861,31 @@ impl Default for ReadyFlags {
     },
     #[clap(about = "Show all hidden bars")]
     ShowBars,
-    /// Toggle between sending text commands to all panes on the current tab and normal mode.
+    /// Toggle whether typing into one pane of a tab types into all of them
     ToggleActiveSyncTab {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Open a new pane in the specified direction [right|down]
-    /// If no direction is specified, will try to use the biggest available space.
-    /// Returns: Created pane ID (format: terminal_<id> or plugin_<id>)
+    /// Open a pane, running a command or your shell
+    ///
+    /// Returns: `pane_id: terminal_<id>` or `pane_id: plugin_<id>`, and `handle: <two-word
+    /// handle>`. Without placement flags, new_pane_default selects split or stacked.
+    ///
+    /// Where it lands: beside the focused pane by default, beside the pane --near names, in the tab
+    /// --in-tab or --tab-id names, or in a tab of its own with --new-tab, which reports `tab_id:`.
     NewPane {
-        /// Direction to open the new pane in
+        /// Split towards right or down, overriding new_pane_default
         #[clap(short, long, value_parser, conflicts_with("floating"))]
         direction: Option<Direction>,
 
+        /// The command to run in the pane, after a `--`. Without one the pane runs your shell
         #[clap(last(true))]
         command: Vec<String>,
 
+        /// Open a plugin pane instead of a terminal, by plugin url (file:/path/to.wasm, an alias
+        /// from the config, or https://...)
         #[clap(short, long, conflicts_with("command"), conflicts_with("direction"))]
         plugin: Option<String>,
 
@@ -1498,16 +1897,16 @@ impl Default for ReadyFlags {
         #[clap(short, long)]
         floating: bool,
 
-        /// Open the new pane in place of the current pane, temporarily suspending it
+        /// Open the new pane on top of an existing one, suspending that pane until this one closes
         #[clap(short, long, conflicts_with("floating"), conflicts_with("direction"))]
         in_place: bool,
 
-        /// Close the replaced pane instead of suspending it (only effective with --in-place)
+        /// With --in-place, close the pane that was replaced instead of suspending it
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
 
-        /// The pane to replace when opening in place, eg. terminal_1, plugin_2 or 3 (only
-        /// effective with --in-place; defaults to the focused pane)
+        /// With --in-place, the pane to open on top of: terminal_1, plugin_2, a bare integer,
+        /// a handle like sunny-otter, or a pane uuid. Without this, the focused pane
         #[clap(
             long,
             value_parser,
@@ -1523,7 +1922,7 @@ impl Default for ReadyFlags {
         /// Close the pane immediately when its command exits
         #[clap(short, long, requires("command"))]
         close_on_exit: bool,
-        /// Start the command suspended, only running it after the you first press ENTER
+        /// Start the command suspended, only running it once someone presses ENTER in the pane
         #[clap(short, long, requires("command"))]
         start_suspended: bool,
         #[clap(
@@ -1532,8 +1931,10 @@ impl Default for ReadyFlags {
             help = "Watch the pane: notify each time its command finishes or its output goes quiet, until the watch is turned off"
         )]
         notify: bool,
+        /// With --plugin, the plugin's configuration as key=value pairs, comma separated
         #[clap(long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
+        /// With --plugin, recompile the plugin instead of loading it from the wasm cache
         #[clap(long, value_parser)]
         skip_plugin_cache: bool,
         /// The x coordinates if the pane is floating as a bare integer (eg. 1) or percent (eg. 10%)
@@ -1551,13 +1952,17 @@ impl Default for ReadyFlags {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
+        /// Open the pane into a stack with the pane it opens beside. Fails if that pane cannot be
+        /// stacked, rather than opening the pane somewhere else
         #[clap(long, conflicts_with("floating"), conflicts_with("direction"))]
         stacked: bool,
-        /// Block until the command has finished and its pane has been closed
+        /// Wait until the pane closes, then exit with the command's exit status. Waiting replaces
+        /// the report: a blocking run prints no `pane_id:`, because the status is the answer
         #[clap(short, long)]
         blocking: bool,
 
-        /// Block until the command exits successfully (exit status 0) OR its pane has been closed
+        /// Wait until the command exits 0 or its pane closes, then exit with its status. Prints no
+        /// `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1566,8 +1971,8 @@ impl Default for ReadyFlags {
         )]
         block_until_exit_success: bool,
 
-        /// Block until the command exits with failure (non-zero exit status) OR its pane has been
-        /// closed
+        /// Wait until the command exits non-zero or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1576,7 +1981,8 @@ impl Default for ReadyFlags {
         )]
         block_until_exit_failure: bool,
 
-        /// Block until the command exits (regardless of exit status) OR its pane has been closed
+        /// Wait until the command exits either way or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             conflicts_with("blocking"),
@@ -1588,19 +1994,59 @@ impl Default for ReadyFlags {
         #[clap(skip)]
         unblock_condition: Option<UnblockCondition>,
 
-        /// if set, will open the pane near the current one rather than following the user's focus
-        #[clap(long)]
-        near_current_pane: bool,
+        /// Put the pane in a tab of its own, made now, and report `tab_id:` as well as the pane.
+        /// With a NAME the tab is called that; bare, zellij names it as it names any new tab. The
+        /// pane in it cannot be named with --name or drawn with --borderless: rename it once it
+        /// is there
         #[clap(
             long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
+            value_name = "NAME",
+            num_args(0..=1),
+            conflicts_with("direction"),
+            conflicts_with("stacked"),
+            conflicts_with("in_place"),
+            conflicts_with("floating"),
+            conflicts_with("tab_id"),
+            conflicts_with("near_current_pane"),
+            conflicts_with("blocking"),
+            conflicts_with("name"),
+            conflicts_with("borderless")
         )]
+        new_tab: Option<Option<String>>,
+
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
+        #[clap(long)]
+        near_current_pane: bool,
+        /// Open the pane beside this one, in whatever tab it lives in: terminal_1, a bare integer
+        /// (3 means terminal_3), a handle like sunny-otter, or a pane uuid. It must name a terminal
+        /// pane - a plugin pane cannot anchor one
+        #[clap(
+            long,
+            value_name = "PANE",
+            value_parser,
+            conflicts_with("near_current_pane"),
+            conflicts_with("in_place"),
+            conflicts_with("tab_id"),
+            conflicts_with("in_tab"),
+            conflicts_with("new_tab")
+        )]
+        near: Option<String>,
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is. The default when an agent runs this
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Take the focus even when an agent runs this. An agent's new pane leaves the person's
+        /// focus alone by default: the caller is an agent when AGENT_SESSION_ID, AGENT_KIND or a
+        /// harness's own session variable is set
+        #[clap(long, conflicts_with("no_focus"), conflicts_with("in_tab"))]
+        focus: bool,
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -1611,17 +2057,34 @@ impl Default for ReadyFlags {
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
+        /// A tab that already exists, by name or by stable id, without going there: nothing moves
+        /// the focus. A tab nothing answers to is a miss and nothing is created
+        #[clap(
+            long,
+            value_name = "NAME_OR_ID",
+            value_parser,
+            conflicts_with("tab_id"),
+            conflicts_with("new_tab"),
+            conflicts_with("near_current_pane"),
+            conflicts_with("in_place")
+        )]
+        in_tab: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
-    /// Open the specified file in a new zellij pane with your default EDITOR
-    /// Returns: Created pane ID (format: terminal_<id>)
+    /// Open a file in a new pane running your $EDITOR
+    ///
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     Edit {
+        /// The file to open. A relative path is resolved against --cwd, or the current directory
         file: PathBuf,
 
-        /// Direction to open the new pane in
+        /// Split towards right or down, overriding new_pane_default
         #[clap(short, long, value_parser, conflicts_with("floating"))]
         direction: Option<Direction>,
 
-        /// Open the file in the specified line number
+        /// Put the cursor on this line when the editor opens
         #[clap(short, long, value_parser)]
         line_number: Option<usize>,
 
@@ -1655,19 +2118,20 @@ impl Default for ReadyFlags {
         /// Whether to pin a floating pane so that it is always on top
         #[clap(long, requires("floating"))]
         pinned: Option<bool>,
-        /// if set, will open the pane near the current one rather than following the user's focus
+        /// Open the pane beside the pane this command was run from, rather than beside whichever
+        /// pane the user is focused on
         #[clap(long)]
         near_current_pane: bool,
-        #[clap(
-            long,
-            help = "if set, will open the pane without changing the focus of any client, placing it relative to the pane the command was issued from"
-        )]
+        /// Open the pane beside the pane this command was run from and leave every client's focus
+        /// where it is
+        #[clap(long)]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(
             long,
             value_parser,
@@ -1678,142 +2142,228 @@ impl Default for ReadyFlags {
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
-    /// Switch input mode of all connected clients [locked|pane|tab|resize|move|search|session]
+    /// Put every client of this session into an input mode
     SwitchMode {
+        /// locked, normal, pane, tab, resize, move, search, session, scroll, prompt, tmux or enter
         input_mode: InputMode,
     },
-    /// Embed focused pane if floating or float focused pane if embedded
+    /// Toggle a pane between floating and embedded in its tab's layout
     TogglePaneEmbedOrFloating {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Toggle the visibility of all floating panes in the current Tab, open one if none exist
+    /// Toggle whether a tab's floating panes are shown, opening one if the tab has none
+    ///
+    /// Use `show-floating-panes` or `hide-floating-panes` to say which state you want rather than
+    /// flipping whichever one the tab is in.
     ToggleFloatingPanes {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Show all floating panes in the specified tab (or active tab if tab_id is not provided).
+    /// Show a tab's floating panes, rather than toggling them
     ///
-    /// Returns exit code 0 if state was changed, 2 if already visible, 1 if tab not found.
+    /// Exits 0 if they were hidden and are now shown, 2 if they were already shown, 1 if there is
+    /// no such tab.
     ShowFloatingPanes {
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Hide all floating panes in the specified tab (or active tab if tab_id is not provided).
+    /// Hide a tab's floating panes, rather than toggling them
     ///
-    /// Returns exit code 0 if state was changed, 2 if already hidden, 1 if tab not found.
+    /// Exits 0 if they were shown and are now hidden, 2 if they were already hidden, 1 if there is
+    /// no such tab.
     HideFloatingPanes {
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Check if floating panes are visible in the specified tab (or active tab).
+    /// Ask whether a tab's floating panes are shown
     ///
-    /// Prints "true" to stdout and exits 0 if visible.
-    /// Prints "false" to stdout and exits 1 if not visible.
+    /// Prints `visible: true` or `visible: false`, and exits 0 either way: both are answers, and
+    /// only a tab nothing answers to is a miss. A tab that is not there exits 2.
     AreFloatingPanesVisible {
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Close the focused pane.
+    /// Close a pane, killing whatever runs in it
+    ///
+    /// Prints `closed: <pane id>`. A pane that is not there is a miss: a message on stderr and
+    /// exit 2. Without --pane-id this closes the focused pane, which is only meaningful from
+    /// inside a pane.
     ClosePane {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Required: this verb never guesses, so pass --focused for the pane you are in
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
+        /// Act on the focused pane, saying so. This verb never guesses a target, so this is how
+        /// you name the pane your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "pane_id")]
+        focused: bool,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
-    /// Renames the focused pane
+    /// Give a pane a name, which is what its frame and the TITLE column then show
     RenamePane {
+        /// The new name
         name: String,
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Remove a previously set pane name
+    /// Drop a name set by `rename-pane`, so the pane goes back to naming itself after its command
     UndoRenamePane {
-        /// Target a specific pane by ID (eg. terminal_1, plugin_2, or 3)
+        /// The pane: terminal_1, plugin_2, a bare integer (3 means terminal_3), a handle like
+        /// sunny-otter, or a pane uuid. `zellij action list-panes` prints every one of them
+        /// in its PANE_ID and HANDLE columns. Without this, the focused pane
         #[clap(short, long, value_parser)]
         pane_id: Option<String>,
     },
-    /// Go to the next tab.
+    /// Move focus to the next tab by display position, wrapping at the end
     GoToNextTab,
-    /// Go to the previous tab.
+    /// Move focus to the previous tab by display position, wrapping at the start
     GoToPreviousTab,
-    /// Close the current tab.
+    /// Close a tab and every pane in it
+    ///
+    /// Prints `closed: <tab id> <tab name>`. A tab that is not there is a miss: a message on
+    /// stderr and exit 2. Without --tab-id this closes the current tab, which is only meaningful
+    /// from inside a pane.
     CloseTab {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Required: this verb never guesses, so pass --focused for the tab you are in
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
+        /// Act on the focused tab, saying so. This verb never guesses a target, so this is how
+        /// you name the tab your hands are on. Only valid from inside the session, which is the
+        /// only place a focus exists
+        #[clap(long, visible_alias = "current", conflicts_with = "tab_id")]
+        focused: bool,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
-    /// Go to tab with index [index]
+    /// Focus the tab at a display position
+    ///
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for the tab focus left and the
+    /// tab it landed on. A switch that did not move prints only `to:`. A position no tab sits at
+    /// is a miss: a message on stderr and exit 2.
     GoToTab {
+        /// The 1-based display position: 1 is the leftmost tab. This is the POSITION column of
+        /// `list-tabs` plus one, not the TAB_ID column
         index: u32,
     },
-    /// Go to tab with name [name]
+    /// Focus the tab with a given name
     ///
-    /// Returns: When --create is used and tab is created, outputs the tab ID as a single number
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`, for a real switch. When
+    /// --create makes the tab it prints `id: <tab id>` instead, then `pane_id:` and `handle:` for
+    /// the pane the new tab opened on. A name no tab answers to is a miss: a message on stderr and
+    /// exit 2.
+    ///
+    /// With --no-focus and without --create this is an existence probe instead: the exit code is 0
+    /// either way, and stdout is the answer - `id: <tab id>` if the tab is there, nothing at all
+    /// if it is not.
     GoToTabName {
+        /// The tab name, matched exactly - the NAME column of `list-tabs`
         name: String,
-        /// Create a tab if one does not exist.
+        /// Create the tab if no tab answers to that name
         #[clap(short, long, value_parser)]
         create: bool,
+        /// Leave focus where it is, whether the tab already existed or was just created.
+        /// Without --create, read stdout for the answer: a tab ID means it exists, empty means it
+        /// does not. The exit code stays 0 for both.
+        #[clap(long, value_parser)]
+        no_focus: bool,
     },
-    /// Renames the focused pane
+    /// Give a tab a name, which is what the tab bar and the NAME column then show
     RenameTab {
+        /// The new name
         name: String,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Remove a previously set tab name
+    /// Drop a name set by `rename-tab`, so the tab goes back to its numbered default
     UndoRenameTab {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Go to tab with stable ID
+    /// Focus a tab by its stable id
+    ///
+    /// Prints `from:` and `to:` lines, each `<tab id> <tab name>`. An id no tab answers to is a
+    /// miss: a message on stderr and exit 2.
     GoToTabById {
+        /// The stable id, from the TAB_ID column of `list-tabs`
         id: u64,
     },
-    /// Close tab with stable ID
+    /// Close a tab by its stable id
+    ///
+    /// Prints `closed: <tab id> <tab name>`. An id no tab answers to is a miss: a message on
+    /// stderr and exit 2.
     CloseTabById {
+        /// The stable id, from the TAB_ID column of `list-tabs`
         id: u64,
     },
-    /// Rename tab by stable ID
+    /// Rename a tab by its stable id
     RenameTabById {
+        /// The stable id, from the TAB_ID column of `list-tabs`
         id: u64,
+        /// The new name
         name: String,
     },
-    /// Create a new tab, optionally with a specified tab layout and name
+    /// Create a tab, optionally from a layout
     ///
-    /// Returns: The created tab's ID as a single number on stdout
+    /// Returns: `tab_id: <id>`, then `pane_id:` and `handle:` for the pane the tab opened on. A
+    /// tab made from a layout gets whatever panes the layout names; otherwise it opens one pane
+    /// running your shell or --initial-command.
     NewTab {
-        /// Layout to use for the new tab
+        /// A layout to build the tab from: a name in the layout directory, or a path to a file
         #[clap(short, long, value_parser, conflicts_with = "layout_string")]
         layout: Option<PathBuf>,
 
-        /// Raw KDL layout string to use directly (instead of a layout file path)
+        /// A KDL layout as a string, instead of a file to read it from
         #[clap(long, value_parser, conflicts_with = "layout")]
         layout_string: Option<String>,
 
-        /// Default folder to look for layouts
+        /// Where to look for the --layout name, overriding the configured layout directory
         #[clap(long, value_parser, requires("layout"))]
         layout_dir: Option<PathBuf>,
 
-        /// Name of the new tab
+        /// Name of the new tab. Without one the tab is numbered
         #[clap(short, long, value_parser)]
         name: Option<String>,
 
-        /// Change the working directory of the new tab
+        /// The working directory the tab's panes start in
         #[clap(short, long, value_parser)]
         cwd: Option<PathBuf>,
 
-        /// Optional initial command to run in the new tab
+        /// The command to run in the tab's first pane, after a `--`. Without one it runs your shell
         #[clap(value_parser, conflicts_with("initial_plugin"), last(true))]
         initial_command: Vec<String>,
 
-        /// Initial plugin to load in the new tab
+        /// Load a plugin in the tab's first pane instead of a terminal, by plugin url
         #[clap(long, value_parser, conflicts_with("initial_command"))]
         initial_plugin: Option<String>,
 
@@ -1825,7 +2375,8 @@ impl Default for ReadyFlags {
         #[clap(long, requires("initial_command"))]
         start_suspended: bool,
 
-        /// Block until the command exits successfully (exit status 0) OR its pane has been closed
+        /// Wait until the command exits 0 or its pane closes, then exit with its status. Prints no
+        /// `pane_id:`, as above
         #[clap(
             long,
             requires("initial_command"),
@@ -1834,7 +2385,8 @@ impl Default for ReadyFlags {
         )]
         block_until_exit_success: bool,
 
-        /// Block until the command exits with failure (non-zero exit status) OR its pane has been closed
+        /// Wait until the command exits non-zero or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             requires("initial_command"),
@@ -1843,7 +2395,8 @@ impl Default for ReadyFlags {
         )]
         block_until_exit_failure: bool,
 
-        /// Block until the command exits (regardless of exit status) OR its pane has been closed
+        /// Wait until the command exits either way or its pane closes, then exit with its status.
+        /// Prints no `pane_id:`, as above
         #[clap(
             long,
             requires("initial_command"),
@@ -1852,26 +2405,60 @@ impl Default for ReadyFlags {
         )]
         block_until_exit: bool,
 
-        #[clap(
-            long,
-            help = "if set, will create the tab without changing the focus of any client"
-        )]
+        /// Create the tab and leave every client's focus where it is. The default when an agent
+        /// runs this
+        #[clap(long)]
         no_focus: bool,
+
+        /// Go to the new tab even when an agent runs this. An agent's new tab leaves the person's
+        /// focus alone by default: the caller is an agent when AGENT_SESSION_ID, AGENT_KIND or a
+        /// harness's own session variable is set
+        #[clap(long, conflicts_with("no_focus"))]
+        focus: bool,
+
+        #[clap(flatten)]
+        ready: ReadyFlags,
     },
-    /// Move the focused tab in the specified direction. [right|left]
+    /// Move a tab in the specified direction. [right|left]
+    ///
+    /// Prints `from:` and `to:` lines, each a 0-based display position - the same numbers
+    /// list-tabs prints in its POSITION column. A tab that is not there is a miss: a message on
+    /// stderr and exit 2. Without --tab-id this moves the current tab, which is only meaningful
+    /// from inside a pane.
     MoveTab {
-        direction: Direction,
-        /// Target a specific tab by ID
+        /// right or left: swap the tab with its neighbour on that side
+        #[clap(
+            value_parser,
+            required_unless_present = "to_index",
+            conflicts_with = "to_index"
+        )]
+        direction: Option<Direction>,
+        /// Move the tab to this 0-based display position, shifting the tabs in between rather
+        /// than swapping. Past the last position it lands at the end
+        #[clap(long, value_parser)]
+        to_index: Option<usize>,
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
+    /// Apply the previous swap layout to a tab
+    ///
+    /// Swap layouts are the alternative arrangements a layout file declares; this walks backwards
+    /// through them.
     PreviousSwapLayout {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
+    /// Apply the next swap layout to a tab
+    ///
+    /// Swap layouts are the alternative arrangements a layout file declares; this walks forwards
+    /// through them.
     NextSwapLayout {
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
@@ -1899,9 +2486,12 @@ impl Default for ReadyFlags {
         #[clap(short, long, value_parser)]
         tab_id: Option<usize>,
     },
-    /// Override the layout of the active tab
+    /// Rearrange the panes of a tab into a layout
+    ///
+    /// The tab's existing panes are placed into the layout's slots. Panes the layout has no room
+    /// for are closed, unless --retain-existing-terminal-panes or its plugin twin is passed.
     OverrideLayout {
-        /// Path to the layout file
+        /// A path to a layout file
         #[clap(
             value_parser,
             required_unless_present = "layout_string",
@@ -1909,78 +2499,104 @@ impl Default for ReadyFlags {
         )]
         layout: Option<PathBuf>,
 
-        /// Raw KDL layout string to use directly (instead of a layout file path)
+        /// A KDL layout as a string, instead of a file to read it from
         #[clap(long, value_parser, conflicts_with = "layout")]
         layout_string: Option<String>,
 
-        /// Default folder to look for layouts
+        /// Where to look for the layout by name, overriding the configured layout directory
         #[clap(long, value_parser)]
         layout_dir: Option<PathBuf>,
 
-        /// Retain existing terminal panes that do not fit in the layout (default: false)
+        /// Keep terminal panes the layout has no room for, instead of closing them
         #[clap(long)]
         retain_existing_terminal_panes: bool,
 
-        /// Retain existing plugin panes that do not fit with the layout (default: false)
+        /// Keep plugin panes the layout has no room for, instead of closing them
         #[clap(long)]
         retain_existing_plugin_panes: bool,
 
-        /// Only apply the layout to the active tab (uses just the first layout tab if it has
-        /// multiple)
+        /// Apply only the layout's first tab, to the focused tab, instead of every tab it declares
         #[clap(long)]
         apply_only_to_active_tab: bool,
     },
-    /// Query all tab names
-    QueryTabNames,
+    /// Reload a running plugin's wasm, or start it if it is not running
+    ///
+    /// The reload is how a plugin under development picks up a rebuild without its pane moving.
     StartOrReloadPlugin {
+        /// The plugin url: file:/path/to.wasm, an alias from the config, or https://...
         url: String,
+        /// The plugin's configuration as key=value pairs, comma separated
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
     },
-    /// Returns: Plugin pane ID (format: plugin_<id>) when creating or focusing plugin
+    /// Focus a plugin's pane if it is already running, otherwise open it
+    ///
+    /// Prints nothing: the plugin's pane is built on the plugin thread after this has been
+    /// answered, so there is no id to report. `list-panes` is how you find the pane afterwards.
     LaunchOrFocusPlugin {
+        /// Open it as a floating pane
         #[clap(short, long, value_parser)]
         floating: bool,
+        /// Open it on top of the focused pane, suspending that pane until this one closes
         #[clap(short, long, value_parser)]
         in_place: bool,
-        /// Close the replaced pane instead of suspending it (only effective with --in-place)
+        /// With --in-place, close the pane that was replaced instead of suspending it
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
+        /// If the plugin is already running in another tab, move its pane here rather than
+        /// focusing the tab it is in
         #[clap(short, long, value_parser)]
         move_to_focused_tab: bool,
+        /// The plugin url: file:/path/to.wasm, an alias from the config, or https://...
         url: String,
+        /// The plugin's configuration as key=value pairs, comma separated. A plugin running under
+        /// a different configuration counts as a different plugin
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
+        /// Recompile the plugin instead of loading it from the wasm cache
         #[clap(short, long, value_parser)]
         skip_plugin_cache: bool,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
-    /// Returns: Plugin pane ID (format: plugin_<id>)
+    /// Open a plugin in a new pane, even if it is already running elsewhere
+    ///
+    /// Prints nothing - see `launch-or-focus-plugin`. `zellij plugin` makes a plugin pane through
+    /// the pane-creating path instead, and that one does report what it made.
     LaunchPlugin {
+        /// Open it as a floating pane
         #[clap(short, long, value_parser)]
         floating: bool,
+        /// Open it on top of the focused pane, suspending that pane until this one closes
         #[clap(short, long, value_parser)]
         in_place: bool,
-        /// Close the replaced pane instead of suspending it (only effective with --in-place)
+        /// With --in-place, close the pane that was replaced instead of suspending it
         #[clap(long, requires("in_place"))]
         close_replaced_pane: bool,
+        /// The plugin url: file:/path/to.wasm or https://...
         url: Url,
+        /// The plugin's configuration as key=value pairs, comma separated
         #[clap(short, long, value_parser)]
         configuration: Option<PluginUserConfiguration>,
+        /// Recompile the plugin instead of loading it from the wasm cache
         #[clap(short, long, value_parser)]
         skip_plugin_cache: bool,
-        #[clap(
-            long,
-            help = "if set, will open the plugin pane without changing the focus of any client"
-        )]
+        /// Open the pane and leave every client's focus where it is
+        #[clap(long)]
         no_focus: bool,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
     },
+    /// Rename this session
+    ///
+    /// The name is what `zellij ls` lists and `zellij attach` takes. Panes that predate the rename
+    /// keep the old name in their $ZELLIJ_SESSION_NAME until they are replaced.
     RenameSession {
+        /// The new session name
         name: String,
     },
     /// Send data to one or more plugins, launch them if they are not running.
@@ -2360,9 +2976,601 @@ tail -f /tmp/my-live-logfile | zellij action pipe --name logs --plugin https://e
     },
 }
 
+/// Run `f` on a thread with a stack big enough to build the clap tree.
+///
+/// `CliAction` has hundreds of variants and clap builds the whole subcommand tree recursively,
+/// which overflows the 2MB stack the test harness gives a spawned test in a debug build. Every test
+/// that builds or parses `CliArgs` must go through here, in this crate and in the `zellij` crate
+/// (`src/tests/cli.rs`) alike: the next `CliAction` subcommand will silently re-break any module
+/// that does not. The binary itself parses on the main thread and never sees this.
+pub fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+impl CliAction {
+    /// The deadline `--wait-ready` set, taken out of the request for the client to hold.
+    /// `Ok(None)` is a request that did not ask.
+    ///
+    /// Refused alongside a blocking wait: that one replaces the report with the command's exit
+    /// status, and a pane that is ready is one a caller is about to type into, not one it waits
+    /// out. The refusal is here rather than in clap because the blocking flags differ by verb, and
+    /// `run` arrives with them already folded into `unblock_condition`.
+    pub fn take_wait_ready(&mut self) -> Result<Option<Duration>, String> {
+        let (ready, blocks) = match self {
+            CliAction::NewPane {
+                ready,
+                blocking,
+                block_until_exit_success,
+                block_until_exit_failure,
+                block_until_exit,
+                unblock_condition,
+                ..
+            } => (
+                ready,
+                *blocking
+                    || *block_until_exit_success
+                    || *block_until_exit_failure
+                    || *block_until_exit
+                    || unblock_condition.is_some(),
+            ),
+            CliAction::NewTab {
+                ready,
+                block_until_exit_success,
+                block_until_exit_failure,
+                block_until_exit,
+                ..
+            } => (
+                ready,
+                *block_until_exit_success || *block_until_exit_failure || *block_until_exit,
+            ),
+            CliAction::Edit { ready, .. } => (ready, false),
+            _ => return Ok(None),
+        };
+        let taken = std::mem::take(ready);
+        if !taken.wait_ready {
+            return Ok(None);
+        }
+        if blocks {
+            return Err("`--wait-ready` cannot be used with `--blocking` or \
+                 `--block-until-exit*`: those wait for the command to end and answer with its \
+                 status, and a ready pane is one you type into."
+                .to_owned());
+        }
+        Ok(Some(Duration::from_secs(taken.ready_timeout)))
+    }
+
+    /// The deadline `pipe --timeout` set, taken out of the request for the client to hold.
+    ///
+    /// A pipe is unblocked by the plugin that received it, so the wait belongs to the client that
+    /// is holding the connection and not to the session, which has nothing to time out. Taking it
+    /// here keeps the flag off `Action::CliPipe` and therefore off the client/server contract.
+    ///
+    /// `None` is a pipe that waits forever, which is what `--timeout 0` means. It is not the
+    /// default: a pipe nothing answers has no other end, and a hook that shells out to one would
+    /// hang with it.
+    pub fn take_pipe_timeout(&mut self) -> Option<Duration> {
+        match self {
+            CliAction::Pipe { timeout, .. } => {
+                let seconds = std::mem::take(timeout);
+                (seconds > 0).then(|| Duration::from_secs(seconds))
+            },
+            _ => None,
+        }
+    }
+
+    /// The verb this action is, spelled the way it is typed: `NewPane` is `new-pane`.
+    ///
+    /// The variant name is the one clap derives the verb from, so the two cannot drift; the
+    /// kebab-casing is the same rule clap's derive applies. It is how a caller looks the verb up
+    /// in [`crate::cli_surface`], which is keyed by the typed name.
+    pub fn verb(&self) -> String {
+        let name = self.to_string();
+        let mut verb = String::with_capacity(name.len() + 4);
+        for (index, character) in name.chars().enumerate() {
+            if character.is_uppercase() && index > 0 {
+                verb.push('-');
+            }
+            verb.extend(character.to_lowercase());
+        }
+        verb
+    }
+
+    /// Turns on the verb's OWN `--json`, and says whether it had one.
+    ///
+    /// The seven verbs that already answer in JSON own the flag, and `zellij action --json
+    /// list-panes` is meant to be the same call as `zellij action list-panes --json` rather than a
+    /// second JSON shape for the same command. `false` means the verb has no JSON of its own, and
+    /// the report it prints is structured by the client instead.
+    pub fn set_output_json(&mut self) -> bool {
+        match self {
+            CliAction::ListPanes { json, .. }
+            | CliAction::ListTabs { json, .. }
+            | CliAction::ListTree { json, .. }
+            | CliAction::ListClients { json, .. }
+            | CliAction::Watch { json }
+            | CliAction::ListAgents { json, .. }
+            | CliAction::Whoami { json, .. }
+            | CliAction::LastReply { json, .. }
+            | CliAction::SendMessage { json, .. }
+            | CliAction::MessageStatus { json, .. }
+            | CliAction::CurrentTabInfo { json, .. } => {
+                *json = true;
+                true
+            },
+            CliAction::ReopenPane {
+                json, list: true, ..
+            } => {
+                *json = true;
+                true
+            },
+            _ => false,
+        }
+    }
+
+    /// The tab `--in-tab` named, for the caller that can ask the session which tab that is.
+    ///
+    /// The flag takes a name or a stable id, and neither can be turned into the `--tab-id` the
+    /// action carries without the session's own list of tabs. So the CLI asks first and rewrites
+    /// the request with [`CliAction::place_in_tab`]; nothing downstream knows the flag existed.
+    pub fn in_tab_target(&self) -> Option<&str> {
+        match self {
+            CliAction::NewPane { in_tab, .. } => in_tab.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The pane `--near` named, for the caller that can ask the session which pane that is.
+    ///
+    /// Same shape as [`CliAction::in_tab_target`], for the same reason: a handle names a pane only
+    /// against the session's live panes, and the anchor has to be a pane id by the time the action
+    /// goes out.
+    pub fn near_target(&self) -> Option<&str> {
+        match self {
+            CliAction::NewPane { near, .. } => near.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Anchors the new pane to the pane `--near` turned out to name.
+    ///
+    /// The anchor travels as the pane the command came from - the same channel
+    /// `--near-current-pane` reads out of `$ZELLIJ_PANE_ID` - so what is left here is to say that
+    /// there is one. The id itself is carried by the client, which is what talks to the server.
+    pub fn anchor_near(&mut self) {
+        if let CliAction::NewPane {
+            near,
+            near_current_pane,
+            ..
+        } = self
+        {
+            *near = None;
+            *near_current_pane = true;
+        }
+    }
+
+    /// Settles `--focus` against `--no-focus` for `new-pane` and `new-tab`, so that the action
+    /// carries `no_focus` alone. See [`leaves_focus_alone`].
+    ///
+    /// Decided here, on the caller's side, so the client/server contract carries no new field.
+    pub fn settle_focus_for_caller(&mut self, caller_is_agent: bool) {
+        if let CliAction::NewPane {
+            no_focus, focus, ..
+        }
+        | CliAction::NewTab {
+            no_focus, focus, ..
+        } = self
+        {
+            *no_focus = leaves_focus_alone(*no_focus, *focus, caller_is_agent);
+            *focus = false;
+        }
+    }
+
+    /// Puts the pane in the tab `--in-tab` turned out to name, and leaves every focus alone.
+    ///
+    /// `no_focus` is the flag's whole point rather than a default it happens to take: a script that
+    /// puts a pane in another tab has not asked to be taken there, and a `zellij action` client
+    /// that "focuses" something is moving a focus that belongs to whoever is attached. `--tab-id`
+    /// is the spelling for a caller that does want the view to follow.
+    pub fn place_in_tab(&mut self, tab: usize) {
+        if let CliAction::NewPane {
+            in_tab,
+            tab_id,
+            no_focus,
+            ..
+        } = self
+        {
+            *in_tab = None;
+            *tab_id = Some(tab);
+            *no_focus = true;
+        }
+    }
+}
+
+/// The most text `write-chars` and `paste` will take from stdin, in bytes.
+///
+/// A megabyte is far more than anyone types and far less than a file that was piped in by mistake.
+/// The text is delivered to the pane as keystrokes, so the pane's program reads all of it: a bound
+/// here is what keeps `zellij action paste < some.iso` from being a way to wedge a shell.
+pub const MAX_STDIN_TEXT_BYTES: usize = 1024 * 1024;
+
+/// The text a `write-chars` or a `paste` was given on stdin, bounded and checked.
+///
+/// `Ok("")` is not an error here - an empty stdin is a well-formed request that writes nothing, and
+/// the caller is what turns it into the miss it is. Both errors are the caller's exit 1: text that
+/// is not text, and text past the bound.
+pub fn text_from_stdin<R: std::io::Read>(reader: R, verb: &str) -> Result<String, String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    // one byte past the bound, so a file exactly at it still passes and anything longer is caught
+    // without reading the rest of it
+    std::io::Read::take(reader, MAX_STDIN_TEXT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("`{}` could not read stdin: {}", verb, e))?;
+    if bytes.len() > MAX_STDIN_TEXT_BYTES {
+        return Err(format!(
+            "`{}` reads at most {} bytes from stdin, and this is more than that. \
+             Send it in pieces, or write the file into the pane's program another way.",
+            verb, MAX_STDIN_TEXT_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "`{}` writes text, and what arrived on stdin is not valid UTF-8. \
+             `zellij action write` takes raw bytes.",
+            verb
+        )
+    })
+}
+
+/// What a confirmation should do, worked out before anything is printed.
+///
+/// The rule the fork applies: **a verb whose effect cannot be undone confirms first.** On a
+/// terminal it asks; anywhere else it refuses and names `--yes`. A script must never meet a prompt
+/// it cannot answer - a command that blocks forever waiting for a keypress nobody is there to
+/// press is worse than either answer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Confirmation {
+    /// Ask, and do it if the answer is yes.
+    Ask(String),
+    /// Go ahead: the caller said `--yes`, which is how a script says it meant this.
+    Proceed,
+    /// Refuse, exit 2, and say what would have allowed it.
+    Refuse(String),
+}
+
+/// Whether this call may go ahead with something it cannot take back.
+///
+/// `on_a_terminal` is the seam: it is `stdin().is_terminal()` at the call site, and a plain
+/// argument here so the whole matrix can be tested without a tty.
+pub fn confirmation_for(verb: &str, what: &str, yes: bool, on_a_terminal: bool) -> Confirmation {
+    if yes {
+        return Confirmation::Proceed;
+    }
+    if on_a_terminal {
+        return Confirmation::Ask(format!("{} {}. Are you sure?", verb, what));
+    }
+    Confirmation::Refuse(format!(
+        "`{verb}` {what}, and cannot be undone. Nothing here can answer a prompt, so pass `--yes` \
+         to say you meant it."
+    ))
+}
+
+/// What each verb destroys, in its own words.
+///
+/// One home for the wording, because the same sentence is read twice: in the question on a
+/// terminal, and in the refusal off one.
+pub mod destroys {
+    pub const CLOSE_PANE: &str = "kills whatever is running in that pane";
+    pub const CLOSE_TAB: &str = "kills every pane in that tab and everything running in them";
+    pub const CLEAR: &str = "throws away that pane's screen and its whole scrollback";
+    pub const KILL_SESSION: &str = "kills that session and everything running in it";
+    pub const DELETE_SESSION: &str = "deletes that session's saved layout";
+    pub const KILL_ALL_SESSIONS: &str = "kills every session and everything running in them";
+    pub const DELETE_ALL_SESSIONS: &str = "deletes every resurrectable session's saved layout";
+    pub const SNAPSHOT_RM: &str = "deletes that snapshot's saved layout";
+    pub const SNAPSHOT_PRUNE: &str =
+        "deletes every snapshot past the newest few of each session name";
+}
+
+/// Which `zellij action` verbs confirm, and what each of them says it destroys.
+///
+/// The table is here rather than at the call site so that what confirms - and, just as much, what
+/// does not - can be read and tested without a session to run it against.
+pub fn confirmation_needed(action: &CliAction) -> Option<(&'static str, &'static str, bool)> {
+    match action {
+        CliAction::ClosePane { yes, .. } => Some(("close-pane", destroys::CLOSE_PANE, *yes)),
+        CliAction::CloseTab { yes, .. } => Some(("close-tab", destroys::CLOSE_TAB, *yes)),
+        CliAction::Clear { yes, .. } => Some(("clear", destroys::CLEAR, *yes)),
+        _ => None,
+    }
+}
+
+/// How a `zellij action` verb behaves when it is not told what to act on.
+///
+/// Three classes, and the difference between them is what "the focused thing" would mean:
+///
+/// * [`Anywhere`](TargetClass::Anywhere) - moving focus, scrolling, switching mode, and every verb
+///   that CREATES something. Placement relative to wherever you are is the whole point of these,
+///   and a script that calls one is asking for exactly that.
+/// * [`InsideOnly`](TargetClass::InsideOnly) - recoverable mutations: renaming, resizing, moving a
+///   pane or a tab. Inside a pane, "focused" is the pane your hands are on. From a script it is a
+///   pane the caller has never seen, so a target is required there.
+/// * [`AlwaysExplicit`](TargetClass::AlwaysExplicit) - closing something, and writing into
+///   something. These are refused without a target from ANYWHERE, inside included: run from inside
+///   a pane, "the focused pane" is the shell that ran the command, and nobody means to close or
+///   type into that. `--focused` is how you say you did.
+///
+/// Keybindings are not governed by any of this. A key is pressed by a person who is looking at the
+/// thing it acts on, which is the case all three classes are reasoning about the absence of.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum TargetClass {
+    Anywhere,
+    InsideOnly,
+    AlwaysExplicit,
+}
+
+/// The class a verb belongs to. Everything not named here is [`TargetClass::Anywhere`].
+///
+/// A verb that takes no target at all is `Anywhere` by definition - there is nothing to leave out,
+/// and so is one whose target is required, like `toggle-pane-borderless`: clap has already refused
+/// the call this would be reasoning about.
+///
+/// A verb named `InsideOnly` or `AlwaysExplicit` here must also have an arm in [`missing_target`],
+/// or the class it is in says one thing and the command does another.
+pub fn target_class(action: &CliAction) -> TargetClass {
+    match action {
+        // destroys, or types into something that will run what it is told
+        CliAction::ClosePane { .. }
+        | CliAction::CloseTab { .. }
+        | CliAction::Write { .. }
+        | CliAction::WriteChars { .. }
+        | CliAction::SendKeys { .. }
+        | CliAction::Paste { .. } => TargetClass::AlwaysExplicit,
+        // changes something a person can put back
+        CliAction::Clear { .. }
+        | CliAction::EditScrollback { .. }
+        | CliAction::RenamePane { .. }
+        | CliAction::RenameTab { .. }
+        | CliAction::UndoRenamePane { .. }
+        | CliAction::UndoRenameTab { .. }
+        | CliAction::Resize { .. }
+        | CliAction::MovePane { .. }
+        | CliAction::MovePaneBackwards { .. }
+        | CliAction::MoveTab { .. }
+        | CliAction::TogglePaneEmbedOrFloating { .. }
+        | CliAction::TogglePanePinned { .. } => TargetClass::InsideOnly,
+        _ => TargetClass::Anywhere,
+    }
+}
+
+/// What this call named to act on: a target, the focus, or nothing.
+enum Named {
+    Target,
+    Focus,
+    Nothing,
+}
+
+/// Whether a command that acts on "the focused thing" has been given something to act on.
+///
+/// A `zellij action` client is not attached to anything. It has no focus of its own, so the server
+/// resolves "focused" against whichever client it can find - which, from a script, is a pane the
+/// caller has never seen. For a mutation that is not a wrong answer, it is a wrong tab getting
+/// closed or moved.
+///
+/// `inside_the_session` is the test for "there is a focus here": the ambient session is this
+/// session, so the command was typed in a pane somebody is looking at.
+///
+/// Returns the sentence to print, naming the flag that would have made the command unambiguous.
+pub fn missing_target(action: &CliAction, inside_the_session: bool) -> Option<String> {
+    let class = target_class(action);
+    let (verb, flag, lister, named) = match action {
+        CliAction::ClosePane {
+            pane_id, focused, ..
+        } => (
+            "close-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::Write {
+            pane_id, focused, ..
+        } => (
+            "write",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::WriteChars {
+            pane_id, focused, ..
+        } => (
+            "write-chars",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::SendKeys {
+            pane_id, focused, ..
+        } => (
+            "send-keys",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::Paste {
+            pane_id, focused, ..
+        } => (
+            "paste",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::Clear {
+            pane_id, focused, ..
+        } => (
+            "clear",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), *focused),
+        ),
+        CliAction::CloseTab {
+            tab_id, focused, ..
+        } => (
+            "close-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), *focused),
+        ),
+        CliAction::EditScrollback { pane_id, .. } => (
+            "edit-scrollback",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::RenamePane { pane_id, .. } => (
+            "rename-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::MoveTab { tab_id, .. } => (
+            "move-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), false),
+        ),
+        CliAction::Resize { pane_id, .. } => (
+            "resize",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::MovePane { pane_id, .. } => (
+            "move-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::MovePaneBackwards { pane_id, .. } => (
+            "move-pane-backwards",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::UndoRenamePane { pane_id, .. } => (
+            "undo-rename-pane",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::TogglePaneEmbedOrFloating { pane_id, .. } => (
+            "toggle-pane-embed-or-floating",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::TogglePanePinned { pane_id, .. } => (
+            "toggle-pane-pinned",
+            "--pane-id",
+            "list-panes",
+            named(pane_id.is_some(), false),
+        ),
+        CliAction::RenameTab { tab_id, .. } => (
+            "rename-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), false),
+        ),
+        CliAction::UndoRenameTab { tab_id, .. } => (
+            "undo-rename-tab",
+            "--tab-id",
+            "list-tabs",
+            named(tab_id.is_some(), false),
+        ),
+        _ => return None,
+    };
+    let thing = if flag == "--pane-id" { "pane" } else { "tab" };
+    match named {
+        // a target was named: nothing to complain about, wherever the call came from
+        Named::Target => None,
+        // `--focused` is only a target where a focus exists
+        Named::Focus if !inside_the_session => Some(format!(
+            "`{verb} --focused` names the {thing} your hands are on, and this call was made from \
+             outside the session, where there are no hands. Pass {flag}. \
+             `zellij action {lister}` lists them."
+        )),
+        Named::Focus => None,
+        Named::Nothing => match class {
+            TargetClass::Anywhere => None,
+            TargetClass::InsideOnly if inside_the_session => None,
+            TargetClass::InsideOnly => Some(format!(
+                "`{verb}` run from outside a pane has no focused {thing} to act on. \
+                 Pass {flag}, or run it from inside the session. \
+                 `zellij action {lister}` lists them."
+            )),
+            TargetClass::AlwaysExplicit => Some(format!(
+                "`{verb}` always names what it acts on. Pass {flag}, or `--focused` for the \
+                 {thing} your hands are on. `zellij action {lister}` lists them."
+            )),
+        },
+    }
+}
+
+fn named(has_target: bool, focused: bool) -> Named {
+    if has_target {
+        Named::Target
+    } else if focused {
+        Named::Focus
+    } else {
+        Named::Nothing
+    }
+}
+
+/// Whether `switch-session --pane-id` was handed a target only the other session could resolve.
+///
+/// A handle or a uuid names a pane against one session's live panes, and the only registry this
+/// process can reach is the session it is standing in. Resolving one here and sending the number on
+/// would land the switch on whichever pane happens to wear that id in the target session - a pane
+/// the caller never named. Asking the target session instead would need a query across sessions
+/// that the protocol does not carry.
+///
+/// So the id forms, which mean the same thing in every session, pass through untouched, and the
+/// rest are refused. A string that names a pane in no form at all is refused here too, in the
+/// parser's own words: it is malformed input like any other, and every other `--pane-id` reports it
+/// and exits 1, so this one does the same rather than turning it into a miss.
+///
+/// Returns the sentence to print, before exiting 1.
+pub fn cross_session_pane_target_needs_an_id(action: &CliAction) -> Option<String> {
+    let (name, pane_id) = match action {
+        CliAction::SwitchSession {
+            name,
+            pane_id: Some(pane_id),
+            ..
+        } => (name, pane_id),
+        _ => return None,
+    };
+    match pane_id.parse::<crate::data::PaneTarget>() {
+        Ok(crate::data::PaneTarget::Id(_)) => None,
+        Err(malformed) => Some(malformed),
+        Ok(_) => Some(format!(
+            "`switch-session --pane-id {pane_id}` reads '{pane_id}' against this session, not \
+             against '{name}', so it cannot mean a pane there. A --pane-id for another session \
+             must be an id form: terminal_1, plugin_2, or a bare integer.",
+            pane_id = pane_id,
+            name = name,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::PaneId;
+    use crate::input::actions::{pane_ids_only, Action};
     use clap::Parser;
 
     const CLI_PARSE_TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
@@ -2382,8 +3590,77 @@ mod tests {
         on_large_stack(move || CliArgs::try_parse_from(full_args))
     }
 
+    /// Parse a command line on a thread with a real stack. See [`on_big_stack`].
+    fn parse_cli(args: Vec<String>) -> Result<CliArgs, clap::Error> {
+        on_big_stack(move || CliArgs::try_parse_from(args))
+    }
+
+    #[test]
+    fn top_level_list_agents_accepts_the_action_options() {
+        let cli = parse_cli(
+            [
+                "zellij",
+                "list-agents",
+                "--json",
+                "--all-sessions",
+                "--report-withheld",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sessions(Sessions::ListAgents {
+                json: true,
+                all_sessions: true,
+                report_withheld: true,
+            }))
+        ));
+    }
+
+    fn parse_action(args: &[&str]) -> CliAction {
+        let mut full_args = vec!["zellij".to_string(), "action".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        let cli = parse_cli(full_args).unwrap();
+        match cli.command {
+            Some(Command::Action { action, .. }) => *action,
+            other => panic!("Expected Action, got {:?}", other),
+        }
+    }
+
+    /// `--version` and `-V` share one string in clap, so rendering it once covers both.
+    #[test]
+    fn the_rendered_version_leads_with_the_bare_version_then_names_the_base() {
+        use clap::CommandFactory;
+        // Building the command tree needs the big stack for the same reason parsing does.
+        let rendered = on_big_stack(|| CliArgs::command().render_version());
+        let mut lines = rendered.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("zellij {}", crate::consts::VERSION),
+            "the first line is what scripts parse and must not grow a suffix"
+        );
+        let base_line = lines.next().unwrap();
+        assert!(
+            base_line.contains(crate::consts::UPSTREAM_BASE_TAG)
+                && base_line.contains(crate::consts::UPSTREAM_BASE_COMMIT),
+            "expected the upstream base on the second line, got {:?}",
+            base_line
+        );
+    }
+
+    fn action_parse_fails(args: &[&str]) -> bool {
+        let mut full_args = vec!["zellij".to_string(), "action".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        parse_cli(full_args).is_err()
+    }
+
     fn parse_subscribe(args: &[&str]) -> SubscribeCli {
-        let cli = try_parse(args).unwrap();
+        let mut full_args = vec!["zellij".to_string()];
+        full_args.extend(args.iter().map(|a| a.to_string()));
+        let cli = parse_cli(full_args).unwrap();
         match cli.command {
             Some(Command::Subscribe(s)) => s,
             other => panic!("Expected Subscribe, got {:?}", other),
@@ -2433,6 +3710,23 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_timestamps_are_off_until_asked_for() {
+        let bare = parse_subscribe(&["subscribe", "--pane-id", "terminal_1"]);
+        assert!(!bare.timestamps);
+        let stamped = parse_subscribe(&["subscribe", "--pane-id", "terminal_1", "--timestamps"]);
+        assert!(stamped.timestamps);
+    }
+
+    #[test]
+    fn an_event_timestamp_is_rfc3339_utc_to_the_millisecond() {
+        let epoch = event_timestamp(std::time::UNIX_EPOCH);
+        assert_eq!(epoch, "1970-01-01T00:00:00.000Z");
+        let later =
+            event_timestamp(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_234_567));
+        assert_eq!(later, "1970-01-01T00:20:34.567Z");
+    }
+
+    #[test]
     fn subscribe_multiple_pane_ids() {
         let s = parse_subscribe(&[
             "subscribe",
@@ -2449,7 +3743,7 @@ mod tests {
 
     #[test]
     fn subscribe_requires_pane_id() {
-        let result = try_parse(&["subscribe"]);
+        let result = parse_cli(vec!["zellij".to_string(), "subscribe".to_string()]);
         assert!(result.is_err());
     }
 
@@ -2458,7 +3752,7 @@ mod tests {
         full_args.extend_from_slice(args);
         let cli = try_parse(&full_args)?;
         match cli.command {
-            Some(Command::Action(action)) => Ok(*action),
+            Some(Command::Action { action, .. }) => Ok(*action),
             other => panic!("Expected Action, got {:?}", other),
         }
     }
@@ -2515,6 +3809,61 @@ mod tests {
     fn set_resurrect_command_requires_command_or_clear() {
         assert!(parse_set_resurrect_command(&[]).is_err());
     }
+
+    #[test]
+    fn close_pane_with_a_pane_id_sends_close_focus_by_pane_id() {
+        // the action this maps to decides which ScreenInstruction reports a missing pane;
+        // `CloseTerminalPane` is a different path and fixing that one does not fix this one
+        let actions = Action::actions_from_cli(
+            parse_action(&["close-pane", "--pane-id", "terminal_9"]),
+            Box::new(PathBuf::new),
+            None,
+            &pane_ids_only,
+        )
+        .expect("TEST");
+        assert_eq!(
+            actions,
+            vec![Action::CloseFocusByPaneId {
+                pane_id: PaneId::Terminal(9)
+            }]
+        );
+    }
+
+    #[test]
+    fn go_to_pane_takes_no_focus() {
+        // the same probe flag `go-to-tab-name` has, on the alias people reach for
+        let action = parse_action(&["go-to-pane", "sunny-otter", "--no-focus"]);
+        match action {
+            CliAction::FocusPaneId { pane_id, no_focus } => {
+                assert_eq!(pane_id, "sunny-otter");
+                assert!(no_focus);
+            },
+            other => panic!("Expected FocusPaneId, got {:?}", other),
+        }
+        // and the negative control: without the flag it is the jump it always was
+        match parse_action(&["go-to-pane", "sunny-otter"]) {
+            CliAction::FocusPaneId { no_focus, .. } => assert!(!no_focus),
+            other => panic!("Expected FocusPaneId, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn go_to_tab_name_no_focus() {
+        let action = parse_action(&["go-to-tab-name", "build", "--create", "--no-focus"]);
+        match action {
+            CliAction::GoToTabName {
+                name,
+                create,
+                no_focus,
+            } => {
+                assert_eq!(name, "build");
+                assert!(create);
+                assert!(no_focus);
+            },
+            other => panic!("Expected GoToTabName, got {:?}", other),
+        }
+    }
+
     #[test]
     fn a_targetless_close_from_outside_a_pane_is_refused() {
         for args in [
@@ -2533,6 +3882,24 @@ mod tests {
                 "expected `{}` to need a target",
                 args.join(" ")
             );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_the_verb_and_the_flag_that_answers_it() {
+        for (args, verb) in [
+            (vec!["write", "27"], "write"),
+            (vec!["write-chars", "hello"], "write-chars"),
+            (vec!["clear"], "clear"),
+            (vec!["edit-scrollback"], "edit-scrollback"),
+            (vec!["rename-pane", "build"], "rename-pane"),
+        ] {
+            let action = parse_action(&args);
+            let message = missing_target(&action, false)
+                .unwrap_or_else(|| panic!("expected `{}` to be refused", args.join(" ")));
+            assert!(message.contains(verb), "got: {}", message);
+            assert!(message.contains("--pane-id"), "got: {}", message);
+            assert!(message.contains("list-panes"), "got: {}", message);
         }
     }
 
@@ -2594,6 +3961,387 @@ mod tests {
         }
     }
 
+    /// The actions a `zellij action` command line turns into, with no session to ask.
+    fn actions_of(args: &[&str]) -> Result<Vec<Action>, String> {
+        Action::actions_from_cli(
+            parse_action(args),
+            Box::new(|| std::path::PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+    }
+
+    #[test]
+    fn new_tab_takes_a_name_or_none_at_all() {
+        let named = parse_action(&["new-pane", "--new-tab", "build"]);
+        let bare = parse_action(&["new-pane", "--new-tab"]);
+        let without = parse_action(&["new-pane"]);
+        let new_tab = |action: &CliAction| match action {
+            CliAction::NewPane { new_tab, .. } => new_tab.clone(),
+            other => panic!("Expected NewPane, got {:?}", other),
+        };
+        assert_eq!(new_tab(&named), Some(Some("build".to_owned())));
+        assert_eq!(new_tab(&bare), Some(None));
+        assert_eq!(new_tab(&without), None);
+    }
+
+    #[test]
+    fn a_pane_in_a_new_tab_is_one_tab_carrying_one_pane() {
+        // the point of the flag: one action, so the tab and the pane it holds are made together
+        // and reported together, rather than a tab that opens a shell and a pane beside it
+        let actions = actions_of(&["new-pane", "--new-tab", "build", "--", "cargo", "test"])
+            .expect("a new tab with a command in it");
+        assert_eq!(actions.len(), 1, "got: {:?}", actions);
+        match &actions[0] {
+            Action::NewTab {
+                tiled_layout,
+                tab_name,
+                initial_panes,
+                should_change_focus_to_new_tab,
+                ..
+            } => {
+                assert_eq!(tab_name.as_deref(), Some("build"));
+                assert!(should_change_focus_to_new_tab);
+                // no layout of our own: the tab is built from the session's new-tab template, so it
+                // keeps its status bars and its panes are serialized like any other tab's
+                assert!(tiled_layout.is_none(), "got: {:?}", tiled_layout);
+                let panes = initial_panes.as_ref().expect("the command");
+                assert_eq!(panes.len(), 1);
+                match &panes[0] {
+                    crate::data::CommandOrPlugin::Command(command) => {
+                        assert_eq!(command.command, std::path::PathBuf::from("cargo"));
+                        assert_eq!(command.args, vec!["test".to_owned()]);
+                    },
+                    other => panic!("Expected a command, got {:?}", other),
+                }
+            },
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_that_names_nothing_still_makes_the_tab() {
+        let actions = actions_of(&["new-pane", "--new-tab"]).expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                tab_name,
+                initial_panes,
+                ..
+            } => {
+                assert_eq!(tab_name, &None, "zellij names it");
+                // no command: the tab opens the shell, which is what a bare `new-pane` opens
+                assert!(initial_panes.is_none());
+            },
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_keeps_the_focus_where_it_is_when_asked() {
+        let actions = actions_of(&["new-pane", "--new-tab", "--no-focus"]).expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                should_change_focus_to_new_tab,
+                ..
+            } => assert!(!should_change_focus_to_new_tab),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_new_tab_refuses_the_flags_that_place_a_pane_in_an_existing_one() {
+        // each of these says where the pane goes, and `--new-tab` has already answered that
+        for args in [
+            vec!["new-pane", "--new-tab", "--stacked"],
+            vec!["new-pane", "--new-tab", "-d", "right"],
+            vec!["new-pane", "--new-tab", "--floating"],
+            vec!["new-pane", "--new-tab", "--in-place"],
+            vec!["new-pane", "--new-tab", "--tab-id", "2"],
+            vec!["new-pane", "--new-tab", "--near-current-pane"],
+            // the pane in a new tab cannot carry a name, so the flag is refused rather than dropped
+            vec!["new-pane", "--new-tab", "--name", "shell"],
+            // and neither can it carry a frame setting, for the same reason: the first pane of a
+            // new tab is described by its command and nothing else
+            vec!["new-pane", "--new-tab", "--borderless", "true"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_tab_says_which_waiting_flag_it_can_honour() {
+        // `--blocking` waits for a pane to close and has no pane to name in a tab that does not
+        // exist yet; the conditional ones ride on the tab's first pane
+        assert!(action_parse_fails(&["new-pane", "--new-tab", "--blocking"]));
+        let actions = actions_of(&["new-pane", "--new-tab", "--block-until-exit", "--", "true"])
+            .expect("a new tab that waits for its command");
+        match &actions[0] {
+            Action::NewTab {
+                first_pane_unblock_condition,
+                ..
+            } => assert_eq!(
+                first_pane_unblock_condition,
+                &Some(UnblockCondition::OnAnyExit)
+            ),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_verb_that_cannot_be_undone_asks_first_and_never_hangs() {
+        // the whole matrix, once, because one helper answers it for every such verb
+        assert_eq!(
+            confirmation_for("close-pane", "kills what is running in it", false, true),
+            Confirmation::Ask("close-pane kills what is running in it. Are you sure?".to_owned())
+        );
+        // `--yes` is how a script says it meant this, and it works either way
+        assert_eq!(
+            confirmation_for("close-pane", "kills what is running in it", true, true),
+            Confirmation::Proceed
+        );
+        assert_eq!(
+            confirmation_for("close-pane", "kills what is running in it", true, false),
+            Confirmation::Proceed
+        );
+        // the case that matters most: no terminal and no `--yes` REFUSES rather than prompting.
+        // A script that met a prompt here would wait forever for a keypress nobody is there to
+        // press, which is worse than either answer
+        match confirmation_for("close-pane", "kills what is running in it", false, false) {
+            Confirmation::Refuse(message) => {
+                assert!(message.contains("--yes"), "the way out is named: {message}");
+                assert!(message.contains("close-pane"), "{message}");
+            },
+            other => panic!("expected a refusal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn only_the_action_verbs_that_destroy_something_confirm() {
+        let asks = |args: &[&str]| confirmation_needed(&parse_action(args)).map(|(v, _, y)| (v, y));
+        // one representative per confirming verb, each parsed from a real command line, so this
+        // also proves `--yes` reached the verb rather than only the helper
+        assert_eq!(
+            asks(&["close-pane", "--pane-id", "terminal_1"]),
+            Some(("close-pane", false))
+        );
+        assert_eq!(
+            asks(&["close-pane", "--pane-id", "terminal_1", "--yes"]),
+            Some(("close-pane", true))
+        );
+        assert_eq!(
+            asks(&["close-tab", "--tab-id", "2"]),
+            Some(("close-tab", false))
+        );
+        assert_eq!(
+            asks(&["close-tab", "--tab-id", "2", "--yes"]),
+            Some(("close-tab", true))
+        );
+        assert_eq!(
+            asks(&["clear", "--pane-id", "terminal_1"]),
+            Some(("clear", false))
+        );
+        assert_eq!(
+            asks(&["clear", "--pane-id", "terminal_1", "--yes"]),
+            Some(("clear", true))
+        );
+        // the negative control, and the point of the table being here: the exempt verbs. Each is
+        // exempt for its own reason - the write family destroys nothing of its own, and
+        // `dump-screen` is a read-band verb
+        assert_eq!(
+            asks(&["write-chars", "hi", "--pane-id", "terminal_1"]),
+            None
+        );
+        assert_eq!(
+            asks(&["send-keys", "Enter", "--pane-id", "terminal_1"]),
+            None
+        );
+        assert_eq!(asks(&["paste", "hi", "--pane-id", "terminal_1"]), None);
+        assert_eq!(
+            asks(&["dump-screen", "/tmp/s", "--pane-id", "terminal_1"]),
+            None
+        );
+        assert_eq!(asks(&["rename-pane", "notes"]), None);
+        assert_eq!(asks(&["new-pane"]), None);
+    }
+
+    #[test]
+    fn every_confirming_verb_says_what_it_destroys() {
+        // the sentence is read twice - as the question and as the refusal - so it has to complete
+        // "`<verb>` <what>, and cannot be undone" in both. One home for it, checked once
+        for what in [
+            destroys::CLOSE_PANE,
+            destroys::CLOSE_TAB,
+            destroys::CLEAR,
+            destroys::KILL_SESSION,
+            destroys::DELETE_SESSION,
+            destroys::KILL_ALL_SESSIONS,
+            destroys::DELETE_ALL_SESSIONS,
+            destroys::SNAPSHOT_RM,
+            destroys::SNAPSHOT_PRUNE,
+        ] {
+            assert!(
+                !what.is_empty() && !what.ends_with('.'),
+                "it is a clause, not a sentence: {what}"
+            );
+            assert!(
+                what.starts_with("kills ")
+                    || what.starts_with("deletes ")
+                    || what.starts_with("throws away "),
+                "it names the destruction in the present tense: {what}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_three_classes_say_what_each_verb_does_without_a_target() {
+        // one representative of each class, and the negative controls are each other
+        let optionless = |args: &[&str]| target_class(&parse_action(args));
+        // class 1: placement relative to where you are is the point
+        assert_eq!(optionless(&["move-focus", "left"]), TargetClass::Anywhere);
+        assert_eq!(optionless(&["go-to-next-tab"]), TargetClass::Anywhere);
+        assert_eq!(optionless(&["scroll-up"]), TargetClass::Anywhere);
+        assert_eq!(optionless(&["new-pane"]), TargetClass::Anywhere);
+        assert_eq!(
+            optionless(&["switch-mode", "locked"]),
+            TargetClass::Anywhere
+        );
+        // class 2: recoverable, and "focused" means something when you are looking at it
+        assert_eq!(
+            optionless(&["rename-pane", "notes"]),
+            TargetClass::InsideOnly
+        );
+        assert_eq!(optionless(&["resize", "increase"]), TargetClass::InsideOnly);
+        assert_eq!(optionless(&["move-tab", "left"]), TargetClass::InsideOnly);
+        // class 3: destroys, or types into something that runs what it is told
+        assert_eq!(optionless(&["close-pane"]), TargetClass::AlwaysExplicit);
+        assert_eq!(optionless(&["close-tab"]), TargetClass::AlwaysExplicit);
+        assert_eq!(
+            optionless(&["send-keys", "Enter"]),
+            TargetClass::AlwaysExplicit
+        );
+        assert_eq!(
+            optionless(&["write-chars", "hello"]),
+            TargetClass::AlwaysExplicit
+        );
+    }
+
+    #[test]
+    fn class_three_names_its_target_from_inside_the_session_too() {
+        // the point of the class: run from inside a pane, "the focused pane" is the shell that ran
+        // the command, and nobody means to close or type into that
+        for args in [
+            vec!["close-pane"],
+            vec!["send-keys", "Enter"],
+            vec!["write-chars", "hello"],
+        ] {
+            let action = parse_action(&args);
+            let inside = missing_target(&action, true);
+            assert!(
+                inside.is_some(),
+                "`{}` should name its target even from inside",
+                args.join(" ")
+            );
+            assert!(
+                inside.unwrap().contains("--focused"),
+                "the way out is named"
+            );
+            assert!(missing_target(&action, false).is_some(), "and from outside");
+        }
+    }
+
+    #[test]
+    fn focused_is_a_target_where_a_focus_exists_and_nowhere_else() {
+        let action = parse_action(&["close-pane", "--focused"]);
+        assert!(
+            missing_target(&action, true).is_none(),
+            "inside the session there are hands to name"
+        );
+        let outside = missing_target(&action, false).expect("outside there are none");
+        assert!(outside.contains("--pane-id"), "{outside}");
+        // `--current` is the same token by another name
+        assert!(missing_target(&parse_action(&["close-pane", "--current"]), true).is_none());
+        // the negative control: a named target is fine from anywhere, and needs no focus
+        let targeted = parse_action(&["close-pane", "--pane-id", "terminal_1"]);
+        assert!(missing_target(&targeted, false).is_none());
+        assert!(missing_target(&targeted, true).is_none());
+    }
+
+    #[test]
+    fn every_verb_in_class_two_is_actually_refused_from_a_script() {
+        // the class table and the refusal are two lists that have to agree: a verb put in
+        // `InsideOnly` with no arm in `missing_target` is documented as refused from a script and
+        // is not, so `resize` from a cron job resized whichever pane somebody was looking at
+        for args in [
+            vec!["resize", "increase"],
+            vec!["move-pane"],
+            vec!["move-pane-backwards"],
+            vec!["undo-rename-pane"],
+            vec!["rename-tab", "logs"],
+            vec!["undo-rename-tab"],
+            vec!["toggle-pane-pinned"],
+            vec!["toggle-pane-embed-or-floating"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                target_class(&action),
+                TargetClass::InsideOnly,
+                "`{}` is a recoverable mutation",
+                args.join(" ")
+            );
+            assert!(
+                missing_target(&action, false).is_some(),
+                "`{}` is in a class that is refused from a script, and is not",
+                args.join(" ")
+            );
+            // the negative controls: inside the session "focused" is what the caller meant, and a
+            // named target is fine from anywhere
+            assert_eq!(
+                missing_target(&action, true),
+                None,
+                "`{}` means the focused thing from inside",
+                args.join(" ")
+            );
+        }
+        // a verb whose target is required is in no class: clap refused the call first
+        assert_eq!(
+            target_class(&parse_action(&[
+                "toggle-pane-borderless",
+                "--pane-id",
+                "terminal_1"
+            ])),
+            TargetClass::Anywhere
+        );
+    }
+
+    #[test]
+    fn a_class_two_verb_that_names_its_target_is_let_through() {
+        for args in [
+            vec!["resize", "increase", "--pane-id", "terminal_1"],
+            vec!["move-pane", "--pane-id", "sunny-otter"],
+            vec!["rename-tab", "logs", "--tab-id", "2"],
+        ] {
+            let action = parse_action(&args);
+            assert_eq!(
+                missing_target(&action, false),
+                None,
+                "`{}` names its target",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn class_two_still_means_the_focused_thing_from_inside() {
+        // the class that did not move: optionless is fine inside a pane, refused from a script
+        let action = parse_action(&["rename-pane", "notes"]);
+        assert!(missing_target(&action, true).is_none());
+        assert!(missing_target(&action, false).is_some());
+    }
+
     fn wait_bounds(args: &[&str]) -> (WaitFor, u64, u64) {
         match parse_action(args) {
             CliAction::Wait {
@@ -2642,6 +4390,80 @@ mod tests {
         assert_eq!(
             wait_bounds(&["wait", "build", "--for", "agent-waiting"]),
             (WaitFor::AgentWaiting, 3000, 300)
+        );
+    }
+
+    #[test]
+    fn a_verb_names_itself_the_way_it_is_typed() {
+        // the name the surface table is keyed by, derived from the same variant clap derives the
+        // verb from, so a renamed verb cannot keep an old shape entry alive
+        assert_eq!(parse_action(&["new-pane"]).verb(), "new-pane");
+        assert_eq!(
+            parse_action(&["go-to-tab-name", "logs"]).verb(),
+            "go-to-tab-name"
+        );
+        assert_eq!(parse_action(&["detach"]).verb(), "detach");
+        // and every verb it names is one the shape table or the band list knows, which is what
+        // stops `--json` from asking about a command spelled a way nothing answers to
+        for args in [vec!["dump-screen"], vec!["close-pane"], vec!["list-panes"]] {
+            let verb = parse_action(&args).verb();
+            assert!(
+                crate::cli_surface::band_of(&verb).is_some(),
+                "`{}` is not in any band",
+                verb
+            );
+        }
+    }
+
+    #[test]
+    fn the_verbs_that_already_print_json_own_the_flag() {
+        // `zellij action --json list-panes` is the same call as `zellij action list-panes --json`,
+        // rather than a second JSON shape for one command
+        for args in [
+            vec!["list-panes"],
+            vec!["list-tabs"],
+            vec!["list-tree"],
+            vec!["list-clients"],
+            vec!["list-agents"],
+            vec!["current-tab-info"],
+        ] {
+            let mut action = parse_action(&args);
+            assert!(
+                action.set_output_json(),
+                "`{}` prints JSON of its own and did not take the flag",
+                args[0]
+            );
+        }
+        // the negative control: a mutation has no JSON of its own, and its record is structured by
+        // the client instead
+        assert!(!parse_action(&["close-pane", "--pane-id", "terminal_1"]).set_output_json());
+        assert!(!parse_action(&["dump-screen"]).set_output_json());
+    }
+
+    #[test]
+    fn a_json_answer_is_offered_for_a_record_and_refused_for_a_payload() {
+        // the two sides of the refusal in `attach_with_cli_client`, read off the shape table so
+        // the flag and the printer cannot disagree about what a verb answers with
+        for verb in ["close-pane", "new-pane", "move-tab", "wait"] {
+            assert_eq!(
+                crate::cli_surface::output_shape(&format!("action {}", verb)),
+                Some("record"),
+                "`{}` is answered as a record",
+                verb
+            );
+        }
+        for verb in ["dump-screen", "dump-layout"] {
+            assert_eq!(
+                crate::cli_surface::output_shape(&format!("action {}", verb)),
+                Some("payload"),
+                "`{}` has no keys to answer with",
+                verb
+            );
+        }
+        // a verb that prints nothing has no entry at all, and answers `{}`
+        assert_eq!(
+            crate::cli_surface::output_shape("action toggle-floating-panes"),
+            None
         );
     }
 
@@ -2758,6 +4580,251 @@ mod tests {
     }
 
     #[test]
+    fn near_takes_every_form_a_pane_answers_to() {
+        for target in [
+            "terminal_1",
+            "3",
+            "sunny-otter",
+            "e9b82dbd-0000-4000-8000-0000000000aa",
+        ] {
+            let action = parse_action(&["new-pane", "--near", target]);
+            assert_eq!(action.near_target(), Some(target));
+        }
+    }
+
+    #[test]
+    fn an_anchored_pane_asks_for_the_pane_the_command_came_from() {
+        // the anchor rides on the channel `--near-current-pane` uses, so what is left in the action
+        // is that there is one; the id itself is the client's to carry
+        let mut action = parse_action(&["new-pane", "--near", "sunny-otter"]);
+        action.anchor_near();
+        match &action {
+            CliAction::NewPane {
+                near,
+                near_current_pane,
+                ..
+            } => {
+                assert_eq!(near, &None, "the name is spent once it is resolved");
+                assert!(near_current_pane);
+            },
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_near_never_reaches_the_session() {
+        // without the lookup the pane would open beside whichever pane the server found, which is
+        // the pane `--near` was passed to avoid
+        let error = actions_of(&["new-pane", "--near", "sunny-otter"])
+            .expect_err("an unresolved --near is not an action");
+        assert!(error.contains("--near"), "got: {}", error);
+    }
+
+    #[test]
+    fn near_refuses_the_flags_that_place_the_pane_somewhere_else() {
+        for args in [
+            vec!["new-pane", "--near", "terminal_1", "--near-current-pane"],
+            vec!["new-pane", "--near", "terminal_1", "--tab-id", "2"],
+            vec!["new-pane", "--near", "terminal_1", "--in-tab", "logs"],
+            vec!["new-pane", "--near", "terminal_1", "--new-tab"],
+            vec!["new-pane", "--near", "terminal_1", "--in-place"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+    }
+
+    #[test]
+    fn in_tab_becomes_a_tab_id_and_takes_nobodys_focus() {
+        let mut action = parse_action(&["new-pane", "--in-tab", "logs"]);
+        assert_eq!(action.in_tab_target(), Some("logs"));
+        action.place_in_tab(4);
+        match &action {
+            CliAction::NewPane {
+                in_tab,
+                tab_id,
+                no_focus,
+                ..
+            } => {
+                assert_eq!(in_tab, &None, "the name is spent once it is resolved");
+                assert_eq!(tab_id, &Some(4));
+                assert!(no_focus, "putting a pane somewhere is not going there");
+            },
+            other => panic!("Expected NewPane, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_unresolved_in_tab_never_reaches_the_session() {
+        // the guard: a caller that skipped the lookup would open the pane in the focused tab, which
+        // is the one tab `--in-tab` was passed to avoid
+        let error = actions_of(&["new-pane", "--in-tab", "logs"])
+            .expect_err("an unresolved --in-tab is not an action");
+        assert!(error.contains("--in-tab"), "got: {}", error);
+    }
+
+    #[test]
+    fn in_tab_refuses_the_other_ways_of_naming_a_tab() {
+        for args in [
+            vec!["new-pane", "--in-tab", "logs", "--tab-id", "2"],
+            vec!["new-pane", "--in-tab", "logs", "--new-tab"],
+            vec!["new-pane", "--in-tab", "logs", "--in-place"],
+            vec!["new-pane", "--in-tab", "logs", "--near-current-pane"],
+        ] {
+            assert!(
+                action_parse_fails(&args),
+                "expected `{}` to be refused",
+                args.join(" ")
+            );
+        }
+        // the negative control: the flags that say how the pane is drawn, not where it goes, are
+        // still free to travel with it
+        assert_eq!(
+            parse_action(&["new-pane", "--in-tab", "logs", "-d", "right"]).in_tab_target(),
+            Some("logs")
+        );
+    }
+
+    #[test]
+    fn write_chars_and_paste_take_their_text_or_leave_it_to_stdin() {
+        for verb in ["write-chars", "paste"] {
+            let with_text = parse_action(&[verb, "hello"]);
+            let from_stdin = parse_action(&[verb]);
+            let explicit = parse_action(&[verb, "-"]);
+            let text = |action: &CliAction| match action {
+                CliAction::WriteChars { chars, .. } | CliAction::Paste { chars, .. } => {
+                    chars.clone()
+                },
+                other => panic!("Expected {}, got {:?}", verb, other),
+            };
+            assert_eq!(text(&with_text), Some("hello".to_owned()));
+            assert_eq!(text(&from_stdin), None);
+            assert_eq!(text(&explicit), Some("-".to_owned()));
+        }
+    }
+
+    #[test]
+    fn stdin_text_arrives_whole() {
+        // multi-line, and nothing added or trimmed: what was piped is what the pane is typed
+        let piped = "first line\nsecond line\n";
+        assert_eq!(
+            text_from_stdin(piped.as_bytes(), "write-chars"),
+            Ok(piped.to_owned())
+        );
+        // the negative control: an empty pipe is not an error here, it is the caller's miss
+        assert_eq!(text_from_stdin(&b""[..], "write-chars"), Ok(String::new()));
+    }
+
+    #[test]
+    fn stdin_text_stops_at_the_bound() {
+        let at_the_bound = vec![b'x'; MAX_STDIN_TEXT_BYTES];
+        assert!(text_from_stdin(&at_the_bound[..], "paste").is_ok());
+        let one_past = vec![b'x'; MAX_STDIN_TEXT_BYTES + 1];
+        let message = text_from_stdin(&one_past[..], "paste").expect_err("past the bound");
+        assert!(
+            message.contains(&MAX_STDIN_TEXT_BYTES.to_string()),
+            "{}",
+            message
+        );
+    }
+
+    #[test]
+    fn stdin_that_is_not_text_says_which_command_takes_bytes() {
+        let message = text_from_stdin(&[0xff, 0xfe][..], "write-chars").expect_err("not utf-8");
+        assert!(message.contains("write"), "{}", message);
+    }
+
+    #[test]
+    fn a_cross_session_pane_target_that_needs_a_registry_is_refused() {
+        // the registry a handle or a uuid would be read against is this session's, and the pane is
+        // in the other one - so the id it resolves to names a pane the caller never asked for
+        for target in ["sunny-otter", "e9b82dbd-0000-4000-8000-0000000000aa"] {
+            let action = parse_action(&["switch-session", "other", "--pane-id", target]);
+            let message = cross_session_pane_target_needs_an_id(&action)
+                .unwrap_or_else(|| panic!("expected `{}` to be refused", target));
+            assert!(message.contains(target), "got: {}", message);
+            assert!(message.contains("terminal_1"), "got: {}", message);
+        }
+    }
+
+    #[test]
+    fn a_cross_session_id_form_passes_through() {
+        // the negative control: an id means the same thing in every session, so nothing is resolved
+        // and nothing is refused
+        for target in ["terminal_7", "plugin_2", "3"] {
+            let action = parse_action(&["switch-session", "other", "--pane-id", target]);
+            assert_eq!(
+                cross_session_pane_target_needs_an_id(&action),
+                None,
+                "`{}` is an id form",
+                target
+            );
+        }
+        // and a switch that names no pane has nothing to refuse
+        let action = parse_action(&["switch-session", "other"]);
+        assert_eq!(cross_session_pane_target_needs_an_id(&action), None);
+    }
+
+    #[test]
+    fn a_malformed_cross_session_target_keeps_the_parsers_own_words() {
+        // malformed input exits 1 wherever it appears, and the sentence that names the four forms
+        // is more use than one about the session boundary, which is not what went wrong
+        let action = parse_action(&["switch-session", "other", "--pane-id", "not a pane"]);
+        let message = cross_session_pane_target_needs_an_id(&action)
+            .expect("a malformed target is refused, not passed on");
+        assert!(message.contains("does not name a pane"), "got: {}", message);
+        assert!(
+            !message.contains("switch-session"),
+            "the session boundary is not what went wrong: {}",
+            message
+        );
+    }
+
+    #[test]
+    fn switch_session_never_reaches_the_local_registry() {
+        // the structural half: even handed a resolver that would answer, `switch-session` does not
+        // ask it - the answer would be about the wrong session's panes
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolver = |target: &str| -> Result<PaneId, String> {
+            asked.borrow_mut().push(target.to_owned());
+            Ok(PaneId::Terminal(99))
+        };
+        let action = parse_action(&["switch-session", "other", "--pane-id", "sunny-otter"]);
+        let built =
+            Action::actions_from_cli(action, Box::new(|| PathBuf::from("/")), None, &resolver);
+        assert!(
+            built.is_err(),
+            "a handle cannot be resolved for another session"
+        );
+        assert!(
+            asked.borrow().is_empty(),
+            "switch-session asked this session about {:?}",
+            asked.borrow()
+        );
+
+        // and an id form is carried across untouched, still without asking
+        let action = parse_action(&["switch-session", "other", "--pane-id", "terminal_7"]);
+        let built =
+            Action::actions_from_cli(action, Box::new(|| PathBuf::from("/")), None, &resolver)
+                .expect("an id form needs no registry");
+        assert_eq!(
+            built,
+            vec![Action::SwitchSession {
+                name: "other".to_owned(),
+                tab_position: None,
+                pane_id: Some((7, false)),
+                layout: None,
+                cwd: None,
+                close_current: false,
+            }]
+        );
+        assert!(asked.borrow().is_empty(), "an id form needs no lookup");
+    }
+
+    #[test]
     fn dump_screen_takes_its_path_as_an_argument() {
         match parse_action(&["dump-screen", "--pane-id", "terminal_1", "/tmp/dump"]) {
             CliAction::DumpScreen { file, path, .. } => {
@@ -2795,4 +4862,17 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn go_to_tab_name_focuses_by_default() {
+        let action = parse_action(&["go-to-tab-name", "build"]);
+        match action {
+            CliAction::GoToTabName {
+                create, no_focus, ..
+            } => {
+                assert!(!create);
+                assert!(!no_focus);
+            },
+            other => panic!("Expected GoToTabName, got {:?}", other),
+        }
+    }
 }

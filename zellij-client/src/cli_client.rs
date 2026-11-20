@@ -4,39 +4,10 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{self, BufRead, Read, Write};
 use std::process;
 use std::str::FromStr;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
 
-use crate::os_input_output::ClientOsApi;
-use uuid::Uuid;
-use zellij_utils::{
-    cli::{PromptCli, PromptElementCli, SubscribeCli, SubscribeFormat},
-    data::{OutsideClick, PaneId, PipePopupPlacement},
-    errors::prelude::*,
-    input::actions::Action,
-    ipc::{ClientToServerMsg, ExitReason, IpcReceiveError, ServerToClientMsg},
-    prompt::{self, ChoiceItem, PromptElement},
-};
-
-pub fn start_cli_client(
-    mut os_input: Box<dyn ClientOsApi>,
-    session_name: &str,
-    actions: Vec<Action>,
-) -> i32 {
-    let zellij_ipc_pipe: PathBuf = {
-        let sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
-        fs::create_dir_all(&sock_dir).unwrap();
-        zellij_utils::shared::set_permissions(&sock_dir, 0o700).unwrap();
-        zellij_utils::sessions::resolve_session_socket_path(session_name)
-            .unwrap_or_else(|| sock_dir.join(session_name))
-    };
-    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
-    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
-        eprintln!("{}", crate::connect_error_message(e));
-        process::exit(1);
-    }
-    let pane_id = os_input
-        .env_variable("ZELLIJ_PANE_ID")
-        .and_then(|e| e.trim().parse().ok());
 /// `--wait-ready` on a verb that makes a pane: how long to wait for the pane's shell, and how to
 /// open the connections the wait asks the session on.
 pub struct WaitReady<'a> {
@@ -48,6 +19,50 @@ pub struct WaitReady<'a> {
 /// marker. The same default `wait --for ready` takes.
 const READY_QUIET: Duration = Duration::from_millis(300);
 
+/// Runs the actions one CLI invocation turned into.
+///
+/// `anchor_pane` is the pane these actions should be read as coming from - what `--near` names. A
+/// `zellij action` client is not attached to anything, so "the pane this came from" is normally the
+/// ambient `$ZELLIJ_PANE_ID`, and this is the same answer given deliberately instead of inherited.
+/// It is a terminal id because that is what the message carries; the refusal for anything else
+/// happens before this, where there is a caller to tell.
+///
+/// `pipe_timeout` is what `pipe --timeout` asked for, and `None` is the pipe that waits forever.
+///
+/// `output_json` is `action --json`: the report is printed as one object instead of `key: value`
+/// lines. It reaches only the printing - what the session is asked, and what it answers, are the
+/// same either way.
+///
+/// `wait_ready` is `--wait-ready`: once the report names the pane, wait for its shell as `wait
+/// --for ready` does, and add `ready_by:` and `ready_ms:` to the report. A pane that is not ready
+/// in time is still reported - the caller made it and has to be able to close it - and the exit is
+/// 2.
+pub fn start_cli_client(
+    mut os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    actions: Vec<Action>,
+    anchor_pane: Option<u32>,
+    pipe_timeout: Option<Duration>,
+    output_json: bool,
+    wait_ready: Option<WaitReady>,
+) -> i32 {
+    let zellij_ipc_pipe: PathBuf = {
+        let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+        fs::create_dir_all(&sock_dir).unwrap();
+        zellij_utils::shared::set_permissions(&sock_dir, 0o700).unwrap();
+        sock_dir.push(zellij_utils::sessions::session_id_for(session_name));
+        sock_dir
+    };
+    crate::check_ipc_pipe_length(&zellij_ipc_pipe);
+    if let Err(e) = os_input.connect_to_server(&*zellij_ipc_pipe) {
+        eprintln!("{}", e);
+        return 1;
+    }
+    let pane_id = anchor_pane.or_else(|| {
+        os_input
+            .env_variable("ZELLIJ_PANE_ID")
+            .and_then(|e| e.trim().parse().ok())
+    });
 
     for action in actions {
         match action {
@@ -877,18 +892,74 @@ pub fn plan_prompt(
     })
 }
 
-fn individual_messages_client(
-    os_input: &mut Box<dyn ClientOsApi>,
-    action: Action,
-    pane_id: Option<u32>,
-) -> Option<i32> {
-    let is_blocking = matches!(
-        &action,
-        Action::NewBlockingPane {
-            unblock_condition: Some(_),
-            ..
+/// A record report as one JSON object, or `None` for lines that are not a record.
+///
+/// A reporting verb prints `key: value` lines, so the object is that report with its keys kept and
+/// its values typed the way the JSON surfaces already type them: `-` is the fork's "no value" and
+/// becomes `null`, a whole number becomes a number, `true`/`false` become booleans, and everything
+/// else stays a string. A pane id is a string in `list-panes --json` and stays one here.
+///
+/// `None` is the guard rather than a case that arises: a verb whose output is not a record is
+/// refused before the call is made. If one ever reaches this, the lines are printed as they are
+/// rather than folded into an object that has lost half of them.
+///
+/// The object is written out rather than collected into a `serde_json::Map`, because that map is a
+/// `BTreeMap` here and would alphabetise the keys. The surface promises them in the order the
+/// command prints them, and a reader of `--json` should meet the same order.
+fn json_report(lines: &[String]) -> Option<String> {
+    let mut pairs = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (key, value) = line.split_once(": ")?;
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            return None;
         }
-    );
+        pairs.push(format!(
+            "  {}: {}",
+            serde_json::Value::String(key.to_owned()),
+            json_value(value)
+        ));
+    }
+    Some(if pairs.is_empty() {
+        "{}".to_owned()
+    } else {
+        format!("{{\n{}\n}}", pairs.join(",\n"))
+    })
+}
+
+/// One reported value, typed.
+fn json_value(value: &str) -> serde_json::Value {
+    match value {
+        // the fork prints `-` where a field has no value, rather than an empty column
+        "-" => serde_json::Value::Null,
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        _ => match value.parse::<i64>() {
+            Ok(number) => serde_json::Value::from(number),
+            Err(_) => serde_json::Value::String(value.to_owned()),
+        },
+    }
+}
+
+/// The report the caller asked for, in the shape they asked for it.
+///
+/// A verb that reported nothing still answers `{}` under `--json`: a parser asked for an object
+/// and "there was nothing to say" is one. Without the flag it prints nothing, exactly as before.
+fn print_report(lines: &[String], output_json: bool) {
+    if !output_json {
+        lines.iter().for_each(|line| println!("{line}"));
+        return;
+    }
+    match json_report(lines) {
+        Some(json) => println!("{}", json),
+        None => {
+            eprintln!(
+                "This report is not a record, so it is printed as it stands rather than as JSON."
+            );
+            lines.iter().for_each(|line| println!("{line}"));
+        },
+    }
+}
+
 /// Asks the running session one question, on a connection opened for it and closed after it.
 ///
 /// The CLI holds a string; only the server holds the panes and the tabs. So a question that has to
@@ -940,6 +1011,155 @@ fn ask(
     };
     os_input.send_to_server(ClientToServerMsg::ClientExited);
     answer
+}
+
+/// Asks the running session which pane a handle or uuid names.
+///
+/// Asked before the real action is built - so by the time the action leaves, it names a pane id like
+/// it always did, and nothing downstream has to know a handle existed.
+///
+/// `Err` carries the server's own message, which is what the caller prints before exiting 2.
+pub fn resolve_pane_target(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    target: &str,
+) -> Result<PaneId, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ResolvePaneTarget {
+            target: target.to_owned(),
+        },
+        target,
+    )?;
+    // `pane_id: terminal_7`, the key-value shape every reporting command answers in
+    lines
+        .first()
+        .and_then(|line| line.strip_prefix("pane_id: "))
+        .ok_or_else(|| format!("Could not read the resolved pane for '{}'", target))
+        .and_then(|id| {
+            PaneId::from_str(id)
+                .map_err(|e| format!("Could not read the resolved pane for '{}': {}", target, e))
+        })
+}
+
+/// Asks the running session which tab a name or a stable id names.
+///
+/// `Ok(None)` is the miss: the session answered, and no tab is that one. Both forms are read out of
+/// the same `list-tabs` answer, so an id that no tab holds is a miss like a name that no tab has,
+/// rather than a number that quietly reaches nothing.
+pub fn resolve_tab_target(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    wanted: &str,
+) -> Result<Option<usize>, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ListTabs {
+            show_state: false,
+            show_dimensions: false,
+            show_panes: false,
+            show_layout: false,
+            show_all: false,
+            output_json: true,
+        },
+        wanted,
+    )?;
+    let tabs: Vec<zellij_utils::data::TabInfo> = serde_json::from_str(&lines.join("\n"))
+        .map_err(|e| format!("Could not read the session's tabs: {}", e))?;
+    // an all-digits value is the stable id from the TAB_ID column; anything else is a name. A tab
+    // may be *named* "3", and the id is what wins - the names are the caller's to change
+    if let Ok(id) = wanted.parse::<usize>() {
+        if tabs.iter().any(|tab| tab.tab_id == id) {
+            return Ok(Some(id));
+        }
+        return Ok(None);
+    }
+    Ok(tabs
+        .iter()
+        .find(|tab| tab.name == wanted)
+        .map(|tab| tab.tab_id))
+}
+
+/// fork: the stable id of the tab a `move-tab --to-index` without `--tab-id` moves - the tab a
+/// connected client has focused, else the first tab. `Ok(None)` is a session with no tabs.
+///
+/// Upstream's `MoveTabToPosition` names its tab, so the client asks for it here, the way
+/// `--in-tab` is asked. A detached session has no focused tab; the first one stands in for it.
+pub fn resolve_focused_tab(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+) -> Result<Option<usize>, String> {
+    let lines = ask(
+        os_input,
+        session_name,
+        Action::ListTabs {
+            show_state: false,
+            show_dimensions: false,
+            show_panes: false,
+            show_layout: false,
+            show_all: false,
+            output_json: true,
+        },
+        "the focused tab",
+    )?;
+    let tabs: Vec<zellij_utils::data::TabInfo> = serde_json::from_str(&lines.join("\n"))
+        .map_err(|e| format!("Could not read the session's tabs: {}", e))?;
+    Ok(tabs
+        .iter()
+        .find(|tab| tab.active)
+        .or_else(|| tabs.iter().min_by_key(|tab| tab.position))
+        .map(|tab| tab.tab_id))
+}
+
+/// Whether this action's answer is a report of its own, rather than "the server is free again".
+///
+/// `UnblockInputThread` is addressed to whoever is holding the input, and every route thread sends
+/// one to its own client when it finishes handling a message. For most actions that is the answer.
+/// For a blocking one it is not: the answer is the command's exit status, which arrives later as
+/// `Exit`, `Log` or `LogError`. A client that took the unblock would print nothing and exit 0 while
+/// the command it was waiting for is still running.
+///
+/// Every `NewBlockingPane` counts, condition or none: bare `-b/--blocking` waits for the pane to
+/// close rather than for a status to match, and it is no less blocking for that.
+fn action_answers_with_its_own_report(action: &Action) -> bool {
+    matches!(action, Action::NewBlockingPane { .. })
+}
+
+/// Whether this action's whole point is to make a pane, so that a report without one is a miss.
+///
+/// The pty is spawned before any tab has agreed to hold the pane, so "the action ran" and "the pane
+/// exists" are two different facts. The session reports the id only for the second, which leaves
+/// the client one thing to decide: whether an absent `pane_id:` line is an answer or a hole. For
+/// these verbs it is a hole, because the caller asked for a pane and has nothing to address.
+///
+/// `NewBlockingPane` is deliberately absent: it is answered by the command's exit status, not by an
+/// id, and it prints no `pane_id:` line even when it works. `NewTab` is absent for the same kind of
+/// reason - it is a tab that is asked for, and the pane inside it is a detail of the report.
+fn action_reports_a_new_pane(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::NewPane { .. }
+            | Action::NewTiledPane { .. }
+            | Action::NewFloatingPane { .. }
+            | Action::NewStackedPane { .. }
+            | Action::NewInPlacePane { .. }
+            | Action::NewTiledPluginPane { .. }
+            | Action::NewFloatingPluginPane { .. }
+            | Action::NewInPlacePluginPane { .. }
+            | Action::Run { .. }
+            | Action::EditFile { .. }
+    )
+}
+
+/// What came back from one action: the lines it wants printed, or the status the command ends on.
+enum ActionOutcome {
+    /// The action's report. It is returned rather than printed because `--wait-ready` still has
+    /// lines to add to it, and a report is printed once or not at all.
+    Reported(Vec<String>),
+    /// Nothing more will come: this is the exit status. Anything to say has been said on stderr.
+    Done(i32),
 }
 
     let msg = ClientToServerMsg::Action {
@@ -1008,6 +1228,348 @@ fn with_ready(mut lines: Vec<String>, ready_by: ReadyBy, waited: Duration) -> Ve
     lines.push(format!("ready_by: {}", ready_by.as_str()));
     lines.push(format!("ready_ms: {}", waited.as_millis()));
     lines
+}
+
+fn reported_pane(lines: &[String]) -> Option<PaneId> {
+    lines
+        .iter()
+        .find_map(|line| line.strip_prefix("pane_id: "))
+        .and_then(|id| PaneId::from_str(id).ok())
+}
+
+/// The prefix each raw `subscribe` line carries, and the empty string when it carries none.
+fn now_stamp(timestamps: bool) -> String {
+    if timestamps {
+        format!(
+            "{} ",
+            zellij_utils::cli::event_timestamp(std::time::SystemTime::now())
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// The same stamp, as the `ts` key of a json event. A key is added, never renamed or removed, so a
+/// reader that does not know about it is unaffected.
+fn add_timestamp(event: &mut serde_json::Value, timestamps: bool) {
+    if !timestamps {
+        return;
+    }
+    if let Some(object) = event.as_object_mut() {
+        object.insert(
+            "ts".to_owned(),
+            serde_json::Value::String(zellij_utils::cli::event_timestamp(
+                std::time::SystemTime::now(),
+            )),
+        );
+    }
+}
+
+/// How often a `--for exit` wait asks the session about its pane.
+///
+/// The render stream says when a pane *closes*, and a command pane that ends is normally *held*
+/// open instead - same event to a script, no message at all on that stream. So this one condition
+/// is a poll rather than a subscription, and the interval is what a person can tolerate as latency
+/// on a build that just finished.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What one look at the session says about the pane a `--for exit` wait is watching.
+#[derive(Debug, PartialEq, Eq)]
+enum PaneState {
+    /// Still running: nothing to report yet.
+    Running,
+    /// The command ended and the pane is still there, holding its status.
+    Exited(Option<i32>),
+    /// The pane is not in the session any more. Whatever status it had went with it.
+    Gone,
+}
+
+/// The condition a wait blocks on, as the caller spelled it.
+///
+/// The pattern arrives as text rather than as a compiled regex so that the caller does not need the
+/// regex crate to ask a question about a pane; compiling it is the first thing the wait does, and a
+/// pattern that does not compile is an error before anything is subscribed to.
+pub enum WaitCondition {
+    Exit,
+    Quiet(Duration),
+    Match(String),
+    /// The pane's shell is ready for input. The duration is the quiet window of the fallback.
+    Ready(Duration),
+    /// The coding agent in the pane stopped working (`waiting: false`), or is blocked on a
+    /// person (`waiting: true`). `quiet` is the silence that answers for an agent that reports no
+    /// state.
+    Agent {
+        waiting: bool,
+        quiet: Duration,
+    },
+}
+
+/// Reads `list-panes --json` for the one pane the wait is about.
+///
+/// A pane missing from the list is `Gone` rather than an error: a wait for an exit that ended in
+/// the pane closing got what it asked for.
+fn pane_state(panes_json: &str, pane: PaneId) -> Result<PaneState, String> {
+    pane_look(panes_json, pane).map(|(state, _)| state)
+}
+
+/// The lines of a render update that were not on screen before it.
+///
+/// Each update carries the whole viewport rather than a delta, so "what is new" has to be worked
+/// out here. Membership rather than position is what survives a scroll: a line that moved up the
+/// screen is not new, and would otherwise match again on every render.
+///
+/// The cost of that choice is that a line identical to one already on screen is not new either. A
+/// prompt printed twice looks like the same line, because on the rendered screen it is.
+fn new_lines<'a>(previous: &[String], current: &'a [String]) -> Vec<&'a str> {
+    let seen: HashSet<&str> = previous.iter().map(|line| line.as_str()).collect();
+    current
+        .iter()
+        .map(|line| line.as_str())
+        .filter(|line| !seen.contains(line))
+        .collect()
+}
+
+/// The first of these lines the pattern matches, if any.
+fn first_match<'a>(pattern: &Regex, lines: &[&'a str]) -> Option<&'a str> {
+    lines.iter().copied().find(|line| pattern.is_match(line))
+}
+
+/// The sentence a render wait prints when its deadline passes.
+///
+/// A `--for match` miss names the pattern and the two rules that make a wait miss a line the
+/// caller can see: lines already on screen when the wait began are the baseline, and a line
+/// identical to one already on screen is not new. Both read as "the regex is wrong" otherwise.
+fn timed_out_message(pane: PaneId, watching: &Watching) -> String {
+    match watching {
+        Watching::Match(pattern) => format!(
+            "The wait on {} timed out: no new line matched the regex `{}`. Only a line drawn after \
+             the wait began counts - lines already on screen do not, and neither does a line \
+             identical to one already on screen.",
+            pane,
+            pattern.as_str()
+        ),
+        Watching::Quiet(_) => format!("The wait on {} timed out.", pane),
+    }
+}
+
+/// How long is left before a deadline, or `None` once it has passed.
+fn remaining(deadline: Option<Instant>, now: Instant) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(now))
+}
+
+/// The report a met wait prints: how long it took, and what it saw.
+fn wait_report(waited: Duration, found: Option<String>) -> Vec<String> {
+    let mut lines = vec![format!("waited_ms: {}", waited.as_millis())];
+    // a wait may report several keys, one per line
+    lines.extend(
+        found
+            .iter()
+            .flat_map(|found| found.lines().map(str::to_owned)),
+    );
+    lines
+}
+
+/// Blocks until the pane meets the condition, and reports what happened.
+///
+/// `make_os_input` is a factory rather than one connection because `--for exit` asks the session
+/// the same question repeatedly, and `ask` opens and closes a connection for each question.
+///
+/// Returns the process exit status: 0 met, 2 missed - a timeout, or a pane that closed while the
+/// wait was for something else - and 1 for a call that could not be carried out at all.
+pub fn start_wait_client(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    condition: WaitCondition,
+    timeout: Option<Duration>,
+    output_json: bool,
+) -> i32 {
+    let started = Instant::now();
+    let deadline = timeout.map(|timeout| started + timeout);
+    let outcome = match condition {
+        WaitCondition::Exit => wait_for_exit(make_os_input, session_name, pane, deadline),
+        WaitCondition::Quiet(window) => wait_on_renders(
+            make_os_input(),
+            session_name,
+            pane,
+            Watching::Quiet(window),
+            deadline,
+        ),
+        WaitCondition::Match(pattern) => match Regex::new(&pattern) {
+            Ok(pattern) => wait_on_renders(
+                make_os_input(),
+                session_name,
+                pane,
+                Watching::Match(pattern),
+                deadline,
+            ),
+            Err(e) => Err(WaitMiss::Failed(format!("`--match` is not a regex: {}", e))),
+        },
+        WaitCondition::Ready(quiet) => {
+            wait_for_ready(make_os_input, session_name, pane, quiet, deadline)
+                .map(|ready_by| Some(format!("ready_by: {}", ready_by.as_str())))
+        },
+        WaitCondition::Agent { waiting, quiet } => {
+            wait_for_agent(make_os_input, session_name, pane, waiting, quiet, deadline)
+                .map(|verdict| Some(agent_report(&verdict).join("\n")))
+        },
+    };
+    match outcome {
+        Ok(found) => {
+            print_report(&wait_report(started.elapsed(), found), output_json);
+            0
+        },
+        Err(WaitMiss::Missed(message)) => {
+            eprintln!("{}", message);
+            2
+        },
+        Err(WaitMiss::Failed(message)) => {
+            eprintln!("{}", message);
+            1
+        },
+    }
+}
+
+/// A wait that ended without its condition: the sentence to print, and which exit code it is.
+enum WaitMiss {
+    Missed(String),
+    Failed(String),
+}
+
+/// `--for exit`, asked of the session rather than of the render stream.
+fn wait_for_exit(
+    make_os_input: &dyn Fn() -> Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    deadline: Option<Instant>,
+) -> Result<Option<String>, WaitMiss> {
+    loop {
+        let lines = ask(
+            make_os_input(),
+            session_name,
+            Action::ListPanes {
+                show_tab: false,
+                show_command: false,
+                show_state: false,
+                show_geometry: false,
+                show_all: true,
+                output_json: true,
+            },
+            &pane.to_string(),
+        )
+        .map_err(WaitMiss::Failed)?;
+        match pane_state(&lines.join("\n"), pane).map_err(WaitMiss::Failed)? {
+            PaneState::Running => {},
+            // a pane that closed took its status with it, and `-` is how the fork's output says a
+            // field has no value rather than a value of nothing
+            PaneState::Gone => return Ok(Some("exit_status: -".to_owned())),
+            PaneState::Exited(status) => {
+                return Ok(Some(match status {
+                    Some(status) => format!("exit_status: {}", status),
+                    None => "exit_status: -".to_owned(),
+                }))
+            },
+        }
+        match remaining(deadline, Instant::now()) {
+            Some(left) if left.is_zero() => {
+                return Err(WaitMiss::Missed(format!(
+                    "{} was still running when the wait timed out.",
+                    pane
+                )))
+            },
+            Some(left) => std::thread::sleep(EXIT_POLL_INTERVAL.min(left)),
+            None => std::thread::sleep(EXIT_POLL_INTERVAL),
+        }
+    }
+}
+
+/// `--for quiet` and `--for match`, both of which are questions about output as it arrives.
+///
+/// The render stream is read on a thread so that the deadline is still reachable while nothing is
+/// arriving - `recv_from_server` blocks, and a pane that fell silent is exactly the case where it
+/// blocks longest.
+/// The two conditions the render stream can answer, ready to be tested.
+enum Watching {
+    Quiet(Duration),
+    Match(Regex),
+}
+
+fn wait_on_renders(
+    os_input: Box<dyn ClientOsApi>,
+    session_name: &str,
+    pane: PaneId,
+    watching: Watching,
+    deadline: Option<Instant>,
+) -> Result<Option<String>, WaitMiss> {
+    let updates = subscribe_to_renders(&*os_input, session_name, pane)?;
+
+    // the viewport as it stood at the last update: the baseline new lines are measured against
+    let mut on_screen: Vec<String> = Vec::new();
+    // a pane that has said nothing yet is not quiet - it has not been watched long enough to know
+    let mut last_output = Instant::now();
+    let answer = loop {
+        let quiet_deadline = match watching {
+            Watching::Quiet(window) => Some(last_output + window),
+            _ => None,
+        };
+        let next = match (deadline, quiet_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let waited = match next {
+            Some(next) => updates.recv_timeout(next.saturating_duration_since(Instant::now())),
+            None => updates.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match waited {
+            Ok(ServerToClientMsg::PaneRenderUpdate {
+                viewport,
+                is_initial,
+                ..
+            }) => {
+                if !is_initial {
+                    if let Watching::Match(ref pattern) = watching {
+                        if let Some(line) = first_match(pattern, &new_lines(&on_screen, &viewport))
+                        {
+                            break Ok(Some(format!("matched: {}", line)));
+                        }
+                    }
+                }
+                last_output = Instant::now();
+                on_screen = viewport;
+            },
+            Ok(ServerToClientMsg::SubscribedPaneClosed { .. }) => {
+                break Err(WaitMiss::Missed(format!(
+                    "{} closed before the wait was satisfied.",
+                    pane
+                )))
+            },
+            Ok(ServerToClientMsg::LogError { lines }) => {
+                break Err(WaitMiss::Failed(lines.join("\n")))
+            },
+            Ok(ServerToClientMsg::Exit { .. }) => {
+                break Err(WaitMiss::Missed(
+                    "The session exited before the wait was satisfied.".to_owned(),
+                ))
+            },
+            Ok(_) => {},
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(WaitMiss::Failed(
+                    "The session stopped answering while the wait was running.".to_owned(),
+                ))
+            },
+            // the only timer that can be the one that fired, when the overall deadline has not
+            // arrived, is the quiet window
+            Err(RecvTimeoutError::Timeout) => {
+                let timed_out = remaining(deadline, Instant::now()) == Some(Duration::ZERO);
+                if timed_out {
+                    break Err(WaitMiss::Missed(timed_out_message(pane, &watching)));
+                }
+                break Ok(None);
+            },
+        }
+    };
+    os_input.send_to_server(ClientToServerMsg::ClientExited);
+    answer
 }
 
 /// Which signal said a pane was ready for input.
@@ -1215,6 +1777,16 @@ fn subscribe_to_renders(
     Ok(updates)
 }
 
+/// The session's socket, which every client here opens the same way.
+fn socket_for(session_name: &str) -> Result<PathBuf, String> {
+    let mut sock_dir = zellij_utils::consts::ZELLIJ_SOCK_DIR.clone();
+    fs::create_dir_all(&sock_dir).map_err(|e| e.to_string())?;
+    zellij_utils::shared::set_permissions(&sock_dir, 0o700).map_err(|e| e.to_string())?;
+    sock_dir.push(zellij_utils::sessions::session_id_for(session_name));
+    crate::check_ipc_pipe_length(&sock_dir);
+    Ok(sock_dir)
+}
+
         process::exit(1);
     }
 
@@ -1256,24 +1828,28 @@ fn subscribe_to_renders(
                 _,
             )) => match subscribe_cli.format {
                 SubscribeFormat::Raw => {
+                    // one stamp for the whole update: these lines are printed in one go, and a
+                    // stamp that crept forward between them would be describing something else
+                    let stamp = now_stamp(subscribe_cli.timestamps);
                     if let Some(ref scrollback_lines) = scrollback {
                         for line in scrollback_lines {
-                            let _ = writeln!(stdout, "{}", line);
+                            let _ = writeln!(stdout, "{}{}", stamp, line);
                         }
                     }
                     for line in &viewport {
-                        let _ = writeln!(stdout, "{}", line);
+                        let _ = writeln!(stdout, "{}{}", stamp, line);
                     }
                     let _ = stdout.flush();
                 },
                 SubscribeFormat::Json => {
-                    let json = serde_json::json!({
+                    let mut json = serde_json::json!({
                         "event": "pane_update",
                         "pane_id": pane_id.to_string(),
                         "viewport": viewport,
                         "scrollback": scrollback,
                         "is_initial": is_initial,
                     });
+                    add_timestamp(&mut json, subscribe_cli.timestamps);
                     let _ = writeln!(stdout, "{}", json);
                     let _ = stdout.flush();
                 },
@@ -1283,10 +1859,11 @@ fn subscribe_to_renders(
                 match subscribe_cli.format {
                     SubscribeFormat::Raw => {},
                     SubscribeFormat::Json => {
-                        let json = serde_json::json!({
+                        let mut json = serde_json::json!({
                             "event": "pane_closed",
                             "pane_id": pane_id.to_string(),
                         });
+                        add_timestamp(&mut json, subscribe_cli.timestamps);
                         let _ = writeln!(stdout, "{}", json);
                         let _ = stdout.flush();
                     },
@@ -1309,3 +1886,895 @@ fn subscribe_to_renders(
 
     os_input.send_to_server(ClientToServerMsg::ClientExited);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zellij_utils::data::{NewPanePlacement, UnblockCondition};
+
+    #[test]
+    fn whoami_names_the_caller_and_excludes_it_from_other_agents() {
+        let mut panes: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (7, false, false, None),
+            (8, false, false, None),
+        ]))
+        .unwrap();
+        for (index, pane) in panes.iter_mut().enumerate() {
+            pane.agent = Some(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "claude", "name": format!("project-{}", index), "source": "command"
+                }))
+                .unwrap(),
+            );
+            pane.pane_info.handle = format!("pane-{}", index);
+            pane.tab_name = "coding".into();
+        }
+        let report = whoami_report("scratch", "test-host", &panes[0], &panes);
+        assert_eq!(report["name"], "project-0");
+        assert_eq!(report["pane_id"], "terminal_7");
+        assert_eq!(report["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(report["agents"][0]["name"], "project-1");
+        let text = whoami_text(&report);
+        assert!(text.ends_with("type into its pane only when it has no messaging."));
+        panes[0].agent.as_mut().unwrap().name = None;
+        assert!(whoami_report("scratch", "test-host", &panes[0], &panes)["name"].is_null());
+    }
+
+    fn blocking_pane(unblock_condition: Option<UnblockCondition>) -> Action {
+        Action::NewBlockingPane {
+            placement: NewPanePlacement::default(),
+            pane_name: None,
+            command: None,
+            unblock_condition,
+            near_current_pane: false,
+            no_focus: false,
+            tab_id: None,
+        }
+    }
+
+    #[test]
+    fn a_payload_on_the_command_line_is_the_whole_pipe() {
+        // the bug: a payload was sent, answered, and then the pipe read the stdin it had inherited
+        // - which for a command run over ssh, or a child of a long-lived server, is a handle that
+        // never reaches EOF and is not covered by `--timeout`
+        assert!(
+            !pipe_reads_stdin(true, true),
+            "a command-line payload ends the pipe even when stdin is not a terminal"
+        );
+        // `echo data | zellij pipe --name n` is still the streaming pipe it always was
+        assert!(
+            pipe_reads_stdin(true, false),
+            "a pipe with no payload of its own reads the stream it was given"
+        );
+        // a terminal is a person, not data
+        assert!(!pipe_reads_stdin(false, false));
+        assert!(!pipe_reads_stdin(false, true));
+    }
+
+    #[test]
+    fn a_pipe_that_ran_out_of_time_says_which_door_it_came_through() {
+        // exit 2 is shared by every kind of "nothing happened", so the sentence is what a caller
+        // reads to tell a timed-out pipe from a session that is not there
+        let said = pipe_timed_out("logs", Duration::from_secs(5));
+        assert!(said.contains("'logs'"), "{said}");
+        assert!(said.contains("5s"), "{said}");
+        assert!(
+            said.contains("unblocked by a plugin"),
+            "the sentence says why a pipe goes unanswered: {said}"
+        );
+    }
+
+    #[test]
+    fn a_record_report_becomes_one_object_with_its_values_typed() {
+        let report = vec![
+            "tab_id: 4".to_owned(),
+            "pane_id: terminal_9".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(
+            json_report(&report).unwrap(),
+            "{\n  \"tab_id\": 4,\n  \"pane_id\": \"terminal_9\",\n  \"handle\": \"sunny-otter\"\n}",
+            "the keys are the report's own, and a tab id is a number the way list-tabs --json \
+             reports one"
+        );
+        // a verb that reported nothing still answers an object: a parser asked for one
+        assert_eq!(json_report(&[]).unwrap(), "{}");
+    }
+
+    #[test]
+    fn the_values_a_report_can_carry_are_typed_the_way_the_other_json_surfaces_type_them() {
+        assert_eq!(
+            json_value("-"),
+            serde_json::Value::Null,
+            "the no-value mark"
+        );
+        assert_eq!(json_value("true"), serde_json::Value::Bool(true));
+        assert_eq!(json_value("false"), serde_json::Value::Bool(false));
+        assert_eq!(json_value("0"), serde_json::Value::from(0));
+        assert_eq!(json_value("-3"), serde_json::Value::from(-3));
+        // a pane id is a string in list-panes --json and stays one here, and so does a handle that
+        // happens to look like nothing else
+        assert_eq!(
+            json_value("terminal_9"),
+            serde_json::Value::String("terminal_9".to_owned())
+        );
+    }
+
+    #[test]
+    fn lines_that_are_not_a_record_are_not_folded_into_an_object() {
+        // the guard, not a case that arises: a payload verb is refused before the call is made.
+        // Folding these would silently lose the lines that carry no key
+        assert_eq!(json_report(&["some screen content".to_owned()]), None);
+        assert_eq!(json_report(&["Tab #1: hello".to_owned()]), None);
+    }
+
+    #[test]
+    fn a_dropped_connection_is_not_an_empty_report() {
+        // the session drops a `zellij action` connection for reasons that say nothing about the
+        // command: client ids are reused, so the departure of the connection before this one can
+        // take this one's sender with it. Reading the disconnect as "the session reported nothing"
+        // is what made `new-pane` print a miss for a pane that had been made
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::Disconnect);
+        assert!(
+            matches!(outcome, ActionOutcome::Done(1)),
+            "a disconnect is a failed call, not a report with nothing in it"
+        );
+        assert!(
+            diagnostic.is_some_and(|line| line.contains("dropped this connection")),
+            "and it says so, rather than leaving the caller to read an empty report"
+        );
+
+        // the controls: the other reasons keep their meanings
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::Error("boom".to_owned()));
+        assert!(matches!(outcome, ActionOutcome::Done(2)));
+        assert_eq!(diagnostic.as_deref(), Some("boom"));
+
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::CustomExitStatus(7));
+        assert!(matches!(outcome, ActionOutcome::Done(7)));
+        assert_eq!(diagnostic, None);
+
+        // an ordinary end of the session IS a report with nothing in it, and stays one
+        let (outcome, diagnostic) = outcome_of_exit(ExitReason::Normal);
+        assert!(
+            matches!(&outcome, ActionOutcome::Reported(lines) if lines.is_empty()),
+            "an ordinary exit still means the command reported nothing"
+        );
+        assert_eq!(diagnostic, None);
+    }
+
+    #[test]
+    fn a_verb_that_makes_a_pane_owes_the_caller_one() {
+        // the pair this rests on: these verbs answer with a pane, so a report without one is a
+        // miss and gets a non-zero exit instead of a printed id that reaches nothing
+        for action in [
+            Action::NewTiledPane {
+                direction: None,
+                command: None,
+                pane_name: None,
+                near_current_pane: false,
+                no_focus: false,
+                tab_id: None,
+                borderless: None,
+                border_style: None,
+            },
+            Action::Run {
+                command: Default::default(),
+                near_current_pane: false,
+                no_focus: false,
+            },
+        ] {
+            assert!(
+                action_reports_a_new_pane(&action),
+                "{:?} makes a pane and was not held to reporting one",
+                action
+            );
+        }
+        // the negative control, and the reason the rule is a list rather than "anything that
+        // creates something": a blocking pane is answered by its command's exit status and prints
+        // no `pane_id:` line even when it worked
+        assert!(
+            !action_reports_a_new_pane(&blocking_pane(None)),
+            "a blocking pane was held to a report it never prints"
+        );
+        assert!(
+            !action_reports_a_new_pane(&Action::ClosePluginPane { pane_id: 3 }),
+            "a verb that makes no pane was held to reporting one"
+        );
+    }
+
+    #[test]
+    fn the_pane_a_report_names_is_the_one_that_gets_the_handle() {
+        let reported = vec![
+            "tab_id: 4".to_owned(),
+            "pane_id: plugin_2".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(reported_pane(&reported), Some(PaneId::Plugin(2)));
+        // the negative control: a report with no pane in it names none
+        assert_eq!(reported_pane(&["tab_id: 4".to_owned()]), None);
+    }
+
+    #[test]
+    fn a_stamped_line_carries_the_time_and_a_bare_one_carries_nothing() {
+        let stamp = now_stamp(true);
+        assert!(
+            stamp.ends_with(' '),
+            "the prefix separates itself: {stamp:?}"
+        );
+        assert!(stamp.trim_end().ends_with('Z'), "utc: {stamp:?}");
+        assert_eq!(stamp.trim_end().len(), "2026-08-14T18:03:12.345Z".len());
+        // the negative control: without the flag the line is exactly what it was before
+        assert_eq!(now_stamp(false), "");
+    }
+
+    #[test]
+    fn a_json_event_gains_a_ts_key_only_when_it_was_asked_for() {
+        let mut event = serde_json::json!({"event": "pane_closed"});
+        add_timestamp(&mut event, false);
+        assert!(event.get("ts").is_none());
+        add_timestamp(&mut event, true);
+        assert!(event["ts"].as_str().unwrap().ends_with('Z'), "{event}");
+        // the rest of the object is untouched
+        assert_eq!(event["event"], "pane_closed");
+    }
+
+    #[test]
+    fn a_bare_blocking_pane_still_waits_for_its_own_report() {
+        // `-b/--blocking` sets no unblock condition: it waits for the pane to close rather than for
+        // a status to match. Reading an `UnblockInputThread` as its answer would print nothing and
+        // exit 0 while the command is still running
+        assert!(action_answers_with_its_own_report(&blocking_pane(None)));
+    }
+
+    #[test]
+    fn a_conditional_blocking_pane_waits_for_its_own_report() {
+        assert!(action_answers_with_its_own_report(&blocking_pane(Some(
+            UnblockCondition::OnAnyExit
+        ))));
+    }
+
+    /// A `list-panes --json` answer, built from the structs the server serializes rather than
+    /// written out by hand: a field added to `PaneInfo` must not break a test about exit status.
+    fn panes_json(entries: &[(u32, bool, bool, Option<i32>)]) -> String {
+        let entries: Vec<PaneListEntry> = entries
+            .iter()
+            .map(|(id, is_plugin, exited, exit_status)| PaneListEntry {
+                pane_info: zellij_utils::data::PaneInfo {
+                    id: *id,
+                    is_plugin: *is_plugin,
+                    exited: *exited,
+                    exit_status: *exit_status,
+                    ..Default::default()
+                },
+                tab_position: 0,
+                tab_name: "tab".to_owned(),
+                agent: None,
+                command_state: None,
+                last_command_exit_code: None,
+                program_status: None,
+                input_since_prompt: false,
+                input_since_state: false,
+                prefilled_command: None,
+                queued_messages: 0,
+            })
+            .collect();
+        serde_json::to_string(&entries).unwrap()
+    }
+
+    #[test]
+    fn a_wait_for_exit_reads_the_pane_it_was_asked_about() {
+        let panes = panes_json(&[(1, false, false, None), (2, false, true, Some(7))]);
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(1)).unwrap(),
+            PaneState::Running
+        );
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(2)).unwrap(),
+            PaneState::Exited(Some(7))
+        );
+        // a pane that is not in the list is gone, which is an exit the wait was asking about and
+        // not an error
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(9)).unwrap(),
+            PaneState::Gone
+        );
+        // the id spaces do not run together: plugin_1 is not terminal_1
+        assert_eq!(
+            pane_state(&panes, PaneId::Plugin(1)).unwrap(),
+            PaneState::Gone
+        );
+    }
+
+    #[test]
+    fn a_pane_that_exited_without_a_status_says_so_rather_than_inventing_one() {
+        let panes = panes_json(&[(3, false, true, None)]);
+        assert_eq!(
+            pane_state(&panes, PaneId::Terminal(3)).unwrap(),
+            PaneState::Exited(None)
+        );
+        // the negative control: an answer that is not a pane list is an error, not "gone"
+        assert!(pane_state("not json", PaneId::Terminal(3)).is_err());
+    }
+
+    #[test]
+    fn only_a_line_that_was_not_on_screen_is_new() {
+        let before = vec!["building".to_owned(), "linking".to_owned()];
+        let after = vec!["linking".to_owned(), "done".to_owned()];
+        assert_eq!(new_lines(&before, &after), vec!["done"]);
+        // a viewport that scrolled carries the same lines at different rows, and none of them is
+        // new - position would have said all of them were
+        let scrolled = vec!["linking".to_owned(), "building".to_owned()];
+        assert!(new_lines(&before, &scrolled).is_empty());
+        // the negative control: nothing changed, nothing is new
+        assert!(new_lines(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn a_match_is_tested_against_one_delivered_line_at_a_time() {
+        let pattern = Regex::new("test result:").unwrap();
+        assert_eq!(
+            first_match(&pattern, &["ok", "test result: ok. 12 passed"]),
+            Some("test result: ok. 12 passed")
+        );
+        // the negative control, and the limitation worth knowing: the terminal wrapped this line,
+        // so the two halves arrive as two lines and a pattern spanning the wrap matches neither
+        assert_eq!(first_match(&pattern, &["test resu", "lt: ok"]), None);
+    }
+
+    #[test]
+    fn a_match_pattern_is_a_regex_anchored_to_the_line() {
+        // a regex, not a substring: anchors and classes work against each delivered line
+        let pattern = Regex::new("^round-7[0-9]-x$").unwrap();
+        assert_eq!(
+            first_match(&pattern, &["$ echo round", "round-77-x"]),
+            Some("round-77-x")
+        );
+        // the negative control: the anchor holds, so the line that merely contains it misses
+        assert_eq!(first_match(&pattern, &["$ echo round-77-x"]), None);
+    }
+
+    #[test]
+    fn a_line_already_on_screen_never_matches_again() {
+        // the baseline: the same output printed a second time is not a new line, so a wait for
+        // it misses even though the regex matches it
+        let pattern = Regex::new("^round-77-x$").unwrap();
+        let before = vec!["round-77-x".to_owned(), "$".to_owned()];
+        let after = vec![
+            "round-77-x".to_owned(),
+            "$ echo again".to_owned(),
+            "round-77-x".to_owned(),
+        ];
+        assert_eq!(first_match(&pattern, &new_lines(&before, &after)), None);
+        // the negative control: output that differs is new, and matches
+        let other = Regex::new("^round-77-y$").unwrap();
+        let fresh = vec!["round-77-x".to_owned(), "round-77-y".to_owned()];
+        assert_eq!(
+            first_match(&other, &new_lines(&before, &fresh)),
+            Some("round-77-y")
+        );
+    }
+
+    #[test]
+    fn a_match_that_times_out_says_why_it_may_have_missed() {
+        let pane = PaneId::Terminal(3);
+        let message = timed_out_message(pane, &Watching::Match(Regex::new("^done$").unwrap()));
+        assert!(message.contains("`^done$`"), "{}", message);
+        assert!(message.contains("already on screen"), "{}", message);
+        assert!(message.contains("identical"), "{}", message);
+        // the negative control: a quiet wait has no pattern to explain
+        assert_eq!(
+            timed_out_message(pane, &Watching::Quiet(Duration::from_millis(500))),
+            "The wait on terminal_3 timed out."
+        );
+    }
+
+    #[test]
+    fn a_wait_reports_how_long_it_waited_and_what_it_saw() {
+        assert_eq!(
+            wait_report(
+                Duration::from_millis(1500),
+                Some("exit_status: 0".to_owned())
+            ),
+            vec!["waited_ms: 1500".to_owned(), "exit_status: 0".to_owned()]
+        );
+        // `--for quiet` has nothing to show but the wait itself
+        assert_eq!(
+            wait_report(Duration::from_millis(80), None),
+            vec!["waited_ms: 80".to_owned()]
+        );
+    }
+
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_ready_wait_reads_the_shells_own_word_from_the_pane_list() {
+        let mut entries: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (1, false, false, None),
+            (2, false, false, None),
+        ]))
+        .unwrap();
+        entries[0].command_state = Some(PaneCommandState::Prompt);
+        let panes = serde_json::to_string(&entries).unwrap();
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(1)).unwrap(),
+            (PaneState::Running, Some(PaneCommandState::Prompt))
+        );
+        // a shell that writes no markers has no state, which is not the same answer as idle
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(2)).unwrap(),
+            (PaneState::Running, None)
+        );
+        assert_eq!(
+            pane_look(&panes, PaneId::Terminal(9)).unwrap(),
+            (PaneState::Gone, None)
+        );
+    }
+
+    /// The race a caller that types and then waits runs into: the command is typed, and until the
+    /// shell's preexec hook writes the output marker the last marker is still the prompt drawn
+    /// BEFORE the typing. That prompt is not ready, and neither is the quiet after it; the prompt
+    /// the shell draws after the command is.
+    #[test]
+    fn a_prompt_drawn_before_the_last_input_is_not_ready() {
+        let mut entries: Vec<PaneListEntry> =
+            serde_json::from_str(&panes_json(&[(1, false, false, None)])).unwrap();
+        entries[0].command_state = Some(PaneCommandState::Prompt);
+        entries[0].input_since_prompt = true;
+        let typed = serde_json::to_string(&entries).unwrap();
+        assert!(typed.contains("\"input_since_prompt\":true"));
+        let (state, command_state) = pane_look(&typed, PaneId::Terminal(1)).unwrap();
+        assert_eq!(
+            (state, command_state),
+            (PaneState::Running, Some(PaneCommandState::Running))
+        );
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        watch.rendered(&screen(&["user@host ~ % ls"]), start);
+        assert_eq!(
+            watch.judge(command_state, start + Duration::from_secs(5)),
+            None
+        );
+
+        // the command ran and the shell drew its next prompt: nothing typed since
+        entries[0].input_since_prompt = false;
+        let fresh = serde_json::to_string(&entries).unwrap();
+        // written only when true, so a row with nothing typed reads as it always did
+        assert!(!fresh.contains("input_since_prompt"));
+        let (_, command_state) = pane_look(&fresh, PaneId::Terminal(1)).unwrap();
+        assert_eq!(watch.judge(command_state, start), Some(ReadyBy::Prompt));
+    }
+
+    #[test]
+    fn a_prompt_is_ready_at_once_and_says_so() {
+        let watch = ReadyWatch::new(Duration::from_millis(300));
+        let now = Instant::now();
+        // no output has been seen and no window has passed: the shell's word is enough
+        assert_eq!(
+            watch.judge(Some(PaneCommandState::Prompt), now),
+            Some(ReadyBy::Prompt)
+        );
+        assert_eq!(ReadyBy::Prompt.as_str(), "prompt");
+        assert_eq!(ReadyBy::Quiet.as_str(), "quiet");
+    }
+
+    #[test]
+    fn output_then_quiet_is_ready_for_a_shell_without_markers() {
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        // the blank screen a new pane starts with is not output, so no window opens
+        watch.rendered(&screen(&["", "   "]), start);
+        assert_eq!(watch.quiet_at(), None);
+        assert_eq!(watch.judge(None, start + Duration::from_secs(5)), None);
+        // the prompt is drawn
+        let drawn = start + Duration::from_millis(100);
+        watch.rendered(&screen(&["user@host ~ %", ""]), drawn);
+        assert_eq!(watch.judge(None, drawn + quiet / 2), None);
+        // more drawing moves the window on
+        let redrawn = drawn + Duration::from_millis(200);
+        watch.rendered(&screen(&["user@host ~ %", ""]), redrawn);
+        assert_eq!(watch.judge(None, drawn + quiet), None);
+        assert_eq!(watch.judge(None, redrawn + quiet), Some(ReadyBy::Quiet));
+        // `done` - an end marker with no prompt after it - leaves the fallback in play
+        assert_eq!(
+            watch.judge(Some(PaneCommandState::Done), redrawn + quiet),
+            Some(ReadyBy::Quiet)
+        );
+    }
+
+    #[test]
+    fn a_running_command_is_not_ready_however_quiet_it_is() {
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        watch.rendered(&screen(&["$ cargo build", "   Compiling zellij"]), start);
+        assert_eq!(
+            watch.judge(
+                Some(PaneCommandState::Running),
+                start + Duration::from_secs(60)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_shell_whose_markers_a_clear_wiped_is_judged_by_the_fallback() {
+        // a clear resets the pane's markers, so a shell that writes them reads as having none until
+        // its next prompt. The wait neither latches "this shell has markers" and hangs, nor reads
+        // the gap as a prompt
+        let quiet = Duration::from_millis(300);
+        let mut watch = ReadyWatch::new(quiet);
+        let start = Instant::now();
+        assert_eq!(watch.judge(Some(PaneCommandState::Running), start), None);
+        let cleared = start + Duration::from_millis(50);
+        watch.rendered(&screen(&["", ""]), cleared);
+        assert_eq!(watch.judge(None, cleared + quiet), None);
+        let redrawn = cleared + Duration::from_millis(10);
+        watch.rendered(&screen(&["user@host ~ %"]), redrawn);
+        assert_eq!(watch.judge(None, redrawn + quiet), Some(ReadyBy::Quiet));
+        // and the prompt marker, when it comes, still wins at once
+        assert_eq!(
+            watch.judge(Some(PaneCommandState::Prompt), redrawn),
+            Some(ReadyBy::Prompt)
+        );
+    }
+
+    #[test]
+    fn a_wait_for_ready_reports_which_signal_fired() {
+        assert_eq!(
+            wait_report(
+                Duration::from_millis(412),
+                Some(format!("ready_by: {}", ReadyBy::Quiet.as_str()))
+            ),
+            vec!["waited_ms: 412".to_owned(), "ready_by: quiet".to_owned()]
+        );
+        let promised = zellij_utils::cli_surface::promised_output_keys("action wait").unwrap();
+        assert!(promised.split_whitespace().any(|key| key == "ready_by"));
+    }
+
+    #[test]
+    fn a_creation_that_waited_for_ready_says_how_and_how_long() {
+        let report = vec![
+            "pane_id: terminal_4".to_owned(),
+            "handle: sunny-otter".to_owned(),
+        ];
+        assert_eq!(
+            with_ready(report.clone(), ReadyBy::Prompt, Duration::from_millis(187)),
+            vec![
+                "pane_id: terminal_4".to_owned(),
+                "handle: sunny-otter".to_owned(),
+                "ready_by: prompt".to_owned(),
+                "ready_ms: 187".to_owned(),
+            ]
+        );
+        // the pane the wait is about is still the one the report names
+        assert_eq!(reported_pane(&report), Some(PaneId::Terminal(4)));
+        // and every line it adds is one the surface map promises for each creating verb
+        for command in ["action new-pane", "action edit", "action new-tab"] {
+            let promised = zellij_utils::cli_surface::promised_output_keys(command).unwrap();
+            for key in ["ready_by", "ready_ms"] {
+                assert!(
+                    promised.split_whitespace().any(|promised| promised == key),
+                    "{} does not promise {}",
+                    command,
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wait_with_no_timeout_never_runs_out_of_time() {
+        let now = Instant::now();
+        // `--timeout 0` carries no deadline, and no amount of elapsed time turns into one
+        assert_eq!(remaining(None, now), None);
+        assert_eq!(
+            remaining(Some(now - Duration::from_secs(1)), now),
+            Some(Duration::ZERO),
+            "a deadline that has passed has nothing left, rather than wrapping"
+        );
+        assert_eq!(
+            remaining(Some(now + Duration::from_secs(5)), now),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn an_ordinary_action_is_answered_by_the_unblock() {
+        // the negative control: everything that is not a blocking pane is done when the server says
+        // the input is free again, and must not be left waiting for a report that never comes
+        assert!(!action_answers_with_its_own_report(
+            &Action::ToggleFloatingPanes
+        ));
+    }
+
+    fn status(state: &str, kind: Option<&str>) -> PaneProgramStatus {
+        PaneProgramStatus {
+            state: state.to_owned(),
+            kind: kind.map(str::to_owned),
+            app: Some("claude-code".to_owned()),
+            title: None,
+            msg: kind.map(|_| "Allow Bash: cargo test?\nreally".to_owned()),
+            progress: None,
+            at: 1,
+            working: 0,
+        }
+    }
+
+    fn agent(state: Option<PaneProgramStatus>, stale: bool) -> AgentLook {
+        AgentLook { state, stale }
+    }
+
+    /// The trap this wait exists to avoid: a message is typed into an agent that said `done`, and
+    /// the pane still holds that `done` until the agent says `working`. It is the turn before.
+    #[test]
+    fn a_state_reported_before_the_last_input_does_not_answer() {
+        let watch = AgentWatch::new(false, Duration::from_millis(3000));
+        let start = Instant::now();
+        let later = start + Duration::from_secs(60);
+        assert_eq!(
+            watch.judge(&agent(Some(status("done", None)), true), later),
+            Ok(None)
+        );
+        assert_eq!(
+            watch.judge(&agent(Some(status("working", None)), false), later),
+            Ok(None)
+        );
+        assert_eq!(
+            watch.judge(&agent(Some(status("done", None)), false), start),
+            Ok(Some(AgentVerdict::State(status("done", None))))
+        );
+    }
+
+    #[test]
+    fn idle_is_any_stop_and_waiting_is_only_a_block() {
+        let idle = AgentWatch::new(false, Duration::from_millis(3000));
+        let waiting = AgentWatch::new(true, Duration::from_millis(3000));
+        let now = Instant::now();
+        for state in ["idle", "done", "error"] {
+            assert!(matches!(
+                idle.judge(&agent(Some(status(state, None)), false), now),
+                Ok(Some(AgentVerdict::State(_)))
+            ));
+            // an agent that finished without asking will not ask now: a miss, not a hang
+            let miss = waiting
+                .judge(&agent(Some(status(state, None)), false), now)
+                .unwrap_err();
+            assert!(miss.contains("without asking"), "{miss}");
+        }
+        let blocked = status("blocked", Some("permission"));
+        for watch in [&idle, &waiting] {
+            assert_eq!(
+                watch.judge(&agent(Some(blocked.clone()), false), now),
+                Ok(Some(AgentVerdict::State(blocked.clone())))
+            );
+        }
+        assert_eq!(
+            agent_report(&AgentVerdict::State(blocked)),
+            vec![
+                "idle_by: state",
+                "state: blocked",
+                "state_kind: permission",
+                "state_msg: Allow Bash: cargo test? really",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_state_is_judged_by_silence_and_cannot_be_waited_on_for_a_block() {
+        let quiet = Duration::from_millis(3000);
+        let mut idle = AgentWatch::new(false, quiet);
+        let mut waiting = AgentWatch::new(true, quiet);
+        let start = Instant::now();
+        let none = agent(None, false);
+        // nothing drawn yet: not started, so not quiet
+        assert_eq!(idle.judge(&none, start + quiet * 2), Ok(None));
+        idle.rendered(&screen(&["> working..."]), start);
+        waiting.rendered(&screen(&["> working..."]), start);
+        assert_eq!(idle.judge(&none, start + quiet / 2), Ok(None));
+        assert_eq!(waiting.judge(&none, start + quiet / 2), Ok(None));
+        assert_eq!(
+            idle.judge(&none, start + quiet),
+            Ok(Some(AgentVerdict::Quiet))
+        );
+        assert_eq!(agent_report(&AgentVerdict::Quiet), vec!["idle_by: quiet"]);
+        let miss = waiting.judge(&none, start + quiet).unwrap_err();
+        assert!(miss.contains("reports no agent state"), "{miss}");
+    }
+
+    #[test]
+    fn the_agent_wait_reads_the_state_and_whether_it_is_stale_off_the_row() {
+        let mut entries: Vec<PaneListEntry> = serde_json::from_str(&panes_json(&[
+            (1, false, false, None),
+            (2, false, true, Some(0)),
+        ]))
+        .unwrap();
+        entries[0].program_status = Some(status("done", None));
+        entries[0].input_since_state = true;
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("\"input_since_state\":true"));
+        assert_eq!(
+            agent_look(&json, PaneId::Terminal(1)).unwrap(),
+            (PaneState::Running, agent(Some(status("done", None)), true))
+        );
+        assert_eq!(
+            agent_look(&json, PaneId::Terminal(2)).unwrap().0,
+            PaneState::Exited(Some(0))
+        );
+        assert_eq!(
+            agent_look(&json, PaneId::Terminal(9)).unwrap().0,
+            PaneState::Gone
+        );
+        entries[0].input_since_state = false;
+        // written only when true, so a row nobody typed into reads as it always did
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("input_since_state"));
+    }
+
+    fn agent_row(
+        pane_id: u32,
+        kind: &str,
+        agent_id: Option<&str>,
+    ) -> zellij_utils::data::AgentListEntry {
+        zellij_utils::data::AgentListEntry {
+            is_self: false,
+            handle: format!("pane-{}", pane_id),
+            pane_id,
+            tab_id: 0,
+            tab_position: 0,
+            tab_name: "t".to_owned(),
+            title: String::new(),
+            agent: agent_detect::PaneAgent {
+                kind: kind.to_owned(),
+                name: None,
+                agent_id: agent_id.map(str::to_owned),
+                source: "command".to_owned(),
+                session_source: None,
+            },
+            command: None,
+            cwd: None,
+            pid: None,
+            program_status: None,
+            session: None,
+            last_output_at: None,
+            queued_messages: 0,
+        }
+    }
+
+    #[test]
+    fn agent_change_held_exit_needs_no_final_osc_state() {
+        let mut entries: Vec<PaneListEntry> =
+            serde_json::from_str(&panes_json(&[(1, false, false, None)])).unwrap();
+        entries[0].agent =
+            Some(agent_detect::detect_command_line("claude", &BTreeMap::new()).unwrap());
+        let previous = active_agents(entries.clone());
+        assert_eq!(previous.len(), 1);
+        entries[0].pane_info.is_held = true;
+        let current = active_agents(entries);
+        assert!(current.is_empty());
+        assert_eq!(
+            agent_detect::agent_changes(&previous, &current)[0].event,
+            "gone"
+        );
+    }
+
+    #[test]
+    fn agent_change_timeout_bounds_a_snapshot_that_never_answers() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        assert!(agent_snapshot_answer(receiver, Some(Instant::now()))
+            .unwrap_err()
+            .contains("timed out"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(7).unwrap();
+        assert_eq!(agent_snapshot_answer(receiver, None), Ok(7));
+    }
+
+    #[test]
+    fn agent_change_reply_uses_the_changed_session_and_only_a_finished_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-src");
+        std::fs::create_dir_all(&project).unwrap();
+        for (id, reply) in [("s1", "wrong"), ("s2", "hello\nsecond line")] {
+            let text = serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": reply}]}});
+            std::fs::write(project.join(format!("{id}.jsonl")), text.to_string()).unwrap();
+        }
+        let mut first = agent_row(1, "claude", Some("s1"));
+        first.session = Some("first".into());
+        let mut old = agent_row(1, "claude", Some("s2"));
+        old.session = Some("second".into());
+        old.program_status = Some(status("working", None));
+        let mut new = old.clone();
+        new.program_status = Some(status("done", None));
+        let agents = vec![first, new.clone()];
+        let mut change = agent_detect::agent_changes(&[old], &[new.clone()]).remove(0);
+        enrich_agent_change_from(&mut change, &agents, &|_| None, Some(dir.path()));
+        assert_eq!(change.last_reply.as_deref(), Some("hello"));
+        let mut renamed = new.clone();
+        renamed.agent.name = Some("child".into());
+        let mut change = agent_detect::agent_changes(&[new], &[renamed]).remove(0);
+        enrich_agent_change_from(&mut change, &agents, &|_| None, Some(dir.path()));
+        assert_eq!(change.last_reply, None);
+    }
+
+    #[test]
+    fn a_last_reply_is_read_from_the_transcript_of_the_panes_own_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let project = home.join(".claude/projects/-src");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("s1.jsonl"),
+            "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n\
+             {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        let agents = vec![
+            agent_row(1, "claude", Some("s1")),
+            agent_row(2, "opencode", Some("s2")),
+            agent_row(3, "claude", None),
+            agent_row(4, "claude", Some("gone")),
+        ];
+        let found = last_reply_of(&agents, PaneId::Terminal(1), &none, Some(home)).unwrap();
+        assert_eq!(
+            (found.reply.as_str(), found.handle.as_str()),
+            ("hello", "pane-1")
+        );
+        assert_eq!(found.transcript, project.join("s1.jsonl"));
+        let why =
+            |pane| last_reply_of(&agents, PaneId::Terminal(pane), &none, Some(home)).unwrap_err();
+        assert!(why(2).contains("opencode keeps its sessions"), "{}", why(2));
+        assert!(why(3).contains("no claude session id"), "{}", why(3));
+        assert!(why(4).contains("no transcript"), "{}", why(4));
+        assert!(why(9).contains("not running a coding agent"), "{}", why(9));
+    }
+
+    #[test]
+    fn list_agents_rows_carry_the_message_address_from_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let project = home.join(".claude/projects/-src");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("s1.jsonl"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-11-19T10:00:00Z\",\"message\":{\"content\":\"hi\"}}\n\
+             {\"type\":\"bridge-session\",\"bridgeSessionId\":\"cse_01Abc\"}\n\
+             {\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":10}}}\n",
+        )
+        .unwrap();
+        let mut agents = vec![
+            agent_row(1, "claude", Some("s1")),
+            agent_row(2, "codex", Some("s2")),
+            agent_row(3, "claude", Some("gone")),
+        ];
+        agents[1].queued_messages = 2;
+        let none = |_: &str| None;
+        let rows = agent_rows(&agents, &none, Some(home), Duration::from_secs(10));
+        let json: serde_json::Value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["message_to"], "bridge:session_01Abc");
+        assert_eq!(json[0]["message_route"], "harness");
+        assert_eq!(json[0]["chat_started_at"], 1_795_082_400_000u64);
+        // no context size: every harness's window is large enough that the number misleads
+        assert!(json[0].get("context_tokens").is_none());
+        // the agent's own keys are still there, unchanged
+        assert_eq!(json[0]["handle"], "pane-1");
+        assert_eq!(json[0]["kind"], "claude");
+        // held messages show as a count, only where there are some
+        assert_eq!(json[1]["queued"], 2);
+        assert!(json[0].get("queued").is_none());
+        for row in [&json[1], &json[2]] {
+            assert_eq!(row["message_route"], "pane");
+            assert!(row.get("message_to").is_none());
+        }
+        // no time for the transcripts: every row still goes out, without the chat keys
+        let rows = agent_rows(&agents, &none, Some(home), Duration::ZERO);
+        let json: serde_json::Value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json.as_array().map(Vec::len), Some(3));
+        assert_eq!(json[0]["handle"], "pane-1");
+    }
+}
+

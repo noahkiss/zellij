@@ -146,7 +146,12 @@ pub enum PluginInstruction {
         Option<PathBuf>,
     ),
     DumpLayout(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
-    ListClientsMetadata(SessionLayoutMetadata, ClientId, Option<NotificationEnd>),
+    ListClientsMetadata(
+        SessionLayoutMetadata,
+        ClientId,
+        bool,
+        Option<NotificationEnd>,
+    ),
     DumpLayoutToPlugin {
         session_layout_metadata: SessionLayoutMetadata,
         plugin_id: PluginId,
@@ -1022,6 +1027,7 @@ pub(crate) fn plugin_thread_main(
             PluginInstruction::ListClientsMetadata(
                 mut session_layout_metadata,
                 client_id,
+                output_json,
                 completion_tx,
             ) => {
                 populate_session_layout_metadata(
@@ -1033,6 +1039,7 @@ pub(crate) fn plugin_thread_main(
                 drop(bus.senders.send_to_pty(PtyInstruction::ListClientsMetadata(
                     session_layout_metadata,
                     client_id,
+                    output_json,
                     completion_tx,
                 )));
             },
