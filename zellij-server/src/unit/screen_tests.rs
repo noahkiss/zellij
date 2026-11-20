@@ -25442,6 +25442,106 @@ fn a_working_or_blocked_agent_holds_and_a_shell_or_no_wait_refuses() {
     assert_eq!(shell.reason, Some(Reason::NotAgent));
 }
 
+/// Pane 1 runs `kind` instead of claude, and the session saw it start `age` ago.
+fn screen_with_agent_started(kind: &str, age: Duration) -> (Screen, PtyWriterReceiver) {
+    let (mut screen, writes) = screen_with_claude(0);
+    screen.pane_process_info.get_mut(&1).unwrap().command = Some(vec![kind.to_owned()]);
+    let since = std::time::Instant::now()
+        .checked_sub(age)
+        .expect("the clock reaches back that far");
+    screen.agent_seen_at.insert(1, (kind.to_owned(), since));
+    (screen, writes)
+}
+
+#[test]
+fn any_new_agent_is_held_as_starting_until_it_reports_then_gets_the_message() {
+    use zellij_utils::agent_mail::{Reason, Status};
+    for kind in ["claude", "opencode", "codex"] {
+        let (mut screen, writes) = screen_with_agent_started(kind, Duration::from_secs(1));
+        let record = send(&mut screen, "First prompt.");
+        assert_eq!(record.status, Status::Queued, "{kind}");
+        assert_eq!(record.reason, Some(Reason::Starting), "{kind}");
+        screen.drain_agent_messages();
+        assert_eq!(
+            screen.agent_mail.get(&record.id).unwrap().record.status,
+            Status::Queued,
+            "{kind}"
+        );
+        agent_reports(&mut screen, "idle");
+        screen.drain_agent_messages();
+        assert_eq!(
+            screen.agent_mail.get(&record.id).unwrap().record.status,
+            Status::Delivered,
+            "{kind}"
+        );
+        assert_eq!(pty_writes(&writes).len(), 2, "{kind}");
+    }
+}
+
+#[test]
+fn a_held_message_is_refused_when_its_agent_outlives_the_startup_window_silent() {
+    use zellij_utils::agent_mail::{Reason, Status, STARTUP_MS};
+    let (mut screen, writes) =
+        screen_with_agent_started("opencode", Duration::from_millis(STARTUP_MS - 2_000));
+    let record = send(&mut screen, "First prompt.");
+    assert_eq!(record.reason, Some(Reason::Starting));
+    // the clock runs out with no state from the agent
+    let since = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(STARTUP_MS + 1))
+        .unwrap();
+    screen
+        .agent_seen_at
+        .insert(1, ("opencode".to_owned(), since));
+    screen.drain_agent_messages();
+    let settled = &screen.agent_mail.get(&record.id).unwrap().record;
+    assert_eq!(settled.status, Status::Refused);
+    assert_eq!(settled.reason, Some(Reason::NoState));
+    assert!(screen.agent_mail.held().is_empty());
+    assert!(pty_writes(&writes).is_empty());
+}
+
+#[test]
+fn an_agent_silent_past_the_startup_window_is_refused_at_once() {
+    use zellij_utils::agent_mail::{Reason, Status, STARTUP_MS};
+    for kind in ["claude", "codex"] {
+        let (mut screen, _writes) =
+            screen_with_agent_started(kind, Duration::from_millis(STARTUP_MS + 1));
+        let record = send(&mut screen, "Ping.");
+        assert_eq!(record.status, Status::Refused, "{kind}");
+        assert_eq!(record.reason, Some(Reason::NoState), "{kind}");
+    }
+}
+
+#[test]
+fn the_process_tick_starts_the_clock_once_and_again_for_a_new_harness() {
+    let (mut screen, _writes) = screen_with_claude(0);
+    let first = std::time::Instant::now();
+    screen.note_agent_starts(first);
+    assert_eq!(
+        screen.agent_seen_at.get(&1).map(|(k, t)| (k.as_str(), *t)),
+        Some(("claude", first))
+    );
+    let later = first + Duration::from_secs(5);
+    screen.note_agent_starts(later);
+    assert_eq!(
+        screen.agent_seen_at.get(&1).unwrap().1,
+        first,
+        "the same agent keeps its start"
+    );
+    screen.pane_process_info.get_mut(&1).unwrap().command = Some(vec!["codex".to_owned()]);
+    screen.note_agent_starts(later);
+    assert_eq!(
+        screen.agent_seen_at.get(&1).map(|(k, t)| (k.as_str(), *t)),
+        Some(("codex", later))
+    );
+    screen.pane_process_info.clear();
+    screen.note_agent_starts(later);
+    assert!(
+        screen.agent_seen_at.is_empty(),
+        "a pane with no agent is forgotten"
+    );
+}
+
 // fork addition: the tab-mode close key, `CloseTabOrConfirm`. Tab 0 holds one plugin pane and
 // tab 1 two terminal panes. The main client sits on tab 1 and a second client on tab 0, so each
 // press is judged by the tab of the client that pressed it and by nothing else.

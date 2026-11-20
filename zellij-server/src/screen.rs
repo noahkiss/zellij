@@ -2394,6 +2394,10 @@ pub(crate) struct Screen {
     /// What the pty thread last told us each terminal pane is running, keyed by terminal id.
     /// Read only when stamping `PaneInfo`; see `ScreenInstruction::UpdatePaneProcessInfo`.
     pane_process_info: HashMap<u32, PaneProcessInfo>,
+    /// fork addition: terminal_id -> the agent the session saw start in that pane, and when. A
+    /// message to an agent that has not reported a state is held as `starting` for
+    /// `agent_mail::STARTUP_MS` from here, then refused as `no_state`.
+    agent_seen_at: HashMap<u32, (String, Instant)>,
     /// terminal_id -> the command line to type at that pane's first prompt; see
     /// `ScreenInstruction::PrefillPane`.
     pending_prefills: HashMap<u32, String>,
@@ -2848,6 +2852,7 @@ impl Screen {
             pane_ids_never_created: BTreeSet::new(),
             pane_not_created_reasons: HashMap::new(),
             pane_process_info: HashMap::new(),
+            agent_seen_at: HashMap::new(),
             pending_prefills: HashMap::new(),
             closed_panes: ClosedPanes::default(),
             agent_mail: Default::default(),
@@ -8287,6 +8292,41 @@ impl Screen {
         }
     }
 
+    /// fork addition: remember when each pane's agent first appeared, and forget panes that no
+    /// longer run one. A different harness in the same pane starts the clock again.
+    fn note_agent_starts(&mut self, now: Instant) {
+        let kinds: Vec<(u32, Option<String>)> = self
+            .tabs
+            .values()
+            .flat_map(|tab| self.pane_infos_for_tab(tab))
+            .filter(|info| !info.is_plugin)
+            .map(|info| (info.id, self.agent_in_pane(&info).map(|agent| agent.kind)))
+            .collect();
+        let mut seen = HashMap::new();
+        for (terminal_id, kind) in kinds {
+            let Some(kind) = kind else { continue };
+            let since = match self.agent_seen_at.get(&terminal_id) {
+                Some((old_kind, since)) if *old_kind == kind => *since,
+                _ => now,
+            };
+            seen.insert(terminal_id, (kind, since));
+        }
+        self.agent_seen_at = seen;
+    }
+
+    /// fork addition: how long `terminal_id` has run `kind`, starting the clock at this look if
+    /// the process tick has not seen it yet.
+    fn agent_age_ms(&mut self, terminal_id: u32, kind: &str, now: Instant) -> u64 {
+        let entry = self
+            .agent_seen_at
+            .entry(terminal_id)
+            .or_insert_with(|| (kind.to_owned(), now));
+        if entry.0 != kind {
+            *entry = (kind.to_owned(), now);
+        }
+        now.saturating_duration_since(entry.1).as_millis() as u64
+    }
+
     /// fork addition: the held messages, tried again in the order they came; the overdue ones
     /// expire. One message per pane per round: a delivered one leaves the agent's prompt
     /// submitted, and the next waits for the turn it starts to end.
@@ -8314,6 +8354,17 @@ impl Screen {
                     self.agent_mail
                         .delivered(&stored.record.id, pane_id, now_ms);
                 },
+                Decision::Refuse(Reason::NoState) => {
+                    // the agent outlived its startup window without a word: it never will say
+                    // it is idle, so holding the message to its expiry helps nobody
+                    self.agent_mail
+                        .set_reason(&stored.record.id, Reason::NoState, Some(pane_id));
+                    self.agent_mail.settle(
+                        &stored.record.id,
+                        zellij_utils::agent_mail::Status::Refused,
+                        now_ms,
+                    );
+                },
                 Decision::Hold(reason) | Decision::Refuse(reason) => {
                     // a pane whose agent went away keeps the message until it expires: the agent
                     // may be started again under the same handle
@@ -8339,6 +8390,9 @@ impl Screen {
     ) -> zellij_utils::agent_mail::Decision {
         use zellij_utils::agent_mail::{self, Decision, GuardFacts};
         let now = std::time::Instant::now();
+        let agent_age_ms = agent
+            .as_ref()
+            .map(|agent| self.agent_age_ms(terminal_id, &agent.kind, now));
         let prompt = self
             .tabs
             .values()
@@ -8356,6 +8410,7 @@ impl Screen {
         let facts = GuardFacts {
             agent_kind: agent.as_ref().map(|agent| agent.kind.as_str()),
             state: state.as_deref(),
+            agent_age_ms,
             draft_pending: prompt.as_ref().is_some_and(|prompt| prompt.draft_pending),
             since_input_ms: prompt
                 .as_ref()
@@ -12671,6 +12726,7 @@ pub(crate) fn screen_thread_main(
             } => {
                 screen.pane_process_info = process_info;
                 screen.detect_agents = detect_agents;
+                screen.note_agent_starts(Instant::now());
                 // an agent's identity comes from here, so a watch looks at once
                 screen.look_for_session_events(true);
                 let names: Vec<_> = screen

@@ -62,12 +62,12 @@ pub enum Reason {
     Draft,
     /// A key reached the pane within the quiet window.
     Typing,
-    /// The agent has not reported a state yet; claude and pi report one as they start.
+    /// The agent has not reported a state yet, and started less than [`STARTUP_MS`] ago.
     Starting,
     /// The pane runs no coding agent.
     NotAgent,
-    /// The agent reports no state, so nothing says when it is idle (opencode; codex without
-    /// the hooks `zellij setup --agent-hooks` prints).
+    /// The agent has run for [`STARTUP_MS`] and never reported a state, so nothing says when it is
+    /// idle: its hooks are missing. `zellij setup --agent-hooks` prints them for every harness.
     NoState,
     /// The pane is gone.
     PaneGone,
@@ -103,7 +103,7 @@ impl Reason {
                 "the pane runs no coding agent; type into it with zellij_write_input instead"
             },
             Reason::NoState => {
-                "the agent reports no state, so nothing says when it is idle; type into it with zellij_write_input instead"
+                "the agent reports no state, so nothing says when it is idle; install its hooks with `zellij setup --agent-hooks`, or type into it with zellij_write_input instead"
             },
             Reason::PaneGone => "the pane is gone",
         }
@@ -248,6 +248,9 @@ pub struct GuardFacts<'a> {
     pub agent_kind: Option<&'a str>,
     /// The state the agent last reported over `OSC 7501`, when it reported one.
     pub state: Option<&'a str>,
+    /// How long the pane has run this agent, as far as the session has seen. `None` reads as just
+    /// started.
+    pub agent_age_ms: Option<u64>,
     /// Text typed into the prompt since the agent's last report, not yet sent or cleared.
     pub draft_pending: bool,
     /// Milliseconds since a key last reached the pane, when one ever did.
@@ -273,11 +276,13 @@ pub enum Decision {
 /// The order says which reason a held message reports: the agent's own state first, since it
 /// moves on its own, then the person's draft, then their typing.
 pub fn guard(facts: &GuardFacts) -> Decision {
-    let Some(kind) = facts.agent_kind else {
+    if facts.agent_kind.is_none() {
         return Decision::Refuse(Reason::NotAgent);
-    };
+    }
     match facts.state {
-        None if reports_state(kind) => return Decision::Hold(Reason::Starting),
+        None if facts.agent_age_ms.map_or(true, |age| age < STARTUP_MS) => {
+            return Decision::Hold(Reason::Starting)
+        },
         None => return Decision::Refuse(Reason::NoState),
         Some("blocked") => return Decision::Hold(Reason::Blocked),
         Some("idle" | "done" | "error") => {},
@@ -296,11 +301,14 @@ pub fn guard(facts: &GuardFacts) -> Decision {
     Decision::Deliver
 }
 
-/// Whether a harness reports its state over `OSC 7501` on its own, as it starts. codex reports
-/// only through the hooks a person installs, and opencode not at all.
-pub fn reports_state(kind: &str) -> bool {
-    matches!(kind, "claude" | "pi")
-}
+/// How long a new agent has to report its first state over `OSC 7501`. Until then a message to it
+/// is held as `starting`; after it, an agent that never reported is refused as `no_state`.
+///
+/// Every harness reports once its hooks are installed (`zellij setup --agent-hooks`), and does so
+/// as its session starts: claude at its first prompt, after its MCP servers come up, which can take
+/// half a minute on a cold machine. A minute covers that with room to spare, and still tells a
+/// sender within a minute that the agent will never say it is idle.
+pub const STARTUP_MS: u64 = 60_000;
 
 /// A sender's address, `host/session/handle`, taken apart. The host may be empty for a sender on
 /// the receiver's own machine.
@@ -342,6 +350,7 @@ mod tests {
         GuardFacts {
             agent_kind: kind,
             state,
+            agent_age_ms: Some(0),
             draft_pending: false,
             since_input_ms: None,
             quiet_ms: QUIET_MS,
@@ -375,14 +384,34 @@ mod tests {
             ),
             (Some("claude"), None, Decision::Hold(Reason::Starting)),
             (Some("pi"), None, Decision::Hold(Reason::Starting)),
-            (Some("opencode"), None, Decision::Refuse(Reason::NoState)),
-            (Some("codex"), None, Decision::Refuse(Reason::NoState)),
+            (Some("opencode"), None, Decision::Hold(Reason::Starting)),
+            (Some("codex"), None, Decision::Hold(Reason::Starting)),
             (None, None, Decision::Refuse(Reason::NotAgent)),
             (None, Some("idle"), Decision::Refuse(Reason::NotAgent)),
         ];
         for (kind, state, expected) in cases {
             assert_eq!(guard(&facts(kind, state)), expected, "{kind:?} {state:?}");
         }
+    }
+
+    #[test]
+    fn a_new_agent_has_the_startup_window_to_report_and_then_is_refused() {
+        for kind in ["claude", "pi", "opencode", "codex"] {
+            let mut silent = facts(Some(kind), None);
+            silent.agent_age_ms = None;
+            assert_eq!(guard(&silent), Decision::Hold(Reason::Starting), "{kind}");
+            silent.agent_age_ms = Some(STARTUP_MS - 1);
+            assert_eq!(guard(&silent), Decision::Hold(Reason::Starting), "{kind}");
+            silent.agent_age_ms = Some(STARTUP_MS);
+            assert_eq!(guard(&silent), Decision::Refuse(Reason::NoState), "{kind}");
+            // a state, however late, ends the question
+            let mut reported = silent;
+            reported.state = Some("idle");
+            assert_eq!(guard(&reported), Decision::Deliver, "{kind}");
+        }
+        assert!(Reason::NoState
+            .explain()
+            .contains("zellij setup --agent-hooks"));
     }
 
     #[test]

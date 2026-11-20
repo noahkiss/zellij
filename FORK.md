@@ -9125,9 +9125,15 @@ when that cannot mix with a person's typing, and otherwise holds it.
   | no key reached the pane lately | 5 s | outlasts the pauses of a person typing; a draft holds a message however old it is, so this only covers the moment around a key |
 
   `working` holds (`reason: working`), `blocked` holds (`blocked`: a permission or question
-  prompt is open and an Enter would answer it). A claude or pi that has not reported yet holds
-  (`starting`). An agent that reports no state - opencode, codex without the hooks `zellij setup
-  --agent-hooks` prints - is refused (`no_state`): nothing says when it is idle.
+  prompt is open and an Enter would answer it). An agent of any harness that has not reported
+  a state yet holds (`starting`) for its first minute in the pane (`agent_mail::STARTUP_MS`,
+  60 s: claude reports at its first prompt, after its MCP servers start, which can take half a
+  minute on a cold machine). An agent past that minute that has never reported is refused
+  (`no_state`), and a held message for it is settled as refused rather than kept to its expiry:
+  its hooks are missing and nothing will ever say it is idle. The refusal names `zellij setup
+  --agent-hooks`, which prints the hooks for every harness. The session starts the clock when
+  its process tick first sees the agent in the pane, or at the first message to it, whichever
+  comes first; another harness in the same pane starts it again.
 - **The draft** is read from the bytes that reach the pane, the same ones that set
   `input_since_state`: characters and pastes add, Backspace and Delete take away, Ctrl c and
   Ctrl u clear, cursor moves change nothing, and a key whose effect cannot be known (Up, Tab, Esc
@@ -9243,14 +9249,18 @@ and the message becomes its first prompt:
    again just before the write, and a shell that is no longer idle gets a new pane instead.
 4. **Then the message.** The harness has 30 seconds to show up as an agent in that pane. The
    message then goes to it through the guard above, which holds it as `starting` until the harness
-   reports `idle` and types it in. stderr names what was started and where.
+   reports `idle` and types it in. stderr names what was started and where. A harness that does
+   not report within the guard's startup minute has the message refused as `no_state`
+   (`message-status` shows it), and it stays running in its pane.
 
 Refused, with nothing started (exit 2):
 
 - a tab that already runs an agent, the caller's own included;
 - a name that matches several tabs, or none;
-- a harness this build does not recognise, and one that reports no `OSC 7501` state (opencode,
-  codex): the guard would refuse the message, so starting it would only leave an agent behind.
+- a harness this build does not recognise.
+
+Any harness the build recognises may be started: with the hooks from `zellij setup
+--agent-hooks` installed, opencode and codex report state as claude and pi do.
 
 The key is read by name from the config file, the way the MCP server reads `remote_hosts`. It is a
 top-level key, so an older build ignores it (a stock build) or warns and skips it (a fork build

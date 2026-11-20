@@ -3600,13 +3600,9 @@ fn start_default_harness(
             harness
         ));
     };
-    if !zellij_utils::agent_mail::reports_state(kind) {
-        return Err(format!(
-            "default_harness {:?} reports no state (OSC 7501), so nothing could say when it is \
-             idle to take the message. Nothing was started.",
-            harness
-        ));
-    }
+    // Any harness may report its state once its hooks are in (`zellij setup --agent-hooks`). The
+    // session holds the message as `starting` for `agent_mail::STARTUP_MS`, and refuses it as
+    // `no_state`, naming the hooks, if the harness never reports.
     let pane_row = |session: &str, terminal_id: u32| -> Result<Option<PaneListEntry>, String> {
         Ok(panes_of_session(make_os_input(), session)?
             .into_iter()
@@ -3664,7 +3660,7 @@ fn start_default_harness(
         if row.agent.as_ref().is_some_and(|agent| agent.kind == kind) {
             return Ok(StartedHarness {
                 line: format!(
-                    "started {} {} {}/{} (tab {}); the message goes in once it is idle",
+                    "started {} {} {}/{} (tab {}); the message goes in once it reports idle",
                     harness, how, session, row.pane_info.handle, row.tab_name
                 ),
                 session,
