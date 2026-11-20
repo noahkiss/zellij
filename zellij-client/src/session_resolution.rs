@@ -2,14 +2,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use zellij_utils::cli::{AttachArgs, SessionCommand};
-use zellij_utils::consts::session_layout_cache_file_name;
+use zellij_utils::consts::VERSION;
+use zellij_utils::consts::{session_layout_cache_file_name, CLIENT_SERVER_CONTRACT_VERSION};
 use zellij_utils::envs;
 use zellij_utils::input::options::Options;
+use zellij_utils::session_snapshot::{resolve_snapshot, Snapshot, SnapshotSettings};
 use zellij_utils::sessions::{
-    assert_session_ne, generate_unique_session_name, get_active_session,
-    get_sessions_sorted_by_mtime, match_session_name, print_sessions, print_sessions_with_index,
-    resurrection_layout, session_exists, session_listing_error_message, ActiveSession,
-    SessionNameMatch,
+    assert_session_ne, discard_resurrection_snapshot, generate_unique_session_name,
+    get_active_session, get_sessions, get_sessions_sorted_by_mtime, match_session_name,
+    print_sessions, print_sessions_with_index, refuse_to_replace_live_session, resurrection_layout,
+    session_exists, session_in_other_contract_versions, session_listing_error_message,
+    socket_is_occupied, ActiveSession, SessionNameMatch,
 };
 
 use crate::ClientInfo;
@@ -30,16 +33,21 @@ pub enum SessionListing {
 impl SessionListing {
     pub fn print(&self) {
         match self {
-            SessionListing::Active => zellij_utils::sessions::list_sessions(false, false, true),
+            SessionListing::Active => {
+                zellij_utils::sessions::list_sessions(false, false, true, false)
+            },
             SessionListing::Indexed(sessions) => print_sessions_with_index(sessions.clone()),
+            // the names are the answer here, and the ages are not known - `--short` is the listing
+            // that says only what this caller has
             SessionListing::Named(sessions) => print_sessions(
                 sessions
                     .iter()
                     .map(|name| (name.clone(), Duration::default(), false))
                     .collect(),
                 false,
-                false,
                 true,
+                true,
+                &std::collections::BTreeMap::new(),
             ),
         }
     }
@@ -115,6 +123,67 @@ impl ResolutionFailure {
             },
             None => self.message.clone(),
         }
+    }
+}
+
+/// fork: a miss that names no session. The sentence and the names of the sessions that DO exist
+/// go to stderr, and the exit is 2: a miss changed nothing the caller can address (see the CLI
+/// output convention in FORK.md). Upstream lists them on stdout and exits 1.
+fn no_session_answers_to(sentence: &str) -> ResolutionFailure {
+    let mut message = sentence.to_owned();
+    for (name, _) in get_sessions().unwrap_or_default() {
+        message.push('\n');
+        message.push_str(&name);
+    }
+    ResolutionFailure::to_stderr(message, 2)
+}
+
+/// fork: a session that exists under another client/server contract is invisible to this binary,
+/// and the bare "no session with that name" is misleading about why. Name the mismatch, and the
+/// way out. `None` when the name is not running under another contract either.
+pub fn contract_mismatch_help(
+    session_name: &str,
+    config_options: Option<&Options>,
+) -> Option<String> {
+    let contracts = session_in_other_contract_versions(session_name);
+    if contracts.is_empty() {
+        return None;
+    }
+    let contracts: Vec<String> = contracts.iter().map(|c| c.to_string()).collect();
+    let mut help = format!(
+        "Session '{}' is running under client/server contract {}; this binary speaks {}.",
+        session_name,
+        contracts.join(", "),
+        CLIENT_SERVER_CONTRACT_VERSION
+    );
+    let settings = SnapshotSettings::from_options(config_options);
+    if resolve_snapshot(&settings, "latest", Some(session_name)).is_ok() {
+        help.push_str("\nIts layout was captured - rebuild it with:");
+        help.push_str(&format!(
+            "\n    zellij snapshot restore latest --session {}",
+            session_name
+        ));
+    }
+    Some(help)
+}
+
+/// The upstream release a fork version is built on, eg. `0.44.3` for `0.44.3-nkmk.4`.
+fn upstream_base_version(version: &str) -> &str {
+    version.split('-').next().unwrap_or(version)
+}
+
+/// fork: say so and continue. A snapshot from another upstream base may still restore perfectly;
+/// refusing on the strength of a version string would be a guess in the unhelpful direction.
+pub fn report_snapshot_version_drift(snapshot: &Snapshot) {
+    let snapshot_version = snapshot.meta.zellij_version.as_str();
+    if snapshot_version.is_empty() {
+        return;
+    }
+    if upstream_base_version(snapshot_version) != upstream_base_version(VERSION) {
+        eprintln!(
+            "Note: snapshot {} was written by zellij {}, this binary is {}. Restoring anyway.",
+            snapshot.id, snapshot_version, VERSION
+        );
     }
 }
 

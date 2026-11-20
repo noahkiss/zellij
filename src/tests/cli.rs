@@ -612,6 +612,51 @@ fn setup_actions_refuse_the_other_setup_flags_and_replace_needs_a_copy() {
     assert!(try_parse(&["zellij", "setup", "--make-default-terminal", "--check"]).is_err());
     assert!(try_parse(&["zellij", "setup", "--replace-existing"]).is_err());
 }
+#[test]
+fn session_up_resumes_unless_told_otherwise() {
+    // the default a bare `up` carries: neither flag, which the command reads as "come back as you
+    // were, from whichever store still holds the shape"
+    match session_lifecycle_from(&["zellij", "session", "up", "work"]) {
+        SessionLifecycleCli::Up {
+            session_name,
+            restore,
+            fresh,
+        } => {
+            assert_eq!(session_name.as_deref(), Some("work"));
+            assert_eq!(restore, None);
+            assert!(!fresh);
+        },
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_up_fresh_is_how_a_layout_edit_applies() {
+    match session_lifecycle_from(&["zellij", "session", "up", "work", "--fresh"]) {
+        SessionLifecycleCli::Up { fresh, restore, .. } => {
+            assert!(fresh);
+            assert_eq!(restore, None);
+        },
+        other => panic!("Expected `up`, got {:?}", other),
+    }
+}
+
+#[test]
+fn session_up_refuses_fresh_together_with_restore() {
+    // the two say opposite things about the same session, so clap rejects the pair rather than
+    // leaving `up` to pick a winner
+    assert!(parse_cli(&[
+        "zellij",
+        "session",
+        "up",
+        "work",
+        "--fresh",
+        "--restore",
+        "abc123"
+    ])
+    .is_err());
+}
+
 /// The session lifecycle verbs that cannot be undone each take `--yes`, and none of them assumes
 /// it. The `action` verbs are covered where the table that drives them lives, in `zellij-utils`.
 #[test]

@@ -1021,6 +1021,10 @@ impl TestSession {
                     Box::new(fake_client_os_api),
                     &session_name,
                     actions,
+                    None,
+                    pipe_timeout,
+                    false,
+                    None,
                 )
             })
             .unwrap();
@@ -1031,7 +1035,7 @@ impl TestSession {
     }
 
     pub fn save_session(&self) {
-        self.run_cli_action(CliAction::SaveSession);
+        self.run_cli_action(CliAction::SaveSession { archive: false });
     }
 
     pub fn wait_for_serialized_session(&self) {

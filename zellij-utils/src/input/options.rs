@@ -488,6 +488,21 @@ pub struct Options {
     #[serde(default)]
     pub scrollback_lines_to_serialize: Option<usize>,
 
+    /// Where the session snapshot archive lives. Defaults to the state directory
+    /// ($XDG_STATE_HOME/zellij/snapshots, else the platform convention).
+    /// config.kdl only - it is read wherever a snapshot is written or listed, so there is nothing
+    /// for a CLI flag to affect.
+    #[clap(skip)]
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
+
+    /// How many snapshots to keep per session name, oldest pruned first. Default is 10, 0 turns
+    /// the archive off.
+    /// config.kdl only, like snapshot_dir.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_snapshot_limit: Option<usize>,
+
     /// How long a pane that rang the bell has to stay focused before its notification is
     /// cleared, in milliseconds. Default is 0 - the notification clears the moment the pane is
     /// focused.
@@ -533,6 +548,17 @@ pub struct Options {
     #[clap(skip)]
     #[serde(default)]
     pub resurrect_commands: Option<ResurrectCommands>,
+
+    /// Whether a plain `zellij session up` comes back with the shape the session had. Default:
+    /// true. `up` already resurrects from the in-place cache that a crash leaves behind; this is
+    /// what makes it reach the archived snapshot as well, which is the only copy left after a
+    /// `session down` or a `delete-session`. Set it false to go back to coming up from the layout
+    /// whenever the in-place cache is gone. `--fresh` does the same for one invocation.
+    /// config.kdl only - it is read by the command that creates the session, which is all it
+    /// affects.
+    #[clap(skip)]
+    #[serde(default)]
+    pub session_up_resume: Option<bool>,
 
     /// The size floating panes get when nothing asks for a specific one.
     /// config.kdl only - it is a nested block, which no CLI flag can express.
@@ -1103,6 +1129,19 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
+            bell_clear_delay_ms,
+            terminal_title_template,
+            session_aliases,
+            session_restart_drop_env,
+            session_service,
+            resurrect_command_hints,
+            resurrect_commands,
+            detect_agents,
+            pane_frame_agent_name,
+            session_up_resume,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -1369,6 +1408,19 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
+            bell_clear_delay_ms,
+            terminal_title_template,
+            session_aliases,
+            session_restart_drop_env,
+            session_service,
+            resurrect_command_hints,
+            resurrect_commands,
+            detect_agents,
+            pane_frame_agent_name,
+            session_up_resume,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,

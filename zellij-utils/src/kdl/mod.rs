@@ -3840,6 +3840,19 @@ impl Options {
             session_serialization,
             serialize_pane_viewport,
             scrollback_lines_to_serialize,
+            snapshot_dir,
+            session_snapshot_limit,
+            bell_clear_delay_ms,
+            terminal_title_template,
+            session_aliases,
+            session_restart_drop_env,
+            detect_agents,
+            pane_frame_agent_name,
+            session_up_resume,
+            session_service,
+            resurrect_command_hints,
+            resurrect_commands,
+            default_floating_size,
             styled_underlines,
             serialization_interval,
             disable_session_metadata,
@@ -6165,6 +6178,56 @@ impl Options {
         }
         if let Some(keybinds_dir) = self.keybinds_dir_to_kdl(add_comments) {
             nodes.push(keybinds_dir);
+        }
+        if let Some(snapshot_dir) = self.snapshot_dir_to_kdl() {
+            nodes.push(snapshot_dir);
+        }
+        if let Some(session_snapshot_limit) = self.session_snapshot_limit_to_kdl() {
+            nodes.push(session_snapshot_limit);
+        }
+        if let Some(bell_clear_delay_ms) = self.bell_clear_delay_ms_to_kdl() {
+            nodes.push(bell_clear_delay_ms);
+        }
+        if let Some(terminal_title_template) = self.terminal_title_template_to_kdl() {
+            nodes.push(terminal_title_template);
+        }
+        if let Some(session_aliases) = self.session_aliases_to_kdl() {
+            nodes.push(session_aliases);
+        }
+        if let Some(session_restart_drop_env) = self.session_restart_drop_env_to_kdl() {
+            nodes.push(session_restart_drop_env);
+        }
+        if let Some(enabled) = self.pane_frame_agent_name {
+            let mut node = KdlNode::new("pane_frame_agent_name");
+            node.push(KdlValue::Bool(enabled));
+            nodes.push(node);
+        }
+        if let Some(detect_agents) = self.detect_agents_to_kdl() {
+            nodes.push(detect_agents);
+        }
+        if let Some(session_up_resume) = self.session_up_resume_to_kdl() {
+            nodes.push(session_up_resume);
+        }
+        if let Some(session_service) = self.session_service_to_kdl() {
+            nodes.push(session_service);
+        }
+        if let Some(resurrect_command_hints) = self.resurrect_command_hints_to_kdl() {
+            nodes.push(resurrect_command_hints);
+        }
+        if let Some(resurrect_commands) = self.resurrect_commands_to_kdl() {
+            nodes.push(resurrect_commands);
+        }
+        if let Some(default_floating_size) = self.default_floating_size_to_kdl() {
+            nodes.push(default_floating_size);
+        }
+        if let Some(plugin_watch) = self.plugin_watch_to_kdl() {
+            nodes.push(plugin_watch);
+        }
+        if let Some(expect_full_disk_access) = self.expect_full_disk_access_to_kdl() {
+            nodes.push(expect_full_disk_access);
+        }
+        if let Some(stale_build_notice) = self.stale_build_notice_to_kdl() {
+            nodes.push(stale_build_notice);
         }
         if let Some(mouse_mode) = self.mouse_mode_to_kdl(add_comments) {
             nodes.push(mouse_mode);
@@ -12548,6 +12611,21 @@ fn terminal_title_is_unset_by_default() {
     let config = Config::from_kdl("", None).unwrap();
     assert_eq!(config.options.terminal_title_template, None);
     assert_eq!(config.options.session_aliases, None);
+}
+
+#[test]
+fn session_up_resume_config_parsing() {
+    let config_contents = r#"
+        session_up_resume false
+    "#;
+    let config = Config::from_kdl(config_contents, None).unwrap();
+    assert_eq!(config.options.session_up_resume, Some(false));
+}
+
+#[test]
+fn session_up_resume_is_unset_by_default() {
+    let config = Config::from_kdl("", None).unwrap();
+    assert_eq!(config.options.session_up_resume, None);
 }
 
 #[test]

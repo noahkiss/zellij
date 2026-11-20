@@ -3434,6 +3434,51 @@ theme \"first\"
     }
 }
 
+pub(crate) fn snapshot_settings() -> SnapshotSettings {
+    SNAPSHOT_SETTINGS
+        .read()
+        .ok()
+        .and_then(|settings| settings.clone())
+        .unwrap_or_else(SnapshotSettings::default)
+}
+
+/// Archive any `session_info` folder left behind by a server that is no longer running.
+///
+/// This is the SIGKILL and crash path: the periodic serializer's file survives, so it is promoted
+/// into the archive rather than lost to the next session of the same name overwriting it. This
+/// session's own folder is always swept, since starting is exactly what is about to reuse it.
+fn promote_orphaned_session_info_folders(own_session_id: &str, settings: &SnapshotSettings) {
+    let Ok(entries) = std::fs::read_dir(&*zellij_utils::consts::ZELLIJ_SESSION_INFO_CACHE_DIR)
+    else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        // the folder and the socket are both named by the session id; the archive by its name
+        let session_id = entry.file_name().to_string_lossy().to_string();
+        // a socket in place means someone else's server owns that folder. Testing for the file
+        // rather than connecting to it is deliberate: this runs on the server thread, and probing
+        // sockets from here would have us wait on a reply from ourselves.
+        let has_socket = zellij_utils::consts::ZELLIJ_SOCK_DIR
+            .join(&session_id)
+            .exists();
+        if has_socket && session_id != own_session_id {
+            continue;
+        }
+        let session_name = zellij_utils::sessions::display_name_for_session_id(&session_id);
+        if let Err(e) = zellij_utils::session_snapshot::archive_session_info_folder(
+            &entry.path(),
+            &session_name,
+            SnapshotReason::Promoted,
+            settings,
+        ) {
+            log::error!("Failed to promote session {:?}: {}", session_name, e);
+        }
+    }
+}
+
 /// How many open files the server asks for. A session's descriptors grow with what is in it -- a
 /// pty per pane, a plugin instance per tab for each of the bars, the mounts and caches each of
 /// those holds -- so the ceiling has to clear a session that has been added to for weeks, not one
@@ -4085,6 +4130,31 @@ pub fn start_server_impl(
     }
 
     let server_socket = ServerSocket::new(socket_path.clone());
+    // A SIGTERM is how a session ends on a reboot, a logout, and a `systemctl --user stop`, and
+    // without a handler it kills the server outright: the last periodic serialize can be a whole
+    // `serialization_interval` old, and no snapshot is archived at all. `KillSession` is exactly
+    // the graceful path - serialize once more, tell the clients, then archive on the way out - so
+    // this thread only has to ask for it. The shutdown that follows is the one `kill-session`
+    // already runs, so nothing new can hang here that could not hang there.
+    //
+    // `install_panic_hook` is false only for the in-process server the integration tests run, and
+    // that one must not take the test harness's signals.
+    #[cfg(unix)]
+    if install_panic_hook {
+        let to_server = to_server.clone();
+        let _ = thread::Builder::new()
+            .name("signal_listener".to_string())
+            .spawn(move || {
+                match signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM]) {
+                    Ok(mut signals) => {
+                        if signals.forever().next().is_some() {
+                            let _ = to_server.send(ServerInstruction::KillSession);
+                        }
+                    },
+                    Err(e) => log::error!("could not listen for SIGTERM: {}", e),
+                }
+            });
+    }
 
     let _ = thread::Builder::new()
         .name("server_listener".to_string())
@@ -4294,6 +4364,14 @@ pub fn start_server_impl(
                     },
                 };
 
+                set_snapshot_settings(SnapshotSettings::from_options(Some(
+                    &runtime_config_options,
+                )));
+                promote_orphaned_session_info_folders(&session_id, &snapshot_settings());
+
+                set_terminal_title_format(TerminalTitleFormat::from_options(
+                    &runtime_config_options,
+                ));
                 info!("FirstClientConnected: initializing session");
                 let mut session = init_session(
                     os_input.clone(),
@@ -4852,6 +4930,10 @@ pub fn start_server_impl(
                 remove_client!(client_id, os_input, session_state, session_data);
             },
             ServerInstruction::KillSession => {
+                // the archive is cut on the way out below; serialize once more first, so what it
+                // captures is the shape the session had when it was killed rather than one up to a
+                // whole serialization interval old
+                serialize_session_before_exit(&session_data);
                 let client_ids = session_state.read().unwrap().client_ids();
                 for client_id in client_ids {
                     let _ = os_input.send_to_client(
@@ -5797,6 +5879,38 @@ fn delete_unused_session_after_exit(session_id: &str, session_name: &str) {
     let _ = std::fs::remove_dir_all(zellij_utils::consts::session_info_folder_for_session(
         session_id,
     ));
+}
+
+/// Ask the session to serialize itself one last time, and wait for that to reach the disk.
+///
+/// Best effort: a session that is already tearing down, or that has serialization turned off, just
+/// leaves whatever the periodic serializer last wrote.
+fn serialize_session_before_exit(session_data: &Arc<RwLock<Option<SessionMetaData>>>) {
+    const FINAL_SERIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    {
+        let session_data = session_data.read().unwrap();
+        let Some(session_data) = session_data.as_ref() else {
+            return;
+        };
+        if session_data
+            .senders
+            .send_to_screen(ScreenInstruction::SaveSession(
+                0,
+                Some(NotificationEnd::new(completion_tx)),
+            ))
+            .is_err()
+        {
+            return;
+        }
+    }
+    let runtime = crate::global_async_runtime::get_tokio_runtime();
+    if runtime
+        .block_on(async { tokio::time::timeout(FINAL_SERIALIZE_TIMEOUT, completion_rx).await })
+        .is_err()
+    {
+        log::warn!("Timed out serializing the session before exit");
+    }
 }
 
 /// The pty thread's bus.

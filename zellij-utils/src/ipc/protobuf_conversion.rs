@@ -1296,6 +1296,25 @@ impl TryFrom<crate::client_server_contract::client_server_contract::Options>
         };
 
         Ok(Self {
+            // config-file only, deliberately not carried over the client/server contract
+            plugin_watch: None,
+            expect_full_disk_access: None,
+            stale_build_notice: None,
+            snapshot_dir: None,
+            session_snapshot_limit: None,
+            bell_clear_delay_ms: None,
+            terminal_title_template: None,
+            session_aliases: None,
+            session_restart_drop_env: None,
+            detect_agents: None,
+            pane_frame_agent_name: None,
+            session_up_resume: None,
+            session_service: None,
+            resurrect_command_hints: None,
+            resurrect_commands: None,
+            default_floating_size: None,
+            input_while_scrolled: None,
+            command_pane_on_clean_exit: None,
             simplified_ui: options.simplified_ui,
             theme: options.theme,
             theme_dark: options.theme_dark,

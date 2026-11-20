@@ -13,7 +13,12 @@ use zellij_client::{
 use zellij_utils::sessions::{
     assert_dead_session, assert_session, assert_session_ne, delete_session as delete_session_impl,
     generate_unique_session_name, get_active_session, get_resurrectable_sessions, get_sessions,
-    kill_session as kill_session_impl, ActiveSession,
+    kill_session as kill_session_impl, ActiveSession, KillWait,
+};
+
+use zellij_utils::session_snapshot::{
+    archive_session_info, list_snapshots, prune_all, remove_snapshot, resolve_snapshot,
+    ArchiveOutcome, Snapshot, SnapshotReason, SnapshotSettings,
 };
 
 #[cfg(feature = "web_server_capability")]
@@ -43,101 +48,6 @@ use zellij_utils::{
 
 pub(crate) use zellij_utils::sessions::list_sessions;
 
-pub(crate) fn kill_all_sessions(yes: bool) {
-    match get_sessions() {
-        Ok(sessions) if sessions.is_empty() => {
-            eprintln!("No active zellij sessions found.");
-            process::exit(1);
-        },
-        Ok(sessions) => {
-            if !yes {
-                println!("WARNING: this action will kill all sessions.");
-                if !Confirm::new()
-                    .with_prompt("Do you want to continue?")
-                    .interact()
-                    .unwrap()
-                {
-                    println!("Abort.");
-                    process::exit(1);
-                }
-            }
-            for session in &sessions {
-                kill_session_impl(&session.0);
-            }
-            process::exit(0);
-        },
-        Err(e) => {
-            eprintln!("Error occurred: {:?}", e);
-            process::exit(1);
-        },
-    }
-}
-
-pub(crate) fn delete_all_sessions(yes: bool, force: bool) {
-    use std::collections::BTreeMap;
-    use zellij_server::background_jobs::scan_session_list_default_dirs;
-
-    let active_sessions: Vec<String> = get_sessions()
-        .unwrap_or_default()
-        .iter()
-        .map(|s| s.0.clone())
-        .collect();
-    let (_live_sessions, resurrectable_map) =
-        scan_session_list_default_dirs(&String::new(), &[], &BTreeMap::new());
-    let mut resurrectable_sessions: Vec<(String, Duration)> =
-        resurrectable_map.into_iter().collect();
-    if force {
-        for entry in get_resurrectable_sessions() {
-            if !resurrectable_sessions.iter().any(|(n, _)| *n == entry.0) {
-                resurrectable_sessions.push(entry);
-            }
-        }
-    }
-    let dead_sessions: Vec<_> = if force {
-        resurrectable_sessions
-    } else {
-        resurrectable_sessions
-            .into_iter()
-            .filter(|(name, _)| !active_sessions.contains(name))
-            .collect()
-    };
-    if !yes {
-        println!("WARNING: this action will delete all resurrectable sessions.");
-        if !Confirm::new()
-            .with_prompt("Do you want to continue?")
-            .interact()
-            .unwrap()
-        {
-            println!("Abort.");
-            process::exit(1);
-        }
-    }
-    for session in &dead_sessions {
-        delete_session_impl(&session.0, force);
-    }
-    process::exit(0);
-}
-
-pub(crate) fn kill_session(target_session: &Option<String>) {
-    match target_session {
-        Some(target_session) => {
-            assert_session(target_session);
-            kill_session_impl(target_session);
-            process::exit(0);
-        },
-        None => {
-            println!("Please specify the session name to kill.");
-            process::exit(1);
-        },
-    }
-}
-
-pub(crate) fn delete_session(target_session: &Option<String>, force: bool) {
-    match target_session {
-        Some(target_session) => {
-            assert_dead_session(target_session, force);
-            delete_session_impl(target_session, force);
-            process::exit(0);
 /// Asks before something that cannot be undone, or refuses when nothing can answer.
 ///
 /// One implementation for every such verb, so the wording and the behaviour on a pipe are the same
@@ -165,6 +75,142 @@ pub(crate) fn confirm_or_exit(verb: &str, what: &str, yes: bool) {
                 process::exit(2);
             }
         },
+    }
+}
+
+pub(crate) fn snapshot_settings(opts: &CliArgs) -> SnapshotSettings {
+    SnapshotSettings::from_options(get_config_options_from_cli_args(opts).ok().as_ref())
+}
+
+fn resolve_snapshot_or_exit(
+    settings: &SnapshotSettings,
+    id: &str,
+    session_name: Option<&str>,
+) -> Snapshot {
+    match resolve_snapshot(settings, id, session_name) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            eprintln!("{}", e);
+            process::exit(2);
+        },
+    }
+}
+
+pub(crate) fn snapshot_command(snapshot_cli: SnapshotCli, opts: CliArgs) {
+    let settings = snapshot_settings(&opts);
+    match snapshot_cli {
+        SnapshotCli::List { session, json } => {
+            list_snapshots_command(&settings, session.as_deref(), json);
+        },
+        SnapshotCli::Show { id } => {
+            let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            match std::fs::read_to_string(snapshot.layout_file()) {
+                Ok(raw) => print!("{}", raw),
+                Err(e) => {
+                    eprintln!("Failed to read {}: {}", snapshot.layout_file().display(), e);
+                    process::exit(2);
+                },
+            }
+        },
+        SnapshotCli::Restore { id, session } => {
+            let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            let target_session_name = session.unwrap_or_else(|| snapshot.session_name.clone());
+            // a restore is an attach that takes its layout from the archive, so it goes through the
+            // same path rather than a parallel one
+            let mut opts = opts;
+            opts.session = None;
+            opts.command = Some(Command::Sessions(Sessions::Attach {
+                args: AttachArgs {
+                    session_name: Some(target_session_name),
+                    create: true,
+                    no_resurrect: false,
+                    restore: Some(snapshot.id),
+                    ..AttachArgs::default()
+                },
+                create_background: false,
+            }));
+            start_client(opts);
+        },
+        SnapshotCli::Rm { id, yes } => {
+            let snapshot = resolve_snapshot_or_exit(&settings, &id, None);
+            confirm_or_exit("snapshot rm", destroys::SNAPSHOT_RM, yes);
+            match remove_snapshot(&snapshot) {
+                Ok(()) => println!("Deleted snapshot {}", snapshot.id),
+                Err(e) => {
+                    eprintln!("Failed to delete snapshot {}: {}", snapshot.id, e);
+                    process::exit(2);
+                },
+            }
+        },
+        SnapshotCli::Prune { keep, yes } => {
+            let keep = keep.unwrap_or(settings.limit);
+            confirm_or_exit("snapshot prune", destroys::SNAPSHOT_PRUNE, yes);
+            let removed = prune_all(&settings, keep);
+            println!(
+                "Pruned {} snapshot(s), keeping {} per session.",
+                removed.len(),
+                keep
+            );
+        },
+    }
+    process::exit(0);
+}
+
+fn list_snapshots_command(settings: &SnapshotSettings, session: Option<&str>, json: bool) {
+    let snapshots = list_snapshots(settings, session);
+    if json {
+        let entries: Vec<String> = snapshots
+            .iter()
+            .map(|snapshot| {
+                // trial-parse rather than trust: a layout a newer binary rejects is still a text
+                // file a human can repair, and finding that out at list time beats finding it out
+                // at restore time
+                let layout_error = snapshot.layout().err();
+                format!(
+                    r#"{{"id":{:?},"session_name":{:?},"saved_at":{},"zellij_version":{:?},"contract_version":{},"reason":{:?},"tabs":{},"panes":{},"path":{:?},"layout_error":{}}}"#,
+                    snapshot.id,
+                    snapshot.session_name,
+                    snapshot.meta.saved_at,
+                    snapshot.meta.zellij_version,
+                    snapshot.meta.contract_version,
+                    snapshot.meta.reason.as_str(),
+                    snapshot.meta.tabs,
+                    snapshot.meta.panes,
+                    snapshot.path.display().to_string(),
+                    match layout_error {
+                        Some(e) => format!("{:?}", e),
+                        None => "null".to_owned(),
+                    }
+                )
+            })
+            .collect();
+        println!("[{}]", entries.join(","));
+        return;
+    }
+    if snapshots.is_empty() {
+        eprintln!("No snapshots in {}.", settings.dir.display());
+        return;
+    }
+    println!(
+        "{:<24}  {:<20}  {:<14}  {:<9}  {:>4}  {:>5}",
+        "ID", "SESSION", "SAVED", "REASON", "TABS", "PANES"
+    );
+    for snapshot in snapshots {
+        let unparseable = if snapshot.layout().is_err() {
+            "  (layout does not parse)"
+        } else {
+            ""
+        };
+        println!(
+            "{:<24}  {:<20}  {:<14}  {:<9}  {:>4}  {:>5}{}",
+            snapshot.id,
+            snapshot.session_name,
+            snapshot.saved_at_description(),
+            snapshot.meta.reason.as_str(),
+            snapshot.meta.tabs,
+            snapshot.meta.panes,
+            unparseable
+        );
     }
 }
 

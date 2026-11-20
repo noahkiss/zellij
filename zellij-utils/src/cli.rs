@@ -1007,6 +1007,10 @@ pub enum Sessions {
         yes: bool,
     },
 
+    /// Inspect and restore archived session snapshots
+    #[clap(subcommand)]
+    Snapshot(SnapshotCli),
+
     /// Run a command in a new pane
     ///
     /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
@@ -1321,6 +1325,57 @@ tail -f /tmp/my-live-logfile | zellij pipe --name logs --plugin https://example.
         /// forever, which only a plugin that received the message can end
         #[clap(long, value_parser, default_value = "30", display_order(5))]
         timeout: u64,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, Serialize, Deserialize)]
+pub enum SnapshotCli {
+    /// List archived snapshots, newest first
+    #[clap(visible_alias = "ls")]
+    List {
+        /// Only snapshots of this session name
+        #[clap(long, value_parser)]
+        session: Option<String>,
+
+        /// Print the list as JSON
+        #[clap(long)]
+        json: bool,
+    },
+    /// Print a snapshot's layout
+    Show {
+        /// The snapshot id, or a unique prefix of one
+        #[clap(value_parser)]
+        id: String,
+    },
+    /// Rebuild a session from a snapshot
+    Restore {
+        /// The snapshot id, a unique prefix of one, or `latest`
+        #[clap(value_parser)]
+        id: String,
+
+        /// Restore under this session name instead of the one the snapshot was taken from
+        #[clap(long, value_parser)]
+        session: Option<String>,
+    },
+    /// Delete a snapshot
+    Rm {
+        /// The snapshot id, or a unique prefix of one
+        #[clap(value_parser)]
+        id: String,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
+    },
+    /// Delete all but the newest snapshots of each session
+    Prune {
+        /// How many snapshots to keep per session name, defaults to session_snapshot_limit
+        #[clap(long, value_parser)]
+        keep: Option<usize>,
+        /// Skip the confirmation. A script that means this says so here; without it, and with
+        /// nothing to answer a prompt, the command refuses rather than hanging
+        #[clap(long)]
+        yes: bool,
     },
 }
 

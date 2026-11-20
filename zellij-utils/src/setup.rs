@@ -830,6 +830,7 @@ impl Setup {
             .unwrap();
         }
         writeln!(&mut message, "[CACHE DIR]: {}", ZELLIJ_CACHE_DIR.display()).unwrap();
+        writeln!(&mut message, "[SOCKET DIR]: {}", ZELLIJ_SOCK_DIR.display()).unwrap();
         writeln!(&mut message, "[DATA DIR]: \"{}\"", data_dir.display()).unwrap();
         writeln!(&mut message, "[PLUGIN DIR]: \"{}\"", plugin_dir.display()).unwrap();
         if !crate::distribution::embedded_plugins().is_empty() {

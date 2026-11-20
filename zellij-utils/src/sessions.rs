@@ -135,6 +135,136 @@ pub fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
     }
 }
 
+/// Live sessions of this contract version sitting in a socket root this environment did *not*
+/// resolve to, keyed by the directory they were found in.
+///
+/// Two clients with different environments each build their own server and neither can see the
+/// other, so `zellij ls` reports "no sessions" while a server is very much alive elsewhere. This
+/// is the scan that makes that split visible.
+///
+/// Read-only, deliberately: unlike [`assert_socket`], a socket that refuses a connection is left
+/// in place rather than removed, because it is not this environment's to clean up.
+pub fn get_sessions_in_other_socket_dirs() -> Vec<(std::path::PathBuf, Vec<String>)> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    socket_dir_candidates()
+        .into_iter()
+        .map(|root| root.join(&*CLIENT_SERVER_CONTRACT_DIR))
+        .filter(|dir| dir != &*ZELLIJ_SOCK_DIR)
+        .filter_map(|dir| {
+            let sessions: Vec<String> = fs::read_dir(&dir)
+                .ok()?
+                .filter_map(|file| {
+                    let file = file.ok()?;
+                    if !is_ipc_socket(&file.file_type().ok()?) {
+                        return None;
+                    }
+                    if !probe_socket(&file.path()) {
+                        return None;
+                    }
+                    file.file_name().into_string().ok()
+                })
+                .collect();
+            if sessions.is_empty() {
+                None
+            } else {
+                Some((dir, sessions))
+            }
+        })
+        .collect()
+}
+
+/// The client/server contract versions a session by this name has a socket under, other than the
+/// one this binary speaks.
+///
+/// The socket path is contract-scoped and the wire format genuinely differs across a contract bump,
+/// so a mismatched client attaching to a live server is a protocol violation rather than a path
+/// problem. The right response is a better failure, which needs to know the mismatch is there.
+/// Nothing is probed: another contract's server would not understand the question.
+pub fn session_in_other_contract_versions(name: &str) -> Vec<usize> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    let mut contracts: Vec<usize> = socket_dir_candidates()
+        .into_iter()
+        .flat_map(|root| fs::read_dir(&root).into_iter().flatten().flatten())
+        .filter_map(|entry| {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if dir_name == *CLIENT_SERVER_CONTRACT_DIR {
+                return None;
+            }
+            let contract = dir_name.strip_prefix("contract_version_")?.parse().ok()?;
+            let socket = entry.path().join(name);
+            if is_ipc_socket(&fs::metadata(&socket).ok()?.file_type()) {
+                Some(contract)
+            } else {
+                None
+            }
+        })
+        .collect();
+    contracts.sort_unstable();
+    contracts.dedup();
+    contracts
+}
+
+/// Every socket directory a listing consulted: the one this binary resolved, then the ones a
+/// differently-configured environment would have landed in.
+///
+/// These are the DERIVED candidates and nothing else. A server created under a `ZELLIJ_SOCKET_DIR`
+/// that this process was not given cannot be derived from here by anything, which is exactly why
+/// naming the list is worth doing: a reader who exported one somewhere else can see at a glance
+/// that their directory is not on it.
+pub fn searched_socket_dirs() -> Vec<std::path::PathBuf> {
+    use crate::consts::{socket_dir_candidates, CLIENT_SERVER_CONTRACT_DIR};
+
+    let mut dirs = vec![ZELLIJ_SOCK_DIR.clone()];
+    for root in socket_dir_candidates() {
+        let dir = root.join(&*CLIENT_SERVER_CONTRACT_DIR);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Say where the listing looked, for the answer that otherwise explains nothing.
+///
+/// "No active zellij sessions found" is true of a directory, not of a machine, and the two come
+/// apart routinely: a session created under an exported `ZELLIJ_SOCKET_DIR` that this shell does
+/// not have is running, reachable and completely absent from this list. Naming the directories
+/// turns the bare sentence into one a reader can check.
+fn print_searched_socket_dirs() {
+    let dirs = searched_socket_dirs();
+    let mut dirs = dirs.iter();
+    if let Some(first) = dirs.next() {
+        eprintln!("  looked in {}", first.display());
+    }
+    for other in dirs {
+        eprintln!("  and in    {}", other.display());
+    }
+    eprintln!(
+        "  A server started with a ZELLIJ_SOCKET_DIR this shell does not have is not in that\n  \
+         list and cannot be. `zellij session up <name>` scans the process table instead, so it\n  \
+         sees one when this does not."
+    );
+}
+
+fn print_other_socket_dir_warning() {
+    for (dir, sessions) in get_sessions_in_other_socket_dirs() {
+        eprintln!(
+            "WARNING: {} live session(s) in another socket directory: {}",
+            sessions.len(),
+            dir.display()
+        );
+        for session in sessions {
+            eprintln!("  {}", session);
+        }
+        eprintln!(
+            "These are invisible to this environment. ZELLIJ_SOCK_DIR here is: {}",
+            ZELLIJ_SOCK_DIR.display()
+        );
+    }
+}
+
 pub fn get_resurrectable_sessions() -> Vec<(String, Duration)> {
     match fs::read_dir(&*ZELLIJ_SESSION_INFO_CACHE_DIR) {
         Ok(files_in_session_info_folder) => {
@@ -254,6 +384,15 @@ fn assert_socket(name: &str) -> bool {
     use crate::consts::ipc_connect;
     let path = &*ZELLIJ_SOCK_DIR.join(name);
     match ipc_connect(path) {
+        Ok(stream) => socket_answers(stream),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            drop(fs::remove_file(path));
+            false
+        },
+        Err(_) => false,
+    }
+}
+
 /// How long the liveness probe gives one server to answer before calling it unresponsive.
 ///
 /// A server that accepts the connection and then never replies is the case this exists for. The
@@ -272,6 +411,24 @@ fn assert_socket(name: &str) -> bool {
 /// its own panes.
 #[cfg(unix)]
 const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ask a connected server whether it is alive.
+#[cfg(unix)]
+fn socket_answers(stream: interprocess::local_socket::Stream) -> bool {
+    use interprocess::local_socket::traits::Stream as _;
+    // both directions, because an unresponsive peer is unresponsive in both: a server that has
+    // stopped reading fills the send buffer just as surely as one that has stopped writing leaves
+    // the receive buffer empty
+    let _ = stream.set_send_timeout(Some(LIVENESS_PROBE_TIMEOUT));
+    let _ = stream.set_recv_timeout(Some(LIVENESS_PROBE_TIMEOUT));
+    let mut sender: IpcSenderWithContext<ClientToServerMsg> = IpcSenderWithContext::new(stream);
+    let _ = sender.send_client_msg(ClientToServerMsg::ConnStatus);
+    let mut receiver: IpcReceiverWithContext<ServerToClientMsg> = sender.get_receiver();
+    match receiver.recv_server_msg() {
+        Some((ServerToClientMsg::Connected, _)) => true,
+        None | Some((_, _)) => false,
+    }
+}
 
 /// Whether a server is bound to this session's socket, without asking it anything.
 ///
@@ -327,6 +484,14 @@ pub fn refuse_to_replace_live_session(name: &str, what: &str) -> ! {
     process::exit(1);
 }
 
+/// [`assert_socket`] for a socket outside `ZELLIJ_SOCK_DIR`, without the stale-socket cleanup.
+#[cfg(unix)]
+fn probe_socket(path: &std::path::Path) -> bool {
+    crate::consts::ipc_connect(path)
+        .map(socket_answers)
+        .unwrap_or(false)
+}
+
 /// On Windows, reads the server PID from the marker file and checks whether
 /// the process is still alive via `OpenProcess`. Cleans up stale marker files.
 #[cfg(windows)]
@@ -369,6 +534,13 @@ fn assert_socket(name: &str) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn assert_socket(_name: &str) -> bool {
     true
+}
+
+/// Only unix resolves the socket directory from the environment, so there is never another
+/// directory to scan elsewhere.
+#[cfg(not(unix))]
+fn probe_socket(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// One row of the `zellij ls` table, already stringified.
@@ -604,6 +776,41 @@ pub fn list_sessions(no_formatting: bool, short: bool, reverse: bool) {
                     short,
                     reverse,
                 );
+const DELETE_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How long to keep sweeping the session_info folder after the server socket has gone away.
+const DELETE_SESSION_SWEEP_DURATION: Duration = Duration::from_millis(500);
+
+/// Archive the session's shape, remove the session_info folder, then keep sweeping it briefly in
+/// case the exiting server writes its snapshot back after the socket has already gone.
+///
+/// Archiving first is what turns the destructive path into the capturing one: deleting a session is
+/// exactly the operation that later motivates restoring it. The server usually archives the same
+/// shape on its way out, and the archive drops a copy identical to the newest one, so an ordinary
+/// `delete-session --force` still leaves one snapshot rather than two.
+fn remove_session_info_folder(
+    name: &str,
+    session_id: &str,
+    snapshot_settings: &SnapshotSettings,
+) -> std::io::Result<()> {
+    if let Err(e) = archive_session_info(name, SnapshotReason::Delete, snapshot_settings) {
+        log::error!(
+            "Failed to archive session {:?} before deleting it: {}",
+            name,
+            e
+        );
+    }
+    let folder = session_info_folder_for_session(session_id);
+    std::fs::remove_dir_all(&folder)?;
+    let deadline = std::time::Instant::now() + DELETE_SESSION_SWEEP_DURATION;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(DELETE_SESSION_POLL_INTERVAL);
+        if folder.exists() {
+            let _ = std::fs::remove_dir_all(&folder);
+        }
+    }
+    Ok(())
+}
+
 /// What `ls --json` reports about the binary behind one live session.
 ///
 /// **Nothing here crosses a contract.** The answer is read from the OS by pid, on the side that
@@ -1034,11 +1241,20 @@ pub fn validate_session_folder_name(name: &str) -> Result<(), String> {
     }
 }
 
-pub fn assert_session_ne(name: &str) {
-    if let Err(e) = validate_session_name(name) {
-        eprintln!("{}", e);
-        process::exit(1);
+/// Drop a dead session's resurrection snapshot, so the name is free and the next session by that
+/// name is built from the layout rather than from the shape it happened to have when it died.
+pub fn discard_resurrection_snapshot(name: &str) {
+    if let Err(e) = std::fs::remove_dir_all(session_info_folder_for_session(&session_id_for(name)))
+    {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::error!(
+                "Failed to discard the resurrection snapshot for session {:?}: {:?}",
+                name,
+                e
+            );
+        }
     }
+}
 
 pub fn assert_session_ne(name: &str) {
     if let Err(e) = validate_session_name(name) {
@@ -1112,21 +1328,74 @@ pub fn read_live_session_states(
     }
 
     let names_by_id = session_index::session_names_by_id();
+    let mut dropped_this_pass: HashMap<String, String> = HashMap::new();
     for (session_id, creation_time) in other_session_names {
+        let session_name = session_name(&names_by_id, session_id.clone());
         let session_cache_file_name = session_info_cache_dir
             .join(&session_id)
             .join("session-metadata.kdl");
-        if let Ok(raw_session_info) = fs::read_to_string(&session_cache_file_name) {
-            if let Ok(mut session_info) =
-                SessionInfo::from_string(&raw_session_info, current_session_name)
-            {
-                session_info.creation_time = creation_time;
-                session_infos_on_machine
-                    .insert(session_name(&names_by_id, session_id), session_info);
-            }
+        match fs::read_to_string(&session_cache_file_name) {
+            Ok(raw_session_info) => {
+                match SessionInfo::from_string(&raw_session_info, current_session_name) {
+                    Ok(mut session_info) => {
+                        session_info.creation_time = creation_time;
+                        session_infos_on_machine.insert(session_name, session_info);
+                    },
+                    Err(e) => {
+                        dropped_this_pass.insert(
+                            session_name,
+                            format!("its metadata file does not parse: {}", e),
+                        );
+                    },
+                }
+            },
+            Err(e) => {
+                dropped_this_pass.insert(
+                    session_name,
+                    format!(
+                        "{} could not be read: {}",
+                        session_cache_file_name.display(),
+                        e
+                    ),
+                );
+            },
         }
     }
+    report_dropped_sessions(dropped_this_pass);
     session_infos_on_machine
+}
+
+/// Why each session is currently missing from the scan, so the same fault is logged once.
+static DROPPED_SESSIONS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+/// Name the live sessions this scan could not list, once each.
+///
+/// A session with a socket but no readable, parseable `session-metadata.kdl` is dropped and the
+/// scan still reports success, so the session manager shows an empty list while `zellij ls` - which
+/// reads the sockets alone - keeps listing the session. That divergence went unexplained for
+/// months. It is a fault, not chatter, so it warns.
+///
+/// The scan runs on every poll of every session-manager plugin, which is about once a second each,
+/// so a persistent fault would otherwise fill the log with one identical line per second. Log only
+/// when a session enters the dropped state or its reason changes, and forget the sessions this pass
+/// listed fine, so a recurrence is reported rather than swallowed.
+fn report_dropped_sessions(dropped_this_pass: HashMap<String, String>) {
+    let previously_dropped = DROPPED_SESSIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut previously_dropped = match previously_dropped.lock() {
+        Ok(previously_dropped) => previously_dropped,
+        Err(poisoned) => poisoned.into_inner(), // a poisoned log-gating map is no reason to panic
+    };
+    for (session_name, reason) in &dropped_this_pass {
+        if previously_dropped.get(session_name) != Some(reason) {
+            log::warn!(
+                "session {} is running but cannot be listed: {}",
+                session_name,
+                reason
+            );
+        }
+    }
+    *previously_dropped = dropped_this_pass;
 }
 
 pub fn read_live_session_states_default_dirs(
