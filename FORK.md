@@ -5542,6 +5542,27 @@ rewritten: an ad-hoc or unsigned pin is reported as not a release build with not
 another team's Developer ID, an Apple Development certificate of the release team and an ad-hoc
 build are each refused over a signed pin, leaving its bytes and recording nothing.
 
+### Panes can ask for the microphone (macOS only)
+
+A program run in a pane asks for macOS permissions as the zellij server, the process macOS holds
+responsible. Full Disk Access, Accessibility and Screen Recording worked that way, but the
+microphone did not: macOS refused at once, without a prompt, and the Microphone pane in System
+Settings has no "+" to add the grant by hand. Two things were missing.
+
+- **An Info.plist.** macOS prompts for the microphone only for a binary whose Info.plist carries
+  `NSMicrophoneUsageDescription`, and a bare Mach-O has none. `src/build.rs` embeds
+  `assets/macos/Info.plist` into the `zellij` binary as its `__TEXT,__info_plist` section
+  (`-Wl,-sectcreate`) on every macOS build, local or CI. Its `CFBundleIdentifier` is the signing
+  identifier, `org.zellij.nkmk`.
+- **The entitlement.** Under the hardened runtime the release is signed with, the microphone also
+  needs `com.apple.security.device.audio-input`. `release.yml` signs with
+  `assets/macos/zellij.entitlements`, and fails the job when the binary lacks the plist section or
+  the signature lacks the entitlement.
+
+Neither changes the signing identifier or team, so the designated requirement every existing grant
+records is unchanged: no re-grant is owed. The first program that asks gets the system prompt once;
+after that every pane inherits the answer.
+
 ### `connect_to_server` gives up on a session that answers to no server
 
 The CLI client's socket connect retried every 50ms forever. That is the right answer while a

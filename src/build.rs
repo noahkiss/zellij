@@ -7,6 +7,18 @@ fn main() {
         println!("cargo:rustc-link-arg=/STACK:8388608");
     }
 
+    // fork addition: embed an Info.plist into the macOS `zellij` binary. A bare Mach-O has none,
+    // and without `NSMicrophoneUsageDescription` macOS refuses microphone access to every pane
+    // without asking. `CARGO_CFG_TARGET_OS`, not `cfg!`: a build script's `cfg!` is the host.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+        println!("cargo:rerun-if-changed=assets/macos/Info.plist");
+        println!(
+            "cargo:rustc-link-arg-bin=zellij=-Wl,-sectcreate,__TEXT,__info_plist,{}/assets/macos/Info.plist",
+            dir
+        );
+    }
+
     // Embed the application icon and manifest into the Windows executables.
     #[cfg(target_os = "windows")]
     {
