@@ -520,7 +520,7 @@ fn f1_opens_all_keys_from_the_sessions_tab() {
     let grid_snapshot = zellij.wait_until("the all keys screen is shown", |grid_snapshot| {
         grid_snapshot.contains("All keys") && grid_snapshot.contains("<Ctrl l>")
     });
-    for key in ["<Ctrl l>", "<Ctrl r>", "<Del>"] {
+    for key in ["<Ctrl l>", "<Ctrl r>", "<Del/Ctrl k>"] {
         assert!(
             grid_snapshot.contains(key),
             "{} is missing from the list:\n{}",

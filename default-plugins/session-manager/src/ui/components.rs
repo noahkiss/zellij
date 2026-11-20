@@ -1222,13 +1222,16 @@ pub fn render_controls_line(
             let disconnect = colors.shortcuts("<Alt x>");
             let disconnect_text = colors.bold("Disconnect others");
             let kill = colors.shortcuts("<Del>");
+            // Mac keyboards without a numpad have no Delete key, so the wide help advertises the
+            // alias too. Only the wide tier: the compact one is already over its own budget.
+            let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill");
             let kill_all = colors.shortcuts("<Ctrl d>");
             let kill_all_text = colors.bold("Kill all");
 
-            if max_cols > 90 {
+            if max_cols > 97 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill} - {kill_text}, {kill_all} - {kill_all_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_text}, {kill_wide} - {kill_text}, {kill_all} - {kill_all_text}"
                 );
                 true
             } else if max_cols >= 28 {
@@ -1244,13 +1247,14 @@ pub fn render_controls_line(
             let enter = colors.shortcuts("<ENTER>");
             let select = colors.bold("Resurrect");
             let del = colors.shortcuts("<DEL>");
+            let del_wide = colors.shortcuts("<DEL/Ctrl k>");
             let del_text = colors.bold("Delete");
             let del_all = colors.shortcuts("<Ctrl d>");
             let del_all_text = colors.bold("Delete all");
 
-            if max_cols > 83 {
+            if max_cols > 90 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del} - {del_text}, {del_all} - {del_all_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {arrows} - {navigate}, {enter} - {select}, {del_wide} - {del_text}, {del_all} - {del_all_text}"
                 );
                 true
             } else if max_cols >= 28 {
@@ -1323,11 +1327,14 @@ pub fn render_controls_line(
             let disconnect_full_text = colors.bold("Disconnect others");
             let disconnect_short_text = colors.bold("Disconnect");
             let kill = colors.shortcuts("<Del>");
+            // Mac keyboards without a numpad have no Delete key, so the widest tier advertises
+            // the alias. The narrower tiers keep "<Del>" rather than lose a whole entry to it.
+            let kill_wide = colors.shortcuts("<Del/Ctrl k>");
             let kill_text = colors.bold("Kill/Delete");
 
-            if max_cols > 76 {
+            if max_cols > 83 {
                 print!(
-                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill} - {kill_text}"
+                    "\u{1b}[m\u{1b}[{y};{x}HHelp: {rename} - {rename_text}, {disconnect} - {disconnect_full_text}, {kill_wide} - {kill_text}"
                 );
                 true
             } else if max_cols > 69 {

@@ -1,4 +1,4 @@
-use crate::compact_bar::action_types::ActionType;
+use crate::compact_bar::action_types::{ActionType, CONFIRM_CLOSE_TAB_PLUGIN};
 use std::collections::HashSet;
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
@@ -396,6 +396,7 @@ impl KeybindProcessor {
                         )
                     },
                     |action: &Action| matches!(action, Action::CloseFocus),
+                    |action: &Action| matches!(action, Action::ReopenPane { list: false, .. }),
                     |action: &Action| {
                         matches!(
                             action,
@@ -463,7 +464,12 @@ impl KeybindProcessor {
                             }
                         )
                     },
-                    |action: &Action| matches!(action, Action::CloseTab),
+                    // fork addition: `|| launches_plugin(..)` because tab mode's close key is
+                    // bound to the confirmation prompt, not to `CloseTab`
+                    |action: &Action| {
+                        matches!(action, Action::CloseTab)
+                            || action.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN)
+                    },
                     |action: &Action| {
                         matches!(
                             action,

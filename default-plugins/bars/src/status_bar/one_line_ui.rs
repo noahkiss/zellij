@@ -16,7 +16,8 @@ use crate::status_bar::second_line::{
     text_copied_hint,
 };
 use crate::status_bar::{
-    action_key, action_key_group, bars_hint, color_elements, MORE_MSG, TO_NORMAL,
+    action_key, action_key_group, bars_hint, color_elements, confirm_close_tab_key, MORE_MSG,
+    TO_NORMAL,
 };
 use crate::status_bar::{ColoredElements, LinePart};
 use zellij_tile::graphemes::display_width;
@@ -1578,6 +1579,12 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
         } else {
             action_key_group(&km, &[&[A::GoToPreviousTab], &[A::GoToNextTab]])
         };
+        // A fallback, not a union: a config that still binds `CloseTab` directly is answered
+        // exactly as before, and the hint never lists two keys for one verb.
+        let close_keys = {
+            let direct = single_action_key(&km, &[A::CloseTab, TO_NORMAL]);
+            if direct.is_empty() { confirm_close_tab_key(&km) } else { direct }
+        };
 
         vec![
         (s("New"), s("New"), single_action_key(&km, &[A::NewTab{
@@ -1592,7 +1599,7 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
             first_pane_unblock_condition: None,
         }, TO_NORMAL])),
         (s("Change focus"), s("Move"), focus_keys),
-        (s("Close"), s("Close"), single_action_key(&km, &[A::CloseTab, TO_NORMAL])),
+        (s("Close"), s("Close"), close_keys),
         (s("Rename"), s("Rename"),
             single_action_key(&km, &[A::SwitchToMode{input_mode: IM::RenameTab}, A::TabNameInput{input: vec![0]}])),
         (s("Sync"), s("Sync"), single_action_key(&km, &[A::ToggleActiveSyncTab, TO_NORMAL])),

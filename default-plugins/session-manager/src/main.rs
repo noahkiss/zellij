@@ -160,6 +160,27 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Kill/delete the selected session: `Delete`, or `Ctrl+k` where `Delete` cannot be typed.
+///
+/// A Mac keyboard without a numeric pad has no Delete key. The label above Backspace says
+/// "delete" but sends Backspace, and `fn+Backspace` - which macOS documents as forward-delete -
+/// does not arrive here as `BareKey::Delete`. So on the fork's own machines the only destructive
+/// action in this plugin was simply unreachable.
+///
+/// `Ctrl+k` for "kill", the one unclaimed mnemonic: `Ctrl+w/f/c/r/d/x/a`, Tab, Esc, Enter, the
+/// arrows and Backspace are all taken here, and every unmodified character is filter input.
+///
+/// Written as a guard rather than an or-pattern because each key needs its OWN modifier test. A
+/// single shared guard would accept `Ctrl+Delete` and, far worse, a bare `k` - which is filter
+/// typing, so the first search for a session with a k in its name would delete one instead.
+fn is_kill_key(key: &KeyWithModifier) -> bool {
+    match key.bare_key {
+        BareKey::Delete => key.has_no_modifiers(),
+        BareKey::Char('k') => key.has_modifiers(&[KeyModifier::Ctrl]),
+        _ => false,
+    }
+}
+
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.is_welcome_screen = configuration
@@ -1432,7 +1453,7 @@ impl State {
                     self.renaming_session_name = Some(String::new());
                     should_render = true;
                 },
-                BareKey::Delete if key.has_no_modifiers() => {
+                BareKey::Delete | BareKey::Char('k') if is_kill_key(&key) => {
                     if let Some(selected_session_name) = self.sessions.get_selected_session_name() {
                         let was_searching = self.sessions.is_searching;
                         let prev_search_idx = self.sessions.selected_search_index;
@@ -1545,7 +1566,7 @@ impl State {
                 self.toggle_active_screen();
                 should_render = true;
             },
-            BareKey::Delete if key.has_no_modifiers() => {
+            BareKey::Delete | BareKey::Char('k') if is_kill_key(&key) => {
                 self.resurrectable_sessions.delete_selected_session();
                 should_render = true;
             },
@@ -1740,7 +1761,7 @@ impl State {
                 self.single_screen_state.transition_to_layout_selection();
                 should_render = true;
             },
-            BareKey::Delete if key.has_no_modifiers() => {
+            BareKey::Delete | BareKey::Char('k') if is_kill_key(&key) => {
                 let selected = self
                     .single_screen_state
                     .get_selected_result()
@@ -2979,7 +3000,7 @@ impl State {
         hints.push(hint("<←→>", "show tabs and panes"));
         hints.push(hint("<Ctrl l>", "new session with a layout"));
         hints.push(hint("<Ctrl r>", "rename this session"));
-        hints.push(hint("<Del>", "stop or delete the selected session"));
+        hints.push(hint("<Del/Ctrl k>", "stop or delete the selected session"));
         if self.exited_session_count() > 0 {
             hints.push(hint("<Shift Del>", "delete all exited sessions"));
         }
@@ -3417,7 +3438,7 @@ impl State {
                         self.open_tree_child();
                         Some(true)
                     },
-                    BareKey::Delete if key.has_no_modifiers() => Some(false),
+                    BareKey::Delete | BareKey::Char('k') if is_kill_key(key) => Some(false),
                     BareKey::Char('r') if key.has_modifiers(&[KeyModifier::Ctrl]) => Some(false),
                     _ => self.handle_manager_key(key),
                 }
@@ -5199,6 +5220,25 @@ mod sessions_live_view_tests {
         state.error = None;
         state.handle_key(KeyWithModifier::new(BareKey::Enter));
         assert_eq!(state.panel.size, None);
+    }
+
+    #[test]
+    fn ctrl_k_stops_a_session_like_delete_and_a_bare_k_does_not() {
+        let mut state = sessions_browser();
+        let web = state
+            .panel
+            .tree
+            .rows
+            .iter()
+            .position(|row| row.session == "web")
+            .expect("the web session is listed");
+        select(&mut state, web);
+        state.handle_key(KeyWithModifier::new(BareKey::Char('k')));
+        assert_eq!(state.pending_session_stop, None);
+        let mut state = sessions_browser();
+        select(&mut state, web);
+        state.handle_key(KeyWithModifier::new(BareKey::Char('k')).with_ctrl_modifier());
+        assert_eq!(state.pending_session_stop, Some("web".to_owned()));
     }
 
     #[test]

@@ -1,6 +1,11 @@
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 
+/// fork addition: the plugin this fork's default config launches from tab mode's close key,
+/// written exactly as the binding writes it. Naming it is the whole point - the match must not
+/// claim whichever plugin launch happens to be bound first in the mode.
+pub const CONFIRM_CLOSE_TAB_PLUGIN: &str = "zellij:confirm-close-tab";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ActionType {
     MoveFocus,
@@ -26,6 +31,7 @@ pub enum ActionType {
     ToggleFocusFullscreen,
     ToggleFloatingPanes,
     CloseFocus,
+    ReopenPane,
     CloseTab,
     ToggleActiveSyncTab,
     ToggleTab,
@@ -87,6 +93,7 @@ impl ActionType {
             ActionType::ToggleFocusFullscreen => "Toggle fullscreen".to_string(),
             ActionType::ToggleFloatingPanes => "Show/hide floating panes".to_string(),
             ActionType::CloseFocus => "Close pane".to_string(),
+            ActionType::ReopenPane => "Reopen closed pane".to_string(),
             ActionType::CloseTab => "Close tab".to_string(),
             ActionType::ToggleActiveSyncTab => "Sync panes in tab".to_string(),
             ActionType::ToggleTab => "Circle tab focus".to_string(),
@@ -140,6 +147,7 @@ impl ActionType {
             Action::ToggleFocusFullscreen => ActionType::ToggleFocusFullscreen,
             Action::ToggleFloatingPanes => ActionType::ToggleFloatingPanes,
             Action::CloseFocus => ActionType::CloseFocus,
+            Action::ReopenPane { .. } => ActionType::ReopenPane,
             Action::CloseTab => ActionType::CloseTab,
             Action::ToggleActiveSyncTab => ActionType::ToggleActiveSyncTab,
             Action::ToggleTab => ActionType::ToggleTab,
@@ -155,6 +163,10 @@ impl ActionType {
             action if action.launches_plugin("configuration") => ActionType::Configuration,
             action if action.launches_plugin("plugin-manager") => ActionType::PluginManager,
             action if action.launches_plugin("zellij:about") => ActionType::About,
+            // fork addition: tab mode's close key launches a confirmation prompt instead of
+            // running `CloseTab`, so the key has to be classified by what it launches or the
+            // close hint has no key to name.
+            action if action.launches_plugin(CONFIRM_CLOSE_TAB_PLUGIN) => ActionType::CloseTab,
             action if matches!(action, Action::NewTab { .. }) => ActionType::NewTab,
             _ => ActionType::Other(format!("{:?}", action)),
         }
