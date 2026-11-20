@@ -39,6 +39,13 @@ use zellij_utils::{
     shared::make_terminal_title,
 };
 
+/// fork addition: the note the server leaves on a plugin pane whose plugin failed.
+///
+/// The counterpart of the `exit 7` a failed command pane gets. It says the kind of failure rather
+/// than the error itself: the loader's error is a formatted chain several lines long, and a note is
+/// one short line on a pane frame. The pane's body still carries the full text.
+const PLUGIN_FAILURE_NOTE: &str = "plugin failed";
+
 macro_rules! style {
     ($fg:expr) => {
         ansi_term::Style::new().fg(match $fg {
@@ -613,8 +620,7 @@ impl Pane for PluginPane {
         self.set_should_render(true);
     }
     fn dump_screen(&self, full: bool, client_id: Option<ClientId>) -> String {
-        client_id
-            .and_then(|c| self.grids.get(&c))
+        self.grid_to_dump(client_id)
             .map(|g| g.dump_screen(full))
             .unwrap_or_else(|| "".to_owned())
     }
@@ -858,11 +864,23 @@ impl Pane for PluginPane {
         }
         self.loading_indication.merge(loading_indication);
         self.write_loading_indication();
+        // fork addition: a plugin that failed leaves its own note, exactly as a command pane that
+        // exited non-zero does. The pane's body says ERROR IN PLUGIN, but that text goes the moment
+        // anything else is drawn over it and nothing outside the server could read it at all - the
+        // note is the durable mark, and `list-panes` prints it. It covers a runtime panic too: a
+        // crash is reported through this same path
+        if self.loading_indication.is_error() {
+            self.set_pane_note(Some((PLUGIN_FAILURE_NOTE.to_owned(), NoteColor::Error)));
+        }
     }
     fn start_loading_indication(&mut self, loading_indication: LoadingIndication) {
         self.loading_only_for = None;
         self.loading_indication.merge(loading_indication);
         self.write_loading_indication();
+        // see `TerminalPane::rerun`: the mark describes the attempt that ended, and this is a new
+        // one. Clearing it here rather than on success means a reload that fails again re-marks the
+        // pane a moment later, and a reload that hangs leaves no stale claim of failure
+        self.set_pane_note(None);
     }
     fn start_loading_indication_for_client(
         &mut self,
@@ -1030,6 +1048,15 @@ impl Pane for PluginPane {
 }
 
 impl PluginPane {
+    // callers that address a pane by id rather than by focus (eg. `dump-screen --pane-id`) have no
+    // client_id to offer. Every client's grid holds the same rendered plugin output, so any one of
+    // them answers the question.
+    fn grid_to_dump(&self, client_id: Option<ClientId>) -> Option<&Grid> {
+        match client_id {
+            Some(client_id) => self.grids.get(&client_id),
+            None => self.grids.values().next(),
+        }
+    }
     fn resize_grids(&mut self) {
         let content_rows = self.get_content_rows();
         let content_columns = self.get_content_columns();

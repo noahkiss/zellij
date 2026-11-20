@@ -6289,6 +6289,8 @@ fn init_session(
                     plugin_aliases,
                     default_mode,
                     default_keybinds,
+                    plugin_permissions,
+                    plugin_watch,
                     background_plugins,
                     client_id,
                 )

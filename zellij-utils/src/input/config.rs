@@ -21,6 +21,7 @@ use super::keybinds::Keybinds;
 use super::layout::RunPluginOrAlias;
 use super::mousebinds::Mousebinds;
 use super::options::Options;
+use super::permission::PluginPermissions;
 use super::plugins::{PluginAliases, PluginsConfigError};
 use super::session_suggestions::SessionSuggestionsConfig;
 use super::terminal::TerminalConfig;

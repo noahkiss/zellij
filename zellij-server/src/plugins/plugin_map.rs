@@ -22,7 +22,9 @@ use zellij_utils::{
     input::layout::{PluginUserConfiguration, RunPlugin, RunPluginLocation},
     input::plugins::PluginConfig,
 };
-use zellij_utils::{data::PermissionType, errors::prelude::*};
+use zellij_utils::{
+    data::PermissionType, errors::prelude::*, input::permission::PluginPermissions,
+};
 
 // the idea here is to provide atomicity when adding/removing plugins from the map (eg. when a new
 // client connects) but to also allow updates/renders not to block each other
@@ -248,6 +250,25 @@ impl PluginMap {
         }
         Ok(plugin_ids)
     }
+    pub fn all_plugin_ids_for_plugin_location_only(
+        &self,
+        plugin_location: &RunPluginLocation,
+    ) -> Result<Vec<PluginId>> {
+        let err_context = || format!("Failed to get plugin ids for location {plugin_location}");
+        let plugin_ids: Vec<PluginId> = self
+            .plugin_assets
+            .iter()
+            .filter(|(_, (running_plugin, _subscriptions, _workers))| {
+                let running_plugin = running_plugin.lock().unwrap();
+                &running_plugin.store.data().plugin.location == plugin_location
+            })
+            .map(|((plugin_id, _client_id), _)| *plugin_id)
+            .collect();
+        if plugin_ids.is_empty() {
+            return Err(ZellijError::PluginDoesNotExist).with_context(err_context);
+        }
+        Ok(plugin_ids)
+    }
     pub fn clone_plugin_assets(
         &self,
     ) -> HashMap<RunPluginLocation, HashMap<PluginUserConfiguration, Vec<(PluginId, ClientId)>>>
@@ -359,6 +380,7 @@ pub struct PluginEnv {
     pub stdin_pipe: Arc<Mutex<VecDeque<u8>>>,
     pub stdout_pipe: Arc<Mutex<VecDeque<u8>>>,
     pub keybinds: SharedKeybinds,
+    pub plugin_permissions: Arc<PluginPermissions>,
     pub intercepting_key_presses: bool,
     pub pending_popup_size: Option<(usize, usize)>,
     pub store_limits: StoreLimits,

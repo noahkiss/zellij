@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{plugins::PluginInstruction, pty::PtyInstruction};
 
-use zellij_utils::channels::{self, ChannelWithContext, Receiver};
+use zellij_utils::channels::{self, ChannelWithContext, Receiver, RecvTimeoutError};
 
 macro_rules! log_actions_in_thread {
     ( $arc_mutex_log:expr, $exit_event:path, $receiver:expr, $exit_after_count:expr ) => {
@@ -418,6 +418,8 @@ pub(super) fn create_plugin_thread(
                 InputMode::Normal,
                 Default::default(),
                 Default::default(),
+                false,
+                Default::default(),
                 initiating_client_id,
             )
             .expect("TEST")
@@ -505,6 +507,8 @@ fn create_plugin_thread_with_server_receiver(
                 PluginAliases::default(),
                 InputMode::Normal,
                 Default::default(),
+                Default::default(),
+                false,
                 Default::default(),
                 initiating_client_id,
             )
@@ -602,6 +606,8 @@ fn create_plugin_thread_with_pty_receiver(
                 InputMode::Normal,
                 Default::default(),
                 Default::default(),
+                false,
+                Default::default(),
                 initiating_client_id,
             )
             .expect("TEST")
@@ -691,6 +697,8 @@ fn create_plugin_thread_with_background_jobs_receiver(
                 InputMode::Normal,
                 Default::default(),
                 Default::default(),
+                false,
+                Default::default(),
                 initiating_client_id,
             )
             .expect("TEST")
@@ -716,6 +724,134 @@ fn create_plugin_thread_with_background_jobs_receiver(
     )
 }
 
+#[test]
+pub fn a_failed_remote_download_does_not_park_later_reloads() {
+    // A download failure used to `return` before ever sending `ApplyCachedEvents`, so the
+    // plugin_id it created never left `loading_plugins` - and `reload_plugin` refuses to do
+    // anything for a location it believes is "currently loading", forever. This does not need the
+    // e2e fixture: the download fails before wasmtime is ever reached, so it also does not need
+    // `#[ignore]`. It does not need real network either - port 1 on loopback refuses instantly.
+    let (plugin_thread_sender, screen_receiver, teardown) = create_plugin_thread(None, None);
+    let client_id = 1;
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let run_plugin = RunPluginOrAlias::RunPlugin(RunPlugin {
+        location: RunPluginLocation::Remote("http://127.0.0.1:1/nope.wasm".to_owned()),
+        configuration: Default::default(),
+        ..Default::default()
+    });
+
+    // `ScreenInstruction::Exit` is a unit variant, and both capture macros in this file only match
+    // a tuple or struct exit event - so this listens directly, bounded by wall-clock time rather
+    // than an event count, which also means a regression that goes back to parking forever fails
+    // this test instead of hanging it.
+    let received_screen_instructions = Arc::new(Mutex::new(vec![]));
+    let screen_thread = {
+        let log = received_screen_instructions.clone();
+        std::thread::Builder::new()
+            .name("plugin_download_loop_test_screen_listener".to_string())
+            .spawn(move || loop {
+                match screen_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok((event, _err_ctx)) => {
+                        let is_exit = matches!(event, ScreenInstruction::Exit);
+                        log.lock().unwrap().push(event);
+                        if is_exit {
+                            break;
+                        }
+                    },
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            })
+            .unwrap()
+    };
+
+    let _ = plugin_thread_sender.send(PluginInstruction::AddClient(client_id));
+    let _ = plugin_thread_sender.send(PluginInstruction::Load(
+        Some(false),
+        false,
+        false,
+        None,
+        run_plugin.clone(),
+        Some(1),
+        None,
+        client_id,
+        size,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+    // the download is a loopback connection refusal, near-instant, but still async
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // before the fix this is a silent no-op: `reload_plugin` sees the first attempt's location as
+    // still "loading" and only queues it in `pending_plugin_reloads`, which nothing ever drains
+    // because `ApplyCachedEvents` - the only thing that drains it - was also never sent
+    let _ = plugin_thread_sender.send(PluginInstruction::Reload(
+        Some(false),
+        None,
+        run_plugin,
+        1,
+        size,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    teardown();
+    screen_thread.join().unwrap();
+
+    let plugin_ids_that_attempted_to_load: std::collections::HashSet<u32> =
+        received_screen_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|i| match i {
+                ScreenInstruction::UpdatePluginLoadingStage(plugin_id, _) => Some(*plugin_id),
+                _ => None,
+            })
+            .collect();
+
+    // The reload's second attempt is a `StartPluginLoadingIndication` for the SAME plugin id, not
+    // a new id: `reload_plugin` finds the failed pane through the failure record and recovers it in
+    // place, rather than falling through to spawning a stray second pane beside it. That
+    // instruction is sent from `reload_plugin_with_id` only after every refusal check has passed,
+    // so seeing it is what proves the reload ran at all.
+    //
+    // Without the fix the location is still in `loading_plugins`, `reload_plugin` returns at its
+    // "currently being loaded" guard having only queued the reload in `pending_plugin_reloads`,
+    // nothing ever drains that queue, and this instruction never arrives.
+    let failed_plugin_id = *plugin_ids_that_attempted_to_load
+        .iter()
+        .next()
+        .expect("the first load should have reported its download failure");
+    let started_a_second_attempt = received_screen_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|i| {
+            matches!(
+                i,
+                ScreenInstruction::StartPluginLoadingIndication(plugin_id, _, _)
+                    if *plugin_id == failed_plugin_id
+            )
+        });
+    assert!(
+        started_a_second_attempt,
+        "the reload should have started a second load attempt for the failed pane instead of \
+         being silently parked behind the first one's failure; screen only saw: {:?}",
+        received_screen_instructions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|i| format!("{:?}", i).chars().take(48).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+}
+
 pub(crate) fn e2e_plugin_path(name: &str) -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .filter(|target_dir| !target_dir.is_empty())
@@ -725,10 +861,6 @@ pub(crate) fn e2e_plugin_path(name: &str) -> PathBuf {
         .join(format!("{}.wasm", name))
 }
 
-lazy_static! {
-    static ref PLUGIN_FIXTURE: String = e2e_plugin_path("fixture-plugin-for-tests")
-        .display()
-        .to_string();
 }
 
 #[test]
@@ -13853,6 +13985,7 @@ fn plugin_env_without_read_pane_contents() -> super::plugin_map::PluginEnv {
         stdin_pipe,
         stdout_pipe,
         keybinds: Arc::new(Default::default()),
+        plugin_permissions: Default::default(),
         intercepting_key_presses: false,
         pending_popup_size: None,
         store_limits: wasmi::StoreLimitsBuilder::new().build(),
@@ -14967,3 +15100,137 @@ pub fn a_plugin_whose_file_is_missing_stays_in_the_dumped_layout() {
     );
 }
 
+/// The loop this exists for: a `file:` plugin fails to load, the file is fixed, the pane is
+/// reloaded. It used to bail, because the reload read the plugin's config, size, tab index and cwd
+/// off the RUNNING instance and a pane whose plugin never loaded has none - and because the reload
+/// could not find the failed pane by location either, so `start-or-reload-plugin` spawned a stray
+/// pane beside the broken one and left it broken. Restoring the layout was the only way back.
+///
+/// This does not need the e2e fixture: the file is missing, so the load fails before wasmtime is
+/// ever reached. It also cannot assert a SUCCESSFUL reload for the same reason - what it asserts is
+/// that the reload reaches the loader for the pane that is already there, which is the whole of
+/// what was broken.
+#[test]
+pub fn a_pane_whose_plugin_failed_to_load_can_be_reloaded() {
+    let temp_folder = tempdir().unwrap();
+    let plugin_host_folder = PathBuf::from(temp_folder.path());
+    let missing_plugin_path = plugin_host_folder.join("not-there-yet.wasm");
+    let (plugin_thread_sender, screen_receiver, teardown) =
+        create_plugin_thread(Some(plugin_host_folder.clone()), None);
+    let client_id = 1;
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let run_plugin = RunPluginOrAlias::RunPlugin(RunPlugin {
+        _allow_exec_host_cmd: false,
+        location: RunPluginLocation::File(missing_plugin_path.clone()),
+        configuration: Default::default(),
+        ..Default::default()
+    });
+
+    // drained continuously rather than by event count: a regression here shows up as an event that
+    // never arrives, which would hang a counting listener instead of failing it
+    let received_screen_instructions = Arc::new(Mutex::new(vec![]));
+    let screen_thread = {
+        let log = received_screen_instructions.clone();
+        std::thread::Builder::new()
+            .name("plugin_reload_recovery_test_screen_listener".to_string())
+            .spawn(move || loop {
+                match screen_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok((event, _err_ctx)) => {
+                        let is_exit = matches!(event, ScreenInstruction::Exit);
+                        log.lock().unwrap().push(event);
+                        if is_exit {
+                            break;
+                        }
+                    },
+                    Err(zellij_utils::channels::RecvTimeoutError::Timeout) => continue,
+                    Err(zellij_utils::channels::RecvTimeoutError::Disconnected) => break,
+                }
+            })
+            .unwrap()
+    };
+
+    let _ = plugin_thread_sender.send(PluginInstruction::AddClient(client_id));
+    let _ = plugin_thread_sender.send(PluginInstruction::Load(
+        Some(false),
+        false,
+        false, // close_replaced_pane
+        Some("test_plugin".to_owned()),
+        run_plugin.clone(),
+        Some(1), // tab index
+        None,
+        client_id,
+        size,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // the pane is added before the load is attempted, so it outlives the failure - and it is the
+    // pane the reload has to find
+    let failed_pane_plugin_id = received_screen_instructions
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|instruction| match instruction {
+            ScreenInstruction::AddPlugin(_, _, _, _, _, _, plugin_id, ..) => Some(*plugin_id),
+            _ => None,
+        })
+        .expect("the failed load still left a pane behind");
+    let loading_attempts_before_reload = loading_attempts_for(
+        &received_screen_instructions.lock().unwrap(),
+        failed_pane_plugin_id,
+    );
+
+    let _ = plugin_thread_sender.send(PluginInstruction::Reload(
+        Some(false),
+        None,
+        run_plugin,
+        1, // tab index
+        size,
+        None,
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    teardown();
+    screen_thread.join().unwrap();
+
+    let instructions = received_screen_instructions.lock().unwrap();
+    let panes_added = instructions
+        .iter()
+        .filter(|instruction| matches!(instruction, ScreenInstruction::AddPlugin(..)))
+        .count();
+    assert_eq!(
+        panes_added, 1,
+        "the reload should have reused the pane that is already there instead of spawning a stray \
+         one beside it"
+    );
+    assert!(
+        loading_attempts_for(&instructions, failed_pane_plugin_id) > loading_attempts_before_reload,
+        "the reload should have reached the loader for plugin {}, and instead bailed before it: \
+         {} attempt(s) before the reload, {} after",
+        failed_pane_plugin_id,
+        loading_attempts_before_reload,
+        loading_attempts_for(&instructions, failed_pane_plugin_id)
+    );
+}
+
+/// How many times the loader has reported on this plugin id - one per load attempt, success or
+/// failure.
+fn loading_attempts_for(instructions: &[ScreenInstruction], plugin_id: u32) -> usize {
+    instructions
+        .iter()
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                ScreenInstruction::UpdatePluginLoadingStage(id, _) if *id == plugin_id
+            )
+        })
+        .count()
+}

@@ -8305,6 +8305,9 @@ impl Config {
             let load_plugins = load_plugins_from_kdl(kdl_load_plugins)?;
             config.background_plugins = load_plugins;
         }
+        if let Some(kdl_plugin_permissions) = kdl_config.get("plugin_permissions") {
+            config.plugin_permissions = plugin_permissions_from_kdl(kdl_plugin_permissions)?;
+        }
         if let Some(kdl_ui_config) = kdl_config.get("ui") {
             config.ui = UiConfig::from_kdl_over(&kdl_ui_config, &config.ui)?;
         }
@@ -8374,6 +8377,12 @@ impl Config {
 
         let load_plugins = load_plugins_to_kdl(&self.background_plugins, add_comments);
         document.nodes_mut().push(load_plugins);
+
+        if !self.plugin_permissions.is_empty() {
+            document
+                .nodes_mut()
+                .push(plugin_permissions_to_kdl(&self.plugin_permissions));
+        }
 
         if let Some(ui_config) = self.ui.to_kdl() {
             document.nodes_mut().push(ui_config);
@@ -8865,6 +8874,91 @@ impl PluginAliases {
         }
         plugins
     }
+}
+
+/// Parse a `plugin_permissions` block: plugin location -> list of PermissionType names.
+///
+/// Only explicitly enumerated local plugin paths are accepted. A pre-grant means "trust whatever
+/// wasm ever sits at this path", so wildcards and remote URLs - where the set of trusted code is
+/// open-ended or not under the user's control - are rejected rather than silently honoured.
+pub fn plugin_permissions_from_kdl(
+    kdl_plugin_permissions: &KdlNode,
+) -> Result<PluginPermissions, ConfigError> {
+    let mut granted: BTreeMap<String, Vec<PermissionType>> = BTreeMap::new();
+    let Some(children) = kdl_plugin_permissions.children() else {
+        return Ok(PluginPermissions { granted });
+    };
+    for plugin_node in children.nodes() {
+        let raw_location = plugin_node.name().value();
+        // a `file:` plugin's location renders as the bare path, but accepting the URL form too
+        // means a location copied out of a layout or the permissions cache works as written. A
+        // location copied out of a layout is also the form that reaches here with a `~` in it,
+        // while what it is matched against is the absolute path the plugin resolves to - so it is
+        // expanded, and a pre-grant that would otherwise never match anything works too
+        let location = expand_path(raw_location.strip_prefix("file:").unwrap_or(raw_location))
+            .to_string_lossy()
+            .into_owned();
+        // the checks read the EXPANDED location: what a variable expands to is what will be
+        // matched, so it is what has to be rejected
+        if location.contains('*') || location.contains('?') {
+            return Err(ConfigError::new_kdl_error(
+                format!(
+                    "Wildcards are not supported in plugin_permissions, list each plugin explicitly: {}",
+                    raw_location
+                ),
+                plugin_node.span().offset(),
+                plugin_node.span().len(),
+            ));
+        }
+        if location.starts_with("http://")
+            || location.starts_with("https://")
+            || location.starts_with("zellij:")
+        {
+            return Err(ConfigError::new_kdl_error(
+                format!(
+                    "Only local plugin paths can be pre-granted permissions, not: {}",
+                    raw_location
+                ),
+                plugin_node.span().offset(),
+                plugin_node.span().len(),
+            ));
+        }
+        let mut permissions = vec![];
+        for permission_node in plugin_node.children().map(|c| c.nodes()).unwrap_or(&[]) {
+            let permission_name = permission_node.name().value();
+            match PermissionType::from_str(permission_name) {
+                Ok(permission) => permissions.push(permission),
+                // a permission from a newer build: granting the rest is what the line asks for
+                Err(_) => note_unknown(
+                    permission_node.span().offset(),
+                    format!(
+                        "unknown permission {:?} for {:?} in plugin_permissions, not granted",
+                        permission_name, raw_location
+                    ),
+                ),
+            }
+        }
+        granted.entry(location).or_default().extend(permissions);
+    }
+    Ok(PluginPermissions { granted })
+}
+
+pub fn plugin_permissions_to_kdl(plugin_permissions: &PluginPermissions) -> KdlNode {
+    let mut node = KdlNode::new("plugin_permissions");
+    let mut children = KdlDocument::new();
+    for (location, permissions) in plugin_permissions.granted.iter() {
+        let mut plugin_node = KdlNode::new(location.as_str());
+        let mut plugin_children = KdlDocument::new();
+        for permission in permissions {
+            plugin_children
+                .nodes_mut()
+                .push(KdlNode::new(permission.to_string()));
+        }
+        plugin_node.set_children(plugin_children);
+        children.nodes_mut().push(plugin_node);
+    }
+    node.set_children(children);
+    node
 }
 
 pub fn load_plugins_to_kdl(background_plugins: &[RunPluginOrAlias], add_comments: bool) -> KdlNode {
@@ -13266,6 +13360,74 @@ fn the_default_config_offers_to_hide_and_show_bars_in_the_right_click_menu() {
         &ContextMenuAction::Action(Action::ShowBars)
     ));
 }
+
+#[test]
+fn can_pre_grant_plugin_permissions_from_config() {
+    let config_str = r#"
+        plugin_permissions {
+            "/home/user/.config/zellij/plugins/my_plugin.wasm" {
+                ReadApplicationState
+                ChangeApplicationState
+            }
+            // the file: form is accepted and normalized to the bare path zellij matches on
+            "file:/home/user/.config/zellij/plugins/other.wasm" {
+                RunCommands
+            }
+        }
+    "#;
+    let config = Config::from_kdl(config_str, None).unwrap();
+    assert!(config.plugin_permissions.all_granted(
+        "/home/user/.config/zellij/plugins/my_plugin.wasm",
+        &[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState
+        ]
+    ));
+    assert!(config.plugin_permissions.all_granted(
+        "/home/user/.config/zellij/plugins/other.wasm",
+        &[PermissionType::RunCommands]
+    ));
+    assert!(!config.plugin_permissions.all_granted(
+        "/home/user/.config/zellij/plugins/my_plugin.wasm",
+        &[PermissionType::RunCommands]
+    ));
+}
+
+#[test]
+fn plugin_permissions_reject_wildcards_and_remote_urls() {
+    let with_wildcard = r#"
+        plugin_permissions {
+            "/home/user/.config/zellij/plugins/*.wasm" {
+                RunCommands
+            }
+        }
+    "#;
+    assert!(Config::from_kdl(with_wildcard, None).is_err());
+    let with_remote_url = r#"
+        plugin_permissions {
+            "https://example.com/plugin.wasm" {
+                RunCommands
+            }
+        }
+    "#;
+    assert!(Config::from_kdl(with_remote_url, None).is_err());
+}
+
+#[test]
+fn plugin_permissions_survive_a_config_round_trip() {
+    let config_str = r#"
+        plugin_permissions {
+            "/home/user/.config/zellij/plugins/my_plugin.wasm" {
+                ReadApplicationState
+            }
+        }
+    "#;
+    let config = Config::from_kdl(config_str, None).unwrap();
+    let serialized = config.to_string(false);
+    let deserialized = Config::from_kdl(&serialized, None).unwrap();
+    assert_eq!(config.plugin_permissions, deserialized.plugin_permissions);
+}
+
 #[test]
 fn bell_clear_delay_config_parsing() {
     let config = Config::from_kdl("bell_clear_delay_ms 1000", None).unwrap();
@@ -14546,6 +14708,44 @@ fn path_options_are_expanded() {
         options.web_server_key,
         Some(PathBuf::from("/etc/zellij/key.pem"))
     );
+}
+
+#[test]
+fn a_plugin_permission_written_with_a_tilde_matches_the_path_the_plugin_resolves_to() {
+    let home = home_dir_for_test();
+    // the form a location takes in a layout, which is where these are copied from
+    let config_str = r#"
+        plugin_permissions {
+            "file:~/.config/zellij/plugins/my_plugin.wasm" {
+                ReadApplicationState
+            }
+            "$HOME/.config/zellij/plugins/other.wasm" {
+                RunCommands
+            }
+        }
+    "#;
+    let config = Config::from_kdl(config_str, None).unwrap();
+    assert!(config.plugin_permissions.all_granted(
+        &format!("{}/.config/zellij/plugins/my_plugin.wasm", home),
+        &[PermissionType::ReadApplicationState]
+    ));
+    assert!(config.plugin_permissions.all_granted(
+        &format!("{}/.config/zellij/plugins/other.wasm", home),
+        &[PermissionType::RunCommands]
+    ));
+}
+
+#[test]
+fn plugin_permissions_reject_what_expansion_produces_too() {
+    // the check reads the expanded location, so a wildcard cannot arrive by way of a variable
+    let expands_to_a_wildcard = r#"
+        plugin_permissions {
+            "~/.config/zellij/plugins/*.wasm" {
+                RunCommands
+            }
+        }
+    "#;
+    assert!(Config::from_kdl(expands_to_a_wildcard, None).is_err());
 }
 
 #[test]

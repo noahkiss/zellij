@@ -37,6 +37,8 @@ fn cached_background_permission_results_reach_existing_instances_before_client_c
         vec![],
         Default::default(),
         Default::default(),
+        Default::default(),
+        false,
     );
     let run = RunPlugin::from_url(&format!(
         "file:{}",

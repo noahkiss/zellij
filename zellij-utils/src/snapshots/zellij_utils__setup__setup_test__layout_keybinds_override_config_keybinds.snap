@@ -1,9 +1,9 @@
 ---
 source: zellij-utils/src/setup.rs
-assertion_line: 1007
 expression: "format!(\"{:#?}\", config)"
 ---
 Config {
+    new_pane_default: None,
     keybinds: {
         Normal: {
             KeyWithModifier {
@@ -110,6 +110,9 @@ Config {
         mouse_mode: None,
         pane_frames: None,
         pane_frame_style: None,
+        plugin_watch: None,
+        expect_full_disk_access: None,
+        stale_build_notice: None,
         mirror_session: None,
         on_force_close: None,
         scroll_buffer_size: None,
@@ -124,6 +127,19 @@ Config {
         session_serialization: None,
         serialize_pane_viewport: None,
         scrollback_lines_to_serialize: None,
+        snapshot_dir: None,
+        session_snapshot_limit: None,
+        bell_clear_delay_ms: None,
+        terminal_title_template: None,
+        session_aliases: None,
+        session_restart_drop_env: None,
+        session_service: None,
+        resurrect_command_hints: None,
+        resurrect_commands: None,
+        detect_agents: None,
+        pane_frame_agent_name: None,
+        session_up_resume: None,
+        default_floating_size: None,
         styled_underlines: None,
         serialization_interval: None,
         disable_session_metadata: None,
@@ -167,6 +183,8 @@ Config {
         bars_hidden_on_start: None,
         hidden_bars_notification: None,
         mode_hints_when_bars_hidden: None,
+        input_while_scrolled: None,
+        command_pane_on_clean_exit: None,
     },
     themes: {},
     plugins: PluginAliases {
@@ -5602,4 +5620,8 @@ Config {
         },
         notification_details: None,
     },
+    plugin_permissions: PluginPermissions {
+        granted: {},
+    },
+    warnings: [],
 }
