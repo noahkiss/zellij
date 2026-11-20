@@ -9311,6 +9311,24 @@ action, `action watch` or `list-agents --watch` against a server from after it, 
 Upstream actions keep working in both directions. A plugin built before this reads none of the
 fork's `PaneInfo` fields and no `top_only` style; the checked-in plugins are rebuilt with it.
 
+### A change that adds a home path, a private address or a tailnet name fails CI
+
+The `Leak scan` workflow (`.github/workflows/leak-scan.yml`) runs on every pull request and every
+push to `main`, with no path filter: a doc is where such a leak most often lands. It runs
+`.github/scripts/leak-scan.sh` over the lines the change ADDS, so content already in the tree
+never fails it:
+
+- a home directory path, `/home/<name>/` or `/Users/<name>/`;
+- a private IPv4 address (10/8, 172.16/12, 192.168/16) or a Tailscale CGNAT one (100.64/10);
+- a `*.ts.net` name.
+
+The rules are generic; the repo is public. `leak-scan-allowlist.txt` beside the script lets
+placeholder names and upstream's own fixtures through, one regex per line against `<path>:<match>`.
+A pull request scans its merge commit against the base; a push scans from the commit before it,
+so a forced push (a rebase onto upstream) scans the whole rewrite. Upstream content it flags then
+goes into the allowlist. `leak-scan-test.sh` runs first and checks the scanner against crafted
+diffs.
+
 ## Assessed and deliberately not built
 
 - **An HTTP/WS API on the embedded web server.** Everything it would have exposed already ships

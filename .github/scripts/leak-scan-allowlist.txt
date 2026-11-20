@@ -1,0 +1,20 @@
+# Allowlist for leak-scan.sh: one Perl regex per line, matched against `<path>:<match>`.
+# Keep every entry generic or upstream-owned. Never add a real machine, user or address of ours.
+
+# Placeholder home directories in docs, tests and examples.
+:/(home|Users)/(user|u|me|you|name|someone|alice|bob|example|runner)/$
+
+# Homebrew's Linux prefix is a fixed path, not a person.
+:/home/linuxbrew/$
+
+# Upstream's recorded terminal sessions, their goldens and snapshots carry its authors' paths.
+:/home/(aram|thomas|jinho)/$
+^src/tests/fixtures/
+^zellij-terminal/fixtures/goldens/
+/snapshots/[^:]*\.snap:
+
+# Sample addresses already in tests, each pinned to its file.
+^default-plugins/session-manager/src/main\.rs:10\.0\.0\.7$
+^zellij-utils/src/desktop_integration/platform\.rs:10\.0\.0\.[12]$
+^zellij-utils/src/input/cli_assets\.rs:192\.168\.1\.[25]$
+^zellij-utils/src/plugin_api/event\.rs:192\.168\.1\.5$
