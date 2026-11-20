@@ -1,4 +1,8 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use tokio::sync::oneshot;
+
 use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::thread_bus::ThreadSenders;
@@ -319,6 +323,29 @@ fn action_submits_input(action: &Action) -> bool {
         Action::WriteChars { chars } => chars.contains('\r') || chars.contains('\n'),
         _ => false,
     }
+}
+
+/// fork addition: the session's default shell, told which directory to start in.
+///
+/// `Pty::fill_cwd` only fills a cwd that is still `None`, so a directory set here wins over the
+/// focused pane's, and passing no directory leaves the inherit-from-the-focused-pane behaviour
+/// exactly as it was. The shell is materialised early only when there is a directory to stamp on
+/// it - `spawn_terminal` builds the same thing from `get_default_terminal(None, None)` otherwise.
+fn default_shell_in_cwd(
+    default_shell: Option<TerminalAction>,
+    cwd: Option<PathBuf>,
+) -> Option<TerminalAction> {
+    let Some(cwd) = cwd else {
+        return default_shell;
+    };
+    let mut shell = default_shell.unwrap_or_else(|| {
+        TerminalAction::RunCommand(RunCommand {
+            command: get_default_shell(),
+            ..Default::default()
+        })
+    });
+    shell.change_cwd(cwd);
+    Some(shell)
 }
 
 /// Whether this action drops the asking client's own viewport to the bottom before it is carried
@@ -1245,6 +1272,87 @@ fn route_action_with_origin(
                     origin_pane_id,
                 ))
                 .with_context(err_context)?;
+        },
+        Action::NewShellPane {
+            placement,
+            pane_name: name,
+            cwd,
+            near_current_pane,
+            no_focus,
+            tab_id,
+        } => {
+            let run_cmd = default_shell_in_cwd(default_shell.clone(), cwd);
+            let pty_instr = match placement {
+                NewPanePlacement::InPlace {
+                    pane_id_to_replace,
+                    close_replaced_pane,
+                    ..
+                } => {
+                    // the in-place path spawns through its own instruction, and it prefers a named
+                    // pane over the client's focus even when nothing asked it to - same as
+                    // `Action::NewInPlacePane` above
+                    let explicit_pane_id_to_replace: Option<PaneId> = pane_id_to_replace
+                        .and_then(|pane_id_to_replace| pane_id_to_replace.try_into().ok());
+                    let pane_id = explicit_pane_id_to_replace.or(pane_id);
+                    let client_tab_index_or_paneid = if let Some(tab_id) = tab_id {
+                        if no_focus {
+                            ClientTabIndexOrPaneId::TabIndexNoFocus(tab_id)
+                        } else {
+                            ClientTabIndexOrPaneId::TabIndex(tab_id)
+                        }
+                    } else if let Some(pane_id) = pane_id.filter(|_| {
+                        explicit_pane_id_to_replace.is_some() || near_current_pane || no_focus
+                    }) {
+                        ClientTabIndexOrPaneId::PaneId(pane_id)
+                    } else if no_focus {
+                        ClientTabIndexOrPaneId::ClientIdNoFocus(client_id)
+                    } else {
+                        ClientTabIndexOrPaneId::ClientId(client_id)
+                    };
+                    PtyInstruction::SpawnInPlaceTerminal(
+                        run_cmd,
+                        name,
+                        close_replaced_pane,
+                        client_tab_index_or_paneid,
+                        Some(NotificationEnd::new(completion_tx)),
+                        origin_pane_id,
+                    )
+                },
+                placement => {
+                    // a stack has to be told which pane to grow under, and only the originating
+                    // pane knows - same as `Action::NewStackedPane` above
+                    let placement = match placement {
+                        NewPanePlacement::Stacked {
+                            pane_id_to_stack_under: None,
+                            borderless,
+                            border_style,
+                        } if tab_id.is_none()
+                            && (no_focus || near_current_pane)
+                            && pane_id.is_some() =>
+                        {
+                            NewPanePlacement::Stacked {
+                                pane_id_to_stack_under: pane_id.map(|pane_id| pane_id.into()),
+                                borderless,
+                                border_style,
+                            }
+                        },
+                        placement => placement,
+                    };
+                    let client_tab_index_or_paneid =
+                        new_pane_routing(no_focus, near_current_pane, tab_id, pane_id, client_id);
+                    PtyInstruction::SpawnTerminal(
+                        run_cmd,
+                        name,
+                        placement,
+                        false,
+                        client_tab_index_or_paneid,
+                        Some(NotificationEnd::new(completion_tx)),
+                        false, // set_blocking
+                        origin_pane_id,
+                    )
+                },
+            };
+            senders.send_to_pty(pty_instr).with_context(err_context)?;
         },
         Action::TogglePaneEmbedOrFloating => {
             senders

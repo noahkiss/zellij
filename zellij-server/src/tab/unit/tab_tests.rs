@@ -21751,6 +21751,226 @@ pub fn making_a_pane_tiled_by_pane_id_hides_floating_panes_and_focuses_it() {
     assert!(!tab.are_floating_panes_visible());
     assert_eq!(tab.get_active_pane_id(client_id), Some(new_pane_id));
 }
+// fork addition: a pane stacked without focus - an agent's `new-pane --stacked --near-current-pane`
+// - collapsed the pane the person was focused on and left it active: hidden, highlighted, and deaf
+// to a click. The focused pane stays expanded, and the newcomer waits collapsed behind it. Each
+// test runs with classic in-grid stacks and with stack lists (`stacked_pane_list`, the default),
+// where only the expanded member stays in the grid.
+
+/// Whether a stack member is the one on screen: in the grid, and not collapsed to a title line.
+fn stack_member_is_shown(tab: &Tab, pid: u32) -> bool {
+    tab.tiled_panes
+        .panes
+        .get(&PaneId::Terminal(pid))
+        .map(|pane| !pane.position_and_size().rows.is_fixed())
+        .unwrap_or(false)
+}
+
+fn tab_for_stack_test(stack_list: bool) -> Tab {
+    let tab = create_new_tab(Size { cols: 80, rows: 24 }, true);
+    *tab.stacked_pane_list.borrow_mut() = stack_list;
+    tab
+}
+
+#[test]
+fn a_pane_stacked_without_focus_does_not_collapse_the_focused_pane() {
+    for stack_list in [false, true] {
+        // the anchored route (`--near-current-pane`) and the client's own active pane
+        for anchored in [true, false] {
+            let mut tab = tab_for_stack_test(stack_list);
+            assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Terminal(1)));
+            tab.new_stacked_pane(
+                PaneId::Terminal(2),
+                None,
+                None,
+                false,
+                false,
+                anchored.then_some(PaneId::Terminal(1)),
+                (!anchored).then_some(1),
+                None,
+                None,
+            )
+            .unwrap();
+            let case = format!("stack_list: {stack_list}, anchored: {anchored}");
+            assert_eq!(
+                tab.get_active_pane_id(1),
+                Some(PaneId::Terminal(1)),
+                "focus stays where it was ({case})"
+            );
+            assert!(
+                stack_member_is_shown(&tab, 1),
+                "the focused pane stays shown ({case})"
+            );
+            assert!(
+                !stack_member_is_shown(&tab, 2),
+                "the new pane waits behind it ({case})"
+            );
+            assert!(tab.get_all_pane_ids().contains(&PaneId::Terminal(2)));
+        }
+    }
+}
+
+#[test]
+fn a_pane_stacked_without_focus_expands_in_a_stack_nobody_is_focused_in() {
+    for stack_list in [false, true] {
+        let mut tab = tab_for_stack_test(stack_list);
+        tab.vertical_split(PaneId::Terminal(3), None, 1, None, None)
+            .unwrap();
+        assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Terminal(3)));
+        tab.new_stacked_pane(
+            PaneId::Terminal(2),
+            None,
+            None,
+            false,
+            false,
+            Some(PaneId::Terminal(1)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tab.get_active_pane_id(1), Some(PaneId::Terminal(3)));
+        assert!(stack_member_is_shown(&tab, 2), "stack_list: {stack_list}");
+        assert!(!stack_member_is_shown(&tab, 1), "stack_list: {stack_list}");
+    }
+}
+
+#[test]
+fn a_pane_stacked_with_focus_takes_the_focus_and_the_expansion() {
+    for stack_list in [false, true] {
+        let mut tab = tab_for_stack_test(stack_list);
+        tab.new_stacked_pane(
+            PaneId::Terminal(2),
+            None,
+            None,
+            false,
+            true,
+            Some(PaneId::Terminal(1)),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            tab.get_active_pane_id(1),
+            Some(PaneId::Terminal(2)),
+            "stack_list: {stack_list}"
+        );
+        assert!(stack_member_is_shown(&tab, 2), "stack_list: {stack_list}");
+        assert!(!stack_member_is_shown(&tab, 1), "stack_list: {stack_list}");
+    }
+}
+
+/// Fills the tab with focused panes until a new one no longer fits beside the others and falls
+/// back into a stack. Returns the next free terminal id.
+fn fill_tab_until_panes_stack(tab: &mut Tab) -> u32 {
+    let mut next_pid = 2;
+    while !tab
+        .tiled_panes
+        .panes
+        .values()
+        .any(|pane| pane.position_and_size().stacked.is_some())
+    {
+        assert!(next_pid < 64, "the tab never fell back to a stack");
+        tab.new_pane(
+            PaneId::Terminal(next_pid),
+            None,
+            None,
+            false,
+            true,
+            NewPanePlacement::default(),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        next_pid += 1;
+    }
+    next_pid
+}
+
+// fork addition: a tiled pane made without focus in a tab with no room to split falls back into a
+// stack. Expanding it there moved every client focused in that stack onto it, so `--no-focus`
+// (and an agent's bare `new-pane` or `zellij run`) took the person's focus anyway.
+#[test]
+fn a_pane_made_without_focus_in_a_full_tab_leaves_the_focus_alone() {
+    for stack_list in [false, true] {
+        let mut tab = tab_for_stack_test(stack_list);
+        let mut next_pid = fill_tab_until_panes_stack(&mut tab);
+        let focused = tab.get_active_pane_id(1).unwrap();
+        let PaneId::Terminal(focused_pid) = focused else {
+            panic!("expected a terminal pane");
+        };
+        // background panes split what room is left, then fall back into a stack
+        let mut stacked_without_focus = 0;
+        while stacked_without_focus < 3 {
+            assert!(next_pid < 128, "no background pane fell back into a stack");
+            let pid = next_pid;
+            next_pid += 1;
+            tab.new_pane(
+                PaneId::Terminal(pid),
+                None,
+                None,
+                false,
+                false,
+                NewPanePlacement::default(),
+                None,
+                None,
+            )
+            .unwrap();
+            let is_stacked = tab
+                .tiled_panes
+                .panes
+                .get(&PaneId::Terminal(pid))
+                .map(|pane| pane.position_and_size().stacked.is_some())
+                .unwrap_or(true);
+            tab.sync_stacked_pane_list_mode();
+            let case = format!("stack_list: {stack_list}, pane: {pid}");
+            assert!(tab.get_all_pane_ids().contains(&PaneId::Terminal(pid)));
+            assert_eq!(
+                tab.get_active_pane_id(1),
+                Some(focused),
+                "focus stays where it was ({case})"
+            );
+            assert!(
+                stack_member_is_shown(&tab, focused_pid),
+                "the focused pane stays shown ({case})"
+            );
+            if is_stacked {
+                stacked_without_focus += 1;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_pane_made_with_focus_in_a_full_tab_takes_the_focus_and_the_expansion() {
+    for stack_list in [false, true] {
+        let mut tab = tab_for_stack_test(stack_list);
+        let new_pid = fill_tab_until_panes_stack(&mut tab);
+        tab.new_pane(
+            PaneId::Terminal(new_pid),
+            None,
+            None,
+            false,
+            true,
+            NewPanePlacement::default(),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        tab.sync_stacked_pane_list_mode();
+        assert_eq!(
+            tab.get_active_pane_id(1),
+            Some(PaneId::Terminal(new_pid)),
+            "stack_list: {stack_list}"
+        );
+        assert!(
+            stack_member_is_shown(&tab, new_pid),
+            "stack_list: {stack_list}"
+        );
+    }
+}
+
 #[test]
 fn stacked_terminal_sizes_follow_the_expanded_member_without_rendering() {
     for explicit_target in [true, false] {

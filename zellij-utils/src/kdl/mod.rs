@@ -7548,6 +7548,15 @@ impl Config {
     pub fn to_string(&self, add_comments: bool) -> String {
         let mut document = KdlDocument::new();
 
+        if let Some(default) = self.new_pane_default {
+            let mut node = KdlNode::new("new_pane_default");
+            node.push(match default {
+                crate::input::config::NewPaneDefault::Split => "split",
+                crate::input::config::NewPaneDefault::Stacked => "stacked",
+            });
+            document.nodes_mut().push(node);
+        }
+
         if let Some(keybinds) = self.keybinds_layers.user.to_kdl() {
             document.nodes_mut().push(keybinds);
         }
@@ -7927,6 +7936,62 @@ pub fn context_menu_item_to_kdl(label: &str, action_nodes: Vec<KdlNode>) -> KdlN
     }
     item_node.set_children(actions);
     item_node
+}
+
+#[test]
+fn new_pane_default_is_client_only_and_round_trips() {
+    use crate::input::config::NewPaneDefault;
+    assert_eq!(Config::from_kdl("", None).unwrap().new_pane_default, None);
+    for (value, expected) in [
+        ("split", NewPaneDefault::Split),
+        ("stacked", NewPaneDefault::Stacked),
+    ] {
+        let config = Config::from_kdl(&format!("new_pane_default \"{}\"", value), None).unwrap();
+        assert_eq!(config.new_pane_default, Some(expected));
+        let rendered = config.to_string(false);
+        assert_eq!(
+            Config::from_kdl(&rendered, None).unwrap().new_pane_default,
+            Some(expected)
+        );
+        // keybinds, mousebinds and keybinds layers are keyed by structs, which JSON cannot write,
+        // and upstream's presets fill them even for an empty config; they are cleared so the rest
+        // of the config can be checked
+        let serializable = Config {
+            keybinds: Default::default(),
+            mousebinds: Default::default(),
+            keybinds_layers: Default::default(),
+            ..config.clone()
+        };
+        assert!(serde_json::to_value(&serializable)
+            .unwrap()
+            .get("new_pane_default")
+            .is_none());
+    }
+    let base = Config::from_kdl("new_pane_default \"stacked\"", None).unwrap();
+    assert_eq!(
+        Config::from_kdl("", Some(base.clone()))
+            .unwrap()
+            .new_pane_default,
+        Some(NewPaneDefault::Stacked)
+    );
+    assert_eq!(
+        Config::from_kdl("new_pane_default \"split\"", Some(base))
+            .unwrap()
+            .new_pane_default,
+        Some(NewPaneDefault::Split)
+    );
+    // a value a newer build may add is warned about and leaves the default; a wrong type fails
+    let newer = Config::from_kdl("new_pane_default \"floating\"", None).unwrap();
+    assert_eq!(newer.new_pane_default, None);
+    assert_eq!(newer.warnings.len(), 1, "{:?}", newer.warnings);
+    assert!(
+        newer.warnings[0].contains("\"floating\""),
+        "{}",
+        newer.warnings[0]
+    );
+    for invalid in ["new_pane_default true", "new_pane_default 3"] {
+        assert!(Config::from_kdl(invalid, None).is_err(), "{}", invalid);
+    }
 }
 
 impl PluginAliases {

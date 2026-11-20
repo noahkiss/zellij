@@ -16217,9 +16217,13 @@ pub(crate) fn screen_thread_main(
                                 // waiting for it
             ) => {
                 screen.toggle_pane_pinned(client_id);
+                screen.render(None)?;
+                screen.log_and_report_session_state()?;
             },
             ScreenInstruction::SetFloatingPanePinned(pane_id, should_be_pinned) => {
                 screen.set_floating_pane_pinned(pane_id, should_be_pinned);
+                screen.render(None)?;
+                screen.log_and_report_session_state()?;
             },
             ScreenInstruction::StackPanes(
                 pane_ids_to_stack,
@@ -17353,6 +17357,8 @@ pub(crate) fn screen_thread_main(
                         c.set_error_message(format!("Pane with id {:?} not found", pane_id));
                     }
                 }
+                screen.render(None)?;
+                screen.log_and_report_session_state()?;
             },
             // Tab-targeting CLI handlers
             ScreenInstruction::UndoRenameTabWithTabId(tab_id, mut _completion_tx) => {

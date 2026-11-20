@@ -1181,19 +1181,26 @@ pub enum Sessions {
             help = "if set, will open the plugin pane without changing the focus of any client, placing it relative to the pane the command was issued from"
         )]
         no_focus: bool,
-        /// start this pane without a border (warning: will make it impossible to move with the
+        /// Take the focus even when an agent runs this. An agent's new pane leaves the person's
+        /// focus alone by default: the caller is an agent when AGENT_SESSION_ID, AGENT_KIND or a
+        /// harness's own session variable is set
+        #[clap(long, conflicts_with("no_focus"))]
+        focus: bool,
+        /// Draw the pane without a frame (warning: a borderless pane cannot be moved with the
         /// mouse)
         #[clap(short, long, value_parser)]
         borderless: Option<bool>,
-        /// Target a specific tab by ID
+        /// The tab, by the stable id in the TAB_ID column of `zellij action list-tabs` - not
+        /// the 1-based display position `go-to-tab` takes. Without this, the focused tab
         #[clap(long, value_parser, conflicts_with("in_place"))]
         tab_id: Option<usize>,
         /// Border line style, eg. "double" or "top:double,left:single,rounded"
         #[clap(long, value_parser)]
         border_style: Option<String>,
     },
-    /// Edit file with default $EDITOR / $VISUAL
-    /// Returns: Created pane ID (format: terminal_<id>)
+    /// Open a file in a new pane running your $EDITOR
+    ///
+    /// Returns: `pane_id: terminal_<id>` and `handle: <two-word handle>`
     #[clap(visible_alias = "e")]
     Edit {
         file: PathBuf,
@@ -3191,6 +3198,15 @@ impl CliAction {
     }
 }
 
+/// Whether a new pane or tab leaves every client's focus where it is.
+///
+/// `--no-focus` always does, and `--focus` never does. Without either, an agent's does: an agent
+/// that makes a pane is working beside the person, not asking for their screen. A person's own
+/// command keeps the upstream default and takes the focus.
+pub fn leaves_focus_alone(no_focus: bool, focus: bool, caller_is_agent: bool) -> bool {
+    no_focus || (caller_is_agent && !focus)
+}
+
 /// The most text `write-chars` and `paste` will take from stdin, in bytes.
 ///
 /// A megabyte is far more than anyone types and far less than a file that was piped in by mistake.
@@ -4046,6 +4062,116 @@ mod tests {
             } => assert!(!should_change_focus_to_new_tab),
             other => panic!("Expected NewTab, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn an_agents_new_pane_or_tab_leaves_the_focus_alone_unless_it_asks() {
+        // (no_focus, focus, caller_is_agent) -> leaves the focus alone
+        let table = [
+            ((false, false, false), false), // a person, no flag: the upstream default
+            ((true, false, false), true),   // a person who asked
+            ((false, true, false), false),  // `--focus` from a person is the default anyway
+            ((false, false, true), true),   // an agent, no flag: the person keeps their focus
+            ((true, false, true), true),
+            ((false, true, true), false), // an agent that asked for the focus gets it
+        ];
+        for ((no_focus, focus, agent), leaves) in table {
+            assert_eq!(
+                leaves_focus_alone(no_focus, focus, agent),
+                leaves,
+                "no_focus: {no_focus}, focus: {focus}, agent: {agent}"
+            );
+        }
+    }
+
+    #[test]
+    fn settling_the_focus_reaches_new_pane_and_new_tab_and_nothing_else() {
+        let settled = |args: &[&str], agent: bool| {
+            let mut action = parse_action(args);
+            action.settle_focus_for_caller(agent);
+            action
+        };
+        for args in [
+            &["new-pane"][..],
+            &["new-tab"][..],
+            &["new-pane", "--stacked"][..],
+        ] {
+            match settled(args, true) {
+                CliAction::NewPane {
+                    no_focus, focus, ..
+                }
+                | CliAction::NewTab {
+                    no_focus, focus, ..
+                } => {
+                    assert!(no_focus, "{:?} from an agent", args);
+                    assert!(!focus);
+                },
+                other => panic!("Expected NewPane or NewTab, got {:?}", other),
+            }
+            match settled(args, false) {
+                CliAction::NewPane { no_focus, .. } | CliAction::NewTab { no_focus, .. } => {
+                    assert!(!no_focus, "{:?} from a person", args)
+                },
+                other => panic!("Expected NewPane or NewTab, got {:?}", other),
+            }
+        }
+        match settled(&["new-tab", "--focus"], true) {
+            CliAction::NewTab { no_focus, .. } => assert!(!no_focus),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+        // and an agent's `new-tab` reaches the server as a tab that does not take the focus
+        let actions = Action::actions_from_cli(
+            settled(&["new-tab"], true),
+            Box::new(|| std::path::PathBuf::from("/tmp")),
+            None,
+            &pane_ids_only,
+        )
+        .expect("a new tab");
+        match &actions[0] {
+            Action::NewTab {
+                should_change_focus_to_new_tab,
+                ..
+            } => assert!(!should_change_focus_to_new_tab),
+            other => panic!("Expected NewTab, got {:?}", other),
+        }
+        // a verb that does not make a pane is not touched
+        assert_eq!(
+            format!("{:?}", settled(&["go-to-pane", "sunny-otter"], true)),
+            format!("{:?}", parse_action(&["go-to-pane", "sunny-otter"]))
+        );
+    }
+
+    #[test]
+    fn focus_and_no_focus_cannot_both_be_asked_for() {
+        assert!(action_parse_fails(&["new-pane", "--focus", "--no-focus"]));
+        assert!(action_parse_fails(&["new-tab", "--focus", "--no-focus"]));
+        // `--in-tab` never goes there, so it cannot be told to
+        assert!(action_parse_fails(&[
+            "new-pane", "--in-tab", "build", "--focus"
+        ]));
+        assert!(!action_parse_fails(&["new-pane", "--focus"]));
+        let run = |extra: &[&str]| {
+            let mut args = vec!["zellij".to_owned(), "run".to_owned()];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            args.extend(["--".to_owned(), "true".to_owned()]);
+            parse_cli(args)
+        };
+        assert!(run(&["--focus", "--no-focus"]).is_err());
+        assert!(matches!(
+            run(&["--focus"]).unwrap().command,
+            Some(Command::Sessions(Sessions::Run { focus: true, .. }))
+        ));
+        let plugin = |extra: &[&str]| {
+            let mut args = vec!["zellij".to_owned(), "plugin".to_owned()];
+            args.extend(extra.iter().map(|a| a.to_string()));
+            args.extend(["--".to_owned(), "zellij:strider".to_owned()]);
+            parse_cli(args)
+        };
+        assert!(plugin(&["--focus", "--no-focus"]).is_err());
+        assert!(matches!(
+            plugin(&["--focus"]).unwrap().command,
+            Some(Command::Sessions(Sessions::Plugin { focus: true, .. }))
+        ));
     }
 
     #[test]

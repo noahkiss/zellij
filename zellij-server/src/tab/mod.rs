@@ -9396,16 +9396,17 @@ impl Tab {
             return Ok(());
         }
         self.set_should_clear_display_before_rendering();
-        // Groupify BEFORE the focus/frame re-application so the just-collapsed
-        // in-grid stack member is moved to `suppressed_panes` before
-        // `reapply_pane_frames` sends a `resize_pty!` at the 1-row collapsed
-        // size. Without this, the shell inside that pane sees two rapid
-        // WINCH events (1 row → visible-size rows) and redraws its prompt
-        // twice, blanking out the visible rows of previous output.
-        self.sync_stacked_pane_list_mode();
+        // before a stack list hides every member but the expanded one: after it, the new pane
+        // is no longer in a stack to expand, and a focus left on a hidden member stays there
         if should_focus {
             self.tiled_panes.expand_pane_in_stack(pane_id);
+        } else {
+            self.tiled_panes
+                .keep_focused_pane_expanded_in_stack_of(pane_id);
         }
+        // Move hidden stack-list members before reapplying visible frames.
+        self.sync_stacked_pane_list_mode();
+        self.tiled_panes.reapply_pane_frames();
         self.swap_layouts.set_is_tiled_damaged();
         Ok(())
     }
@@ -9428,6 +9429,11 @@ impl Tab {
             self.close_unplaced_pane(pane, Some(client_id), PaneNotCreatedReason::NoRoom);
             return Ok(());
         }
+        // fork: before a stack list hides every member but the expanded one
+        if !should_focus {
+            self.tiled_panes
+                .keep_focused_pane_expanded_in_stack_of(pane_id);
+        }
         // See comment in `add_stacked_pane_to_pane_id` — groupify before
         // focusing so the collapsed member is suppressed before
         // `reapply_pane_frames` fires its intermediate `resize_pty!`.
@@ -9435,6 +9441,7 @@ impl Tab {
         if should_focus {
             self.tiled_panes.focus_pane(pane_id, client_id);
         }
+        self.tiled_panes.reapply_pane_frames();
         self.swap_layouts.set_is_tiled_damaged();
         Ok(())
     }

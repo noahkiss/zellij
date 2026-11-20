@@ -107,6 +107,12 @@ mod shared_keybinds {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewPaneDefault {
+    Split,
+    Stacked,
+}
+
 #[derive(Error, Debug, Serialize, Deserialize)]
 pub struct KdlError {
     pub error_message: String,
@@ -393,6 +399,7 @@ impl Config {
         }
     }
     pub fn merge(&mut self, other: Config) -> Result<(), ConfigError> {
+        self.new_pane_default = other.new_pane_default.or(self.new_pane_default);
         self.options = self.options.merge(other.options);
         let other_layers = other.keybinds_layers;
         if !other_layers.user.is_empty()
@@ -420,6 +427,7 @@ impl Config {
         self.terminal = self.terminal.merge(other.terminal);
         self.session_suggestions = self.session_suggestions.merge(other.session_suggestions);
         self.attention = self.attention.merge(other.attention);
+        self.warnings.extend(other.warnings);
         Ok(())
     }
     pub fn config_file_path(opts: &CliArgs) -> Option<PathBuf> {

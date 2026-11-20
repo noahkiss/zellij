@@ -61,6 +61,7 @@ fn no_focus_new_tab_action() -> CliAction {
         block_until_exit_failure: false,
         block_until_exit: false,
         no_focus: true,
+        focus: false,
     }
 }
 

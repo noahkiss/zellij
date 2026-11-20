@@ -4792,6 +4792,7 @@ pub fn send_cli_new_tab_action_default_params() {
         block_until_exit_success: false,
         block_until_exit_failure: false,
         no_focus: false,
+        focus: false,
     };
     send_cli_action_to_server(&session_metadata, new_tab_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -4842,6 +4843,7 @@ pub fn send_cli_new_tab_action_with_name_and_layout() {
         block_until_exit_success: false,
         block_until_exit_failure: false,
         no_focus: false,
+        focus: false,
     };
     send_cli_action_to_server(&session_metadata, new_tab_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -10233,6 +10235,7 @@ pub fn send_cli_new_tab_action_with_layout_string() {
         block_until_exit_success: false,
         block_until_exit_failure: false,
         no_focus: false,
+        focus: false,
     };
     send_cli_action_to_server(&session_metadata, new_tab_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -10289,6 +10292,7 @@ pub fn send_cli_new_tab_action_with_layout_string_and_name() {
         block_until_exit_success: false,
         block_until_exit_failure: false,
         no_focus: false,
+        focus: false,
     };
     send_cli_action_to_server(&session_metadata, new_tab_action, client_id);
     std::thread::sleep(std::time::Duration::from_millis(100));

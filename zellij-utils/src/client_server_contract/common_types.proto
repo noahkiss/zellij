@@ -616,6 +616,17 @@ message NewBlockingPaneAction {
   bool no_focus = 7;
 }
 
+// fork addition: a pane with no command, opened in a cwd the caller named. The four New*Pane
+// actions carry their cwd inside RunCommandAction, so a command-less pane had nowhere to put one.
+message NewShellPaneAction {
+  NewPanePlacement placement = 1;
+  optional string pane_name = 2;
+  optional string cwd = 3;
+  bool near_current_pane = 4;
+  bool no_focus = 5;
+  optional uint32 tab_id = 6;
+}
+
 message PaneNameInputAction {
   repeated uint32 input = 1;
 }
